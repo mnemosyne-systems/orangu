@@ -53,37 +53,45 @@ impl ChatSession {
     ) -> Result<String> {
         let client = OpenAiClient::from_profile(profile)?;
         let tool_definitions = tools.definitions();
+        let checkpoint = self.messages.len();
         self.messages.push(ChatMessage::user(user_input));
 
         for _ in 0..profile.max_tool_rounds {
-            match client.chat(&self.messages, &tool_definitions).await? {
-                LlmResponse::Text(text) => {
-                    self.messages.push(ChatMessage::assistant(&text));
-                    return Ok(text);
-                }
-                LlmResponse::ToolCalls(tool_calls) => {
-                    self.messages
-                        .push(ChatMessage::assistant_tool_calls(tool_calls.clone()));
-
-                    for tool_call in tool_calls {
-                        let rendered = match tools
-                            .execute(
-                                &tool_call.function.name,
-                                &tool_call.function.arguments.into_iter().collect(),
-                            )
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(err) => format!("error: {err:#}"),
-                        };
-
-                        self.messages
-                            .push(ChatMessage::tool_result(&tool_call.id, &rendered));
+            match client.chat(&self.messages, &tool_definitions).await {
+                Ok(response) => match response {
+                    LlmResponse::Text(text) => {
+                        self.messages.push(ChatMessage::assistant(&text));
+                        return Ok(text);
                     }
+                    LlmResponse::ToolCalls(tool_calls) => {
+                        self.messages
+                            .push(ChatMessage::assistant_tool_calls(tool_calls.clone()));
+
+                        for tool_call in tool_calls {
+                            let rendered = match tools
+                                .execute(
+                                    &tool_call.function.name,
+                                    &tool_call.function.arguments.into_iter().collect(),
+                                )
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(err) => format!("error: {err:#}"),
+                            };
+
+                            self.messages
+                                .push(ChatMessage::tool_result(&tool_call.id, &rendered));
+                        }
+                    }
+                },
+                Err(err) => {
+                    self.messages.truncate(checkpoint);
+                    return Err(err);
                 }
             }
         }
 
+        self.messages.truncate(checkpoint);
         Err(anyhow!(
             "model exceeded the configured max_tool_rounds ({})",
             profile.max_tool_rounds

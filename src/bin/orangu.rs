@@ -183,7 +183,7 @@ async fn run() -> Result<()> {
             .llms
             .get(&active_model)
             .ok_or_else(|| anyhow!("unknown model profile '{active_model}'"))?;
-        let answer = wait_for_response(
+        match wait_for_response(
             &mut session,
             trimmed,
             profile,
@@ -193,8 +193,11 @@ async fn run() -> Result<()> {
             tools.workspace(),
             &transcript,
         )
-        .await?;
-        push_transcript(&mut transcript, &answer);
+        .await
+        {
+            Ok(answer) => push_transcript(&mut transcript, &answer),
+            Err(err) => push_transcript(&mut transcript, &format!("error: {err:#}")),
+        }
     }
 
     Ok(())
