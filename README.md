@@ -4,16 +4,18 @@
 
 ## Features
 
-- LLM based coding environment
+- Coding environment (LLM based)
 
 ## Configuration
 
-`orangu` reads an INI-style configuration similar to `pgmoneta_mcp_client`, but without a `url` property.
+`orangu` reads an INI-style configuration
 
 Default lookup order:
 
 1. `./orangu.conf`
 2. `~/.orangu/orangu.conf`
+
+Or use `--config` to point to a configuration file.
 
 ## Running
 
