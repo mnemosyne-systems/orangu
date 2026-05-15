@@ -810,24 +810,22 @@ fn handle_command(
         return Ok(CommandOutcome::Cleared);
     }
     if input == "/model" {
-        return Ok(CommandOutcome::Output(format!(
-            "active model: {active_model}\nserver: {}\nprofiles: {}",
-            current_endpoint.as_deref().unwrap_or("(disconnected)"),
-            sorted_model_names(llms).join(", ")
-        )));
+        return Ok(CommandOutcome::Output(
+            "Use /list-models to see configured profiles".to_string(),
+        ));
     }
     if let Some(name) = input.strip_prefix("/model ") {
         let name = name.trim();
         if !llms.contains_key(name) {
             return Ok(CommandOutcome::Output(format!(
-                "unknown model profile '{name}'. Available: {}",
+                "Unknown model profile '{name}'. Available: {}",
                 sorted_model_names(llms).join(", ")
             )));
         }
         *active_model = name.to_string();
         session.set_system_prompt(system_prompt(&llms[name]));
         return Ok(CommandOutcome::Output(format!(
-            "switched to model profile '{name}'"
+            "Switched to model profile '{name}'"
         )));
     }
     if input == "/connect" {
@@ -842,7 +840,7 @@ fn handle_command(
     if let Some(endpoint) = input.strip_prefix("/connect ") {
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
-            return Ok(CommandOutcome::Output("usage: /connect [url]".to_string()));
+            return Ok(CommandOutcome::Output("Usage: /connect [url]".to_string()));
         }
         *current_endpoint = Some(endpoint.to_string());
         return Ok(CommandOutcome::Output(format!("Connected to '{endpoint}'")));
