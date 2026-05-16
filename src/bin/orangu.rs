@@ -944,6 +944,12 @@ fn handle_command(
     workspace: &std::path::Path,
 ) -> Result<CommandOutcome> {
     let Some(command) = parse_local_command(input) else {
+        if input.trim_start().starts_with('/') {
+            return Ok(CommandOutcome::Output(format!(
+                "Unknown command '{}'. Use /help to see available commands.",
+                input.trim()
+            )));
+        }
         return Ok(CommandOutcome::Unhandled);
     };
 
@@ -1500,9 +1506,12 @@ fn format_tools(tools: &ToolExecutor) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalCommand, completion_candidates, discover_git_dir, parse_local_command,
-        resolve_workspace_root, shell_words, workspace_branch_name,
+        CommandOutcome, LocalCommand, completion_candidates, discover_git_dir, handle_command,
+        parse_local_command, resolve_workspace_root, shell_words, system_prompt,
+        workspace_branch_name,
     };
+    use orangu::{config::LlmConfiguration, session::ChatSession, tools::ToolExecutor};
+    use std::collections::HashMap;
     use std::{fs, path::PathBuf};
     use tempfile::tempdir;
 
@@ -1602,6 +1611,47 @@ mod tests {
             discover_git_dir(workspace.path()).as_deref(),
             Some(workspace.path().join(".git").as_path())
         );
+    }
+
+    #[test]
+    fn unknown_slash_commands_error_locally() {
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut llms = HashMap::new();
+        llms.insert(
+            "default".to_string(),
+            LlmConfiguration {
+                provider: "openai".to_string(),
+                model: "gpt-4.1".to_string(),
+                endpoint: "http://localhost:11434/v1".to_string(),
+                api_key: None,
+                request_timeout_seconds: 30,
+                max_tool_rounds: 10,
+                system_prompt: String::new(),
+            },
+        );
+        let mut session = ChatSession::new(system_prompt(&llms["default"]));
+        let mut active_model = "default".to_string();
+        let mut current_endpoint = Some("http://localhost:11434/v1".to_string());
+
+        let outcome = handle_command(
+            "/unknown",
+            &mut active_model,
+            &mut current_endpoint,
+            "default",
+            "http://localhost:11434/v1",
+            &llms,
+            &mut session,
+            &tools,
+            workspace.path(),
+        )
+        .expect("command outcome");
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Output(ref message)
+                if message == "Unknown command '/unknown'. Use /help to see available commands."
+        ));
     }
 
     #[test]
