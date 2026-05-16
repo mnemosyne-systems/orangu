@@ -34,6 +34,7 @@ use orangu::{
 use serde::Deserialize;
 use std::{
     collections::HashMap,
+    collections::VecDeque,
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -48,6 +49,7 @@ const TERMINAL_TITLE: &str = "orangu";
 const CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const CTRL_C_EXIT_MESSAGE: &str = "Press Ctrl+c again to quit";
 const THINKING_FRAME_INTERVAL: Duration = Duration::from_millis(120);
+const WAIT_LOOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRANSCRIPT_MAX_LINES: usize = 10_000;
 const HISTORY_DIRECTORY: &str = ".orangu";
 const HISTORY_FILE: &str = "orangu.history";
@@ -120,6 +122,7 @@ async fn run() -> Result<()> {
     let mut output_state = OutputState::default();
     let mut interrupt_state = InterruptState::default();
     let mut input_state = InputState::default();
+    let mut pending_commands = VecDeque::new();
     let history_path = history_file_path()?;
     let mut history = load_history(&history_path)?;
     let status_http_client = reqwest::Client::builder()
@@ -148,43 +151,51 @@ async fn run() -> Result<()> {
             header_status,
             output_state.lines(),
             output_state.scroll_offset(),
+            pending_commands.len(),
             None,
             input_state.as_str(),
             input_state.cursor(),
         );
         std::io::stdout().flush()?;
 
-        let input = match read_input(
-            &mut input_state,
-            &history,
-            &workspace,
-            &model_names,
-            &mut interrupt_state,
-            &mut output_state,
-            &active_model,
-            current_endpoint.as_deref().unwrap_or("(disconnected)"),
-            prompt_branch.as_deref(),
-            header_status,
-        )? {
-            InputResult::Submitted(line) => line,
-            InputResult::Quit => {
-                print!("{CLEAR_TERMINAL_SEQUENCE}");
-                std::io::stdout().flush()?;
-                break;
+        let next_input = if let Some(queued) = pending_commands.pop_front() {
+            queued
+        } else {
+            match read_input(
+                &mut input_state,
+                &history,
+                &workspace,
+                &model_names,
+                &mut interrupt_state,
+                &mut output_state,
+                &active_model,
+                current_endpoint.as_deref().unwrap_or("(disconnected)"),
+                prompt_branch.as_deref(),
+                header_status,
+                pending_commands.len(),
+            )? {
+                InputResult::Submitted(line) => {
+                    let Some(trimmed) = prepare_submitted_input(
+                        &line,
+                        &mut history,
+                        &history_path,
+                        &mut output_state,
+                        None,
+                    )?
+                    else {
+                        continue;
+                    };
+                    trimmed
+                }
+                InputResult::Quit => {
+                    print!("{CLEAR_TERMINAL_SEQUENCE}");
+                    std::io::stdout().flush()?;
+                    break;
+                }
             }
         };
 
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('\\') {
-            continue;
-        }
-
-        history.push(trimmed.to_string());
-        append_history_entry(&history_path, trimmed)?;
-        output_state.push_text(&format!("> {trimmed}"));
+        output_state.push_text(&format!("> {next_input}"));
         output_state.reset_scroll();
         print_screen(
             &active_model,
@@ -194,17 +205,15 @@ async fn run() -> Result<()> {
             header_status,
             output_state.lines(),
             output_state.scroll_offset(),
+            pending_commands.len(),
             None,
             input_state.as_str(),
             input_state.cursor(),
         );
         std::io::stdout().flush()?;
-        if trimmed.starts_with('#') {
-            continue;
-        }
 
         match handle_command(
-            trimmed,
+            &next_input,
             &mut active_model,
             &mut current_endpoint,
             &startup_model,
@@ -244,7 +253,7 @@ async fn run() -> Result<()> {
         prompt_profile.endpoint = endpoint.to_string();
         match wait_for_response(
             &mut session,
-            trimmed,
+            &next_input,
             &prompt_profile,
             &tools,
             &active_model,
@@ -252,11 +261,22 @@ async fn run() -> Result<()> {
             tools.workspace(),
             prompt_branch.as_deref(),
             header_status,
-            output_state.lines(),
+            &mut history,
+            &history_path,
+            &model_names,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut input_state,
+            &mut pending_commands,
         )
         .await
         {
-            Ok(answer) => output_state.push_text(&answer),
+            Ok(WaitResult::Response(answer)) => output_state.push_text(&answer),
+            Ok(WaitResult::Quit) => {
+                print!("{CLEAR_TERMINAL_SEQUENCE}");
+                std::io::stdout().flush()?;
+                break;
+            }
             Err(err) => output_state.push_text(&format!("Error: {err:#}")),
         }
         output_state.reset_scroll();
@@ -548,6 +568,16 @@ enum InputResult {
     Quit,
 }
 
+enum WaitResult {
+    Response(String),
+    Quit,
+}
+
+struct InputEventResult {
+    redraw: bool,
+    outcome: Option<InputResult>,
+}
+
 fn read_input(
     input_state: &mut InputState,
     history: &[String],
@@ -559,142 +589,28 @@ fn read_input(
     endpoint: &str,
     prompt_branch: Option<&str>,
     header_status: HeaderStatus,
+    pending_count: usize,
 ) -> Result<InputResult> {
     loop {
-        let mut redraw = false;
-        match event::read()? {
-            Event::Paste(text) => {
-                interrupt_state.reset();
-                input_state.insert_str(&text);
-                redraw = true;
-            }
-            Event::Key(KeyEvent {
-                code,
-                modifiers,
-                kind,
-                ..
-            }) if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat => {
-                match (code, modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        match interrupt_state.handle_interrupt(Instant::now()) {
-                            InterruptAction::Continue => {
-                                output_state.push_text(CTRL_C_EXIT_MESSAGE);
-                                output_state.reset_scroll();
-                                input_state.clear();
-                                return Ok(InputResult::Submitted(String::new()));
-                            }
-                            InterruptAction::Exit => return Ok(InputResult::Quit),
-                        }
-                    }
-                    (KeyCode::Char('d'), KeyModifiers::CONTROL)
-                        if input_state.as_str().is_empty() =>
-                    {
-                        return Ok(InputResult::Quit);
-                    }
-                    (KeyCode::Enter, KeyModifiers::NONE) => {
-                        interrupt_state.reset();
-                        let input = input_state.buffer.clone();
-                        input_state.clear();
-                        return Ok(InputResult::Submitted(input));
-                    }
-                    (KeyCode::Backspace, _) => {
-                        interrupt_state.reset();
-                        input_state.backspace();
-                        redraw = true;
-                    }
-                    (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.delete();
-                        redraw = true;
-                    }
-                    (KeyCode::Left, _) => {
-                        interrupt_state.reset();
-                        input_state.move_left();
-                        redraw = true;
-                    }
-                    (KeyCode::Right, _) => {
-                        interrupt_state.reset();
-                        input_state.move_right();
-                        redraw = true;
-                    }
-                    (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.move_home();
-                        redraw = true;
-                    }
-                    (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.move_end();
-                        redraw = true;
-                    }
-                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.kill_to_end();
-                        redraw = true;
-                    }
-                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.kill_to_start();
-                        redraw = true;
-                    }
-                    (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
-                        interrupt_state.reset();
-                        input_state.delete_prev_word();
-                        redraw = true;
-                    }
-                    (KeyCode::Up, _) => {
-                        interrupt_state.reset();
-                        history_previous(input_state, history);
-                        redraw = true;
-                    }
-                    (KeyCode::Down, _) => {
-                        interrupt_state.reset();
-                        history_next(input_state, history);
-                        redraw = true;
-                    }
-                    (KeyCode::Tab, _) => {
-                        interrupt_state.reset();
-                        apply_completion(input_state, workspace, model_names);
-                        redraw = true;
-                    }
-                    (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                        interrupt_state.reset();
-                        output_state.page_up(output_view_rows(
-                            VERSION,
-                            current_model,
-                            endpoint,
-                            workspace,
-                            prompt_branch,
-                            header_status,
-                            input_state.as_str(),
-                        ));
-                        redraw = true;
-                    }
-                    (KeyCode::PageDown, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                        interrupt_state.reset();
-                        output_state.page_down(output_view_rows(
-                            VERSION,
-                            current_model,
-                            endpoint,
-                            workspace,
-                            prompt_branch,
-                            header_status,
-                            input_state.as_str(),
-                        ));
-                        redraw = true;
-                    }
-                    (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        interrupt_state.reset();
-                        input_state.insert_char(ch);
-                        redraw = true;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
+        let result = handle_input_event(
+            event::read()?,
+            input_state,
+            history,
+            workspace,
+            model_names,
+            interrupt_state,
+            output_state,
+            current_model,
+            endpoint,
+            prompt_branch,
+            header_status,
+        );
+
+        if let Some(outcome) = result.outcome {
+            return Ok(outcome);
         }
 
-        if redraw {
+        if result.redraw {
             print_screen(
                 current_model,
                 endpoint,
@@ -703,12 +619,178 @@ fn read_input(
                 header_status,
                 output_state.lines(),
                 output_state.scroll_offset(),
+                pending_count,
                 None,
                 input_state.as_str(),
                 input_state.cursor(),
             );
             std::io::stdout().flush()?;
         }
+    }
+}
+
+fn handle_input_event(
+    event: Event,
+    input_state: &mut InputState,
+    history: &[String],
+    workspace: &std::path::Path,
+    model_names: &[String],
+    interrupt_state: &mut InterruptState,
+    output_state: &mut OutputState,
+    current_model: &str,
+    endpoint: &str,
+    prompt_branch: Option<&str>,
+    header_status: HeaderStatus,
+) -> InputEventResult {
+    let mut redraw = false;
+
+    match event {
+        Event::Paste(text) => {
+            interrupt_state.reset();
+            input_state.insert_str(&text);
+            redraw = true;
+        }
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind,
+            ..
+        }) if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat => {
+            match (code, modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    match interrupt_state.handle_interrupt(Instant::now()) {
+                        InterruptAction::Continue => {
+                            output_state.push_text(CTRL_C_EXIT_MESSAGE);
+                            output_state.reset_scroll();
+                            input_state.clear();
+                            return InputEventResult {
+                                redraw: true,
+                                outcome: Some(InputResult::Submitted(String::new())),
+                            };
+                        }
+                        InterruptAction::Exit => {
+                            return InputEventResult {
+                                redraw: false,
+                                outcome: Some(InputResult::Quit),
+                            };
+                        }
+                    }
+                }
+                (KeyCode::Char('d'), KeyModifiers::CONTROL) if input_state.as_str().is_empty() => {
+                    return InputEventResult {
+                        redraw: false,
+                        outcome: Some(InputResult::Quit),
+                    };
+                }
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    interrupt_state.reset();
+                    let input = input_state.buffer.clone();
+                    input_state.clear();
+                    return InputEventResult {
+                        redraw: false,
+                        outcome: Some(InputResult::Submitted(input)),
+                    };
+                }
+                (KeyCode::Backspace, _) => {
+                    interrupt_state.reset();
+                    input_state.backspace();
+                    redraw = true;
+                }
+                (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.delete();
+                    redraw = true;
+                }
+                (KeyCode::Left, _) => {
+                    interrupt_state.reset();
+                    input_state.move_left();
+                    redraw = true;
+                }
+                (KeyCode::Right, _) => {
+                    interrupt_state.reset();
+                    input_state.move_right();
+                    redraw = true;
+                }
+                (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.move_home();
+                    redraw = true;
+                }
+                (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.move_end();
+                    redraw = true;
+                }
+                (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.kill_to_end();
+                    redraw = true;
+                }
+                (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.kill_to_start();
+                    redraw = true;
+                }
+                (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.delete_prev_word();
+                    redraw = true;
+                }
+                (KeyCode::Up, _) => {
+                    interrupt_state.reset();
+                    history_previous(input_state, history);
+                    redraw = true;
+                }
+                (KeyCode::Down, _) => {
+                    interrupt_state.reset();
+                    history_next(input_state, history);
+                    redraw = true;
+                }
+                (KeyCode::Tab, _) => {
+                    interrupt_state.reset();
+                    apply_completion(input_state, workspace, model_names);
+                    redraw = true;
+                }
+                (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                    interrupt_state.reset();
+                    output_state.page_up(output_view_rows(
+                        VERSION,
+                        current_model,
+                        endpoint,
+                        workspace,
+                        prompt_branch,
+                        header_status,
+                        input_state.as_str(),
+                    ));
+                    redraw = true;
+                }
+                (KeyCode::PageDown, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                    interrupt_state.reset();
+                    output_state.page_down(output_view_rows(
+                        VERSION,
+                        current_model,
+                        endpoint,
+                        workspace,
+                        prompt_branch,
+                        header_status,
+                        input_state.as_str(),
+                    ));
+                    redraw = true;
+                }
+                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    interrupt_state.reset();
+                    input_state.insert_char(ch);
+                    redraw = true;
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+
+    InputEventResult {
+        redraw,
+        outcome: None,
     }
 }
 
@@ -1382,6 +1464,35 @@ fn shell_words(input: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+fn prepare_submitted_input(
+    input: &str,
+    history: &mut Vec<String>,
+    history_path: &Path,
+    output_state: &mut OutputState,
+    pending_commands: Option<&mut VecDeque<String>>,
+) -> Result<Option<String>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.starts_with('\\') {
+        return Ok(None);
+    }
+
+    history.push(trimmed.to_string());
+    append_history_entry(history_path, trimmed)?;
+
+    if trimmed.starts_with('#') {
+        output_state.push_text(&format!("> {trimmed}"));
+        output_state.reset_scroll();
+        return Ok(None);
+    }
+
+    if let Some(pending_commands) = pending_commands {
+        pending_commands.push_back(trimmed.to_string());
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
 fn workspace_branch_name(workspace: &Path) -> Option<String> {
     let git_dir = discover_git_dir(workspace)?;
     let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
@@ -1440,6 +1551,7 @@ fn print_screen(
     header_status: HeaderStatus,
     transcript: &[String],
     scroll_offset: usize,
+    pending_count: usize,
     pending_line: Option<&str>,
     input: &str,
     cursor: usize,
@@ -1456,6 +1568,7 @@ fn print_screen(
             header_status,
             transcript,
             scroll_offset,
+            pending_count,
             pending_line,
             input,
             cursor
@@ -1473,10 +1586,16 @@ async fn wait_for_response(
     workspace: &std::path::Path,
     prompt_branch: Option<&str>,
     header_status: HeaderStatus,
-    transcript: &[String],
-) -> Result<String> {
+    history: &mut Vec<String>,
+    history_path: &Path,
+    model_names: &[String],
+    interrupt_state: &mut InterruptState,
+    output_state: &mut OutputState,
+    input_state: &mut InputState,
+    pending_commands: &mut VecDeque<String>,
+) -> Result<WaitResult> {
     let mut prompt_future = Box::pin(session.prompt(user_input, profile, tools));
-    let mut interval = tokio::time::interval(THINKING_FRAME_INTERVAL);
+    let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut thinking_frame = 0usize;
     let thinking_started = Instant::now();
     let initial_frame = render_thinking_frame(thinking_frame, thinking_started.elapsed());
@@ -1487,34 +1606,75 @@ async fn wait_for_response(
         workspace,
         prompt_branch,
         header_status,
-        transcript,
-        0,
+        output_state.lines(),
+        output_state.scroll_offset(),
+        pending_commands.len(),
         Some(initial_frame.as_str()),
-        "",
-        0,
+        input_state.as_str(),
+        input_state.cursor(),
     );
     std::io::stdout().flush()?;
 
     loop {
         tokio::select! {
-            result = &mut prompt_future => return result,
+            result = &mut prompt_future => return result.map(WaitResult::Response),
             _ = interval.tick() => {
-                thinking_frame = thinking_frame.wrapping_add(1);
-                let pending_line =
-                    render_thinking_frame(thinking_frame, thinking_started.elapsed());
-                print_screen(
-                    current_model,
-                    endpoint,
-                    workspace,
-                    prompt_branch,
-                    header_status,
-                    transcript,
-                    0,
-                    Some(pending_line.as_str()),
-                    "",
-                    0,
-                );
-                std::io::stdout().flush()?;
+                let elapsed = thinking_started.elapsed();
+                let next_frame = (elapsed.as_millis() / THINKING_FRAME_INTERVAL.as_millis()) as usize;
+                let mut redraw = next_frame != thinking_frame;
+                thinking_frame = next_frame;
+
+                while event::poll(Duration::ZERO)? {
+                    let result = handle_input_event(
+                        event::read()?,
+                        input_state,
+                        history,
+                        workspace,
+                        model_names,
+                        interrupt_state,
+                        output_state,
+                        current_model,
+                        endpoint,
+                        prompt_branch,
+                        header_status,
+                    );
+
+                    if let Some(outcome) = result.outcome {
+                        match outcome {
+                            InputResult::Submitted(line) => {
+                                let had_pending = pending_commands.len();
+                                let _ = prepare_submitted_input(
+                                    &line,
+                                    history,
+                                    history_path,
+                                    output_state,
+                                    Some(pending_commands),
+                                )?;
+                                redraw = redraw || pending_commands.len() != had_pending || !line.trim().is_empty();
+                            }
+                            InputResult::Quit => return Ok(WaitResult::Quit),
+                        }
+                    }
+                    redraw |= result.redraw;
+                }
+
+                if redraw {
+                    let pending_line = render_thinking_frame(thinking_frame, elapsed);
+                    print_screen(
+                        current_model,
+                        endpoint,
+                        workspace,
+                        prompt_branch,
+                        header_status,
+                        output_state.lines(),
+                        output_state.scroll_offset(),
+                        pending_commands.len(),
+                        Some(pending_line.as_str()),
+                        input_state.as_str(),
+                        input_state.cursor(),
+                    );
+                    std::io::stdout().flush()?;
+                }
             }
         }
     }

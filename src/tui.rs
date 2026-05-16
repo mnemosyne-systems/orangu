@@ -142,6 +142,7 @@ pub fn render_screen(
     status: HeaderStatus,
     transcript: &[String],
     scroll_offset: usize,
+    pending_count: usize,
     pending_line: Option<&str>,
     input: &str,
     cursor: usize,
@@ -175,6 +176,7 @@ pub fn render_screen(
     screen.push_str(&render_prompt_frame(
         header_line_count,
         current_model,
+        pending_count,
         &prompt_prefix,
         input,
         cursor,
@@ -280,6 +282,7 @@ fn status_indicator_line(text: &str, ok: bool) -> HeaderLine {
 fn render_prompt_frame(
     header_height: usize,
     current_model: &str,
+    pending_count: usize,
     prompt_prefix: &str,
     input: &str,
     cursor: usize,
@@ -294,8 +297,6 @@ fn render_prompt_frame(
     let bottom_row = input_start_row + input_height;
     let model_row = bottom_row + 1;
     let line = "━".repeat(width);
-    let model_width = current_model.chars().count();
-    let padding = width.saturating_sub(model_width);
     let prompt_width = prompt_prefix.chars().count();
     let mut frame = format!("\x1b[{top_row};1H{line}");
 
@@ -314,9 +315,9 @@ fn render_prompt_frame(
     let cursor_row = input_start_row + cursor_row_offset;
     let cursor_col = 1 + prompt_width + cursor_col_offset;
 
+    let status_line = render_status_line(width, current_model, pending_count);
     frame.push_str(&format!(
-        "\x1b[{bottom_row};1H{line}\x1b[{model_row};1H{}{current_model}\x1b[{cursor_row};{cursor_col}H",
-        " ".repeat(padding)
+        "\x1b[{bottom_row};1H{line}\x1b[{model_row};1H{status_line}\x1b[{cursor_row};{cursor_col}H"
     ));
     frame
 }
@@ -363,6 +364,30 @@ fn prompt_prefix(branch_name: Option<&str>) -> String {
         Some(branch_name) if !branch_name.trim().is_empty() => format!("{branch_name}> "),
         _ => "> ".to_string(),
     }
+}
+
+fn render_status_line(width: usize, current_model: &str, pending_count: usize) -> String {
+    let mut cells = vec![' '; width];
+    if pending_count > 0 {
+        let pending = format!("Pending: {pending_count}");
+        let pending_width = pending.chars().count();
+        let pending_start = width.saturating_sub(pending_width) / 2;
+        for (index, ch) in pending.chars().enumerate() {
+            if pending_start + index < width {
+                cells[pending_start + index] = ch;
+            }
+        }
+    }
+
+    let model_width = current_model.chars().count();
+    let model_start = width.saturating_sub(model_width);
+    for (index, ch) in current_model.chars().enumerate() {
+        if model_start + index < width {
+            cells[model_start + index] = ch;
+        }
+    }
+
+    cells.into_iter().collect()
 }
 
 fn truncate_to_width(input: &str, width: usize) -> String {
@@ -479,8 +504,8 @@ impl Completer for OranguHelper {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_RESET, THINKING_TEXT, available_output_rows, prompt_prefix, render_thinking_frame,
-        wrapped_input_lines,
+        ANSI_RESET, THINKING_TEXT, available_output_rows, prompt_prefix, render_status_line,
+        render_thinking_frame, wrapped_input_lines,
     };
     use std::time::Duration;
 
@@ -513,6 +538,13 @@ mod tests {
             wrapped_input_lines("abc", 8, "main> "),
             vec!["ab".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn status_line_centers_pending_count() {
+        let line = render_status_line(30, "gpt-4.1", 3);
+        assert!(line.contains("Pending: 3"));
+        assert!(line.ends_with("gpt-4.1"));
     }
 
     #[test]

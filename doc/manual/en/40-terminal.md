@@ -25,13 +25,15 @@ The prompt area stays at the bottom of the terminal window.
 
 ## Waiting state
 
-While the model is generating a response, the output area shows a blinking:
+While the model is generating a response, the output area shows a rolling:
 
 ```text
-Thinking
+Thinking (2s)
 ```
 
 placeholder in the position where the reply will appear.
+
+You can keep typing and submitting commands while a response is pending. Submitted commands are queued and executed in order after the active response finishes.
 
 ## History and navigation
 
@@ -94,5 +96,6 @@ The prompt supports standard shell-style editing:
 - `Shift+PageDown` scrolls forward through the output window
 - The output scrollback buffer keeps the most recent 10,000 lines
 - Scrolling is limited to the output window; it does not replace the header or prompt area
+- The footer centers `Pending: X` to show how many queued commands are waiting
 
 Press `Ctrl+C` once to arm quit mode. Press it again within 2 seconds to exit.
