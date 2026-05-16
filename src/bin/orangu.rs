@@ -29,7 +29,10 @@ use orangu::{
     llm::{StreamMetrics, StreamPromptProgress, normalized_openai_endpoint},
     session::ChatSession,
     tools::{ToolExecutor, resolve_workspace_path},
-    tui::{HeaderStatus, help_text, output_view_rows, render_screen, render_thinking_frame},
+    tui::{
+        HeaderStatus, ScreenRenderArgs, help_text, output_view_rows, render_screen,
+        render_thinking_frame,
+    },
 };
 use serde::Deserialize;
 use std::{
@@ -146,19 +149,24 @@ async fn run() -> Result<()> {
             current_endpoint.as_deref(),
         )
         .await;
-        print_screen(
-            &active_model,
-            current_endpoint.as_deref().unwrap_or("(disconnected)"),
-            tools.workspace(),
-            prompt_branch.as_deref(),
+        let render = RenderContext {
+            current_model: &active_model,
+            endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
+            workspace: tools.workspace(),
+            prompt_branch: prompt_branch.as_deref(),
             header_status,
-            output_state.lines(),
-            output_state.scroll_offset(),
-            None,
-            pending_commands.len(),
-            None,
-            input_state.as_str(),
-            input_state.cursor(),
+        };
+        print_screen(
+            render,
+            ScreenState {
+                transcript: output_state.lines(),
+                scroll_offset: output_state.scroll_offset(),
+                left_status: None,
+                pending_count: pending_commands.len(),
+                pending_line: None,
+                input: input_state.as_str(),
+                cursor: input_state.cursor(),
+            },
         );
         std::io::stdout().flush()?;
 
@@ -167,16 +175,15 @@ async fn run() -> Result<()> {
         } else {
             match read_input(
                 &mut input_state,
-                &history,
-                &workspace,
-                &model_names,
                 &mut interrupt_state,
                 &mut output_state,
-                &active_model,
-                current_endpoint.as_deref().unwrap_or("(disconnected)"),
-                prompt_branch.as_deref(),
-                header_status,
                 pending_commands.len(),
+                InputContext {
+                    history: &history,
+                    workspace: &workspace,
+                    model_names: &model_names,
+                    render,
+                },
             )? {
                 InputResult::Submitted(line) => {
                     let Some(trimmed) = prepare_submitted_input(
@@ -202,31 +209,33 @@ async fn run() -> Result<()> {
         output_state.push_text(&format!("> {next_input}"));
         output_state.reset_scroll();
         print_screen(
-            &active_model,
-            current_endpoint.as_deref().unwrap_or("(disconnected)"),
-            tools.workspace(),
-            prompt_branch.as_deref(),
-            header_status,
-            output_state.lines(),
-            output_state.scroll_offset(),
-            None,
-            pending_commands.len(),
-            None,
-            input_state.as_str(),
-            input_state.cursor(),
+            render,
+            ScreenState {
+                transcript: output_state.lines(),
+                scroll_offset: output_state.scroll_offset(),
+                left_status: None,
+                pending_count: pending_commands.len(),
+                pending_line: None,
+                input: input_state.as_str(),
+                cursor: input_state.cursor(),
+            },
         );
         std::io::stdout().flush()?;
 
         match handle_command(
             &next_input,
-            &mut active_model,
-            &mut current_endpoint,
-            &startup_model,
-            &startup_endpoint,
-            &config.llms,
-            &mut session,
-            &tools,
-            &workspace,
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: &startup_model,
+                startup_endpoint: &startup_endpoint,
+                llms: &config.llms,
+                tools: &tools,
+                workspace: &workspace,
+            },
         )? {
             CommandOutcome::Quit => {
                 print!("{CLEAR_TERMINAL_SEQUENCE}");
@@ -261,18 +270,22 @@ async fn run() -> Result<()> {
             &next_input,
             &prompt_profile,
             &tools,
-            &active_model,
-            endpoint,
-            tools.workspace(),
-            prompt_branch.as_deref(),
-            header_status,
-            &mut history,
-            &history_path,
-            &model_names,
-            &mut interrupt_state,
-            &mut output_state,
-            &mut input_state,
-            &mut pending_commands,
+            WaitContext {
+                render: RenderContext {
+                    current_model: &active_model,
+                    endpoint,
+                    workspace: tools.workspace(),
+                    prompt_branch: prompt_branch.as_deref(),
+                    header_status,
+                },
+                history: &mut history,
+                history_path: &history_path,
+                model_names: &model_names,
+                interrupt_state: &mut interrupt_state,
+                output_state: &mut output_state,
+                input_state: &mut input_state,
+                pending_commands: &mut pending_commands,
+            },
         )
         .await
         {
@@ -585,6 +598,26 @@ struct InputEventResult {
     outcome: Option<InputResult>,
 }
 
+#[derive(Clone, Copy)]
+struct RenderContext<'a> {
+    current_model: &'a str,
+    endpoint: &'a str,
+    workspace: &'a Path,
+    prompt_branch: Option<&'a str>,
+    header_status: HeaderStatus,
+}
+
+#[derive(Clone, Copy)]
+struct ScreenState<'a> {
+    transcript: &'a [String],
+    scroll_offset: usize,
+    left_status: Option<&'a str>,
+    pending_count: usize,
+    pending_line: Option<&'a str>,
+    input: &'a str,
+    cursor: usize,
+}
+
 #[derive(Clone, Default)]
 struct StreamRenderState {
     output: String,
@@ -614,32 +647,39 @@ impl EscapeCancelState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct InputContext<'a> {
+    history: &'a [String],
+    workspace: &'a Path,
+    model_names: &'a [String],
+    render: RenderContext<'a>,
+}
+
+struct WaitContext<'a> {
+    render: RenderContext<'a>,
+    history: &'a mut Vec<String>,
+    history_path: &'a Path,
+    model_names: &'a [String],
+    interrupt_state: &'a mut InterruptState,
+    output_state: &'a mut OutputState,
+    input_state: &'a mut InputState,
+    pending_commands: &'a mut VecDeque<String>,
+}
+
 fn read_input(
     input_state: &mut InputState,
-    history: &[String],
-    workspace: &std::path::Path,
-    model_names: &[String],
     interrupt_state: &mut InterruptState,
     output_state: &mut OutputState,
-    current_model: &str,
-    endpoint: &str,
-    prompt_branch: Option<&str>,
-    header_status: HeaderStatus,
     pending_count: usize,
+    input_context: InputContext<'_>,
 ) -> Result<InputResult> {
     loop {
         let result = handle_input_event(
             event::read()?,
             input_state,
-            history,
-            workspace,
-            model_names,
             interrupt_state,
             output_state,
-            current_model,
-            endpoint,
-            prompt_branch,
-            header_status,
+            input_context,
         );
 
         if let Some(outcome) = result.outcome {
@@ -648,18 +688,16 @@ fn read_input(
 
         if result.redraw {
             print_screen(
-                current_model,
-                endpoint,
-                workspace,
-                prompt_branch,
-                header_status,
-                output_state.lines(),
-                output_state.scroll_offset(),
-                None,
-                pending_count,
-                None,
-                input_state.as_str(),
-                input_state.cursor(),
+                input_context.render,
+                ScreenState {
+                    transcript: output_state.lines(),
+                    scroll_offset: output_state.scroll_offset(),
+                    left_status: None,
+                    pending_count,
+                    pending_line: None,
+                    input: input_state.as_str(),
+                    cursor: input_state.cursor(),
+                },
             );
             std::io::stdout().flush()?;
         }
@@ -669,15 +707,9 @@ fn read_input(
 fn handle_input_event(
     event: Event,
     input_state: &mut InputState,
-    history: &[String],
-    workspace: &std::path::Path,
-    model_names: &[String],
     interrupt_state: &mut InterruptState,
     output_state: &mut OutputState,
-    current_model: &str,
-    endpoint: &str,
-    prompt_branch: Option<&str>,
-    header_status: HeaderStatus,
+    input_context: InputContext<'_>,
 ) -> InputEventResult {
     let mut redraw = false;
 
@@ -775,28 +807,32 @@ fn handle_input_event(
                 }
                 (KeyCode::Up, _) => {
                     interrupt_state.reset();
-                    history_previous(input_state, history);
+                    history_previous(input_state, input_context.history);
                     redraw = true;
                 }
                 (KeyCode::Down, _) => {
                     interrupt_state.reset();
-                    history_next(input_state, history);
+                    history_next(input_state, input_context.history);
                     redraw = true;
                 }
                 (KeyCode::Tab, _) => {
                     interrupt_state.reset();
-                    apply_completion(input_state, workspace, model_names);
+                    apply_completion(
+                        input_state,
+                        input_context.workspace,
+                        input_context.model_names,
+                    );
                     redraw = true;
                 }
                 (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     interrupt_state.reset();
                     output_state.page_up(output_view_rows(
                         VERSION,
-                        current_model,
-                        endpoint,
-                        workspace,
-                        prompt_branch,
-                        header_status,
+                        input_context.render.current_model,
+                        input_context.render.endpoint,
+                        input_context.workspace,
+                        input_context.render.prompt_branch,
+                        input_context.render.header_status,
                         input_state.as_str(),
                     ));
                     redraw = true;
@@ -805,11 +841,11 @@ fn handle_input_event(
                     interrupt_state.reset();
                     output_state.page_down(output_view_rows(
                         VERSION,
-                        current_model,
-                        endpoint,
-                        workspace,
-                        prompt_branch,
-                        header_status,
+                        input_context.render.current_model,
+                        input_context.render.endpoint,
+                        input_context.workspace,
+                        input_context.render.prompt_branch,
+                        input_context.render.header_status,
                         input_state.as_str(),
                     ));
                     redraw = true;
@@ -1149,16 +1185,24 @@ enum LocalCommand<'a> {
     Quit,
 }
 
+struct CommandContext<'a> {
+    startup_model: &'a str,
+    startup_endpoint: &'a str,
+    llms: &'a HashMap<String, LlmConfiguration>,
+    tools: &'a ToolExecutor,
+    workspace: &'a Path,
+}
+
+struct CommandState<'a> {
+    active_model: &'a mut String,
+    current_endpoint: &'a mut Option<String>,
+    session: &'a mut ChatSession,
+}
+
 fn handle_command(
     input: &str,
-    active_model: &mut String,
-    current_endpoint: &mut Option<String>,
-    startup_model: &str,
-    startup_endpoint: &str,
-    llms: &HashMap<String, LlmConfiguration>,
-    session: &mut ChatSession,
-    tools: &ToolExecutor,
-    workspace: &std::path::Path,
+    state: CommandState<'_>,
+    context: CommandContext<'_>,
 ) -> Result<CommandOutcome> {
     let Some(command) = parse_local_command(input) else {
         if input.trim_start().starts_with('/') {
@@ -1169,6 +1213,19 @@ fn handle_command(
         }
         return Ok(CommandOutcome::Unhandled);
     };
+
+    let CommandState {
+        active_model,
+        current_endpoint,
+        session,
+    } = state;
+    let CommandContext {
+        startup_model,
+        startup_endpoint,
+        llms,
+        tools,
+        workspace,
+    } = context;
 
     match command {
         LocalCommand::Help => Ok(CommandOutcome::Output(help_text().to_string())),
@@ -1580,38 +1637,25 @@ fn sorted_model_names(llms: &HashMap<String, LlmConfiguration>) -> Vec<String> {
     names
 }
 
-fn print_screen(
-    current_model: &str,
-    endpoint: &str,
-    workspace: &std::path::Path,
-    prompt_branch: Option<&str>,
-    header_status: HeaderStatus,
-    transcript: &[String],
-    scroll_offset: usize,
-    left_status: Option<&str>,
-    pending_count: usize,
-    pending_line: Option<&str>,
-    input: &str,
-    cursor: usize,
-) {
+fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
     print!("{CLEAR_TERMINAL_SEQUENCE}");
     print!(
         "{}",
-        render_screen(
-            VERSION,
-            current_model,
-            endpoint,
-            workspace,
-            prompt_branch,
-            header_status,
-            transcript,
-            scroll_offset,
-            left_status,
-            pending_count,
-            pending_line,
-            input,
-            cursor
-        )
+        render_screen(ScreenRenderArgs {
+            version: VERSION,
+            current_model: render.current_model,
+            endpoint: render.endpoint,
+            workspace: render.workspace,
+            prompt_branch: render.prompt_branch,
+            status: render.header_status,
+            transcript: screen.transcript,
+            scroll_offset: screen.scroll_offset,
+            left_status: screen.left_status,
+            pending_count: screen.pending_count,
+            pending_line: screen.pending_line,
+            input: screen.input,
+            cursor: screen.cursor,
+        })
     );
 }
 
@@ -1620,19 +1664,18 @@ async fn wait_for_response(
     user_input: &str,
     profile: &LlmConfiguration,
     tools: &ToolExecutor,
-    current_model: &str,
-    endpoint: &str,
-    workspace: &std::path::Path,
-    prompt_branch: Option<&str>,
-    header_status: HeaderStatus,
-    history: &mut Vec<String>,
-    history_path: &Path,
-    model_names: &[String],
-    interrupt_state: &mut InterruptState,
-    output_state: &mut OutputState,
-    input_state: &mut InputState,
-    pending_commands: &mut VecDeque<String>,
+    wait_context: WaitContext<'_>,
 ) -> Result<WaitResult> {
+    let WaitContext {
+        render,
+        history,
+        history_path,
+        model_names,
+        interrupt_state,
+        output_state,
+        input_state,
+        pending_commands,
+    } = wait_context;
     let streamed_state = Arc::new(Mutex::new(StreamRenderState::default()));
     let prompt_output = Arc::clone(&streamed_state);
     let prompt_metrics = Arc::clone(&streamed_state);
@@ -1661,18 +1704,16 @@ async fn wait_for_response(
     let initial_frame = render_thinking_frame(thinking_frame, thinking_started.elapsed());
 
     print_screen(
-        current_model,
-        endpoint,
-        workspace,
-        prompt_branch,
-        header_status,
-        output_state.lines(),
-        output_state.scroll_offset(),
-        None,
-        pending_commands.len(),
-        Some(initial_frame.as_str()),
-        input_state.as_str(),
-        input_state.cursor(),
+        render,
+        ScreenState {
+            transcript: output_state.lines(),
+            scroll_offset: output_state.scroll_offset(),
+            left_status: None,
+            pending_count: pending_commands.len(),
+            pending_line: Some(initial_frame.as_str()),
+            input: input_state.as_str(),
+            cursor: input_state.cursor(),
+        },
     );
     std::io::stdout().flush()?;
 
@@ -1686,18 +1727,16 @@ async fn wait_for_response(
                     .unwrap_or_default();
                 if let Some(pending_line) = final_pending_line(&final_state.output, &response) {
                     print_screen(
-                        current_model,
-                        endpoint,
-                        workspace,
-                        prompt_branch,
-                        header_status,
-                        output_state.lines(),
-                        output_state.scroll_offset(),
-                        None,
-                        pending_commands.len(),
-                        Some(pending_line.as_str()),
-                        input_state.as_str(),
-                        input_state.cursor(),
+                        render,
+                        ScreenState {
+                            transcript: output_state.lines(),
+                            scroll_offset: output_state.scroll_offset(),
+                            left_status: None,
+                            pending_count: pending_commands.len(),
+                            pending_line: Some(pending_line.as_str()),
+                            input: input_state.as_str(),
+                            cursor: input_state.cursor(),
+                        },
                     );
                     std::io::stdout().flush()?;
                 }
@@ -1730,15 +1769,14 @@ async fn wait_for_response(
                     let result = handle_input_event(
                         event,
                         input_state,
-                        history,
-                        workspace,
-                        model_names,
                         interrupt_state,
                         output_state,
-                        current_model,
-                        endpoint,
-                        prompt_branch,
-                        header_status,
+                        InputContext {
+                            history,
+                            workspace: render.workspace,
+                            model_names,
+                            render,
+                        },
                     );
 
                     if let Some(outcome) = result.outcome {
@@ -1776,18 +1814,16 @@ async fn wait_for_response(
                         last_rendered_output.clone()
                     };
                     print_screen(
-                        current_model,
-                        endpoint,
-                        workspace,
-                        prompt_branch,
-                        header_status,
-                        output_state.lines(),
-                        output_state.scroll_offset(),
-                        left_status.as_deref(),
-                        pending_commands.len(),
-                        Some(pending_line.as_str()),
-                        input_state.as_str(),
-                        input_state.cursor(),
+                        render,
+                        ScreenState {
+                            transcript: output_state.lines(),
+                            scroll_offset: output_state.scroll_offset(),
+                            left_status: left_status.as_deref(),
+                            pending_count: pending_commands.len(),
+                            pending_line: Some(pending_line.as_str()),
+                            input: input_state.as_str(),
+                            cursor: input_state.cursor(),
+                        },
                     );
                     std::io::stdout().flush()?;
                 }
@@ -2000,11 +2036,11 @@ fn format_tools(tools: &ToolExecutor) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandOutcome, EscapeCancelState, LocalCommand, OutputState, completion_candidates,
-        discover_git_dir, discover_git_root, final_pending_line, git_workspace_diff,
-        handle_command, is_wait_cancel_escape, parse_local_command,
-        prompt_progress_tokens_per_second, render_left_status, resolve_workspace_root, shell_words,
-        system_prompt, workspace_branch_name,
+        CommandContext, CommandOutcome, CommandState, EscapeCancelState, LocalCommand,
+        OutputState, completion_candidates, discover_git_dir, discover_git_root,
+        final_pending_line, git_workspace_diff, handle_command, is_wait_cancel_escape,
+        parse_local_command, prompt_progress_tokens_per_second, render_left_status,
+        resolve_workspace_root, shell_words, system_prompt, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -2212,14 +2248,18 @@ mod tests {
 
         let outcome = handle_command(
             "/unknown",
-            &mut active_model,
-            &mut current_endpoint,
-            "default",
-            "http://localhost:11434/v1",
-            &llms,
-            &mut session,
-            &tools,
-            workspace.path(),
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: "default",
+                startup_endpoint: "http://localhost:11434/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+            },
         )
         .expect("command outcome");
 

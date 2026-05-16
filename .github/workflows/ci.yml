@@ -88,17 +88,27 @@ jobs:
       options: --privileged -v /var/run/docker.sock:/var/run/docker.sock
     steps:
     - uses: actions/checkout@v4
-    - name: Run integration tests
+    - uses: Swatinem/rust-cache@v2
+    - name: Install stable toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    - name: Run test cases
       run: |
         set -o pipefail
         mkdir -p /tmp/orangu-test/log
-        chmod u+x ./test/check.sh
-        ./test/check.sh ci 2>&1 | tee /tmp/orangu-test/log/test.log
+        cargo test --all-targets --all-features -- --nocapture 2>&1 | tee /tmp/orangu-test/log/test.log
+        status=${PIPESTATUS[0]}
+        grep -nE 'FAILED|panicked at|^error:|test result: FAILED' /tmp/orangu-test/log/test.log > /tmp/orangu-test/log/failures.log || true
+        exit "$status"
 
     - name: Upload full logs
       if: always()
       uses: actions/upload-artifact@v5
       with:
         name: full-logs
-        path: /tmp/orangu-test/log/test.log
+        path: |
+          /tmp/orangu-test/log/test.log
+          /tmp/orangu-test/log/failures.log
         if-no-files-found: ignore

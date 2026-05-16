@@ -133,32 +133,52 @@ Natural-language forms such as `open README.md`, `list models`, and `show help` 
 The prompt uses standard Unix shell keys, including Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, and Tab completion."#
 }
 
-pub fn render_screen(
-    version: &str,
-    current_model: &str,
-    endpoint: &str,
-    workspace: &std::path::Path,
-    prompt_branch: Option<&str>,
-    status: HeaderStatus,
-    transcript: &[String],
-    scroll_offset: usize,
-    left_status: Option<&str>,
+pub struct ScreenRenderArgs<'a> {
+    pub version: &'a str,
+    pub current_model: &'a str,
+    pub endpoint: &'a str,
+    pub workspace: &'a std::path::Path,
+    pub prompt_branch: Option<&'a str>,
+    pub status: HeaderStatus,
+    pub transcript: &'a [String],
+    pub scroll_offset: usize,
+    pub left_status: Option<&'a str>,
+    pub pending_count: usize,
+    pub pending_line: Option<&'a str>,
+    pub input: &'a str,
+    pub cursor: usize,
+}
+
+struct PromptFrameArgs<'a> {
+    header_height: usize,
+    current_model: &'a str,
+    left_status: Option<&'a str>,
     pending_count: usize,
-    pending_line: Option<&str>,
-    input: &str,
+    prompt_prefix: &'a str,
+    input: &'a str,
     cursor: usize,
-) -> String {
-    let header = render_header(version, current_model, endpoint, workspace, status);
+    width: usize,
+    height: usize,
+}
+
+pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
+    let header = render_header(
+        args.version,
+        args.current_model,
+        args.endpoint,
+        args.workspace,
+        args.status,
+    );
     let header_line_count = header.lines().count();
     let width = terminal_width().max(1);
-    let prompt_prefix = prompt_prefix(prompt_branch);
-    let input_lines = wrapped_input_lines(input, width, &prompt_prefix);
+    let prompt_prefix = prompt_prefix(args.prompt_branch);
+    let input_lines = wrapped_input_lines(args.input, width, &prompt_prefix);
     let prompt_frame_height = input_lines.len() + 3;
     let height = terminal_height().max(header_line_count + prompt_frame_height + 1);
     let available_output_rows =
         available_output_rows(header_line_count, prompt_frame_height, height);
-    let mut output_lines = transcript.to_vec();
-    if let Some(pending_line) = pending_line {
+    let mut output_lines = args.transcript.to_vec();
+    if let Some(pending_line) = args.pending_line {
         if pending_line.is_empty() {
             output_lines.push(String::new());
         } else {
@@ -166,7 +186,7 @@ pub fn render_screen(
         }
     }
     let max_scroll_offset = output_lines.len().saturating_sub(available_output_rows);
-    let scroll_offset = scroll_offset.min(max_scroll_offset);
+    let scroll_offset = args.scroll_offset.min(max_scroll_offset);
     let visible_end = output_lines.len().saturating_sub(scroll_offset);
     let visible_start = visible_end.saturating_sub(available_output_rows);
     let visible_lines = &output_lines[visible_start..visible_end];
@@ -178,17 +198,17 @@ pub fn render_screen(
         screen.push_str(&visible_lines.join("\r\n"));
         screen.push_str("\r\n");
     }
-    screen.push_str(&render_prompt_frame(
-        header_line_count,
-        current_model,
-        left_status,
-        pending_count,
-        &prompt_prefix,
-        input,
-        cursor,
+    screen.push_str(&render_prompt_frame(PromptFrameArgs {
+        header_height: header_line_count,
+        current_model: args.current_model,
+        left_status: args.left_status,
+        pending_count: args.pending_count,
+        prompt_prefix: &prompt_prefix,
+        input: args.input,
+        cursor: args.cursor,
         width,
         height,
-    ));
+    }));
     screen
 }
 
@@ -285,44 +305,39 @@ fn status_indicator_line(text: &str, ok: bool) -> HeaderLine {
     }
 }
 
-fn render_prompt_frame(
-    header_height: usize,
-    current_model: &str,
-    left_status: Option<&str>,
-    pending_count: usize,
-    prompt_prefix: &str,
-    input: &str,
-    cursor: usize,
-    width: usize,
-    height: usize,
-) -> String {
-    let input_lines = wrapped_input_lines(input, width, prompt_prefix);
+fn render_prompt_frame(args: PromptFrameArgs<'_>) -> String {
+    let input_lines = wrapped_input_lines(args.input, args.width, args.prompt_prefix);
     let input_height = input_lines.len();
-    let height = height.max(header_height + input_height + 3);
-    let top_row = (height.saturating_sub(input_height + 2)).max(header_height + 1);
+    let height = args.height.max(args.header_height + input_height + 3);
+    let top_row = (height.saturating_sub(input_height + 2)).max(args.header_height + 1);
     let input_start_row = top_row + 1;
     let bottom_row = input_start_row + input_height;
     let model_row = bottom_row + 1;
-    let line = "━".repeat(width);
-    let prompt_width = prompt_prefix.chars().count();
+    let line = "━".repeat(args.width);
+    let prompt_width = args.prompt_prefix.chars().count();
     let mut frame = format!("\x1b[{top_row};1H{line}");
 
     for (index, input_line) in input_lines.iter().enumerate() {
         let row = input_start_row + index;
-        let content = truncate_to_width(input_line, width.saturating_sub(prompt_width));
+        let content = truncate_to_width(input_line, args.width.saturating_sub(prompt_width));
         let content_width = content.chars().count();
-        frame.push_str(&format!("\x1b[{row};1H{prompt_prefix}{content}"));
-        if width > content_width + prompt_width {
-            frame.push_str(&" ".repeat(width - content_width - prompt_width));
+        frame.push_str(&format!("\x1b[{row};1H{}{}", args.prompt_prefix, content));
+        if args.width > content_width + prompt_width {
+            frame.push_str(&" ".repeat(args.width - content_width - prompt_width));
         }
     }
 
     let (cursor_row_offset, cursor_col_offset) =
-        cursor_position(input, cursor, width, prompt_prefix);
+        cursor_position(args.input, args.cursor, args.width, args.prompt_prefix);
     let cursor_row = input_start_row + cursor_row_offset;
     let cursor_col = 1 + prompt_width + cursor_col_offset;
 
-    let status_line = render_status_line(width, left_status, current_model, pending_count);
+    let status_line = render_status_line(
+        args.width,
+        args.left_status,
+        args.current_model,
+        args.pending_count,
+    );
     frame.push_str(&format!(
         "\x1b[{bottom_row};1H{line}\x1b[{model_row};1H{status_line}\x1b[{cursor_row};{cursor_col}H"
     ));
