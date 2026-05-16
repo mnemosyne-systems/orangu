@@ -8,6 +8,7 @@
 
 ```
 Jesper Pedersen <jesperpedersen.db@gmail.com>
+Mahmoud Hamdy (TutTrue) <mahmoud.hamdy5113@gmail.com>
 ```
 
 ## Committers

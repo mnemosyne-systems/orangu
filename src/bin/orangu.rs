@@ -1270,10 +1270,13 @@ fn handle_command(
                     sorted_model_names(llms).join(", ")
                 )));
             }
+            let profile = &llms[name];
+            let endpoint = normalized_openai_endpoint(&profile.endpoint);
             *active_model = name.to_string();
-            session.set_system_prompt(system_prompt(&llms[name]));
+            *current_endpoint = Some(endpoint.clone());
+            session.set_system_prompt(system_prompt(profile));
             Ok(CommandOutcome::Output(format!(
-                "Switched to model profile '{name}'"
+                "Switched to model profile '{name}' (server: {endpoint})"
             )))
         }
         LocalCommand::Diff => Ok(CommandOutcome::Output(git_workspace_diff(workspace)?)),
@@ -2045,7 +2048,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
         config::LlmConfiguration,
-        llm::{StreamMetrics, StreamPromptProgress},
+        llm::{StreamMetrics, StreamPromptProgress, normalized_openai_endpoint},
         session::ChatSession,
         tools::ToolExecutor,
     };
@@ -2056,6 +2059,18 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    fn test_profile(provider: &str, endpoint: &str, model: &str) -> LlmConfiguration {
+        LlmConfiguration {
+            provider: provider.to_string(),
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            api_key: None,
+            request_timeout_seconds: 1800,
+            max_tool_rounds: 10,
+            system_prompt: String::new(),
+        }
+    }
 
     #[test]
     fn resolve_workspace_root_makes_relative_paths_absolute() {
@@ -2159,6 +2174,56 @@ mod tests {
     fn leaves_regular_prompts_unhandled() {
         assert!(parse_local_command("help me understand this code").is_none());
         assert!(parse_local_command("show me the files in the workspace").is_none());
+    }
+
+    #[test]
+    fn set_model_switches_active_endpoint() {
+        const GEMMA: &str = "gemma-4-E4B-it-GGUF";
+        const OPENAI: &str = "gpt-4.1";
+
+        let llms = HashMap::from([
+            (
+                GEMMA.to_string(),
+                test_profile(
+                    "llama.cpp",
+                    "http://localhost:8100/v1",
+                    "ggml-org/gemma-4-E4B-it-GGUF",
+                ),
+            ),
+            (
+                OPENAI.to_string(),
+                test_profile("openai", "https://api.openai.com/v1", "gpt-4.1"),
+            ),
+        ]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = GEMMA.to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/model gpt-4.1",
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: GEMMA,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::Output(_)));
+        assert_eq!(active_model, OPENAI);
+        assert_eq!(
+            current_endpoint,
+            Some(normalized_openai_endpoint("https://api.openai.com/v1"))
+        );
     }
 
     #[test]
