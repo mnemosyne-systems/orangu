@@ -1,6 +1,6 @@
 # Configuration
 
-`orangu` uses a pgmoneta-style INI configuration file.
+`orangu` uses an INI configuration file.
 
 Default lookup order:
 
