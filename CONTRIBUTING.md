@@ -5,7 +5,7 @@
 All contributions are more than welcome ! This includes bug reports, bug fixes, enhancements, features, questions, ideas,
 and documentation.
 
-This document will hopefully help you contribute to pgmoneta-mcp.
+This document will hopefully help you contribute to orangu.
 
 * [Legal](#legal)
 * [Reporting an issue](#reporting-an-issue)
@@ -20,14 +20,14 @@ This document will hopefully help you contribute to pgmoneta-mcp.
 
 ## Legal
 
-All contributions to pgmoneta-mcp are licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.en.html).
+All contributions to orangu are licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.en.html).
 
 ## Reporting an issue
 
 This project uses GitHub issues to manage the issues. Open an issue directly in GitHub.
 
 If you believe you found a bug, and it's likely possible, please indicate a way to reproduce it, what you are seeing and what you would expect to see.
-Don't forget to indicate your pgmoneta-mcp version.
+Don't forget to indicate your orangu version.
 
 ## Setup your build environment
 
