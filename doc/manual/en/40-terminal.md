@@ -65,6 +65,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/reload` | Restore the configured model and server |
 | `/list_models` | List models |
 | `/list_files` | List workspace files as a tree |
+| `/show_file [--hash] [--author] <path>` | Show a file with optional Git metadata |
 | `/tools` | List tools |
 | `/model [name]` | Switch to the configured model, or a specific model |
 | `/diff` | Show a color unified diff against the current branch |
@@ -80,6 +81,7 @@ Free-form prompts are blocked when the server or model status in the header is r
 
 - `/tools` lists the model-facing workspace tools described in the tools chapter
 - `/open_file <path>` is workspace-scoped; paths outside the workspace are rejected
+- `/show_file [--hash] [--author] <path>` is workspace-scoped, syntax highlights the file content, and can prepend Git blame hash and author columns when the workspace is a Git repository
 - `/list_files` is a local convenience command and is separate from the model-facing `list_directory` tool
 - `/reload` also clears the current conversation history in memory
 - `/quit` exits immediately, while `Ctrl+C` uses a two-step confirmation
@@ -133,19 +135,19 @@ Completion cycling is reset as soon as you edit the line, move the cursor, paste
 
 The completion modes are:
 
-1. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/tools`, and `/quit`.
+1. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
 2. If the line starts with `/model `, complete configured model profile names.
-3. If the line starts with `/open_file `, complete workspace file paths recursively.
+3. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively. `/show_file` also completes `--hash` and `--author`.
 4. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
 5. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
 
 Path-completion details:
 
 - General filesystem completion lists entries from the matching directory level and appends `/` to directories
-- `/open_file` and the natural-language open/edit forms search recursively through the workspace
+- `/open_file`, `/show_file`, and the natural-language open/edit forms search recursively through the workspace
 - Recursive file completion matches either the full relative path or, when no `/` is present in the token, the file name
-- Quoted file completion is supported for `/open_file "..."` and `open "..."`; the inserted completion keeps the opening quote
-- Completion skips `.git` content
+- Quoted file completion is supported for `/open_file "..."`, `/show_file "..."`, and `open "..."`; the inserted completion keeps the opening quote
+- Completion skips `.git`, `build`, and `target` content
 - Completion also skips paths ignored by the workspace `.gitignore`
 
 ### Output scrolling

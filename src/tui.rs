@@ -114,18 +114,19 @@ pub fn render_header(
 }
 
 pub fn help_text() -> &'static str {
-    r#"/help             Show available commands
-/connect [url]    Connect to the configured server, or a specific server
-/disconnect       Disconnect from the current server
-/reload           Restore the configured model and server
-/list_models      List models
-/list_files       List workspace files as a tree
-/tools            List tools
-/model [name]     Switch to the configured model, or a specific model
-/diff             Show a color unified diff against the current branch
-/open_file <path> Open a workspace file in $EDITOR
-/clear            Clear the current conversation
-/quit             Exit the client
+    r#"/help                                 Show available commands
+/connect [url]                        Connect to the configured server, or a specific server
+/disconnect                           Disconnect from the current server
+/reload                               Restore the configured model and server
+/list_models                          List models
+/list_files                           List workspace files as a tree
+/show_file [--hash] [--author] <path> Show a file with optional Git metadata
+/tools                                List tools
+/model [name]                         Switch to the configured model, or a specific model
+/diff                                 Show a color unified diff against the current branch
+/open_file <path>                     Open a workspace file in $EDITOR
+/clear                                Clear the current conversation
+/quit                                 Exit the client
 
 Natural-language forms such as `open README.md`, `list models`, `list files`, and `show help` are also handled locally.
 
@@ -506,6 +507,7 @@ impl OranguHelper {
                 "/reload".to_string(),
                 "/list_models".to_string(),
                 "/list_files".to_string(),
+                "/show_file".to_string(),
                 "/tools".to_string(),
                 "/model".to_string(),
                 "/clear".to_string(),

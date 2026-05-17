@@ -77,6 +77,7 @@ const ANSI_FG_CODE: &str = "\x1b[38;2;255;215;120m";
 const ANSI_FG_LINK: &str = "\x1b[38;2;102;178;255m";
 const ANSI_FG_SUBTLE: &str = "\x1b[38;2;180;190;205m";
 const ANSI_FG_RESET: &str = "\x1b[39m";
+const ANSI_RESET: &str = "\x1b[0m";
 const THINKING_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const WAIT_LOOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TRANSCRIPT_MAX_LINES: usize = 10_000;
@@ -89,6 +90,7 @@ const COMMANDS: &[&str] = &[
     "/reload",
     "/list_models",
     "/list_files",
+    "/show_file",
     "/tools",
     "/model",
     "/diff",
@@ -483,6 +485,18 @@ struct SyntaxHighlightAssets {
     theme: Theme,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ShowFileOptions {
+    show_hash: bool,
+    show_author: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitLineMetadata {
+    hash: String,
+    author: String,
+}
+
 fn syntax_highlight_assets() -> &'static SyntaxHighlightAssets {
     static ASSETS: OnceLock<SyntaxHighlightAssets> = OnceLock::new();
     ASSETS.get_or_init(|| {
@@ -496,6 +510,192 @@ fn syntax_highlight_assets() -> &'static SyntaxHighlightAssets {
             .unwrap_or_default();
         SyntaxHighlightAssets { syntaxes, theme }
     })
+}
+
+fn show_file_output(workspace: &Path, raw_args: &str) -> Result<String> {
+    let (path, options) = parse_show_file_arguments(raw_args)?;
+    let resolved_path = resolve_workspace_path(workspace, &path)?;
+    let content = fs::read_to_string(&resolved_path)
+        .with_context(|| format!("failed to read {}", resolved_path.display()))?;
+    let blame = if options.show_hash || options.show_author {
+        Some(git_blame_metadata(workspace, &resolved_path)?)
+    } else {
+        None
+    };
+
+    render_show_file_content(&resolved_path, &content, blame.as_deref(), options)
+}
+
+fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOptions)> {
+    let args = shell_words(raw_args)
+        .map_err(|_| anyhow!("Usage: /show_file [--hash] [--author] <path>"))?;
+    let mut options = ShowFileOptions::default();
+    let mut path = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--hash" => options.show_hash = true,
+            "--author" => options.show_author = true,
+            _ if arg.starts_with('-') => {
+                return Err(anyhow!(
+                    "Unknown option '{arg}'. Usage: /show_file [--hash] [--author] <path>"
+                ));
+            }
+            _ if path.is_none() => path = Some(arg),
+            _ => {
+                return Err(anyhow!("Usage: /show_file [--hash] [--author] <path>"));
+            }
+        }
+    }
+
+    let path = path.ok_or_else(|| anyhow!("Usage: /show_file [--hash] [--author] <path>"))?;
+    Ok((path, options))
+}
+
+fn render_show_file_content(
+    path: &Path,
+    content: &str,
+    blame: Option<&[GitLineMetadata]>,
+    options: ShowFileOptions,
+) -> Result<String> {
+    let assets = syntax_highlight_assets();
+    let syntax = assets
+        .syntaxes
+        .find_syntax_for_file(path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, &assets.theme);
+    let line_count = content.lines().count().max(1);
+    let line_number_width = line_count.to_string().len();
+    let mut rendered = Vec::new();
+
+    if content.is_empty() {
+        rendered.push(format_show_file_line(
+            1,
+            "",
+            blame.and_then(|metadata| metadata.first()),
+            options,
+            line_number_width,
+        ));
+        return Ok(rendered.join("\n"));
+    }
+
+    for (index, line) in LinesWithEndings::from(content).enumerate() {
+        let line_no = index + 1;
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        let highlighted = highlight_source_line(&mut highlighter, &assets.syntaxes, line)?;
+        let highlighted = highlighted.trim_end_matches(['\r', '\n']);
+        let rendered_line = if line_without_newline.is_empty() {
+            String::new()
+        } else {
+            highlighted.to_string()
+        };
+        rendered.push(format_show_file_line(
+            line_no,
+            &rendered_line,
+            blame.and_then(|metadata| metadata.get(index)),
+            options,
+            line_number_width,
+        ));
+    }
+
+    Ok(rendered.join("\n"))
+}
+
+fn highlight_source_line(
+    highlighter: &mut HighlightLines<'_>,
+    syntaxes: &SyntaxSet,
+    line: &str,
+) -> Result<String> {
+    let ranges = highlighter
+        .highlight_line(line, syntaxes)
+        .map_err(|err| anyhow!("failed to highlight source line: {err}"))?;
+    Ok(as_24_bit_terminal_escaped(&ranges, false))
+}
+
+fn format_show_file_line(
+    line_no: usize,
+    line: &str,
+    metadata: Option<&GitLineMetadata>,
+    options: ShowFileOptions,
+    line_number_width: usize,
+) -> String {
+    let mut parts = vec![format!("{line_no:>line_number_width$}")];
+    if options.show_hash
+        && let Some(metadata) = metadata
+    {
+        parts.push(metadata.hash.clone());
+    }
+    if options.show_author
+        && let Some(metadata) = metadata
+    {
+        parts.push(metadata.author.clone());
+    }
+    if !line.is_empty() {
+        parts.push(format!("{ANSI_RESET}{line}{ANSI_RESET}"));
+    }
+    parts.join(" ")
+}
+
+fn git_blame_metadata(workspace: &Path, path: &Path) -> Result<Vec<GitLineMetadata>> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("Git blame metadata is only available inside a Git repository"))?;
+    let relative_path = path
+        .strip_prefix(&repo_root)
+        .with_context(|| format!("{} is outside the Git repository", path.display()))?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("blame")
+        .arg("--line-porcelain")
+        .arg("--abbrev=8")
+        .arg("--")
+        .arg(relative_path)
+        .output()
+        .context("failed to run git blame")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git blame failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git blame output was not UTF-8")?;
+    let mut metadata = Vec::new();
+    let mut current_hash = String::new();
+    let mut current_author = String::new();
+    for line in stdout.lines() {
+        if let Some(content) = line.strip_prefix('\t') {
+            let _ = content;
+            metadata.push(GitLineMetadata {
+                hash: current_hash.clone(),
+                author: current_author.clone(),
+            });
+            continue;
+        }
+
+        if let Some(author) = line.strip_prefix("author ") {
+            current_author = author.to_string();
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        if let (Some(hash), Some(_orig), Some(_final)) = (parts.next(), parts.next(), parts.next())
+            && hash.chars().all(|ch| ch.is_ascii_hexdigit())
+            && hash.len() >= 8
+        {
+            current_hash = hash.chars().take(8).collect();
+            current_author.clear();
+        }
+    }
+
+    Ok(metadata)
 }
 
 fn render_markdown_for_console(text: &str) -> String {
@@ -1269,6 +1469,10 @@ fn completion_candidates(
     let cursor = cursor.min(input.len());
     let prefix = &input[..cursor];
 
+    if let Some((start, candidates)) = show_file_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
     if let Some((start, path_prefix)) = open_file_completion_prefix(prefix) {
         return Some((
             start,
@@ -1357,6 +1561,79 @@ fn file_completion_candidates(token: &str, workspace: &std::path::Path) -> Vec<S
     matches
 }
 
+fn show_file_completion_candidates(prefix: &str, workspace: &Path) -> Option<(usize, Vec<String>)> {
+    let remainder = prefix.strip_prefix("/show_file ")?;
+    let (token_start, token) = last_shell_token(remainder);
+    let previous = remainder[..token_start].trim_end();
+    let previous_tokens = if previous.is_empty() {
+        Vec::new()
+    } else {
+        shell_words(previous).unwrap_or_default()
+    };
+    let has_path = previous_tokens.iter().any(|value| !value.starts_with('-'));
+
+    let mut candidates = if token.starts_with('-') {
+        show_file_flag_candidates(token)
+    } else if has_path {
+        Vec::new()
+    } else {
+        open_file_completion_candidates(token, workspace)
+    };
+    candidates.sort();
+    candidates.dedup();
+    Some(("/show_file ".len() + token_start, candidates))
+}
+
+fn last_shell_token(input: &str) -> (usize, &str) {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut token_start = 0;
+    let mut in_token = false;
+
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else if active_quote == '"' && ch == '\\' {
+                escaped = true;
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            in_token = false;
+            token_start = index + ch.len_utf8();
+            continue;
+        }
+
+        if !in_token {
+            token_start = index;
+            in_token = true;
+        }
+
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == '\\' {
+            escaped = true;
+        }
+    }
+
+    (token_start, &input[token_start..])
+}
+
+fn show_file_flag_candidates(token: &str) -> Vec<String> {
+    ["--hash", "--author"]
+        .into_iter()
+        .filter(|flag| flag.starts_with(token))
+        .map(str::to_string)
+        .collect()
+}
+
 fn open_file_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
     if let Some(path_prefix) = prefix.strip_prefix("/open_file ") {
         return Some(("/open_file ".len(), path_prefix));
@@ -1415,10 +1692,15 @@ fn open_file_completion_matches(relative: &str, file_name: &str, token: &str) ->
 }
 
 fn workspace_gitignore(workspace: &Path) -> Option<Gitignore> {
-    let mut builder = GitignoreBuilder::new(workspace);
-    let gitignore_path = workspace.join(".gitignore");
-    if gitignore_path.is_file() {
-        builder.add(gitignore_path);
+    let ignore_root = discover_git_root(workspace).unwrap_or_else(|| workspace.to_path_buf());
+    let mut builder = GitignoreBuilder::new(&ignore_root);
+    let root_gitignore_path = ignore_root.join(".gitignore");
+    if root_gitignore_path.is_file() {
+        builder.add(root_gitignore_path);
+    }
+    let workspace_gitignore_path = workspace.join(".gitignore");
+    if workspace != ignore_root && workspace_gitignore_path.is_file() {
+        builder.add(workspace_gitignore_path);
     }
     builder.build().ok()
 }
@@ -1432,20 +1714,26 @@ fn should_include_completion_path(
     let Ok(relative) = path.strip_prefix(workspace) else {
         return false;
     };
+
+    if gitignore.is_some_and(|matcher| {
+        matcher
+            .matched_path_or_any_parents(path, is_dir)
+            .is_ignore()
+    }) {
+        return false;
+    }
+
     if relative.as_os_str().is_empty() {
         return true;
     }
 
     let relative = relative.to_string_lossy().replace('\\', "/");
-    if relative == ".git" || relative.starts_with(".git/") {
-        return false;
-    }
-
-    gitignore.is_none_or(|matcher| {
-        !matcher
-            .matched_path_or_any_parents(path, is_dir)
-            .is_ignore()
-    })
+    !(relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "build"
+        || relative.starts_with("build/")
+        || relative == "target"
+        || relative.starts_with("target/"))
 }
 
 fn previous_boundary(input: &str, cursor: usize) -> Option<usize> {
@@ -1480,6 +1768,7 @@ enum LocalCommand<'a> {
     Reload,
     ListModels,
     ListFiles,
+    ShowFile(&'a str),
     Tools,
     ModelInfo,
     SetModel(&'a str),
@@ -1564,6 +1853,9 @@ fn handle_command(
         LocalCommand::ListFiles => Ok(CommandOutcome::Output(list_workspace_files_tree(
             workspace,
         )?)),
+        LocalCommand::ShowFile(args) => {
+            Ok(CommandOutcome::Output(show_file_output(workspace, args)?))
+        }
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
         LocalCommand::ModelInfo => Ok(CommandOutcome::Output(
             "Use /list_models to see configured profiles".to_string(),
@@ -1616,6 +1908,7 @@ fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/reload" => Some(LocalCommand::Reload),
         "/list_models" => Some(LocalCommand::ListModels),
         "/list_files" => Some(LocalCommand::ListFiles),
+        "/show_file" => Some(LocalCommand::ShowFile("")),
         "/tools" => Some(LocalCommand::Tools),
         "/model" => Some(LocalCommand::ModelInfo),
         "/diff" => Some(LocalCommand::Diff),
@@ -1627,6 +1920,9 @@ fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(name) = input.strip_prefix("/model ") {
                 return Some(LocalCommand::SetModel(name.trim()));
+            }
+            if let Some(args) = input.strip_prefix("/show_file ") {
+                return Some(LocalCommand::ShowFile(args.trim()));
             }
             parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
         }
@@ -2418,12 +2714,13 @@ fn format_tools(tools: &ToolExecutor) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandContext, CommandOutcome, CommandState, EscapeCancelState, LocalCommand, OutputState,
-        completion_candidates, discover_git_dir, discover_git_root, final_pending_line,
+        ANSI_RESET, CommandContext, CommandOutcome, CommandState, EscapeCancelState,
+        GitLineMetadata, LocalCommand, OutputState, ShowFileOptions, completion_candidates,
+        discover_git_dir, discover_git_root, final_pending_line, format_show_file_line,
         git_workspace_diff, handle_command, is_wait_cancel_escape, list_workspace_files_tree,
-        llm_prompt_block_reason, parse_local_command, render_left_status,
-        render_markdown_for_console, resolve_workspace_root, shell_words, system_prompt,
-        workspace_branch_name,
+        llm_prompt_block_reason, parse_local_command, parse_show_file_arguments,
+        render_left_status, render_markdown_for_console, resolve_workspace_root, shell_words,
+        show_file_output, system_prompt, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -2440,6 +2737,33 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    fn init_test_git_repo(workspace: &std::path::Path) {
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(workspace)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "user.name", "Orangu Tests"])
+                .current_dir(workspace)
+                .status()
+                .expect("git config name")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "user.email", "tests@example.com"])
+                .current_dir(workspace)
+                .status()
+                .expect("git config email")
+                .success()
+        );
+    }
 
     fn test_profile(provider: &str, endpoint: &str, model: &str) -> LlmConfiguration {
         LlmConfiguration {
@@ -2632,6 +2956,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_show_file_commands() {
+        match parse_local_command("/show_file README.md") {
+            Some(LocalCommand::ShowFile(args)) => assert_eq!(args, "README.md"),
+            _ => panic!("expected show file slash command"),
+        }
+
+        let (path, options) = parse_show_file_arguments("--hash --author \"docs/user guide.md\"")
+            .expect("show file args");
+        assert_eq!(path, "docs/user guide.md");
+        assert!(options.show_hash);
+        assert!(options.show_author);
+    }
+
+    #[test]
     fn parses_list_files_commands() {
         assert!(matches!(
             parse_local_command("/list_files"),
@@ -2772,32 +3110,24 @@ mod tests {
     #[test]
     fn git_workspace_diff_is_colorized_and_unified() {
         let workspace = tempdir().expect("workspace");
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Orangu Tests"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git config name");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "tests@example.com"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git config email");
+        init_test_git_repo(workspace.path());
         fs::write(workspace.path().join("README.md"), "one\ntwo\nthree\n").expect("write file");
-        std::process::Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git commit");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
 
         fs::write(
             workspace.path().join("README.md"),
@@ -2864,6 +3194,16 @@ mod tests {
         fs::write(workspace.path().join("README.md"), "").expect("root readme");
         fs::create_dir(workspace.path().join("doc")).expect("doc dir");
         fs::write(workspace.path().join("doc/README.md"), "").expect("doc readme");
+        fs::create_dir(workspace.path().join("src")).expect("src dir");
+        fs::write(workspace.path().join("src/tui.rs"), "").expect("src file");
+        fs::create_dir_all(workspace.path().join("target/.fingerprint/pkg")).expect("target dir");
+        fs::write(
+            workspace.path().join("target/.fingerprint/pkg/tui-output"),
+            "",
+        )
+        .expect("target file");
+        fs::create_dir_all(workspace.path().join("build/out")).expect("build dir");
+        fs::write(workspace.path().join("build/out/tui.txt"), "").expect("build file");
         fs::write(workspace.path().join(".gitignore"), "ignored.md\n").expect("gitignore");
         fs::write(workspace.path().join("ignored.md"), "").expect("ignored file");
         fs::create_dir(workspace.path().join(".git")).expect("git dir");
@@ -2899,6 +3239,186 @@ mod tests {
             completion_candidates("Open con", "Open con".len(), workspace.path(), &[])
                 .expect("git completion");
         assert!(git_candidates.is_empty());
+
+        let (_, _, target_candidates) =
+            completion_candidates("/open_file t", "/open_file t".len(), workspace.path(), &[])
+                .expect("target completion");
+        assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
+    }
+
+    #[test]
+    fn completes_show_file_commands_and_flags() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("README.md"), "").expect("root readme");
+        fs::create_dir(workspace.path().join("doc")).expect("doc dir");
+        fs::write(workspace.path().join("doc/README.md"), "").expect("doc readme");
+        fs::create_dir(workspace.path().join("src")).expect("src dir");
+        fs::write(workspace.path().join("src/tui.rs"), "").expect("src file");
+        fs::create_dir_all(workspace.path().join("target/.fingerprint/pkg")).expect("target dir");
+        fs::write(
+            workspace.path().join("target/.fingerprint/pkg/tui-output"),
+            "",
+        )
+        .expect("target file");
+
+        let (_, _, initial_file_candidates) =
+            completion_candidates("/show_file ", "/show_file ".len(), workspace.path(), &[])
+                .expect("initial file completion");
+        assert_eq!(
+            initial_file_candidates,
+            vec![
+                "README.md".to_string(),
+                "doc/README.md".to_string(),
+                "src/tui.rs".to_string()
+            ]
+        );
+
+        let (_, _, flag_candidates) = completion_candidates(
+            "/show_file --",
+            "/show_file --".len(),
+            workspace.path(),
+            &[],
+        )
+        .expect("flag completion");
+        assert_eq!(
+            flag_candidates,
+            vec!["--author".to_string(), "--hash".to_string()]
+        );
+
+        let (_, _, file_candidates) = completion_candidates(
+            "/show_file --hash READ",
+            "/show_file --hash READ".len(),
+            workspace.path(),
+            &[],
+        )
+        .expect("file completion");
+        assert_eq!(
+            file_candidates,
+            vec!["README.md".to_string(), "doc/README.md".to_string()]
+        );
+
+        let (_, _, quoted_candidates) = completion_candidates(
+            "/show_file \"READ",
+            "/show_file \"READ".len(),
+            workspace.path(),
+            &[],
+        )
+        .expect("quoted file completion");
+        assert_eq!(
+            quoted_candidates,
+            vec!["\"README.md".to_string(), "\"doc/README.md".to_string()]
+        );
+
+        let (_, _, target_candidates) =
+            completion_candidates("/show_file t", "/show_file t".len(), workspace.path(), &[])
+                .expect("target completion");
+        assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
+    }
+
+    #[test]
+    fn completion_respects_repo_gitignore_when_workspace_is_ignored_subdir() {
+        let repo = tempdir().expect("repo");
+        fs::create_dir(repo.path().join(".git")).expect("git dir");
+        fs::write(repo.path().join(".git/config"), "").expect("git config");
+        fs::write(repo.path().join(".gitignore"), "target/\n").expect("gitignore");
+        fs::create_dir_all(repo.path().join("target/debug/.fingerprint/pkg")).expect("target dir");
+        fs::write(
+            repo.path().join("target/debug/.fingerprint/pkg/tui-output"),
+            "",
+        )
+        .expect("target file");
+
+        let workspace = repo.path().join("target/debug");
+
+        let (_, _, open_candidates) =
+            completion_candidates("/open_file ", "/open_file ".len(), &workspace, &[])
+                .expect("open completion");
+        assert!(open_candidates.is_empty());
+
+        let (_, _, show_candidates) =
+            completion_candidates("/show_file ", "/show_file ".len(), &workspace, &[])
+                .expect("show completion");
+        assert!(show_candidates.is_empty());
+    }
+
+    #[test]
+    fn show_file_outputs_line_numbers_and_syntax_highlighting() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .expect("source file");
+
+        let output = show_file_output(workspace.path(), "main.rs").expect("show file");
+        assert!(output.contains("1 "));
+        assert!(output.contains("2 "));
+        assert!(output.contains("\u{1b}["));
+        assert!(output.contains("println!"));
+    }
+
+    #[test]
+    fn show_file_formatting_bounds_ansi_to_source_column() {
+        let metadata = GitLineMetadata {
+            hash: "deadbeef".to_string(),
+            author: "Alice".to_string(),
+        };
+
+        let rendered = format_show_file_line(
+            7,
+            "\x1b[38;2;1;2;3mlet x = 1;",
+            Some(&metadata),
+            ShowFileOptions {
+                show_hash: true,
+                show_author: true,
+            },
+            2,
+        );
+
+        assert_eq!(
+            rendered,
+            format!(" 7 deadbeef Alice {ANSI_RESET}\x1b[38;2;1;2;3mlet x = 1;{ANSI_RESET}")
+        );
+    }
+
+    #[test]
+    fn show_file_can_include_git_hash_and_author() {
+        let workspace = tempdir().expect("workspace");
+        init_test_git_repo(workspace.path());
+        fs::write(workspace.path().join("README.md"), "alpha\nbeta\n").expect("write file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        let hash_output = std::process::Command::new("git")
+            .args(["rev-parse", "--short=8", "HEAD"])
+            .current_dir(workspace.path())
+            .output()
+            .expect("git rev-parse");
+        let expected_hash = String::from_utf8(hash_output.stdout)
+            .expect("hash output")
+            .trim()
+            .to_string();
+
+        let output =
+            show_file_output(workspace.path(), "--hash --author README.md").expect("show file");
+        assert!(output.contains(&expected_hash));
+        assert!(output.contains("Orangu Tests"));
+        assert!(output.contains("1 "));
+        assert!(output.contains("2 "));
     }
 
     #[test]

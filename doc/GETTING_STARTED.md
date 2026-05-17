@@ -40,6 +40,7 @@ orangu --config ./orangu.conf
 - `/disconnect`
 - `/list_models`
 - `/list_files`
+- `/show_file README.md`
 - `/tools`
 - `/model`
 - `/reload`

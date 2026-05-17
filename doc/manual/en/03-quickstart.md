@@ -55,6 +55,7 @@ Then start with:
 /help
 /list_models
 /list_files
+/show_file README.md
 /tools
 ```
 
