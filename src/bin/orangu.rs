@@ -264,6 +264,14 @@ async fn run() -> Result<()> {
             output_state.reset_scroll();
             continue;
         };
+        if !header_status.model_ok {
+            continue;
+        }
+        if let Some(message) = llm_prompt_block_reason(current_endpoint.as_deref(), header_status) {
+            output_state.push_text(message);
+            output_state.reset_scroll();
+            continue;
+        }
         let mut prompt_profile = profile.clone();
         prompt_profile.endpoint = endpoint.to_string();
         match wait_for_response(
@@ -1962,6 +1970,16 @@ fn history_file_path() -> Result<PathBuf> {
     Ok(home.join(HISTORY_DIRECTORY).join(HISTORY_FILE))
 }
 
+fn llm_prompt_block_reason(
+    endpoint: Option<&str>,
+    _header_status: HeaderStatus,
+) -> Option<&'static str> {
+    if endpoint.is_none() {
+        return Some("Error: Not connected to an LLM server");
+    }
+    None
+}
+
 fn resolve_workspace_root(workspace: Option<PathBuf>) -> Result<PathBuf> {
     let current_dir = std::env::current_dir().context("failed to resolve current directory")?;
     let workspace = workspace.unwrap_or_else(|| current_dir.clone());
@@ -2044,9 +2062,9 @@ mod tests {
     use super::{
         CommandContext, CommandOutcome, CommandState, EscapeCancelState, LocalCommand, OutputState,
         completion_candidates, discover_git_dir, discover_git_root, final_pending_line,
-        git_workspace_diff, handle_command, is_wait_cancel_escape, parse_local_command,
-        prompt_progress_tokens_per_second, render_left_status, resolve_workspace_root, shell_words,
-        system_prompt, workspace_branch_name,
+        git_workspace_diff, handle_command, is_wait_cancel_escape, llm_prompt_block_reason,
+        parse_local_command, prompt_progress_tokens_per_second, render_left_status,
+        resolve_workspace_root, shell_words, system_prompt, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -2054,7 +2072,7 @@ mod tests {
         llm::{StreamMetrics, StreamPromptProgress, normalized_openai_endpoint},
         session::ChatSession,
         tools::ToolExecutor,
-        tui::StatusFragment,
+        tui::{HeaderStatus, StatusFragment},
     };
     use std::collections::HashMap;
     use std::{
@@ -2452,6 +2470,32 @@ mod tests {
             Some("final reply")
         );
         assert_eq!(final_pending_line("", ""), None);
+    }
+
+    #[test]
+    fn llm_prompt_block_reason_requires_model_connection() {
+        assert_eq!(
+            llm_prompt_block_reason(
+                Some("http://localhost:8100/v1"),
+                HeaderStatus {
+                    workspace_ok: true,
+                    server_ok: true,
+                    model_ok: false,
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            llm_prompt_block_reason(
+                Some("http://localhost:8100/v1"),
+                HeaderStatus {
+                    workspace_ok: true,
+                    server_ok: true,
+                    model_ok: true,
+                }
+            ),
+            None
+        );
     }
 
     #[test]
