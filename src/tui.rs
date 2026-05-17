@@ -118,7 +118,7 @@ pub fn help_text() -> &'static str {
 /connect [url]    Connect to the configured server, or a specific server
 /disconnect       Disconnect from the current server
 /reload           Restore the configured model and server
-/list-models      List models
+/list_models      List models
 /list_files       List workspace files as a tree
 /tools            List tools
 /model [name]     Switch to the configured model, or a specific model
@@ -504,7 +504,7 @@ impl OranguHelper {
                 "/connect".to_string(),
                 "/disconnect".to_string(),
                 "/reload".to_string(),
-                "/list-models".to_string(),
+                "/list_models".to_string(),
                 "/list_files".to_string(),
                 "/tools".to_string(),
                 "/model".to_string(),

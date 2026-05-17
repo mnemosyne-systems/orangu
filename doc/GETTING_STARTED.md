@@ -38,7 +38,7 @@ orangu --config ./orangu.conf
 - `/help`
 - `/connect`
 - `/disconnect`
-- `/list-models`
+- `/list_models`
 - `/list_files`
 - `/tools`
 - `/model`

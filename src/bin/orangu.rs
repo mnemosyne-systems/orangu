@@ -64,7 +64,7 @@ const COMMANDS: &[&str] = &[
     "/connect",
     "/disconnect",
     "/reload",
-    "/list-models",
+    "/list_models",
     "/list_files",
     "/tools",
     "/model",
@@ -1274,7 +1274,7 @@ fn handle_command(
         )?)),
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
         LocalCommand::ModelInfo => Ok(CommandOutcome::Output(
-            "Use /list-models to see configured profiles".to_string(),
+            "Use /list_models to see configured profiles".to_string(),
         )),
         LocalCommand::SetModel(name) => {
             if !llms.contains_key(name) {
@@ -1322,7 +1322,7 @@ fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/connect" => Some(LocalCommand::ConnectDefault),
         "/disconnect" => Some(LocalCommand::Disconnect),
         "/reload" => Some(LocalCommand::Reload),
-        "/list-models" => Some(LocalCommand::ListModels),
+        "/list_models" => Some(LocalCommand::ListModels),
         "/list_files" => Some(LocalCommand::ListFiles),
         "/tools" => Some(LocalCommand::Tools),
         "/model" => Some(LocalCommand::ModelInfo),
@@ -1937,13 +1937,12 @@ fn render_left_status(
         return Some(render_thinking_status(frame, elapsed));
     }
 
-    if profile.provider.eq_ignore_ascii_case("llama.cpp") {
-        if let Some(rate) = metrics
+    if profile.provider.eq_ignore_ascii_case("llama.cpp")
+        && let Some(rate) = metrics
             .predicted_per_second
             .filter(|rate| *rate > 0.0 && !rendered_output.is_empty())
-        {
-            return Some(render_working_status(frame, rate, elapsed));
-        }
+    {
+        return Some(render_working_status(frame, rate, elapsed));
     }
 
     tokenizer.and_then(|tokenizer| {
