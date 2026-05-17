@@ -54,6 +54,7 @@ Then start with:
 ```text
 /help
 /list-models
+/list_files
 /tools
 ```
 

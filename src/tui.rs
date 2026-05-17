@@ -119,6 +119,7 @@ pub fn help_text() -> &'static str {
 /disconnect       Disconnect from the current server
 /reload           Restore the configured model and server
 /list-models      List models
+/list_files       List workspace files as a tree
 /tools            List tools
 /model [name]     Switch to the configured model, or a specific model
 /diff             Show a color unified diff against the current branch
@@ -126,7 +127,7 @@ pub fn help_text() -> &'static str {
 /clear            Clear the current conversation
 /quit             Exit the client
 
-Natural-language forms such as `open README.md`, `list models`, and `show help` are also handled locally.
+Natural-language forms such as `open README.md`, `list models`, `list files`, and `show help` are also handled locally.
 
 The prompt uses standard Unix shell keys, including Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, and Tab completion."#
 }
@@ -504,6 +505,7 @@ impl OranguHelper {
                 "/disconnect".to_string(),
                 "/reload".to_string(),
                 "/list-models".to_string(),
+                "/list_files".to_string(),
                 "/tools".to_string(),
                 "/model".to_string(),
                 "/clear".to_string(),

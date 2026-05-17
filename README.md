@@ -25,8 +25,8 @@
 - OpenAI-compatible chat completions
 - Workspace-aware local tools for files, shell commands, and URL fetching
 - Shell-style prompt editing, history, and completion
-- Local commands such as `/help`, `/list-models`, `/tools`, `/diff`, and `/open_file`
-- Natural-language command aliases such as `open README.md`, `list models`, and `show help`
+- Local commands such as `/help`, `/list-models`, `/list_files`, `/tools`, `/diff`, and `/open_file`
+- Natural-language command aliases such as `open README.md`, `list models`, `list files`, and `show help`
 - Streaming responses with terminal status updates
 
 ## Installation
@@ -109,6 +109,7 @@ Useful first commands:
 ```text
 /help
 /list-models
+/list_files
 /tools
 /open_file README.md
 ```

@@ -39,6 +39,7 @@ orangu --config ./orangu.conf
 - `/connect`
 - `/disconnect`
 - `/list-models`
+- `/list_files`
 - `/tools`
 - `/model`
 - `/reload`
@@ -47,7 +48,7 @@ orangu --config ./orangu.conf
 Then try a natural-language request such as:
 
 ```text
-Show me the files in the current workspace
+list files
 ```
 
 Built-in commands also accept natural-language forms, for example:
@@ -55,6 +56,7 @@ Built-in commands also accept natural-language forms, for example:
 ```text
 open README.md
 list models
+list files
 show help
 ```
 

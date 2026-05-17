@@ -65,6 +65,7 @@ const COMMANDS: &[&str] = &[
     "/disconnect",
     "/reload",
     "/list-models",
+    "/list_files",
     "/tools",
     "/model",
     "/diff",
@@ -1186,6 +1187,7 @@ enum LocalCommand<'a> {
     Disconnect,
     Reload,
     ListModels,
+    ListFiles,
     Tools,
     ModelInfo,
     SetModel(&'a str),
@@ -1267,6 +1269,9 @@ fn handle_command(
             Ok(CommandOutcome::Quiet)
         }
         LocalCommand::ListModels => Ok(CommandOutcome::Output(format_models(llms))),
+        LocalCommand::ListFiles => Ok(CommandOutcome::Output(list_workspace_files_tree(
+            workspace,
+        )?)),
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
         LocalCommand::ModelInfo => Ok(CommandOutcome::Output(
             "Use /list-models to see configured profiles".to_string(),
@@ -1318,6 +1323,7 @@ fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/disconnect" => Some(LocalCommand::Disconnect),
         "/reload" => Some(LocalCommand::Reload),
         "/list-models" => Some(LocalCommand::ListModels),
+        "/list_files" => Some(LocalCommand::ListFiles),
         "/tools" => Some(LocalCommand::Tools),
         "/model" => Some(LocalCommand::ModelInfo),
         "/diff" => Some(LocalCommand::Diff),
@@ -1369,6 +1375,17 @@ fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         ],
     ) {
         return Some(LocalCommand::ListModels);
+    }
+    if matches_ci(
+        input,
+        &[
+            "list files",
+            "show files",
+            "show workspace files",
+            "list workspace files",
+        ],
+    ) {
+        return Some(LocalCommand::ListFiles);
     }
     if matches_ci(
         input,
@@ -1435,6 +1452,72 @@ fn strip_ascii_prefix<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+fn list_workspace_files_tree(workspace: &Path) -> Result<String> {
+    let mut lines = vec![workspace.display().to_string()];
+    append_workspace_tree(workspace, "", &mut lines)?;
+    Ok(lines.join("\n"))
+}
+
+fn append_workspace_tree(directory: &Path, prefix: &str, lines: &mut Vec<String>) -> Result<()> {
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {}", directory.display()))?;
+    entries.retain(|entry| should_include_listed_path(&entry.file_name(), &entry.path()));
+    entries.sort_by(|left, right| {
+        compare_tree_entries(
+            &left.file_name(),
+            &left.path(),
+            &right.file_name(),
+            &right.path(),
+        )
+    });
+    let total_entries = entries.len();
+
+    for (index, entry) in entries.into_iter().enumerate() {
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let branch = if index + 1 == total_entries {
+            "└── "
+        } else {
+            "├── "
+        };
+        lines.push(format!("{prefix}{branch}{name}"));
+        if is_dir {
+            let next_prefix = if index + 1 == total_entries {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}│   ")
+            };
+            append_workspace_tree(&path, &next_prefix, lines)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_include_listed_path(file_name: &std::ffi::OsStr, path: &Path) -> bool {
+    !(path.is_dir() && matches!(file_name.to_str(), Some(".git" | "build" | "target")))
+}
+
+fn compare_tree_entries(
+    left_name: &std::ffi::OsStr,
+    left_path: &Path,
+    right_name: &std::ffi::OsStr,
+    right_path: &Path,
+) -> std::cmp::Ordering {
+    left_path
+        .is_file()
+        .cmp(&right_path.is_file())
+        .then_with(|| {
+            left_name
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&right_name.to_string_lossy().to_lowercase())
+        })
 }
 
 fn matches_ci(input: &str, options: &[&str]) -> bool {
@@ -2044,9 +2127,9 @@ mod tests {
     use super::{
         CommandContext, CommandOutcome, CommandState, EscapeCancelState, LocalCommand, OutputState,
         completion_candidates, discover_git_dir, discover_git_root, final_pending_line,
-        git_workspace_diff, handle_command, is_wait_cancel_escape, llm_prompt_block_reason,
-        parse_local_command, render_left_status, resolve_workspace_root, shell_words,
-        system_prompt, workspace_branch_name,
+        git_workspace_diff, handle_command, is_wait_cancel_escape, list_workspace_files_tree,
+        llm_prompt_block_reason, parse_local_command, render_left_status, resolve_workspace_root,
+        shell_words, system_prompt, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -2148,6 +2231,58 @@ mod tests {
     }
 
     #[test]
+    fn list_files_outputs_filtered_workspace_tree() {
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("README.md"), "readme").expect("root file");
+        fs::create_dir(workspace.path().join("doc")).expect("doc dir");
+        fs::write(workspace.path().join("doc/guide.txt"), "guide").expect("doc file");
+        fs::create_dir(workspace.path().join("src")).expect("src dir");
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn lib() {}").expect("src file");
+        fs::create_dir(workspace.path().join(".git")).expect("git dir");
+        fs::write(workspace.path().join(".git/config"), "[core]").expect("git config");
+        fs::create_dir(workspace.path().join("build")).expect("build dir");
+        fs::write(workspace.path().join("build/output.txt"), "artifact").expect("build file");
+        fs::create_dir(workspace.path().join("target")).expect("target dir");
+        fs::write(workspace.path().join("target/app"), "binary").expect("target file");
+
+        let tree = list_workspace_files_tree(workspace.path()).expect("tree");
+        assert_eq!(
+            tree,
+            format!(
+                "{}\n├── doc\n│   └── guide.txt\n├── src\n│   └── lib.rs\n└── README.md",
+                workspace.path().display()
+            )
+        );
+
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+        let outcome = handle_command(
+            "/list_files",
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::Output(output) if output == tree));
+    }
+
+    #[test]
     fn parses_open_file_commands() {
         match parse_local_command("/open_file README.md") {
             Some(LocalCommand::OpenFile(path)) => assert_eq!(path, "README.md"),
@@ -2161,6 +2296,22 @@ mod tests {
             Some(LocalCommand::OpenFile(path)) => assert_eq!(path, "docs/user guide.md"),
             _ => panic!("expected quoted natural language open file command"),
         }
+    }
+
+    #[test]
+    fn parses_list_files_commands() {
+        assert!(matches!(
+            parse_local_command("/list_files"),
+            Some(LocalCommand::ListFiles)
+        ));
+        assert!(matches!(
+            parse_local_command("list files"),
+            Some(LocalCommand::ListFiles)
+        ));
+        assert!(matches!(
+            parse_local_command("show workspace files"),
+            Some(LocalCommand::ListFiles)
+        ));
     }
 
     #[test]

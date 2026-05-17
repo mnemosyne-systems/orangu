@@ -25,17 +25,17 @@ The prompt area stays at the bottom of the terminal window.
 
 ## Waiting state
 
-While the model is generating a response, the output area shows a rolling:
+While the model is generating a response, the left side of the footer shows a rolling:
 
 ```text
 Thinking (2s)
 ```
 
-placeholder in the position where the reply will appear.
+status indicator.
 
 You can keep typing and submitting commands while a response is pending. Submitted commands are queued and executed in order after the active response finishes.
 
-When a profile uses `provider = llama.cpp`, the left side of the footer uses llama.cpp's native stream metrics: prompt-processing throughput before the first token, then generation throughput while tokens are streaming.
+When a profile uses `provider = llama.cpp`, the footer starts with `Thinking (<CLOCK>)` and switches to llama.cpp's native generation throughput once tokens are streaming, for example `Working @ 42.5 t/s (2s)`.
 
 Press `Esc` twice within 2 seconds during the waiting state to cancel the active request without exiting the client. Queued commands are preserved.
 
@@ -61,9 +61,11 @@ Use:
 - `/disconnect` disconnects from the current server target
 - `/reload` restores the startup model and configured server target and clears the current conversation
 
-## Local editor command
+## Local workspace commands
 
 Use `/open_file <path>` to launch a workspace file in the editor configured by `$EDITOR`.
+
+Use `/list_files` to print a recursive tree of the current workspace. The listing excludes `.git/`, `build/`, and `target/`.
 
 ## Natural-language command aliases
 
@@ -71,6 +73,7 @@ Local commands can also be entered in plain language. Examples:
 
 - `open README.md`
 - `list models`
+- `list files`
 - `show tools`
 - `show help`
 - `switch model to <name>`
