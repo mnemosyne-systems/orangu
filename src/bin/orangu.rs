@@ -56,6 +56,7 @@ use syntect::{
     parsing::SyntaxSet,
     util::{LinesWithEndings, as_24_bit_terminal_escaped},
 };
+use terminal_size::{Width, terminal_size};
 use tiktoken_rs::cl100k_base;
 use walkdir::WalkDir;
 
@@ -2148,8 +2149,10 @@ fn open_in_editor(workspace: &Path, raw_path: &str) -> Result<()> {
 }
 
 fn git_workspace_diff(workspace: &Path) -> Result<String> {
-    let repo_root = discover_git_root(workspace)
-        .ok_or_else(|| anyhow!("diff is only available inside a Git repository"))?;
+    let Some(repo_root) = discover_git_root(workspace) else {
+        return legacy_workspace_diff(workspace);
+    };
+    let terminal_width = current_terminal_width();
     let workspace_pathspec = workspace
         .strip_prefix(&repo_root)
         .ok()
@@ -2159,11 +2162,9 @@ fn git_workspace_diff(workspace: &Path) -> Result<String> {
     command
         .arg("-C")
         .arg(&repo_root)
-        .arg("--no-pager")
         .arg("diff")
-        .arg("--color=always")
-        .arg("--unified=3")
-        .arg("HEAD");
+        .arg("--color=always");
+    command.env("COLUMNS", terminal_width.to_string());
     if let Some(pathspec) = workspace_pathspec {
         command.arg("--").arg(pathspec);
     }
@@ -2181,12 +2182,132 @@ fn git_workspace_diff(workspace: &Path) -> Result<String> {
         ));
     }
 
-    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    let diff = if let Some(pager_command) = configured_git_diff_pager(&repo_root)? {
+        run_git_diff_pager(&repo_root, &pager_command, &output.stdout, terminal_width)?
+    } else {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
     if diff.trim().is_empty() {
         Ok("No changes against the current branch.".to_string())
     } else {
         Ok(diff)
     }
+}
+
+fn configured_git_diff_pager(repo_root: &Path) -> Result<Option<String>> {
+    for key in ["pager.diff", "core.pager"] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["config", "--get", key])
+            .output()
+            .with_context(|| format!("failed to read git config key {key}"))?;
+        if !output.status.success() {
+            continue;
+        }
+        let value = String::from_utf8(output.stdout)
+            .with_context(|| format!("git config key {key} was not valid UTF-8"))?;
+        let value = value.trim();
+        if value.is_empty() || looks_like_interactive_pager(value) {
+            continue;
+        }
+        return Ok(Some(value.to_string()));
+    }
+
+    Ok(None)
+}
+
+fn looks_like_interactive_pager(command: &str) -> bool {
+    let first = shell_words(command)
+        .ok()
+        .and_then(|parts| parts.into_iter().next())
+        .unwrap_or_else(|| command.trim().to_string());
+    let first = Path::new(&first)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(first.as_str());
+    matches!(first, "less" | "more" | "most" | "lv")
+}
+
+fn with_explicit_pager_width(command: &str, terminal_width: usize) -> String {
+    let Ok(parts) = shell_words(command) else {
+        return command.to_string();
+    };
+    let Some(first) = parts.first() else {
+        return command.to_string();
+    };
+    let executable = Path::new(first)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(first.as_str());
+    if executable != "delta"
+        || parts
+            .iter()
+            .any(|part| part == "--width" || part.starts_with("--width="))
+    {
+        return command.to_string();
+    }
+
+    format!("{command} --width={terminal_width}")
+}
+
+fn run_git_diff_pager(
+    repo_root: &Path,
+    pager_command: &str,
+    diff: &[u8],
+    terminal_width: usize,
+) -> Result<String> {
+    let pager_command = with_explicit_pager_width(pager_command, terminal_width);
+    let mut pager = std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(&pager_command)
+        .current_dir(repo_root)
+        .env("COLUMNS", terminal_width.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch configured git pager '{pager_command}'"))?;
+
+    if let Some(stdin) = pager.stdin.as_mut() {
+        stdin
+            .write_all(diff)
+            .with_context(|| format!("failed to write diff to git pager '{pager_command}'"))?;
+    }
+
+    let output = pager
+        .wait_with_output()
+        .with_context(|| format!("failed to read output from git pager '{pager_command}'"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git pager failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+
+    String::from_utf8(output.stdout).context("git pager output was not UTF-8")
+}
+
+fn legacy_workspace_diff(_workspace: &Path) -> Result<String> {
+    Err(anyhow!("diff is only available inside a Git repository"))
+}
+
+fn current_terminal_width() -> usize {
+    terminal_size()
+        .map(|(Width(width), _)| usize::from(width))
+        .filter(|width| *width > 0)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|width| *width > 0)
+        })
+        .unwrap_or(80)
 }
 
 fn shell_words(input: &str) -> Result<Vec<String>> {
@@ -2720,7 +2841,7 @@ mod tests {
         git_workspace_diff, handle_command, is_wait_cancel_escape, list_workspace_files_tree,
         llm_prompt_block_reason, parse_local_command, parse_show_file_arguments,
         render_left_status, render_markdown_for_console, resolve_workspace_root, shell_words,
-        show_file_output, system_prompt, workspace_branch_name,
+        show_file_output, system_prompt, with_explicit_pager_width, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -2732,11 +2853,61 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::{
+        ffi::OsString,
         fs,
         path::PathBuf,
+        sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
+
+    fn process_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_process_env() -> std::sync::MutexGuard<'static, ()> {
+        process_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize process-wide environment changes with process_env_lock().
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn set_value(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize process-wide environment changes with process_env_lock().
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize process-wide environment changes with process_env_lock().
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn init_test_git_repo(workspace: &std::path::Path) {
         assert!(
@@ -3109,7 +3280,10 @@ mod tests {
 
     #[test]
     fn git_workspace_diff_is_colorized_and_unified() {
+        let _env_lock = lock_process_env();
         let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
         init_test_git_repo(workspace.path());
         fs::write(workspace.path().join("README.md"), "one\ntwo\nthree\n").expect("write file");
         assert!(
@@ -3141,6 +3315,120 @@ mod tests {
         assert!(diff.contains("diff --git"));
         assert!(diff.contains("changed"));
         assert!(diff.contains("four"));
+    }
+
+    #[test]
+    fn git_workspace_diff_honors_global_gitconfig() {
+        let _env_lock = lock_process_env();
+        let workspace = tempdir().expect("workspace");
+        init_test_git_repo(workspace.path());
+        fs::write(workspace.path().join("README.md"), "one\ntwo\nthree\n").expect("write file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        fs::write(
+            workspace.path().join("README.md"),
+            "one\nchanged\nthree\nfour\n",
+        )
+        .expect("update file");
+
+        let home = tempdir().expect("home");
+        fs::write(
+            home.path().join(".gitconfig"),
+            "[diff]\n\tnoprefix = true\n",
+        )
+        .expect("gitconfig");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+
+        let diff = git_workspace_diff(workspace.path()).expect("git diff");
+        assert!(diff.contains("diff --git README.md README.md"));
+        assert!(diff.contains("--- README.md"));
+        assert!(diff.contains("+++ README.md"));
+        assert!(!diff.contains("diff --git a/README.md b/README.md"));
+    }
+
+    #[test]
+    fn git_workspace_diff_uses_configured_noninteractive_pager() {
+        let _env_lock = lock_process_env();
+        let workspace = tempdir().expect("workspace");
+        init_test_git_repo(workspace.path());
+        fs::write(workspace.path().join("README.md"), "one\ntwo\nthree\n").expect("write file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        fs::write(
+            workspace.path().join("README.md"),
+            "one\nchanged\nthree\nfour\n",
+        )
+        .expect("update file");
+
+        let home = tempdir().expect("home");
+        let pager = home.path().join("pager.sh");
+        fs::write(
+            &pager,
+            "#!/bin/sh\nprintf 'PAGER-START WIDTH=%s\\n' \"$COLUMNS\"\ncat\nprintf 'PAGER-END\\n'\n",
+        )
+        .expect("pager script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&pager).expect("pager metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&pager, permissions).expect("pager permissions");
+        }
+        fs::write(
+            home.path().join(".gitconfig"),
+            format!("[core]\n\tpager = {}\n", pager.display()),
+        )
+        .expect("gitconfig");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        let _columns_guard = EnvVarGuard::set_value("COLUMNS", "123");
+
+        let diff = git_workspace_diff(workspace.path()).expect("git diff");
+        assert!(diff.contains("PAGER-START WIDTH="));
+        assert!(diff.contains("diff --git"));
+        assert!(diff.ends_with("PAGER-END\n"));
+    }
+
+    #[test]
+    fn adds_explicit_width_to_delta_pager_command() {
+        assert_eq!(
+            with_explicit_pager_width("delta --side-by-side", 123),
+            "delta --side-by-side --width=123"
+        );
+        assert_eq!(
+            with_explicit_pager_width("/usr/bin/delta --width=90 --side-by-side", 123),
+            "/usr/bin/delta --width=90 --side-by-side"
+        );
+        assert_eq!(with_explicit_pager_width("less -FRX", 123), "less -FRX");
     }
 
     #[test]
