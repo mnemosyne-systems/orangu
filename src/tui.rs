@@ -42,6 +42,7 @@ const ORANGU_BROWN: &str = "\x1b[38;2;139;90;43m";
 const STATUS_GREEN: &str = "\x1b[38;2;80;200;120m";
 const STATUS_RED: &str = "\x1b[38;2;220;80;80m";
 const ANSI_RESET: &str = "\x1b[0m";
+const USER_INPUT_BACKGROUND: &str = "\x1b[48;2;44;44;44m";
 const THINKING_TEXT: &str = "Thinking";
 const WORKING_TEXT: &str = "Working";
 const THINKING_SHADE_LEVELS: &[u8] = &[230, 210, 190, 170, 150, 130, 110, 90];
@@ -177,7 +178,11 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
     let height = terminal_height().max(header_line_count + prompt_frame_height + 1);
     let available_output_rows =
         available_output_rows(header_line_count, prompt_frame_height, height);
-    let mut output_lines = args.transcript.to_vec();
+    let mut output_lines = args
+        .transcript
+        .iter()
+        .map(|line| render_transcript_line(line, width))
+        .collect::<Vec<_>>();
     if let Some(pending_line) = args.pending_line {
         if pending_line.is_empty() {
             output_lines.push(String::new());
@@ -365,6 +370,21 @@ fn render_prompt_frame(args: PromptFrameArgs<'_>) -> String {
         "\x1b[{bottom_row};1H{line}\x1b[{model_row};1H{status_line}\x1b[{cursor_row};{cursor_col}H"
     ));
     frame
+}
+
+fn render_transcript_line(line: &str, width: usize) -> String {
+    let Some(content) = line
+        .strip_prefix(USER_INPUT_BACKGROUND)
+        .and_then(|line| line.strip_suffix(ANSI_RESET))
+    else {
+        return line.to_string();
+    };
+
+    let padding = width.saturating_sub(content.chars().count());
+    format!(
+        "{USER_INPUT_BACKGROUND}{content}{}{ANSI_RESET}",
+        " ".repeat(padding)
+    )
 }
 
 fn wrapped_input_lines(input: &str, width: usize, prompt_prefix: &str) -> Vec<String> {
@@ -576,8 +596,9 @@ impl Completer for OranguHelper {
 #[cfg(test)]
 mod tests {
     use super::{
-        StatusFragment, THINKING_TEXT, WORKING_TEXT, available_output_rows, prompt_prefix,
-        render_status_line, render_thinking_status, render_working_status, wrapped_input_lines,
+        ANSI_RESET, StatusFragment, THINKING_TEXT, USER_INPUT_BACKGROUND, WORKING_TEXT,
+        available_output_rows, prompt_prefix, render_status_line, render_thinking_status,
+        render_transcript_line, render_working_status, wrapped_input_lines,
     };
     use std::time::Duration;
 
@@ -644,5 +665,18 @@ mod tests {
     #[test]
     fn available_output_rows_matches_current_layout_math() {
         assert_eq!(available_output_rows(8, 4, 24), 11);
+    }
+
+    #[test]
+    fn transcript_input_highlight_fills_the_row() {
+        let rendered = render_transcript_line(
+            &format!("{USER_INPUT_BACKGROUND}> Hello World!{ANSI_RESET}"),
+            20,
+        );
+
+        assert_eq!(
+            rendered,
+            format!("{USER_INPUT_BACKGROUND}> Hello World!      {ANSI_RESET}")
+        );
     }
 }

@@ -77,6 +77,7 @@ const ANSI_STRIKETHROUGH_ON: &str = "\x1b[9m";
 const ANSI_STRIKETHROUGH_OFF: &str = "\x1b[29m";
 const ANSI_FG_CODE: &str = "\x1b[38;2;255;215;120m";
 const ANSI_FG_LINK: &str = "\x1b[38;2;102;178;255m";
+const ANSI_FG_LIGHT_RED: &str = "\x1b[38;2;255;170;170m";
 const ANSI_FG_SUBTLE: &str = "\x1b[38;2;180;190;205m";
 const ANSI_FG_RESET: &str = "\x1b[39m";
 const ANSI_RESET: &str = "\x1b[0m";
@@ -234,7 +235,7 @@ async fn run() -> Result<()> {
             }
         };
 
-        output_state.push_text(&format!("> {next_input}"));
+        output_state.push_input(&format!("> {next_input}"));
         output_state.reset_scroll();
         print_screen(
             render,
@@ -327,7 +328,9 @@ async fn run() -> Result<()> {
         .await
         {
             Ok(WaitResult::Response(answer)) => output_state.push_markdown(&answer),
-            Ok(WaitResult::Cancelled) => output_state.push_text("Request cancelled."),
+            Ok(WaitResult::Cancelled(partial_output)) => {
+                preserve_cancelled_output(&mut output_state, &partial_output);
+            }
             Ok(WaitResult::Quit) => {
                 print!("{CLEAR_TERMINAL_SEQUENCE}");
                 std::io::stdout().flush()?;
@@ -347,6 +350,8 @@ struct OutputState {
     scroll_offset: usize,
 }
 
+const USER_INPUT_BACKGROUND: &str = "\x1b[48;2;44;44;44m";
+
 impl OutputState {
     fn lines(&self) -> &[String] {
         &self.transcript
@@ -362,8 +367,23 @@ impl OutputState {
     }
 
     fn push_text(&mut self, text: &str) {
-        let added_lines = text.lines().count();
-        self.transcript.extend(text.lines().map(ToOwned::to_owned));
+        self.push_lines(text.lines().map(ToOwned::to_owned));
+    }
+
+    fn push_input(&mut self, text: &str) {
+        self.push_lines(
+            text.lines()
+                .map(|line| style_transcript_input_line(line.to_string())),
+        );
+    }
+
+    fn push_lines<I>(&mut self, lines: I)
+    where
+        I: Iterator<Item = String>,
+    {
+        let collected = lines.collect::<Vec<_>>();
+        let added_lines = collected.len();
+        self.transcript.extend(collected);
         if self.scroll_offset > 0 {
             self.scroll_offset = self.scroll_offset.saturating_add(added_lines);
         }
@@ -390,6 +410,10 @@ impl OutputState {
     fn page_down(&mut self, rows: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows.max(1));
     }
+}
+
+fn style_transcript_input_line(line: String) -> String {
+    format!("{USER_INPUT_BACKGROUND}{line}{ANSI_RESET}")
 }
 
 enum InterruptAction {
@@ -1283,7 +1307,7 @@ enum InputResult {
 
 enum WaitResult {
     Response(String),
-    Cancelled,
+    Cancelled(String),
     Quit,
 }
 
@@ -2766,7 +2790,7 @@ fn prepare_submitted_input(
     append_history_entry(history_path, trimmed)?;
 
     if trimmed.starts_with('#') {
-        output_state.push_text(&format!("> {trimmed}"));
+        output_state.push_input(&format!("> {trimmed}"));
         output_state.reset_scroll();
         return Ok(None);
     }
@@ -2954,8 +2978,12 @@ async fn wait_for_response(
                     let event = event::read()?;
                     if is_wait_cancel_escape(&event) {
                         if escape_cancel_state.handle_escape(Instant::now()) {
+                            let partial_output = streamed_state
+                                .lock()
+                                .map(|state| state.output.clone())
+                                .unwrap_or_default();
                             drop(prompt_future);
-                            return Ok(WaitResult::Cancelled);
+                            return Ok(WaitResult::Cancelled(partial_output));
                         }
                         continue;
                     }
@@ -3074,6 +3102,17 @@ fn final_pending_line(streamed_output: &str, response: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn request_cancelled_message() -> String {
+    format!("{ANSI_FG_LIGHT_RED}Request cancelled.{ANSI_RESET}")
+}
+
+fn preserve_cancelled_output(output_state: &mut OutputState, partial_output: &str) {
+    if !partial_output.is_empty() {
+        output_state.push_markdown(partial_output);
+    }
+    output_state.push_text(&request_cancelled_message());
 }
 
 #[derive(Debug, Deserialize)]
@@ -3232,8 +3271,9 @@ mod tests {
         final_pending_line, format_show_file_line, git_workspace_diff, handle_command,
         handle_input_event, is_wait_cancel_escape, list_workspace_files_tree,
         llm_prompt_block_reason, parse_local_command, parse_show_file_arguments,
-        render_left_status, render_markdown_for_console, resolve_workspace_root, shell_words,
-        show_file_output, system_prompt, with_explicit_pager_width, workspace_branch_name,
+        preserve_cancelled_output, render_left_status, render_markdown_for_console,
+        request_cancelled_message, resolve_workspace_root, shell_words, show_file_output,
+        system_prompt, with_explicit_pager_width, workspace_branch_name,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use orangu::{
@@ -3392,6 +3432,23 @@ mod tests {
         assert_eq!(
             output_state.lines().last().map(String::as_str),
             Some("line 10004")
+        );
+    }
+
+    #[test]
+    fn output_state_styles_echoed_user_input() {
+        let mut output_state = OutputState::default();
+
+        output_state.push_input("> show README.md");
+        output_state.push_text("plain output");
+
+        assert_eq!(
+            output_state.lines().first().map(String::as_str),
+            Some("\x1b[48;2;44;44;44m> show README.md\x1b[0m")
+        );
+        assert_eq!(
+            output_state.lines().get(1).map(String::as_str),
+            Some("plain output")
         );
     }
 
@@ -4438,6 +4495,18 @@ mod tests {
             Some("final reply")
         );
         assert_eq!(final_pending_line("", ""), None);
+    }
+
+    #[test]
+    fn cancelled_output_preserves_partial_reply_and_uses_light_red_notice() {
+        let mut output_state = OutputState::default();
+
+        preserve_cancelled_output(&mut output_state, "partial reply");
+
+        assert_eq!(
+            output_state.lines(),
+            &["partial reply".to_string(), request_cancelled_message()]
+        );
     }
 
     #[test]
