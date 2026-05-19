@@ -132,6 +132,7 @@ async fn run() -> Result<()> {
     let mut interrupt_state = InterruptState::default();
     let mut input_state = InputState::default();
     let mut pending_commands = VecDeque::new();
+    let mut usage_stats = UsageStats::new();
     let history_path = history_file_path()?;
     let mut history = load_history(&history_path)?;
     let status_http_client = reqwest::Client::builder()
@@ -240,6 +241,7 @@ async fn run() -> Result<()> {
                 llms: &config.llms,
                 tools: &tools,
                 workspace: &workspace,
+                usage_stats: &usage_stats,
             },
         )? {
             CommandOutcome::Quit => {
@@ -279,6 +281,8 @@ async fn run() -> Result<()> {
         }
         let mut prompt_profile = profile.clone();
         prompt_profile.endpoint = endpoint.to_string();
+        let llm_start = std::time::Instant::now();
+        let tool_time_before = tools.total_tool_duration();
         match wait_for_response(
             &mut session,
             &next_input,
@@ -303,7 +307,11 @@ async fn run() -> Result<()> {
         )
         .await
         {
-            Ok(WaitResult::Response(answer)) => output_state.push_markdown(&answer),
+            Ok(WaitResult::Response(answer)) => {
+                let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
+                usage_stats.record_response(llm_start.elapsed(), &answer, tool_delta);
+                output_state.push_markdown(&answer);
+            }
             Ok(WaitResult::Cancelled(partial_output)) => {
                 preserve_cancelled_output(&mut output_state, &partial_output);
             }
@@ -318,6 +326,68 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct UsageStats {
+    app_start: std::time::Instant,
+    total_llm_duration: std::time::Duration,
+    total_tool_duration: std::time::Duration,
+    total_tokens: usize,
+}
+
+impl UsageStats {
+    fn new() -> Self {
+        Self {
+            app_start: std::time::Instant::now(),
+            total_llm_duration: std::time::Duration::ZERO,
+            total_tool_duration: std::time::Duration::ZERO,
+            total_tokens: 0,
+        }
+    }
+
+    fn record_response(
+        &mut self,
+        total_duration: std::time::Duration,
+        response: &str,
+        tool_duration: std::time::Duration,
+    ) {
+        self.total_tool_duration += tool_duration;
+        self.total_llm_duration += total_duration.saturating_sub(tool_duration);
+        if let Ok(tokenizer) = cl100k_base() {
+            self.total_tokens += tokenizer.encode_with_special_tokens(response).len();
+        }
+    }
+
+    fn format(&self) -> String {
+        let app_elapsed = self.app_start.elapsed();
+        let avg_tps = if self.total_llm_duration.as_secs_f64() > 0.0 {
+            self.total_tokens as f64 / self.total_llm_duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        format!(
+            "Application time : {}\nLLM time         : {}\nTool time        : {}\nTotal tokens     : {}\nAvg tokens/sec   : {:.1}",
+            format_duration(app_elapsed),
+            format_duration(self.total_llm_duration),
+            format_duration(self.total_tool_duration),
+            self.total_tokens,
+            avg_tps,
+        )
+    }
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}h {}m {}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m {}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
 }
 
 struct TerminalTitleGuard;
@@ -416,6 +486,7 @@ fn handle_command(
         llms,
         tools,
         workspace,
+        usage_stats,
     } = context;
 
     match command {
@@ -589,6 +660,7 @@ fn handle_command(
                 Err(err) => Ok(CommandOutcome::Output(format!("Error: {err:#}"))),
             }
         }
+        LocalCommand::Usage => Ok(CommandOutcome::Output(usage_stats.format())),
         LocalCommand::Clear => {
             let prompt = system_prompt(
                 llms.get(active_model)
@@ -1295,6 +1367,7 @@ mod tests {
                 llms: &llms,
                 tools: &tools,
                 workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
             },
         )
         .expect("handle command");
@@ -1460,6 +1533,7 @@ mod tests {
                     llms: &llms,
                     tools: &tools,
                     workspace: workspace.path(),
+                    usage_stats: &super::UsageStats::new(),
                 },
             )
             .expect("handle command");
@@ -1516,6 +1590,7 @@ mod tests {
                 llms: &llms,
                 tools: &tools,
                 workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
             },
         )
         .expect("handle command");
@@ -1789,6 +1864,7 @@ mod tests {
                 llms: &llms,
                 tools: &tools,
                 workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
             },
         )
         .expect("handle command");
@@ -1835,6 +1911,7 @@ mod tests {
                 llms: &llms,
                 tools: &tools,
                 workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
             },
         )
         .expect("command outcome");

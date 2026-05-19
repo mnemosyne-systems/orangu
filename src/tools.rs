@@ -22,6 +22,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
 };
 use tokio::{process::Command, time::Duration};
 use walkdir::WalkDir;
@@ -30,6 +31,7 @@ use walkdir::WalkDir;
 pub struct ToolExecutor {
     workspace: PathBuf,
     http_client: Client,
+    tool_duration: Arc<Mutex<std::time::Duration>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -79,7 +81,12 @@ impl ToolExecutor {
         Self {
             workspace: workspace.into(),
             http_client: Client::new(),
+            tool_duration: Arc::new(Mutex::new(std::time::Duration::ZERO)),
         }
+    }
+
+    pub fn total_tool_duration(&self) -> std::time::Duration {
+        self.tool_duration.lock().map(|d| *d).unwrap_or_default()
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -156,14 +163,19 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, arguments: &Map<String, Value>) -> Result<String> {
-        match name {
+        let start = std::time::Instant::now();
+        let result = match name {
             "read_file" => self.read_file(arguments).await,
             "edit_file" => self.edit_file(arguments).await,
             "list_directory" => self.list_directory(arguments).await,
             "fetch_url" => self.fetch_url(arguments).await,
             "run_shell_command" => self.run_shell_command(arguments).await,
             _ => Err(anyhow!("unknown tool '{}'", name)),
+        };
+        if let Ok(mut d) = self.tool_duration.lock() {
+            *d += start.elapsed();
         }
+        result
     }
 
     async fn read_file(&self, arguments: &Map<String, Value>) -> Result<String> {

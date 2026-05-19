@@ -139,6 +139,7 @@ pub enum LocalCommand<'a> {
     Squash,
     DeleteBranch(Option<Cow<'a, str>>),
     OpenFile(&'a str),
+    Usage,
     Clear,
     Quit,
 }
@@ -149,6 +150,7 @@ pub struct CommandContext<'a> {
     pub llms: &'a HashMap<String, LlmConfiguration>,
     pub tools: &'a ToolExecutor,
     pub workspace: &'a Path,
+    pub usage_stats: &'a crate::UsageStats,
 }
 
 pub struct CommandState<'a> {
@@ -195,6 +197,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/init_repo" => Some(LocalCommand::InitRepo),
         "/squash" => Some(LocalCommand::Squash),
         "/delete" => Some(LocalCommand::DeleteBranch(None)),
+        "/usage" => Some(LocalCommand::Usage),
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
         _ => {
@@ -561,6 +564,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::DeleteBranch(Some(Cow::Borrowed(branch))));
             }
         }
+    }
+    if matches_ci(input, &["usage", "show usage"]) {
+        return Some(LocalCommand::Usage);
     }
     if matches_ci(
         input,
