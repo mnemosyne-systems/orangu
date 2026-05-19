@@ -23,6 +23,20 @@ use rustyline::{
 use std::time::Duration;
 use terminal_size::{Height, Width, terminal_size};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptLine {
+    Plain(String),
+    UserInput(String),
+}
+
+impl TranscriptLine {
+    pub fn as_str(&self) -> &str {
+        match self {
+            TranscriptLine::Plain(s) | TranscriptLine::UserInput(s) => s,
+        }
+    }
+}
+
 pub fn editor_config() -> Config {
     Config::builder()
         .history_ignore_space(true)
@@ -141,7 +155,7 @@ pub struct ScreenRenderArgs<'a> {
     pub workspace: &'a std::path::Path,
     pub prompt_branch: Option<&'a str>,
     pub status: HeaderStatus,
-    pub transcript: &'a [String],
+    pub transcript: &'a [TranscriptLine],
     pub scroll_offset: usize,
     pub left_status: Option<StatusFragment>,
     pub pending_count: usize,
@@ -372,19 +386,17 @@ fn render_prompt_frame(args: PromptFrameArgs<'_>) -> String {
     frame
 }
 
-fn render_transcript_line(line: &str, width: usize) -> String {
-    let Some(content) = line
-        .strip_prefix(USER_INPUT_BACKGROUND)
-        .and_then(|line| line.strip_suffix(ANSI_RESET))
-    else {
-        return line.to_string();
-    };
-
-    let padding = width.saturating_sub(content.chars().count());
-    format!(
-        "{USER_INPUT_BACKGROUND}{content}{}{ANSI_RESET}",
-        " ".repeat(padding)
-    )
+fn render_transcript_line(line: &TranscriptLine, width: usize) -> String {
+    match line {
+        TranscriptLine::Plain(content) => content.clone(),
+        TranscriptLine::UserInput(content) => {
+            let padding = width.saturating_sub(content.chars().count());
+            format!(
+                "{USER_INPUT_BACKGROUND}{content}{}{ANSI_RESET}",
+                " ".repeat(padding)
+            )
+        }
+    }
 }
 
 fn wrapped_input_lines(input: &str, width: usize, prompt_prefix: &str) -> Vec<String> {
@@ -596,9 +608,9 @@ impl Completer for OranguHelper {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_RESET, StatusFragment, THINKING_TEXT, USER_INPUT_BACKGROUND, WORKING_TEXT,
-        available_output_rows, prompt_prefix, render_status_line, render_thinking_status,
-        render_transcript_line, render_working_status, wrapped_input_lines,
+        ANSI_RESET, StatusFragment, THINKING_TEXT, TranscriptLine, USER_INPUT_BACKGROUND,
+        WORKING_TEXT, available_output_rows, prompt_prefix, render_status_line,
+        render_thinking_status, render_transcript_line, render_working_status, wrapped_input_lines,
     };
     use std::time::Duration;
 
@@ -670,7 +682,7 @@ mod tests {
     #[test]
     fn transcript_input_highlight_fills_the_row() {
         let rendered = render_transcript_line(
-            &format!("{USER_INPUT_BACKGROUND}> Hello World!{ANSI_RESET}"),
+            &TranscriptLine::UserInput("> Hello World!".to_string()),
             20,
         );
 

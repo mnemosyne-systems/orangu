@@ -35,8 +35,8 @@ use orangu::{
     session::ChatSession,
     tools::{ToolExecutor, resolve_workspace_path},
     tui::{
-        HeaderStatus, ScreenRenderArgs, StatusFragment, help_text, output_view_rows, render_screen,
-        render_thinking_status, render_working_status,
+        HeaderStatus, ScreenRenderArgs, StatusFragment, TranscriptLine, help_text, output_view_rows,
+        render_screen, render_thinking_status, render_working_status,
     },
 };
 use serde::Deserialize;
@@ -348,14 +348,12 @@ async fn run() -> Result<()> {
 
 #[derive(Default)]
 struct OutputState {
-    transcript: Vec<String>,
+    transcript: Vec<TranscriptLine>,
     scroll_offset: usize,
 }
 
-const USER_INPUT_BACKGROUND: &str = "\x1b[48;2;44;44;44m";
-
 impl OutputState {
-    fn lines(&self) -> &[String] {
+    fn lines(&self) -> &[TranscriptLine] {
         &self.transcript
     }
 
@@ -369,19 +367,19 @@ impl OutputState {
     }
 
     fn push_text(&mut self, text: &str) {
-        self.push_lines(text.lines().map(ToOwned::to_owned));
+        self.push_lines(text.lines().map(|line| TranscriptLine::Plain(line.to_owned())));
     }
 
     fn push_input(&mut self, text: &str) {
         self.push_lines(
             text.lines()
-                .map(|line| style_transcript_input_line(line.to_string())),
+                .map(|line| TranscriptLine::UserInput(line.to_owned())),
         );
     }
 
     fn push_lines<I>(&mut self, lines: I)
     where
-        I: Iterator<Item = String>,
+        I: Iterator<Item = TranscriptLine>,
     {
         let collected = lines.collect::<Vec<_>>();
         let added_lines = collected.len();
@@ -412,10 +410,6 @@ impl OutputState {
     fn page_down(&mut self, rows: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows.max(1));
     }
-}
-
-fn style_transcript_input_line(line: String) -> String {
-    format!("{USER_INPUT_BACKGROUND}{line}{ANSI_RESET}")
 }
 
 enum InterruptAction {
@@ -595,7 +589,8 @@ fn show_file_output_with_bat(path: &Path) -> Result<Option<String>> {
 }
 
 fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOptions)> {
-    let args = shell_words(raw_args).map_err(|_| anyhow!(show_file_usage_message()))?;
+    let args = shell_words(raw_args)
+        .map_err(|_| LocalError::Usage(show_file_usage_message().to_string()))?;
     let mut options = ShowFileOptions::default();
     let mut path = None;
 
@@ -604,19 +599,21 @@ fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOptions)
             "--hash" => options.show_hash = true,
             "--author" => options.show_author = true,
             _ if arg.starts_with('-') => {
-                return Err(anyhow!(
+                return Err(LocalError::Usage(format!(
                     "Unknown option '{arg}'. {}",
                     show_file_usage_message()
-                ));
+                ))
+                .into());
             }
             _ if path.is_none() => path = Some(arg),
             _ => {
-                return Err(anyhow!(show_file_usage_message()));
+                return Err(LocalError::Usage(show_file_usage_message().to_string()).into());
             }
         }
     }
 
-    let path = path.ok_or_else(|| anyhow!(show_file_usage_message()))?;
+    let path =
+        path.ok_or_else(|| LocalError::Usage(show_file_usage_message().to_string()))?;
     Ok((path, options))
 }
 
@@ -636,12 +633,26 @@ fn connect_usage_message() -> &'static str {
     "Usage: /connect <endpoint>. Use /help to see available commands."
 }
 
+#[derive(Debug)]
+enum LocalError {
+    Usage(String),
+}
+
+impl std::fmt::Display for LocalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocalError::Usage(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for LocalError {}
+
 fn local_command_error(err: Error) -> CommandOutcome {
-    let message = format!("{err:#}");
-    if message.starts_with("Usage: ") {
-        CommandOutcome::Output(message)
+    if err.is::<LocalError>() {
+        CommandOutcome::Output(format!("{err}"))
     } else {
-        CommandOutcome::Output(format!("Error: {message}"))
+        CommandOutcome::Output(format!("Error: {err:#}"))
     }
 }
 
@@ -1169,63 +1180,16 @@ impl InputState {
     }
 
     fn delete_backward_readline_word(&mut self) {
-        if self.cursor == 0 {
-            return;
+        let start = readline_word_start(&self.buffer, self.cursor);
+        if start < self.cursor {
+            self.buffer.drain(start..self.cursor);
+            self.cursor = start;
+            self.completion = None;
         }
-
-        let mut start = self.cursor;
-        while let Some(previous) = previous_boundary(&self.buffer, start) {
-            if self.buffer[previous..start]
-                .chars()
-                .all(|ch| !is_readline_word_char(ch))
-            {
-                start = previous;
-            } else {
-                break;
-            }
-        }
-
-        while let Some(previous) = previous_boundary(&self.buffer, start) {
-            if self.buffer[previous..start]
-                .chars()
-                .all(is_readline_word_char)
-            {
-                start = previous;
-            } else {
-                break;
-            }
-        }
-
-        self.buffer.drain(start..self.cursor);
-        self.cursor = start;
-        self.completion = None;
     }
 
     fn delete_forward_readline_word(&mut self) {
-        if self.cursor >= self.buffer.len() {
-            return;
-        }
-
-        let mut end = self.cursor;
-        while let Some(next) = next_boundary(&self.buffer, end) {
-            if self.buffer[end..next]
-                .chars()
-                .all(|ch| !is_readline_word_char(ch))
-            {
-                end = next;
-            } else {
-                break;
-            }
-        }
-
-        while let Some(next) = next_boundary(&self.buffer, end) {
-            if self.buffer[end..next].chars().all(is_readline_word_char) {
-                end = next;
-            } else {
-                break;
-            }
-        }
-
+        let end = readline_word_end(&self.buffer, self.cursor);
         if end > self.cursor {
             self.buffer.drain(self.cursor..end);
             self.completion = None;
@@ -1233,64 +1197,19 @@ impl InputState {
     }
 
     fn move_backward_readline_word(&mut self) {
-        if self.cursor == 0 {
-            return;
+        let start = readline_word_start(&self.buffer, self.cursor);
+        if start != self.cursor {
+            self.cursor = start;
+            self.completion = None;
         }
-
-        let mut start = self.cursor;
-        while let Some(previous) = previous_boundary(&self.buffer, start) {
-            if self.buffer[previous..start]
-                .chars()
-                .all(|ch| !is_readline_word_char(ch))
-            {
-                start = previous;
-            } else {
-                break;
-            }
-        }
-
-        while let Some(previous) = previous_boundary(&self.buffer, start) {
-            if self.buffer[previous..start]
-                .chars()
-                .all(is_readline_word_char)
-            {
-                start = previous;
-            } else {
-                break;
-            }
-        }
-
-        self.cursor = start;
-        self.completion = None;
     }
 
     fn move_forward_readline_word(&mut self) {
-        if self.cursor >= self.buffer.len() {
-            return;
+        let end = readline_word_end(&self.buffer, self.cursor);
+        if end != self.cursor {
+            self.cursor = end;
+            self.completion = None;
         }
-
-        let mut end = self.cursor;
-        while let Some(next) = next_boundary(&self.buffer, end) {
-            if self.buffer[end..next]
-                .chars()
-                .all(|ch| !is_readline_word_char(ch))
-            {
-                end = next;
-            } else {
-                break;
-            }
-        }
-
-        while let Some(next) = next_boundary(&self.buffer, end) {
-            if self.buffer[end..next].chars().all(is_readline_word_char) {
-                end = next;
-            } else {
-                break;
-            }
-        }
-
-        self.cursor = end;
-        self.completion = None;
     }
 }
 
@@ -1330,7 +1249,7 @@ struct RenderContext<'a> {
 
 #[derive(Clone)]
 struct ScreenState<'a> {
-    transcript: &'a [String],
+    transcript: &'a [TranscriptLine],
     scroll_offset: usize,
     left_status: Option<StatusFragment>,
     pending_count: usize,
@@ -2043,8 +1962,47 @@ fn next_boundary(input: &str, cursor: usize) -> Option<usize> {
         .or_else(|| (cursor < input.len()).then_some(input.len()))
 }
 
+// Underscore is not a word char: Alt+Backspace/Alt+D stop at `_` boundaries in identifiers and paths.
 fn is_readline_word_char(ch: char) -> bool {
     ch.is_alphanumeric()
+}
+
+fn readline_word_start(buffer: &str, cursor: usize) -> usize {
+    let mut pos = cursor;
+    while let Some(prev) = previous_boundary(buffer, pos) {
+        if buffer[prev..pos].chars().all(|ch| !is_readline_word_char(ch)) {
+            pos = prev;
+        } else {
+            break;
+        }
+    }
+    while let Some(prev) = previous_boundary(buffer, pos) {
+        if buffer[prev..pos].chars().all(is_readline_word_char) {
+            pos = prev;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+fn readline_word_end(buffer: &str, cursor: usize) -> usize {
+    let mut pos = cursor;
+    while let Some(next) = next_boundary(buffer, pos) {
+        if buffer[pos..next].chars().all(|ch| !is_readline_word_char(ch)) {
+            pos = next;
+        } else {
+            break;
+        }
+    }
+    while let Some(next) = next_boundary(buffer, pos) {
+        if buffer[pos..next].chars().all(is_readline_word_char) {
+            pos = next;
+        } else {
+            break;
+        }
+    }
+    pos
 }
 
 enum CommandOutcome {
@@ -2451,7 +2409,7 @@ fn quote_shell_argument(argument: &str) -> String {
     if !argument.is_empty()
         && !argument
             .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\' | '$' | '`'))
     {
         return argument.to_string();
     }
@@ -2459,7 +2417,7 @@ fn quote_shell_argument(argument: &str) -> String {
     let mut quoted = String::from("\"");
     for ch in argument.chars() {
         match ch {
-            '"' | '\\' => {
+            '"' | '\\' | '$' | '`' => {
                 quoted.push('\\');
                 quoted.push(ch);
             }
@@ -2585,7 +2543,7 @@ fn open_in_editor(workspace: &Path, raw_path: &str) -> Result<()> {
 
 fn git_workspace_diff(workspace: &Path) -> Result<String> {
     let Some(repo_root) = discover_git_root(workspace) else {
-        return legacy_workspace_diff(workspace);
+        return workspace_is_not_git(workspace);
     };
     let terminal_width = current_terminal_width();
     let workspace_pathspec = workspace
@@ -2704,7 +2662,7 @@ fn run_git_diff_pager(
         .spawn()
         .with_context(|| format!("failed to launch configured git pager '{pager_command}'"))?;
 
-    if let Some(stdin) = pager.stdin.as_mut() {
+    if let Some(mut stdin) = pager.stdin.take() {
         stdin
             .write_all(diff)
             .with_context(|| format!("failed to write diff to git pager '{pager_command}'"))?;
@@ -2728,7 +2686,7 @@ fn run_git_diff_pager(
     String::from_utf8(output.stdout).context("git pager output was not UTF-8")
 }
 
-fn legacy_workspace_diff(_workspace: &Path) -> Result<String> {
+fn workspace_is_not_git(_workspace: &Path) -> Result<String> {
     Err(anyhow!("diff is only available inside a Git repository"))
 }
 
@@ -3303,7 +3261,7 @@ mod tests {
         llm::{StreamMetrics, StreamPromptProgress, normalized_openai_endpoint},
         session::ChatSession,
         tools::ToolExecutor,
-        tui::HeaderStatus,
+        tui::{HeaderStatus, TranscriptLine},
     };
     use std::collections::HashMap;
     use std::{
@@ -3448,11 +3406,11 @@ mod tests {
 
         assert_eq!(output_state.lines().len(), 10_000);
         assert_eq!(
-            output_state.lines().first().map(String::as_str),
+            output_state.lines().first().map(TranscriptLine::as_str),
             Some("line 5")
         );
         assert_eq!(
-            output_state.lines().last().map(String::as_str),
+            output_state.lines().last().map(TranscriptLine::as_str),
             Some("line 10004")
         );
     }
@@ -3464,13 +3422,11 @@ mod tests {
         output_state.push_input("> show README.md");
         output_state.push_text("plain output");
 
-        assert_eq!(
-            output_state.lines().first().map(String::as_str),
-            Some("\x1b[48;2;44;44;44m> show README.md\x1b[0m")
+        assert!(
+            matches!(output_state.lines().first(), Some(TranscriptLine::UserInput(s)) if s == "> show README.md")
         );
-        assert_eq!(
-            output_state.lines().get(1).map(String::as_str),
-            Some("plain output")
+        assert!(
+            matches!(output_state.lines().get(1), Some(TranscriptLine::Plain(s)) if s == "plain output")
         );
     }
 
@@ -4527,7 +4483,10 @@ mod tests {
 
         assert_eq!(
             output_state.lines(),
-            &["partial reply".to_string(), request_cancelled_message()]
+            &[
+                TranscriptLine::Plain("partial reply".to_string()),
+                TranscriptLine::Plain(request_cancelled_message()),
+            ]
         );
     }
 
