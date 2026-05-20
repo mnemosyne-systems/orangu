@@ -121,7 +121,7 @@ pub enum LocalCommand<'a> {
     Tools,
     ModelInfo,
     SetModel(&'a str),
-    Diff,
+    Diff(Option<Cow<'a, str>>),
     Status,
     Log,
     Pull(Option<u64>),
@@ -178,7 +178,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/open_file" => Some(LocalCommand::OpenFile("")),
         "/tools" => Some(LocalCommand::Tools),
         "/model" => Some(LocalCommand::ModelInfo),
-        "/diff" => Some(LocalCommand::Diff),
+        "/diff" => Some(LocalCommand::Diff(None)),
         "/status" => Some(LocalCommand::Status),
         "/log" => Some(LocalCommand::Log),
         "/pull" => Some(LocalCommand::Pull(None)),
@@ -200,6 +200,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         _ => {
             if let Some(endpoint) = input.strip_prefix("/connect ") {
                 return Some(LocalCommand::ConnectTo(endpoint.trim()));
+            }
+            if let Some(args) = input.strip_prefix("/diff ") {
+                let branch = args.trim();
+                return Some(LocalCommand::Diff(if branch.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(branch))
+                }));
             }
             if let Some(name) = input.strip_prefix("/model ") {
                 return Some(LocalCommand::SetModel(name.trim()));
@@ -364,7 +372,17 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::ModelInfo);
     }
     if matches_ci(input, &["diff", "show diff", "git diff"]) {
-        return Some(LocalCommand::Diff);
+        return Some(LocalCommand::Diff(None));
+    }
+    for prefix in ["diff against ", "show diff against ", "git diff "] {
+        if let Some(branch) = strip_ascii_prefix(input, prefix) {
+            let branch = branch.trim();
+            return Some(LocalCommand::Diff(if branch.is_empty() {
+                None
+            } else {
+                Some(Cow::Borrowed(branch))
+            }));
+        }
     }
     if matches_ci(input, &["status", "show status", "git status"]) {
         return Some(LocalCommand::Status);
@@ -874,13 +892,14 @@ mod tests {
             _ => panic!("expected show file slash command"),
         }
 
-        let (path, options) = super::super::render::parse_show_file_arguments(
+        let (path, options, rev) = super::super::render::parse_show_file_arguments(
             "--hash --author \"docs/user guide.md\"",
         )
         .expect("show file args");
         assert_eq!(path, "docs/user guide.md");
         assert!(options.show_hash);
         assert!(options.show_author);
+        assert!(rev.is_none());
     }
 
     #[test]
@@ -907,7 +926,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_local_command("diff"),
-            Some(LocalCommand::Diff)
+            Some(LocalCommand::Diff(None))
         ));
         assert!(matches!(
             parse_local_command("list models"),

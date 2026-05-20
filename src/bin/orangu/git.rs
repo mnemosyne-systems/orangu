@@ -173,6 +173,52 @@ pub fn workspace_is_not_git(_workspace: &Path) -> Result<String> {
     Err(anyhow!("diff is only available inside a Git repository"))
 }
 
+pub fn git_show_file_content(workspace: &Path, file_path: &Path, rev: &str) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("git show is only available inside a Git repository"))?;
+    let relative = file_path.strip_prefix(&repo_root).unwrap_or(file_path);
+    let spec = format!("{rev}:{}", relative.display());
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["show", &spec])
+        .output()
+        .context("failed to run git show")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git show failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    String::from_utf8(output.stdout).context("git show output was not UTF-8")
+}
+
+pub fn git_file_commit_hashes(repo_root: &Path, relative_path: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["log", "--follow", "--format=%h", "--"])
+        .arg(relative_path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn list_workspace_files_tree(workspace: &Path) -> Result<String> {
     let mut lines = vec![workspace.display().to_string()];
     append_workspace_tree(workspace, "", &mut lines)?;
@@ -305,6 +351,46 @@ pub fn git_workspace_diff(workspace: &Path) -> Result<String> {
     };
     if diff.trim().is_empty() {
         Ok("No changes against the current branch.".to_string())
+    } else {
+        Ok(diff)
+    }
+}
+
+pub fn git_diff_against_branch(workspace: &Path, branch: &str) -> Result<String> {
+    let Some(repo_root) = discover_git_root(workspace) else {
+        return workspace_is_not_git(workspace);
+    };
+    let terminal_width = current_terminal_width();
+
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("diff")
+        .arg("--color=always")
+        .arg(format!("{branch}...HEAD"));
+    command.env("COLUMNS", terminal_width.to_string());
+
+    let output = command.output().context("failed to run git diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git diff failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+
+    let diff = if let Some(pager_command) = configured_git_diff_pager(&repo_root)? {
+        run_git_diff_pager(&repo_root, &pager_command, &output.stdout, terminal_width)?
+    } else {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    if diff.trim().is_empty() {
+        Ok(format!("No changes against {branch}."))
     } else {
         Ok(diff)
     }

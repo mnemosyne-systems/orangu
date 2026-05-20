@@ -19,7 +19,8 @@ use walkdir::WalkDir;
 
 use super::commands::{shell_words, strip_ascii_prefix};
 use super::git::{
-    discover_git_root, git_branch_names, git_local_branch_names, git_tag_names, is_protected_branch,
+    discover_git_root, git_branch_names, git_file_commit_hashes, git_local_branch_names,
+    git_tag_names, is_protected_branch,
 };
 
 pub const COMMANDS: &[&str] = &[
@@ -113,6 +114,26 @@ pub fn completion_candidates(
 
     if let Some((start, candidates)) = cherry_pick_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
+    }
+
+    if let Some((start, branch_prefix)) = diff_completion_prefix(prefix) {
+        let branches = discover_git_root(workspace)
+            .map(|root| {
+                let local = git_local_branch_names(&root);
+                let all = git_branch_names(&root);
+                let local_set: std::collections::HashSet<&str> =
+                    local.iter().map(String::as_str).collect();
+                let remote_only: Vec<String> = all
+                    .into_iter()
+                    .filter(|b| !local_set.contains(b.as_str()))
+                    .collect();
+                local.into_iter().chain(remote_only).collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| b.starts_with(branch_prefix))
+            .collect();
+        return Some((start, cursor, branches));
     }
 
     if let Some((start, branch_prefix)) = merge_completion_prefix(prefix) {
@@ -230,7 +251,28 @@ pub fn show_file_completion_candidates(
     let mut candidates = if token.starts_with('-') {
         show_file_flag_candidates(token)
     } else if has_path {
-        Vec::new()
+        let path_str = previous_tokens
+            .iter()
+            .find(|t| !t.starts_with('-'))
+            .map(String::as_str)
+            .unwrap_or("");
+        discover_git_root(workspace)
+            .map(|root| {
+                let resolved = if std::path::Path::new(path_str).is_absolute() {
+                    std::path::PathBuf::from(path_str)
+                } else {
+                    workspace.join(path_str)
+                };
+                let relative = resolved
+                    .strip_prefix(&root)
+                    .unwrap_or(resolved.as_path())
+                    .to_path_buf();
+                git_file_commit_hashes(&root, &relative)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| h.starts_with(token))
+            .collect()
     } else {
         open_file_completion_candidates(token, workspace)
     };
@@ -426,6 +468,18 @@ pub fn cherry_pick_completion_candidates(
         .map(|root| git_commit_hashes(&root, token))
         .unwrap_or_default();
     Some((cmd_len, candidates))
+}
+
+pub fn diff_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
+    if let Some(branch) = prefix.strip_prefix("/diff ") {
+        return Some(("/diff ".len(), branch));
+    }
+    for command_prefix in ["diff against ", "show diff against ", "git diff "] {
+        if let Some(branch) = strip_ascii_prefix(prefix, command_prefix) {
+            return Some((prefix.len() - branch.len(), branch));
+        }
+    }
+    None
 }
 
 pub fn merge_completion_prefix(prefix: &str) -> Option<(usize, &str)> {

@@ -129,35 +129,35 @@ pub fn render_header(
 }
 
 pub fn help_text() -> &'static str {
-    r#"/help                                 Show available commands
-/connect [url]                        Connect to the configured server, or a specific server
-/disconnect                           Disconnect from the current server
-/reload                               Restore the configured model and server
-/list_models                          List models
-/list_files                           List workspace files as a tree
-/show_file [--hash] [--author] <path> Show a file with optional Git metadata
-/tools                                List tools
-/model [name]                         Switch to the configured model, or a specific model
-/diff                                 Show a color unified diff against the current branch
-/status                               Show working tree status with color highlighting
-/log                                  Show commit log (uses git lg alias if configured)
-/pull <number>                        Check out a GitHub pull request on a dedicated branch
-/rebase                               Rebase the current branch against master/main
-/merge <branch>                       Merge a branch into the current branch
-/checkout <branch|file>               Switch branch or restore a file
-/add_file <path>                      Stage a file or directory with git add
-/remove_file <path>                   Remove a file or directory from Git tracking
-/move_file <source> <destination>     Rename or move a tracked file with git mv
-/cherry_pick <commit>                 Cherry-pick a commit onto the current branch
-/commit <message>                     Commit all tracked changes with git commit -a -m
-/amend <message>                      Rewrite the last commit message with git commit --amend
-/push [--force]                       Push the current branch to origin
-/init_repo                            Initialize a Git repository in the workspace
-/squash                               Squash all branch commits into one
-/delete <branch>                      Delete a local branch with git branch -D
-/open_file <path>                     Open a workspace file in $EDITOR
-/clear                                Clear the current conversation
-/quit                                 Exit the client
+    r#"/help                                         Show available commands
+/connect [url]                                Connect to the configured server, or a specific server
+/disconnect                                   Disconnect from the current server
+/reload                                       Restore the configured model and server
+/list_models                                  List models
+/list_files                                   List workspace files as a tree
+/show_file [--hash] [--author] <path> [<ref>] Show a file; optional ref uses git show
+/tools                                        List tools
+/model [name]                                 Switch to the configured model, or a specific model
+/diff                                         Show a color unified diff against the current branch
+/status                                       Show working tree status with color highlighting
+/log                                          Show commit log (uses git lg alias if configured)
+/pull <number>                                Check out a GitHub pull request on a dedicated branch
+/rebase                                       Rebase the current branch against master/main
+/merge <branch>                               Merge a branch into the current branch
+/checkout <branch|file>                       Switch branch or restore a file
+/add_file <path>                              Stage a file or directory with git add
+/remove_file <path>                           Remove a file or directory from Git tracking
+/move_file <source> <destination>             Rename or move a tracked file with git mv
+/cherry_pick <commit>                         Cherry-pick a commit onto the current branch
+/commit <message>                             Commit all tracked changes with git commit -a -m
+/amend <message>                              Rewrite the last commit message with git commit --amend
+/push [--force]                               Push the current branch to origin
+/init_repo                                    Initialize a Git repository in the workspace
+/squash                                       Squash all branch commits into one
+/delete <branch>                              Delete a local branch with git branch -D
+/open_file <path>                             Open a workspace file in $EDITOR
+/clear                                        Clear the current conversation
+/quit                                         Exit the client
 
 Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `init repo`, `delete feature/foo`, and `show help` are also handled locally.
 

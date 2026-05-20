@@ -28,7 +28,7 @@ use syntect::{
 };
 
 use super::commands::{LocalError, ShowFileOptions, current_terminal_width, shell_words};
-use super::git::discover_git_root;
+use super::git::{discover_git_root, git_show_file_content};
 use orangu::tools::{ToolExecutor, resolve_workspace_path};
 
 pub const ANSI_BOLD_ON: &str = "\x1b[1m";
@@ -74,8 +74,23 @@ pub fn syntax_highlight_assets() -> &'static SyntaxHighlightAssets {
 }
 
 pub fn show_file_output(workspace: &Path, raw_args: &str) -> Result<String> {
-    let (path, options) = parse_show_file_arguments(raw_args)?;
+    let (path, options, rev) = parse_show_file_arguments(raw_args)?;
     let resolved_path = resolve_workspace_path(workspace, &path)?;
+
+    if let Some(ref rev) = rev {
+        let content = git_show_file_content(workspace, &resolved_path, rev)?;
+        let blame = if options.show_hash || options.show_author {
+            Some(git_blame_metadata_at_rev(
+                workspace,
+                &resolved_path,
+                Some(rev),
+            )?)
+        } else {
+            None
+        };
+        return render_show_file_content(&resolved_path, &content, blame.as_deref(), options);
+    }
+
     if !options.show_hash
         && !options.show_author
         && let Some(output) = show_file_output_with_bat(&resolved_path)?
@@ -127,11 +142,14 @@ pub fn show_file_output_with_bat(path: &Path) -> Result<Option<String>> {
         .with_context(|| format!("bat output for {} was not UTF-8", path.display()))
 }
 
-pub fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOptions)> {
+pub fn parse_show_file_arguments(
+    raw_args: &str,
+) -> Result<(String, ShowFileOptions, Option<String>)> {
     let args = shell_words(raw_args)
         .map_err(|_| LocalError::Usage(show_file_usage_message().to_string()))?;
     let mut options = ShowFileOptions::default();
     let mut path = None;
+    let mut rev = None;
 
     for arg in args {
         match arg.as_str() {
@@ -145,6 +163,7 @@ pub fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOpti
                 .into());
             }
             _ if path.is_none() => path = Some(arg),
+            _ if rev.is_none() => rev = Some(arg),
             _ => {
                 return Err(LocalError::Usage(show_file_usage_message().to_string()).into());
             }
@@ -152,11 +171,11 @@ pub fn parse_show_file_arguments(raw_args: &str) -> Result<(String, ShowFileOpti
     }
 
     let path = path.ok_or_else(|| LocalError::Usage(show_file_usage_message().to_string()))?;
-    Ok((path, options))
+    Ok((path, options, rev))
 }
 
 pub fn show_file_usage_message() -> &'static str {
-    "Usage: /show_file [--hash] [--author] <path>. Use /help to see available commands."
+    "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands."
 }
 
 pub fn render_show_file_content(
@@ -246,17 +265,29 @@ pub fn format_show_file_line(
 }
 
 pub fn git_blame_metadata(workspace: &Path, path: &Path) -> Result<Vec<GitLineMetadata>> {
+    git_blame_metadata_at_rev(workspace, path, None)
+}
+
+pub fn git_blame_metadata_at_rev(
+    workspace: &Path,
+    path: &Path,
+    rev: Option<&str>,
+) -> Result<Vec<GitLineMetadata>> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("Git blame metadata is only available inside a Git repository"))?;
     let relative_path = path
         .strip_prefix(&repo_root)
         .with_context(|| format!("{} is outside the Git repository", path.display()))?;
-    let output = std::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
         .arg(&repo_root)
         .arg("blame")
         .arg("--line-porcelain")
-        .arg("--abbrev=8")
+        .arg("--abbrev=8");
+    if let Some(rev) = rev {
+        cmd.arg(rev);
+    }
+    let output = cmd
         .arg("--")
         .arg(relative_path)
         .output()

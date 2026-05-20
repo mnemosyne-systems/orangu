@@ -67,10 +67,10 @@ All slash commands are handled locally. They are not sent to the model.
 | `/reload` | Restore the configured model and server |
 | `/list_models` | List models |
 | `/list_files` | List workspace files as a tree |
-| `/show_file [--hash] [--author] <path>` | Show a file with optional Git metadata |
+| `/show_file [--hash] [--author] <path> [<ref>]` | Show a file; optional ref shows that commit via git show |
 | `/tools` | List tools |
 | `/model [name]` | Switch to the configured model, or a specific model |
-| `/diff` | Show a color unified diff against the current branch |
+| `/diff [branch]` | Show a color unified diff; without a branch shows unstaged changes, with a branch shows changes since diverging from it |
 | `/status` | Show working tree status with color highlighting |
 | `/log` | Show commit log (uses `git lg` alias if configured) |
 | `/pull <number>` | Check out a GitHub pull request on a dedicated branch |
@@ -99,8 +99,8 @@ Free-form prompts are blocked when the server or model status in the header is r
 
 - `/tools` lists the model-facing workspace tools described in the tools chapter
 - `/open_file <path>` is workspace-scoped; paths outside the workspace are rejected
-- `/show_file [--hash] [--author] <path>` is workspace-scoped; when `bat` is installed it is used for the plain file view, otherwise the built-in syntax-highlighted renderer is used, and Git blame hash/author columns still use the built-in renderer
-- `/diff` uses `git diff` inside Git repositories and applies configured non-interactive Git pagers such as `delta`; outside Git repositories it keeps the existing non-Git behavior
+- `/show_file [--hash] [--author] <path> [<ref>]` is workspace-scoped; without a ref, the current workspace file is shown — when `bat` is installed it is used for the plain view, otherwise the built-in syntax-highlighted renderer is used; when a ref (commit hash, branch, or tag) is given, the file content at that ref is retrieved via `git show <ref>:<path>` and rendered with the built-in renderer; `--hash` and `--author` add per-line blame columns sourced from `git blame`, using the same ref when one is provided; Tab completion for the first positional argument offers workspace file paths recursively; Tab completion for the second positional argument cycles through that file's commit history (abbreviated hashes from `git log --follow`)
+- `/diff` uses `git diff` inside Git repositories and applies configured non-interactive Git pagers such as `delta`; outside Git repositories it keeps the existing non-Git behavior; `/diff <branch>` runs `git diff <branch>...HEAD` to show commits on the current branch not yet in the specified branch; Tab completion after `/diff ` or natural-language forms such as `diff against <branch>` offers local and remote branch names
 - `/status` requires a Git repository and runs `git status --branch --short`; `gh` has no equivalent so it always uses plain Git; added files and untracked entries are shown in green, deleted entries in red, and modified entries in the default terminal color; the branch line is shown in a muted color
 - `/log` requires a Git repository; if a `lg` alias is found in `~/.gitconfig` it runs `git lg`, otherwise it falls back to `git log --graph --oneline --decorate`; see the optional tools chapter for the recommended `git lg` alias setup
 - `/pull <number>` requires a Git repository; if `gh` is installed it uses `gh pr checkout`, otherwise it fetches the pull request directly from `origin`
@@ -200,7 +200,7 @@ The completion modes are checked in order:
 6. If the line starts with `/merge `, or with the natural-language prefixes `merge ` or `git merge `, complete local branch names first (from `git branch`), then remote-only branch names (from `git branch --all`).
 7. If the line starts with `/delete `, or with the natural-language prefixes `delete `, `delete branch `, or `git branch -D `, complete local branch names (from `git branch`) excluding `main` and `master`.
 8. If the line starts with `/model `, complete configured model profile names.
-9. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively. `/show_file` also completes `--hash` and `--author`.
+9. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
 10. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
 11. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
 12. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.

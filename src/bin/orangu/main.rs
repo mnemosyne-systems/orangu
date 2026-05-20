@@ -56,7 +56,8 @@ use commands::{
 };
 use git::{
     add_file_output, amend_output, checkout_output, cherry_pick_output, commit_output,
-    delete_branch_output, git_workspace_diff, init_repo_output, list_workspace_files_tree,
+    delete_branch_output, git_diff_against_branch, git_workspace_diff, init_repo_output,
+    list_workspace_files_tree,
     log_output, merge_output, move_file_output, open_in_editor, pull_request_output, push_output,
     rebase_output, remove_file_output, squash_output, status_output, workspace_branch_name,
 };
@@ -479,7 +480,11 @@ fn handle_command(
             session.set_system_prompt(system_prompt(profile));
             Ok(CommandOutcome::Quiet)
         }
-        LocalCommand::Diff => match git_workspace_diff(workspace) {
+        LocalCommand::Diff(None) => match git_workspace_diff(workspace) {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Err(err) => Ok(local_command_error(err)),
+        },
+        LocalCommand::Diff(Some(branch)) => match git_diff_against_branch(workspace, &branch) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
@@ -1427,11 +1432,11 @@ mod tests {
         for (input, expected) in [
             (
                 "/show_file",
-                "Usage: /show_file [--hash] [--author] <path>. Use /help to see available commands.",
+                "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands.",
             ),
             (
                 "/show_file --hash",
-                "Usage: /show_file [--hash] [--author] <path>. Use /help to see available commands.",
+                "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands.",
             ),
             (
                 "/open_file",
@@ -1525,11 +1530,16 @@ mod tests {
             _ => panic!("expected show file slash command"),
         }
 
-        let (path, options) = parse_show_file_arguments("--hash --author \"docs/user guide.md\"")
-            .expect("show file args");
+        let (path, options, rev) =
+            parse_show_file_arguments("--hash --author \"docs/user guide.md\"")
+                .expect("show file args");
         assert_eq!(path, "docs/user guide.md");
         assert!(options.show_hash);
         assert!(options.show_author);
+        assert!(rev.is_none());
+        let (path2, _, rev2) = parse_show_file_arguments("src/main.rs abc1234").expect("path+rev");
+        assert_eq!(path2, "src/main.rs");
+        assert_eq!(rev2.as_deref(), Some("abc1234"));
     }
 
     #[test]
