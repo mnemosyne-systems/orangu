@@ -139,6 +139,7 @@ pub enum LocalCommand<'a> {
     Squash,
     DeleteBranch(Option<Cow<'a, str>>),
     OpenFile(&'a str),
+    Sessions(Option<Cow<'a, str>>),
     Usage,
     Build,
     Clear,
@@ -198,11 +199,20 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/init_repo" => Some(LocalCommand::InitRepo),
         "/squash" => Some(LocalCommand::Squash),
         "/delete" => Some(LocalCommand::DeleteBranch(None)),
+        "/sessions" => Some(LocalCommand::Sessions(None)),
         "/usage" => Some(LocalCommand::Usage),
         "/build" => Some(LocalCommand::Build),
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
         _ => {
+            if let Some(args) = input.strip_prefix("/sessions ") {
+                let workspace = args.trim();
+                return Some(LocalCommand::Sessions(if workspace.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(workspace))
+                }));
+            }
             if let Some(endpoint) = input.strip_prefix("/connect ") {
                 return Some(LocalCommand::ConnectTo(endpoint.trim()));
             }
@@ -569,6 +579,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::DeleteBranch(Some(Cow::Borrowed(branch))));
             }
         }
+    }
+    if matches_ci(input, &["sessions", "list sessions", "show sessions"]) {
+        return Some(LocalCommand::Sessions(None));
     }
     if matches_ci(input, &["usage", "show usage"]) {
         return Some(LocalCommand::Usage);

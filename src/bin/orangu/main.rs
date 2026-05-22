@@ -32,12 +32,12 @@ use crossterm::{
 };
 use orangu::{
     config::{LlmConfiguration, default_client_config_path, load_client_configuration},
-    llm::{StreamMetrics, normalized_openai_endpoint},
+    llm::{ChatMessage, StreamMetrics, normalized_openai_endpoint},
     session::ChatSession,
     tools::ToolExecutor,
     tui::{ScreenRenderArgs, render_screen, render_thinking_status, render_working_status},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::Write,
@@ -46,6 +46,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tiktoken_rs::cl100k_base;
+use uuid::Uuid;
 
 use anyhow::Error;
 use commands::{
@@ -74,8 +75,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TERMINAL_TITLE: &str = "orangu";
 const WAIT_LOOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const THINKING_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
-const HISTORY_DIRECTORY: &str = ".orangu";
-const HISTORY_FILE: &str = "orangu.history";
+const SESSIONS_DIRECTORY: &str = ".orangu/sessions";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -83,6 +83,8 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long)]
     workspace: Option<PathBuf>,
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[tokio::main]
@@ -127,15 +129,46 @@ async fn run() -> Result<()> {
             .ok_or_else(|| anyhow!("missing configured profile {}", active_model))?,
     ));
     let mut current_endpoint = Some(startup_endpoint.clone());
+
+    let session_id = match &args.resume {
+        Some(id) => id.clone(),
+        None => Uuid::new_v4().to_string(),
+    };
+    let session_dir = session_dir_path(&session_id)?;
+    std::fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "failed to create session directory {}",
+            session_dir.display()
+        )
+    })?;
+    let session_hist_path = session_dir.join("history");
+    let session_messages_path = session_dir.join("messages");
+    let session_metadata_path = session_dir.join("metadata");
+
+    if args.resume.is_none() {
+        save_session_metadata(
+            &session_metadata_path,
+            &SessionMetadata {
+                started_at: current_unix_timestamp(),
+                last_updated_at: current_unix_timestamp(),
+                workspace: workspace.display().to_string(),
+            },
+        )?;
+    }
+
+    if args.resume.is_some() {
+        let messages = load_session_messages(&session_messages_path)?;
+        session.restore(messages);
+    }
+
     let _terminal_ui_guard = TerminalUiGuard::new()?;
 
     let mut output_state = OutputState::default();
     let mut interrupt_state = InterruptState::default();
     let mut input_state = InputState::default();
     let mut pending_commands = VecDeque::new();
-    let mut usage_stats = UsageStats::new();
-    let history_path = history_file_path()?;
-    let mut history = load_history(&history_path)?;
+    let mut usage_stats = UsageStats::new().with_session(&session_id);
+    let mut history = load_history(&session_hist_path)?;
     let status_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()?;
@@ -195,7 +228,7 @@ async fn run() -> Result<()> {
                     let Some(trimmed) = prepare_submitted_input(
                         &line,
                         &mut history,
-                        &history_path,
+                        &session_hist_path,
                         &mut output_state,
                         None,
                     )?
@@ -206,6 +239,8 @@ async fn run() -> Result<()> {
                 }
                 InputResult::Refresh => continue,
                 InputResult::Quit => {
+                    save_session_messages(&session_messages_path, session.messages())?;
+                    update_session_metadata_timestamp(&session_metadata_path)?;
                     print!("{CLEAR_TERMINAL_SEQUENCE}");
                     std::io::stdout().flush()?;
                     break;
@@ -246,6 +281,8 @@ async fn run() -> Result<()> {
             },
         )? {
             CommandOutcome::Quit => {
+                save_session_messages(&session_messages_path, session.messages())?;
+                update_session_metadata_timestamp(&session_metadata_path)?;
                 print!("{CLEAR_TERMINAL_SEQUENCE}");
                 std::io::stdout().flush()?;
                 break;
@@ -298,7 +335,7 @@ async fn run() -> Result<()> {
                     header_status,
                 },
                 history: &mut history,
-                history_path: &history_path,
+                history_path: &session_hist_path,
                 model_names: &model_names,
                 interrupt_state: &mut interrupt_state,
                 output_state: &mut output_state,
@@ -317,6 +354,8 @@ async fn run() -> Result<()> {
                 preserve_cancelled_output(&mut output_state, &partial_output);
             }
             Ok(WaitResult::Quit) => {
+                save_session_messages(&session_messages_path, session.messages())?;
+                update_session_metadata_timestamp(&session_metadata_path)?;
                 print!("{CLEAR_TERMINAL_SEQUENCE}");
                 std::io::stdout().flush()?;
                 break;
@@ -326,6 +365,8 @@ async fn run() -> Result<()> {
         output_state.reset_scroll();
     }
 
+    drop(_terminal_ui_guard);
+    eprintln!("orangu --resume {session_id}");
     Ok(())
 }
 
@@ -334,6 +375,7 @@ struct UsageStats {
     total_llm_duration: std::time::Duration,
     total_tool_duration: std::time::Duration,
     total_tokens: usize,
+    session_id: String,
 }
 
 impl UsageStats {
@@ -343,7 +385,13 @@ impl UsageStats {
             total_llm_duration: std::time::Duration::ZERO,
             total_tool_duration: std::time::Duration::ZERO,
             total_tokens: 0,
+            session_id: String::new(),
         }
+    }
+
+    fn with_session(mut self, session_id: &str) -> Self {
+        self.session_id = session_id.to_string();
+        self
     }
 
     fn record_response(
@@ -367,12 +415,13 @@ impl UsageStats {
             0.0
         };
         format!(
-            "Application time : {}\nLLM time         : {}\nTool time        : {}\nTotal tokens     : {}\nAvg tokens/sec   : {:.1}",
+            "Application time : {}\nLLM time         : {}\nTool time        : {}\nTotal tokens     : {}\nAvg tokens/sec   : {:.1}\nSession          : {}",
             format_duration(app_elapsed),
             format_duration(self.total_llm_duration),
             format_duration(self.total_tool_duration),
             self.total_tokens,
             avg_tps,
+            self.session_id,
         )
     }
 }
@@ -661,6 +710,10 @@ fn handle_command(
                 Err(err) => Ok(CommandOutcome::Output(format!("Error: {err:#}"))),
             }
         }
+        LocalCommand::Sessions(filter) => match list_sessions_output(filter.as_deref()) {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Err(err) => Ok(local_command_error(err)),
+        },
         LocalCommand::Usage => Ok(CommandOutcome::Output(usage_stats.format())),
         LocalCommand::Build => match build::build_output(workspace) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
@@ -1004,9 +1057,185 @@ async fn probe_header_status(
     }
 }
 
-fn history_file_path() -> Result<PathBuf> {
+fn session_dir_path(session_id: &str) -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
-    Ok(home.join(HISTORY_DIRECTORY).join(HISTORY_FILE))
+    Ok(home.join(SESSIONS_DIRECTORY).join(session_id))
+}
+
+fn load_session_messages(path: &Path) -> Result<Vec<ChatMessage>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session messages {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read session messages {}", path.display()))
+        }
+    }
+}
+
+fn save_session_messages(path: &Path, messages: &[ChatMessage]) -> Result<()> {
+    let json = serde_json::to_string(messages).context("failed to serialize session messages")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write session messages {}", path.display()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionMetadata {
+    started_at: u64,
+    last_updated_at: u64,
+    workspace: String,
+}
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn format_unix_timestamp(secs: u64) -> String {
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let (y, m, d) = days_to_ymd(days);
+    format!("{y:04}{m:02}{d:02}{hour:02}{min:02}")
+}
+
+fn days_to_ymd(mut days: u64) -> (u32, u32, u32) {
+    let mut year = 1970u32;
+    loop {
+        let in_year: u64 = if is_leap_year(year) { 366 } else { 365 };
+        if days < in_year {
+            break;
+        }
+        days -= in_year;
+        year += 1;
+    }
+    let months: [u64; 12] = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u32;
+    for dim in months {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    (year, month, days as u32 + 1)
+}
+
+fn is_leap_year(y: u32) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+fn save_session_metadata(path: &Path, metadata: &SessionMetadata) -> Result<()> {
+    let json = serde_json::to_string(metadata).context("failed to serialize session metadata")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write session metadata {}", path.display()))
+}
+
+fn load_session_metadata(path: &Path) -> Result<Option<SessionMetadata>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session metadata {}", path.display()))
+            .map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read session metadata {}", path.display()))
+        }
+    }
+}
+
+fn update_session_metadata_timestamp(path: &Path) -> Result<()> {
+    if let Ok(Some(mut meta)) = load_session_metadata(path) {
+        meta.last_updated_at = current_unix_timestamp();
+        save_session_metadata(path, &meta)?;
+    }
+    Ok(())
+}
+
+fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
+    let sessions_dir = {
+        let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+        home.join(SESSIONS_DIRECTORY)
+    };
+
+    if !sessions_dir.exists() {
+        return Ok("No sessions found.".to_string());
+    }
+
+    let mut entries: Vec<(String, Option<SessionMetadata>, usize)> = Vec::new();
+
+    for entry in std::fs::read_dir(&sessions_dir).with_context(|| {
+        format!(
+            "failed to read sessions directory {}",
+            sessions_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let uuid = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let meta = load_session_metadata(&path.join("metadata")).ok().flatten();
+        if let Some(filter) = workspace_filter
+            && !meta
+                .as_ref()
+                .map(|m| m.workspace.contains(filter))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let cmd_count = load_history(&path.join("history"))
+            .unwrap_or_default()
+            .len();
+        entries.push((uuid, meta, cmd_count));
+    }
+
+    if entries.is_empty() {
+        return Ok("No sessions found.".to_string());
+    }
+
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.as_ref().map(|m| m.started_at).unwrap_or(0)));
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "{:<36}  {:<12}  {:<12}  {:>4}  {}",
+        "UUID", "STARTED", "LAST", "CMDS", "WORKSPACE"
+    ));
+    for (uuid, meta, cmd_count) in &entries {
+        let started = meta
+            .as_ref()
+            .map(|m| format_unix_timestamp(m.started_at))
+            .unwrap_or_else(|| "-".to_string());
+        let last = meta
+            .as_ref()
+            .map(|m| format_unix_timestamp(m.last_updated_at))
+            .unwrap_or_else(|| "-".to_string());
+        let workspace = meta.as_ref().map(|m| m.workspace.as_str()).unwrap_or("-");
+        lines.push(format!(
+            "{:<36}  {:<12}  {:<12}  {:>4}  {}",
+            uuid, started, last, cmd_count, workspace
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 fn llm_prompt_block_reason(

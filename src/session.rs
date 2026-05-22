@@ -45,6 +45,14 @@ impl ChatSession {
         self.messages.push(ChatMessage::system(system_prompt));
     }
 
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn restore(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
+    }
+
     pub fn checkpoint(&self) -> usize {
         self.messages.len()
     }

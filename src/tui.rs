@@ -156,6 +156,7 @@ pub fn help_text() -> &'static str {
 /squash                                       Squash all branch commits into one
 /delete <branch>                              Delete a local branch with git branch -D
 /open_file <path>                             Open a workspace file in $EDITOR
+/sessions [workspace]                         List all sessions, optionally filtered by workspace path
 /usage                                        Show usage statistics for this session
 /clear                                        Clear the current conversation
 /quit                                         Exit the client

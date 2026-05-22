@@ -79,4 +79,12 @@ Then start with:
 
 By default the tools operate on the current directory. Use `--workspace /path/to/project` to point **orangu** at another tree.
 
+Each run creates a session. When you exit, the resume command is printed:
+
+```text
+orangu --resume 550e8400-e29b-41d4-a716-446655440000
+```
+
+Use `/sessions` to list previous sessions and find a UUID to resume.
+
 Lines whose first non-whitespace character is `#` stay local and are not sent to the model. Lines whose first non-whitespace character is `\` are ignored.

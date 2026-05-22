@@ -42,12 +42,64 @@ When a profile uses `provider = llama.cpp`, the footer starts with `Thinking (<C
 
 Press `Esc` twice within 2 seconds during the waiting state to cancel the active request without exiting the client. Queued commands are preserved.
 
-## History and navigation
+## Sessions
 
-Command history is stored in:
+Each run of `orangu` creates a unique session identified by a UUID. When the client exits, the full resume command is printed so you can resume later:
 
 ```text
-~/.orangu/orangu.history
+orangu --resume 550e8400-e29b-41d4-a716-446655440000
+```
+
+Session data is stored under `~/.orangu/sessions/<uuid>/`:
+
+```text
+history    per-session command history (readline)
+messages   full conversation turn history (JSON array of role/content objects)
+metadata   session metadata (JSON)
+```
+
+The `messages` file preserves the complete conversation so that resuming restores the exact context the model had when the session was last active.
+
+The `metadata` file is a JSON object with three fields:
+
+```json
+{
+  "started_at": 1748000000,
+  "last_updated_at": 1748003600,
+  "workspace": "/home/user/myproject"
+}
+```
+
+Timestamps are Unix seconds (UTC).
+
+To resume a previous session, pass `--resume <uuid>` when starting:
+
+```text
+orangu --resume 550e8400-e29b-41d4-a716-446655440000
+```
+
+This restores the previous conversation context and per-session readline history.
+
+Use `/sessions` to list all sessions:
+
+```text
+UUID                                  STARTED       LAST          CMDS  WORKSPACE
+550e8400-e29b-41d4-a716-446655440000  202605220910  202605221143    42  /home/user/myproject
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  202605210830  202605210831     3  /home/user/other
+```
+
+Pass an optional workspace filter to narrow results:
+
+```text
+/sessions myproject
+```
+
+## History and navigation
+
+Command history is stored per session in:
+
+```text
+~/.orangu/sessions/<uuid>/history
 ```
 
 Use:
@@ -88,6 +140,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/squash` | Squash all branch commits into one using the first commit message |
 | `/delete <branch>` | Delete a local branch |
 | `/open_file <path>` | Open a workspace file in $EDITOR |
+| `/sessions [workspace]` | List all sessions, optionally filtered by workspace path |
 | `/usage` | Show usage statistics for this session |
 | `/build` | Build the workspace project (Rust, C, or Java) |
 | `/clear` | Clear the current conversation |
@@ -120,10 +173,11 @@ Free-form prompts are blocked when the server or model status in the header is r
 - `/init_repo` runs `git init` in the workspace directory; works both inside and outside an existing Git repository (reinitializing an existing repo is safe); `gh` has no equivalent so it always uses plain Git
 - `/squash` requires a Git repository; squashes all commits on the current branch (relative to `origin/main`, `origin/master`, `main`, or `master`, tried in that order) into a single commit using the oldest commit's message; `gh` has no equivalent so it always uses plain Git; squashing on `main` or `master` is blocked; requires at least two commits on the branch
 - `/delete <branch>` requires a Git repository and runs `git branch -D`; `gh` has no equivalent so it always uses plain Git; deleting `main` or `master` is blocked; Tab completion offers local branch names excluding `main` and `master`
+- `/sessions [workspace]` lists all sessions found under `~/.orangu/sessions/`; output is one line per session with aligned columns: UUID, start date, last-updated date, command count, and workspace path; sessions are sorted by creation time, most-recent first; an optional workspace argument filters the list to sessions whose workspace path contains the given string; each session directory also contains a `metadata` file (JSON) recording `started_at`, `last_updated_at`, and `workspace`
 - `/usage` shows session statistics: total application time, total time spent waiting for LLM responses, total tokens generated (counted with the bundled tokenizer), and average tokens per second
 - `/list_files` is a local convenience command and is separate from the model-facing `list_directory` tool
 - `/reload` also clears the current conversation history in memory
-- `/quit` exits immediately, while `Ctrl+C` uses a two-step confirmation
+- `/quit` exits immediately, while `Ctrl+C` uses a two-step confirmation; on exit the full resume command is printed
 - Unknown slash commands are handled locally and produce an error message that points back to `/help`
 
 ## Natural-language command aliases

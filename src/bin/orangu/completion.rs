@@ -51,6 +51,7 @@ pub const COMMANDS: &[&str] = &[
     "/squash",
     "/delete",
     "/open_file",
+    "/sessions",
     "/usage",
     "/build",
     "/clear",
