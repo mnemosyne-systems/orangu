@@ -75,16 +75,26 @@ Then start with:
 /init_repo
 /squash
 /delete feature/foo
+/sessions
+/session 550e8400-e29b-41d4-a716-446655440000
 ```
 
 By default the tools operate on the current directory. Use `--workspace /path/to/project` to point **orangu** at another tree.
 
-Each run creates a session. When you exit, the resume command is printed:
+**orangu** automatically resumes an existing session when you return to the same workspace and Git branch. When a previous session is found, the UUID is printed before the TUI starts:
+
+```text
+Resuming session 550e8400-e29b-41d4-a716-446655440000
+```
+
+On exit, the resume command is printed so you can return to the session from a different branch or machine:
 
 ```text
 orangu --resume 550e8400-e29b-41d4-a716-446655440000
 ```
 
-Use `/sessions` to list previous sessions and find a UUID to resume.
+Sessions that had no LLM interaction on `main`, `master`, or outside a Git repository are deleted automatically on exit. Feature branch sessions are always kept.
+
+Use `/sessions` to list all sessions and their branches. Use `/session <uuid>` and Tab completion to find and print the resume command for a specific session.
 
 Lines whose first non-whitespace character is `#` stay local and are not sent to the model. Lines whose first non-whitespace character is `\` are ignored.

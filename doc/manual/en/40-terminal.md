@@ -44,11 +44,41 @@ Press `Esc` twice within 2 seconds during the waiting state to cancel the active
 
 ## Sessions
 
-Each run of `orangu` creates a unique session identified by a UUID. When the client exits, the full resume command is printed so you can resume later:
+Each run of `orangu` creates or resumes a session identified by a UUID.
+
+### Automatic resume
+
+On startup, `orangu` checks whether a session already exists for the current workspace path and Git branch. If exactly one matching session with conversation history is found, it is resumed automatically:
+
+```text
+Resuming session 550e8400-e29b-41d4-a716-446655440000
+```
+
+This message appears on the primary terminal before the TUI starts. No `--resume` flag is needed for normal branch-based workflows.
+
+If more than one session matches the current workspace and branch, a fresh session is started instead. Use `--resume <uuid>` to target a specific session explicitly.
+
+### Manual resume
+
+To resume a specific session regardless of workspace or branch, pass `--resume <uuid>` when starting:
 
 ```text
 orangu --resume 550e8400-e29b-41d4-a716-446655440000
 ```
+
+This restores the previous conversation context and per-session readline history.
+
+### Session cleanup on exit
+
+When you exit, the resume command is printed:
+
+```text
+orangu --resume 550e8400-e29b-41d4-a716-446655440000
+```
+
+Sessions that had no LLM interaction (zero tokens generated) and are on `main`, `master`, or a workspace with no Git repository are deleted automatically on exit. No resume command is printed for deleted sessions. Sessions on feature branches are always kept even when empty, so that returning to the branch triggers auto-resume correctly.
+
+### Session storage
 
 Session data is stored under `~/.orangu/sessions/<uuid>/`:
 
@@ -60,32 +90,27 @@ metadata   session metadata (JSON)
 
 The `messages` file preserves the complete conversation so that resuming restores the exact context the model had when the session was last active.
 
-The `metadata` file is a JSON object with three fields:
+The `metadata` file records when the session was created, last used, which workspace it belongs to, and which Git branch was active:
 
 ```json
 {
   "started_at": 1748000000,
   "last_updated_at": 1748003600,
-  "workspace": "/home/user/myproject"
+  "workspace": "/home/user/myproject",
+  "branch": "feature/my-pr"
 }
 ```
 
-Timestamps are Unix seconds (UTC).
+`branch` is `null` for sessions started outside a Git repository or in a detached HEAD state. Timestamps are Unix seconds (UTC).
 
-To resume a previous session, pass `--resume <uuid>` when starting:
-
-```text
-orangu --resume 550e8400-e29b-41d4-a716-446655440000
-```
-
-This restores the previous conversation context and per-session readline history.
+### Listing and switching sessions
 
 Use `/sessions` to list all sessions:
 
 ```text
-UUID                                  STARTED       LAST          CMDS  WORKSPACE
-550e8400-e29b-41d4-a716-446655440000  202605220910  202605221143    42  /home/user/myproject
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  202605210830  202605210831     3  /home/user/other
+UUID                                  STARTED       LAST          CMDS  BRANCH                WORKSPACE
+550e8400-e29b-41d4-a716-446655440000  202605220910  202605221143    42  feature/my-pr         /home/user/myproject
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  202605210830  202605210831     3  -                     /home/user/other
 ```
 
 Pass an optional workspace filter to narrow results:
@@ -93,6 +118,20 @@ Pass an optional workspace filter to narrow results:
 ```text
 /sessions myproject
 ```
+
+Use `/session <uuid>` to print the resume command for a specific session:
+
+```text
+/session 550e8400-e29b-41d4-a716-446655440000
+```
+
+This outputs:
+
+```text
+orangu --resume 550e8400-e29b-41d4-a716-446655440000
+```
+
+Tab completion after `/session ` (with a trailing space) cycles through session UUIDs, newest first.
 
 ## History and navigation
 
@@ -141,6 +180,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/delete <branch>` | Delete a local branch |
 | `/open_file <path>` | Open a workspace file in $EDITOR |
 | `/sessions [workspace]` | List all sessions, optionally filtered by workspace path |
+| `/session [uuid]` | Print the resume command for a specific session; Tab completion cycles UUIDs newest-first |
 | `/usage` | Show usage statistics for this session |
 | `/build` | Build the workspace project (Rust, C, or Java) |
 | `/clear` | Clear the current conversation |
@@ -173,11 +213,12 @@ Free-form prompts are blocked when the server or model status in the header is r
 - `/init_repo` runs `git init` in the workspace directory; works both inside and outside an existing Git repository (reinitializing an existing repo is safe); `gh` has no equivalent so it always uses plain Git
 - `/squash` requires a Git repository; squashes all commits on the current branch (relative to `origin/main`, `origin/master`, `main`, or `master`, tried in that order) into a single commit using the oldest commit's message; `gh` has no equivalent so it always uses plain Git; squashing on `main` or `master` is blocked; requires at least two commits on the branch
 - `/delete <branch>` requires a Git repository and runs `git branch -D`; `gh` has no equivalent so it always uses plain Git; deleting `main` or `master` is blocked; Tab completion offers local branch names excluding `main` and `master`
-- `/sessions [workspace]` lists all sessions found under `~/.orangu/sessions/`; output is one line per session with aligned columns: UUID, start date, last-updated date, command count, and workspace path; sessions are sorted by creation time, most-recent first; an optional workspace argument filters the list to sessions whose workspace path contains the given string; each session directory also contains a `metadata` file (JSON) recording `started_at`, `last_updated_at`, and `workspace`
+- `/sessions [workspace]` lists all sessions found under `~/.orangu/sessions/`; output is one line per session with aligned columns: UUID, start date, last-updated date, command count, branch, and workspace path; sessions are sorted by creation time, most-recent first; an optional workspace argument filters the list to sessions whose workspace path contains the given string; the branch column shows `-` for sessions with no recorded branch
+- `/session [uuid]` prints the `orangu --resume <uuid>` command for the given session; Tab completion after `/session ` (with a trailing space) cycles through all session UUIDs, newest first; with no argument it lists all sessions (same as `/sessions`)
 - `/usage` shows session statistics: total application time, total time spent waiting for LLM responses, total tokens generated (counted with the bundled tokenizer), and average tokens per second
 - `/list_files` is a local convenience command and is separate from the model-facing `list_directory` tool
 - `/reload` also clears the current conversation history in memory
-- `/quit` exits immediately, while `Ctrl+C` uses a two-step confirmation; on exit the full resume command is printed
+- `/quit` exits immediately, while `Ctrl+C` uses a two-step confirmation; on exit the full resume command is printed unless the session had no LLM interaction and was on `main`, `master`, or outside a Git repository — in that case the session directory is deleted silently
 - Unknown slash commands are handled locally and produce an error message that points back to `/help`
 
 ## Natural-language command aliases
@@ -209,6 +250,7 @@ Local commands can also be entered in plain language. Examples:
 - `init` or `init repo` or `git init`
 - `delete feature/foo` or `delete branch feature/foo` or `git branch -D feature/foo`
 - `usage` or `show usage`
+- `session` or `switch session`
 
 Natural-language forms are recognized only for the built-in local command phrases. Ordinary prompts continue to go to the model.
 
@@ -258,11 +300,12 @@ The completion modes are checked in order:
 5. If the line starts with `/cherry_pick `, or with the natural-language prefixes `cherry pick `, `cherry-pick `, or `git cherry-pick `, complete abbreviated commit hashes from the default branch (`origin/main`, `origin/master`, `main`, or `master`, tried in that order).
 6. If the line starts with `/merge `, or with the natural-language prefixes `merge ` or `git merge `, complete local branch names first (from `git branch`), then remote-only branch names (from `git branch --all`).
 7. If the line starts with `/delete `, or with the natural-language prefixes `delete `, `delete branch `, or `git branch -D `, complete local branch names (from `git branch`) excluding `main` and `master`.
-8. If the line starts with `/model `, complete configured model profile names.
-9. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
-10. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
-11. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
-12. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
+8. If the line starts with `/session ` (with a trailing space), complete session UUIDs sorted newest-first by last-modified time.
+9. If the line starts with `/model `, complete configured model profile names.
+10. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
+11. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
+12. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
+13. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
 
 Path-completion details:
 
