@@ -141,6 +141,10 @@ Useful first commands:
 
 - [Fedora](https://getfedora.org/) 44
 
+## Sponsors
+
+- [mnemosyne systems](https://www.mnemosyne-systems.ai/)
+
 ## Contributing
 
 Contributions to **orangu** are managed on [GitHub](https://github.com/mnemosyne-systems/orangu/):
