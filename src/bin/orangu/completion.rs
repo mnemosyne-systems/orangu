@@ -51,6 +51,7 @@ pub const COMMANDS: &[&str] = &[
     "/squash",
     "/delete",
     "/open_file",
+    "/session",
     "/sessions",
     "/usage",
     "/build",
@@ -167,6 +168,14 @@ pub fn completion_candidates(
             .filter(|b| !is_protected_branch(b) && b.starts_with(branch_prefix))
             .collect();
         return Some((start, cursor, branches));
+    }
+
+    if let Some(uuid_prefix) = prefix.strip_prefix("/session ") {
+        let candidates = session_uuids_newest_first()
+            .into_iter()
+            .filter(|u| u.starts_with(uuid_prefix))
+            .collect();
+        return Some(("/session ".len(), cursor, candidates));
     }
 
     if prefix.starts_with('/') {
@@ -712,6 +721,34 @@ pub fn open_file_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
     }
 
     None
+}
+
+fn session_uuids_newest_first() -> Vec<String> {
+    let Some(home) = home::home_dir() else {
+        return Vec::new();
+    };
+    let sessions_dir = home.join(".orangu/sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(String, u64)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let mtime = e
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Some((name, mtime))
+        })
+        .collect();
+    dirs.sort_by_key(|e| std::cmp::Reverse(e.1));
+    dirs.into_iter().map(|(name, _)| name).collect()
 }
 
 pub fn natural_show_file_completion_prefix(prefix: &str) -> Option<(usize, &str)> {

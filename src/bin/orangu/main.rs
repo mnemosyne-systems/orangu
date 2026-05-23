@@ -130,9 +130,17 @@ async fn run() -> Result<()> {
     ));
     let mut current_endpoint = Some(startup_endpoint.clone());
 
-    let session_id = match &args.resume {
-        Some(id) => id.clone(),
-        None => Uuid::new_v4().to_string(),
+    let current_branch = workspace_branch_name(&workspace);
+
+    let (session_id, is_resumed) = match &args.resume {
+        Some(id) => (id.clone(), true),
+        None => {
+            let workspace_str = workspace.display().to_string();
+            match find_session_for_workspace_branch(&workspace_str, current_branch.as_deref()) {
+                Some(existing_id) => (existing_id, true),
+                None => (Uuid::new_v4().to_string(), false),
+            }
+        }
     };
     let session_dir = session_dir_path(&session_id)?;
     std::fs::create_dir_all(&session_dir).with_context(|| {
@@ -145,18 +153,21 @@ async fn run() -> Result<()> {
     let session_messages_path = session_dir.join("messages");
     let session_metadata_path = session_dir.join("metadata");
 
-    if args.resume.is_none() {
+    if !is_resumed {
         save_session_metadata(
             &session_metadata_path,
             &SessionMetadata {
                 started_at: current_unix_timestamp(),
                 last_updated_at: current_unix_timestamp(),
                 workspace: workspace.display().to_string(),
+                branch: current_branch.clone(),
             },
         )?;
+    } else if args.resume.is_none() {
+        eprintln!("Resuming session {session_id}");
     }
 
-    if args.resume.is_some() {
+    if is_resumed {
         let messages = load_session_messages(&session_messages_path)?;
         session.restore(messages);
     }
@@ -366,7 +377,11 @@ async fn run() -> Result<()> {
     }
 
     drop(_terminal_ui_guard);
-    eprintln!("orangu --resume {session_id}");
+    if usage_stats.total_tokens == 0 && is_ephemeral_branch(current_branch.as_deref()) {
+        delete_session_dir(&session_dir);
+    } else {
+        eprintln!("orangu --resume {session_id}");
+    }
     Ok(())
 }
 
@@ -709,6 +724,13 @@ fn handle_command(
                 Ok(()) => Ok(CommandOutcome::Quiet),
                 Err(err) => Ok(CommandOutcome::Output(format!("Error: {err:#}"))),
             }
+        }
+        LocalCommand::Session(None) => match list_sessions_output(None) {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Err(err) => Ok(local_command_error(err)),
+        },
+        LocalCommand::Session(Some(uuid)) => {
+            Ok(CommandOutcome::Output(format!("orangu --resume {uuid}")))
         }
         LocalCommand::Sessions(filter) => match list_sessions_output(filter.as_deref()) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
@@ -1084,6 +1106,8 @@ struct SessionMetadata {
     started_at: u64,
     last_updated_at: u64,
     workspace: String,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -1167,6 +1191,58 @@ fn update_session_metadata_timestamp(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn find_session_for_workspace_branch(workspace: &str, branch: Option<&str>) -> Option<String> {
+    let sessions_dir = home::home_dir()?.join(SESSIONS_DIRECTORY);
+    if !sessions_dir.exists() {
+        return None;
+    }
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    for entry in std::fs::read_dir(&sessions_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(uuid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(meta) = load_session_metadata(&path.join("metadata")).ok().flatten() else {
+            continue;
+        };
+        if meta.workspace != workspace {
+            continue;
+        }
+        if meta.branch.as_deref() != branch {
+            continue;
+        }
+        let has_messages = path
+            .join("messages")
+            .metadata()
+            .map(|m| m.len() > 2)
+            .unwrap_or(false);
+        if !has_messages {
+            continue;
+        }
+        candidates.push((uuid, meta.last_updated_at));
+    }
+    if candidates.len() == 1 {
+        Some(candidates.remove(0).0)
+    } else {
+        None
+    }
+}
+
+fn is_ephemeral_branch(branch: Option<&str>) -> bool {
+    matches!(branch, None | Some("main") | Some("master"))
+}
+
+fn delete_session_dir(session_dir: &Path) {
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
 fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
     let sessions_dir = {
         let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
@@ -1217,8 +1293,8 @@ fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
 
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
-        "{:<36}  {:<12}  {:<12}  {:>4}  {}",
-        "UUID", "STARTED", "LAST", "CMDS", "WORKSPACE"
+        "{:<36}  {:<12}  {:<12}  {:>4}  {:<24}  {}",
+        "UUID", "STARTED", "LAST", "CMDS", "BRANCH", "WORKSPACE"
     ));
     for (uuid, meta, cmd_count) in &entries {
         let started = meta
@@ -1229,10 +1305,14 @@ fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
             .as_ref()
             .map(|m| format_unix_timestamp(m.last_updated_at))
             .unwrap_or_else(|| "-".to_string());
+        let branch = meta
+            .as_ref()
+            .and_then(|m| m.branch.as_deref())
+            .unwrap_or("-");
         let workspace = meta.as_ref().map(|m| m.workspace.as_str()).unwrap_or("-");
         lines.push(format!(
-            "{:<36}  {:<12}  {:<12}  {:>4}  {}",
-            uuid, started, last, cmd_count, workspace
+            "{:<36}  {:<12}  {:<12}  {:>4}  {:<24}  {}",
+            uuid, started, last, cmd_count, branch, workspace
         ));
     }
     Ok(lines.join("\n"))
