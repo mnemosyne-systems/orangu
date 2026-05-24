@@ -337,6 +337,16 @@ async fn run() -> Result<()> {
                 output_state.reset_scroll();
                 continue;
             }
+            CommandOutcome::PendingList => {
+                output_state.push_text(&format_pending_list(&pending_commands));
+                output_state.reset_scroll();
+                continue;
+            }
+            CommandOutcome::PendingDelete(index) => {
+                apply_pending_delete(index, &mut pending_commands, &mut output_state);
+                output_state.reset_scroll();
+                continue;
+            }
             CommandOutcome::Blocking(f) => {
                 let handle = tokio::task::spawn_blocking(f);
                 // Recreate render here — handle_command's mutable borrows have ended.
@@ -885,6 +895,11 @@ fn handle_command(
             Ok(CommandOutcome::Cleared)
         }
         LocalCommand::Quit => Ok(CommandOutcome::Quit),
+        LocalCommand::PendingList => Ok(CommandOutcome::PendingList),
+        LocalCommand::PendingDelete(None) => Ok(CommandOutcome::Output(
+            "Usage: /pending delete <number>. Use /pending to list.".to_string(),
+        )),
+        LocalCommand::PendingDelete(Some(index)) => Ok(CommandOutcome::PendingDelete(index)),
     }
 }
 
@@ -1054,15 +1069,40 @@ async fn wait_for_response(
                     if let Some(outcome) = result.outcome {
                         match outcome {
                             InputResult::Submitted(line) => {
-                                let had_pending = pending_commands.len();
-                                let _ = prepare_submitted_input(
-                                    &line,
-                                    history,
-                                    history_path,
-                                    output_state,
-                                    Some(pending_commands),
-                                )?;
-                                redraw = redraw || pending_commands.len() != had_pending || !line.trim().is_empty();
+                                match parse_local_command(line.trim()) {
+                                    Some(LocalCommand::PendingList) => {
+                                        output_state
+                                            .push_text(&format_pending_list(pending_commands));
+                                        redraw = true;
+                                    }
+                                    Some(LocalCommand::PendingDelete(Some(index))) => {
+                                        apply_pending_delete(
+                                            index,
+                                            pending_commands,
+                                            output_state,
+                                        );
+                                        redraw = true;
+                                    }
+                                    Some(LocalCommand::PendingDelete(None)) => {
+                                        output_state.push_text(
+                                            "Usage: /pending delete <number>. Use /pending to list.",
+                                        );
+                                        redraw = true;
+                                    }
+                                    _ => {
+                                        let had_pending = pending_commands.len();
+                                        let _ = prepare_submitted_input(
+                                            &line,
+                                            history,
+                                            history_path,
+                                            output_state,
+                                            Some(pending_commands),
+                                        )?;
+                                        redraw = redraw
+                                            || pending_commands.len() != had_pending
+                                            || !line.trim().is_empty();
+                                    }
+                                }
                             }
                             InputResult::Refresh => {}
                             InputResult::Quit => return Ok(WaitResult::Quit),
@@ -1225,6 +1265,33 @@ fn final_pending_line(streamed_output: &str, response: &str) -> Option<String> {
         Some(response.to_string())
     } else {
         None
+    }
+}
+
+fn format_pending_list(pending: &VecDeque<String>) -> String {
+    if pending.is_empty() {
+        "No pending commands.".to_string()
+    } else {
+        let mut lines = vec!["Pending commands:".to_string()];
+        for (i, cmd) in pending.iter().enumerate() {
+            lines.push(format!("  {}. {}", i + 1, cmd));
+        }
+        lines.join("\n")
+    }
+}
+
+fn apply_pending_delete(
+    index: usize,
+    pending: &mut VecDeque<String>,
+    output_state: &mut OutputState,
+) {
+    if index == 0 || index > pending.len() {
+        output_state.push_text(&format!(
+            "No pending command at index {index}. Use /pending to list."
+        ));
+    } else {
+        let removed = pending.remove(index - 1).expect("index validated");
+        output_state.push_text(&format!("Removed: {removed}"));
     }
 }
 
@@ -3322,5 +3389,110 @@ mod tests {
         if let Some((start, _, _)) = nl_result {
             assert_eq!(start, "cherry pick ".len());
         }
+    }
+
+    #[test]
+    fn pending_list_returns_pending_list_outcome() {
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/pending",
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::PendingList));
+    }
+
+    #[test]
+    fn pending_delete_with_index_returns_pending_delete_outcome() {
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/pending delete 3",
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::PendingDelete(3)));
+    }
+
+    #[test]
+    fn pending_delete_without_index_returns_usage_output() {
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/pending delete",
+            CommandState {
+                active_model: &mut active_model,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+            },
+            CommandContext {
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Output(msg) if msg.contains("Usage")
+        ));
     }
 }
