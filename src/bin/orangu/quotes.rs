@@ -101,6 +101,13 @@ static MARCO_PIERRE_WHITE: &[&str] = &[
     "Nature is the true artist; the chef is merely the cook.",
     "When you understand an ingredient, you understand the dish.",
     "Give a man a fish and you feed him for a day. Teach a man to fish and you feed him for life.",
+    "A tree without roots is just a piece of wood.",
+    "If you are not extreme, then people will take shortcuts because they don't fear you.",
+    "Strategy will compensate the talent. The talent will never compensate the strategy.",
+    "Mother Nature is the true artist and our job as cooks is to allow her to shine.",
+    "Success is born out of arrogance, but greatness comes from humility.",
+    "Once you accept you are being judged by people who have less knowledge than yourself, then what's it worth?",
+    "People who can give themselves every day. They're the people that I admire, they're real people.",
 ];
 
 static GORDON_RAMSAY: &[&str] = &[
