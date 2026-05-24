@@ -15,7 +15,7 @@
 
 use anyhow::{Result, anyhow};
 use orangu::{config::LlmConfiguration, session::ChatSession, tools::ToolExecutor};
-use std::{borrow::Cow, collections::HashMap, path::Path};
+use std::{borrow::Cow, collections::HashMap, path::Path, pin::Pin};
 use terminal_size::{Width, terminal_size};
 
 #[derive(Clone, Copy, Default)]
@@ -108,6 +108,7 @@ pub enum CommandOutcome {
     Cleared,
     Quit,
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),
+    Async(Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'static>>),
 }
 
 pub enum LocalCommand<'a> {
@@ -155,6 +156,7 @@ pub struct CommandContext<'a> {
     pub tools: &'a ToolExecutor,
     pub workspace: &'a Path,
     pub usage_stats: &'a crate::UsageStats,
+    pub http_client: reqwest::Client,
 }
 
 pub struct CommandState<'a> {
@@ -178,7 +180,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/connect" => Some(LocalCommand::ConnectDefault),
         "/disconnect" => Some(LocalCommand::Disconnect),
         "/reload" => Some(LocalCommand::Reload),
-        "/list_models" => Some(LocalCommand::ListModels),
+        "/models" => Some(LocalCommand::ListModels),
         "/list_files" => Some(LocalCommand::ListFiles),
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
         "/open_file" => Some(LocalCommand::OpenFile("")),
@@ -792,16 +794,6 @@ pub fn sorted_model_names(llms: &HashMap<String, LlmConfiguration>) -> Vec<Strin
     names
 }
 
-pub fn format_models(llms: &HashMap<String, LlmConfiguration>) -> String {
-    let mut names = sorted_model_names(llms);
-    let mut lines = Vec::with_capacity(names.len());
-    for name in names.drain(..) {
-        if let Some(llm) = llms.get(&name) {
-            lines.push(format!("- {}: {} ({})", name, llm.model, llm.provider));
-        }
-    }
-    lines.join("\n")
-}
 
 pub fn open_file_usage_message() -> &'static str {
     "Usage: /open_file <path>. Use /help to see available commands."

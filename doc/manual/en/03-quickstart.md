@@ -53,7 +53,7 @@ Then start with:
 
 ```text
 /help
-/list_models
+/models
 /list_files
 /show_file README.md
 /tools

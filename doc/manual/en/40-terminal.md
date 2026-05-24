@@ -156,7 +156,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/connect [url]` | Connect to the configured server, or a specific server |
 | `/disconnect` | Disconnect from the current server |
 | `/reload` | Restore the configured model and server |
-| `/list_models` | List models |
+| `/models` | List models |
 | `/list_files` | List workspace files as a tree |
 | `/show_file [--hash] [--author] <path> [<ref>]` | Show a file; optional ref shows that commit via git show |
 | `/tools` | List tools |
@@ -304,7 +304,7 @@ The completion modes are checked in order:
 9. If the line starts with `/model `, complete configured model profile names.
 10. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
 11. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
-12. If the line starts with `/`, complete built-in slash commands such as `/help`, `/list_models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
+12. If the line starts with `/`, complete built-in slash commands such as `/help`, `/models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
 13. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
 
 Path-completion details:

@@ -55,7 +55,7 @@ use anyhow::Error;
 use commands::{
     CommandContext, CommandOutcome, CommandState, LocalCommand, LocalError, add_file_usage_message,
     amend_usage_message, checkout_usage_message, cherry_pick_usage_message, commit_usage_message,
-    connect_usage_message, delete_branch_usage_message, format_models, merge_usage_message,
+    connect_usage_message, delete_branch_usage_message, merge_usage_message,
     model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
     pull_usage_message, remove_file_usage_message, sorted_model_names, system_prompt,
 };
@@ -303,6 +303,7 @@ async fn run() -> Result<()> {
                 tools: &tools,
                 workspace: &workspace,
                 usage_stats: &usage_stats,
+                http_client: status_http_client.clone(),
             },
         )? {
             CommandOutcome::Quit => {
@@ -325,6 +326,36 @@ async fn run() -> Result<()> {
             CommandOutcome::Blocking(f) => {
                 let handle = tokio::task::spawn_blocking(f);
                 // Recreate render here — handle_command's mutable borrows have ended.
+                let blocking_render = RenderContext {
+                    current_model: &active_model,
+                    endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
+                    workspace: tools.workspace(),
+                    prompt_branch: prompt_branch.as_deref(),
+                    header_status,
+                };
+                let result = wait_for_local_command(
+                    WaitContext {
+                        render: blocking_render,
+                        history: &mut history,
+                        history_path: &session_hist_path,
+                        model_names: &model_names,
+                        interrupt_state: &mut interrupt_state,
+                        output_state: &mut output_state,
+                        input_state: &mut input_state,
+                        pending_commands: &mut pending_commands,
+                    },
+                    handle,
+                )
+                .await?;
+                match result {
+                    Ok(output) => output_state.push_text(&output),
+                    Err(err) => output_state.push_text(&format!("Error: {err:#}")),
+                }
+                output_state.reset_scroll();
+                continue;
+            }
+            CommandOutcome::Async(future) => {
+                let handle = tokio::spawn(future);
                 let blocking_render = RenderContext {
                     current_model: &active_model,
                     endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
@@ -598,6 +629,7 @@ fn handle_command(
         tools,
         workspace,
         usage_stats,
+        http_client,
     } = context;
 
     match command {
@@ -632,7 +664,40 @@ fn handle_command(
             session.clear(prompt);
             Ok(CommandOutcome::Quiet)
         }
-        LocalCommand::ListModels => Ok(CommandOutcome::Output(format_models(llms))),
+        LocalCommand::ListModels => {
+            let names = sorted_model_names(llms);
+            let configs: Vec<(String, LlmConfiguration)> = names
+                .into_iter()
+                .filter_map(|n| llms.get(&n).map(|c| (n, c.clone())))
+                .collect();
+            Ok(CommandOutcome::Async(Box::pin(async move {
+                let mut lines = Vec::with_capacity(configs.len());
+                for (name, profile) in &configs {
+                    let endpoint = normalized_openai_endpoint(&profile.endpoint);
+                    let models_url = format!("{endpoint}/v1/models");
+                    let available = async {
+                        let resp = http_client.get(&models_url).send().await.ok()?;
+                        if !resp.status().is_success() {
+                            return None;
+                        }
+                        let models = resp.json::<ModelsResponse>().await.ok()?;
+                        Some(models.data.iter().chain(models.models.iter()).any(|e| {
+                            e.id == profile.model
+                                || e.model == profile.model
+                                || e.name == profile.model
+                        }))
+                    }
+                    .await
+                    .unwrap_or(false);
+                    let indicator = if available { "🟢" } else { "🔴" };
+                    lines.push(format!(
+                        "- {}: {} ({}) {}",
+                        name, profile.model, profile.provider, indicator
+                    ));
+                }
+                Ok(lines.join("\n"))
+            })))
+        }
         LocalCommand::ListFiles => match list_workspace_files_tree(workspace) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
@@ -643,7 +708,7 @@ fn handle_command(
         },
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
         LocalCommand::ModelInfo => Ok(CommandOutcome::Output(
-            "Use /list_models to see configured profiles".to_string(),
+            "Use /models to see configured profiles".to_string(),
         )),
         LocalCommand::SetModel(name) => {
             if name.is_empty() {
@@ -1816,6 +1881,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
             },
         )
         .expect("handle command");
@@ -1982,6 +2048,7 @@ mod tests {
                     tools: &tools,
                     workspace: workspace.path(),
                     usage_stats: &super::UsageStats::new(),
+                    http_client: reqwest::Client::new(),
                 },
             )
             .expect("handle command");
@@ -2039,6 +2106,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
             },
         )
         .expect("handle command");
@@ -2313,6 +2381,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
             },
         )
         .expect("handle command");
@@ -2360,6 +2429,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
+                http_client: reqwest::Client::new(),
             },
         )
         .expect("command outcome");
