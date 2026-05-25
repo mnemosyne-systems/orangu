@@ -42,7 +42,7 @@
 Install the tools needed to build and run **orangu** from source:
 
 ```sh
-dnf install -y git rust cargo gcc
+dnf install -y git rust cargo
 ```
 
 ### Release build
