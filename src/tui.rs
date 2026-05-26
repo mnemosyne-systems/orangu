@@ -153,6 +153,7 @@ pub fn help_text() -> &'static str {
 /log                                          Show commit log (uses git lg alias if configured)
 /merge <branch>                               Merge a branch into the current branch
 /move_file <source> <destination>             Rename or move a tracked file with git mv
+/pending [delete <n>]                         List queued commands, or delete one by number
 /pull <number>                                Check out a GitHub pull request on a dedicated branch
 /push [--force]                               Push the current branch to origin
 /rebase                                       Rebase the current branch against master/main
@@ -163,7 +164,7 @@ pub fn help_text() -> &'static str {
 /clear                                        Clear the current conversation
 /quit                                         Exit the client
 
-Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `init repo`, `delete feature/foo`, and `show help` are also handled locally.
+Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `init repo`, `delete feature/foo`, `pending`, and `show help` are also handled locally.
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 

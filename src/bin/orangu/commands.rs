@@ -107,6 +107,8 @@ pub enum CommandOutcome {
     Output(String),
     Cleared,
     Quit,
+    PendingList,
+    PendingDelete(usize),
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),
     Async(Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'static>>),
 }
@@ -147,6 +149,8 @@ pub enum LocalCommand<'a> {
     Build,
     Clear,
     Quit,
+    PendingList,
+    PendingDelete(Option<usize>),
 }
 
 pub struct CommandContext<'a> {
@@ -209,6 +213,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/usage" => Some(LocalCommand::Usage),
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
+        "/pending" => Some(LocalCommand::PendingList),
         _ => {
             if let Some(args) = input.strip_prefix("/session ") {
                 let uuid = args.trim();
@@ -330,6 +335,16 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 && args.trim().is_empty()
             {
                 return Some(LocalCommand::OpenFile(""));
+            }
+            if let Some(args) = input.strip_prefix("/pending ") {
+                let args = args.trim();
+                return Some(if args.eq_ignore_ascii_case("list") || args.is_empty() {
+                    LocalCommand::PendingList
+                } else if let Some(rest) = strip_ascii_prefix(args, "delete") {
+                    LocalCommand::PendingDelete(rest.trim().parse::<usize>().ok())
+                } else {
+                    LocalCommand::PendingList
+                });
             }
             parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
         }
@@ -592,6 +607,12 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::DeleteBranch(Some(Cow::Borrowed(branch))));
             }
         }
+    }
+    if matches_ci(
+        input,
+        &["pending", "list pending", "pending list", "show pending"],
+    ) {
+        return Some(LocalCommand::PendingList);
     }
     if matches_ci(input, &["session", "switch session"]) {
         return Some(LocalCommand::Session(None));
@@ -1620,6 +1641,42 @@ mod tests {
             parse_local_command("git squash"),
             Some(LocalCommand::Squash)
         ));
+    }
+
+    #[test]
+    fn parses_pending_commands() {
+        assert!(matches!(
+            parse_local_command("/pending"),
+            Some(LocalCommand::PendingList)
+        ));
+        assert!(matches!(
+            parse_local_command("/pending list"),
+            Some(LocalCommand::PendingList)
+        ));
+        assert!(matches!(
+            parse_local_command("pending"),
+            Some(LocalCommand::PendingList)
+        ));
+        assert!(matches!(
+            parse_local_command("list pending"),
+            Some(LocalCommand::PendingList)
+        ));
+        assert!(matches!(
+            parse_local_command("show pending"),
+            Some(LocalCommand::PendingList)
+        ));
+        assert!(matches!(
+            parse_local_command("/pending delete"),
+            Some(LocalCommand::PendingDelete(None))
+        ));
+        match parse_local_command("/pending delete 2") {
+            Some(LocalCommand::PendingDelete(Some(2))) => {}
+            _ => panic!("expected pending delete 2"),
+        }
+        match parse_local_command("/pending delete 1") {
+            Some(LocalCommand::PendingDelete(Some(1))) => {}
+            _ => panic!("expected pending delete 1"),
+        }
     }
 
     #[test]
