@@ -21,12 +21,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::tui::Banner;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
     pub default_model: String,
     pub llms: HashMap<String, LlmConfiguration>,
     pub quotes: String,
     pub width: usize,
+    #[serde(skip)]
+    pub banner: Banner,
+    pub feedback: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +59,10 @@ struct ClientConfiguration {
     quotes: String,
     #[serde(default = "default_virtual_width")]
     width: usize,
+    #[serde(default)]
+    banner: String,
+    #[serde(default)]
+    feedback: String,
 }
 
 pub fn default_virtual_width() -> usize {
@@ -76,6 +85,10 @@ pub fn default_llm_max_tool_rounds() -> usize {
     10
 }
 
+pub fn parse_feedback_bool(s: &str) -> bool {
+    matches!(s.trim().to_lowercase().as_str(), "on" | "true" | "1")
+}
+
 pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> {
     let conf = Config::builder()
         .add_source(config::File::from(path).format(FileFormat::Ini))
@@ -95,6 +108,8 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         )?,
         quotes: root.client.quotes,
         width: root.client.width,
+        banner: root.client.banner.parse().unwrap_or_default(),
+        feedback: parse_feedback_bool(&root.client.feedback),
     })
 }
 
@@ -227,6 +242,17 @@ mod tests {
         assert_eq!(conf.llms["gemma"].provider, "llama.cpp");
         assert_eq!(conf.llms["gemma"].request_timeout_seconds, 45);
         assert_eq!(conf.llms["gemma"].max_tool_rounds, 12);
+    }
+
+    #[test]
+    fn parse_feedback_bool_recognises_truthy_and_falsy_values() {
+        assert!(super::parse_feedback_bool("on"));
+        assert!(super::parse_feedback_bool("true"));
+        assert!(super::parse_feedback_bool("1"));
+        assert!(!super::parse_feedback_bool("off"));
+        assert!(!super::parse_feedback_bool("false"));
+        assert!(!super::parse_feedback_bool("0"));
+        assert!(!super::parse_feedback_bool(""));
     }
 
     #[test]

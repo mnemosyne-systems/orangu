@@ -37,8 +37,9 @@ use orangu::{
     session::ChatSession,
     tools::ToolExecutor,
     tui::{
-        ScreenRenderArgs, StatusFragment, render_screen, render_thinking_status,
-        render_tool_running_status, render_working_status, terminal_height, terminal_width,
+        FEEDBACK_ERR, FEEDBACK_OK, ScreenRenderArgs, StatusFragment, render_screen,
+        render_thinking_status, render_tool_running_status, render_working_status, terminal_height,
+        terminal_width,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -259,6 +260,8 @@ async fn run() -> Result<()> {
             actual_width: viewport.actual_width,
             actual_height: viewport.actual_height,
             x_offset: viewport.x_offset,
+            banner: config.banner,
+            feedback: config.feedback,
         };
         let resume_left_status = startup_notice_until
             .filter(|&deadline| std::time::Instant::now() < deadline)
@@ -360,13 +363,30 @@ async fn run() -> Result<()> {
                 std::io::stdout().flush()?;
                 break;
             }
-            CommandOutcome::Quiet => continue,
+            CommandOutcome::Quiet => {
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_OK);
+                    output_state.reset_scroll();
+                }
+                continue;
+            }
             CommandOutcome::Cleared => {
                 output_state.clear();
                 continue;
             }
             CommandOutcome::Output(output) => {
                 output_state.push_text(&output);
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_OK);
+                }
+                output_state.reset_scroll();
+                continue;
+            }
+            CommandOutcome::OutputError(output) => {
+                output_state.push_text(&output);
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_ERR);
+                }
                 output_state.reset_scroll();
                 continue;
             }
@@ -388,6 +408,8 @@ async fn run() -> Result<()> {
                     actual_width: viewport.actual_width,
                     actual_height: viewport.actual_height,
                     x_offset: viewport.x_offset,
+                    banner: config.banner,
+                    feedback: config.feedback,
                 };
                 let result = wait_for_local_command(
                     WaitContext {
@@ -406,8 +428,18 @@ async fn run() -> Result<()> {
                 )
                 .await?;
                 match result {
-                    Ok(output) => output_state.push_text(&output),
-                    Err(err) => output_state.push_text(&format!("Error: {err:#}")),
+                    Ok(output) => {
+                        output_state.push_text(&output);
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_OK);
+                        }
+                    }
+                    Err(err) => {
+                        output_state.push_text(&format!("Error: {err:#}"));
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_ERR);
+                        }
+                    }
                 }
                 output_state.reset_scroll();
                 continue;
@@ -424,6 +456,8 @@ async fn run() -> Result<()> {
                     actual_width: viewport.actual_width,
                     actual_height: viewport.actual_height,
                     x_offset: viewport.x_offset,
+                    banner: config.banner,
+                    feedback: config.feedback,
                 };
                 let result = wait_for_local_command(
                     WaitContext {
@@ -442,8 +476,18 @@ async fn run() -> Result<()> {
                 )
                 .await?;
                 match result {
-                    Ok(output) => output_state.push_text(&output),
-                    Err(err) => output_state.push_text(&format!("Error: {err:#}")),
+                    Ok(output) => {
+                        output_state.push_text(&output);
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_OK);
+                        }
+                    }
+                    Err(err) => {
+                        output_state.push_text(&format!("Error: {err:#}"));
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_ERR);
+                        }
+                    }
                 }
                 output_state.reset_scroll();
                 continue;
@@ -457,14 +501,24 @@ async fn run() -> Result<()> {
             .ok_or_else(|| anyhow!("unknown model profile '{active_model}'"))?;
         let Some(endpoint) = current_endpoint.as_deref() else {
             output_state.push_text("Error: Not connected to an LLM server");
+            if config.feedback {
+                output_state.push_text(FEEDBACK_ERR);
+            }
             output_state.reset_scroll();
             continue;
         };
         if !header_status.model_ok {
+            if config.feedback {
+                output_state.push_text(FEEDBACK_ERR);
+                output_state.reset_scroll();
+            }
             continue;
         }
         if let Some(message) = llm_prompt_block_reason(current_endpoint.as_deref(), header_status) {
             output_state.push_text(message);
+            if config.feedback {
+                output_state.push_text(FEEDBACK_ERR);
+            }
             output_state.reset_scroll();
             continue;
         }
@@ -493,6 +547,8 @@ async fn run() -> Result<()> {
                     actual_width: viewport.actual_width,
                     actual_height: viewport.actual_height,
                     x_offset: viewport.x_offset,
+                    banner: config.banner,
+                    feedback: config.feedback,
                 },
                 history: &mut history,
                 history_path: &session_hist_path,
@@ -511,6 +567,9 @@ async fn run() -> Result<()> {
                 let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
                 usage_stats.record_response(llm_start.elapsed(), &answer, tool_delta);
                 output_state.push_markdown(&answer);
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_OK);
+                }
             }
             Ok(WaitResult::Cancelled(partial_output)) => {
                 preserve_cancelled_output(&mut output_state, &partial_output);
@@ -522,7 +581,12 @@ async fn run() -> Result<()> {
                 std::io::stdout().flush()?;
                 break;
             }
-            Err(err) => output_state.push_text(&format!("Error: {err:#}")),
+            Err(err) => {
+                output_state.push_text(&format!("Error: {err:#}"));
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_ERR);
+                }
+            }
         }
         output_state.reset_scroll();
     }
@@ -671,9 +735,9 @@ impl Drop for RawModePauseGuard {
 
 fn local_command_error(err: Error) -> CommandOutcome {
     if err.is::<LocalError>() {
-        CommandOutcome::Output(format!("{err}"))
+        CommandOutcome::OutputError(format!("{err}"))
     } else {
-        CommandOutcome::Output(format!("Error: {err:#}"))
+        CommandOutcome::OutputError(format!("Error: {err:#}"))
     }
 }
 
@@ -684,7 +748,7 @@ fn handle_command(
 ) -> anyhow::Result<CommandOutcome> {
     let Some(command) = parse_local_command(input) else {
         if input.trim_start().starts_with('/') {
-            return Ok(CommandOutcome::Output(format!(
+            return Ok(CommandOutcome::OutputError(format!(
                 "Unknown command '{}'. Use /help to see available commands.",
                 input.trim()
             )));
@@ -721,7 +785,9 @@ fn handle_command(
         }
         LocalCommand::ConnectTo(endpoint) => {
             if endpoint.is_empty() {
-                return Ok(CommandOutcome::Output(connect_usage_message().to_string()));
+                return Ok(CommandOutcome::OutputError(
+                    connect_usage_message().to_string(),
+                ));
             }
             *current_endpoint = Some(endpoint.to_string());
             Ok(CommandOutcome::Quiet)
@@ -790,10 +856,12 @@ fn handle_command(
         )),
         LocalCommand::SetModel(name) => {
             if name.is_empty() {
-                return Ok(CommandOutcome::Output(model_usage_message().to_string()));
+                return Ok(CommandOutcome::OutputError(
+                    model_usage_message().to_string(),
+                ));
             }
             if !llms.contains_key(name) {
-                return Ok(CommandOutcome::Output(format!(
+                return Ok(CommandOutcome::OutputError(format!(
                     "Unknown model profile '{name}'. Available: {}",
                     sorted_model_names(llms).join(", ")
                 )));
@@ -821,7 +889,9 @@ fn handle_command(
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Pull(None) => Ok(CommandOutcome::Output(pull_usage_message().to_string())),
+        LocalCommand::Pull(None) => Ok(CommandOutcome::OutputError(
+            pull_usage_message().to_string(),
+        )),
         LocalCommand::Pull(Some(pr_number)) => match pull_request_output(workspace, pr_number) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
@@ -830,54 +900,58 @@ fn handle_command(
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Merge(None) => Ok(CommandOutcome::Output(merge_usage_message().to_string())),
+        LocalCommand::Merge(None) => Ok(CommandOutcome::OutputError(
+            merge_usage_message().to_string(),
+        )),
         LocalCommand::Merge(Some(branch)) => match merge_output(workspace, &branch) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Checkout(None) => {
-            Ok(CommandOutcome::Output(checkout_usage_message().to_string()))
-        }
+        LocalCommand::Checkout(None) => Ok(CommandOutcome::OutputError(
+            checkout_usage_message().to_string(),
+        )),
         LocalCommand::Checkout(Some(target)) => match checkout_output(workspace, &target) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::AddFile(None) => {
-            Ok(CommandOutcome::Output(add_file_usage_message().to_string()))
-        }
+        LocalCommand::AddFile(None) => Ok(CommandOutcome::OutputError(
+            add_file_usage_message().to_string(),
+        )),
         LocalCommand::AddFile(Some(path)) => match add_file_output(workspace, &path) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::RemoveFile(None) => Ok(CommandOutcome::Output(
+        LocalCommand::RemoveFile(None) => Ok(CommandOutcome::OutputError(
             remove_file_usage_message().to_string(),
         )),
         LocalCommand::RemoveFile(Some(path)) => match remove_file_output(workspace, &path) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::MoveFile(None) => Ok(CommandOutcome::Output(
+        LocalCommand::MoveFile(None) => Ok(CommandOutcome::OutputError(
             move_file_usage_message().to_string(),
         )),
         LocalCommand::MoveFile(Some((src, dst))) => match move_file_output(workspace, &src, &dst) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::CherryPick(None) => Ok(CommandOutcome::Output(
+        LocalCommand::CherryPick(None) => Ok(CommandOutcome::OutputError(
             cherry_pick_usage_message().to_string(),
         )),
         LocalCommand::CherryPick(Some(commit)) => match cherry_pick_output(workspace, &commit) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Commit(None) => {
-            Ok(CommandOutcome::Output(commit_usage_message().to_string()))
-        }
+        LocalCommand::Commit(None) => Ok(CommandOutcome::OutputError(
+            commit_usage_message().to_string(),
+        )),
         LocalCommand::Commit(Some(message)) => match commit_output(workspace, &message) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Amend(None) => Ok(CommandOutcome::Output(amend_usage_message().to_string())),
+        LocalCommand::Amend(None) => Ok(CommandOutcome::OutputError(
+            amend_usage_message().to_string(),
+        )),
         LocalCommand::Amend(Some(message)) => match amend_output(workspace, &message) {
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
@@ -894,7 +968,7 @@ fn handle_command(
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::DeleteBranch(None) => Ok(CommandOutcome::Output(
+        LocalCommand::DeleteBranch(None) => Ok(CommandOutcome::OutputError(
             delete_branch_usage_message().to_string(),
         )),
         LocalCommand::DeleteBranch(Some(branch)) => {
@@ -905,13 +979,13 @@ fn handle_command(
         }
         LocalCommand::OpenFile(path) => {
             if path.is_empty() {
-                return Ok(CommandOutcome::Output(
+                return Ok(CommandOutcome::OutputError(
                     open_file_usage_message().to_string(),
                 ));
             }
             match open_in_editor(workspace, path) {
                 Ok(()) => Ok(CommandOutcome::Quiet),
-                Err(err) => Ok(CommandOutcome::Output(format!("Error: {err:#}"))),
+                Err(err) => Ok(CommandOutcome::OutputError(format!("Error: {err:#}"))),
             }
         }
         LocalCommand::Session(None) => match list_sessions_output(None) {
@@ -955,6 +1029,7 @@ pub fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
             workspace: render.workspace,
             prompt_branch: render.prompt_branch,
             status: render.header_status,
+            banner: render.banner,
             transcript: screen.transcript,
             scroll_offset: screen.scroll_offset,
             left_status: screen.left_status,
@@ -1025,7 +1100,10 @@ async fn wait_for_response(
     let mut last_rendered_metrics = StreamMetrics::default();
     let mut last_tool_was_running = false;
     let mut escape_cancel_state = EscapeCancelState::default();
-    let initial_status = render_thinking_status(thinking_frame, thinking_started.elapsed());
+    let initial_status = Some(render_thinking_status(
+        thinking_frame,
+        thinking_started.elapsed(),
+    ));
     let quote_line = thinking_quote.map(|q| format!("\x1b[2m{q}\x1b[0m"));
 
     print_screen(
@@ -1033,7 +1111,7 @@ async fn wait_for_response(
         ScreenState {
             transcript: output_state.lines(),
             scroll_offset: output_state.scroll_offset(),
-            left_status: Some(initial_status),
+            left_status: initial_status,
             pending_count: pending_commands.len(),
             pending_line: quote_line.as_deref(),
             input: input_state.as_str(),
@@ -1221,13 +1299,13 @@ async fn wait_for_local_command(
                     render.actual_height = viewport.actual_height;
                     render.x_offset = viewport.x_offset;
                 }
-                let left_status = render_tool_running_status(frame, elapsed);
+                let left_status = Some(render_tool_running_status(frame, elapsed));
                 print_screen(
                     render,
                     ScreenState {
                         transcript: output_state.lines(),
                         scroll_offset: output_state.scroll_offset(),
-                        left_status: Some(left_status),
+                        left_status,
                         pending_count: pending_commands.len(),
                         pending_line: None,
                         input: input_state.as_str(),
@@ -1891,7 +1969,7 @@ mod tests {
         llm::{StreamMetrics, StreamPromptProgress, normalized_openai_endpoint},
         session::ChatSession,
         tools::ToolExecutor,
-        tui::{HeaderStatus, TranscriptLine},
+        tui::{Banner, HeaderStatus, TranscriptLine},
     };
     use std::collections::HashMap;
     use std::{
@@ -2003,6 +2081,8 @@ mod tests {
                 actual_width: 80,
                 actual_height: 24,
                 x_offset: 0,
+                banner: Banner::Left,
+                feedback: false,
             },
         }
     }
@@ -2131,7 +2211,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            CommandOutcome::Output(message) if message.starts_with("Error: ")
+            CommandOutcome::OutputError(message) if message.starts_with("Error: ")
         ));
     }
 
@@ -2306,7 +2386,7 @@ mod tests {
             .expect("handle command");
 
             assert!(
-                matches!(outcome, CommandOutcome::Output(message) if message == expected),
+                matches!(outcome, CommandOutcome::OutputError(message) if message == expected),
                 "unexpected outcome for {input:?}"
             );
         }
@@ -2525,6 +2605,10 @@ mod tests {
         assert!(!diff.contains("diff --git a/README.md b/README.md"));
     }
 
+    // The pager test requires `sh` in PATH and a POSIX shell script as the pager.
+    // `run_git_diff_pager` invokes `sh -lc`, which is not guaranteed to be in PATH
+    // on Windows (Git for Windows may not add its bundled sh.exe to PATH).
+    #[cfg(not(windows))]
     #[test]
     fn git_workspace_diff_uses_configured_noninteractive_pager() {
         let _env_lock = lock_process_env();
@@ -2568,9 +2652,12 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(&pager, permissions).expect("pager permissions");
         }
+        // Backslashes are escape characters in gitconfig values, so use forward slashes
+        // on Windows to avoid "bad config line" parse errors.
+        let pager_config_path = pager.to_str().expect("pager path UTF-8").replace('\\', "/");
         fs::write(
             home.path().join(".gitconfig"),
-            format!("[core]\n\tpager = {}\n", pager.display()),
+            format!("[core]\n\tpager = {}\n", pager_config_path),
         )
         .expect("gitconfig");
         let _home_guard = EnvVarGuard::set_path("HOME", home.path());
@@ -2691,7 +2778,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            CommandOutcome::Output(ref message)
+            CommandOutcome::OutputError(ref message)
                 if message == "Unknown command '/unknown'. Use /help to see available commands."
         ));
     }
@@ -2951,6 +3038,11 @@ mod tests {
         assert!(output.contains("2 "));
     }
 
+    // This test creates a fake `bat` shell script to intercept the call.
+    // On Windows, plain extensionless scripts aren't executable via CreateProcessW,
+    // and PATHEXT resolution finds the real bat.exe before bat.cmd in a later PATH
+    // directory. Skipped on Windows; bat integration is verified on CI via Linux runners.
+    #[cfg(not(windows))]
     #[test]
     fn show_file_uses_bat_when_available_without_metadata_columns() {
         let _env_lock = lock_process_env();

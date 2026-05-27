@@ -16,7 +16,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orangu::{
     llm::StreamMetrics,
-    tui::{HeaderStatus, StatusFragment, TranscriptLine, visible_line_width},
+    tui::{Banner, HeaderStatus, StatusFragment, TranscriptLine, visible_line_width},
 };
 use std::{
     collections::VecDeque,
@@ -71,6 +71,8 @@ pub struct RenderContext<'a> {
     pub actual_width: usize,
     pub actual_height: usize,
     pub x_offset: usize,
+    pub banner: Banner,
+    pub feedback: bool,
 }
 
 #[derive(Clone, Debug)]

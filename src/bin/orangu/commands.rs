@@ -104,8 +104,11 @@ pub fn shell_words(input: &str) -> Result<Vec<String>> {
 pub enum CommandOutcome {
     Unhandled,
     Quiet,
+    /// Command ran and produced informational output (success).
     Output(String),
     WideOutput(String),
+    /// Command failed — invalid usage, unknown command, or other error.
+    OutputError(String),
     Cleared,
     Quit,
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),

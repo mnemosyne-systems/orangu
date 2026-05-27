@@ -22,6 +22,8 @@ max_tool_rounds = 10
 | `max_tool_rounds` | No | Maximum tool-calling turns before the client aborts the prompt |
 | `quotes` | No | Quote set shown while the model is thinking. Defaults to `none`. Options: `none`, `star_trek`, `star_wars`, `marco_pierre_white`, `gordon_ramsay`, `calvin_and_hobbes`, `all` |
 | `width` | No | Virtual terminal width in characters. Controls the layout canvas for `/show_file` output. Defaults to `512` |
+| `banner` | No | Horizontal placement of the banner. Defaults to `left`. Options: `left`, `center`, `right` |
+| `feedback` | No | Show a green or red dot in the output window after each command to indicate success or failure. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 
 ## Model profiles
 
@@ -44,7 +46,7 @@ model = ggml-org/gemma-4-E4B-it-GGUF
 
 - The endpoint may be configured either with or without `/v1`
 - The client normalizes the endpoint internally before calling `/v1/chat/completions`
-- Slow responses will display a blinking `Thinking` / `Working` placeholder in the status bar while the model is working
+- Set `feedback = on` in `[orangu]` to show a green or red dot in the output window after each command completes
 
 ## Sample file
 

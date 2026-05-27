@@ -57,10 +57,32 @@ const ORANGU_BROWN: &str = "\x1b[38;2;139;90;43m";
 const STATUS_GREEN: &str = "\x1b[38;2;80;200;120m";
 const STATUS_RED: &str = "\x1b[38;2;220;80;80m";
 const ANSI_RESET: &str = "\x1b[0m";
+pub const FEEDBACK_OK: &str = "\x1b[38;2;80;200;120m●\x1b[0m";
+pub const FEEDBACK_ERR: &str = "\x1b[38;2;220;80;80m●\x1b[0m";
 const USER_INPUT_BACKGROUND: &str = "\x1b[48;2;44;44;44m";
 const THINKING_TEXT: &str = "Thinking";
 const WORKING_TEXT: &str = "Working";
 const THINKING_SHADE_LEVELS: &[u8] = &[230, 210, 190, 170, 150, 130, 110, 90];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Banner {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl std::str::FromStr for Banner {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "center" => Self::Center,
+            "right" => Self::Right,
+            _ => Self::Left,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HeaderStatus {
@@ -75,6 +97,8 @@ pub fn render_header(
     endpoint: &str,
     workspace: &std::path::Path,
     status: HeaderStatus,
+    alignment: Banner,
+    actual_width: usize,
 ) -> String {
     let status_lines = [
         status_text_line(&format!("Version: {version}")),
@@ -126,7 +150,23 @@ pub fn render_header(
     }
 
     lines.push(bottom_border);
-    lines.join("\r\n")
+
+    let box_width = width + 4;
+    let padding = match alignment {
+        Banner::Left => 0,
+        Banner::Center => actual_width.saturating_sub(box_width) / 2,
+        Banner::Right => actual_width.saturating_sub(box_width),
+    };
+    if padding == 0 {
+        lines.join("\r\n")
+    } else {
+        let prefix = " ".repeat(padding);
+        lines
+            .iter()
+            .map(|line| format!("{prefix}{line}"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
 }
 
 pub fn help_text() -> &'static str {
@@ -178,6 +218,7 @@ pub struct ScreenRenderArgs<'a> {
     pub workspace: &'a std::path::Path,
     pub prompt_branch: Option<&'a str>,
     pub status: HeaderStatus,
+    pub banner: Banner,
     pub transcript: &'a [TranscriptLine],
     pub scroll_offset: usize,
     pub left_status: Option<StatusFragment>,
@@ -210,6 +251,8 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
         args.endpoint,
         args.workspace,
         args.status,
+        args.banner,
+        args.actual_width,
     );
     let header_line_count = header.lines().count();
     let width = args.virtual_width.max(1);
@@ -302,7 +345,15 @@ pub fn output_view_rows(
     actual_width: usize,
     actual_height: usize,
 ) -> usize {
-    let header = render_header(version, current_model, endpoint, workspace, status);
+    let header = render_header(
+        version,
+        current_model,
+        endpoint,
+        workspace,
+        status,
+        Banner::Left,
+        actual_width,
+    );
     let header_line_count = header.lines().count();
     let prompt_prefix = prompt_prefix(prompt_branch);
     let input_lines = wrapped_input_lines(input, actual_width.max(1), &prompt_prefix);
