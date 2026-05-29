@@ -52,6 +52,10 @@ pub enum InputResult {
 pub enum WaitResult {
     Response(String),
     Cancelled(String),
+    Failed {
+        partial: String,
+        error: anyhow::Error,
+    },
     Quit,
 }
 

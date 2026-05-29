@@ -572,7 +572,17 @@ async fn run() -> Result<()> {
                 }
             }
             Ok(WaitResult::Cancelled(partial_output)) => {
+                let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
+                usage_stats.record_response(llm_start.elapsed(), &partial_output, tool_delta);
                 preserve_cancelled_output(&mut output_state, &partial_output);
+            }
+            Ok(WaitResult::Failed { partial, error }) => {
+                let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
+                usage_stats.record_response(llm_start.elapsed(), &partial, tool_delta);
+                output_state.push_text(&format!("Error: {error:#}"));
+                if config.feedback {
+                    output_state.push_text(FEEDBACK_ERR);
+                }
             }
             Ok(WaitResult::Quit) => {
                 save_session_messages(&session_messages_path, session.messages())?;
@@ -582,6 +592,8 @@ async fn run() -> Result<()> {
                 break;
             }
             Err(err) => {
+                let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
+                usage_stats.record_elapsed(llm_start.elapsed(), tool_delta);
                 output_state.push_text(&format!("Error: {err:#}"));
                 if config.feedback {
                     output_state.push_text(FEEDBACK_ERR);
@@ -625,14 +637,25 @@ impl UsageStats {
         self
     }
 
+    /// Record the time spent on a turn, splitting it into tool time and LLM
+    /// time. Called for every outcome — success, cancellation, and failure —
+    /// so the LLM time before a failure or cancellation is still counted.
+    fn record_elapsed(
+        &mut self,
+        total_duration: std::time::Duration,
+        tool_duration: std::time::Duration,
+    ) {
+        self.total_tool_duration += tool_duration;
+        self.total_llm_duration += total_duration.saturating_sub(tool_duration);
+    }
+
     fn record_response(
         &mut self,
         total_duration: std::time::Duration,
         response: &str,
         tool_duration: std::time::Duration,
     ) {
-        self.total_tool_duration += tool_duration;
-        self.total_llm_duration += total_duration.saturating_sub(tool_duration);
+        self.record_elapsed(total_duration, tool_duration);
         if let Ok(tokenizer) = cl100k_base() {
             self.total_tokens += tokenizer.encode_with_special_tokens(response).len();
         }
@@ -1132,7 +1155,16 @@ async fn wait_for_response(
     loop {
         tokio::select! {
             result = &mut prompt_future => {
-                let response = result?;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let partial = streamed_state
+                            .lock()
+                            .map(|state| state.output.clone())
+                            .unwrap_or_default();
+                        return Ok(WaitResult::Failed { partial, error });
+                    }
+                };
                 let final_state = streamed_state
                     .lock()
                     .map(|state| state.clone())
@@ -2094,6 +2126,35 @@ mod tests {
                 feedback: false,
             },
         }
+    }
+
+    #[test]
+    fn record_elapsed_counts_llm_time_without_tokens() {
+        use std::time::Duration;
+
+        let mut stats = super::UsageStats::new();
+        // A failed or cancelled turn: time is spent but no response is recorded.
+        stats.record_elapsed(Duration::from_secs(5), Duration::from_secs(2));
+
+        assert_eq!(stats.total_llm_duration, Duration::from_secs(3));
+        assert_eq!(stats.total_tool_duration, Duration::from_secs(2));
+        assert_eq!(stats.total_tokens, 0);
+    }
+
+    #[test]
+    fn record_response_counts_llm_time_and_tokens() {
+        use std::time::Duration;
+
+        let mut stats = super::UsageStats::new();
+        stats.record_response(
+            Duration::from_secs(4),
+            "hello world",
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(stats.total_llm_duration, Duration::from_secs(3));
+        assert_eq!(stats.total_tool_duration, Duration::from_secs(1));
+        assert!(stats.total_tokens > 0);
     }
 
     #[test]
