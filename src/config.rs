@@ -32,6 +32,8 @@ pub struct ClientAppConfiguration {
     #[serde(skip)]
     pub banner: Banner,
     pub feedback: bool,
+    pub auto_rebase: bool,
+    pub auto_squash: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -63,6 +65,10 @@ struct ClientConfiguration {
     banner: String,
     #[serde(default)]
     feedback: String,
+    #[serde(default)]
+    auto_rebase: String,
+    #[serde(default)]
+    auto_squash: String,
 }
 
 pub fn default_virtual_width() -> usize {
@@ -110,6 +116,8 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         width: root.client.width,
         banner: root.client.banner.parse().unwrap_or_default(),
         feedback: parse_feedback_bool(&root.client.feedback),
+        auto_rebase: parse_feedback_bool(&root.client.auto_rebase),
+        auto_squash: parse_feedback_bool(&root.client.auto_squash),
     })
 }
 

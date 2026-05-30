@@ -196,6 +196,7 @@ pub fn help_text() -> &'static str {
 /merge <branch>                               Merge a branch into the current branch
 /move_file <source> <destination>             Rename or move a tracked file with git mv
 /pull <number>                                Check out a GitHub pull request on a dedicated branch
+/pull_request                                 Create a pull request for the current branch
 /push [--force]                               Push the current branch to origin
 /rebase                                       Rebase the current branch against master/main
 /remove_file <path>                           Remove a file or directory from Git tracking
@@ -205,7 +206,7 @@ pub fn help_text() -> &'static str {
 /clear                                        Clear the current conversation
 /quit                                         Exit the client
 
-Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `init repo`, `delete feature/foo`, and `show help` are also handled locally.
+Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `create pull request`, `init repo`, `delete feature/foo`, and `show help` are also handled locally.
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 

@@ -132,6 +132,7 @@ pub enum LocalCommand<'a> {
     Log,
     Pull(Option<u64>),
     Comment(Option<(u64, Cow<'a, str>)>),
+    CreatePullRequest,
     Rebase,
     Merge(Option<Cow<'a, str>>),
     Checkout(Option<Cow<'a, str>>),
@@ -163,6 +164,8 @@ pub struct CommandContext<'a> {
     pub usage_stats: &'a crate::UsageStats,
     pub http_client: reqwest::Client,
     pub virtual_width: usize,
+    pub auto_rebase: bool,
+    pub auto_squash: bool,
 }
 
 pub struct CommandState<'a> {
@@ -208,6 +211,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/move_file" => Some(LocalCommand::MoveFile(None)),
         "/pull" => Some(LocalCommand::Pull(None)),
         "/comment" => Some(LocalCommand::Comment(None)),
+        "/pull_request" => Some(LocalCommand::CreatePullRequest),
         "/push" => Some(LocalCommand::Push(false)),
         "/rebase" => Some(LocalCommand::Rebase),
         "/remove_file" => Some(LocalCommand::RemoveFile(None)),
@@ -459,6 +463,20 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
             return Some(LocalCommand::Comment(parse_comment_args(rest.trim())));
         }
+    }
+    if matches_ci(
+        input,
+        &[
+            "pull request",
+            "create pull request",
+            "open pull request",
+            "new pull request",
+            "create pr",
+            "open pr",
+            "new pr",
+        ],
+    ) {
+        return Some(LocalCommand::CreatePullRequest);
     }
     if matches_ci(input, &["rebase", "git rebase"]) {
         return Some(LocalCommand::Rebase);

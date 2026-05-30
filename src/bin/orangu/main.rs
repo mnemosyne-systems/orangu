@@ -63,10 +63,10 @@ use commands::{
 };
 use git::{
     add_file_output, amend_output, checkout_output, cherry_pick_output, comment_output,
-    commit_output, delete_branch_output, git_diff_against_branch, git_workspace_diff,
-    init_repo_output, list_workspace_files_tree, log_output, merge_output, move_file_output,
-    open_in_editor, pull_request_output, push_output, rebase_output, remove_file_output,
-    squash_output, status_output, workspace_branch_name,
+    commit_output, create_pull_request_output, delete_branch_output, git_diff_against_branch,
+    git_workspace_diff, init_repo_output, list_workspace_files_tree, log_output, merge_output,
+    move_file_output, open_in_editor, pull_request_output, push_output, rebase_output,
+    remove_file_output, squash_output, status_output, workspace_branch_name,
 };
 use input::{
     EscapeCancelState, InputContext, InputResult, InputState, InterruptState, OutputState,
@@ -354,6 +354,8 @@ async fn run() -> Result<()> {
                 usage_stats: &usage_stats,
                 http_client: status_http_client.clone(),
                 virtual_width: viewport.virtual_width,
+                auto_rebase: config.auto_rebase,
+                auto_squash: config.auto_squash,
             },
         )? {
             CommandOutcome::Quit => {
@@ -793,6 +795,8 @@ fn handle_command(
         usage_stats,
         http_client,
         virtual_width,
+        auto_rebase,
+        auto_squash,
     } = context;
 
     match command {
@@ -927,6 +931,12 @@ fn handle_command(
                 Ok(_) => Ok(CommandOutcome::Quiet),
                 Err(err) => Ok(local_command_error(err)),
             }
+        }
+        LocalCommand::CreatePullRequest => {
+            let ws = workspace.to_path_buf();
+            Ok(CommandOutcome::Blocking(Box::new(move || {
+                create_pull_request_output(&ws, auto_rebase, auto_squash)
+            })))
         }
         LocalCommand::Rebase => match rebase_output(workspace) {
             Ok(_) => Ok(CommandOutcome::Quiet),
@@ -2275,6 +2285,8 @@ mod tests {
                 usage_stats: &super::UsageStats::new(),
                 http_client: reqwest::Client::new(),
                 virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
             },
         )
         .expect("handle command");
@@ -2451,6 +2463,8 @@ mod tests {
                     usage_stats: &super::UsageStats::new(),
                     http_client: reqwest::Client::new(),
                     virtual_width: 512,
+                    auto_rebase: false,
+                    auto_squash: false,
                 },
             )
             .expect("handle command");
@@ -2510,6 +2524,8 @@ mod tests {
                 usage_stats: &super::UsageStats::new(),
                 http_client: reqwest::Client::new(),
                 virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
             },
         )
         .expect("handle command");
@@ -2793,6 +2809,8 @@ mod tests {
                 usage_stats: &super::UsageStats::new(),
                 http_client: reqwest::Client::new(),
                 virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
             },
         )
         .expect("handle command");
@@ -2842,6 +2860,8 @@ mod tests {
                 usage_stats: &super::UsageStats::new(),
                 http_client: reqwest::Client::new(),
                 virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
             },
         )
         .expect("command outcome");

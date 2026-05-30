@@ -76,7 +76,7 @@ Please refer to the upstream documentation for full installation and configurati
 
 [**gh**](https://cli.github.com/) is the official GitHub CLI. It provides commands such as `gh repo clone`, `gh pr create`, and `gh issue list` for interacting with GitHub repositories directly from the terminal.
 
-If it is installed, **orangu** will use it for `/pull` to check out pull requests, for `/rebase` to determine the default branch, and for `/merge` to merge pull requests. Without it, **orangu** falls back to plain Git for all three operations. The `/comment` command does require `gh` and runs `gh issue comment` to add a comment to a GitHub issue; there is no plain Git fallback for it.
+If it is installed, **orangu** will use it for `/pull` to check out pull requests, for `/rebase` to determine the default branch, and for `/merge` to merge pull requests. Without it, **orangu** falls back to plain Git for all three operations. The `/comment` command requires `gh` and runs `gh issue comment` to add a comment to a GitHub issue; there is no plain Git fallback for it. The `/pull_request` command also requires `gh` and runs `gh pr create` to open a pull request from the current branch; there is no plain Git fallback for it.
 
 **Installation**
 

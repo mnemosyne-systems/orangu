@@ -770,6 +770,137 @@ pub fn comment_output(workspace: &Path, issue_number: u64, body: &str) -> Result
     })
 }
 
+pub fn create_pull_request_output(
+    workspace: &Path,
+    auto_rebase: bool,
+    auto_squash: bool,
+) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("pull_request is only available inside a Git repository"))?;
+    let current = git_current_branch(&repo_root)?;
+    if is_protected_branch(&current) {
+        return Err(anyhow!(
+            "cannot create a pull request from the '{}' branch",
+            current
+        ));
+    }
+    let base_ref = git_find_base_ref(&repo_root)?;
+    let ahead = git_commit_count(&repo_root, &format!("{base_ref}..HEAD"))?;
+    if ahead == 0 {
+        return Err(anyhow!(
+            "no commits ahead of {base_ref}; make at least one commit before opening a pull request"
+        ));
+    }
+    let behind = git_commit_count(&repo_root, &format!("HEAD..{base_ref}"))?;
+    if behind > 0 {
+        if auto_rebase {
+            rebase_output(workspace)?;
+        } else {
+            return Err(anyhow!(
+                "branch is {behind} commit{} behind {base_ref}; run /rebase first",
+                if behind == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    let ahead = git_commit_count(&repo_root, &format!("{base_ref}..HEAD"))?;
+    if ahead > 1 {
+        if auto_squash {
+            squash_output(workspace)?;
+        } else {
+            return Err(anyhow!(
+                "{ahead} commits ahead of {base_ref}; run /squash first"
+            ));
+        }
+    }
+    try_gh_create_pr(&repo_root, &current, &base_ref)
+}
+
+fn git_commit_count(repo_root: &Path, range: &str) -> Result<usize> {
+    Ok(String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["rev-list", "--count", range])
+            .output()
+            .context("failed to run git rev-list")?
+            .stdout,
+    )
+    .trim()
+    .parse()
+    .unwrap_or(0))
+}
+
+pub fn try_gh_create_pr(repo_root: &Path, branch: &str, base_ref: &str) -> Result<String> {
+    let full_message = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .context("failed to run git log")?
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let (title, body) = match full_message.split_once('\n') {
+        Some((subject, rest)) => (subject.trim().to_string(), rest.trim().to_string()),
+        None => (full_message.clone(), String::new()),
+    };
+    if title.is_empty() {
+        return Err(anyhow!(
+            "commit message is empty; cannot derive a pull request title"
+        ));
+    }
+    let push = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["push", "--set-upstream", "origin", branch])
+        .output()
+        .context("failed to run git push")?;
+    if !push.status.success() {
+        let stderr = String::from_utf8_lossy(&push.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git push failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    let base = base_ref.trim_start_matches("origin/");
+    let output = match std::process::Command::new("gh")
+        .args([
+            "pr", "create", "--title", &title, "--body", &body, "--base", base,
+        ])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("pull_request requires the gh CLI to be installed"));
+        }
+        Err(err) => return Err(err).context("failed to run gh"),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "gh pr create failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if stdout.is_empty() {
+        format!("Created pull request from '{branch}'")
+    } else {
+        stdout
+    })
+}
+
 pub fn rebase_output(workspace: &Path) -> Result<String> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("rebase is only available inside a Git repository"))?;

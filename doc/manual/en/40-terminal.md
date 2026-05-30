@@ -178,6 +178,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/merge <branch>` | Merge a branch into the current branch |
 | `/move_file <source> <destination>` | Rename or move a tracked file with git mv |
 | `/pull <number>` | Check out a GitHub pull request on a dedicated branch |
+| `/pull_request` | Create a pull request for the current branch |
 | `/push [--force]` | Push the current branch to origin |
 | `/rebase` | Rebase the current branch against master/main |
 | `/remove_file <path>` | Remove a file or directory from Git tracking |
@@ -201,6 +202,7 @@ Free-form prompts are blocked when the server or model status in the header is r
 - `/status` requires a Git repository and runs `git status --branch --short`; `gh` has no equivalent so it always uses plain Git; added files and untracked entries are shown in green, deleted entries in red, and modified entries in the default terminal color; the branch line is shown in a muted color
 - `/log` requires a Git repository; if a `lg` alias is found in `~/.gitconfig` it runs `git lg`, otherwise it falls back to `git log --graph --oneline --decorate`; see the optional tools chapter for the recommended `git lg` alias setup
 - `/pull <number>` requires a Git repository; if `gh` is installed it uses `gh pr checkout`, otherwise it fetches the pull request directly from `origin`
+- `/pull_request` requires a Git repository and the `gh` CLI; it runs several pre-flight checks before creating the pull request: it blocks on `main` and `master`, requires at least one commit ahead of the base branch, blocks if the branch is behind the base (suggesting `/rebase`), and blocks if there is more than one commit ahead (suggesting `/squash`); when all checks pass it pushes the branch with `--set-upstream origin` and calls `gh pr create` with the title and body derived from the single commit message; the checks can be bypassed by setting `auto_rebase = on` or `auto_squash = on` in the `[orangu]` config section, which triggers the corresponding fix automatically before continuing
 - `/rebase` requires a Git repository; if `gh` is installed it queries the repository default branch, otherwise it probes `origin/main` then `origin/master`
 - `/merge <branch>` requires a Git repository; if `gh` is installed it uses `gh pr merge --merge`, otherwise it uses `git merge`
 - `/checkout <branch|file>` requires a Git repository and runs `git checkout`; Tab completion offers branch names first, then workspace file paths
@@ -248,6 +250,7 @@ Local commands can also be entered in plain language. Examples:
 - `cherry pick abc1234` or `cherry-pick abc1234` or `git cherry-pick abc1234`
 - `commit "[#42] My feature"` or `commit Fix the bug` or `git commit -m "Fix the bug"`
 - `amend "[#42] My feature"` or `amend Fix the bug` or `git amend "[#42] My feature"` or `git commit --amend -m "Fix the bug"`
+- `pull request` or `create pull request` or `open pull request` or `create pr` or `open pr`
 - `push` or `git push` or `git push origin`
 - `force push` or `push force` or `push --force`
 - `init` or `init repo` or `git init`
