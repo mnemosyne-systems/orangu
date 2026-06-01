@@ -298,16 +298,20 @@ pub fn open_in_editor(workspace: &Path, raw_path: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("EDITOR is empty"))?;
 
     let _raw_mode_pause_guard = RawModePauseGuard::new()?;
-    let _child = std::process::Command::new(program)
-        .args(args)
-        .arg(&path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to launch editor '{}'", editor))?;
+    let mut editor: std::process::Command = std::process::Command::new(program);
+    editor.args(args).arg(&path);
 
-    Ok(())
+    match editor.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(anyhow!(
+            "{} exited with status code {}",
+            program,
+            status
+                .code()
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string())
+        )),
+        Err(err) => Err(anyhow!("{}: {err}", program)),
+    }
 }
 
 pub fn git_workspace_diff(workspace: &Path) -> Result<String> {
