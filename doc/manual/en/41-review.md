@@ -25,18 +25,18 @@ Above the bottom prompt frame (the status bar and input window, exactly as on th
 Each file row begins with a review-status box:
 
 - `[ ]` — not yet reviewed
-- `[●]` (green) — approved
-- `[●]` (red) — rejected
+- a green dot in the box — approved
+- a red dot in the box — rejected
 
 The currently selected file is highlighted in the right pane. Selecting a different file replaces the left pane with that file's diff, shown from the top.
 
 ```
- diff --git a/src/main.rs b/src/main.rs│Files (3)
- @@ -1,4 +1,5 @@                       │[ ] README.md
- +fn new() {}                          │[●] src/main.rs  ← selected
-  (only the selected file's diff,      │[●] src/git.rs
-   scrollable)                         │
-                                       │
+ diff --git a/src/main.rs b/src/main.rs |Files (3)
+ @@ -1,4 +1,5 @@                        |[ ] README.md
+ +fn new() {}                           |[*] src/main.rs  <- selected
+  (only the selected file's diff,       |[*] src/git.rs
+   scrollable)                          |
+                                        |
 ```
 
 ## Asking the model to review a file
@@ -53,11 +53,11 @@ The request and the model's reply are added to your chat session, so after leavi
 
 Move the highlighted line to the place you want to comment on and press `Alt+c`. A small comment window opens **inline, just below that line** in the left pane. Type your note (it wraps and the five-line window scrolls if the comment is long), then press `Enter` to save it or `Esc` to discard it.
 
-Each comment is recorded against the file and that diff line; lines with a comment are flagged with an amber dot (`●`) at the right edge. Pressing `Alt+c` on a line that already has a comment re-opens it for editing, and saving an empty comment removes it.
+Each comment is recorded against the file and that diff line; lines with a comment are flagged with an amber dot at the right edge. Pressing `Alt+c` on a line that already has a comment re-opens it for editing, and saving an empty comment removes it.
 
 You can also add a **general note** about the patch: type `# <note>` in the input window and press `Enter` (or `Alt+o`). Instead of being sent to the model, it is recorded as a general note (the `#` is dropped). Anything not starting with `#` is still treated as an LLM request.
 
-When you leave review mode (`Alt+x`), a summary is written to the output window. Each file is listed with its status and a colored dot — `<file>: Approved ●` (green), `Rejected ●` (red), or `No review ●` (white, for unmarked files) — followed by the line comments, one per line, as `<file>:<line>: <comment>` (ordered by file then line, with 1-based line numbers), then the general notes (with the `#` removed). The summary ends with a bold verdict line. If every file is approved and there are no comments or notes the summary is just `Patch approved`; otherwise (any file rejected or unreviewed, or any comment/note) the verdict is `Patch rejected`.
+When you leave review mode (`Alt+x`), a summary is written to the output window. Each file is listed with its status and a colored dot — `<file>: Approved` with a green dot, `Rejected` with a red dot, or `No review` with a white dot (for unmarked files) — followed by the line comments, one per line, as `<file>:<line>: <comment>` (ordered by file then line, with 1-based line numbers), then the general notes (with the `#` removed). The summary ends with a bold verdict line. If every file is approved and there are no comments or notes the summary is just `Patch approved`; otherwise (any file rejected or unreviewed, or any comment/note) the verdict is `Patch rejected`.
 
 The comments — both the line comments and the general (`#`) notes — are copied to the system clipboard; the per-file statuses and the verdict are not. If the clipboard cannot be reached (for example on a headless machine), a short note is shown instead and the output-window summary is unaffected.
 
@@ -74,7 +74,7 @@ The comments — both the line comments and the general (`#`) notes — are copi
 | `Esc` `Esc` | Cancel an in-progress review request (while the model is thinking) |
 | `Alt+x` or `Esc` `Esc` | Exit review mode and return to the prompt |
 
-When the feedback window is open it is modal: `x` or `Esc` closes it, and `↑`/`↓`, `PageUp`/`PageDown`, and `←`/`→` scroll and pan it.
+When the feedback window is open it is modal: `x` or `Esc` closes it, and `Up`/`Down`, `PageUp`/`PageDown`, and `Left`/`Right` scroll and pan it.
 
 Otherwise you can type into the input window normally, and move through the selected file's diff:
 
