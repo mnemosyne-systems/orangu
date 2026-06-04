@@ -218,6 +218,9 @@ async fn run() -> Result<()> {
     let mut usage_stats = UsageStats::new().with_session(&session_id);
     let mut history = load_history(&session_hist_path)?;
     let mut restart_requested = false;
+    // When set, the post-loop exec resumes this session instead of the current
+    // one — used by `/session <UUID>` to switch sessions in place.
+    let mut resume_override: Option<String> = None;
     let mut startup_notice_until: Option<std::time::Instant> =
         if is_resumed && args.resume.is_none() {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(5))
@@ -441,6 +444,15 @@ async fn run() -> Result<()> {
                 print!("{CLEAR_TERMINAL_SEQUENCE}");
                 std::io::stdout().flush()?;
                 restart_requested = true;
+                break;
+            }
+            CommandOutcome::SwitchSession(target) => {
+                save_session_messages(&session_messages_path, session.messages())?;
+                update_session_metadata_timestamp(&session_metadata_path)?;
+                print!("{CLEAR_TERMINAL_SEQUENCE}");
+                std::io::stdout().flush()?;
+                restart_requested = true;
+                resume_override = Some(target);
                 break;
             }
             CommandOutcome::Quiet => {
@@ -798,15 +810,29 @@ async fn run() -> Result<()> {
     drop(_terminal_ui_guard);
 
     if restart_requested {
+        let resume_target = resume_override.as_deref().unwrap_or(&session_id);
+        // When switching to a different session, follow it to the workspace it
+        // was started in so the resumed client (and its banner) reflect that
+        // session's project rather than the current directory.
+        let resume_workspace = match &resume_override {
+            Some(uuid) => session_dir_path(uuid)
+                .ok()
+                .and_then(|dir| load_session_metadata(&dir.join("metadata")).ok().flatten())
+                .map(|meta| meta.workspace)
+                .filter(|ws| !ws.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace.clone()),
+            None => workspace.clone(),
+        };
         let exe = restart_executable_path()?;
         let mut command = std::process::Command::new(&exe);
         command
             .arg("--config")
             .arg(&config_path)
             .arg("--workspace")
-            .arg(&workspace)
+            .arg(&resume_workspace)
             .arg("--resume")
-            .arg(&session_id);
+            .arg(resume_target);
         // Replace the current process image so the restarted client keeps the
         // controlling terminal as the foreground process. Spawning a child and
         // exiting instead would hand the terminal back to the launching shell,
@@ -1322,17 +1348,32 @@ fn handle_command(
                 Err(err) => Ok(CommandOutcome::OutputError(format!("Error: {err:#}"))),
             }
         }
-        LocalCommand::Session(None) => match list_sessions_output(None) {
+        LocalCommand::Session(None) => match list_sessions_output(None, &usage_stats.session_id) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Session(Some(uuid)) => {
-            Ok(CommandOutcome::Output(format!("orangu --resume {uuid}")))
+            if uuid == usage_stats.session_id {
+                return Ok(CommandOutcome::Output(format!(
+                    "Already in session {uuid}"
+                )));
+            }
+            match session_dir_path(&uuid) {
+                Ok(path) if path.is_dir() => {
+                    Ok(CommandOutcome::SwitchSession(uuid.into_owned()))
+                }
+                Ok(_) => Ok(CommandOutcome::OutputError(format!(
+                    "Error: no session found with UUID '{uuid}'"
+                ))),
+                Err(err) => Ok(local_command_error(err)),
+            }
         }
-        LocalCommand::Sessions(filter) => match list_sessions_output(filter.as_deref()) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
-            Err(err) => Ok(local_command_error(err)),
-        },
+        LocalCommand::Sessions(filter) => {
+            match list_sessions_output(filter.as_deref(), &usage_stats.session_id) {
+                Ok(output) => Ok(CommandOutcome::Output(output)),
+                Err(err) => Ok(local_command_error(err)),
+            }
+        }
         LocalCommand::Usage => Ok(CommandOutcome::Output(usage_stats.format())),
         LocalCommand::Build => {
             let ws = workspace.to_path_buf();
@@ -2766,7 +2807,7 @@ fn delete_session_dir(session_dir: &Path) {
     let _ = std::fs::remove_dir_all(session_dir);
 }
 
-fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
+fn list_sessions_output(workspace_filter: Option<&str>, active_session: &str) -> Result<String> {
     let sessions_dir = {
         let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
         home.join(SESSIONS_DIRECTORY)
@@ -2814,34 +2855,73 @@ fn list_sessions_output(workspace_filter: Option<&str>) -> Result<String> {
 
     entries.sort_by_key(|e| std::cmp::Reverse(e.1.as_ref().map(|m| m.started_at).unwrap_or(0)));
 
+    // Build every cell first so column widths can be sized to the widest value
+    // across all sessions, keeping the columns aligned regardless of content.
+    struct Row {
+        is_active: bool,
+        uuid: String,
+        started: String,
+        last: String,
+        cmds: String,
+        branch: String,
+        workspace: String,
+    }
+    let rows: Vec<Row> = entries
+        .iter()
+        .map(|(uuid, meta, cmd_count)| Row {
+            is_active: *uuid == active_session,
+            uuid: uuid.clone(),
+            started: meta
+                .as_ref()
+                .map(|m| format_unix_timestamp(m.started_at))
+                .unwrap_or_else(|| "-".to_string()),
+            last: meta
+                .as_ref()
+                .map(|m| format_unix_timestamp(m.last_updated_at))
+                .unwrap_or_else(|| "-".to_string()),
+            cmds: cmd_count.to_string(),
+            branch: meta
+                .as_ref()
+                .filter(|m| !m.branch.is_empty())
+                .map(|m| m.branch.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            workspace: meta
+                .as_ref()
+                .filter(|m| !m.workspace.is_empty())
+                .map(|m| m.workspace.clone())
+                .unwrap_or_else(|| "-".to_string()),
+        })
+        .collect();
+
+    let col_width = |header: &str, value: &dyn Fn(&Row) -> &str| {
+        rows.iter()
+            .map(|r| value(r).chars().count())
+            .chain(std::iter::once(header.chars().count()))
+            .max()
+            .unwrap_or(0)
+    };
+    let w_uuid = col_width("UUID", &|r| &r.uuid);
+    let w_started = col_width("STARTED", &|r| &r.started);
+    let w_last = col_width("LAST", &|r| &r.last);
+    let w_cmds = col_width("CMDS", &|r| &r.cmds);
+    let w_branch = col_width("BRANCH", &|r| &r.branch);
+
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
-        "{:<36}  {:<12}  {:<12}  {:>4}  {:<24}  {}",
-        "UUID", "STARTED", "LAST", "CMDS", "BRANCH", "WORKSPACE"
+        "{:<6}  {:<w_uuid$}  {:<w_started$}  {:<w_last$}  {:>w_cmds$}  {:<w_branch$}  {}",
+        "ACTIVE", "UUID", "STARTED", "LAST", "CMDS", "BRANCH", "WORKSPACE"
     ));
-    for (uuid, meta, cmd_count) in &entries {
-        let started = meta
-            .as_ref()
-            .map(|m| format_unix_timestamp(m.started_at))
-            .unwrap_or_else(|| "-".to_string());
-        let last = meta
-            .as_ref()
-            .map(|m| format_unix_timestamp(m.last_updated_at))
-            .unwrap_or_else(|| "-".to_string());
-        let branch = meta
-            .as_ref()
-            .map(|m| {
-                if m.branch.is_empty() {
-                    "-"
-                } else {
-                    m.branch.as_str()
-                }
-            })
-            .unwrap_or("-");
-        let workspace = meta.as_ref().map(|m| m.workspace.as_str()).unwrap_or("-");
+    for row in &rows {
+        // The dot is a single visible glyph; pad manually to the 6-char ACTIVE
+        // header width so the surrounding ANSI codes don't skew alignment.
+        let dot = if row.is_active {
+            FEEDBACK_OK
+        } else {
+            FEEDBACK_ERR
+        };
         lines.push(format!(
-            "{:<36}  {:<12}  {:<12}  {:>4}  {:<24}  {}",
-            uuid, started, last, cmd_count, branch, workspace
+            "{dot}       {:<w_uuid$}  {:<w_started$}  {:<w_last$}  {:>w_cmds$}  {:<w_branch$}  {}",
+            row.uuid, row.started, row.last, row.cmds, row.branch, row.workspace
         ));
     }
     Ok(lines.join("\n"))

@@ -114,6 +114,8 @@ pub enum CommandOutcome {
     Cleared,
     Quit,
     Restart,
+    /// Re-exec into a different existing session, resuming the given UUID.
+    SwitchSession(String),
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),
     Async(Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'static>>),
     /// Enter the interactive `/review` mode with a collected branch diff.
