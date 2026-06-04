@@ -857,7 +857,11 @@ pub fn git_log(repo_root: &Path) -> Result<String> {
     }
 }
 
-pub fn pull_request_output(workspace: &Path, pr_number: u64, forge: Forge) -> Result<Option<String>> {
+pub fn pull_request_output(
+    workspace: &Path,
+    pr_number: u64,
+    forge: Forge,
+) -> Result<Option<String>> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("pull is only available inside a Git repository"))?;
     if try_forge_pr_checkout(&repo_root, pr_number, forge)?.is_none() {
@@ -2609,8 +2613,14 @@ mod tests {
         let advice = pr_sync_advice(workspace.path()).expect("advice expected");
         assert!(advice.contains("run /rebase"), "missing rebase: {advice}");
         assert!(advice.contains("run /squash"), "missing squash: {advice}");
-        assert!(advice.contains("1 commit behind main"), "behind text: {advice}");
-        assert!(advice.contains("2 commits ahead of main"), "ahead text: {advice}");
+        assert!(
+            advice.contains("1 commit behind main"),
+            "behind text: {advice}"
+        );
+        assert!(
+            advice.contains("2 commits ahead of main"),
+            "ahead text: {advice}"
+        );
     }
 
     #[test]
@@ -2677,7 +2687,9 @@ mod tests {
 
         // Auto-fixes disabled: creation is blocked with the shared hint.
         let result = create_pull_request_output(workspace.path(), false, false, Forge::GitHub);
-        let msg = result.expect_err("PR creation should be blocked").to_string();
+        let msg = result
+            .expect_err("PR creation should be blocked")
+            .to_string();
         assert!(msg.contains("This pull request needs attention"), "{msg}");
         assert!(msg.contains("run /rebase"), "{msg}");
         assert!(msg.contains("run /squash"), "{msg}");
