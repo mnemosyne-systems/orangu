@@ -1354,14 +1354,10 @@ fn handle_command(
         },
         LocalCommand::Session(Some(uuid)) => {
             if uuid == usage_stats.session_id {
-                return Ok(CommandOutcome::Output(format!(
-                    "Already in session {uuid}"
-                )));
+                return Ok(CommandOutcome::Output(format!("Already in session {uuid}")));
             }
             match session_dir_path(&uuid) {
-                Ok(path) if path.is_dir() => {
-                    Ok(CommandOutcome::SwitchSession(uuid.into_owned()))
-                }
+                Ok(path) if path.is_dir() => Ok(CommandOutcome::SwitchSession(uuid.into_owned())),
                 Ok(_) => Ok(CommandOutcome::OutputError(format!(
                     "Error: no session found with UUID '{uuid}'"
                 ))),
