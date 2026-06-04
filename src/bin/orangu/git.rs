@@ -625,8 +625,13 @@ fn run_git_diff_capture(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-pub fn configured_git_diff_pager(repo_root: &Path) -> Result<Option<String>> {
-    for key in ["pager.diff", "core.pager"] {
+/// Look up the non-interactive pager configured for a specific git subcommand.
+/// Checks `pager.<subcommand>` first, then falls back to `core.pager`.
+/// Returns `None` when no pager is configured or the configured pager is an
+/// interactive one (less, more, …) that cannot be used non-interactively.
+pub fn configured_git_pager(repo_root: &Path, subcommand: &str) -> Result<Option<String>> {
+    let pager_key = format!("pager.{subcommand}");
+    for key in [pager_key.as_str(), "core.pager"] {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(repo_root)
@@ -644,8 +649,11 @@ pub fn configured_git_diff_pager(repo_root: &Path) -> Result<Option<String>> {
         }
         return Ok(Some(value.to_string()));
     }
-
     Ok(None)
+}
+
+pub fn configured_git_diff_pager(repo_root: &Path) -> Result<Option<String>> {
+    configured_git_pager(repo_root, "diff")
 }
 
 pub fn looks_like_interactive_pager(command: &str) -> bool {
@@ -690,7 +698,7 @@ pub fn run_git_diff_pager(
 ) -> Result<String> {
     let pager_command = with_explicit_pager_width(pager_command, terminal_width);
     let mut pager = std::process::Command::new("sh")
-        .arg("-lc")
+        .arg("-c")
         .arg(&pager_command)
         .current_dir(repo_root)
         .env("COLUMNS", terminal_width.to_string())
@@ -722,6 +730,38 @@ pub fn run_git_diff_pager(
     }
 
     String::from_utf8(output.stdout).context("git pager output was not UTF-8")
+}
+
+pub fn grep_output(workspace: &Path, pattern: &str) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("grep is only available inside a Git repository"))?;
+    let terminal_width = current_terminal_width();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["grep", pattern])
+        .env("COLUMNS", terminal_width.to_string())
+        .output()
+        .context("failed to run git grep")?;
+    if output.status.code() == Some(1) {
+        return Ok(format!("No matches for '{pattern}'."));
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git grep failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    if let Some(pager_command) = configured_git_pager(&repo_root, "grep")? {
+        run_git_diff_pager(&repo_root, &pager_command, &output.stdout, terminal_width)
+    } else {
+        String::from_utf8(output.stdout).context("git grep output was not UTF-8")
+    }
 }
 
 pub fn status_output(workspace: &Path) -> Result<String> {

@@ -191,6 +191,7 @@ pub fn help_text() -> &'static str {
 /comment <number> "<comment>"                 Add a comment to a GitHub/GitLab issue with gh/glab
 /commit <message>                             Commit all tracked changes with git commit -a -m
 /diff                                         Show a color unified diff against the current branch
+/grep <pattern>                               Search the workspace with git grep
 /init_repo                                    Initialize a Git repository in the workspace
 /log                                          Show commit log (uses git lg alias if configured)
 /merge <branch>                               Merge a branch into the current branch
@@ -212,7 +213,7 @@ pub fn help_text() -> &'static str {
 /clear                                        Clear the current conversation
 /quit                                         Exit the client
 
-Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `branch`, `list branches`, `checkout main`, `switch to main`, `create branch feature/x`, `rename to new-name`, `delete feature/foo`, `restore README.md`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `review`, `create pull request`, `stash`, `stash pop`, `stash list`, `stash drop`, `init repo`, `restart`, and `show help` are also handled locally.
+Natural-language forms such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `squash`, `merge feature/foo`, `grep <pattern>`, `find <pattern>`, `branch`, `list branches`, `checkout main`, `switch to main`, `create branch feature/x`, `rename to new-name`, `delete feature/foo`, `restore README.md`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `review`, `create pull request`, `stash`, `stash pop`, `stash list`, `stash drop`, `init repo`, `restart`, and `show help` are also handled locally.
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 

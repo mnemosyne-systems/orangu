@@ -156,6 +156,7 @@ pub enum LocalCommand<'a> {
     ModelInfo,
     SetModel(&'a str),
     Diff(Option<Cow<'a, str>>),
+    Grep(Option<Cow<'a, str>>),
     Review,
     Status,
     Log,
@@ -238,6 +239,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/commit" => Some(LocalCommand::Commit(None)),
         "/restore" => Some(LocalCommand::Restore(None)),
         "/diff" => Some(LocalCommand::Diff(None)),
+        "/grep" => Some(LocalCommand::Grep(None)),
         "/init_repo" => Some(LocalCommand::InitRepo),
         "/log" => Some(LocalCommand::Log),
         "/merge" => Some(LocalCommand::Merge(None)),
@@ -281,6 +283,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     None
                 } else {
                     Some(Cow::Borrowed(branch))
+                }));
+            }
+            if let Some(args) = input.strip_prefix("/grep ") {
+                let pattern = args.trim();
+                return Some(LocalCommand::Grep(if pattern.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(pattern))
                 }));
             }
             if let Some(name) = input.strip_prefix("/model ") {
@@ -533,6 +543,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     if matches_ci(input, &["status", "show status", "git status"]) {
         return Some(LocalCommand::Status);
+    }
+    for prefix in ["grep ", "find ", "git grep "] {
+        if let Some(pattern) = strip_ascii_prefix(input, prefix) {
+            let pattern = pattern.trim();
+            if !pattern.is_empty() {
+                return Some(LocalCommand::Grep(Some(Cow::Borrowed(pattern))));
+            }
+        }
     }
     if matches_ci(input, &["log", "show log", "git log", "git lg"]) {
         return Some(LocalCommand::Log);
@@ -1015,6 +1033,10 @@ pub fn merge_usage_message() -> &'static str {
 
 pub fn restore_usage_message() -> &'static str {
     "Usage: /restore [--staged] <file>. Use /help to see available commands."
+}
+
+pub fn grep_usage_message() -> &'static str {
+    "Usage: /grep <pattern>. Use /help to see available commands."
 }
 
 pub fn add_file_usage_message() -> &'static str {

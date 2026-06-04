@@ -59,20 +59,20 @@ use commands::ReviewLaunch;
 use commands::{
     BranchSubcommand, CommandContext, CommandOutcome, CommandState, LocalCommand, LocalError,
     StashSubcommand, add_file_usage_message, amend_usage_message, cherry_pick_usage_message,
-    comment_usage_message, commit_usage_message, connect_usage_message, merge_usage_message,
-    model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
-    pull_usage_message, remove_file_usage_message, restore_usage_message, sorted_model_names,
-    system_prompt,
+    comment_usage_message, commit_usage_message, connect_usage_message, grep_usage_message,
+    merge_usage_message, model_usage_message, move_file_usage_message, open_file_usage_message,
+    parse_local_command, pull_usage_message, remove_file_usage_message, restore_usage_message,
+    sorted_model_names, system_prompt,
 };
 use git::{
     Forge, add_file_output, amend_output, branch_create_output, branch_delete_output,
     branch_list_all_output, branch_list_output, branch_rename_output, cherry_pick_output,
     collect_review_diff, comment_output, commit_output, create_pull_request_output,
-    discover_git_root, git_checkout, git_diff_against_branch, git_workspace_diff, init_repo_output,
-    list_workspace_files_tree, log_output, merge_output, move_file_output, open_in_editor,
-    pull_request_output, push_output, rebase_output, remove_file_output, restore_output,
-    squash_output, stash_drop_output, stash_list_output, stash_output, stash_pop_output,
-    status_output, sync_default_branch, workspace_branch_name,
+    discover_git_root, git_checkout, git_diff_against_branch, git_workspace_diff, grep_output,
+    init_repo_output, list_workspace_files_tree, log_output, merge_output, move_file_output,
+    open_in_editor, pull_request_output, push_output, rebase_output, remove_file_output,
+    restore_output, squash_output, stash_drop_output, stash_list_output, stash_output,
+    stash_pop_output, status_output, sync_default_branch, workspace_branch_name,
 };
 use input::{
     EscapeCancelState, IDLE_STATUS_REFRESH_INTERVAL, InputContext, InputResult, InputState,
@@ -1143,6 +1143,13 @@ fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Status => match status_output(workspace) {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Err(err) => Ok(local_command_error(err)),
+        },
+        LocalCommand::Grep(None) => Ok(CommandOutcome::OutputError(
+            grep_usage_message().to_string(),
+        )),
+        LocalCommand::Grep(Some(pattern)) => match grep_output(workspace, &pattern) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
@@ -4006,7 +4013,7 @@ mod tests {
     }
 
     // The pager test requires `sh` in PATH and a POSIX shell script as the pager.
-    // `run_git_diff_pager` invokes `sh -lc`, which is not guaranteed to be in PATH
+    // `run_git_diff_pager` invokes `sh -c`, which is not guaranteed to be in PATH
     // on Windows (Git for Windows may not add its bundled sh.exe to PATH).
     #[cfg(not(windows))]
     #[test]

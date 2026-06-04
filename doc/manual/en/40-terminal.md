@@ -179,6 +179,7 @@ All slash commands are handled locally. They are not sent to the model.
 | `/comment <number> "<comment>"` | Add a comment to a GitHub issue with gh issue comment |
 | `/commit <message>` | Commit all tracked changes with git commit -a -m |
 | `/diff [branch]` | Show a color unified diff; without a branch shows unstaged changes, with a branch shows changes since diverging from it |
+| `/grep <pattern>` | Search the workspace for a pattern with git grep |
 | `/init_repo` | Initialize a Git repository in the workspace |
 | `/log` | Show commit log (uses `git lg` alias if configured) |
 | `/merge <branch>` | Merge a branch into the current branch |
@@ -210,6 +211,7 @@ Free-form prompts are blocked when the server or model status in the header is r
 - `/open_file <path>` is workspace-scoped; paths outside the workspace are rejected. It launches `$EDITOR` on the file in a separate window so orangu stays usable, and never waits for the editor.
 - `/show_file [--hash] [--author] <path> [<ref>]` is workspace-scoped; without a ref, the current workspace file is shown — when `bat` is installed it is used for the plain view, otherwise the built-in syntax-highlighted renderer is used; when a ref (commit hash, branch, or tag) is given, the file content at that ref is retrieved via `git show <ref>:<path>` and rendered with the built-in renderer; `--hash` and `--author` add per-line blame columns sourced from `git blame`, using the same ref when one is provided; Tab completion for the first positional argument offers workspace file paths recursively; Tab completion for the second positional argument cycles through that file's commit history (abbreviated hashes from `git log --follow`)
 - `/build` detects the project type from the workspace root and runs the appropriate toolchain: for Rust (`Cargo.toml`) it runs `cargo fmt`, `cargo clippy`, `cargo build`, and `cargo test`; for C (`CMakeLists.txt`) it runs `clang-format.sh` (if present), creates a `build/` directory if needed, runs `cmake ..` on the first build, then `make`; for Java (`pom.xml`) it installs frontend dependencies with `npm ci` when outdated, runs `npm run fix` and `npm run check` for the frontend (if `src/frontend/` exists), then `mvn package`; each step is reported individually and the pipeline stops on first failure
+- `/grep <pattern>` requires a Git repository and runs `git grep <pattern>` to search all tracked files; output is piped through the configured non-interactive pager (`pager.grep`, then `core.pager`) when one is set — if `delta` is configured it will colorize and format the results; exit code 1 (no matches) is handled gracefully; `gh` has no equivalent so it always uses plain Git; natural-language forms `grep <pattern>` and `find <pattern>` are also handled
 - `/diff` uses `git diff` inside Git repositories and applies configured non-interactive Git pagers such as `delta`; outside Git repositories it keeps the existing non-Git behavior; `/diff <branch>` runs `git diff <branch>...HEAD` to show commits on the current branch not yet in the specified branch; Tab completion after `/diff ` or natural-language forms such as `diff against <branch>` offers local and remote branch names
 - `/status` requires a Git repository and runs `git status --branch --short`; `gh` has no equivalent so it always uses plain Git; added files and untracked entries are shown in green, deleted entries in red, and modified entries in the default terminal color; the branch line is shown in a muted color
 - `/log` requires a Git repository; if a `lg` alias is found in `~/.gitconfig` it runs `git lg`, otherwise it falls back to `git log --graph --oneline --decorate`; see the optional tools chapter for the recommended `git lg` alias setup
@@ -256,6 +258,7 @@ Local commands can also be entered in plain language. Examples:
 - `review` or `review changes` or `code review` or `review branch`
 - `log` or `show log` or `git log` or `git lg`
 - `status` or `show status` or `git status`
+- `grep <pattern>` or `find <pattern>` or `git grep <pattern>`
 - `rebase` or `git rebase`
 - `merge feature/foo` or `git merge feature/foo`
 - `branch` or `list branches` or `git branch`
