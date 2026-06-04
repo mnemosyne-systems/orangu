@@ -1239,7 +1239,8 @@ fn handle_command(
         )),
         LocalCommand::Pull(Some(pr_number)) => {
             match pull_request_output(workspace, pr_number, forge) {
-                Ok(_) => Ok(CommandOutcome::Quiet),
+                Ok(Some(advice)) => Ok(CommandOutcome::Output(advice)),
+                Ok(None) => Ok(CommandOutcome::Quiet),
                 Err(err) => Ok(local_command_error(err)),
             }
         }
@@ -1367,7 +1368,8 @@ fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Push(force) => match push_output(workspace, force) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
+            Ok(Some(advice)) => Ok(CommandOutcome::Output(advice)),
+            Ok(None) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::InitRepo => match init_repo_output(workspace) {

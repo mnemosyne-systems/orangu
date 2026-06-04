@@ -857,13 +857,52 @@ pub fn git_log(repo_root: &Path) -> Result<String> {
     }
 }
 
-pub fn pull_request_output(workspace: &Path, pr_number: u64, forge: Forge) -> Result<String> {
+pub fn pull_request_output(workspace: &Path, pr_number: u64, forge: Forge) -> Result<Option<String>> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("pull is only available inside a Git repository"))?;
-    if let Some(output) = try_forge_pr_checkout(&repo_root, pr_number, forge)? {
-        return Ok(output);
+    if try_forge_pr_checkout(&repo_root, pr_number, forge)?.is_none() {
+        git_pr_checkout(&repo_root, pr_number)?;
     }
-    git_pr_checkout(&repo_root, pr_number)
+    Ok(pr_sync_advice(&repo_root))
+}
+
+/// Build the rebase/squash hint lines for the checked-out branch relative to the
+/// default base branch. Each entry is one line such as
+/// "branch is 2 commits behind origin/main; run /rebase". Returns an empty `Vec`
+/// when the branch is up to date with at most a single commit ahead.
+fn pr_sync_notes(repo_root: &Path, base_ref: &str) -> Result<Vec<String>> {
+    // Commits on the base branch the branch has not yet incorporated.
+    let behind = git_commit_count(repo_root, &format!("HEAD..{base_ref}"))?;
+    // Commits the branch adds on top of the merge base.
+    let ahead = git_commit_count(repo_root, &format!("{base_ref}..HEAD"))?;
+
+    let mut notes = Vec::new();
+    if behind > 0 {
+        notes.push(format!(
+            "branch is {behind} commit{} behind {base_ref}; run /rebase",
+            if behind == 1 { "" } else { "s" }
+        ));
+    }
+    if ahead > 1 {
+        notes.push(format!("{ahead} commits ahead of {base_ref}; run /squash"));
+    }
+    Ok(notes)
+}
+
+/// Report whether the checked-out branch would benefit from a rebase and/or
+/// squash against the default base branch before it can be merged. Returns
+/// `None` when the branch is already up to date with a single commit, or when
+/// the base branch cannot be determined.
+fn pr_sync_advice(repo_root: &Path) -> Option<String> {
+    let base_ref = git_find_base_ref(repo_root).ok()?;
+    let notes = pr_sync_notes(repo_root, &base_ref).ok()?;
+    if notes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "This pull request needs attention:\n- {}",
+        notes.join("\n- ")
+    ))
 }
 
 pub fn try_forge_pr_checkout(
@@ -1038,26 +1077,22 @@ pub fn create_pull_request_output(
             "no commits ahead of {base_ref}; make at least one commit before opening a pull request"
         ));
     }
+    // Apply any configured auto-fixes before re-checking the branch state.
     let behind = git_commit_count(&repo_root, &format!("HEAD..{base_ref}"))?;
-    if behind > 0 {
-        if auto_rebase {
-            rebase_output(workspace, forge)?;
-        } else {
-            return Err(anyhow!(
-                "branch is {behind} commit{} behind {base_ref}; run /rebase first",
-                if behind == 1 { "" } else { "s" }
-            ));
-        }
+    if behind > 0 && auto_rebase {
+        rebase_output(workspace, forge)?;
     }
     let ahead = git_commit_count(&repo_root, &format!("{base_ref}..HEAD"))?;
-    if ahead > 1 {
-        if auto_squash {
-            squash_output(workspace)?;
-        } else {
-            return Err(anyhow!(
-                "{ahead} commits ahead of {base_ref}; run /squash first"
-            ));
-        }
+    if ahead > 1 && auto_squash {
+        squash_output(workspace)?;
+    }
+    // Anything still outstanding blocks PR creation with the shared hint.
+    let notes = pr_sync_notes(&repo_root, &base_ref)?;
+    if !notes.is_empty() {
+        return Err(anyhow!(
+            "This pull request needs attention:\n- {}",
+            notes.join("\n- ")
+        ));
     }
     try_forge_create_pr(&repo_root, &current, &base_ref, forge)
 }
@@ -1761,13 +1796,13 @@ pub fn git_amend(repo_root: &Path, message: &str) -> Result<String> {
     Ok(String::new())
 }
 
-pub fn push_output(workspace: &Path, force: bool) -> Result<String> {
+pub fn push_output(workspace: &Path, force: bool) -> Result<Option<String>> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("push is only available inside a Git repository"))?;
-    if let Some(output) = try_gh_push(&repo_root, force)? {
-        return Ok(output);
+    if try_gh_push(&repo_root, force)?.is_none() {
+        git_push(&repo_root, force)?;
     }
-    git_push(&repo_root, force)
+    Ok(pr_sync_advice(&repo_root))
 }
 
 pub fn try_gh_push(_repo_root: &Path, _force: bool) -> Result<Option<String>> {
@@ -2535,6 +2570,117 @@ mod tests {
             .parse()
             .unwrap_or(99);
         assert_eq!(count, 1, "expected 1 commit after squash, got {count}");
+    }
+
+    #[test]
+    fn pr_sync_advice_flags_rebase_and_squash() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git command");
+        };
+        let commit = |name: &str, content: &str, msg: &str| {
+            std::fs::write(workspace.path().join(name), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+
+        git(&["checkout", "-B", "main"]);
+        commit("base.txt", "base\n", "Base commit");
+
+        // Feature branch with two commits (squash needed).
+        git(&["checkout", "-b", "pr-1"]);
+        commit("feature.txt", "feat1\n", "First feature commit");
+        commit("feature.txt", "feat2\n", "Second feature commit");
+
+        // Advance main so the branch is also behind (rebase needed).
+        git(&["checkout", "main"]);
+        commit("base.txt", "base2\n", "Base advances");
+        git(&["checkout", "pr-1"]);
+
+        let advice = pr_sync_advice(workspace.path()).expect("advice expected");
+        assert!(advice.contains("run /rebase"), "missing rebase: {advice}");
+        assert!(advice.contains("run /squash"), "missing squash: {advice}");
+        assert!(advice.contains("1 commit behind main"), "behind text: {advice}");
+        assert!(advice.contains("2 commits ahead of main"), "ahead text: {advice}");
+    }
+
+    #[test]
+    fn pr_sync_advice_silent_when_up_to_date() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git command");
+        };
+
+        git(&["checkout", "-B", "main"]);
+        std::fs::write(workspace.path().join("base.txt"), "base\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-m", "Base commit"]);
+
+        // Single commit, fully up to date with main: no advice.
+        git(&["checkout", "-b", "pr-2"]);
+        std::fs::write(workspace.path().join("feature.txt"), "feat\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-m", "Lone feature commit"]);
+
+        assert!(pr_sync_advice(workspace.path()).is_none());
+    }
+
+    #[test]
+    fn create_pull_request_blocks_with_combined_hint() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git command");
+        };
+        let commit = |name: &str, content: &str, msg: &str| {
+            std::fs::write(workspace.path().join(name), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+
+        git(&["checkout", "-B", "main"]);
+        commit("base.txt", "base\n", "Base commit");
+
+        git(&["checkout", "-b", "feature/pr"]);
+        commit("feature.txt", "feat1\n", "First feature commit");
+        commit("feature.txt", "feat2\n", "Second feature commit");
+
+        git(&["checkout", "main"]);
+        commit("base.txt", "base2\n", "Base advances");
+        git(&["checkout", "feature/pr"]);
+
+        // Auto-fixes disabled: creation is blocked with the shared hint.
+        let result = create_pull_request_output(workspace.path(), false, false, Forge::GitHub);
+        let msg = result.expect_err("PR creation should be blocked").to_string();
+        assert!(msg.contains("This pull request needs attention"), "{msg}");
+        assert!(msg.contains("run /rebase"), "{msg}");
+        assert!(msg.contains("run /squash"), "{msg}");
     }
 
     #[test]
