@@ -1182,6 +1182,7 @@ impl OranguHelper {
                 "/connect".to_string(),
                 "/disconnect".to_string(),
                 "/reload".to_string(),
+                "/restart".to_string(),
                 "/models".to_string(),
                 "/list_files".to_string(),
                 "/show_file".to_string(),

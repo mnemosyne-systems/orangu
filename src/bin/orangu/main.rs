@@ -87,6 +87,10 @@ const TERMINAL_TITLE: &str = "orangu";
 const WAIT_LOOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const THINKING_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 const SESSIONS_DIRECTORY: &str = ".orangu/sessions";
+/// Scratch directory used by `/restart` to stage a runnable copy of the binary
+/// when the original on-disk path has been replaced (e.g. rebuilt while
+/// running). Cleared on every startup.
+const RESTART_DIRECTORY: &str = ".orangu/last";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -131,6 +135,10 @@ async fn run() -> Result<()> {
         false
     };
     let tools = ToolExecutor::new(&workspace);
+
+    // Remove any binary staged by a previous `/restart`; it is only needed
+    // across the exec handoff and must not accumulate.
+    clear_restart_dir();
 
     let status_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -790,7 +798,7 @@ async fn run() -> Result<()> {
     drop(_terminal_ui_guard);
 
     if restart_requested {
-        let exe = std::env::current_exe()?;
+        let exe = restart_executable_path()?;
         let mut command = std::process::Command::new(&exe);
         command
             .arg("--config")
@@ -2538,6 +2546,65 @@ async fn try_startup_model_switch(
 fn session_dir_path(session_id: &str) -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
     Ok(home.join(SESSIONS_DIRECTORY).join(session_id))
+}
+
+/// The `~/.orangu/last` scratch directory used across a `/restart` handoff.
+fn restart_dir_path() -> Option<PathBuf> {
+    Some(home::home_dir()?.join(RESTART_DIRECTORY))
+}
+
+/// Remove the `/restart` scratch directory. Errors are ignored: a missing or
+/// unremovable directory must never block startup.
+fn clear_restart_dir() {
+    if let Some(dir) = restart_dir_path() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Resolve the path to exec when restarting.
+///
+/// `std::env::current_exe()` reads `/proc/self/exe`, which keeps pointing at the
+/// original inode. When the binary is rebuilt while running, that inode is
+/// unlinked and the path is reported with a trailing ` (deleted)` marker, so
+/// exec'ing it fails with `ENOENT`. We first retry the real on-disk path with
+/// the marker stripped — after a rebuild that path holds the fresh binary, which
+/// is exactly what a restart should pick up. If that path is gone entirely
+/// (e.g. the build directory was cleaned), we fall back to copying the still-open
+/// running binary into `~/.orangu/last` and exec'ing that copy, which always
+/// succeeds even though it relaunches the previous build.
+fn restart_executable_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+
+    // Fast path: the binary on disk is intact.
+    if exe.exists() {
+        return Ok(exe);
+    }
+
+    // The reported path may carry the kernel's " (deleted)" suffix; the real
+    // path without it usually holds the rebuilt binary.
+    let display = exe.to_string_lossy();
+    if let Some(stripped) = display.strip_suffix(" (deleted)") {
+        let real = PathBuf::from(stripped);
+        if real.exists() {
+            return Ok(real);
+        }
+    }
+
+    // Last resort: stage a copy of the running binary somewhere stable and exec
+    // that. `/proc/self/exe` can still be read while the inode is open, even
+    // after the original path is gone.
+    let dir = restart_dir_path().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let staged = dir.join("orangu");
+    std::fs::copy("/proc/self/exe", &staged)
+        .with_context(|| format!("failed to stage restart binary at {}", staged.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to mark {} executable", staged.display()))?;
+    }
+    Ok(staged)
 }
 
 fn load_session_messages(path: &Path) -> Result<Vec<ChatMessage>> {
