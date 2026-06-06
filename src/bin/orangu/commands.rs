@@ -489,6 +489,259 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
     }
 }
 
+/// Every natural-language trigger phrase recognised by
+/// [`parse_natural_language_command`], in the same priority order the parser
+/// tries them. Phrases that take an argument keep their trailing space (e.g.
+/// `"diff against "`); bare aliases do not (e.g. `"diff"`).
+///
+/// Entries are split into `// ---`-commented groups, one per command the
+/// phrases trigger, to make it obvious where a new alias belongs. To add a
+/// phrase, drop it into the matching group; order still matters, both across
+/// groups and within one, because it sets the parser's match priority and the
+/// order the grey ghost hint cycles through. Add a new group only when you add
+/// a new command, keeping it in the same priority position the parser uses.
+///
+/// This drives the grey inline "ghost" completion (see
+/// `completion::natural_language_ghost_candidates`), so it must stay in sync
+/// with the parser below. The `binding_phrases_all_parse` test guards against
+/// drift.
+pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
+    // --- help ---
+    "help",
+    "show help",
+    "show commands",
+    "show available commands",
+    // --- connect ---
+    "connect",
+    "reconnect",
+    "connect to ",
+    // --- disconnect ---
+    "disconnect",
+    // --- reload configuration ---
+    "reload",
+    "reload configuration",
+    // --- reset session / restart ---
+    "reset session",
+    "restart",
+    "restart orangu",
+    // --- list files ---
+    "list files",
+    "show files",
+    "show workspace files",
+    "list workspace files",
+    // --- tools ---
+    "show tools",
+    "list tools",
+    "show local tools",
+    "tools",
+    // --- model (current) ---
+    "show model",
+    "current model",
+    "what model am i using",
+    "model",
+    // --- models (list) ---
+    "list models",
+    "show models",
+    "show available models",
+    "models",
+    // --- build ---
+    "build",
+    "build project",
+    "run build",
+    // --- diff ---
+    "diff",
+    "show diff",
+    "git diff",
+    "diff against ",
+    "show diff against ",
+    "git diff ",
+    // --- review ---
+    "review",
+    "review changes",
+    "code review",
+    "review branch",
+    // --- status ---
+    "status",
+    "show status",
+    "git status",
+    // --- grep ---
+    "grep ",
+    "find ",
+    "git grep ",
+    // --- log ---
+    "log ",
+    "show log ",
+    "git log ",
+    "git lg ",
+    "log",
+    "show log",
+    "git log",
+    "git lg",
+    // --- server (select) ---
+    "use server ",
+    "switch server to ",
+    "set server to ",
+    "select server ",
+    // --- model (select) ---
+    "use model ",
+    "switch model to ",
+    "set model to ",
+    "select model ",
+    // --- open / edit / show file ---
+    "open file ",
+    "open ",
+    "edit file ",
+    "edit ",
+    "show file ",
+    "show ",
+    // --- pull (fetch pull request) ---
+    "pull pull request ",
+    "pull request ",
+    "pull pr ",
+    "pull #",
+    "pull ",
+    // --- comment on pull request / issue ---
+    "add comment on ",
+    "add comment to ",
+    "comment on ",
+    // --- create pull request ---
+    "pull request",
+    "create pull request",
+    "open pull request",
+    "new pull request",
+    "create pr",
+    "open pr",
+    "new pr",
+    // --- close issue / pull request ---
+    "close issue ",
+    "close -i ",
+    "close pr ",
+    "close pull request ",
+    "close -p ",
+    // --- stash ---
+    "stash",
+    "git stash",
+    "git stash push",
+    "stash pop",
+    "pop stash",
+    "git stash pop",
+    "stash list",
+    "list stashes",
+    "git stash list",
+    "stash drop",
+    "drop stash",
+    "git stash drop",
+    // --- rebase ---
+    "rebase",
+    "git rebase",
+    // --- merge ---
+    "git merge ",
+    "merge ",
+    "merge",
+    // --- checkout ---
+    "git checkout ",
+    "checkout ",
+    "switch to branch ",
+    "switch to ",
+    // --- create branch ---
+    "create branch ",
+    "new branch ",
+    "branch -b ",
+    // --- rename branch ---
+    "rename branch to ",
+    "rename to ",
+    "branch -m ",
+    // --- list branches / checkout ---
+    "branch",
+    "list branches",
+    "git branch",
+    "checkout",
+    "list all branches",
+    "branch -a",
+    "branch --all",
+    // --- restore ---
+    "restore ",
+    "git restore ",
+    // --- add ---
+    "git add ",
+    "add file ",
+    "add ",
+    "add",
+    // --- remove ---
+    "git rm ",
+    "remove file ",
+    "remove ",
+    "remove",
+    // --- move ---
+    "git mv ",
+    "move file ",
+    "move ",
+    "move",
+    // --- cherry-pick ---
+    "git cherry-pick ",
+    "cherry-pick ",
+    "cherry pick ",
+    "cherry pick",
+    "cherry-pick",
+    // --- commit ---
+    "git commit -a -m ",
+    "git commit -m ",
+    "commit ",
+    "commit",
+    // --- amend ---
+    "git commit --amend -m ",
+    "git amend -m ",
+    "git amend ",
+    "amend message ",
+    "amend ",
+    "amend",
+    "git amend",
+    "git commit --amend",
+    // --- push ---
+    "force push",
+    "push force",
+    "push --force",
+    "push -f",
+    "git push --force",
+    "git push -f",
+    "git push origin --force",
+    "git push origin -f",
+    "push",
+    "git push",
+    "git push origin",
+    // --- init ---
+    "init",
+    "init repo",
+    "git init",
+    // --- squash ---
+    "squash",
+    "squash branch",
+    "squash commits",
+    "git squash",
+    // --- delete branch ---
+    "delete",
+    "delete branch",
+    "git branch -D ",
+    "delete branch ",
+    "delete ",
+    // --- session ---
+    "session",
+    "switch session",
+    "sessions",
+    "list sessions",
+    "show sessions",
+    // --- usage ---
+    "usage",
+    "show usage",
+    // --- clear conversation ---
+    "clear",
+    "clear conversation",
+    "reset conversation",
+    // --- quit ---
+    "quit",
+    "exit",
+];
+
 pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(
         input,
@@ -1274,6 +1527,20 @@ mod tests {
             parse_local_command("exit"),
             Some(LocalCommand::Quit)
         ));
+    }
+
+    #[test]
+    fn binding_phrases_all_parse() {
+        // Every listed phrase must be a real binding so the ghost completion
+        // never suggests something the parser would reject. Argument-taking
+        // prefixes only parse once an argument follows (some, like `git mv `,
+        // need two), so accept the bare phrase or one with trailing tokens.
+        for phrase in NATURAL_LANGUAGE_BINDINGS {
+            let parses = parse_local_command(phrase.trim()).is_some()
+                || parse_local_command(&format!("{phrase}1")).is_some()
+                || parse_local_command(&format!("{phrase}1 2")).is_some();
+            assert!(parses, "natural-language binding {phrase:?} does not parse");
+        }
     }
 
     #[test]

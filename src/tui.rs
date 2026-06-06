@@ -60,6 +60,7 @@ const ANSI_RESET: &str = "\x1b[0m";
 pub const FEEDBACK_OK: &str = "\x1b[38;2;80;200;120m●\x1b[0m";
 pub const FEEDBACK_ERR: &str = "\x1b[38;2;220;80;80m●\x1b[0m";
 const USER_INPUT_BACKGROUND: &str = "\x1b[48;2;44;44;44m";
+const GHOST_TEXT: &str = "\x1b[38;2;120;120;120m";
 const THINKING_TEXT: &str = "Thinking";
 const WORKING_TEXT: &str = "Working";
 const THINKING_SHADE_LEVELS: &[u8] = &[230, 210, 190, 170, 150, 130, 110, 90];
@@ -219,6 +220,8 @@ Natural-language forms such as `open README.md`, `list models`, `list files`, `p
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 
+As you type, a grey inline hint previews the matching command (e.g. `c` suggests `connect`). Press Tab to accept it. When several commands match, Shift+Tab cycles the hint through them; Tab then accepts the one shown.
+
 Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up / Alt+Down scrolls one line at a time."#
 }
 
@@ -237,6 +240,7 @@ pub struct ScreenRenderArgs<'a> {
     pub pending_line: Option<&'a str>,
     pub input: &'a str,
     pub cursor: usize,
+    pub ghost: &'a str,
     pub virtual_width: usize,
     pub actual_width: usize,
     pub actual_height: usize,
@@ -251,6 +255,7 @@ struct PromptFrameArgs<'a> {
     prompt_prefix: &'a str,
     input: &'a str,
     cursor: usize,
+    ghost: &'a str,
     height: usize,
     actual_width: usize,
 }
@@ -338,6 +343,7 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
         prompt_prefix: &prompt_prefix,
         input: args.input,
         cursor: args.cursor,
+        ghost: args.ghost,
         height: actual_height,
         actual_width,
     }));
@@ -487,13 +493,26 @@ fn render_prompt_frame(args: PromptFrameArgs<'_>) -> String {
     let prompt_width = args.prompt_prefix.chars().count();
     let mut frame = format!("\x1b[{top_row};1H{separator}");
 
+    let last_input_index = input_lines.len().saturating_sub(1);
     for (index, input_line) in input_lines.iter().enumerate() {
         let row = input_start_row + index;
         let content = truncate_to_width(input_line, args.actual_width.saturating_sub(prompt_width));
         let content_width = content.chars().count();
         let mut full_line = format!("{}{}", args.prompt_prefix, content);
-        if args.actual_width > content_width + prompt_width {
-            full_line.push_str(&" ".repeat(args.actual_width - content_width - prompt_width));
+        let mut used = content_width + prompt_width;
+
+        // The ghost suffix trails the input on the cursor's (final) line, in grey.
+        if index == last_input_index && !args.ghost.is_empty() {
+            let ghost = truncate_to_width(args.ghost, args.actual_width.saturating_sub(used));
+            let ghost_width = ghost.chars().count();
+            if ghost_width > 0 {
+                full_line.push_str(&format!("{GHOST_TEXT}{ghost}{ANSI_RESET}"));
+                used += ghost_width;
+            }
+        }
+
+        if args.actual_width > used {
+            full_line.push_str(&" ".repeat(args.actual_width - used));
         }
         frame.push_str(&format!("\x1b[{row};1H{full_line}"));
     }
@@ -909,6 +928,7 @@ pub fn render_review_screen(args: ReviewScreenArgs<'_>) -> String {
         prompt_prefix: &prompt_prefix,
         input: args.input,
         cursor: args.cursor,
+        ghost: "",
         height,
         actual_width: width,
     }));

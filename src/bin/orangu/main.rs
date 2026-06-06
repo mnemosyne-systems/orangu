@@ -335,6 +335,7 @@ async fn run() -> Result<()> {
                 pending_line: None,
                 input: input_state.as_str(),
                 cursor: input_state.cursor(),
+                ghost_index: input_state.ghost_index,
             },
         );
         std::io::stdout().flush()?;
@@ -407,6 +408,7 @@ async fn run() -> Result<()> {
                 pending_line: None,
                 input: input_state.as_str(),
                 cursor: input_state.cursor(),
+                ghost_index: input_state.ghost_index,
             },
         );
         std::io::stdout().flush()?;
@@ -1437,6 +1439,18 @@ fn handle_command(
 }
 
 pub fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
+    // Only hint a completion while the cursor sits at the end of what was typed.
+    // Slash commands take priority over natural-language bindings; for the latter,
+    // `ghost_index` selects which candidate to preview (cycled with Shift+Tab).
+    let ghost = if screen.cursor == screen.input.len() {
+        completion::command_ghost_suffix(screen.input)
+            .or_else(|| {
+                completion::natural_language_ghost_suffix_at(screen.input, screen.ghost_index)
+            })
+            .unwrap_or("")
+    } else {
+        ""
+    };
     print!("{CLEAR_TERMINAL_SEQUENCE}");
     print!(
         "{}",
@@ -1455,6 +1469,7 @@ pub fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
             pending_line: screen.pending_line,
             input: screen.input,
             cursor: screen.cursor,
+            ghost,
             virtual_width: render.virtual_width,
             actual_width: render.actual_width,
             actual_height: render.actual_height,
@@ -2146,6 +2161,7 @@ async fn wait_for_response(
             pending_line: quote_line.as_deref(),
             input: input_state.as_str(),
             cursor: input_state.cursor(),
+            ghost_index: input_state.ghost_index,
         },
     );
     std::io::stdout().flush()?;
@@ -2180,6 +2196,7 @@ async fn wait_for_response(
                             pending_line: Some(pending_line.as_str()),
                             input: input_state.as_str(),
                             cursor: input_state.cursor(),
+            ghost_index: input_state.ghost_index,
                         },
                     );
                     std::io::stdout().flush()?;
@@ -2282,6 +2299,7 @@ async fn wait_for_response(
                             pending_line: Some(pending_line.as_str()),
                             input: input_state.as_str(),
                             cursor: input_state.cursor(),
+            ghost_index: input_state.ghost_index,
                         },
                     );
                     std::io::stdout().flush()?;
@@ -2352,6 +2370,7 @@ async fn wait_for_local_command(
                         pending_line: None,
                         input: input_state.as_str(),
                         cursor: input_state.cursor(),
+            ghost_index: input_state.ghost_index,
                     },
                 );
                 std::io::stdout().flush()?;
@@ -2431,6 +2450,7 @@ async fn wait_for_streaming_command(
                         pending_line: None,
                         input: input_state.as_str(),
                         cursor: input_state.cursor(),
+            ghost_index: input_state.ghost_index,
                     },
                 );
                 std::io::stdout().flush()?;
@@ -3104,13 +3124,16 @@ mod tests {
         CommandContext, CommandOutcome, CommandState, LocalCommand, ShowFileOptions,
         parse_local_command, system_prompt,
     };
-    use super::completion::completion_candidates;
+    use super::completion::{
+        command_ghost_suffix, completion_candidates, natural_language_ghost_candidates,
+        natural_language_ghost_suffix_at,
+    };
     use super::git::with_explicit_pager_width;
     use super::git::{
         branch_delete_output, discover_git_dir, discover_git_root, git_workspace_diff,
         init_repo_output, is_protected_branch, list_workspace_files_tree, workspace_branch_name,
     };
-    use super::input::idle_status_refresh_timeout;
+    use super::input::{apply_completion, cycle_ghost_suggestion, idle_status_refresh_timeout};
     use super::render::{
         ANSI_RESET, GitLineMetadata, format_show_file_line, parse_show_file_arguments,
         render_markdown_for_console, show_file_output,
@@ -4702,6 +4725,135 @@ mod tests {
             show_file_candidates,
             vec!["README.md".to_string(), "doc/README.md".to_string()]
         );
+    }
+
+    #[test]
+    fn suggests_ghost_suffix_for_partial_slash_commands() {
+        // A unique prefix completes to the rest of the command.
+        assert_eq!(command_ghost_suffix("/q"), Some("uit"));
+        assert_eq!(command_ghost_suffix("/qui"), Some("t"));
+
+        // The first matching command wins, so the hint narrows as letters arrive.
+        assert_eq!(command_ghost_suffix("/"), Some("help"));
+
+        // A fully typed command and unmatched prefixes have nothing to suggest.
+        assert_eq!(command_ghost_suffix("/quit"), None);
+        assert_eq!(command_ghost_suffix("/zzz"), None);
+
+        // Once an argument is being typed (whitespace) the name hint stops.
+        assert_eq!(command_ghost_suffix("/quit "), None);
+        assert_eq!(command_ghost_suffix("not a command"), None);
+    }
+
+    #[test]
+    fn suggests_ghost_suffix_for_partial_natural_language_bindings() {
+        // The rendered hint is cycle position 0.
+        let ghost = |input| natural_language_ghost_suffix_at(input, 0);
+
+        // A partial verb completes to the rest of the binding.
+        assert_eq!(ghost("discon"), Some("nect"));
+        assert_eq!(ghost("rebas"), Some("e"));
+
+        // Argument-taking prefixes complete through their trailing space.
+        assert_eq!(ghost("diff a"), Some("gainst "));
+        assert_eq!(ghost("connect t"), Some("o "));
+
+        // Matching is case-insensitive; the suggested suffix is canonical.
+        assert_eq!(ghost("DIF"), Some("f"));
+
+        // A complete binding has nothing left to hint, even when a longer
+        // binding shares its prefix (e.g. "connect" vs "connect to ").
+        assert_eq!(ghost("commit"), None);
+        assert_eq!(ghost("merge"), None);
+        assert_eq!(ghost("connect"), None);
+        assert_eq!(ghost("diff"), None);
+
+        // Still hinted while the binding is incomplete.
+        assert_eq!(ghost("c"), Some("onnect"));
+
+        // Empty input, slash input, and unknown prefixes suggest nothing.
+        assert_eq!(ghost(""), None);
+        assert_eq!(ghost("/q"), None);
+        assert_eq!(ghost("xyzzy"), None);
+    }
+
+    #[test]
+    fn shift_tab_cycles_through_natural_language_candidates() {
+        // "c" matches several bindings; cycling walks them in priority order and
+        // wraps back to the first. Bindings differing only by trailing whitespace
+        // (e.g. "checkout " vs "checkout") collapse to one entry.
+        let candidates = natural_language_ghost_candidates("c");
+        assert!(
+            candidates.len() > 1,
+            "expected multiple candidates for \"c\", got {candidates:?}"
+        );
+        assert_eq!(
+            natural_language_ghost_suffix_at("c", 0),
+            Some(candidates[0])
+        );
+        assert_eq!(
+            natural_language_ghost_suffix_at("c", 1),
+            Some(candidates[1])
+        );
+        // Index wraps around the candidate list.
+        assert_eq!(
+            natural_language_ghost_suffix_at("c", candidates.len()),
+            Some(candidates[0])
+        );
+
+        // The whole list completes "c" to distinct, real commands.
+        for suffix in candidates {
+            let completed = format!("c{suffix}");
+            assert!(
+                parse_local_command(completed.trim()).is_some()
+                    || parse_local_command(&format!("{completed}1")).is_some()
+                    || parse_local_command(&format!("{completed}1 2")).is_some(),
+                "cycled candidate {completed:?} does not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_accepts_natural_language_ghost_suggestion() {
+        let workspace = tempdir().expect("workspace");
+
+        // Tab fills in the ghosted binding when no structured candidate applies.
+        let mut input_state = InputState::default();
+        input_state.set_buffer("ad".to_string());
+        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        assert_eq!(input_state.as_str(), "add comment on ");
+        assert_eq!(input_state.cursor(), "add comment on ".len());
+
+        // A fully typed binding has no ghost, so Tab leaves it untouched.
+        let mut input_state = InputState::default();
+        input_state.set_buffer("commit".to_string());
+        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        assert_eq!(input_state.as_str(), "commit");
+
+        // The binding ghost wins over a same-prefixed filename: typing "c" with
+        // a "contrib/" directory present completes to "connect", not "contrib/".
+        let repo = tempdir().expect("repo");
+        std::fs::create_dir(repo.path().join("contrib")).expect("contrib dir");
+        let mut input_state = InputState::default();
+        input_state.set_buffer("c".to_string());
+        apply_completion(&mut input_state, repo.path(), &[], &[]);
+        assert_eq!(input_state.as_str(), "connect");
+
+        // Shift+Tab advances the preview; Tab then accepts the shown candidate.
+        let mut input_state = InputState::default();
+        input_state.set_buffer("c".to_string());
+        let second = format!("c{}", natural_language_ghost_candidates("c")[1]);
+        cycle_ghost_suggestion(&mut input_state);
+        assert_eq!(input_state.ghost_index, 1);
+        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        assert_eq!(input_state.as_str(), second);
+
+        // Editing the line resets the cycle back to the first candidate.
+        let mut input_state = InputState::default();
+        input_state.set_buffer("c".to_string());
+        cycle_ghost_suggestion(&mut input_state);
+        input_state.insert_char('o');
+        assert_eq!(input_state.ghost_index, 0);
     }
 
     #[test]

@@ -25,7 +25,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::completion::completion_candidates;
+use super::completion::{
+    completion_candidates, natural_language_ghost_candidates, natural_language_ghost_suffix_at,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -132,6 +134,7 @@ pub struct ScreenState<'a> {
     pub pending_line: Option<&'a str>,
     pub input: &'a str,
     pub cursor: usize,
+    pub ghost_index: usize,
 }
 
 #[derive(Clone, Default)]
@@ -313,6 +316,7 @@ pub struct InputState {
     pub buffer: String,
     pub cursor: usize,
     pub completion: Option<CompletionState>,
+    pub ghost_index: usize,
     pub history_index: Option<usize>,
     pub history_draft: String,
 }
@@ -330,6 +334,7 @@ impl InputState {
         self.buffer.clear();
         self.cursor = 0;
         self.completion = None;
+        self.ghost_index = 0;
         self.history_index = None;
         self.history_draft.clear();
     }
@@ -338,18 +343,21 @@ impl InputState {
         self.buffer = buffer;
         self.cursor = self.buffer.len();
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn insert_char(&mut self, ch: char) {
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn insert_str(&mut self, text: &str) {
         self.buffer.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn backspace(&mut self) {
@@ -357,6 +365,7 @@ impl InputState {
             self.buffer.drain(previous..self.cursor);
             self.cursor = previous;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -364,6 +373,7 @@ impl InputState {
         if let Some(next) = next_boundary(&self.buffer, self.cursor) {
             self.buffer.drain(self.cursor..next);
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -371,6 +381,7 @@ impl InputState {
         if let Some(previous) = previous_boundary(&self.buffer, self.cursor) {
             self.cursor = previous;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -378,28 +389,33 @@ impl InputState {
         if let Some(next) = next_boundary(&self.buffer, self.cursor) {
             self.cursor = next;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
     pub fn move_home(&mut self) {
         self.cursor = 0;
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn move_end(&mut self) {
         self.cursor = self.buffer.len();
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn kill_to_end(&mut self) {
         self.buffer.truncate(self.cursor);
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn kill_to_start(&mut self) {
         self.buffer.drain(..self.cursor);
         self.cursor = 0;
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn delete_prev_word(&mut self) {
@@ -438,6 +454,7 @@ impl InputState {
         self.buffer.drain(start..self.cursor);
         self.cursor = start;
         self.completion = None;
+        self.ghost_index = 0;
     }
 
     pub fn delete_backward_readline_word(&mut self) {
@@ -446,6 +463,7 @@ impl InputState {
             self.buffer.drain(start..self.cursor);
             self.cursor = start;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -454,6 +472,7 @@ impl InputState {
         if end > self.cursor {
             self.buffer.drain(self.cursor..end);
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -462,6 +481,7 @@ impl InputState {
         if start != self.cursor {
             self.cursor = start;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 
@@ -470,6 +490,7 @@ impl InputState {
         if end != self.cursor {
             self.cursor = end;
             self.completion = None;
+            self.ghost_index = 0;
         }
     }
 }
@@ -536,6 +557,7 @@ pub fn read_input(
                     pending_line: None,
                     input: input_state.as_str(),
                     cursor: input_state.cursor(),
+                    ghost_index: input_state.ghost_index,
                 },
             );
             std::io::stdout().flush()?;
@@ -727,6 +749,11 @@ pub fn handle_input_event(
                     );
                     redraw = true;
                 }
+                (KeyCode::BackTab, _) => {
+                    interrupt_state.reset();
+                    cycle_ghost_suggestion(input_state);
+                    redraw = true;
+                }
                 (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     interrupt_state.reset();
                     output_state.page_up(orangu::tui::output_view_rows(
@@ -814,6 +841,21 @@ pub fn history_next(input_state: &mut InputState, history: &[String]) {
     input_state.set_buffer(history[new_index].clone());
 }
 
+/// Advance the inline natural-language ghost preview to the next candidate
+/// (Shift+Tab). For input like `c`, this cycles `connect` -> `code review` ->
+/// `checkout ` -> ... -> back to `connect`. Tab then accepts whatever is shown.
+/// No-op when the cursor is not at the end of the line, or when there is nothing
+/// (or only one thing) to cycle through.
+pub fn cycle_ghost_suggestion(input_state: &mut InputState) {
+    if input_state.cursor() != input_state.buffer.len() {
+        return;
+    }
+    let count = natural_language_ghost_candidates(input_state.as_str()).len();
+    if count > 1 {
+        input_state.ghost_index = (input_state.ghost_index + 1) % count;
+    }
+}
+
 pub fn apply_completion(
     input_state: &mut InputState,
     workspace: &Path,
@@ -832,29 +874,41 @@ pub fn apply_completion(
         return;
     }
 
-    let Some((start, end, candidates)) = completion_candidates(
+    // Accept the inline natural-language ghost the user is seeing (e.g. "c" ->
+    // "connect") before falling back to generic file completion, so Tab fills in
+    // the hint that is actually rendered rather than a same-prefixed filename.
+    // The cycle position chosen with Shift+Tab decides which candidate is taken.
+    // Only when the cursor is at the end of the line, matching where the ghost
+    // is drawn. Slash commands return `None` here and use the cycling path below.
+    if input_state.cursor() == input_state.buffer.len()
+        && let Some(suffix) =
+            natural_language_ghost_suffix_at(input_state.as_str(), input_state.ghost_index)
+    {
+        let end = input_state.buffer.len();
+        let original = input_state.buffer.clone();
+        apply_completion_candidate(input_state, end, end, &original, suffix);
+        return;
+    }
+
+    if let Some((start, end, candidates)) = completion_candidates(
         input_state.as_str(),
         input_state.cursor(),
         workspace,
         server_names,
         available_models,
-    ) else {
-        return;
-    };
-    if candidates.is_empty() {
-        return;
+    ) && !candidates.is_empty()
+    {
+        let original = input_state.buffer.clone();
+        let candidate = candidates[0].clone();
+        apply_completion_candidate(input_state, start, end, &original, &candidate);
+        input_state.completion = Some(CompletionState {
+            start,
+            end,
+            original,
+            candidates,
+            index: 0,
+        });
     }
-
-    let original = input_state.buffer.clone();
-    let candidate = candidates[0].clone();
-    apply_completion_candidate(input_state, start, end, &original, &candidate);
-    input_state.completion = Some(CompletionState {
-        start,
-        end,
-        original,
-        candidates,
-        index: 0,
-    });
 }
 
 pub fn apply_completion_candidate(

@@ -17,7 +17,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::{fs, path::Path};
 use walkdir::WalkDir;
 
-use super::commands::{shell_words, strip_ascii_prefix};
+use super::commands::{NATURAL_LANGUAGE_BINDINGS, shell_words, strip_ascii_prefix};
 use super::git::{
     discover_git_root, git_branch_names, git_file_commit_hashes, git_local_branch_names,
     git_tag_names, is_protected_branch,
@@ -65,6 +65,81 @@ pub const COMMANDS: &[&str] = &[
     "/clear",
     "/quit",
 ];
+
+/// Returns the trailing characters needed to finish the slash command the user
+/// is part-way through typing, e.g. `/q` -> `uit` (completing `/quit`). This is
+/// the grey "ghost" hint shown inline after the cursor; pressing Tab fills it in.
+///
+/// Returns `None` unless `input` is a lone slash-command prefix still being
+/// typed (no whitespace yet) that matches a known command. The first matching
+/// command in [`COMMANDS`] wins, so the suggestion narrows as more letters are
+/// typed. An already-complete command yields `None`.
+pub fn command_ghost_suffix(input: &str) -> Option<&'static str> {
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let candidate = COMMANDS.iter().find(|command| command.starts_with(input))?;
+    candidate
+        .strip_prefix(input)
+        .filter(|rest| !rest.is_empty())
+}
+
+/// Every natural-language binding the user's part-typed input could still grow
+/// into, as the trailing characters needed to complete each one. For input `c`
+/// this yields `onnect`, `ode review`, `heckout `, ... (completing `connect`,
+/// `code review`, `checkout `, ...). The list drives the grey "ghost" hint and
+/// its Shift+Tab cycling; index 0 is what `natural_language_ghost_suffix`
+/// returns.
+///
+/// Matching is ASCII case-insensitive, mirroring the parser, and candidates keep
+/// [`NATURAL_LANGUAGE_BINDINGS`] (parser priority) order. Bindings that differ
+/// only by trailing whitespace (e.g. `checkout ` vs `checkout`) render
+/// identically, so only the first is kept. Empty input, slash input, and input
+/// that already spells a complete binding (e.g. `connect`, `diff`) yield an
+/// empty list — there is nothing left to hint.
+pub fn natural_language_ghost_candidates(input: &str) -> Vec<&'static str> {
+    if input.is_empty() || input.starts_with('/') {
+        return Vec::new();
+    }
+    if NATURAL_LANGUAGE_BINDINGS
+        .iter()
+        .any(|binding| binding.eq_ignore_ascii_case(input))
+    {
+        return Vec::new();
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut candidates: Vec<&'static str> = Vec::new();
+    for binding in NATURAL_LANGUAGE_BINDINGS {
+        if binding.len() <= input.len()
+            || !binding.as_bytes()[..input.len()].eq_ignore_ascii_case(input.as_bytes())
+        {
+            continue;
+        }
+        let suffix = &binding[input.len()..];
+        if suffix.trim().is_empty() {
+            continue;
+        }
+        let key = binding.trim_end();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        candidates.push(suffix);
+    }
+    candidates
+}
+
+/// The natural-language ghost suffix to preview at cycle position `index`,
+/// wrapping around the candidate list (see [`natural_language_ghost_candidates`]).
+/// `index` 0 is the first match (e.g. `c` -> `onnect`, completing `connect`);
+/// Shift+Tab advances it. This is the grey hint shown inline after the cursor.
+pub fn natural_language_ghost_suffix_at(input: &str, index: usize) -> Option<&'static str> {
+    let candidates = natural_language_ghost_candidates(input);
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(candidates[index % candidates.len()])
+}
 
 pub fn completion_candidates(
     input: &str,

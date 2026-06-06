@@ -329,6 +329,18 @@ Natural-language forms are recognized only for the built-in local command phrase
 - `<ARROW_DOWN>` moves forward through command history
 - History navigation preserves the current unfinished line as a draft and restores it when you move back out of history
 
+### Inline command hints (ghost text)
+
+As you type, a grey inline hint previews the command your input is growing into, drawn just after the cursor. It covers both slash commands and the natural-language bindings:
+
+- Typing `/q` shows `/q`​`uit`, with `uit` greyed; typing `c` shows `c`​`onnect`.
+- Press `Tab` to accept the hint, filling in the rest of the command (for an argument-taking form such as `diff against `, the cursor lands after the trailing space, ready for the argument).
+- When several commands share your prefix (for example `c` matches `connect`, `code review`, `checkout`, `commit`, and more), `Shift+Tab` cycles the hint through them in priority order, wrapping back to the first. `Tab` then accepts whichever candidate is currently shown.
+- The hint only appears while the cursor is at the end of the line, and disappears once your input already spells a complete command (so `connect` and `diff` show no hint, even though `connect to ` and `diff against ` share their prefix).
+- Editing the line, moving the cursor, or pasting resets the `Shift+Tab` cycle back to the first candidate.
+
+The natural-language hint takes priority over generic filename completion, so `c` + `Tab` completes to `connect` rather than a same-prefixed file such as `contrib/`. Slash-command and argument completion (branches, files, commit hashes, and so on) continue to use the cycling `Tab` behavior described next.
+
 ### Tab completion
 
 `Tab` uses context-sensitive completion. The first `Tab` inserts the first match. Repeated `Tab` presses cycle through the remaining matches for the same completion range.
