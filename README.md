@@ -29,7 +29,7 @@
 - Workspace-aware local tools for reading, editing, listing, fetching, and shell commands
 - Persistent terminal UI with workspace, server, and model status in the header, refreshed every minute while idle
 - Shell-style prompt editing, history, scrolling, and context-sensitive Tab completion
-- Local commands such as `/help`, `/models`, `/list_files`, `/show_file`, `/tools`, `/diff`, `/status`, `/log`, `/pull`, `/rebase`, `/merge`, `/checkout`, `/add_file`, `/remove_file`, `/move_file`, `/cherry_pick`, `/comment`, `/commit`, `/amend`, `/push`, `/review`, `/init_repo`, `/squash`, `/delete`, and `/open_file`
+- Local commands such as `/help`, `/model`, `/server`, `/list_files`, `/show_file`, `/tools`, `/diff`, `/status`, `/log`, `/pull`, `/rebase`, `/merge`, `/checkout`, `/add_file`, `/remove_file`, `/move_file`, `/cherry_pick`, `/comment`, `/close`, `/commit`, `/amend`, `/push`, `/review`, `/init_repo`, `/squash`, `/delete`, and `/open_file`
 - Natural-language local aliases such as `open README.md`, `list models`, `list files`, `pull 58`, `log`, `status`, `rebase`, `merge feature/foo`, `checkout main`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `review`, `init repo`, `squash`, `delete feature/foo`, and `show help`
 - Streaming responses with live footer status such as `Thinking (...)` and llama.cpp-native `Working @ X.Y t/s (...)`
 - Queued local commands while a response is in flight, plus double-`Esc` request cancellation
@@ -120,7 +120,6 @@ Useful first commands:
 ```text
 /help
 /tools
-/models
 /list_files
 /open_file README.md
 /show_file README.md

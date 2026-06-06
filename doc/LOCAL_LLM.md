@@ -6,11 +6,12 @@
 
 ```ini
 [orangu]
-model = gemma-4-E4B-it-GGUF
+server = main-server
+model = ggml-org/gemma-4-E4B-it-GGUF
 timeout = 1800
 max_tool_rounds = 10
 
-[gemma-4-E4B-it-GGUF]
+[main-server]
 provider = llama.cpp
 endpoint = http://localhost:8100/v1
 model = ggml-org/gemma-4-E4B-it-GGUF
@@ -35,3 +36,4 @@ orangu --config ./orangu.conf
 - The endpoint may be configured as either the server root or the `/v1` path.
 - Tool-calling prompts can be slow on local models, so a larger timeout is recommended.
 - The local tools run against the current workspace and can edit files on disk.
+- If you start `llama-server` with `--api-key <key>`, set `api_key = <key>` in the server section. The key is sent on every request, so the `/v1/models` health probe keeps working.

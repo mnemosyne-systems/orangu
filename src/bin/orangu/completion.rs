@@ -29,11 +29,11 @@ pub const COMMANDS: &[&str] = &[
     "/disconnect",
     "/reload",
     "/restart",
-    "/models",
     "/list_files",
     "/show_file",
     "/tools",
     "/model",
+    "/server",
     "/diff",
     "/grep",
     "/review",
@@ -70,7 +70,8 @@ pub fn completion_candidates(
     input: &str,
     cursor: usize,
     workspace: &Path,
-    model_names: &[String],
+    server_names: &[String],
+    available_models: &[String],
 ) -> Option<(usize, usize, Vec<String>)> {
     let cursor = cursor.min(input.len());
     let prefix = &input[..cursor];
@@ -99,9 +100,21 @@ pub fn completion_candidates(
         return Some((
             7,
             cursor,
-            model_names
+            available_models
                 .iter()
                 .filter(|model| model.starts_with(model_prefix))
+                .cloned()
+                .collect(),
+        ));
+    }
+
+    if let Some(server_prefix) = prefix.strip_prefix("/server ") {
+        return Some((
+            8,
+            cursor,
+            server_names
+                .iter()
+                .filter(|server| server.starts_with(server_prefix))
                 .cloned()
                 .collect(),
         ));

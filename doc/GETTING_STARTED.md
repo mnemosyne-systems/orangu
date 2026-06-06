@@ -41,7 +41,7 @@ orangu --config ./orangu.conf
 - `/reload`
 - `/tools`
 - `/model`
-- `/models`
+- `/server`
 - `/session`
 - `/sessions`
 - `/list_files`
@@ -56,6 +56,7 @@ orangu --config ./orangu.conf
 - `/branch -d feature/old`
 - `/cherry_pick <commit>`
 - `/comment 51 "My comment"`
+- `/close -i 51`
 - `/commit <message>`
 - `/restore README.md`
 - `/diff`

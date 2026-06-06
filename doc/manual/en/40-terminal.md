@@ -172,8 +172,8 @@ All slash commands are handled locally. They are not sent to the model.
 | `/reload` | Restore the configured model and server |
 | `/restart` | Restart orangu, resuming the same workspace and session |
 | `/tools` | List tools |
-| `/model [name]` | Switch to the configured model, or a specific model |
-| `/models` | List models |
+| `/model [name]` | With no argument, list the selected server's models (active in green, others in red); with a name, switch to that model. Tab cycles the server's models |
+| `/server [name]` | With no argument, list the configured servers (active in green, others in red); with a name, switch to that server. Tab cycles server names. Selecting a server re-detects an available model on it |
 | `/session [uuid]` | Print the resume command for a specific session; Tab completion cycles UUIDs newest-first |
 | `/sessions [workspace]` | List all sessions, optionally filtered by workspace path |
 | `/list_files` | List workspace files as a tree |
@@ -345,10 +345,10 @@ The completion modes are checked in order:
 6. If the line starts with `/merge `, or with the natural-language prefixes `merge ` or `git merge `, complete local branch names first (from `git branch`), then remote-only branch names (from `git branch --all`).
 7. If the line starts with `/branch -d `, or with the natural-language prefixes `delete `, `delete branch `, or `git branch -D `, complete local branch names (from `git branch`) excluding `main` and `master`.
 8. If the line starts with `/session ` (with a trailing space), complete session UUIDs sorted newest-first by last-modified time.
-9. If the line starts with `/model `, complete configured model profile names.
+9. If the line starts with `/model `, complete the models available on the selected server, cycling through them. If the line starts with `/server `, complete the names of all INI sections identified as servers; selecting one switches the active server.
 10. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
 11. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
-12. If the line starts with `/`, complete built-in slash commands such as `/help`, `/models`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
+12. If the line starts with `/`, complete built-in slash commands such as `/help`, `/model`, `/server`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
 13. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
 
 Path-completion details:

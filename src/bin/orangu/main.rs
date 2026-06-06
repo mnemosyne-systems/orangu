@@ -45,7 +45,7 @@ use orangu::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     io::Write,
     path::{Component, Path, PathBuf},
     process::ExitCode,
@@ -62,7 +62,7 @@ use commands::{
     close_usage_message, comment_usage_message, commit_usage_message, connect_usage_message,
     grep_usage_message, merge_usage_message, model_usage_message, move_file_usage_message,
     open_file_usage_message, parse_local_command, pull_usage_message, remove_file_usage_message,
-    restore_usage_message, sorted_model_names, system_prompt,
+    restore_usage_message, server_usage_message, sorted_model_names, system_prompt,
 };
 use git::{
     Forge, add_file_output, amend_output, branch_create_output, branch_delete_output,
@@ -124,7 +124,7 @@ async fn run() -> Result<()> {
             ));
         }
     };
-    let mut config = load_client_configuration(&config_path)?;
+    let config = load_client_configuration(&config_path)?;
     let quote_module = quotes::QuoteModule::from_str(&config.quotes);
     let workspace = resolve_workspace_root(args.workspace)?;
     let workspace_created = if !workspace.exists() {
@@ -143,23 +143,24 @@ async fn run() -> Result<()> {
     let status_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()?;
-    let discovered_models =
-        try_discover_new_models(&status_http_client, &mut config, &config_path).await;
 
-    let model_names = sorted_model_names(&config.llms);
-    let startup_model = config.default_model.clone();
-    let startup_endpoint = config
+    // Server section names, used for `/server` completion.
+    let server_names = sorted_model_names(&config.llms);
+    let startup_model = config.default_server.clone();
+    let startup_profile = config
         .llms
         .get(&startup_model)
-        .ok_or_else(|| anyhow!("missing configured profile {}", startup_model))?
-        .endpoint
-        .clone();
+        .ok_or_else(|| anyhow!("missing configured server {}", startup_model))?;
+    let startup_endpoint = startup_profile.endpoint.clone();
+    // The wire model id sent to the active server, initialised from the active
+    // server's resolved model and changed at runtime by `/model`.
+    let mut active_model_id = startup_profile.model.clone();
     let mut active_model = startup_model.clone();
     let mut session = ChatSession::new(system_prompt(
         config
             .llms
             .get(&active_model)
-            .ok_or_else(|| anyhow!("missing configured profile {}", active_model))?,
+            .ok_or_else(|| anyhow!("missing configured server {}", active_model))?,
     ));
     let mut current_endpoint = Some(startup_endpoint.clone());
 
@@ -231,25 +232,16 @@ async fn run() -> Result<()> {
         output_state.push_text(&format!("Created workspace {}", workspace.display()));
     }
 
-    for section_name in &discovered_models {
-        output_state.push_text(&format!("Added {section_name} model"));
-    }
-
-    if let Some(new_model) = discovered_models.first().filter(|_| !is_resumed) {
-        let old_model = std::mem::replace(&mut active_model, new_model.clone());
-        if let Some(profile) = config.llms.get(new_model) {
-            current_endpoint = Some(normalized_openai_endpoint(&profile.endpoint));
-            session.set_system_prompt(system_prompt(profile));
-        }
-        output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
-    } else if let Some((old_model, new_model)) = try_startup_model_switch(
-        &status_http_client,
-        &config,
-        &mut active_model,
-        &mut current_endpoint,
-        &mut session,
-    )
-    .await
+    // If the active server isn't serving the configured model at startup, switch
+    // to a model it does advertise.
+    if let Some(active_profile) = config.llms.get(&active_model)
+        && let Some((old_model, new_model)) = try_startup_model_switch(
+            &status_http_client,
+            active_profile,
+            &mut active_model_id,
+            current_endpoint.as_deref(),
+        )
+        .await
     {
         output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
     }
@@ -269,17 +261,19 @@ async fn run() -> Result<()> {
         let active_profile = config
             .llms
             .get(&active_model)
-            .ok_or_else(|| anyhow!("missing configured profile {}", active_model))?;
-        let header_status = probe_header_status(
+            .ok_or_else(|| anyhow!("missing configured server {}", active_model))?;
+        let (header_status, server_models) = probe_header_status(
             &status_http_client,
             tools.workspace(),
-            &active_model,
+            &active_model_id,
             active_profile,
             current_endpoint.as_deref(),
         )
         .await;
+        // Models advertised by the selected server, used for `/model` completion.
+        let available_models = server_models;
         let render = RenderContext {
-            current_model: &active_model,
+            current_model: &active_model_id,
             endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
             workspace: tools.workspace(),
             prompt_branch: prompt_branch.as_deref(),
@@ -362,7 +356,8 @@ async fn run() -> Result<()> {
                 InputContext {
                     history: &history,
                     workspace: &workspace,
-                    model_names: &model_names,
+                    server_names: &server_names,
+                    available_models: &available_models,
                     render,
                 },
                 print_screen,
@@ -409,12 +404,15 @@ async fn run() -> Result<()> {
         );
         std::io::stdout().flush()?;
 
-        match handle_command(
+        let mut detect_model = false;
+        let command_outcome = handle_command(
             &next_input,
             CommandState {
                 active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
                 current_endpoint: &mut current_endpoint,
                 session: &mut session,
+                detect_model: &mut detect_model,
             },
             CommandContext {
                 startup_model: &startup_model,
@@ -423,14 +421,30 @@ async fn run() -> Result<()> {
                 tools: &tools,
                 workspace: &workspace,
                 usage_stats: &usage_stats,
-                http_client: status_http_client.clone(),
+                available_models: &available_models,
                 virtual_width: viewport.virtual_width,
                 auto_rebase: config.auto_rebase,
                 auto_squash: config.auto_squash,
                 terminal: &config.terminal,
                 forge,
             },
-        )? {
+        )?;
+        // When `/server` (or `/reload`) selects a server, auto-detect an
+        // available model on it — exactly like the startup model switch. This
+        // runs even when re-selecting the server we are already on.
+        if detect_model
+            && let Some(profile) = config.llms.get(&active_model)
+            && let Some((old_model, new_model)) = try_startup_model_switch(
+                &status_http_client,
+                profile,
+                &mut active_model_id,
+                current_endpoint.as_deref(),
+            )
+            .await
+        {
+            output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
+        }
+        match command_outcome {
             CommandOutcome::Quit => {
                 save_session_messages(&session_messages_path, session.messages())?;
                 update_session_metadata_timestamp(&session_metadata_path)?;
@@ -491,7 +505,7 @@ async fn run() -> Result<()> {
                 let handle = tokio::task::spawn_blocking(f);
                 // Recreate render here — handle_command's mutable borrows have ended.
                 let blocking_render = RenderContext {
-                    current_model: &active_model,
+                    current_model: &active_model_id,
                     endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
                     workspace: tools.workspace(),
                     prompt_branch: prompt_branch.as_deref(),
@@ -508,7 +522,8 @@ async fn run() -> Result<()> {
                         render: blocking_render,
                         history: &mut history,
                         history_path: &session_hist_path,
-                        model_names: &model_names,
+                        server_names: &server_names,
+                        available_models: &available_models,
                         interrupt_state: &mut interrupt_state,
                         output_state: &mut output_state,
                         input_state: &mut input_state,
@@ -541,7 +556,7 @@ async fn run() -> Result<()> {
                 let handle = tokio::task::spawn_blocking(move || f(tx));
                 // Recreate render here — handle_command's mutable borrows have ended.
                 let blocking_render = RenderContext {
-                    current_model: &active_model,
+                    current_model: &active_model_id,
                     endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
                     workspace: tools.workspace(),
                     prompt_branch: prompt_branch.as_deref(),
@@ -558,7 +573,8 @@ async fn run() -> Result<()> {
                         render: blocking_render,
                         history: &mut history,
                         history_path: &session_hist_path,
-                        model_names: &model_names,
+                        server_names: &server_names,
+                        available_models: &available_models,
                         interrupt_state: &mut interrupt_state,
                         output_state: &mut output_state,
                         input_state: &mut input_state,
@@ -586,59 +602,11 @@ async fn run() -> Result<()> {
                 output_state.reset_scroll();
                 continue;
             }
-            CommandOutcome::Async(future) => {
-                let handle = tokio::spawn(future);
-                let blocking_render = RenderContext {
-                    current_model: &active_model,
-                    endpoint: current_endpoint.as_deref().unwrap_or("(disconnected)"),
-                    workspace: tools.workspace(),
-                    prompt_branch: prompt_branch.as_deref(),
-                    header_status,
-                    virtual_width: viewport.virtual_width,
-                    actual_width: viewport.actual_width,
-                    actual_height: viewport.actual_height,
-                    x_offset: viewport.x_offset,
-                    banner: config.banner,
-                    feedback: config.feedback,
-                };
-                let result = wait_for_local_command(
-                    WaitContext {
-                        render: blocking_render,
-                        history: &mut history,
-                        history_path: &session_hist_path,
-                        model_names: &model_names,
-                        interrupt_state: &mut interrupt_state,
-                        output_state: &mut output_state,
-                        input_state: &mut input_state,
-                        pending_commands: &mut pending_commands,
-                        thinking_quote: None,
-                        viewport: &mut viewport,
-                    },
-                    handle,
-                )
-                .await?;
-                match result {
-                    Ok(output) => {
-                        output_state.push_text(&output);
-                        if config.feedback {
-                            output_state.push_text(FEEDBACK_OK);
-                        }
-                    }
-                    Err(err) => {
-                        output_state.push_text(&format!("Error: {err:#}"));
-                        if config.feedback {
-                            output_state.push_text(FEEDBACK_ERR);
-                        }
-                    }
-                }
-                output_state.reset_scroll();
-                continue;
-            }
             CommandOutcome::Review(launch) => {
                 let mut review = ReviewState::new(launch);
                 loop {
                     let chrome = ReviewChrome {
-                        current_model: &active_model,
+                        current_model: &active_model_id,
                         prompt_branch: prompt_branch.as_deref(),
                         pending_count: pending_commands.len(),
                     };
@@ -671,9 +639,7 @@ async fn run() -> Result<()> {
                                 review.feedback = Some(FeedbackWindow {
                                     title,
                                     question,
-                                    lines: vec![format!(
-                                        "Error: unknown model profile '{active_model}'"
-                                    )],
+                                    lines: vec![format!("Error: unknown server '{active_model}'")],
                                     scroll: 0,
                                     x_offset: 0,
                                 });
@@ -681,6 +647,7 @@ async fn run() -> Result<()> {
                             };
                             let mut prompt_profile = profile.clone();
                             prompt_profile.endpoint = endpoint.to_string();
+                            prompt_profile.model = active_model_id.clone();
                             let prompt = build_review_prompt(&path, &request, &patch);
                             let llm_start = std::time::Instant::now();
                             let tool_before = tools.total_tool_duration();
@@ -752,7 +719,7 @@ async fn run() -> Result<()> {
         let profile = config
             .llms
             .get(&active_model)
-            .ok_or_else(|| anyhow!("unknown model profile '{active_model}'"))?;
+            .ok_or_else(|| anyhow!("unknown server '{active_model}'"))?;
         let Some(endpoint) = current_endpoint.as_deref() else {
             output_state.push_text("Error: Not connected to an LLM server");
             if config.feedback {
@@ -778,6 +745,7 @@ async fn run() -> Result<()> {
         }
         let mut prompt_profile = profile.clone();
         prompt_profile.endpoint = endpoint.to_string();
+        prompt_profile.model = active_model_id.clone();
         let llm_start = std::time::Instant::now();
         let tool_time_before = tools.total_tool_duration();
         let seed = std::time::SystemTime::now()
@@ -792,7 +760,7 @@ async fn run() -> Result<()> {
             &tools,
             WaitContext {
                 render: RenderContext {
-                    current_model: &active_model,
+                    current_model: &active_model_id,
                     endpoint,
                     workspace: tools.workspace(),
                     prompt_branch: prompt_branch.as_deref(),
@@ -806,7 +774,8 @@ async fn run() -> Result<()> {
                 },
                 history: &mut history,
                 history_path: &session_hist_path,
-                model_names: &model_names,
+                server_names: &server_names,
+                available_models: &available_models,
                 interrupt_state: &mut interrupt_state,
                 output_state: &mut output_state,
                 input_state: &mut input_state,
@@ -1078,8 +1047,10 @@ fn handle_command(
 
     let CommandState {
         active_model,
+        active_model_id,
         current_endpoint,
         session,
+        detect_model,
     } = state;
     let CommandContext {
         startup_model,
@@ -1088,7 +1059,7 @@ fn handle_command(
         tools,
         workspace,
         usage_stats,
-        http_client,
+        available_models,
         virtual_width,
         auto_rebase,
         auto_squash,
@@ -1101,7 +1072,7 @@ fn handle_command(
         LocalCommand::ConnectDefault => {
             let endpoint = llms
                 .get(active_model)
-                .ok_or_else(|| anyhow!("unknown model profile '{active_model}'"))?
+                .ok_or_else(|| anyhow!("unknown server '{active_model}'"))?
                 .endpoint
                 .clone();
             *current_endpoint = Some(endpoint);
@@ -1123,48 +1094,15 @@ fn handle_command(
         LocalCommand::Reload => {
             *active_model = startup_model.to_string();
             *current_endpoint = Some(startup_endpoint.to_string());
-            let prompt = system_prompt(
-                llms.get(startup_model)
-                    .ok_or_else(|| anyhow!("unknown model profile '{startup_model}'"))?,
-            );
-            session.clear(prompt);
+            let profile = llms
+                .get(startup_model)
+                .ok_or_else(|| anyhow!("unknown server '{startup_model}'"))?;
+            *active_model_id = profile.model.clone();
+            session.clear(system_prompt(profile));
+            *detect_model = true;
             Ok(CommandOutcome::Quiet)
         }
         LocalCommand::Restart => Ok(CommandOutcome::Restart),
-        LocalCommand::ListModels => {
-            let names = sorted_model_names(llms);
-            let configs: Vec<(String, LlmConfiguration)> = names
-                .into_iter()
-                .filter_map(|n| llms.get(&n).map(|c| (n, c.clone())))
-                .collect();
-            Ok(CommandOutcome::Async(Box::pin(async move {
-                let mut lines = Vec::with_capacity(configs.len());
-                for (name, profile) in &configs {
-                    let endpoint = normalized_openai_endpoint(&profile.endpoint);
-                    let models_url = format!("{endpoint}/v1/models");
-                    let available = async {
-                        let resp = http_client.get(&models_url).send().await.ok()?;
-                        if !resp.status().is_success() {
-                            return None;
-                        }
-                        let models = resp.json::<ModelsResponse>().await.ok()?;
-                        Some(models.data.iter().chain(models.models.iter()).any(|e| {
-                            e.id == profile.model
-                                || e.model == profile.model
-                                || e.name == profile.model
-                        }))
-                    }
-                    .await
-                    .unwrap_or(false);
-                    let indicator = if available { "🟢" } else { "🔴" };
-                    lines.push(format!(
-                        "- {}: {} ({}) {}",
-                        name, profile.model, profile.provider, indicator
-                    ));
-                }
-                Ok(lines.join("\n"))
-            })))
-        }
         LocalCommand::ListFiles => match list_workspace_files_tree(workspace) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
@@ -1176,26 +1114,62 @@ fn handle_command(
             }
         }
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
-        LocalCommand::ModelInfo => Ok(CommandOutcome::Output(
-            "Use /models to see configured profiles".to_string(),
-        )),
-        LocalCommand::SetModel(name) => {
+        LocalCommand::ModelInfo => {
+            // The active model is marked active (green dot); every other model
+            // the server advertises is listed as inactive (red dot).
+            let mut lines = vec![format!("{FEEDBACK_OK} {active_model_id}")];
+            for model in available_models {
+                if model != active_model_id {
+                    lines.push(format!("{FEEDBACK_ERR} {model}"));
+                }
+            }
+            Ok(CommandOutcome::Output(lines.join("\n")))
+        }
+        LocalCommand::SetModelId(name) => {
             if name.is_empty() {
                 return Ok(CommandOutcome::OutputError(
                     model_usage_message().to_string(),
                 ));
             }
+            *active_model_id = name.to_string();
+            Ok(CommandOutcome::Quiet)
+        }
+        LocalCommand::ServerInfo => {
+            // The active server is marked active (green dot); every other
+            // configured server is listed as inactive (red dot).
+            let lines: Vec<String> = sorted_model_names(llms)
+                .into_iter()
+                .map(|name| {
+                    if name == *active_model {
+                        format!("{FEEDBACK_OK} {name}")
+                    } else {
+                        format!("{FEEDBACK_ERR} {name}")
+                    }
+                })
+                .collect();
+            Ok(CommandOutcome::Output(lines.join("\n")))
+        }
+        LocalCommand::SetServer(name) => {
+            if name.is_empty() {
+                return Ok(CommandOutcome::OutputError(
+                    server_usage_message().to_string(),
+                ));
+            }
             if !llms.contains_key(name) {
                 return Ok(CommandOutcome::OutputError(format!(
-                    "Unknown model profile '{name}'. Available: {}",
+                    "Unknown server '{name}'. Available: {}",
                     sorted_model_names(llms).join(", ")
                 )));
             }
             let profile = &llms[name];
             let endpoint = orangu::llm::normalized_openai_endpoint(&profile.endpoint);
             *active_model = name.to_string();
+            *active_model_id = profile.model.clone();
             *current_endpoint = Some(endpoint);
             session.set_system_prompt(system_prompt(profile));
+            // Re-run the startup-style model detection against the selected
+            // server, even when it is the server we were already on.
+            *detect_model = true;
             Ok(CommandOutcome::Quiet)
         }
         LocalCommand::Diff(None) => match git_workspace_diff(workspace) {
@@ -1446,7 +1420,7 @@ fn handle_command(
         LocalCommand::Clear => {
             let prompt = system_prompt(
                 llms.get(active_model)
-                    .ok_or_else(|| anyhow!("unknown model profile '{active_model}'"))?,
+                    .ok_or_else(|| anyhow!("unknown server '{active_model}'"))?,
             );
             session.clear(prompt);
             Ok(CommandOutcome::Cleared)
@@ -2104,7 +2078,8 @@ async fn wait_for_response(
         mut render,
         history,
         history_path,
-        model_names,
+        server_names,
+        available_models,
         interrupt_state,
         output_state,
         input_state,
@@ -2243,7 +2218,8 @@ async fn wait_for_response(
                         InputContext {
                             history,
                             workspace: render.workspace,
-                            model_names,
+                            server_names,
+                            available_models,
                             render,
                         },
                     );
@@ -2316,7 +2292,8 @@ async fn wait_for_local_command(
         mut render,
         history,
         history_path: _,
-        model_names,
+        server_names,
+        available_models,
         interrupt_state,
         output_state,
         input_state,
@@ -2348,7 +2325,8 @@ async fn wait_for_local_command(
                         InputContext {
                             history,
                             workspace: render.workspace,
-                            model_names,
+                            server_names,
+                            available_models,
                             render,
                         },
                     );
@@ -2386,7 +2364,8 @@ async fn wait_for_streaming_command(
         mut render,
         history,
         history_path: _,
-        model_names,
+        server_names,
+        available_models,
         interrupt_state,
         output_state,
         input_state,
@@ -2425,7 +2404,8 @@ async fn wait_for_streaming_command(
                         InputContext {
                             history,
                             workspace: render.workspace,
-                            model_names,
+                            server_names,
+                            available_models,
                             render,
                         },
                     );
@@ -2543,184 +2523,123 @@ struct ModelEntry {
     name: String,
 }
 
+/// Build a GET request to a server's `/v1/models` endpoint, attaching the
+/// optional bearer token. OpenAI-compatible servers — including a llama.cpp
+/// server started with `--api-key` — require `Authorization: Bearer <key>` on
+/// every `/v1/*` endpoint, not just chat completions.
+fn models_request(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}/v1/models", normalized_openai_endpoint(endpoint));
+    let request = http_client.get(url);
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
+/// Probe the active server and return its header status together with the list
+/// of model ids it advertises (used for `/model` completion). `model_ok` is set
+/// when the active wire model id is among the advertised models.
 async fn probe_header_status(
     http_client: &reqwest::Client,
     workspace: &Path,
-    active_model: &str,
+    active_model_id: &str,
     profile: &LlmConfiguration,
     endpoint: Option<&str>,
-) -> orangu::tui::HeaderStatus {
+) -> (orangu::tui::HeaderStatus, Vec<String>) {
     let workspace_ok = workspace.exists();
     let mut server_ok = false;
     let mut model_ok = false;
+    let mut available_models = Vec::new();
 
-    if let Some(endpoint) = endpoint {
-        let models_url = format!("{}/v1/models", normalized_openai_endpoint(endpoint));
-        if let Ok(response) = http_client.get(&models_url).send().await
-            && response.status().is_success()
-        {
-            server_ok = true;
-            if let Ok(models) = response.json::<ModelsResponse>().await {
-                model_ok = models.data.iter().chain(models.models.iter()).any(|entry| {
-                    entry.id == profile.model
-                        || entry.model == profile.model
-                        || entry.name == profile.model
-                        || entry.id == active_model
-                        || entry.model == active_model
-                        || entry.name == active_model
-                });
+    if let Some(endpoint) = endpoint
+        && let Ok(response) = models_request(http_client, endpoint, profile.api_key.as_deref())
+            .send()
+            .await
+        && response.status().is_success()
+    {
+        server_ok = true;
+        if let Ok(models) = response.json::<ModelsResponse>().await {
+            for entry in models.data.iter().chain(models.models.iter()) {
+                let id = if !entry.id.is_empty() {
+                    &entry.id
+                } else if !entry.model.is_empty() {
+                    &entry.model
+                } else if !entry.name.is_empty() {
+                    &entry.name
+                } else {
+                    continue;
+                };
+                if id == active_model_id
+                    || entry.model == active_model_id
+                    || entry.name == active_model_id
+                {
+                    model_ok = true;
+                }
+                available_models.push(id.clone());
             }
         }
     }
 
-    orangu::tui::HeaderStatus {
-        workspace_ok,
-        server_ok,
-        model_ok,
-    }
+    (
+        orangu::tui::HeaderStatus {
+            workspace_ok,
+            server_ok,
+            model_ok,
+        },
+        available_models,
+    )
 }
 
-async fn try_discover_new_models(
-    http_client: &reqwest::Client,
-    config: &mut orangu::config::ClientAppConfiguration,
-    config_path: &Path,
-) -> Vec<String> {
-    let mut known_model_ids: HashSet<String> =
-        config.llms.values().map(|p| p.model.clone()).collect();
-
-    let mut seen_endpoints: HashSet<String> = HashSet::new();
-    let endpoints: Vec<(String, String)> = config
-        .llms
-        .values()
-        .filter(|p| seen_endpoints.insert(p.endpoint.clone()))
-        .map(|p| (p.endpoint.clone(), p.provider.clone()))
-        .collect();
-
-    let (fallback_timeout, fallback_max_tool_rounds, fallback_system_prompt) = config
-        .llms
-        .values()
-        .next()
-        .map(|p| {
-            (
-                p.request_timeout_seconds,
-                p.max_tool_rounds,
-                p.system_prompt.clone(),
-            )
-        })
-        .unwrap_or((1800, 10, String::new()));
-
-    let mut added = Vec::new();
-
-    for (endpoint, provider) in &endpoints {
-        let url = format!("{}/v1/models", normalized_openai_endpoint(endpoint));
-        let Ok(response) = http_client.get(&url).send().await else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(models) = response.json::<ModelsResponse>().await else {
-            continue;
-        };
-
-        for entry in models.data.iter().chain(models.models.iter()) {
-            let model_id = if !entry.id.is_empty() {
-                entry.id.clone()
-            } else if !entry.model.is_empty() {
-                entry.model.clone()
-            } else {
-                continue;
-            };
-
-            if known_model_ids.contains(&model_id) {
-                continue;
-            }
-
-            let base_name = model_id.rsplit('/').next().unwrap_or(&model_id).to_string();
-            let section_name = if !config.llms.contains_key(&base_name) {
-                base_name
-            } else {
-                model_id.replace('/', "-")
-            };
-
-            if config.llms.contains_key(&section_name) {
-                continue;
-            }
-
-            config.llms.insert(
-                section_name.clone(),
-                LlmConfiguration {
-                    provider: provider.clone(),
-                    endpoint: endpoint.clone(),
-                    model: model_id.clone(),
-                    api_key: None,
-                    request_timeout_seconds: fallback_timeout,
-                    max_tool_rounds: fallback_max_tool_rounds,
-                    system_prompt: fallback_system_prompt.clone(),
-                },
-            );
-
-            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(config_path) {
-                let _ = writeln!(file);
-                let _ = writeln!(file, "[{section_name}]");
-                let _ = writeln!(file, "provider = {provider}");
-                let _ = writeln!(file, "endpoint = {endpoint}");
-                let _ = writeln!(file, "model = {model_id}");
-            }
-
-            known_model_ids.insert(model_id);
-            added.push(section_name);
-        }
-    }
-
-    added
-}
-
+/// If the active server is not serving the configured model at startup, switch
+/// to a model the server actually advertises. Returns `(old, new)` model ids
+/// when a switch happened. The server (endpoint, provider, system prompt) is
+/// unchanged — only the wire model id moves.
 async fn try_startup_model_switch(
     http_client: &reqwest::Client,
-    config: &orangu::config::ClientAppConfiguration,
-    active_model: &mut String,
-    current_endpoint: &mut Option<String>,
-    session: &mut ChatSession,
+    profile: &LlmConfiguration,
+    active_model_id: &mut String,
+    endpoint: Option<&str>,
 ) -> Option<(String, String)> {
-    let endpoint = current_endpoint.as_deref()?;
-    let models_url = format!("{}/v1/models", normalized_openai_endpoint(endpoint));
-    let response = http_client.get(&models_url).send().await.ok()?;
+    let endpoint = endpoint?;
+    let response = models_request(http_client, endpoint, profile.api_key.as_deref())
+        .send()
+        .await
+        .ok()?;
     if !response.status().is_success() {
         return None;
     }
     let models = response.json::<ModelsResponse>().await.ok()?;
 
-    let current_profile = config.llms.get(active_model.as_str())?;
-    let current_available = models.data.iter().chain(models.models.iter()).any(|e| {
-        e.id == current_profile.model
-            || e.model == current_profile.model
-            || e.name == current_profile.model
-            || e.id == active_model.as_str()
-            || e.model == active_model.as_str()
-            || e.name == active_model.as_str()
-    });
-    if current_available {
+    let available: Vec<String> = models
+        .data
+        .iter()
+        .chain(models.models.iter())
+        .filter_map(|entry| {
+            if !entry.id.is_empty() {
+                Some(entry.id.clone())
+            } else if !entry.model.is_empty() {
+                Some(entry.model.clone())
+            } else if !entry.name.is_empty() {
+                Some(entry.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // The server already serves the configured model — nothing to switch.
+    if available.iter().any(|model| model == active_model_id) {
         return None;
     }
 
-    for name in sorted_model_names(&config.llms) {
-        if name == *active_model {
-            continue;
-        }
-        if let Some(profile) = config.llms.get(&name) {
-            let available = models.data.iter().chain(models.models.iter()).any(|e| {
-                e.id == profile.model || e.model == profile.model || e.name == profile.model
-            });
-            if available {
-                let old = std::mem::replace(active_model, name.clone());
-                *current_endpoint = Some(normalized_openai_endpoint(&profile.endpoint));
-                session.set_system_prompt(system_prompt(profile));
-                return Some((old, name));
-            }
-        }
-    }
-    None
+    // Otherwise move to the first model the server actually offers.
+    let new_model = available.into_iter().next()?;
+    let old = std::mem::replace(active_model_id, new_model.clone());
+    Some((old, new_model))
 }
 
 fn session_dir_path(session_id: &str) -> Result<PathBuf> {
@@ -3298,7 +3217,8 @@ mod tests {
         InputContext {
             history: &[],
             workspace,
-            model_names: &[],
+            server_names: &[],
+            available_models: &[],
             render: RenderContext {
                 current_model: "default",
                 endpoint: "http://localhost:11434/v1",
@@ -3317,6 +3237,33 @@ mod tests {
                 feedback: false,
             },
         }
+    }
+
+    #[test]
+    fn models_request_attaches_optional_bearer_token() {
+        let client = reqwest::Client::new();
+
+        let with_key = super::models_request(&client, "http://localhost:8100/v1", Some("secret"))
+            .build()
+            .expect("build request");
+        assert_eq!(with_key.url().as_str(), "http://localhost:8100/v1/models");
+        assert_eq!(
+            with_key
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret")
+        );
+
+        let without_key = super::models_request(&client, "http://localhost:8100/v1", None)
+            .build()
+            .expect("build request");
+        assert!(
+            without_key
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3860,6 +3807,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
         let mut active_model = "llama".to_string();
+        let mut active_model_id = "gemma".to_string();
         let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
         let mut session = ChatSession::new("system");
 
@@ -3867,8 +3815,10 @@ mod tests {
             "/open_file /etc/hosts",
             CommandState {
                 active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
                 current_endpoint: &mut current_endpoint,
                 session: &mut session,
+                detect_model: &mut false,
             },
             CommandContext {
                 startup_model: "llama",
@@ -3877,7 +3827,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
-                http_client: reqwest::Client::new(),
+                available_models: &[],
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
@@ -4040,6 +3990,7 @@ mod tests {
             ),
         ] {
             let mut active_model = "llama".to_string();
+            let mut active_model_id = "gemma".to_string();
             let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
             let mut session = ChatSession::new("system");
 
@@ -4047,8 +3998,10 @@ mod tests {
                 input,
                 CommandState {
                     active_model: &mut active_model,
+                    active_model_id: &mut active_model_id,
                     current_endpoint: &mut current_endpoint,
                     session: &mut session,
+                    detect_model: &mut false,
                 },
                 CommandContext {
                     startup_model: "llama",
@@ -4057,7 +4010,7 @@ mod tests {
                     tools: &tools,
                     workspace: workspace.path(),
                     usage_stats: &super::UsageStats::new(),
-                    http_client: reqwest::Client::new(),
+                    available_models: &[],
                     virtual_width: 512,
                     auto_rebase: false,
                     auto_squash: false,
@@ -4104,14 +4057,17 @@ mod tests {
 
         let tools = ToolExecutor::new(workspace.path());
         let mut active_model = "llama".to_string();
+        let mut active_model_id = "gemma".to_string();
         let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
         let mut session = ChatSession::new("system");
         let outcome = handle_command(
             "/list_files",
             CommandState {
                 active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
                 current_endpoint: &mut current_endpoint,
                 session: &mut session,
+                detect_model: &mut false,
             },
             CommandContext {
                 startup_model: "llama",
@@ -4120,7 +4076,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
-                http_client: reqwest::Client::new(),
+                available_models: &[],
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
@@ -4369,7 +4325,7 @@ mod tests {
     }
 
     #[test]
-    fn set_model_switches_active_endpoint() {
+    fn set_server_switches_active_endpoint() {
         const GEMMA: &str = "gemma-4-E4B-it-GGUF";
         const OPENAI: &str = "gpt-4.1";
 
@@ -4390,15 +4346,19 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
         let mut active_model = GEMMA.to_string();
+        let mut active_model_id = GEMMA.to_string();
         let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
         let mut session = ChatSession::new("system");
+        let mut detect_model = false;
 
         let outcome = handle_command(
-            "/model gpt-4.1",
+            "/server gpt-4.1",
             CommandState {
                 active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
                 current_endpoint: &mut current_endpoint,
                 session: &mut session,
+                detect_model: &mut detect_model,
             },
             CommandContext {
                 startup_model: GEMMA,
@@ -4407,7 +4367,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
-                http_client: reqwest::Client::new(),
+                available_models: &[],
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
@@ -4419,10 +4379,183 @@ mod tests {
 
         assert!(matches!(outcome, CommandOutcome::Quiet));
         assert_eq!(active_model, OPENAI);
+        // Switching server resets the wire model id to the server's model.
+        assert_eq!(active_model_id, "gpt-4.1");
         assert_eq!(
             current_endpoint,
             Some(normalized_openai_endpoint("https://api.openai.com/v1"))
         );
+        // Selecting a server requests model auto-detection against it.
+        assert!(detect_model);
+    }
+
+    #[test]
+    fn set_model_changes_wire_model_only() {
+        const GEMMA: &str = "gemma-4-E4B-it-GGUF";
+
+        let llms = HashMap::from([(
+            GEMMA.to_string(),
+            test_profile(
+                "llama.cpp",
+                "http://localhost:8100/v1",
+                "ggml-org/gemma-4-E4B-it-GGUF",
+            ),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = GEMMA.to_string();
+        let mut active_model_id = "ggml-org/gemma-4-E4B-it-GGUF".to_string();
+        let endpoint = normalized_openai_endpoint("http://localhost:8100/v1");
+        let mut current_endpoint = Some(endpoint.clone());
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/model some-other-model",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                startup_model: GEMMA,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::Quiet));
+        // The wire model id changes; the server and endpoint stay put.
+        assert_eq!(active_model_id, "some-other-model");
+        assert_eq!(active_model, GEMMA);
+        assert_eq!(current_endpoint, Some(endpoint));
+    }
+
+    #[test]
+    fn model_info_marks_active_green_and_others_red() {
+        const SERVER: &str = "local";
+
+        let llms = HashMap::from([(
+            SERVER.to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = SERVER.to_string();
+        let mut active_model_id = "model-a".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+        let available = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
+
+        let outcome = handle_command(
+            "/model",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                startup_model: SERVER,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                available_models: &available,
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+            },
+        )
+        .expect("handle command");
+
+        match outcome {
+            CommandOutcome::Output(text) => {
+                let ok = super::FEEDBACK_OK;
+                let err = super::FEEDBACK_ERR;
+                assert_eq!(text, format!("{ok} model-a\n{err} model-b\n{err} model-c"));
+            }
+            _ => panic!("expected output from /model"),
+        }
+    }
+
+    #[test]
+    fn server_info_marks_active_green_and_others_red() {
+        let llms = HashMap::from([
+            (
+                "alpha".to_string(),
+                test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+            ),
+            (
+                "bravo".to_string(),
+                test_profile("llama.cpp", "http://localhost:8200/v1", "model-b"),
+            ),
+            (
+                "charlie".to_string(),
+                test_profile("llama.cpp", "http://localhost:8300/v1", "model-c"),
+            ),
+        ]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "bravo".to_string();
+        let mut active_model_id = "model-b".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8200/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/server",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                startup_model: "bravo",
+                startup_endpoint: "http://localhost:8200/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+            },
+        )
+        .expect("handle command");
+
+        match outcome {
+            CommandOutcome::Output(text) => {
+                let ok = super::FEEDBACK_OK;
+                let err = super::FEEDBACK_ERR;
+                // Servers are listed in sorted order; only the active one is green.
+                assert_eq!(text, format!("{err} alpha\n{ok} bravo\n{err} charlie"));
+            }
+            _ => panic!("expected output from /server"),
+        }
     }
 
     #[test]
@@ -4444,14 +4577,17 @@ mod tests {
         );
         let mut session = ChatSession::new(system_prompt(&llms["default"]));
         let mut active_model = "default".to_string();
+        let mut active_model_id = "default".to_string();
         let mut current_endpoint = Some("http://localhost:11434/v1".to_string());
 
         let outcome = handle_command(
             "/unknown",
             CommandState {
                 active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
                 current_endpoint: &mut current_endpoint,
                 session: &mut session,
+                detect_model: &mut false,
             },
             CommandContext {
                 startup_model: "default",
@@ -4460,7 +4596,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 usage_stats: &super::UsageStats::new(),
-                http_client: reqwest::Client::new(),
+                available_models: &[],
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
@@ -4503,6 +4639,7 @@ mod tests {
             "/open_file READ".len(),
             workspace.path(),
             &[],
+            &[],
         )
         .expect("slash completion");
         assert_eq!(
@@ -4511,7 +4648,7 @@ mod tests {
         );
 
         let (start, _, natural_candidates) =
-            completion_candidates("Open READ", "Open READ".len(), workspace.path(), &[])
+            completion_candidates("Open READ", "Open READ".len(), workspace.path(), &[], &[])
                 .expect("natural completion");
         assert_eq!(start, "Open ".len());
         assert_eq!(
@@ -4520,22 +4657,27 @@ mod tests {
         );
 
         let (_, _, ignored_candidates) =
-            completion_candidates("Open ign", "Open ign".len(), workspace.path(), &[])
+            completion_candidates("Open ign", "Open ign".len(), workspace.path(), &[], &[])
                 .expect("ignored completion");
         assert!(ignored_candidates.is_empty());
 
         let (_, _, git_candidates) =
-            completion_candidates("Open con", "Open con".len(), workspace.path(), &[])
+            completion_candidates("Open con", "Open con".len(), workspace.path(), &[], &[])
                 .expect("git completion");
         assert!(git_candidates.is_empty());
 
-        let (_, _, target_candidates) =
-            completion_candidates("/open_file t", "/open_file t".len(), workspace.path(), &[])
-                .expect("target completion");
+        let (_, _, target_candidates) = completion_candidates(
+            "/open_file t",
+            "/open_file t".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("target completion");
         assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
 
         let (start, _, show_candidates) =
-            completion_candidates("Show t", "Show t".len(), workspace.path(), &[])
+            completion_candidates("Show t", "Show t".len(), workspace.path(), &[], &[])
                 .expect("show completion");
         assert_eq!(start, "Show ".len());
         assert_eq!(show_candidates, vec!["src/tui.rs".to_string()]);
@@ -4544,6 +4686,7 @@ mod tests {
             "show file READ",
             "show file READ".len(),
             workspace.path(),
+            &[],
             &[],
         )
         .expect("show file completion");
@@ -4569,9 +4712,14 @@ mod tests {
         )
         .expect("target file");
 
-        let (_, _, initial_file_candidates) =
-            completion_candidates("/show_file ", "/show_file ".len(), workspace.path(), &[])
-                .expect("initial file completion");
+        let (_, _, initial_file_candidates) = completion_candidates(
+            "/show_file ",
+            "/show_file ".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("initial file completion");
         assert_eq!(
             initial_file_candidates,
             vec![
@@ -4586,6 +4734,7 @@ mod tests {
             "/show_file --".len(),
             workspace.path(),
             &[],
+            &[],
         )
         .expect("flag completion");
         assert_eq!(
@@ -4597,6 +4746,7 @@ mod tests {
             "/show_file --hash READ",
             "/show_file --hash READ".len(),
             workspace.path(),
+            &[],
             &[],
         )
         .expect("file completion");
@@ -4610,6 +4760,7 @@ mod tests {
             "/show_file \"READ".len(),
             workspace.path(),
             &[],
+            &[],
         )
         .expect("quoted file completion");
         assert_eq!(
@@ -4617,9 +4768,14 @@ mod tests {
             vec!["\"README.md".to_string(), "\"doc/README.md".to_string()]
         );
 
-        let (_, _, target_candidates) =
-            completion_candidates("/show_file t", "/show_file t".len(), workspace.path(), &[])
-                .expect("target completion");
+        let (_, _, target_candidates) = completion_candidates(
+            "/show_file t",
+            "/show_file t".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("target completion");
         assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
     }
 
@@ -4639,12 +4795,12 @@ mod tests {
         let workspace = repo.path().join("target/debug");
 
         let (_, _, open_candidates) =
-            completion_candidates("/open_file ", "/open_file ".len(), &workspace, &[])
+            completion_candidates("/open_file ", "/open_file ".len(), &workspace, &[], &[])
                 .expect("open completion");
         assert!(open_candidates.is_empty());
 
         let (_, _, show_candidates) =
-            completion_candidates("/show_file ", "/show_file ".len(), &workspace, &[])
+            completion_candidates("/show_file ", "/show_file ".len(), &workspace, &[], &[])
                 .expect("show completion");
         assert!(show_candidates.is_empty());
     }
@@ -5020,9 +5176,14 @@ mod tests {
                 .success()
         );
 
-        let (start, _, candidates) =
-            completion_candidates("/checkout m", "/checkout m".len(), workspace.path(), &[])
-                .expect("checkout completion");
+        let (start, _, candidates) = completion_candidates(
+            "/checkout m",
+            "/checkout m".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("checkout completion");
         assert_eq!(start, "/checkout ".len());
         assert!(candidates.contains(&"main".to_string()), "main missing");
         assert!(
@@ -5032,7 +5193,7 @@ mod tests {
         assert!(candidates.contains(&"main.rs".to_string()), "file missing");
 
         let (start, _, nat_candidates) =
-            completion_candidates("checkout m", "checkout m".len(), workspace.path(), &[])
+            completion_candidates("checkout m", "checkout m".len(), workspace.path(), &[], &[])
                 .expect("natural checkout completion");
         assert_eq!(start, "checkout ".len());
         assert!(
@@ -5093,9 +5254,14 @@ mod tests {
                 .success()
         );
 
-        let (start, _, candidates) =
-            completion_candidates("switch to m", "switch to m".len(), workspace.path(), &[])
-                .expect("switch to completion");
+        let (start, _, candidates) = completion_candidates(
+            "switch to m",
+            "switch to m".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("switch to completion");
         assert_eq!(start, "switch to ".len());
         assert!(
             candidates.contains(&"mybranch".to_string()),
@@ -5135,9 +5301,14 @@ mod tests {
         fs::write(workspace.path().join("newfile.txt"), "").expect("new file");
 
         // "n" matches directory "newdir/" before file "newfile.txt"
-        let (start, _, candidates) =
-            completion_candidates("/add_file n", "/add_file n".len(), workspace.path(), &[])
-                .expect("add_file completion");
+        let (start, _, candidates) = completion_candidates(
+            "/add_file n",
+            "/add_file n".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("add_file completion");
         assert_eq!(start, "/add_file ".len());
         assert_eq!(candidates[0], "newdir/");
         assert!(candidates.contains(&"newfile.txt".to_string()));
@@ -5146,7 +5317,7 @@ mod tests {
 
         // Natural-language form
         let (start, _, nat_candidates) =
-            completion_candidates("add n", "add n".len(), workspace.path(), &[])
+            completion_candidates("add n", "add n".len(), workspace.path(), &[], &[])
                 .expect("natural add_file completion");
         assert_eq!(start, "add ".len());
         assert_eq!(nat_candidates[0], "newdir/");
@@ -5183,6 +5354,7 @@ mod tests {
             "/remove_file s".len(),
             workspace.path(),
             &[],
+            &[],
         )
         .expect("remove_file completion");
         assert_eq!(start, "/remove_file ".len());
@@ -5193,7 +5365,7 @@ mod tests {
 
         // Natural-language form
         let (start, _, nat_candidates) =
-            completion_candidates("remove s", "remove s".len(), workspace.path(), &[])
+            completion_candidates("remove s", "remove s".len(), workspace.path(), &[], &[])
                 .expect("natural remove_file completion");
         assert_eq!(start, "remove ".len());
         assert_eq!(nat_candidates[0], "src/");
@@ -5225,9 +5397,14 @@ mod tests {
         );
 
         // First arg: "s" matches tracked "src/" (directory) — untracked file absent
-        let (start, _, src_candidates) =
-            completion_candidates("/move_file s", "/move_file s".len(), workspace.path(), &[])
-                .expect("move_file source completion");
+        let (start, _, src_candidates) = completion_candidates(
+            "/move_file s",
+            "/move_file s".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("move_file source completion");
         assert_eq!(start, "/move_file ".len());
         assert_eq!(src_candidates[0], "src/");
         assert!(!src_candidates.contains(&"untracked.txt".to_string()));
@@ -5238,6 +5415,7 @@ mod tests {
             "/move_file src/main.rs u".len(),
             workspace.path(),
             &[],
+            &[],
         )
         .expect("move_file destination completion");
         assert_eq!(start, "/move_file src/main.rs ".len());
@@ -5245,7 +5423,7 @@ mod tests {
 
         // Natural-language form — first arg
         let (start, _, nat_candidates) =
-            completion_candidates("move s", "move s".len(), workspace.path(), &[])
+            completion_candidates("move s", "move s".len(), workspace.path(), &[], &[])
                 .expect("natural move_file completion");
         assert_eq!(start, "move ".len());
         assert_eq!(nat_candidates[0], "src/");
@@ -5279,6 +5457,7 @@ mod tests {
             "/cherry_pick ".len(),
             workspace.path(),
             &[],
+            &[],
         );
         if let Some((start, _, candidates)) = result {
             assert_eq!(start, "/cherry_pick ".len());
@@ -5287,8 +5466,13 @@ mod tests {
         }
 
         // Natural-language form triggers completion
-        let nl_result =
-            completion_candidates("cherry pick ", "cherry pick ".len(), workspace.path(), &[]);
+        let nl_result = completion_candidates(
+            "cherry pick ",
+            "cherry pick ".len(),
+            workspace.path(),
+            &[],
+            &[],
+        );
         if let Some((start, _, _)) = nl_result {
             assert_eq!(start, "cherry pick ".len());
         }

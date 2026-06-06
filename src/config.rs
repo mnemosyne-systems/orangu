@@ -25,7 +25,8 @@ use crate::tui::Banner;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
-    pub default_model: String,
+    pub default_server: String,
+    pub default_model: Option<String>,
     pub llms: HashMap<String, LlmConfiguration>,
     pub quotes: String,
     pub width: usize,
@@ -83,9 +84,23 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let width = parse_client_field(&client, "width", default_virtual_width)?;
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
 
+    // `[orangu].model` is the general default model id; a server section's own
+    // `model` takes precedence over it.
+    let default_model = client
+        .get("model")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     normalize_client_configuration(ClientAppConfiguration {
-        default_model: client.get("model").cloned().unwrap_or_default(),
-        llms: parse_llm_profiles(sections, timeout, max_tool_rounds, system_prompt)?,
+        default_server: client.get("server").cloned().unwrap_or_default(),
+        default_model: default_model.clone(),
+        llms: parse_llm_profiles(
+            sections,
+            timeout,
+            max_tool_rounds,
+            system_prompt,
+            default_model,
+        )?,
         quotes: client.get("quotes").cloned().unwrap_or_default(),
         width,
         banner: client
@@ -187,7 +202,7 @@ pub fn default_client_config_path() -> Option<PathBuf> {
 fn normalize_client_configuration(
     mut conf: ClientAppConfiguration,
 ) -> Result<ClientAppConfiguration> {
-    conf.default_model = conf.default_model.trim().to_string();
+    conf.default_server = conf.default_server.trim().to_string();
 
     conf.platform = conf.platform.trim().to_lowercase();
     if conf.platform.is_empty() {
@@ -210,25 +225,39 @@ fn normalize_client_configuration(
         normalize_llm_configuration(llm)?;
     }
 
-    if conf.default_model.is_empty() {
-        if conf.llms.len() == 1 {
-            conf.default_model = conf
-                .llms
-                .keys()
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow!("Missing LLM model definition"))?;
-        } else {
+    // Each server must point at a distinct endpoint: a server is one host, and
+    // `/model` cycles the models that single host offers. Endpoints are compared
+    // canonically, so `http://x` and `http://x/v1/` count as the same host.
+    let mut endpoints: HashMap<&str, &str> = HashMap::new();
+    for (name, llm) in &conf.llms {
+        let canonical = llm.endpoint.strip_suffix("/v1").unwrap_or(&llm.endpoint);
+        if let Some(existing) = endpoints.insert(canonical, name.as_str()) {
             return Err(anyhow!(
-                "Client configuration must define [orangu].model when multiple LLM profiles are configured"
+                "Servers '{existing}' and '{name}' share endpoint '{}'; each server must use a unique endpoint",
+                llm.endpoint
             ));
         }
     }
 
-    if !conf.llms.contains_key(&conf.default_model) {
+    if conf.default_server.is_empty() {
+        if conf.llms.len() == 1 {
+            conf.default_server = conf
+                .llms
+                .keys()
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow!("Missing server definition"))?;
+        } else {
+            return Err(anyhow!(
+                "Client configuration must define [orangu].server when multiple servers are configured"
+            ));
+        }
+    }
+
+    if !conf.llms.contains_key(&conf.default_server) {
         return Err(anyhow!(
-            "Client model '{}' is not defined in the configuration",
-            conf.default_model
+            "Server '{}' is not defined in the configuration",
+            conf.default_server
         ));
     }
 
@@ -240,30 +269,30 @@ fn parse_llm_profiles(
     timeout: u64,
     max_tool_rounds: usize,
     system_prompt: String,
+    default_model: Option<String>,
 ) -> Result<HashMap<String, LlmConfiguration>> {
     sections
         .into_iter()
         .map(|(name, values)| {
+            // A server section's own `model` overrides the general
+            // `[orangu].model`; fall back to it when the section omits one.
+            let model = values
+                .get("model")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| default_model.clone())
+                .unwrap_or_default();
             let api_key = values
                 .get("api_key")
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
-            let api_key_env = values
-                .get("api_key_env")
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            let api_key = match (api_key, api_key_env) {
-                (Some(key), _) => Some(key),
-                (None, Some(env_var)) => std::env::var(&env_var).ok(),
-                (None, None) => None,
-            };
 
             Ok((
                 name,
                 LlmConfiguration {
                     provider: values.get("provider").cloned().unwrap_or_default(),
                     endpoint: values.get("endpoint").cloned().unwrap_or_default(),
-                    model: values.get("model").cloned().unwrap_or_default(),
+                    model,
                     api_key,
                     request_timeout_seconds: timeout,
                     max_tool_rounds,
@@ -306,12 +335,12 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nmodel = gemma\ntimeout = 45\nmax_tool_rounds = 12\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
+            "[orangu]\nserver = gemma\ntimeout = 45\nmax_tool_rounds = 12\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
         )
         .unwrap();
 
         let conf = load_client_configuration(file.path()).unwrap();
-        assert_eq!(conf.default_model, "gemma");
+        assert_eq!(conf.default_server, "gemma");
         assert_eq!(conf.llms.len(), 2);
         assert_eq!(conf.llms["gemma"].provider, "llama.cpp");
         assert_eq!(conf.llms["gemma"].request_timeout_seconds, 45);
@@ -325,7 +354,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nmodel = a\nplatform = GitLab\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nplatform = GitLab\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -334,7 +363,7 @@ mod tests {
         let mut bad = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             bad,
-            "[orangu]\nmodel = a\nplatform = bitbucket\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nplatform = bitbucket\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let err = load_client_configuration(bad.path()).unwrap_err();
@@ -349,12 +378,12 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nmodel = Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen_Qwen3.6-35B-A3B-GGUF]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = bartowski/Qwen_Qwen3.6-35B-A3B-GGUF\n"
+            "[orangu]\nserver = Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen_Qwen3.6-35B-A3B-GGUF]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = bartowski/Qwen_Qwen3.6-35B-A3B-GGUF\n"
         )
         .unwrap();
 
         let conf = load_client_configuration(file.path()).unwrap();
-        assert_eq!(conf.default_model, "Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M");
+        assert_eq!(conf.default_server, "Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M");
         assert_eq!(conf.llms.len(), 2);
         assert!(
             conf.llms
@@ -372,7 +401,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nmodel = a\ntimeout = soon\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ntimeout = soon\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
 
@@ -395,15 +424,66 @@ mod tests {
     }
 
     #[test]
-    fn requires_default_model_when_multiple_profiles_exist() {
+    fn requires_default_server_when_multiple_profiles_exist() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
+            "[orangu]\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
         )
         .unwrap();
 
         let err = load_client_configuration(file.path()).unwrap_err();
-        assert!(err.to_string().contains("must define [orangu].model"));
+        assert!(err.to_string().contains("must define [orangu].server"));
+    }
+
+    #[test]
+    fn server_model_overrides_general_default_model() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\nmodel = general-default\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = server-specific\n\n[fallback]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\n"
+        )
+        .unwrap();
+
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.default_server, "main");
+        assert_eq!(conf.default_model.as_deref(), Some("general-default"));
+        // The server's own model wins over [orangu].model.
+        assert_eq!(conf.llms["main"].model, "server-specific");
+        // A server without its own model inherits [orangu].model.
+        assert_eq!(conf.llms["fallback"].model, "general-default");
+    }
+
+    #[test]
+    fn rejects_servers_sharing_an_endpoint() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = two\n"
+        )
+        .unwrap();
+
+        let err = load_client_configuration(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unique endpoint"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn endpoint_uniqueness_ignores_trailing_slash_and_v1_suffix() {
+        // `http://x` and `http://x/v1/` normalise to the same endpoint.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1/\nmodel = two\n"
+        )
+        .unwrap();
+
+        let err = load_client_configuration(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unique endpoint"),
+            "unexpected error: {err:#}"
+        );
     }
 }

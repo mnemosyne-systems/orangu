@@ -58,7 +58,7 @@ Then start with:
 /reload
 /tools
 /model
-/models
+/server
 /session <UUID>
 /sessions
 /list_files
@@ -73,6 +73,7 @@ Then start with:
 /branch -d feature/old
 /cherry_pick abc1234
 /comment 51 "My comment"
+/close -i 51
 /commit "[#42] My feature"
 /restore README.md
 /diff

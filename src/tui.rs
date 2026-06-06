@@ -176,8 +176,8 @@ pub fn help_text() -> &'static str {
 /reload                                       Restore the configured model and server
 /restart                                      Restart orangu, resuming the same workspace and session
 /tools                                        List tools
-/model [name]                                 Switch to the configured model, or a specific model
-/models                                       List models
+/model [name]                                 List the server's models (active green), or switch to a specific one
+/server [name]                                List configured servers (active green), or switch to a specific one
 /session [uuid]                               List sessions or print resume command for a UUID (Tab cycles UUIDs)
 /sessions [workspace]                         List all sessions, optionally filtered by workspace path
 /list_files                                   List workspace files as a tree
@@ -1186,7 +1186,6 @@ impl OranguHelper {
                 "/disconnect".to_string(),
                 "/reload".to_string(),
                 "/restart".to_string(),
-                "/models".to_string(),
                 "/list_files".to_string(),
                 "/show_file".to_string(),
                 "/tools".to_string(),

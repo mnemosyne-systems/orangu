@@ -196,7 +196,8 @@ impl InterruptState {
 pub struct InputContext<'a> {
     pub history: &'a [String],
     pub workspace: &'a Path,
-    pub model_names: &'a [String],
+    pub server_names: &'a [String],
+    pub available_models: &'a [String],
     pub render: RenderContext<'a>,
 }
 
@@ -204,7 +205,8 @@ pub struct WaitContext<'a> {
     pub render: RenderContext<'a>,
     pub history: &'a mut Vec<String>,
     pub history_path: &'a Path,
-    pub model_names: &'a [String],
+    pub server_names: &'a [String],
+    pub available_models: &'a [String],
     pub interrupt_state: &'a mut InterruptState,
     pub output_state: &'a mut OutputState,
     pub input_state: &'a mut InputState,
@@ -720,7 +722,8 @@ pub fn handle_input_event(
                     apply_completion(
                         input_state,
                         input_context.workspace,
-                        input_context.model_names,
+                        input_context.server_names,
+                        input_context.available_models,
                     );
                     redraw = true;
                 }
@@ -811,7 +814,12 @@ pub fn history_next(input_state: &mut InputState, history: &[String]) {
     input_state.set_buffer(history[new_index].clone());
 }
 
-pub fn apply_completion(input_state: &mut InputState, workspace: &Path, model_names: &[String]) {
+pub fn apply_completion(
+    input_state: &mut InputState,
+    workspace: &Path,
+    server_names: &[String],
+    available_models: &[String],
+) {
     if let Some(state) = input_state.completion.as_mut()
         && !state.candidates.is_empty()
     {
@@ -828,7 +836,8 @@ pub fn apply_completion(input_state: &mut InputState, workspace: &Path, model_na
         input_state.as_str(),
         input_state.cursor(),
         workspace,
-        model_names,
+        server_names,
+        available_models,
     ) else {
         return;
     };

@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use orangu::{
     config::LlmConfiguration, session::ChatSession, tools::ToolExecutor, tui::ReviewEntry,
 };
-use std::{borrow::Cow, collections::HashMap, path::Path, pin::Pin};
+use std::{borrow::Cow, collections::HashMap, path::Path};
 use terminal_size::{Width, terminal_size};
 
 #[derive(Clone, Copy, Default)]
@@ -126,7 +126,6 @@ pub enum CommandOutcome {
                 + 'static,
         >,
     ),
-    Async(Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'static>>),
     /// Enter the interactive `/review` mode with a collected branch diff.
     Review(ReviewLaunch),
 }
@@ -172,12 +171,13 @@ pub enum LocalCommand<'a> {
     Disconnect,
     Reload,
     Restart,
-    ListModels,
     ListFiles,
     ShowFile(Cow<'a, str>),
     Tools,
     ModelInfo,
-    SetModel(&'a str),
+    SetModelId(&'a str),
+    ServerInfo,
+    SetServer(&'a str),
     Diff(Option<Cow<'a, str>>),
     Grep(Option<Cow<'a, str>>),
     Review,
@@ -217,7 +217,7 @@ pub struct CommandContext<'a> {
     pub tools: &'a ToolExecutor,
     pub workspace: &'a Path,
     pub usage_stats: &'a crate::UsageStats,
-    pub http_client: reqwest::Client,
+    pub available_models: &'a [String],
     pub virtual_width: usize,
     pub auto_rebase: bool,
     pub auto_squash: bool,
@@ -227,8 +227,10 @@ pub struct CommandContext<'a> {
 
 pub struct CommandState<'a> {
     pub active_model: &'a mut String,
+    pub active_model_id: &'a mut String,
     pub current_endpoint: &'a mut Option<String>,
     pub session: &'a mut ChatSession,
+    pub detect_model: &'a mut bool,
 }
 
 pub fn parse_local_command(input: &str) -> Option<LocalCommand<'_>> {
@@ -249,7 +251,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/restart" => Some(LocalCommand::Restart),
         "/tools" => Some(LocalCommand::Tools),
         "/model" => Some(LocalCommand::ModelInfo),
-        "/models" => Some(LocalCommand::ListModels),
+        "/server" => Some(LocalCommand::ServerInfo),
         "/session" => Some(LocalCommand::Session(None)),
         "/sessions" => Some(LocalCommand::Sessions(None)),
         "/list_files" => Some(LocalCommand::ListFiles),
@@ -319,7 +321,10 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 }));
             }
             if let Some(name) = input.strip_prefix("/model ") {
-                return Some(LocalCommand::SetModel(name.trim()));
+                return Some(LocalCommand::SetModelId(name.trim()));
+            }
+            if let Some(name) = input.strip_prefix("/server ") {
+                return Some(LocalCommand::SetServer(name.trim()));
             }
             if let Some(args) = input.strip_prefix("/show_file ") {
                 return Some(LocalCommand::ShowFile(Cow::Borrowed(args.trim())));
@@ -514,17 +519,6 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(
         input,
         &[
-            "list models",
-            "show models",
-            "show available models",
-            "models",
-        ],
-    ) {
-        return Some(LocalCommand::ListModels);
-    }
-    if matches_ci(
-        input,
-        &[
             "list files",
             "show files",
             "show workspace files",
@@ -546,6 +540,10 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             "current model",
             "what model am i using",
             "model",
+            "list models",
+            "show models",
+            "show available models",
+            "models",
         ],
     ) {
         return Some(LocalCommand::ModelInfo);
@@ -594,13 +592,23 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::Log(None));
     }
     for prefix in [
+        "use server ",
+        "switch server to ",
+        "set server to ",
+        "select server ",
+    ] {
+        if let Some(name) = strip_ascii_prefix(input, prefix) {
+            return Some(LocalCommand::SetServer(name.trim()));
+        }
+    }
+    for prefix in [
         "use model ",
         "switch model to ",
         "set model to ",
         "select model ",
     ] {
         if let Some(name) = strip_ascii_prefix(input, prefix) {
-            return Some(LocalCommand::SetModel(name.trim()));
+            return Some(LocalCommand::SetModelId(name.trim()));
         }
     }
     if let Some(path) = parse_open_file_target(input, "/open_file ") {
@@ -1073,6 +1081,10 @@ pub fn model_usage_message() -> &'static str {
     "Usage: /model <name>. Use /help to see available commands."
 }
 
+pub fn server_usage_message() -> &'static str {
+    "Usage: /server <name>. Use /help to see available commands."
+}
+
 pub fn connect_usage_message() -> &'static str {
     "Usage: /connect <endpoint>. Use /help to see available commands."
 }
@@ -1244,7 +1256,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_local_command("list models"),
-            Some(LocalCommand::ListModels)
+            Some(LocalCommand::ModelInfo)
         ));
         assert!(matches!(
             parse_local_command("show tools"),
@@ -1273,8 +1285,16 @@ mod tests {
             _ => panic!("expected connect command"),
         }
         match parse_local_command("switch model to local") {
-            Some(LocalCommand::SetModel(name)) => assert_eq!(name, "local"),
+            Some(LocalCommand::SetModelId(name)) => assert_eq!(name, "local"),
             _ => panic!("expected set model command"),
+        }
+        match parse_local_command("switch server to main") {
+            Some(LocalCommand::SetServer(name)) => assert_eq!(name, "main"),
+            _ => panic!("expected set server command"),
+        }
+        match parse_local_command("/server main") {
+            Some(LocalCommand::SetServer(name)) => assert_eq!(name, "main"),
+            _ => panic!("expected set server command"),
         }
     }
 
