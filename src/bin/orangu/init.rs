@@ -96,8 +96,7 @@ pub async fn run_init() -> Result<()> {
     // and fixed-option keys are validated so the wizard never writes a config
     // the loader would later reject.
     let timeout = prompt_number::<u64>("timeout", default_timeout())?;
-    let max_tool_rounds =
-        prompt_number::<usize>("max_tool_rounds", default_llm_max_tool_rounds())?;
+    let max_tool_rounds = prompt_number::<usize>("max_tool_rounds", default_llm_max_tool_rounds())?;
     let quotes = prompt_with_options("quotes", "none", QUOTE_OPTIONS)?;
     let width = prompt_number::<usize>("width", default_virtual_width())?;
     let banner = prompt_with_options("banner", "left", BANNER_OPTIONS)?;
@@ -311,10 +310,16 @@ fn prompt_with_options(label: &str, default: &str, options: &[&str]) -> Result<S
         if value.is_empty() {
             return Ok(default.to_string());
         }
-        if options.iter().any(|option| option.eq_ignore_ascii_case(&value)) {
+        if options
+            .iter()
+            .any(|option| option.eq_ignore_ascii_case(&value))
+        {
             return Ok(value);
         }
-        println!("'{value}' is not valid; choose one of: {}", options.join(", "));
+        println!(
+            "'{value}' is not valid; choose one of: {}",
+            options.join(", ")
+        );
     }
 }
 
@@ -361,7 +366,10 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     let default_label = if default { "Yes" } else { "No" };
     let mut editor = option_editor(&["Yes", "No"])?;
     loop {
-        let value = read_line(&mut editor, &format!("{label} (Yes/No) [{default_label}]: "))?;
+        let value = read_line(
+            &mut editor,
+            &format!("{label} (Yes/No) [{default_label}]: "),
+        )?;
         if value.is_empty() {
             return Ok(default);
         }
