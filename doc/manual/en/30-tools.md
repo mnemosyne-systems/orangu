@@ -9,7 +9,7 @@
 | Tool | Purpose | Key arguments |
 | :-- | :-- | :-- |
 | `read_file` | Read a text file from the workspace | `path`, optional `start_line`, optional `end_line` |
-| `edit_file` | Edit a workspace file by replacing text | `path`, `old_text`, `new_text`, optional `replace_all`, optional `create_if_missing` |
+| `edit_file` | Edit a workspace file by replacing text (creates it if missing) | `path`, `old_text`, `new_text`, optional `replace_all` |
 | `list_directory` | List files and directories below the workspace | optional `path`, optional `max_depth` |
 | `fetch_url` | Fetch an external URL and return readable text | `url`, optional `max_chars` |
 | `run_shell_command` | Run a shell command inside the workspace | `command`, optional `cwd`, optional `timeout_seconds` |
@@ -56,14 +56,14 @@ Behavior:
 Optional flags:
 
 - `replace_all` replaces every match instead of only the first one
-- `create_if_missing` allows a missing file to be created
 
 Important details:
 
 - `path`, `old_text`, and `new_text` are required by the tool schema
+- If the file does not exist, it is created (mode `0644`) with `new_text` as its contents
 - If `old_text` is empty, the file content is replaced with `new_text`
-- If `old_text` is not found, the tool returns an error
-- Successful edits return JSON with `path`, `updated`, `original_bytes`, and `new_bytes`
+- If `old_text` is not found in an existing file, the tool returns an error
+- Successful edits return JSON with `path`, `created`, `updated`, `original_bytes`, and `new_bytes`
 
 ## `list_directory`
 

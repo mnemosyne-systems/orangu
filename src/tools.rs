@@ -18,6 +18,8 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -47,7 +49,6 @@ struct EditFileRequest {
     old_text: String,
     new_text: String,
     replace_all: Option<bool>,
-    create_if_missing: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -106,15 +107,14 @@ impl ToolExecutor {
             ),
             tool(
                 "edit_file",
-                "Edit a file on disk in the current workspace by replacing old_text with new_text.",
+                "Edit a file on disk in the current workspace by replacing old_text with new_text. If the file does not exist it is created (mode 0644) with new_text as its contents.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
                         "old_text": {"type": "string"},
                         "new_text": {"type": "string"},
-                        "replace_all": {"type": "boolean"},
-                        "create_if_missing": {"type": "boolean"}
+                        "replace_all": {"type": "boolean"}
                     },
                     "required": ["path", "old_text", "new_text"]
                 }),
@@ -188,12 +188,9 @@ impl ToolExecutor {
     async fn edit_file(&self, arguments: &Map<String, Value>) -> Result<String> {
         let args: EditFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
-        let create_if_missing = args.create_if_missing.unwrap_or(false);
-        let original = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
-                String::new()
-            }
+        let (original, created) = match fs::read_to_string(&path) {
+            Ok(content) => (content, false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
             Err(err) => return Err(err.into()),
         };
 
@@ -202,16 +199,21 @@ impl ToolExecutor {
             &args.old_text,
             &args.new_text,
             args.replace_all.unwrap_or(false),
-            create_if_missing,
+            created,
         )?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&path, &updated)?;
+        if created {
+            #[cfg(unix)]
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        }
 
         Ok(json!({
             "path": path,
+            "created": created,
             "updated": true,
             "original_bytes": original.len(),
             "new_bytes": updated.len()
@@ -327,9 +329,9 @@ pub fn apply_edit(
     old_text: &str,
     new_text: &str,
     replace_all: bool,
-    create_if_missing: bool,
+    created: bool,
 ) -> Result<String> {
-    if original.is_empty() && create_if_missing {
+    if created {
         return Ok(new_text.to_string());
     }
 
@@ -417,6 +419,42 @@ mod tests {
     fn create_new_file_content() {
         let updated = apply_edit("", "", "new content", false, true).unwrap();
         assert_eq!(updated, "new content");
+    }
+
+    #[tokio::test]
+    async fn edit_file_creates_missing_file_with_0644() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+
+        let mut args = Map::new();
+        args.insert("path".into(), json!("sub/new.txt"));
+        args.insert("old_text".into(), json!(""));
+        args.insert("new_text".into(), json!("hello orangu"));
+        executor.edit_file(&args).await.unwrap();
+
+        let created = workspace.path().join("sub/new.txt");
+        assert_eq!(fs::read_to_string(&created).unwrap(), "hello orangu");
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&created).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644);
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_modifies_existing_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("existing.txt");
+        fs::write(&path, "hello world").unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+
+        let mut args = Map::new();
+        args.insert("path".into(), json!("existing.txt"));
+        args.insert("old_text".into(), json!("world"));
+        args.insert("new_text".into(), json!("orangu"));
+        executor.edit_file(&args).await.unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello orangu");
     }
 
     #[test]
