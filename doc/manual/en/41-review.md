@@ -49,6 +49,10 @@ When the response arrives it opens in a **feedback window** over the panes. If y
 
 The request and the model's reply are added to your chat session, so after leaving review mode you can keep discussing it with full context.
 
+## Opening the file
+
+Press `Alt+e` to open the currently selected file in your `$EDITOR` — the same way as the `/open_file` command. Terminal editors open in a new window (the configured `terminal` command, or an auto-detected emulator) and GUI editors open their own window; either way the editor is detached, leaving review mode on screen so you can keep working through the diff. If the file cannot be opened, the error is shown in a feedback window.
+
 ## Commenting on a line
 
 Move the highlighted line to the place you want to comment on and press `Alt+c`. A small comment window opens **inline, just below that line** in the left pane. Type your note (it wraps and the five-line window scrolls if the comment is long), then press `Enter` to save it or `Esc` to discard it.
@@ -70,6 +74,7 @@ The comments — both the line comments and the general (`#`) notes — are copi
 | `Alt+a` | Mark the selected file approved (green dot) |
 | `Alt+r` | Mark the selected file rejected (red dot) |
 | `Alt+c` | Comment on the highlighted line (`Enter` saves, `Esc` discards) |
+| `Alt+e` | Open the selected file in your configured editor |
 | `Alt+o` / `Enter` | Ask the model to review the selected file using the typed request |
 | `Esc` `Esc` | Cancel an in-progress review request (while the model is thinking) |
 | `Alt+x` or `Esc` `Esc` | Exit review mode and return to the prompt |

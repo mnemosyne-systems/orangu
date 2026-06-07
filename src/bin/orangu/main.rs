@@ -621,6 +621,17 @@ async fn run() -> Result<()> {
                     };
                     match run_review_mode(&mut review, &mut viewport, &mut input_state, chrome)? {
                         ReviewSignal::Exit => break,
+                        ReviewSignal::OpenFile { path } => {
+                            if let Err(err) = open_in_editor(&workspace, &path, &config.terminal) {
+                                review.feedback = Some(FeedbackWindow {
+                                    title: format!("Open: {path}"),
+                                    question: None,
+                                    lines: vec![format!("Error: {err:#}")],
+                                    scroll: 0,
+                                    x_offset: 0,
+                                });
+                            }
+                        }
                         ReviewSignal::RequestReview {
                             path,
                             patch,
@@ -1529,6 +1540,8 @@ enum ReviewSignal {
         patch: String,
         request: String,
     },
+    /// Open the selected file in the configured editor.
+    OpenFile { path: String },
 }
 
 /// Static rendering pieces for the review prompt frame.
@@ -1968,6 +1981,13 @@ fn run_review_mode(
             (KeyCode::Char('a'), true, _) => state.set_status(ReviewStatus::Approved),
             (KeyCode::Char('r'), true, _) => state.set_status(ReviewStatus::Rejected),
             (KeyCode::Char('c'), true, _) => state.open_comment_editor(body_height),
+            (KeyCode::Char('e'), true, _) => {
+                if let Some(file) = state.files.get(state.selected) {
+                    return Ok(ReviewSignal::OpenFile {
+                        path: file.path.clone(),
+                    });
+                }
+            }
             (KeyCode::Char('o'), true, _) | (KeyCode::Enter, _, _) => {
                 if input_state.as_str().trim_start().starts_with('#') {
                     // A `# <note>` in the input window is a general note, not an

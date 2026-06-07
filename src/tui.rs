@@ -950,7 +950,7 @@ fn render_review_panes(args: &ReviewScreenArgs<'_>, width: usize, pane_rows: usi
     };
 
     let title = format!(
-        "Review: {}  Alt+j/k Switch file  Alt+a Approve  Alt+r Reject  Alt+o Review  Alt+c Comment  Alt+x Exit",
+        "Review: {}  Alt+j/k Switch file  Alt+a Approve  Alt+r Reject  Alt+o Review  Alt+c Comment  Alt+e Open  Alt+x Exit",
         args.prompt_branch.unwrap_or("(detached HEAD)"),
     );
     let right_header = format!("Files ({})", args.files.len());
