@@ -104,7 +104,11 @@ impl ChatSession {
         H: FnMut(bool),
     {
         let key = ClientKey::from_profile(profile);
-        if self.client.as_ref().is_none_or(|(cached, _)| *cached != key) {
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != key)
+        {
             self.client = Some((key, OpenAiClient::from_profile(profile)?));
         }
         // Cheap clone: shares the underlying reqwest connection pool.
