@@ -17,10 +17,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::RwLock,
 };
 use walkdir::WalkDir;
 
 use super::commands::{NATURAL_LANGUAGE_BINDINGS, shell_words, strip_ascii_prefix};
+use super::git::PullRequest;
 use super::git::{
     discover_git_root, git_branch_names, git_file_commit_hashes, git_local_branch_names,
     git_tag_names, is_protected_branch,
@@ -66,6 +68,61 @@ pub const COMMANDS: &[&str] = &[
     "/clear",
     "/quit",
 ];
+
+/// Open pull/merge requests fetched once at startup (see
+/// `crate::git::fetch_active_pull_requests`) and cached here in memory, so `/pull`
+/// completion can offer numbers without shelling out to `gh`/`glab` on every
+/// keystroke. Holds the request number paired with its title; only the number is
+/// ever inserted into the prompt, the title is kept for future menu display.
+static ACTIVE_PULL_REQUESTS: RwLock<Vec<(u64, String)>> = RwLock::new(Vec::new());
+
+/// Replace the cached open pull/merge requests. Called once when the startup
+/// fetch finishes; a poisoned lock is recovered rather than panicking, since a
+/// stale cache is harmless.
+pub fn set_active_pull_requests(requests: &[PullRequest]) {
+    let mut guard = ACTIVE_PULL_REQUESTS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = requests
+        .iter()
+        .map(|request| (request.number, request.title.clone()))
+        .collect();
+}
+
+/// The cached open pull/merge request numbers whose decimal spelling starts with
+/// `token`, as the strings `/pull` completion inserts. Numeric order, so the
+/// lowest matching number is offered first.
+fn pull_number_candidates(token: &str) -> Vec<String> {
+    let guard = ACTIVE_PULL_REQUESTS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut numbers: Vec<u64> = guard
+        .iter()
+        .map(|(number, _)| *number)
+        .filter(|number| number.to_string().starts_with(token))
+        .collect();
+    numbers.sort_unstable();
+    numbers.iter().map(u64::to_string).collect()
+}
+
+/// For a `/pull <number>` argument (or its natural-language aliases `pull `,
+/// `pull pr `, `pull request `, `pull #`), the offset where the number token
+/// starts and the partial number typed so far. Mirrors the prefixes
+/// `commands::parse_pull_pr_number` accepts, longest first so `pull request 5`
+/// keeps `5` as the token rather than treating `request 5` as the number.
+/// Returns `None` for anything else, including the bare `/pull` slash command
+/// still being typed (no argument yet).
+pub fn pull_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
+    if let Some(number) = prefix.strip_prefix("/pull ") {
+        return Some(("/pull ".len(), number));
+    }
+    for command_prefix in ["pull request ", "pull pr ", "pull #", "pull "] {
+        if let Some(number) = strip_ascii_prefix(prefix, command_prefix) {
+            return Some((prefix.len() - number.len(), number));
+        }
+    }
+    None
+}
 
 /// Returns the trailing characters needed to finish the slash command the user
 /// is part-way through typing, e.g. `/q` -> `uit` (completing `/quit`). This is
@@ -287,6 +344,10 @@ fn structured_completion_candidates(
                 .cloned()
                 .collect(),
         ));
+    }
+
+    if let Some((start, token)) = pull_completion_prefix(prefix) {
+        return Some((start, cursor, pull_number_candidates(token)));
     }
 
     if let Some((start, candidates)) = comment_file_completion_candidates(prefix) {
@@ -1119,6 +1180,47 @@ mod tests {
                 format!("{}/PostgreSQL", base.display()),
             ]
         );
+    }
+
+    #[test]
+    fn pull_completion_prefix_keeps_number_token_offset() {
+        // The token offset must point at the number, not mid-command, so the
+        // accepted candidate replaces just the `9` (e.g. `pull 9` -> `pull 90`)
+        // rather than splicing the number into the middle of the command word.
+        assert_eq!(pull_completion_prefix("/pull 9"), Some((6, "9")));
+        assert_eq!(pull_completion_prefix("pull 9"), Some((5, "9")));
+        assert_eq!(pull_completion_prefix("pull #9"), Some((6, "9")));
+        assert_eq!(pull_completion_prefix("pull pr 9"), Some((8, "9")));
+        assert_eq!(pull_completion_prefix("pull request 9"), Some((13, "9")));
+        // Empty argument is offered (all numbers); bare slash command is not.
+        assert_eq!(pull_completion_prefix("/pull "), Some((6, "")));
+        assert_eq!(pull_completion_prefix("/pull"), None);
+        assert_eq!(pull_completion_prefix("/pull_request"), None);
+    }
+
+    #[test]
+    fn pull_number_candidates_filter_and_sort() {
+        set_active_pull_requests(&[
+            PullRequest {
+                number: 90,
+                title: "Add pull completion".to_string(),
+            },
+            PullRequest {
+                number: 9,
+                title: "Older".to_string(),
+            },
+            PullRequest {
+                number: 58,
+                title: "Fix rebase".to_string(),
+            },
+        ]);
+        // `9` matches 9 and 90, numeric order; the candidate is the bare number.
+        assert_eq!(pull_number_candidates("9"), vec!["9", "90"]);
+        assert_eq!(pull_number_candidates("5"), vec!["58"]);
+        assert!(pull_number_candidates("7").is_empty());
+        // Empty token offers every cached number.
+        assert_eq!(pull_number_candidates(""), vec!["9", "58", "90"]);
+        set_active_pull_requests(&[]);
     }
 
     #[test]

@@ -69,7 +69,8 @@ use git::{
     Forge, add_file_output, amend_output, branch_create_output, branch_delete_output,
     branch_list_all_output, branch_list_output, branch_rename_output, cherry_pick_output,
     close_output, collect_review_diff, comment_output, commit_output, create_pull_request_output,
-    discover_git_root, git_checkout, git_diff_against_branch, git_workspace_diff, grep_output,
+    discover_git_root, fetch_active_pull_requests, git_checkout, git_diff_against_branch,
+    git_workspace_diff, grep_output,
     init_repo_output, list_workspace_files_tree, log_output, merge_output, move_file_output,
     open_in_editor, pull_request_output, push_output, rebase_output, remove_file_output,
     restore_output, squash_output, stash_drop_output, stash_list_output, stash_output,
@@ -266,6 +267,14 @@ async fn run() -> Result<()> {
     });
     let mut sync_notice: Option<(String, std::time::Instant)> = None;
 
+    // Fetch the open pull/merge requests once at startup, off the UI thread, and
+    // keep them in memory. Caching them here means `/pull` completion can offer
+    // numbers without shelling out to `gh`/`glab` on every keystroke.
+    let mut pr_handle = discover_git_root(tools.workspace()).map(|_| {
+        let pr_workspace = tools.workspace().to_path_buf();
+        tokio::task::spawn_blocking(move || fetch_active_pull_requests(&pr_workspace, forge))
+    });
+
     loop {
         let prompt_branch = workspace_branch_name(tools.workspace());
         let active_profile = config
@@ -313,6 +322,22 @@ async fn run() -> Result<()> {
                     message,
                     std::time::Instant::now() + std::time::Duration::from_secs(5),
                 ));
+            }
+        }
+
+        // Collect the startup pull-request fetch once it finishes, caching the
+        // open requests in memory for later use (e.g. `/pull` completion).
+        if pr_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+            && let Some(handle) = pr_handle.take()
+        {
+            match handle.await {
+                Ok(Ok(requests)) => completion::set_active_pull_requests(&requests),
+                Ok(Err(err)) => {
+                    output_state.push_text(&format!("Could not load open pull requests: {err}"))
+                }
+                Err(_) => {}
             }
         }
 

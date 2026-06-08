@@ -966,6 +966,96 @@ pub fn count_pending_changes(repo_root: &Path) -> Result<(usize, usize)> {
     Ok((total, untracked))
 }
 
+/// An open pull request (GitHub) or merge request (GitLab), reduced to the number
+/// used by `/pull <number>` and its title. Fetched once at startup (see
+/// [`fetch_active_pull_requests`]) and cached in memory so `/pull` completion can
+/// offer numbers without hitting the network on every keystroke.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+}
+
+/// Fetch the open pull/merge requests for the repository containing `workspace`
+/// via the forge CLI (`gh pr list` / `glab mr list`), as JSON.
+///
+/// Returns an empty list — never an error — when the workspace is not a Git
+/// repository or the CLI is not installed, so a missing `gh`/`glab` cannot break
+/// startup. Only a CLI that runs but exits non-zero (e.g. no forge remote, not
+/// authenticated) is surfaced as `Err` for the caller to report.
+pub fn fetch_active_pull_requests(workspace: &Path, forge: Forge) -> Result<Vec<PullRequest>> {
+    let Some(repo_root) = discover_git_root(workspace) else {
+        return Ok(Vec::new());
+    };
+    let cli = forge.cli();
+    let request = match forge {
+        Forge::GitHub => "pr",
+        Forge::GitLab => "mr",
+    };
+    // GitHub: `gh pr list --state open --json number,title`.
+    // GitLab: `glab mr list --output json` (open merge requests by default).
+    let args: Vec<&str> = match forge {
+        Forge::GitHub => vec![request, "list", "--state", "open", "--json", "number,title"],
+        Forge::GitLab => vec![request, "list", "--output", "json"],
+    };
+    let output = match std::process::Command::new(cli)
+        .args(&args)
+        .current_dir(&repo_root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).context(format!("failed to run {cli}")),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "{cli} {request} list failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    parse_pull_request_list(&output.stdout, forge)
+}
+
+/// Parse the JSON array printed by `gh pr list --json number,title` /
+/// `glab mr list --output json` into [`PullRequest`]s. GitHub names the number
+/// `number`, GitLab names it `iid`; both carry a `title`. Empty output yields an
+/// empty list, and entries missing the number field are skipped rather than
+/// failing the whole parse.
+pub fn parse_pull_request_list(stdout: &[u8], forge: Forge) -> Result<Vec<PullRequest>> {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).context("failed to parse forge pull request list as JSON")?;
+    let number_key = match forge {
+        Forge::GitHub => "number",
+        Forge::GitLab => "iid",
+    };
+    let requests = value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            let number = entry.get(number_key)?.as_u64()?;
+            let title = entry
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(PullRequest { number, title })
+        })
+        .collect();
+    Ok(requests)
+}
+
 pub fn pull_request_output(
     workspace: &Path,
     pr_number: u64,
@@ -2533,6 +2623,62 @@ mod tests {
     use super::*;
     use crate::process_env_lock;
     use tempfile::tempdir;
+
+    #[test]
+    fn parses_github_pull_request_list() {
+        let json = br#"[{"number":90,"title":"Add pull completion"},{"number":58,"title":"Fix rebase"}]"#;
+        let requests = parse_pull_request_list(json, Forge::GitHub).expect("parse");
+        assert_eq!(
+            requests,
+            vec![
+                PullRequest {
+                    number: 90,
+                    title: "Add pull completion".to_string(),
+                },
+                PullRequest {
+                    number: 58,
+                    title: "Fix rebase".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_gitlab_merge_request_list_by_iid() {
+        // GitLab keys the user-facing number as `iid`, not `number`.
+        let json = br#"[{"iid":7,"title":"Tidy docs"}]"#;
+        let requests = parse_pull_request_list(json, Forge::GitLab).expect("parse");
+        assert_eq!(
+            requests,
+            vec![PullRequest {
+                number: 7,
+                title: "Tidy docs".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_pull_request_list_is_empty() {
+        assert!(parse_pull_request_list(b"", Forge::GitHub).expect("parse").is_empty());
+        assert!(
+            parse_pull_request_list(b"[]\n", Forge::GitHub)
+                .expect("parse")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pull_request_entry_without_number_is_skipped() {
+        let json = br#"[{"title":"no number"},{"number":3,"title":"ok"}]"#;
+        let requests = parse_pull_request_list(json, Forge::GitHub).expect("parse");
+        assert_eq!(
+            requests,
+            vec![PullRequest {
+                number: 3,
+                title: "ok".to_string(),
+            }]
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,
