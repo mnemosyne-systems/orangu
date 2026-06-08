@@ -14,8 +14,11 @@ complete the startup flags and their arguments:
 | `-h`  | `--help`      | —            |
 
 Completion for `--resume` scans `~/.orangu/sessions/` for the available session
-UUIDs and offers them newest first, matching the in-app `/session` Tab
-completion.
+UUIDs and offers them newest first. The in-app `/session` Tab completion offers
+the same UUIDs, then the distinct workspace paths recorded across sessions, and
+finally — when the typed text matches neither — falls back to filesystem
+directory completion (expanding `~`) so a brand-new workspace can be navigated
+to.
 
 | Shell | File          |
 | ----- | ------------- |

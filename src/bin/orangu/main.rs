@@ -60,10 +60,10 @@ use commands::ReviewLaunch;
 use commands::{
     BranchSubcommand, CommandContext, CommandOutcome, CommandState, LocalCommand, LocalError,
     StashSubcommand, add_file_usage_message, amend_usage_message, cherry_pick_usage_message,
-    close_usage_message, comment_usage_message, commit_usage_message, connect_usage_message,
-    grep_usage_message, merge_usage_message, model_usage_message, move_file_usage_message,
-    open_file_usage_message, parse_local_command, pull_usage_message, remove_file_usage_message,
-    restore_usage_message, server_usage_message, sorted_model_names, system_prompt,
+    close_usage_message, comment_usage_message, commit_usage_message, grep_usage_message,
+    merge_usage_message, model_usage_message, move_file_usage_message, open_file_usage_message,
+    parse_local_command, pull_usage_message, remove_file_usage_message, restore_usage_message,
+    server_usage_message, sorted_model_names, system_prompt,
 };
 use git::{
     Forge, add_file_output, amend_output, branch_create_output, branch_delete_output,
@@ -229,6 +229,9 @@ async fn run() -> Result<()> {
     // When set, the post-loop exec resumes this session instead of the current
     // one — used by `/session <UUID>` to switch sessions in place.
     let mut resume_override: Option<String> = None;
+    // When set, the post-loop exec switches to this workspace directory (without
+    // a resume target) — used by `/session <path>` to open a new workspace.
+    let mut workspace_override: Option<PathBuf> = None;
     let mut startup_notice_until: Option<std::time::Instant> =
         if is_resumed && args.resume.is_none() {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(5))
@@ -478,6 +481,15 @@ async fn run() -> Result<()> {
                 std::io::stdout().flush()?;
                 restart_requested = true;
                 resume_override = Some(target);
+                break;
+            }
+            CommandOutcome::SwitchWorkspace(dir) => {
+                save_session_messages(&session_messages_path, session.messages())?;
+                update_session_metadata_timestamp(&session_metadata_path)?;
+                print!("{CLEAR_TERMINAL_SEQUENCE}");
+                std::io::stdout().flush()?;
+                restart_requested = true;
+                workspace_override = Some(dir);
                 break;
             }
             CommandOutcome::Quiet => {
@@ -857,29 +869,35 @@ async fn run() -> Result<()> {
     drop(_terminal_ui_guard);
 
     if restart_requested {
-        let resume_target = resume_override.as_deref().unwrap_or(&session_id);
-        // When switching to a different session, follow it to the workspace it
-        // was started in so the resumed client (and its banner) reflect that
-        // session's project rather than the current directory.
-        let resume_workspace = match &resume_override {
-            Some(uuid) => session_dir_path(uuid)
-                .ok()
-                .and_then(|dir| load_session_metadata(&dir.join("metadata")).ok().flatten())
-                .map(|meta| meta.workspace)
-                .filter(|ws| !ws.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| workspace.clone()),
-            None => workspace.clone(),
-        };
         let exe = restart_executable_path()?;
         let mut command = std::process::Command::new(&exe);
-        command
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--workspace")
-            .arg(&resume_workspace)
-            .arg("--resume")
-            .arg(resume_target);
+        command.arg("--config").arg(&config_path);
+        if let Some(new_workspace) = &workspace_override {
+            // Opening a different workspace: pass no --resume, so startup either
+            // auto-resumes an existing session for that workspace/branch or
+            // starts a fresh one there.
+            command.arg("--workspace").arg(new_workspace);
+        } else {
+            let resume_target = resume_override.as_deref().unwrap_or(&session_id);
+            // When switching to a different session, follow it to the workspace it
+            // was started in so the resumed client (and its banner) reflect that
+            // session's project rather than the current directory.
+            let resume_workspace = match &resume_override {
+                Some(uuid) => session_dir_path(uuid)
+                    .ok()
+                    .and_then(|dir| load_session_metadata(&dir.join("metadata")).ok().flatten())
+                    .map(|meta| meta.workspace)
+                    .filter(|ws| !ws.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| workspace.clone()),
+                None => workspace.clone(),
+            };
+            command
+                .arg("--workspace")
+                .arg(&resume_workspace)
+                .arg("--resume")
+                .arg(resume_target);
+        }
         // Replace the current process image so the restarted client keeps the
         // controlling terminal as the foreground process. Spawning a child and
         // exiting instead would hand the terminal back to the launching shell,
@@ -1097,24 +1115,6 @@ fn handle_command(
 
     match command {
         LocalCommand::Help => Ok(CommandOutcome::Output(orangu::tui::help_text().to_string())),
-        LocalCommand::ConnectDefault => {
-            let endpoint = llms
-                .get(active_model)
-                .ok_or_else(|| anyhow!("unknown server '{active_model}'"))?
-                .endpoint
-                .clone();
-            *current_endpoint = Some(endpoint);
-            Ok(CommandOutcome::Quiet)
-        }
-        LocalCommand::ConnectTo(endpoint) => {
-            if endpoint.is_empty() {
-                return Ok(CommandOutcome::OutputError(
-                    connect_usage_message().to_string(),
-                ));
-            }
-            *current_endpoint = Some(endpoint.to_string());
-            Ok(CommandOutcome::Quiet)
-        }
         LocalCommand::Disconnect => Ok({
             *current_endpoint = None;
             CommandOutcome::Quiet
@@ -1420,20 +1420,41 @@ fn handle_command(
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Session(Some(uuid)) => {
-            if uuid == usage_stats.session_id {
-                return Ok(CommandOutcome::Output(format!("Already in session {uuid}")));
+        LocalCommand::Session(Some(arg)) => {
+            if arg == usage_stats.session_id {
+                return Ok(CommandOutcome::Output(format!("Already in session {arg}")));
             }
-            match session_dir_path(&uuid) {
-                Ok(path) if path.is_dir() => Ok(CommandOutcome::SwitchSession(uuid.into_owned())),
-                Ok(_) => Ok(CommandOutcome::OutputError(format!(
-                    "Error: no session found with UUID '{uuid}'"
-                ))),
-                Err(err) => Ok(local_command_error(err)),
+            // A bare name (no path separators) matching an existing session
+            // directory is a session UUID: switch to it.
+            let is_session_id = !arg.contains('/')
+                && !arg.contains('\\')
+                && matches!(session_dir_path(&arg), Ok(path) if path.is_dir());
+            if is_session_id {
+                return Ok(CommandOutcome::SwitchSession(arg.into_owned()));
             }
-        }
-        LocalCommand::Sessions(filter) => {
-            match list_sessions_output(filter.as_deref(), &usage_stats.session_id) {
+            // Otherwise treat the argument as a workspace.
+            let matches = sessions_matching_workspace(arg.as_ref())?;
+            match matches.as_slice() {
+                // A workspace that uniquely identifies one session switches to it.
+                [uuid] => {
+                    if *uuid == usage_stats.session_id {
+                        return Ok(CommandOutcome::Output(format!("Already in session {uuid}")));
+                    }
+                    return Ok(CommandOutcome::SwitchSession(uuid.clone()));
+                }
+                // No session uses this workspace yet: if the argument resolves to
+                // a real directory on disk (with `~` expanded), open it as a new
+                // workspace; otherwise fall through to the empty listing.
+                [] => {
+                    if let Some(dir) = resolve_existing_dir_arg(arg.as_ref()) {
+                        return Ok(CommandOutcome::SwitchWorkspace(dir));
+                    }
+                }
+                // Several sessions share the workspace: list them so the user can
+                // pick a UUID.
+                _ => {}
+            }
+            match list_sessions_output(Some(arg.as_ref()), &usage_stats.session_id) {
                 Ok(output) => Ok(CommandOutcome::Output(output)),
                 Err(err) => Ok(local_command_error(err)),
             }
@@ -2932,6 +2953,45 @@ fn delete_session_dir(session_dir: &Path) {
     let _ = std::fs::remove_dir_all(session_dir);
 }
 
+/// UUIDs of sessions whose recorded workspace path contains `filter`. Used to
+/// decide whether a `/session <workspace>` argument uniquely identifies a
+/// session (switch to it) or matches several (list them).
+fn sessions_matching_workspace(filter: &str) -> Result<Vec<String>> {
+    let sessions_dir = {
+        let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+        home.join(SESSIONS_DIRECTORY)
+    };
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut matches: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&sessions_dir).with_context(|| {
+        format!(
+            "failed to read sessions directory {}",
+            sessions_dir.display()
+        )
+    })? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(uuid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(meta) = load_session_metadata(&path.join("metadata")).ok().flatten() else {
+            continue;
+        };
+        if meta.workspace.contains(filter) {
+            matches.push(uuid);
+        }
+    }
+    Ok(matches)
+}
+
 fn list_sessions_output(workspace_filter: Option<&str>, active_session: &str) -> Result<String> {
     let sessions_dir = {
         let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
@@ -3087,6 +3147,27 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Resolve a `/session <path>` argument to an existing workspace directory,
+/// expanding a leading `~`/`~/` and normalizing the result. Relative paths are
+/// taken against the current directory. Returns `None` when the argument does
+/// not point at a real directory.
+fn resolve_existing_dir_arg(arg: &str) -> Option<PathBuf> {
+    let expanded = if arg == "~" {
+        home::home_dir()?
+    } else if let Some(rest) = arg.strip_prefix("~/") {
+        home::home_dir()?.join(rest)
+    } else {
+        PathBuf::from(arg)
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().ok()?.join(expanded)
+    };
+    let normalized = normalize_path(&absolute);
+    normalized.is_dir().then_some(normalized)
 }
 
 fn load_history(path: &Path) -> Result<Vec<String>> {
@@ -4798,20 +4879,19 @@ mod tests {
 
         // Argument-taking prefixes complete through their trailing space.
         assert_eq!(ghost("diff a"), Some("gainst "));
-        assert_eq!(ghost("connect t"), Some("o "));
+        assert_eq!(ghost("use s"), Some("erver "));
 
         // Matching is case-insensitive; the suggested suffix is canonical.
         assert_eq!(ghost("DIF"), Some("f"));
 
         // A complete binding has nothing left to hint, even when a longer
-        // binding shares its prefix (e.g. "connect" vs "connect to ").
+        // binding shares its prefix (e.g. "diff" vs "diff against ").
         assert_eq!(ghost("commit"), None);
         assert_eq!(ghost("merge"), None);
-        assert_eq!(ghost("connect"), None);
         assert_eq!(ghost("diff"), None);
 
         // Still hinted while the binding is incomplete.
-        assert_eq!(ghost("c"), Some("onnect"));
+        assert_eq!(ghost("c"), Some("urrent model"));
 
         // Empty input, slash input, and unknown prefixes suggest nothing.
         assert_eq!(ghost(""), None);
@@ -4893,13 +4973,14 @@ mod tests {
         assert_eq!(input_state.as_str(), "commit");
 
         // The binding ghost wins over a same-prefixed filename: typing "c" with
-        // a "contrib/" directory present completes to "connect", not "contrib/".
+        // a "contrib/" directory present completes to "current " (the first word
+        // of "current model"), not "contrib/".
         let repo = tempdir().expect("repo");
         std::fs::create_dir(repo.path().join("contrib")).expect("contrib dir");
         let mut input_state = InputState::default();
         input_state.set_buffer("c".to_string());
         apply_completion(&mut input_state, repo.path(), &[], &[]);
-        assert_eq!(input_state.as_str(), "connect");
+        assert_eq!(input_state.as_str(), "current ");
 
         // Shift+Tab advances the preview; Tab then accepts the first word of the
         // shown candidate (word-at-a-time).

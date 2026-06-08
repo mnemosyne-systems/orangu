@@ -172,15 +172,13 @@ pub fn render_header(
 
 pub fn help_text() -> &'static str {
     r#"/help                                         Show available commands
-/connect [url]                                Connect to the configured server, or a specific server
+/server [name]                                List configured servers (active green), or switch to a specific one
 /disconnect                                   Disconnect from the current server
 /reload                                       Restore the configured model and server
 /restart                                      Restart orangu, resuming the same workspace and session
 /tools                                        List tools
 /model [name]                                 List the server's models (active green), or switch to a specific one
-/server [name]                                List configured servers (active green), or switch to a specific one
-/session [uuid]                               List sessions or print resume command for a UUID (Tab cycles UUIDs)
-/sessions [workspace]                         List all sessions, optionally filtered by workspace path
+/session [uuid|workspace]                     List/switch sessions, or open a workspace directory (Tab completes UUIDs, workspaces, then filesystem paths)
 /list_files                                   List workspace files as a tree
 /open_file <path>                             Open a workspace file in $EDITOR
 /show_file [--hash] [--author] <path> [<ref>] Show a file; optional ref uses git show
@@ -220,7 +218,7 @@ Natural-language forms such as `open README.md`, `list models`, `list files`, `p
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 
-As you type, a grey inline hint previews the matching command (e.g. `c` suggests `connect`). Press Tab to accept it. When several commands match, Shift+Tab cycles the hint through them; Tab then accepts the one shown.
+As you type, a grey inline hint previews the matching command (e.g. `q` suggests `quit`). Press Tab to accept it. When several commands match, Shift+Tab cycles the hint through them; Tab then accepts the one shown.
 
 Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up / Alt+Down scrolls one line at a time."#
 }
@@ -1202,7 +1200,6 @@ impl OranguHelper {
             file_completer: FilenameCompleter::new(),
             commands: vec![
                 "/help".to_string(),
-                "/connect".to_string(),
                 "/disconnect".to_string(),
                 "/reload".to_string(),
                 "/restart".to_string(),

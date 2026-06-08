@@ -14,7 +14,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
 
 use super::commands::{NATURAL_LANGUAGE_BINDINGS, shell_words, strip_ascii_prefix};
@@ -25,7 +28,6 @@ use super::git::{
 
 pub const COMMANDS: &[&str] = &[
     "/help",
-    "/connect",
     "/disconnect",
     "/reload",
     "/restart",
@@ -59,7 +61,6 @@ pub const COMMANDS: &[&str] = &[
     "/stash",
     "/open_file",
     "/session",
-    "/sessions",
     "/usage",
     "/build",
     "/clear",
@@ -86,8 +87,8 @@ pub fn command_ghost_suffix(input: &str) -> Option<&'static str> {
 
 /// Every natural-language binding the user's part-typed input could still grow
 /// into, as the trailing characters needed to complete each one. For input `c`
-/// this yields `onnect`, `ode review`, `heckout `, ... (completing `connect`,
-/// `code review`, `checkout `, ...). The list drives the grey "ghost" hint and
+/// this yields `urrent model`, `ode review`, `heckout `, ... (completing
+/// `current model`, `code review`, `checkout `, ...). The list drives the grey "ghost" hint and
 /// its Shift+Tab cycling; index 0 is what `natural_language_ghost_suffix`
 /// returns.
 ///
@@ -95,7 +96,7 @@ pub fn command_ghost_suffix(input: &str) -> Option<&'static str> {
 /// [`NATURAL_LANGUAGE_BINDINGS`] (parser priority) order. Bindings that differ
 /// only by trailing whitespace (e.g. `checkout ` vs `checkout`) render
 /// identically, so only the first is kept. Empty input, slash input, and input
-/// that already spells a complete binding (e.g. `connect`, `diff`) yield an
+/// that already spells a complete binding (e.g. `status`, `diff`) yield an
 /// empty list — there is nothing left to hint.
 pub fn natural_language_ghost_candidates(input: &str) -> Vec<&'static str> {
     if input.is_empty() || input.starts_with('/') {
@@ -131,7 +132,7 @@ pub fn natural_language_ghost_candidates(input: &str) -> Vec<&'static str> {
 
 /// The natural-language ghost suffix to preview at cycle position `index`,
 /// wrapping around the candidate list (see [`natural_language_ghost_candidates`]).
-/// `index` 0 is the first match (e.g. `c` -> `onnect`, completing `connect`);
+/// `index` 0 is the first match (e.g. `c` -> `urrent model`, completing `current model`);
 /// Shift+Tab advances it. This is the grey hint shown inline after the cursor.
 pub fn natural_language_ghost_suffix_at(input: &str, index: usize) -> Option<&'static str> {
     let candidates = natural_language_ghost_candidates(input);
@@ -362,11 +363,25 @@ fn structured_completion_candidates(
         return Some((start, cursor, branches));
     }
 
-    if let Some(uuid_prefix) = prefix.strip_prefix("/session ") {
-        let candidates = session_uuids_newest_first()
+    if let Some(arg_prefix) = prefix.strip_prefix("/session ") {
+        // `/session <arg>` takes either a session UUID (to switch) or a workspace
+        // path (to filter the listing), so offer both: UUIDs first, newest-first,
+        // then the unique workspace paths.
+        let mut candidates: Vec<String> = session_uuids_newest_first()
             .into_iter()
-            .filter(|u| u.starts_with(uuid_prefix))
+            .filter(|u| u.starts_with(arg_prefix))
             .collect();
+        candidates.extend(
+            session_workspaces_newest_first()
+                .into_iter()
+                .filter(|w| w.starts_with(arg_prefix)),
+        );
+        // When the argument matches no session UUID or known workspace, fall back
+        // to filesystem directory completion so a brand-new workspace can be
+        // navigated to (e.g. `/session ~/Pr<TAB>/po<TAB>`).
+        if candidates.is_empty() {
+            candidates = session_path_completion_candidates(arg_prefix);
+        }
         return Some(("/session ".len(), cursor, candidates));
     }
 
@@ -930,6 +945,94 @@ fn session_uuids_newest_first() -> Vec<String> {
     dirs.into_iter().map(|(name, _)| name).collect()
 }
 
+/// The distinct workspace paths recorded across all sessions, ordered by the
+/// most recently updated session that used each one, newest first. Drives the
+/// workspace half of `/session <arg>` completion; empty workspaces (sessions
+/// started outside a Git repository) are skipped.
+fn session_workspaces_newest_first() -> Vec<String> {
+    let Some(home) = home::home_dir() else {
+        return Vec::new();
+    };
+    let sessions_dir = home.join(".orangu/sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, u64)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let meta = crate::load_session_metadata(&e.path().join("metadata"))
+                .ok()
+                .flatten()?;
+            if meta.workspace.is_empty() {
+                return None;
+            }
+            Some((meta.workspace, meta.last_updated_at))
+        })
+        .collect();
+    rows.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
+    let mut workspaces: Vec<String> = Vec::new();
+    for (workspace, _) in rows {
+        if !workspaces.contains(&workspace) {
+            workspaces.push(workspace);
+        }
+    }
+    workspaces
+}
+
+/// Filesystem directory completion for a `/session <path>` argument, used as a
+/// fallback when the typed text matches no session UUID or known workspace, so a
+/// new workspace can be navigated to. Only fires for path-like input (starting
+/// with `~`, `/`, or `.`, or containing a `/`). A leading `~`/`~/` is expanded to
+/// the home directory for the lookup but kept verbatim in the returned
+/// candidates. Only directories are offered, since a workspace is always a
+/// directory; candidates carry no trailing slash, matching how the user types
+/// the next `/` segment themselves.
+fn session_path_completion_candidates(arg: &str) -> Vec<String> {
+    let looks_like_path =
+        arg.starts_with('~') || arg.starts_with('/') || arg.starts_with('.') || arg.contains('/');
+    if !looks_like_path {
+        return Vec::new();
+    }
+    // Split into the directory portion already typed (kept verbatim in each
+    // candidate) and the partial final segment being completed.
+    let split = arg.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let (typed_dir, partial) = arg.split_at(split);
+    let Ok(entries) = fs::read_dir(expand_tilde_dir(typed_dir)) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.starts_with(partial)
+                .then(|| format!("{typed_dir}{name}"))
+        })
+        .collect();
+    candidates.sort();
+    candidates
+}
+
+/// The real filesystem directory to scan for the already-typed directory portion
+/// of a `/session` path argument, expanding a leading `~`/`~/` to the home
+/// directory. An empty portion (the argument has no `/` yet) scans the current
+/// directory.
+fn expand_tilde_dir(typed_dir: &str) -> PathBuf {
+    if typed_dir == "~" || typed_dir == "~/" {
+        return home::home_dir().unwrap_or_else(|| PathBuf::from(typed_dir));
+    }
+    if let Some(rest) = typed_dir.strip_prefix("~/")
+        && let Some(home) = home::home_dir()
+    {
+        return home.join(rest);
+    }
+    if typed_dir.is_empty() {
+        return PathBuf::from(".");
+    }
+    PathBuf::from(typed_dir)
+}
+
 pub fn natural_show_file_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
     if let Some(path_prefix) = strip_ascii_prefix(prefix, "show file ") {
         return Some((prefix.len() - path_prefix.len(), path_prefix));
@@ -988,4 +1091,40 @@ pub fn comment_file_completion_candidates(prefix: &str) -> Option<(usize, Vec<St
     candidates.sort();
     let start = prefix.len() - file_prefix.len();
     Some((start, candidates))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn session_path_completion_lists_matching_subdirectories() {
+        let root = tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir(base.join("PostgreSQL")).expect("dir");
+        std::fs::create_dir(base.join("Postfix")).expect("dir");
+        std::fs::create_dir(base.join("Redis")).expect("dir");
+        std::fs::write(base.join("Postscript.txt"), b"x").expect("file");
+
+        // The typed directory portion is kept verbatim; only directories whose
+        // name extends the partial segment are offered, sorted, with no trailing
+        // slash. The plain file is skipped.
+        let prefix = format!("{}/Post", base.display());
+        let candidates = session_path_completion_candidates(&prefix);
+        assert_eq!(
+            candidates,
+            vec![
+                format!("{}/Postfix", base.display()),
+                format!("{}/PostgreSQL", base.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_path_completion_ignores_non_path_arguments() {
+        // A bare token (no separators, not `~`/`/`/`.`) is a UUID/workspace
+        // prefix, not a path, so filesystem completion stays out of the way.
+        assert!(session_path_completion_candidates("Postgre").is_empty());
+    }
 }

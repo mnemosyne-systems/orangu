@@ -849,8 +849,8 @@ pub fn history_next(input_state: &mut InputState, history: &[String]) {
 }
 
 /// Advance the inline natural-language ghost preview to the next candidate
-/// (Shift+Tab). For input like `c`, this cycles `connect` -> `code review` ->
-/// `checkout ` -> ... -> back to `connect`. Tab then accepts whatever is shown.
+/// (Shift+Tab). For input like `c`, this cycles `current model` -> `code review` ->
+/// `checkout ` -> ... -> back to `current model`. Tab then accepts whatever is shown.
 /// No-op when the cursor is not at the end of the line, or when there is nothing
 /// (or only one thing) to cycle through.
 pub fn cycle_ghost_suggestion(input_state: &mut InputState) {
@@ -882,7 +882,7 @@ pub fn apply_completion(
     }
 
     // Accept the inline natural-language ghost the user is seeing (e.g. "c" ->
-    // "connect") before falling back to generic file completion, so Tab fills in
+    // "current model") before falling back to generic file completion, so Tab fills in
     // the hint that is actually rendered rather than a same-prefixed filename.
     // The cycle position chosen with Shift+Tab decides which candidate is taken.
     // Only when the cursor is at the end of the line, matching where the ghost

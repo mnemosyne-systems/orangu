@@ -58,14 +58,12 @@ orangu --config ./orangu.conf
 ## 4. Try a few commands
 
 - `/help`
-- `/connect`
+- `/server`
 - `/disconnect`
 - `/reload`
 - `/tools`
 - `/model`
-- `/server`
 - `/session`
-- `/sessions`
 - `/list_files`
 - `/open_file README.md`
 - `/show_file README.md`

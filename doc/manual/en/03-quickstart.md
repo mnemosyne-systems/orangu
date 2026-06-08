@@ -62,14 +62,12 @@ Then start with:
 
 ```text
 /help
-/connect
+/server
 /disconnect
 /reload
 /tools
 /model
-/server
 /session <UUID>
-/sessions
 /list_files
 /open_file README.md
 /show_file README.md
@@ -124,6 +122,6 @@ orangu --resume 550e8400-e29b-41d4-a716-446655440000
 
 Sessions that had no LLM interaction on `main`, `master`, or outside a Git repository are deleted automatically on exit. Feature branch sessions are always kept.
 
-Use `/sessions` to list all sessions and their branches. Use `/session <uuid>` and Tab completion to find and print the resume command for a specific session.
+Use `/session` to list all sessions and their branches. Use `/session <uuid>` (Tab completion cycles UUIDs and workspace paths) to switch to a specific session; passing a workspace switches straight to it when it matches exactly one session, otherwise it lists the matches. Passing a directory path that no session uses yet opens it as a new workspace — Tab falls back to filesystem completion (with `~` expansion) so you can navigate there, e.g. `/session ~/Po<Tab>/pga<Tab>/of<Tab>`.
 
 Lines whose first non-whitespace character is `#` stay local and are not sent to the model. Lines whose first non-whitespace character is `\` are ignored.

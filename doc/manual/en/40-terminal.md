@@ -119,7 +119,7 @@ The `metadata` file records when the session was created, last used, which works
 
 ### Listing and switching sessions
 
-Use `/sessions` to list all sessions:
+Use `/session` to list all sessions:
 
 ```text
 UUID                                  STARTED       LAST          CMDS  BRANCH                WORKSPACE
@@ -127,25 +127,25 @@ UUID                                  STARTED       LAST          CMDS  BRANCH  
 a1b2c3d4-e5f6-7890-abcd-ef1234567890  202605210830  202605210831     3  -                     /home/user/other
 ```
 
-Pass an optional workspace filter to narrow results:
+Pass a workspace to narrow the list to sessions whose workspace path contains the given string. When exactly one session matches, this switches straight to it; otherwise it lists the matches:
 
 ```text
-/sessions myproject
+/session myproject
 ```
 
-Use `/session <uuid>` to print the resume command for a specific session:
+Use `/session <uuid>` to switch to a specific session (the current session is saved first):
 
 ```text
 /session 550e8400-e29b-41d4-a716-446655440000
 ```
 
-This outputs:
+To open a directory that no session uses yet as a new workspace, pass its path:
 
 ```text
-orangu --resume 550e8400-e29b-41d4-a716-446655440000
+/session ~/PostgreSQL/pgagroal/official
 ```
 
-Tab completion after `/session ` (with a trailing space) cycles through session UUIDs, newest first.
+Tab completion after `/session ` (with a trailing space) cycles through session UUIDs (newest first), then the distinct workspace paths recorded across sessions. When the typed text matches neither a UUID nor a known workspace, completion falls back to the filesystem, expanding `~` and completing one directory segment at a time, so you can navigate to a brand-new workspace: `/session ~/Po<Tab>/pga<Tab>/of<Tab>`.
 
 ## History and navigation
 
@@ -167,15 +167,13 @@ All slash commands are handled locally. They are not sent to the model.
 | Command | Description |
 | :-- | :-- |
 | `/help` | Show available commands |
-| `/connect [url]` | Connect to the configured server, or a specific server |
+| `/server [name]` | With no argument, list the configured servers (active in green, others in red); with a name, switch to that server. Tab cycles server names. Selecting a server re-detects an available model on it |
 | `/disconnect` | Disconnect from the current server |
 | `/reload` | Restore the configured model and server |
 | `/restart` | Restart orangu, resuming the same workspace and session |
 | `/tools` | List tools |
 | `/model [name]` | With no argument, list the selected server's models (active in green, others in red); with a name, switch to that model. Tab cycles the server's models |
-| `/server [name]` | With no argument, list the configured servers (active in green, others in red); with a name, switch to that server. Tab cycles server names. Selecting a server re-detects an available model on it |
-| `/session [uuid]` | Print the resume command for a specific session; Tab completion cycles UUIDs newest-first |
-| `/sessions [workspace]` | List all sessions, optionally filtered by workspace path |
+| `/session [uuid\|workspace]` | With no argument, list all sessions; with a UUID, switch to that session; with a workspace that matches exactly one session, switch to it, with one that matches several, list them; with a directory path that no session uses yet (e.g. `~/code/proj`), open it as a new workspace. Tab completion cycles UUIDs newest-first, then workspace paths, then falls back to filesystem directory completion (with `~` expansion) |
 | `/list_files` | List workspace files as a tree |
 | `/open_file <path>` | Open a workspace file in $EDITOR |
 | `/show_file [--hash] [--author] <path> [<ref>]` | Show a file; optional ref shows that commit via git show |
@@ -244,8 +242,7 @@ Free-form prompts are blocked when the server or model status in the header is r
 - `/squash` requires a Git repository; squashes all commits on the current branch (relative to `origin/main`, `origin/master`, `main`, or `master`, tried in that order) into a single commit using the oldest commit's message; `gh` has no equivalent so it always uses plain Git; squashing on `main` or `master` is blocked; requires at least two commits on the branch
 - `/stash` requires a Git repository and runs `git stash push` to save all uncommitted changes (both staged and unstaged) to the stash stack; `/stash pop` restores and removes the most recent stash entry with `git stash pop`; `/stash list` shows all stash entries with their index and description; `/stash drop` discards the most recent stash entry with `git stash drop`; `gh` has no stash equivalent so all four operations always use plain Git; running `/stash` with a clean working tree produces an error from Git
 - `/review` requires a Git repository; it opens a full-screen, two-pane review of the branch's changes (local plus committed) against the default branch — see the [review chapter](#review) for the full layout and key bindings; `gh` has no equivalent so it always uses plain Git
-- `/sessions [workspace]` lists all sessions found under `~/.orangu/sessions/`; output is one line per session with aligned columns: UUID, start date, last-updated date, command count, branch, and workspace path; sessions are sorted by creation time, most-recent first; an optional workspace argument filters the list to sessions whose workspace path contains the given string; the branch column shows `-` for sessions with no recorded branch
-- `/session [uuid]` prints the `orangu --resume <uuid>` command for the given session; Tab completion after `/session ` (with a trailing space) cycles through all session UUIDs, newest first; with no argument it lists all sessions (same as `/sessions`)
+- `/session [uuid|workspace]` with no argument lists all sessions found under `~/.orangu/sessions/`; output is one line per session with aligned columns: UUID, start date, last-updated date, command count, branch, and workspace path; sessions are sorted by creation time, most-recent first; the branch column shows `-` for sessions with no recorded branch. When the argument names an existing session directory it switches to that session in place (the current session is saved first). Any other argument is treated as a workspace: if exactly one session's workspace path contains the string, it switches to that session; if several do, it lists only those sessions; if none do but the argument resolves to a real directory on disk (a leading `~`/`~/` is expanded), it opens that directory as a new workspace, auto-resuming any existing session for it or starting a fresh one. Tab completion after `/session ` (with a trailing space) cycles through all session UUIDs newest first, then the distinct workspace paths recorded across sessions; when the typed text matches neither, it falls back to filesystem directory completion so a new workspace can be navigated to one segment at a time (`/session ~/co<Tab>/pr<Tab>`)
 - `/usage` shows session statistics: total application time, total time spent waiting for LLM responses, total tokens generated (counted with the bundled tokenizer), and average tokens per second
 - `/list_files` is a local convenience command and is separate from the model-facing `list_directory` tool
 - `/reload` also clears the current conversation history in memory
@@ -333,13 +330,13 @@ Natural-language forms are recognized only for the built-in local command phrase
 
 As you type, a grey inline hint previews the command your input is growing into, drawn just after the cursor. It covers both slash commands and the natural-language bindings:
 
-- Typing `/q` shows `/q`​`uit`, with `uit` greyed; typing `c` shows `c`​`onnect`.
+- Typing `/q` shows `/q`​`uit`, with `uit` greyed; typing `c` shows `c`​`urrent model`.
 - Press `Tab` to accept the hint, filling in the rest of the command (for an argument-taking form such as `diff against `, the cursor lands after the trailing space, ready for the argument).
-- When several commands share your prefix (for example `c` matches `connect`, `code review`, `checkout`, `commit`, and more), `Shift+Tab` cycles the hint through them in priority order, wrapping back to the first. `Tab` then accepts whichever candidate is currently shown.
-- The hint only appears while the cursor is at the end of the line, and disappears once your input already spells a complete command (so `connect` and `diff` show no hint, even though `connect to ` and `diff against ` share their prefix).
+- When several commands share your prefix (for example `c` matches `current model`, `code review`, `checkout`, `commit`, and more), `Shift+Tab` cycles the hint through them in priority order, wrapping back to the first. `Tab` then accepts whichever candidate is currently shown.
+- The hint only appears while the cursor is at the end of the line, and disappears once your input already spells a complete command (so `status` and `diff` show no hint, even though `diff against ` shares the latter's prefix).
 - Editing the line, moving the cursor, or pasting resets the `Shift+Tab` cycle back to the first candidate.
 
-The natural-language hint takes priority over generic filename completion, so `c` + `Tab` completes to `connect` rather than a same-prefixed file such as `contrib/`. Slash-command and argument completion (branches, files, commit hashes, and so on) continue to use the cycling `Tab` behavior described next.
+The natural-language hint takes priority over generic filename completion, so `c` + `Tab` completes to `current model` rather than a same-prefixed file such as `contrib/`. Slash-command and argument completion (branches, files, commit hashes, and so on) continue to use the cycling `Tab` behavior described next.
 
 ### Tab completion
 

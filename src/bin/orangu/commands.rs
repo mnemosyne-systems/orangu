@@ -17,7 +17,11 @@ use anyhow::{Result, anyhow};
 use orangu::{
     config::LlmConfiguration, session::ChatSession, tools::ToolExecutor, tui::ReviewEntry,
 };
-use std::{borrow::Cow, collections::HashMap, path::Path};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use terminal_size::{Width, terminal_size};
 
 #[derive(Clone, Copy, Default)]
@@ -116,6 +120,9 @@ pub enum CommandOutcome {
     Restart,
     /// Re-exec into a different existing session, resuming the given UUID.
     SwitchSession(String),
+    /// Re-exec into a different workspace directory, starting (or auto-resuming)
+    /// a session there.
+    SwitchWorkspace(PathBuf),
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),
     /// A long-running command that streams its output line by line through the
     /// sink as it is produced, rather than returning it all at once.
@@ -166,8 +173,6 @@ pub enum BranchSubcommand<'a> {
 
 pub enum LocalCommand<'a> {
     Help,
-    ConnectDefault,
-    ConnectTo(&'a str),
     Disconnect,
     Reload,
     Restart,
@@ -203,7 +208,6 @@ pub enum LocalCommand<'a> {
     Stash(StashSubcommand),
     OpenFile(&'a str),
     Session(Option<Cow<'a, str>>),
-    Sessions(Option<Cow<'a, str>>),
     Usage,
     Build,
     Clear,
@@ -245,7 +249,6 @@ pub fn parse_local_command(input: &str) -> Option<LocalCommand<'_>> {
 pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
     match input {
         "/help" => Some(LocalCommand::Help),
-        "/connect" => Some(LocalCommand::ConnectDefault),
         "/disconnect" => Some(LocalCommand::Disconnect),
         "/reload" => Some(LocalCommand::Reload),
         "/restart" => Some(LocalCommand::Restart),
@@ -253,7 +256,6 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/model" => Some(LocalCommand::ModelInfo),
         "/server" => Some(LocalCommand::ServerInfo),
         "/session" => Some(LocalCommand::Session(None)),
-        "/sessions" => Some(LocalCommand::Sessions(None)),
         "/list_files" => Some(LocalCommand::ListFiles),
         "/open_file" => Some(LocalCommand::OpenFile("")),
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
@@ -292,17 +294,6 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 } else {
                     Some(Cow::Borrowed(uuid))
                 }));
-            }
-            if let Some(args) = input.strip_prefix("/sessions ") {
-                let workspace = args.trim();
-                return Some(LocalCommand::Sessions(if workspace.is_empty() {
-                    None
-                } else {
-                    Some(Cow::Borrowed(workspace))
-                }));
-            }
-            if let Some(endpoint) = input.strip_prefix("/connect ") {
-                return Some(LocalCommand::ConnectTo(endpoint.trim()));
             }
             if let Some(args) = input.strip_prefix("/diff ") {
                 let branch = args.trim();
@@ -511,10 +502,6 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "show help",
     "show commands",
     "show available commands",
-    // --- connect ---
-    "connect",
-    "reconnect",
-    "connect to ",
     // --- disconnect ---
     "disconnect",
     // --- reload configuration ---
@@ -752,12 +739,6 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         ],
     ) {
         return Some(LocalCommand::Help);
-    }
-    if matches_ci(input, &["connect", "reconnect"]) {
-        return Some(LocalCommand::ConnectDefault);
-    }
-    if let Some(endpoint) = strip_ascii_prefix(input, "connect to ") {
-        return Some(LocalCommand::ConnectTo(endpoint.trim()));
     }
     if matches_ci(input, &["disconnect"]) {
         return Some(LocalCommand::Disconnect);
@@ -1105,11 +1086,17 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             }
         }
     }
-    if matches_ci(input, &["session", "switch session"]) {
+    if matches_ci(
+        input,
+        &[
+            "session",
+            "switch session",
+            "sessions",
+            "list sessions",
+            "show sessions",
+        ],
+    ) {
         return Some(LocalCommand::Session(None));
-    }
-    if matches_ci(input, &["sessions", "list sessions", "show sessions"]) {
-        return Some(LocalCommand::Sessions(None));
     }
     if matches_ci(input, &["usage", "show usage"]) {
         return Some(LocalCommand::Usage);
@@ -1331,10 +1318,6 @@ pub fn server_usage_message() -> &'static str {
     "Usage: /server <name>. Use /help to see available commands."
 }
 
-pub fn connect_usage_message() -> &'static str {
-    "Usage: /connect <endpoint>. Use /help to see available commands."
-}
-
 pub fn pull_usage_message() -> &'static str {
     "Usage: /pull <number>. Use /help to see available commands."
 }
@@ -1538,12 +1521,6 @@ mod tests {
 
     #[test]
     fn parses_natural_language_commands_with_arguments() {
-        match parse_local_command("connect to http://localhost:8080/v1") {
-            Some(LocalCommand::ConnectTo(endpoint)) => {
-                assert_eq!(endpoint, "http://localhost:8080/v1")
-            }
-            _ => panic!("expected connect command"),
-        }
         match parse_local_command("switch model to local") {
             Some(LocalCommand::SetModelId(name)) => assert_eq!(name, "local"),
             _ => panic!("expected set model command"),
