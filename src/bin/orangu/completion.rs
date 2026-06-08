@@ -151,6 +151,78 @@ pub fn completion_candidates(
     let cursor = cursor.min(input.len());
     let prefix = &input[..cursor];
 
+    if let Some(result) =
+        structured_completion_candidates(prefix, cursor, workspace, server_names, available_models)
+    {
+        return Some(result);
+    }
+
+    if prefix.starts_with('/') {
+        return Some((
+            0,
+            cursor,
+            COMMANDS
+                .iter()
+                .filter(|command| command.starts_with(prefix))
+                .map(|command| (*command).to_string())
+                .collect(),
+        ));
+    }
+
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let token = &prefix[start..];
+    Some((start, cursor, file_completion_candidates(token, workspace)))
+}
+
+/// The grey inline "ghost" suffix previewing the first structured completion
+/// candidate at the cursor, e.g. `switch to branch m` -> `ain` (completing the
+/// `main` branch) or `/server lo` -> `cal`. This complements the command and
+/// natural-language ghosts so branch, tag, file, model, and server arguments get
+/// the same inline hint that Tab fills in.
+///
+/// Limited to the structured completions (those tied to a recognised command);
+/// the generic last-word file completion that also fires for ordinary prose is
+/// deliberately excluded so plain prompts are not littered with hints. Returns
+/// `None` unless the cursor sits at the end of the input and the first candidate
+/// extends the typed token rather than rewriting it.
+pub fn completion_ghost_suffix(
+    input: &str,
+    cursor: usize,
+    workspace: &Path,
+    server_names: &[String],
+    available_models: &[String],
+) -> Option<String> {
+    if cursor != input.len() {
+        return None;
+    }
+    let (start, end, candidates) =
+        structured_completion_candidates(input, cursor, workspace, server_names, available_models)?;
+    let candidate = candidates.into_iter().next()?;
+    let typed = input.get(start..end)?;
+    candidate
+        .strip_prefix(typed)
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
+}
+
+/// The completion candidates tied to a recognised command (branch, tag, file,
+/// model, server, session, ... arguments). Returns `None` when the input is not
+/// one of those forms, leaving [`completion_candidates`] to fall back to the
+/// slash-command list or generic file completion. Split out so the inline ghost
+/// hint can reuse exactly these structured candidates without the prose-noisy
+/// fallback.
+fn structured_completion_candidates(
+    prefix: &str,
+    cursor: usize,
+    workspace: &Path,
+    server_names: &[String],
+    available_models: &[String],
+) -> Option<(usize, usize, Vec<String>)> {
     if let Some((start, candidates)) = show_file_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
@@ -277,26 +349,7 @@ pub fn completion_candidates(
         return Some(("/session ".len(), cursor, candidates));
     }
 
-    if prefix.starts_with('/') {
-        return Some((
-            0,
-            cursor,
-            COMMANDS
-                .iter()
-                .filter(|command| command.starts_with(prefix))
-                .map(|command| (*command).to_string())
-                .collect(),
-        ));
-    }
-
-    let start = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| ch.is_whitespace())
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0);
-    let token = &prefix[start..];
-    Some((start, cursor, file_completion_candidates(token, workspace)))
+    None
 }
 
 pub fn file_completion_candidates(token: &str, workspace: &Path) -> Vec<String> {
@@ -447,6 +500,10 @@ pub fn checkout_completion_candidates(
         (prefix.len() - rest.len(), rest, false)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "checkout ") {
         (prefix.len() - rest.len(), rest, false)
+    } else if let Some(rest) = strip_ascii_prefix(prefix, "switch to branch ") {
+        // Checked before the shorter `switch to ` so `switch to branch m` keeps
+        // `m` as the token rather than treating `branch m` as the branch prefix.
+        (prefix.len() - rest.len(), rest, true)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "switch to ") {
         (prefix.len() - rest.len(), rest, true)
     } else {

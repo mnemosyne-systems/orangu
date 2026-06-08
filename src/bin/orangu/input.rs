@@ -79,6 +79,12 @@ pub struct RenderContext<'a> {
     pub x_offset: usize,
     pub banner: Banner,
     pub feedback: bool,
+    /// Configured server names, used to hint `/server` argument completions in
+    /// the inline ghost.
+    pub server_names: &'a [String],
+    /// Available model ids, used to hint `/model` argument completions in the
+    /// inline ghost.
+    pub available_models: &'a [String],
 }
 
 #[derive(Clone, Debug)]

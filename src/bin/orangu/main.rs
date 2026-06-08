@@ -291,6 +291,8 @@ async fn run() -> Result<()> {
             x_offset: viewport.x_offset,
             banner: config.banner,
             feedback: config.feedback,
+            server_names: &server_names,
+            available_models: &available_models,
         };
         // Collect the startup branch-sync result once its task finishes.
         if sync_handle
@@ -525,6 +527,8 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     feedback: config.feedback,
+                    server_names: &server_names,
+                    available_models: &available_models,
                 };
                 let result = wait_for_local_command(
                     WaitContext {
@@ -576,6 +580,8 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     feedback: config.feedback,
+                    server_names: &server_names,
+                    available_models: &available_models,
                 };
                 let result = wait_for_streaming_command(
                     WaitContext {
@@ -791,6 +797,8 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     feedback: config.feedback,
+                    server_names: &server_names,
+                    available_models: &available_models,
                 },
                 history: &mut history,
                 history_path: &session_hist_path,
@@ -1453,15 +1461,27 @@ pub fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
     // Only hint a completion while the cursor sits at the end of what was typed.
     // Slash commands take priority over natural-language bindings; for the latter,
     // `ghost_index` selects which candidate to preview (cycled with Shift+Tab).
-    let ghost = if screen.cursor == screen.input.len() {
+    // Structured argument completions (branches, tags, files, models, servers)
+    // fall last, previewing the first candidate Tab would fill in.
+    let structured_ghost = if screen.cursor == screen.input.len() {
         completion::command_ghost_suffix(screen.input)
             .or_else(|| {
                 completion::natural_language_ghost_suffix_at(screen.input, screen.ghost_index)
             })
-            .unwrap_or("")
+            .map(str::to_string)
+            .or_else(|| {
+                completion::completion_ghost_suffix(
+                    screen.input,
+                    screen.cursor,
+                    render.workspace,
+                    render.server_names,
+                    render.available_models,
+                )
+            })
     } else {
-        ""
+        None
     };
+    let ghost = structured_ghost.as_deref().unwrap_or("");
     print!("{CLEAR_TERMINAL_SEQUENCE}");
     print!(
         "{}",
@@ -3145,8 +3165,8 @@ mod tests {
         parse_local_command, system_prompt,
     };
     use super::completion::{
-        command_ghost_suffix, completion_candidates, natural_language_ghost_candidates,
-        natural_language_ghost_suffix_at,
+        command_ghost_suffix, completion_candidates, completion_ghost_suffix,
+        natural_language_ghost_candidates, natural_language_ghost_suffix_at,
     };
     use super::git::with_explicit_pager_width;
     use super::git::{
@@ -3285,6 +3305,8 @@ mod tests {
                 x_offset: 0,
                 banner: Banner::Left,
                 feedback: false,
+                server_names: &[],
+                available_models: &[],
             },
         }
     }
@@ -5451,6 +5473,94 @@ mod tests {
         assert!(
             !candidates.contains(&"main.rs".to_string()),
             "file should not appear"
+        );
+
+        // The longer `switch to branch ` phrasing must complete branches too,
+        // keeping `m` (not `branch m`) as the token being completed.
+        let (start, _, branch_candidates) = completion_candidates(
+            "switch to branch m",
+            "switch to branch m".len(),
+            workspace.path(),
+            &[],
+            &[],
+        )
+        .expect("switch to branch completion");
+        assert_eq!(start, "switch to branch ".len());
+        assert!(
+            branch_candidates.contains(&"main".to_string()),
+            "main missing"
+        );
+        assert!(
+            branch_candidates.contains(&"mybranch".to_string()),
+            "mybranch missing"
+        );
+    }
+
+    #[test]
+    fn ghost_previews_first_structured_completion() {
+        let workspace = tempdir().expect("workspace");
+        init_test_git_repo(workspace.path());
+        std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .current_dir(workspace.path())
+            .status()
+            .expect("set initial branch to main");
+        fs::write(workspace.path().join("main.rs"), "").expect("main.rs");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "main.rs"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "--quiet", "-m", "initial"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // The first matching branch is previewed as the trailing ghost suffix.
+        let input = "switch to branch m";
+        assert_eq!(
+            completion_ghost_suffix(input, input.len(), workspace.path(), &[], &[]).as_deref(),
+            Some("ain")
+        );
+
+        // `/server` argument completion previews the first server name.
+        let servers = vec!["local".to_string(), "remote".to_string()];
+        assert_eq!(
+            completion_ghost_suffix(
+                "/server lo",
+                "/server lo".len(),
+                workspace.path(),
+                &servers,
+                &[]
+            )
+            .as_deref(),
+            Some("cal")
+        );
+
+        // Ordinary prose gets no ghost even when its last word prefixes a file,
+        // so plain prompts stay clean.
+        assert_eq!(
+            completion_ghost_suffix(
+                "tell me about main",
+                "tell me about main".len(),
+                workspace.path(),
+                &[],
+                &[]
+            ),
+            None
+        );
+
+        // No ghost when the cursor is not at the end of the input.
+        assert_eq!(
+            completion_ghost_suffix(input, 0, workspace.path(), &[], &[]),
+            None
         );
     }
 

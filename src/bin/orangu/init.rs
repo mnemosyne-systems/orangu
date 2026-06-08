@@ -213,7 +213,10 @@ fn report_optional_tools(platform: &str) {
     // delta is only used when it resolves as the Git diff pager.
     println!(
         "  delta:  {}",
-        tool_status(delta_installed, delta_installed && delta_is_git_diff_pager())
+        tool_status(
+            delta_installed,
+            delta_installed && delta_is_git_diff_pager()
+        )
     );
     // bat needs no configuration; orangu uses it whenever it is installed.
     println!("  bat:    {}", tool_status(bat_installed, bat_installed));
