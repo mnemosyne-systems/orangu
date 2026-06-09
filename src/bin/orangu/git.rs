@@ -2080,6 +2080,22 @@ pub fn git_push(repo_root: &Path, force: bool) -> Result<String> {
             branch
         ));
     }
+    // Require the branch to be rebased on top of main/master before pushing, so
+    // we never push a branch that is behind its base. Protected branches are
+    // their own base, and a missing base branch (e.g. no main/master) is not
+    // grounds to block the push.
+    if !is_protected_branch(&branch)
+        && let Ok(base_ref) = git_find_base_ref(repo_root)
+    {
+        let behind = git_commit_count(repo_root, &format!("HEAD..{base_ref}"))?;
+        if behind > 0 {
+            return Err(anyhow!(
+                "branch '{branch}' is {behind} commit{} behind {base_ref}; \
+                 rebase on {base_ref} before pushing (run /rebase)",
+                if behind == 1 { "" } else { "s" }
+            ));
+        }
+    }
     let mut command = std::process::Command::new("git");
     command.arg("-C").arg(repo_root).arg("push");
     if force {
@@ -2752,6 +2768,46 @@ mod tests {
         assert!(is_protected_branch("master"));
         assert!(!is_protected_branch("feature/my-branch"));
         assert!(!is_protected_branch("develop"));
+    }
+
+    #[test]
+    fn push_blocked_when_branch_behind_base() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git command");
+        };
+        let commit = |name: &str, content: &str, msg: &str| {
+            std::fs::write(workspace.path().join(name), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+
+        git(&["checkout", "-B", "main"]);
+        commit("base.txt", "base\n", "Base commit");
+
+        // Feature branch, then advance main so the branch falls behind.
+        git(&["checkout", "-b", "feature/push-test"]);
+        commit("feature.txt", "feat\n", "Feature commit");
+        git(&["checkout", "main"]);
+        commit("base.txt", "base2\n", "Base advances");
+        git(&["checkout", "feature/push-test"]);
+
+        let result = git_push(workspace.path(), false);
+        assert!(result.is_err(), "push should be blocked when behind base");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("behind main") && msg.contains("/rebase"),
+            "error should explain the branch is behind and to rebase: {msg}"
+        );
     }
 
     #[test]
