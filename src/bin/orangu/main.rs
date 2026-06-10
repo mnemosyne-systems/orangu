@@ -21,6 +21,7 @@ mod init;
 mod input;
 mod quotes;
 mod render;
+mod shell;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -106,6 +107,39 @@ struct Args {
     /// Interactively create ~/.orangu/orangu.conf and exit.
     #[arg(short, long)]
     init: bool,
+    /// Print the shell completion script for the detected shell and exit.
+    ///
+    /// Detects the current shell from $SHELL. Pipe into your shell's eval or
+    /// drop the output into the appropriate completions directory:
+    ///
+    ///   bash: eval "$(orangu -s)"
+    ///   zsh:  orangu -s > ~/.zsh/completions/_orangu
+    ///   fish: orangu -s > ~/.config/fish/completions/orangu.fish
+    #[arg(short = 's', long = "shell-completions")]
+    shell_completions: bool,
+}
+
+fn print_shell_completions() -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let script = if shell.ends_with("/bash") || shell == "bash" {
+        shell::BASH
+    } else if shell.ends_with("/zsh") || shell == "zsh" {
+        shell::ZSH
+    } else if shell.ends_with("/fish") || shell == "fish" {
+        shell::FISH
+    } else {
+        return Err(anyhow!(
+            "could not detect shell from $SHELL ({shell:?}).\n\
+             Supported shells: bash, zsh, fish.\n\
+             \n\
+             Usage:\n\
+             \x20 bash: eval \"$(orangu -s)\"\n\
+             \x20 zsh:  orangu -s > ~/.zsh/completions/_orangu\n\
+             \x20 fish: orangu -s > ~/.config/fish/completions/orangu.fish"
+        ));
+    };
+    print!("{script}");
+    Ok(())
 }
 
 #[tokio::main]
@@ -122,6 +156,9 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
     let args = Args::parse();
+    if args.shell_completions {
+        return print_shell_completions();
+    }
     if args.init {
         return init::run_init().await;
     }
