@@ -1306,16 +1306,7 @@ pub fn close_output(workspace: &Path, target: &CloseTarget, forge: Forge) -> Res
             }
         ));
     }
-    let kind = match target {
-        CloseTarget::Issue(_) => "issue",
-        CloseTarget::PullRequest(_) => "pull request",
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if stdout.is_empty() {
-        format!("Closed {kind} #{number}")
-    } else {
-        stdout
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn create_pull_request_output(
