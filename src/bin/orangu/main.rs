@@ -2488,6 +2488,8 @@ struct AutoReviewState {
     /// When set, the Alt+r reject window is open over the panes (browse
     /// phase only).
     reject: Option<AutoReviewReject>,
+    /// The model performing the review, shown after the `Conclusion` verdict.
+    model: String,
 }
 
 impl AutoReviewState {
@@ -2505,6 +2507,7 @@ impl AutoReviewState {
             done: false,
             cancelled: false,
             reject: None,
+            model: String::new(),
         }
     }
 
@@ -2538,6 +2541,26 @@ impl AutoReviewState {
         } else {
             "orangu rejects this patch"
         }
+    }
+
+    /// The model name appended after the `Conclusion` verdict, outside the
+    /// verdict's bold: ` (<model>)`. Empty when no model name is known.
+    fn conclusion_model_suffix(&self) -> String {
+        if self.model.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.model)
+        }
+    }
+
+    /// The `Conclusion` verdict row as rendered for the console: the verdict
+    /// in bold, then the reviewing model's name in parentheses, not bold.
+    fn conclusion_verdict_line(&self) -> String {
+        format!(
+            "\x1b[1m{}\x1b[0m{}",
+            self.conclusion_verdict(),
+            self.conclusion_model_suffix()
+        )
     }
 
     /// The rejected and not-reviewed files listed under the `Conclusion`
@@ -2589,9 +2612,9 @@ impl AutoReviewState {
         if pending {
             lines.push("\x1b[2m(pending)\x1b[0m".to_string());
         } else {
-            // The verdict stands alone in bold; the affected files follow as
-            // a bullet list.
-            lines.push(format!("\x1b[1m{}\x1b[0m", self.conclusion_verdict()));
+            // The verdict stands alone in bold, with the reviewing model in
+            // parentheses; the affected files follow as a bullet list.
+            lines.push(self.conclusion_verdict_line());
             let findings = self.conclusion_findings();
             if !findings.is_empty() {
                 lines.push(String::new());
@@ -2970,11 +2993,15 @@ fn auto_review_exit_output(state: &AutoReviewState) -> (Vec<String>, String) {
     markdown.push(format!("## {AUTO_REVIEW_CONCLUSION}"));
     lines.push(String::new());
     markdown.push(String::new());
-    // The verdict stands alone in bold; the affected files follow as a
-    // bullet list.
-    let verdict = state.conclusion_verdict();
-    lines.push(format!("\x1b[1m{verdict}\x1b[0m"));
-    markdown.push(format!("**{verdict}**"));
+    // The verdict stands alone in bold, with the reviewing model appended in
+    // parentheses outside the bold; the affected files follow as a bullet
+    // list.
+    lines.push(state.conclusion_verdict_line());
+    markdown.push(format!(
+        "**{}**{}",
+        state.conclusion_verdict(),
+        state.conclusion_model_suffix()
+    ));
     let findings = state.conclusion_findings();
     if !findings.is_empty() {
         lines.push(String::new());
@@ -3048,6 +3075,7 @@ async fn run_auto_review_mode(
     terminal: &str,
 ) -> Result<AutoReviewState> {
     let mut state = AutoReviewState::new(launch);
+    state.model = chrome.current_model.to_string();
     let mut exit_requested = false;
     let total = state.files.len();
     // The run's request count: each file is scanned only for the categories
@@ -5766,12 +5794,14 @@ mod tests {
         });
         state.sections[0].push("ready to merge".to_string());
         state.sections[1].push("**a.rs**: tighten error handling".to_string());
+        state.model = "gemma".to_string();
         state.finish();
 
         // The report is just the categories — no header and no per-file
-        // status lines — ending with the Conclusion verdict. The output-window
-        // lines display the Markdown rendered: bold headings without the `##`
-        // markers, `**file**` resolved to bold.
+        // status lines — ending with the Conclusion verdict followed by the
+        // reviewing model in parentheses, outside the verdict's bold. The
+        // output-window lines display the Markdown rendered: bold headings
+        // without the `##` markers, `**file**` resolved to bold.
         let (lines, clipboard) = auto_review_exit_output(&state);
         assert_eq!(
             lines,
@@ -5806,7 +5836,7 @@ mod tests {
                 String::new(),
                 "\x1b[1mConclusion\x1b[0m".to_string(),
                 String::new(),
-                "\x1b[1morangu approves this patch\x1b[0m".to_string(),
+                "\x1b[1morangu approves this patch\x1b[0m (gemma)".to_string(),
             ]
         );
         // The clipboard copy is the raw Markdown report.
@@ -5842,7 +5872,7 @@ mod tests {
              \n\
              ## Conclusion\n\
              \n\
-             **orangu approves this patch**"
+             **orangu approves this patch** (gemma)"
         );
     }
 
