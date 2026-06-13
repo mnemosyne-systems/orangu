@@ -512,7 +512,15 @@ pub(crate) fn auto_review_finding_body(line: &str) -> Option<String> {
     // it for the "None" placeholder check so `95-96: None` is dropped too, not
     // recorded as a finding against the category.
     let (_, text) = auto_review_split_line(body);
-    let lower = text.to_ascii_lowercase();
+    // A "None" verdict may trail a parenthetical justification, e.g.
+    // `None (no direct memory risk)`; strip a closing `(...)` group so the
+    // placeholder is still recognized and the line is dropped, not recorded.
+    let core = text
+        .strip_suffix(')')
+        .and_then(|head| head.rsplit_once('('))
+        .map(|(before, _)| before.trim())
+        .unwrap_or(text);
+    let lower = core.to_ascii_lowercase();
     let lower = lower.trim_end_matches(['.', '!']);
     if text.is_empty()
         || matches!(
@@ -1248,11 +1256,25 @@ mod tests {
             "VERDICT: APPROVE\nFINDINGS:\n- None\n",
             "VERDICT: APPROVE\nFINDINGS:\n- 95-96: None\n",
             "VERDICT: APPROVE\nFINDINGS:\n- 42: none.\n",
+            // A "None" with a trailing parenthetical justification is still a
+            // placeholder, not a finding.
+            "VERDICT: APPROVE\nFINDINGS:\n- 152-155: None (no direct memory risk)\n",
+            "VERDICT: APPROVE\nFINDINGS:\n- No issues (documentation only)\n",
         ] {
             let (approved, findings) = parse_auto_review_category_response(clean);
             assert_eq!(approved, Some(true));
             assert!(findings.is_empty(), "{clean:?} -> {findings:?}");
         }
+
+        // A genuine finding that merely ends in a parenthetical is kept — only
+        // a "None"-style placeholder is stripped.
+        let (_, findings) = parse_auto_review_category_response(
+            "FINDINGS:\n- 42: unwrap may panic (added on the hot path)\n",
+        );
+        assert_eq!(
+            findings,
+            vec!["42: unwrap may panic (added on the hot path)".to_string()]
+        );
     }
 
     #[test]
