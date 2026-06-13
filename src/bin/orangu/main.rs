@@ -814,28 +814,23 @@ async fn run() -> Result<()> {
                         }
                     }
                 }
-                // On exit, print the per-file status and comments to the output
-                // window, and copy the comments to the system clipboard. The
-                // Markdown summary is kept for `/comment <n> with review`.
-                last_review_report = Some(review_markdown_report(
-                    &review.files,
-                    &review.comments,
-                    &review.general_notes,
-                ));
+                // On exit, print the category-grouped report to the output
+                // window and copy its raw Markdown to the system clipboard; the
+                // Markdown is also kept for `/comment <n> with review` and
+                // `/export review`.
+                let (lines, markdown) =
+                    review_exit_output(&review.files, &review.comments, &review.general_notes);
+                last_review_report = Some(markdown.clone());
                 completion::set_available_review_reports(
                     last_review_report.is_some(),
                     last_auto_review_report.is_some(),
                 );
-                let (lines, clipboard) =
-                    review_exit_output(&review.files, &review.comments, &review.general_notes);
                 for line in &lines {
                     output_state.push_text(line);
                 }
-                if let Some(text) = clipboard
-                    && let Err(err) = copy_to_clipboard(&text)
-                {
+                if let Err(err) = copy_to_clipboard(&markdown) {
                     output_state.push_text(&format!(
-                        "Could not copy review comments to the clipboard: {err}"
+                        "Could not copy the review report to the clipboard: {err}"
                     ));
                 }
                 // The modal view overwrote the screen; the next loop iteration

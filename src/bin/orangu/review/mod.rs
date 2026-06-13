@@ -38,12 +38,3 @@ pub(crate) fn review_status_label(status: ReviewStatus) -> &'static str {
         ReviewStatus::Unreviewed => "No review",
     }
 }
-
-/// A colored dot shown after the status label: green/red/white.
-pub(crate) fn review_status_dot(status: ReviewStatus) -> &'static str {
-    match status {
-        ReviewStatus::Approved => "\x1b[38;2;80;200;120m●\x1b[0m",
-        ReviewStatus::Rejected => "\x1b[38;2;220;80;80m●\x1b[0m",
-        ReviewStatus::Unreviewed => "\x1b[38;2;230;230;230m●\x1b[0m",
-    }
-}

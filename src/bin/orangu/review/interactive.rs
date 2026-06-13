@@ -31,7 +31,30 @@ pub(crate) struct ReviewComment {
     pub(crate) file: String,
     /// Diff-line index within the file (0-based).
     pub(crate) line: usize,
+    /// Index of the comment's category, into `AUTO_REVIEW_CATEGORIES`.
+    pub(crate) category: usize,
     pub(crate) text: String,
+}
+
+/// The inline Alt+c comment editor: the chosen category, which part has the
+/// focus, and the comment text. Tab switches the focus between the single-line
+/// category selector and the comment text; Up/Down move the category while the
+/// selector has the focus.
+pub(crate) struct CommentEditor {
+    /// Index of the chosen category, into `AUTO_REVIEW_CATEGORIES`.
+    pub(crate) category: usize,
+    /// `true` while the focus is on the category selector.
+    pub(crate) selector_focused: bool,
+    pub(crate) input: InputState,
+}
+
+/// The category name for a comment's category index, falling back to the first
+/// category (`Overall`) when the index is out of range.
+pub(crate) fn review_category_name(category: usize) -> &'static str {
+    crate::review::AUTO_REVIEW_CATEGORIES
+        .get(category)
+        .copied()
+        .unwrap_or(crate::review::AUTO_REVIEW_CATEGORIES[0])
 }
 
 /// Interactive state for `/review` mode.
@@ -53,7 +76,7 @@ pub(crate) struct ReviewState {
     /// General notes entered in the input window as `# <note>`.
     pub(crate) general_notes: Vec<String>,
     /// When set, the inline comment editor is open for the highlighted line.
-    pub(crate) comment_editor: Option<InputState>,
+    pub(crate) comment_editor: Option<CommentEditor>,
 }
 
 /// Why `run_review_mode` returned control to the caller.
@@ -112,13 +135,12 @@ impl ReviewState {
         self.files.get(self.selected).map(|file| file.path.as_str())
     }
 
-    /// The existing comment text for the highlighted line, if any.
-    pub(crate) fn comment_for_selected_line(&self) -> Option<&str> {
+    /// The existing comment recorded against the highlighted line, if any.
+    pub(crate) fn comment_for_selected_line(&self) -> Option<&ReviewComment> {
         let path = self.selected_path()?;
         self.comments
             .iter()
             .find(|comment| comment.file == path && comment.line == self.line)
-            .map(|comment| comment.text.as_str())
     }
 
     /// Diff-line indices of the selected file that carry a comment.
@@ -134,15 +156,26 @@ impl ReviewState {
     }
 
     /// Open the inline comment editor for the highlighted line, pre-filled with
-    /// any existing comment, and scroll so the editor box fits below the line.
+    /// any existing comment (its category and text), and scroll so the editor
+    /// box fits below the line. A fresh comment defaults to the first category,
+    /// `Overall`, with the focus on the comment text.
     pub(crate) fn open_comment_editor(&mut self, body_height: usize) {
-        let existing = self.comment_for_selected_line().unwrap_or("").to_string();
+        let existing = self.comment_for_selected_line();
+        let category = existing.map(|comment| comment.category).unwrap_or(0);
+        let text = existing
+            .map(|comment| comment.text.clone())
+            .unwrap_or_default();
         let mut input = InputState::default();
-        input.set_buffer(existing);
-        self.comment_editor = Some(input);
+        input.set_buffer(text);
+        self.comment_editor = Some(CommentEditor {
+            category,
+            selector_focused: false,
+            input,
+        });
 
-        // Keep the highlighted line high enough that the box fits beneath it.
-        let room = body_height.saturating_sub(orangu::tui::REVIEW_COMMENT_BOX_HEIGHT + 1);
+        // Keep the highlighted line high enough that the box (the category row
+        // plus the comment window) fits beneath it.
+        let room = body_height.saturating_sub(orangu::tui::REVIEW_COMMENT_BOX_HEIGHT + 2);
         if self.line.saturating_sub(self.scroll) > room {
             self.scroll = self.line.saturating_sub(room);
         }
@@ -161,13 +194,14 @@ impl ReviewState {
             return;
         };
         let line = self.line;
-        let text = editor.as_str().trim().to_string();
+        let text = editor.input.as_str().trim().to_string();
         self.comments
             .retain(|comment| !(comment.file == path && comment.line == line));
         if !text.is_empty() {
             self.comments.push(ReviewComment {
                 file: path,
                 line,
+                category: editor.category,
                 text,
             });
         }
@@ -257,15 +291,37 @@ pub(crate) fn build_review_prompt(path: &str, request: &str, patch: &str) -> Str
     format!("{instruction}\n\n```diff\n{patch}\n```")
 }
 
-/// Format the recorded review comments as `<file>:<line>: <comment>` lines,
-/// ordered by file then line. Line numbers are shown 1-based.
-pub(crate) fn format_review_comments(comments: &[ReviewComment]) -> Vec<String> {
+/// The recorded review comments bucketed by category, in
+/// `AUTO_REVIEW_CATEGORIES` order. Within each bucket the comments are ordered
+/// by file then line and formatted like an auto review finding —
+/// `**file:line**: text`, so the location renders bold — with the general
+/// `# <note>` notes folded into the first bucket (`Overall`) as whole-patch
+/// commentary.
+fn review_findings_by_category(
+    comments: &[ReviewComment],
+    general_notes: &[String],
+) -> Vec<Vec<String>> {
+    let count = crate::review::AUTO_REVIEW_CATEGORIES.len();
+    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); count];
+
+    // General notes are about the whole patch, so they lead the `Overall`
+    // category.
+    for note in general_notes {
+        buckets[0].push(note.clone());
+    }
+
     let mut ordered: Vec<&ReviewComment> = comments.iter().collect();
     ordered.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
-    ordered
-        .into_iter()
-        .map(|comment| format!("{}:{}: {}", comment.file, comment.line + 1, comment.text))
-        .collect()
+    for comment in ordered {
+        let index = comment.category.min(count - 1);
+        buckets[index].push(format!(
+            "**{}:{}**: {}",
+            comment.file,
+            comment.line + 1,
+            comment.text
+        ));
+    }
+    buckets
 }
 
 /// The body of a `# <note>` general comment, with the leading `#` removed.
@@ -278,88 +334,92 @@ pub(crate) fn general_comment_body(text: &str) -> String {
         .to_string()
 }
 
-/// Build the review exit summary: the lines to print to the output window, and
-/// the text (if any) to copy to the clipboard. When every file is approved and
-/// there are no comments, the summary is just "Patch approved". Otherwise it is
-/// each file's status, the line comments, then the general notes, then a final
-/// "Patch rejected" verdict. The line comments and general notes are copied to
-/// the clipboard (never the per-file status or the verdict).
+/// Build the `/review` exit report, grouped by category like `/auto_review`:
+/// the lines rendered for the output window, and the raw Markdown kept for
+/// `/comment <n> with review` and `/export review` (and copied to the clipboard
+/// on exit). Each category — `Overall` through `Documentation` — is a heading
+/// followed by its line comments as a bullet list (`No issues found` when
+/// empty); the general `# <note>` notes lead the `Overall` category. The closing
+/// `Conclusion` carries the bold verdict — `Patch approved` when every file is
+/// approved, otherwise `Patch rejected` — followed by any rejected or
+/// not-reviewed files. The rendered lines display the same report with the
+/// Markdown syntax consumed (bold headings, `**file**` resolved to bold).
 pub(crate) fn review_exit_output(
     files: &[ReviewEntry],
     comments: &[ReviewComment],
     general_notes: &[String],
-) -> (Vec<String>, Option<String>) {
-    let line_lines = format_review_comments(comments);
+) -> (Vec<String>, String) {
+    let buckets = review_findings_by_category(comments, general_notes);
 
-    // Both kinds of comment are copied (line comments first, then notes).
-    let mut clip: Vec<String> = line_lines.clone();
-    clip.extend(general_notes.iter().cloned());
-    let clipboard = (!clip.is_empty()).then(|| clip.join("\n"));
-
-    let all_approved = !files.is_empty()
-        && files
-            .iter()
-            .all(|file| file.status == ReviewStatus::Approved);
-    if all_approved && clip.is_empty() {
-        return (vec!["\x1b[1mPatch approved\x1b[0m".to_string()], None);
-    }
-
-    let mut lines: Vec<String> = files
-        .iter()
-        .map(|file| {
-            format!(
-                "{}: {} {}",
-                file.path,
-                review_status_label(file.status),
-                review_status_dot(file.status),
-            )
-        })
-        .collect();
-    lines.extend(line_lines);
-    lines.extend(general_notes.iter().cloned());
-    lines.push("\x1b[1mPatch rejected\x1b[0m".to_string());
-    (lines, clipboard)
-}
-
-/// The `/review` summary as Markdown, kept after leaving review mode so
-/// `/comment <number> with review` can post it. It mirrors
-/// `review_exit_output`: just `**Patch approved**` when every file is
-/// approved and there is nothing to report; otherwise each file's status as
-/// a bullet list, then the line comments and the general notes, ending with
-/// the bold `**Patch rejected**` verdict.
-pub(crate) fn review_markdown_report(
-    files: &[ReviewEntry],
-    comments: &[ReviewComment],
-    general_notes: &[String],
-) -> String {
-    let all_approved = !files.is_empty()
-        && files
-            .iter()
-            .all(|file| file.status == ReviewStatus::Approved);
-    if all_approved && comments.is_empty() && general_notes.is_empty() {
-        return "**Patch approved**".to_string();
-    }
-
-    let mut lines: Vec<String> = files
-        .iter()
-        .map(|file| format!("- **{}**: {}", file.path, review_status_label(file.status)))
-        .collect();
-    let comment_lines = format_review_comments(comments);
-    if !comment_lines.is_empty() {
+    // The two variants stay in lockstep: `lines` goes to the output window,
+    // `markdown` is kept for the report (and copied to the clipboard).
+    let mut lines = Vec::new();
+    let mut markdown = Vec::new();
+    for (index, name) in crate::review::AUTO_REVIEW_CATEGORIES.iter().enumerate() {
+        lines.push(format!("\x1b[1m{name}\x1b[0m"));
+        markdown.push(format!("## {name}"));
         lines.push(String::new());
-        for comment in comment_lines {
-            lines.push(format!("- {comment}"));
+        markdown.push(String::new());
+        let bucket = &buckets[index];
+        if bucket.is_empty() {
+            lines.push("No issues found".to_string());
+            markdown.push("No issues found".to_string());
+        } else {
+            for finding in bucket {
+                let bullet = format!("- {finding}");
+                lines.extend(
+                    render_markdown_for_console(&bullet)
+                        .lines()
+                        .map(str::to_string),
+                );
+                markdown.push(bullet);
+            }
         }
-    }
-    if !general_notes.is_empty() {
         lines.push(String::new());
-        for note in general_notes {
-            lines.push(format!("- {note}"));
-        }
+        markdown.push(String::new());
     }
+
+    // The synthesized `Conclusion`: the verdict, then any rejected or
+    // not-reviewed files (approved files are implied by the verdict).
+    let conclusion = crate::review::AUTO_REVIEW_CONCLUSION;
+    lines.push(format!("\x1b[1m{conclusion}\x1b[0m"));
+    markdown.push(format!("## {conclusion}"));
     lines.push(String::new());
-    lines.push("**Patch rejected**".to_string());
-    lines.join("\n")
+    markdown.push(String::new());
+
+    let all_approved = !files.is_empty()
+        && files
+            .iter()
+            .all(|file| file.status == ReviewStatus::Approved);
+    let verdict = if all_approved {
+        "Patch approved"
+    } else {
+        "Patch rejected"
+    };
+    lines.push(format!("\x1b[1m{verdict}\x1b[0m"));
+    markdown.push(format!("**{verdict}**"));
+
+    let mut findings = Vec::new();
+    for file in files {
+        if file.status == ReviewStatus::Rejected {
+            findings.push(format!("Rejected: **{}**", file.path));
+        }
+    }
+    for file in files {
+        if file.status == ReviewStatus::Unreviewed {
+            findings.push(format!("Not reviewed: **{}**", file.path));
+        }
+    }
+    if !findings.is_empty() {
+        lines.push(String::new());
+        markdown.push(String::new());
+        for finding in findings {
+            lines.push(render_markdown_for_console(&format!("- {finding}")));
+            markdown.push(format!("- {finding}"));
+        }
+    }
+
+    (lines, markdown.join("\n"))
 }
 
 pub(crate) fn print_review_screen(
@@ -380,8 +440,10 @@ pub(crate) fn print_review_screen(
         .comment_editor
         .as_ref()
         .map(|editor| ReviewCommentEditor {
-            text: editor.as_str(),
-            cursor: editor.cursor(),
+            category: review_category_name(editor.category),
+            selector_focused: editor.selector_focused,
+            text: editor.input.as_str(),
+            cursor: editor.input.cursor(),
         });
     let commented_lines = state.commented_lines();
     print!("{CLEAR_TERMINAL_SEQUENCE}");
@@ -463,27 +525,50 @@ pub(crate) fn run_review_mode(
             continue;
         }
 
-        // While the inline comment editor is open it is modal: type the comment,
-        // Enter saves it, Esc discards it.
-        if state.comment_editor.is_some() {
+        // While the inline comment editor is open it is modal: Tab switches the
+        // focus between the category selector and the comment text, Up/Down move
+        // the category while the selector has the focus, Enter saves it, and Esc
+        // discards it.
+        if let Some(editor) = state.comment_editor.as_ref() {
             escape_cancel.reset();
+            let selector_focused = editor.selector_focused;
             match (code, alt, ctrl) {
                 (KeyCode::Enter, _, _) => state.commit_comment(),
                 (KeyCode::Esc, _, _) => state.comment_editor = None,
+                (KeyCode::Tab, _, _) | (KeyCode::BackTab, _, _) => {
+                    let editor = state.comment_editor.as_mut().unwrap();
+                    editor.selector_focused = !editor.selector_focused;
+                }
+                // While the selector has the focus, Up/Down pick the category
+                // and every other key is ignored (no typing into the comment).
+                (KeyCode::Up, _, _) if selector_focused => {
+                    let editor = state.comment_editor.as_mut().unwrap();
+                    editor.category = editor.category.saturating_sub(1);
+                }
+                (KeyCode::Down, _, _) if selector_focused => {
+                    let editor = state.comment_editor.as_mut().unwrap();
+                    editor.category =
+                        (editor.category + 1).min(crate::review::AUTO_REVIEW_CATEGORIES.len() - 1);
+                }
+                _ if selector_focused => {}
                 (KeyCode::Backspace, true, _) => {
                     state
                         .comment_editor
                         .as_mut()
                         .unwrap()
+                        .input
                         .delete_backward_readline_word();
                 }
-                (KeyCode::Backspace, _, _) => state.comment_editor.as_mut().unwrap().backspace(),
-                (KeyCode::Delete, _, _) => state.comment_editor.as_mut().unwrap().delete(),
+                (KeyCode::Backspace, _, _) => {
+                    state.comment_editor.as_mut().unwrap().input.backspace();
+                }
+                (KeyCode::Delete, _, _) => state.comment_editor.as_mut().unwrap().input.delete(),
                 (KeyCode::Left, _, true) => {
                     state
                         .comment_editor
                         .as_mut()
                         .unwrap()
+                        .input
                         .move_backward_readline_word();
                 }
                 (KeyCode::Right, _, true) => {
@@ -491,14 +576,15 @@ pub(crate) fn run_review_mode(
                         .comment_editor
                         .as_mut()
                         .unwrap()
+                        .input
                         .move_forward_readline_word();
                 }
-                (KeyCode::Left, _, _) => state.comment_editor.as_mut().unwrap().move_left(),
-                (KeyCode::Right, _, _) => state.comment_editor.as_mut().unwrap().move_right(),
-                (KeyCode::Home, _, _) => state.comment_editor.as_mut().unwrap().move_home(),
-                (KeyCode::End, _, _) => state.comment_editor.as_mut().unwrap().move_end(),
+                (KeyCode::Left, _, _) => state.comment_editor.as_mut().unwrap().input.move_left(),
+                (KeyCode::Right, _, _) => state.comment_editor.as_mut().unwrap().input.move_right(),
+                (KeyCode::Home, _, _) => state.comment_editor.as_mut().unwrap().input.move_home(),
+                (KeyCode::End, _, _) => state.comment_editor.as_mut().unwrap().input.move_end(),
                 (KeyCode::Char(ch), false, false) => {
-                    state.comment_editor.as_mut().unwrap().insert_char(ch);
+                    state.comment_editor.as_mut().unwrap().input.insert_char(ch);
                 }
                 _ => {}
             }
@@ -779,29 +865,36 @@ mod tests {
             comment_editor: None,
         };
 
-        // Open the editor (pre-filled empty), type, and commit.
+        // Open the editor (pre-filled empty), type, and commit. A fresh comment
+        // defaults to the first category, Overall, with the focus on the text.
         state.open_comment_editor(20);
         assert!(state.comment_editor.is_some());
+        assert_eq!(state.comment_editor.as_ref().unwrap().category, 0);
+        assert!(!state.comment_editor.as_ref().unwrap().selector_focused);
         for ch in "looks off".chars() {
-            state.comment_editor.as_mut().unwrap().insert_char(ch);
+            state.comment_editor.as_mut().unwrap().input.insert_char(ch);
         }
         state.commit_comment();
         assert!(state.comment_editor.is_none());
         assert_eq!(state.comments.len(), 1);
         assert_eq!(state.comments[0].file, "a.txt");
         assert_eq!(state.comments[0].line, 3);
+        assert_eq!(state.comments[0].category, 0);
         assert_eq!(state.comments[0].text, "looks off");
         assert_eq!(state.commented_lines(), vec![3]);
 
         // Re-opening pre-fills the existing comment; editing replaces it.
         state.open_comment_editor(20);
-        assert_eq!(state.comment_editor.as_ref().unwrap().as_str(), "looks off");
+        assert_eq!(
+            state.comment_editor.as_ref().unwrap().input.as_str(),
+            "looks off"
+        );
         state.commit_comment();
         assert_eq!(state.comments.len(), 1, "no duplicate for the same line");
 
         // An empty comment removes it.
         state.open_comment_editor(20);
-        state.comment_editor.as_mut().unwrap().kill_to_start();
+        state.comment_editor.as_mut().unwrap().input.kill_to_start();
         state.commit_comment();
         assert!(state.comments.is_empty());
         assert!(state.commented_lines().is_empty());
@@ -809,7 +902,7 @@ mod tests {
         // Comments are scoped to the selected file.
         state.open_comment_editor(20);
         for ch in "note".chars() {
-            state.comment_editor.as_mut().unwrap().insert_char(ch);
+            state.comment_editor.as_mut().unwrap().input.insert_char(ch);
         }
         state.commit_comment();
         state.select_next();
@@ -847,22 +940,24 @@ mod tests {
         // Record a comment on the highlighted line, then re-open with Alt+c.
         state.open_comment_editor(12);
         for ch in "needs a guard".chars() {
-            state.comment_editor.as_mut().unwrap().insert_char(ch);
+            state.comment_editor.as_mut().unwrap().input.insert_char(ch);
         }
         state.commit_comment();
         state.open_comment_editor(12);
 
         // The editor holds the existing comment, and it renders inside the box.
         assert_eq!(
-            state.comment_editor.as_ref().unwrap().as_str(),
+            state.comment_editor.as_ref().unwrap().input.as_str(),
             "needs a guard"
         );
         let editor = state
             .comment_editor
             .as_ref()
-            .map(|input| ReviewCommentEditor {
-                text: input.as_str(),
-                cursor: input.cursor(),
+            .map(|editor| ReviewCommentEditor {
+                category: crate::review::review_category_name(editor.category),
+                selector_focused: editor.selector_focused,
+                text: editor.input.as_str(),
+                cursor: editor.input.cursor(),
             });
         let commented = state.commented_lines();
         let rendered = render_review_screen(ReviewScreenArgs {
@@ -890,40 +985,50 @@ mod tests {
     }
 
     #[test]
-    fn format_review_comments_sorts_and_uses_one_based_lines() {
-        use crate::review::{ReviewComment, format_review_comments};
+    fn comment_editor_keeps_and_reloads_the_chosen_category() {
+        use crate::review::ReviewState;
+        use orangu::tui::{ReviewEntry, ReviewStatus};
 
-        let comments = vec![
-            ReviewComment {
-                file: "src/b.rs".to_string(),
-                line: 4,
-                text: "second file".to_string(),
-            },
-            ReviewComment {
-                file: "src/a.rs".to_string(),
-                line: 9,
-                text: "later line".to_string(),
-            },
-            ReviewComment {
-                file: "src/a.rs".to_string(),
-                line: 0,
-                text: "first line".to_string(),
-            },
-        ];
+        let mut state = ReviewState {
+            files: vec![ReviewEntry {
+                path: "a.txt".to_string(),
+                status: ReviewStatus::Unreviewed,
+                diff_lines: (0..10).map(|i| format!("x {i}")).collect(),
+                patch: String::new(),
+            }],
+            selected: 0,
+            line: 1,
+            scroll: 0,
+            x_offset: 0,
+            feedback: None,
+            comments: Vec::new(),
+            general_notes: Vec::new(),
+            comment_editor: None,
+        };
 
-        assert_eq!(
-            format_review_comments(&comments),
-            vec![
-                "src/a.rs:1: first line".to_string(),
-                "src/a.rs:10: later line".to_string(),
-                "src/b.rs:5: second file".to_string(),
-            ]
-        );
+        // Open the editor, pick a non-default category (as Up/Down would), type
+        // the comment, and commit it.
+        state.open_comment_editor(20);
+        {
+            let editor = state.comment_editor.as_mut().unwrap();
+            editor.category = 2; // Security
+            for ch in "unsafe input".chars() {
+                editor.input.insert_char(ch);
+            }
+        }
+        state.commit_comment();
+        assert_eq!(state.comments[0].category, 2);
+
+        // Re-opening the line pre-fills both the category and the text.
+        state.open_comment_editor(20);
+        let editor = state.comment_editor.as_ref().unwrap();
+        assert_eq!(editor.category, 2);
+        assert_eq!(editor.input.as_str(), "unsafe input");
     }
 
     #[test]
-    fn review_exit_output_summarizes_statuses_and_comments() {
-        use crate::review::{ReviewComment, review_exit_output, review_status_dot};
+    fn review_exit_output_groups_comments_by_category() {
+        use crate::review::{ReviewComment, review_exit_output};
         use orangu::tui::{ReviewEntry, ReviewStatus};
 
         let entry = |path: &str, status| ReviewEntry {
@@ -932,66 +1037,78 @@ mod tests {
             diff_lines: vec!["+x".to_string()],
             patch: String::new(),
         };
-        let status_line = |path: &str, label: &str, status| {
-            format!("{path}: {label} {}", review_status_dot(status))
-        };
 
-        // All approved + no comments => just "Patch approved", nothing copied.
-        let files = vec![
-            entry("a.txt", ReviewStatus::Approved),
-            entry("b.txt", ReviewStatus::Approved),
-        ];
-        let (lines, clipboard) = review_exit_output(&files, &[], &[]);
-        assert_eq!(lines, vec!["\x1b[1mPatch approved\x1b[0m".to_string()]);
-        assert!(clipboard.is_none());
-
-        // Mixed statuses: per-file status lines, then comments; only comments
-        // are copied.
         let files = vec![
             entry("a.txt", ReviewStatus::Approved),
             entry("b.txt", ReviewStatus::Rejected),
             entry("c.txt", ReviewStatus::Unreviewed),
         ];
-        let comments = vec![ReviewComment {
-            file: "b.txt".to_string(),
-            line: 2,
-            text: "fix this".to_string(),
-        }];
-        let (lines, clipboard) = review_exit_output(&files, &comments, &[]);
-        assert_eq!(
-            lines,
-            vec![
-                status_line("a.txt", "Approved", ReviewStatus::Approved),
-                status_line("b.txt", "Rejected", ReviewStatus::Rejected),
-                status_line("c.txt", "No review", ReviewStatus::Unreviewed),
-                "b.txt:3: fix this".to_string(),
-                "\x1b[1mPatch rejected\x1b[0m".to_string(),
-            ]
-        );
-        assert_eq!(clipboard.as_deref(), Some("b.txt:3: fix this"));
+        let comments = vec![
+            ReviewComment {
+                file: "b.txt".to_string(),
+                line: 2,
+                category: 2, // Security
+                text: "fix this".to_string(),
+            },
+            ReviewComment {
+                file: "a.txt".to_string(),
+                line: 0,
+                category: 0, // Overall
+                text: "nit".to_string(),
+            },
+        ];
+        // General notes lead the Overall category.
+        let notes = vec!["ship after nits".to_string()];
 
-        // Approved but with a comment => not the "Patch approved" shortcut.
-        let files = vec![entry("a.txt", ReviewStatus::Approved)];
-        let comments = vec![ReviewComment {
-            file: "a.txt".to_string(),
-            line: 0,
-            text: "nit".to_string(),
-        }];
-        let (lines, clipboard) = review_exit_output(&files, &comments, &[]);
+        let (_lines, markdown) = review_exit_output(&files, &comments, &notes);
+
+        // The Markdown is category-grouped like /auto_review: each category is a
+        // `## heading`, the general note leads Overall, each line comment sits
+        // under its category, empty categories read "No issues found", and the
+        // Conclusion carries the verdict and the rejected/not-reviewed files.
         assert_eq!(
-            lines,
-            vec![
-                status_line("a.txt", "Approved", ReviewStatus::Approved),
-                "a.txt:1: nit".to_string(),
-                "\x1b[1mPatch rejected\x1b[0m".to_string(),
-            ]
+            markdown,
+            "## Overall\n\
+             \n\
+             - ship after nits\n\
+             - **a.txt:1**: nit\n\
+             \n\
+             ## Code\n\
+             \n\
+             No issues found\n\
+             \n\
+             ## Security\n\
+             \n\
+             - **b.txt:3**: fix this\n\
+             \n\
+             ## Memory\n\
+             \n\
+             No issues found\n\
+             \n\
+             ## Performance\n\
+             \n\
+             No issues found\n\
+             \n\
+             ## Test Suite\n\
+             \n\
+             No issues found\n\
+             \n\
+             ## Documentation\n\
+             \n\
+             No issues found\n\
+             \n\
+             ## Conclusion\n\
+             \n\
+             **Patch rejected**\n\
+             \n\
+             - Rejected: **b.txt**\n\
+             - Not reviewed: **c.txt**"
         );
-        assert_eq!(clipboard.as_deref(), Some("a.txt:1: nit"));
     }
 
     #[test]
-    fn review_exit_output_appends_general_notes() {
-        use crate::review::{ReviewComment, review_exit_output, review_status_dot};
+    fn review_exit_output_approves_when_every_file_is_approved() {
+        use crate::review::review_exit_output;
         use orangu::tui::{ReviewEntry, ReviewStatus};
 
         let files = vec![ReviewEntry {
@@ -1000,75 +1117,16 @@ mod tests {
             diff_lines: vec!["+x".to_string()],
             patch: String::new(),
         }];
-        let comments = vec![ReviewComment {
-            file: "a.txt".to_string(),
-            line: 4,
-            text: "tighten this".to_string(),
-        }];
-        // General notes come from the input window with the '#' already stripped.
-        let general_notes = vec!["overall solid, ship after nits".to_string()];
 
-        let (lines, clipboard) = review_exit_output(&files, &comments, &general_notes);
-        // Line comments first, then the general note, then the verdict.
-        assert_eq!(
-            lines,
-            vec![
-                format!(
-                    "a.txt: Approved {}",
-                    review_status_dot(ReviewStatus::Approved)
-                ),
-                "a.txt:5: tighten this".to_string(),
-                "overall solid, ship after nits".to_string(),
-                "\x1b[1mPatch rejected\x1b[0m".to_string(),
-            ]
-        );
-        // Both the line comment and the general note are copied.
-        assert_eq!(
-            clipboard.as_deref(),
-            Some("a.txt:5: tighten this\noverall solid, ship after nits")
-        );
-    }
-
-    #[test]
-    fn review_markdown_report_mirrors_the_exit_summary() {
-        use crate::review::{ReviewComment, review_markdown_report};
-        use orangu::tui::{ReviewEntry, ReviewStatus};
-
-        let entry = |path: &str, status| ReviewEntry {
-            path: path.to_string(),
-            status,
-            diff_lines: vec!["+x".to_string()],
-            patch: String::new(),
-        };
-
-        // All approved with nothing to report collapses to the verdict.
-        let files = vec![entry("a.txt", ReviewStatus::Approved)];
-        assert_eq!(
-            review_markdown_report(&files, &[], &[]),
-            "**Patch approved**"
-        );
-
-        // Otherwise: statuses, line comments, notes, then the verdict.
-        let files = vec![
-            entry("a.txt", ReviewStatus::Approved),
-            entry("b.rs", ReviewStatus::Rejected),
-        ];
-        let comments = vec![ReviewComment {
-            file: "b.rs".to_string(),
-            line: 4,
-            text: "tighten this".to_string(),
-        }];
-        let notes = vec!["overall solid".to_string()];
-        assert_eq!(
-            review_markdown_report(&files, &comments, &notes),
-            "- **a.txt**: Approved\n\
-             - **b.rs**: Rejected\n\
-             \n\
-             - b.rs:5: tighten this\n\
-             \n\
-             - overall solid\n\
-             \n\
-             **Patch rejected**"
+        let (lines, markdown) = review_exit_output(&files, &[], &[]);
+        // Every category reports "No issues found" and the Conclusion approves
+        // the patch with no rejected/not-reviewed files to list.
+        assert!(markdown.ends_with("## Conclusion\n\n**Patch approved**"));
+        assert!(markdown.contains("## Overall\n\nNo issues found"));
+        // The rendered output window shows the bold verdict.
+        assert!(
+            lines.contains(&"\x1b[1mPatch approved\x1b[0m".to_string()),
+            "{lines:?}"
         );
     }
 

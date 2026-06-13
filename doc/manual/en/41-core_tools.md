@@ -479,17 +479,17 @@ Press `Alt+e` to open the currently selected file in your `$EDITOR` — the same
 
 ### Commenting on a line
 
-Move the highlighted line to the place you want to comment on and press `Alt+c`. A small comment window opens **inline, just below that line** in the left pane. Type your note (it wraps and the five-line window scrolls if the comment is long), then press `Enter` to save it or `Esc` to discard it.
+Move the highlighted line to the place you want to comment on and press `Alt+c`. A small comment window opens **inline, just below that line** in the left pane. Its first row is a single-line **category selector** — the same categories as `/auto_review`: **Overall**, **Code**, **Security**, **Memory**, **Performance**, **Test Suite**, and **Documentation** — and below it the comment text. The focus starts on the text, so you can type right away (it wraps and the five-line window scrolls if the comment is long). Press `Tab` to switch the focus between the category selector and the comment text; while the selector has the focus, `Up`/`Down` move through the categories. Press `Enter` to save the comment or `Esc` to discard it.
 
-Each comment is recorded against the file and that diff line; lines with a comment are flagged with an amber dot at the right edge. Pressing `Alt+c` on a line that already has a comment re-opens it for editing, and saving an empty comment removes it.
+Each comment defaults to the **Overall** category and is recorded against the file, that diff line, and the chosen category; lines with a comment are flagged with an amber dot at the right edge. Pressing `Alt+c` on a line that already has a comment re-opens it for editing — pre-filled with both its category and text — and saving an empty comment removes it.
 
 You can also add a **general note** about the patch: type `# <note>` in the input window and press `Enter` (or `Alt+o`). Instead of being sent to the model, it is recorded as a general note (the `#` is dropped). Anything not starting with `#` is still treated as an LLM request.
 
-When you leave review mode (`Alt+x`), a summary is written to the output window. Each file is listed with its status and a colored dot — `<file>: Approved` with a green dot, `Rejected` with a red dot, or `No review` with a white dot (for unmarked files) — followed by the line comments, one per line, as `<file>:<line>: <comment>` (ordered by file then line, with 1-based line numbers), then the general notes (with the `#` removed). The summary ends with a bold verdict line. If every file is approved and there are no comments or notes the summary is just `Patch approved`; otherwise (any file rejected or unreviewed, or any comment/note) the verdict is `Patch rejected`.
+When you leave review mode (`Alt+x`), a **category-grouped report** is written to the output window, laid out like the `/auto_review` report. Each category — **Overall**, **Code**, **Security**, **Memory**, **Performance**, **Test Suite**, and **Documentation** — is a heading, under which its line comments appear as a bullet list (`<file>:<line>: <comment>`, ordered by file then line, with 1-based line numbers); a category with no comments reads `No issues found`. The general `# <note>` notes are whole-patch commentary, so they lead the **Overall** category. The report closes with a **Conclusion**: the bold verdict — `Patch approved` when every file is approved, otherwise `Patch rejected` — followed by any `Rejected:` or `Not reviewed:` files (approved files are implied by the verdict).
 
-The comments — both the line comments and the general (`#`) notes — are copied to the system clipboard; the per-file statuses and the verdict are not. If the clipboard cannot be reached (for example on a headless machine), a short note is shown instead and the output-window summary is unaffected.
+The whole report's Markdown is copied to the system clipboard on exit. If the clipboard cannot be reached (for example on a headless machine), a short note is shown instead and the output-window report is unaffected.
 
-The full summary — statuses, comments, notes, and the verdict — is also kept as Markdown for the rest of the session, so `/comment <number> with review` can post it on a GitHub/GitLab issue (see the `/comment` tool in the Git tools chapter).
+The same Markdown is also kept for the rest of the session, so `/comment <number> with review` can post it on a GitHub/GitLab issue (see the `/comment` tool in the Git tools chapter) and `/export review` can write it to a PDF (see the `/export` tool).
 
 ### Key bindings
 
@@ -499,7 +499,7 @@ The full summary — statuses, comments, notes, and the verdict — is also kept
 | `Alt+k` | Select the previous file (shows its diff in the left pane) |
 | `Alt+a` | Mark the selected file approved (green dot) |
 | `Alt+r` | Mark the selected file rejected (red dot) |
-| `Alt+c` | Comment on the highlighted line (`Enter` saves, `Esc` discards) |
+| `Alt+c` | Comment on the highlighted line — pick a category (`Tab` to focus it, `Up`/`Down` to move), `Enter` saves, `Esc` discards |
 | `Alt+e` | Open the selected file in your configured editor |
 | `Alt+o` / `Enter` | Ask the model to review the selected file using the typed request |
 | `Esc` `Esc` | Cancel an in-progress review request (while the model is thinking) |

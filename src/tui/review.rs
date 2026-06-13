@@ -46,8 +46,14 @@ pub struct ReviewFeedbackView<'a> {
     pub x_offset: usize,
 }
 
-/// The inline comment editor shown below the highlighted line.
+/// The inline comment editor shown below the highlighted line: a single
+/// category-selector row above the multi-line comment text.
 pub struct ReviewCommentEditor<'a> {
+    /// The chosen category name (e.g. `Overall`), shown on the selector row.
+    pub category: &'a str,
+    /// `true` while the focus is on the category selector (Up/Down move it);
+    /// `false` while it is on the comment text (where the caret is drawn).
+    pub selector_focused: bool,
     pub text: &'a str,
     pub cursor: usize,
 }
@@ -295,7 +301,13 @@ fn render_review_left_column(
 
     // The comment editor is open: emit diff lines from `scroll`, and after the
     // highlighted line, splice in the comment box.
-    let box_rows = render_review_comment_box(editor.text, editor.cursor, left_width);
+    let box_rows = render_review_comment_box(
+        editor.category,
+        editor.selector_focused,
+        editor.text,
+        editor.cursor,
+        left_width,
+    );
     let mut cells: Vec<String> = Vec::with_capacity(body_height);
     let mut index = args.scroll;
     let mut box_shown = false;
@@ -326,30 +338,51 @@ fn render_review_left_column(
     cells
 }
 
-/// Render the inline comment editor box (a fixed-height window). The text wraps
-/// to the pane width and scrolls to keep the cursor visible.
-fn render_review_comment_box(text: &str, cursor: usize, width: usize) -> Vec<String> {
+/// Render the inline comment editor box: a single category-selector row above a
+/// fixed-height comment window. The comment text wraps to the pane width and
+/// scrolls to keep the cursor visible. The chosen category is inverted while
+/// the selector has the focus; otherwise the caret is drawn in the comment.
+fn render_review_comment_box(
+    category: &str,
+    selector_focused: bool,
+    text: &str,
+    cursor: usize,
+    width: usize,
+) -> Vec<String> {
     let inner_width = width.saturating_sub(2).max(1);
+    // Greenish gutter bar; reset only the foreground so the comment background
+    // spans the whole row, padded to the inner width.
+    let gutter = |content: &str| {
+        let visible = visible_line_width(content);
+        let padding = " ".repeat(inner_width.saturating_sub(visible));
+        format!("{REVIEW_COMMENT_BG}\x1b[38;2;120;160;120m▕\x1b[39m {content}{padding}{ANSI_RESET}")
+    };
+
+    // The category selector: the chosen category on one line, inverted while
+    // it has the focus, followed by the navigation hint.
+    let chosen = if selector_focused {
+        format!("\x1b[7m {category} \x1b[27m")
+    } else {
+        format!("[{category}]")
+    };
+    let mut rows = Vec::with_capacity(REVIEW_COMMENT_BOX_HEIGHT + 1);
+    rows.push(gutter(&format!(
+        "Category: {chosen}  \x1b[2m↑/↓ Category · Tab Switch focus\x1b[22m"
+    )));
+
     let wrapped = wrapped_input_lines(text, inner_width, "");
     let (cursor_row, cursor_col) = cursor_position(text, cursor, inner_width, "");
     let start = cursor_row.saturating_sub(REVIEW_COMMENT_BOX_HEIGHT - 1);
-
-    (0..REVIEW_COMMENT_BOX_HEIGHT)
-        .map(|row| {
-            let index = start + row;
-            let mut content = wrapped.get(index).cloned().unwrap_or_default();
-            if index == cursor_row {
-                content = comment_caret(&content, cursor_col, inner_width);
-            }
-            let visible = visible_line_width(&content);
-            let padding = " ".repeat(inner_width.saturating_sub(visible));
-            // Greenish gutter bar; reset only the foreground so the comment
-            // background spans the whole row.
-            format!(
-                "{REVIEW_COMMENT_BG}\x1b[38;2;120;160;120m▕\x1b[39m {content}{padding}{ANSI_RESET}"
-            )
-        })
-        .collect()
+    for row in 0..REVIEW_COMMENT_BOX_HEIGHT {
+        let index = start + row;
+        let mut content = wrapped.get(index).cloned().unwrap_or_default();
+        // The caret is only drawn while the comment text has the focus.
+        if index == cursor_row && !selector_focused {
+            content = comment_caret(&content, cursor_col, inner_width);
+        }
+        rows.push(gutter(&content));
+    }
+    rows
 }
 
 /// Wrap multi-line text to `width` visible columns: each logical line (split
@@ -610,6 +643,8 @@ mod tests {
         let mut args = review_args(&files, 0, 0, 50, 14);
         args.line = 1;
         args.comment_editor = Some(super::ReviewCommentEditor {
+            category: "Overall",
+            selector_focused: false,
             text: "needs a guard",
             cursor: "needs a guard".len(),
         });
@@ -617,20 +652,26 @@ mod tests {
         let rows: Vec<&str> = rendered.split("\r\n").collect();
 
         // Find the body row holding the highlighted line, then assert the next
-        // five rows are the comment box (they carry the comment background and
-        // the typed text appears within them).
+        // six rows are the comment box: a category selector row followed by the
+        // five comment rows (they carry the comment background and the typed
+        // text appears within them).
         let line_row = rows
             .iter()
             .position(|row| row.contains("line one"))
             .expect("highlighted line present");
-        let box_block = rows[line_row + 1..line_row + 1 + 5].join("\n");
+        let box_block = rows[line_row + 1..line_row + 1 + 6].join("\n");
         assert!(
             box_block.contains("\u{1b}[48;2;38;48;38m"),
             "comment box background missing below the line"
         );
+        // The category selector row leads the box, defaulting to Overall.
+        assert!(
+            rows[line_row + 1].contains("Category: [Overall]"),
+            "category selector row missing"
+        );
         assert!(box_block.contains("needs a guard"), "comment text missing");
         // The line after the box continues the diff.
-        assert!(rows[line_row + 6].contains("line two"));
+        assert!(rows[line_row + 7].contains("line two"));
     }
 
     #[test]
