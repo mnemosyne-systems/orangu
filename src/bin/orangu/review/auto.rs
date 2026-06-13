@@ -495,6 +495,30 @@ pub(crate) fn auto_review_finding_location(path: &str, line: Option<&str>) -> St
     }
 }
 
+/// Whether `text` is a "no findings" placeholder rather than a real finding:
+/// empty, or a `None`/`no issues`/... word — possibly with a trailing
+/// parenthetical justification (`None (no direct memory risk)`) or surrounding
+/// punctuation. The model emits these when a category is clean, and they must
+/// never reach the report.
+pub(crate) fn auto_review_is_placeholder(text: &str) -> bool {
+    // Drop a trailing `(...)` justification, but only when something precedes
+    // it — a finding that is wholly parenthesized is kept as content.
+    let core = match text
+        .strip_suffix(')')
+        .and_then(|head| head.rsplit_once('('))
+    {
+        Some((before, _)) if !before.trim().is_empty() => before.trim(),
+        _ => text.trim(),
+    };
+    let lower = core.to_ascii_lowercase();
+    let lower = lower.trim_end_matches(['.', '!']);
+    lower.is_empty()
+        || matches!(
+            lower,
+            "none" | "no findings" | "no issues" | "no issues found" | "nothing" | "n/a"
+        )
+}
+
 /// The body of a finding line: bullet markers and list numbering stripped;
 /// `None` for blank lines and "no findings" placeholders.
 pub(crate) fn auto_review_finding_body(line: &str) -> Option<String> {
@@ -509,25 +533,13 @@ pub(crate) fn auto_review_finding_body(line: &str) -> Option<String> {
         _ => body,
     };
     // A finding may carry a leading `line:` / `start-end:` reference; look past
-    // it for the "None" placeholder check so `95-96: None` is dropped too, not
-    // recorded as a finding against the category.
+    // it for the placeholder check. A clean category may also fill the line
+    // slot itself with `None`, leaving the bare line `None: None`, so the
+    // actual finding text is whatever follows the last colon — drop the line
+    // when that, or the whole body, is a placeholder.
     let (_, text) = auto_review_split_line(body);
-    // A "None" verdict may trail a parenthetical justification, e.g.
-    // `None (no direct memory risk)`; strip a closing `(...)` group so the
-    // placeholder is still recognized and the line is dropped, not recorded.
-    let core = text
-        .strip_suffix(')')
-        .and_then(|head| head.rsplit_once('('))
-        .map(|(before, _)| before.trim())
-        .unwrap_or(text);
-    let lower = core.to_ascii_lowercase();
-    let lower = lower.trim_end_matches(['.', '!']);
-    if text.is_empty()
-        || matches!(
-            lower,
-            "none" | "no findings" | "no issues" | "no issues found" | "nothing" | "n/a"
-        )
-    {
+    let finding_text = text.rsplit_once(':').map_or(text, |(_, last)| last);
+    if auto_review_is_placeholder(text) || auto_review_is_placeholder(finding_text) {
         None
     } else {
         Some(body.to_string())
@@ -1260,6 +1272,10 @@ mod tests {
             // placeholder, not a finding.
             "VERDICT: APPROVE\nFINDINGS:\n- 152-155: None (no direct memory risk)\n",
             "VERDICT: APPROVE\nFINDINGS:\n- No issues (documentation only)\n",
+            // The model may also fill the line slot with `None`, leaving a bare
+            // `None: None` (optionally with a justification).
+            "VERDICT: APPROVE\nFINDINGS:\n- None: None\n",
+            "VERDICT: APPROVE\nFINDINGS:\n- None: None (nothing to flag)\n",
         ] {
             let (approved, findings) = parse_auto_review_category_response(clean);
             assert_eq!(approved, Some(true));
