@@ -185,15 +185,40 @@ pub(crate) async fn wait_for_response(
                     if let Some(outcome) = result.outcome {
                         match outcome {
                             InputResult::Submitted(line) => {
-                                let had_pending = pending_commands.len();
-                                let _ = prepare_submitted_input(
-                                    &line,
-                                    history,
-                                    history_path,
-                                    output_state,
-                                    Some(pending_commands),
-                                )?;
-                                redraw = redraw || pending_commands.len() != had_pending || !line.trim().is_empty();
+                                match parse_local_command(line.trim()) {
+                                    Some(LocalCommand::PendingList) => {
+                                        output_state
+                                            .push_text(&format_pending_list(pending_commands));
+                                        redraw = true;
+                                    }
+                                    Some(LocalCommand::PendingDelete(Some(index))) => {
+                                        apply_pending_delete(
+                                            index,
+                                            pending_commands,
+                                            output_state,
+                                        );
+                                        redraw = true;
+                                    }
+                                    Some(LocalCommand::PendingDelete(None)) => {
+                                        output_state.push_text(
+                                            "Usage: /pending delete <number>. Use /pending to list.",
+                                        );
+                                        redraw = true;
+                                    }
+                                    _ => {
+                                        let had_pending = pending_commands.len();
+                                        let _ = prepare_submitted_input(
+                                            &line,
+                                            history,
+                                            history_path,
+                                            output_state,
+                                            Some(pending_commands),
+                                        )?;
+                                        redraw = redraw
+                                            || pending_commands.len() != had_pending
+                                            || !line.trim().is_empty();
+                                    }
+                                }
                             }
                             InputResult::Refresh => {}
                             InputResult::Quit => return Ok(WaitResult::Quit),
@@ -436,6 +461,33 @@ pub(crate) fn is_wait_cancel_escape(event: &Event) -> bool {
             ..
         })
     )
+}
+
+pub(crate) fn format_pending_list(pending: &VecDeque<String>) -> String {
+    if pending.is_empty() {
+        "No pending commands.".to_string()
+    } else {
+        let mut lines = vec!["Pending commands:".to_string()];
+        for (i, cmd) in pending.iter().enumerate() {
+            lines.push(format!("  {}. {}", i + 1, cmd));
+        }
+        lines.join("\n")
+    }
+}
+
+pub(crate) fn apply_pending_delete(
+    index: usize,
+    pending: &mut VecDeque<String>,
+    output_state: &mut OutputState,
+) {
+    if index == 0 || index > pending.len() {
+        output_state.push_text(&format!(
+            "No pending command at index {index}. Use /pending to list."
+        ));
+    } else {
+        let removed = pending.remove(index - 1).expect("index validated");
+        output_state.push_text(&format!("Removed: {removed}"));
+    }
 }
 
 pub(crate) fn final_pending_line(streamed_output: &str, response: &str) -> Option<String> {

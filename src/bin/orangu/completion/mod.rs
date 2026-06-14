@@ -69,6 +69,7 @@ pub const COMMANDS: &[&str] = &[
     "/squash",
     "/stash",
     "/open_file",
+    "/pending",
     "/session",
     "/manual",
     "/usage",

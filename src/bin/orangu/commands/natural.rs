@@ -271,6 +271,11 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "prune sessions in ",
     "prune all",
     "prune",
+    // --- pending ---
+    "pending",
+    "list pending",
+    "pending list",
+    "show pending",
     // --- usage ---
     "usage",
     "show usage",
@@ -703,6 +708,12 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     if matches_ci(input, &["prune"]) {
         return Some(LocalCommand::Prune(None));
+    }
+    if matches_ci(
+        input,
+        &["pending", "list pending", "pending list", "show pending"],
+    ) {
+        return Some(LocalCommand::PendingList);
     }
     if matches_ci(input, &["usage", "show usage"]) {
         return Some(LocalCommand::Usage);

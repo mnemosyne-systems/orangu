@@ -585,6 +585,16 @@ async fn run() -> Result<()> {
                 output_state.clear();
                 continue;
             }
+            CommandOutcome::PendingList => {
+                output_state.push_text(&format_pending_list(&pending_commands));
+                output_state.reset_scroll();
+                continue;
+            }
+            CommandOutcome::PendingDelete(index) => {
+                apply_pending_delete(index, &mut pending_commands, &mut output_state);
+                output_state.reset_scroll();
+                continue;
+            }
             CommandOutcome::Output(output) => {
                 output_state.push_text(&output);
                 if config.feedback {
