@@ -112,6 +112,11 @@ pub(crate) struct AutoReviewState {
     pub(crate) started: std::time::Instant,
     /// When the run ended (done or cancelled); freezes the `Time:` element.
     pub(crate) finished: Option<std::time::Instant>,
+    /// Projected instant the run will finish, set after each completed request
+    /// from the average time per request so far; drives the `Estimated:`
+    /// element, which counts down toward it. `None` until the first request
+    /// completes.
+    pub(crate) projected_finish: Option<std::time::Instant>,
     /// The run finished every file and the overall pass.
     pub(crate) done: bool,
     /// The run was cancelled with Esc Esc.
@@ -135,6 +140,7 @@ impl AutoReviewState {
             status: "Starting".to_string(),
             started: std::time::Instant::now(),
             finished: None,
+            projected_finish: None,
             done: false,
             cancelled: false,
             reject: None,
@@ -149,14 +155,53 @@ impl AutoReviewState {
             .saturating_duration_since(self.started)
     }
 
-    /// The status area's full text: the current activity, then the total time
-    /// spent on the run (after the progress information).
+    /// Recompute the projected finish from the work done so far: the average
+    /// time per completed request extrapolated over the requests still to run.
+    /// Called after each request completes so the `Estimated:` element counts
+    /// down toward zero as the run progresses. A no-op until at least one
+    /// request has completed, since there is nothing to average yet.
+    pub(crate) fn update_estimate(&mut self, completed: usize, total_requests: usize) {
+        if completed == 0 {
+            return;
+        }
+        let total = total_requests.max(1);
+        // Saturating casts so a pathological request count can't overflow the
+        // u32 arithmetic; in practice both are well under a few hundred.
+        let remaining = u32::try_from(total.saturating_sub(completed)).unwrap_or(u32::MAX);
+        let completed = u32::try_from(completed).unwrap_or(u32::MAX);
+        // Multiply the elapsed time before dividing so the per-request average
+        // keeps full (nanosecond) resolution instead of truncating up front,
+        // and saturate the multiply so the Duration can't overflow.
+        let remaining = self.elapsed().saturating_mul(remaining) / completed;
+        self.projected_finish = Some(std::time::Instant::now() + remaining);
+    }
+
+    /// Time still expected before the run finishes, counting down from the last
+    /// projection. `None` until the first request completes, and once the run
+    /// ends (the `Estimated:` element drops away, leaving only the frozen
+    /// `Time:`).
+    pub(crate) fn estimated_remaining(&self) -> Option<std::time::Duration> {
+        if self.finished.is_some() {
+            return None;
+        }
+        self.projected_finish
+            .map(|finish| finish.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// The status area's full text: the current activity, the total time spent
+    /// on the run, and — while the run is in progress — the estimated time
+    /// left, all after the progress information.
     pub(crate) fn status_text(&self) -> String {
-        format!(
+        let mut text = format!(
             "{}  Time: {}",
             self.status,
             orangu::tui::format_status_duration(self.elapsed()),
-        )
+        );
+        if let Some(remaining) = self.estimated_remaining() {
+            text.push_str("  Estimated: ");
+            text.push_str(&orangu::tui::format_status_duration(remaining));
+        }
+        text
     }
 
     /// The patch verdict opening the `Conclusion` category: `orangu approves
@@ -823,6 +868,7 @@ pub(crate) async fn run_auto_review_mode(
             match outcome {
                 AutoReviewRequestOutcome::Completed(Ok(text)) => {
                     completed += 1;
+                    state.update_estimate(completed, total_requests);
                     // No tools run during auto review requests.
                     usage_stats.record_response(
                         llm_start.elapsed(),
@@ -847,6 +893,7 @@ pub(crate) async fn run_auto_review_mode(
                 }
                 AutoReviewRequestOutcome::Completed(Err(err)) => {
                     completed += 1;
+                    state.update_estimate(completed, total_requests);
                     any_failed = true;
                     state.record_failure(index, category, &err);
                 }
@@ -1562,9 +1609,22 @@ mod tests {
         let time = text.find("  Time: ").expect("time in status");
         assert!(time > progress, "expected Time after Progress in {text:?}");
 
+        // No estimate until the first request completes; once one has, the
+        // estimate follows `Time:`.
+        assert!(!text.contains("Estimated:"), "{text:?}");
+        state.update_estimate(1, 13);
+        let text = state.status_text();
+        let estimated = text.find("  Estimated: ").expect("estimate in status");
+        assert!(
+            estimated > time,
+            "expected Estimated after Time in {text:?}"
+        );
+
+        // The estimate drops away once the run ends; `Time:` freezes.
         state.finish();
         let frozen = state.status_text();
         assert!(frozen.starts_with("Done  Time: "));
+        assert!(!frozen.contains("Estimated:"), "{frozen:?}");
         assert_eq!(frozen, state.status_text());
     }
 
