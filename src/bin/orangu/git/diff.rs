@@ -170,6 +170,31 @@ pub fn collect_review_diff(workspace: &Path) -> Result<ReviewDiff> {
     })
 }
 
+/// The repo-relative paths changed on the current branch against the default
+/// branch's merge base — the files a single-file `/auto_review` can target on a
+/// non-default branch, and the candidates its Tab completion offers there.
+/// Returns an empty list outside a repository or on any git error, so
+/// completion degrades quietly.
+pub fn review_changed_paths(workspace: &Path) -> Vec<String> {
+    let Some(repo_root) = discover_git_root(workspace) else {
+        return Vec::new();
+    };
+    let Ok(base_ref) = git_find_base_ref(&repo_root) else {
+        return Vec::new();
+    };
+    let merge_base = git_merge_base(&repo_root, &base_ref).unwrap_or(base_ref);
+    run_git_diff_capture(&repo_root, &["--name-only", &merge_base])
+        .map(|output| {
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn git_merge_base(repo_root: &Path, base_ref: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")

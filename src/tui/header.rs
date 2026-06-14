@@ -145,7 +145,7 @@ pub fn help_text() -> &'static str {
 /build                                        Build the project
 /export [console|review]                      Export the output window (console) or the last review report (review) to a PDF in the workspace root
 /add_file <path>                              Stage a file or directory with git add
-/auto_review                                  LLM auto review of branch changes against main/master in a split view
+/auto_review [<file>]                         LLM auto review in a split view: the whole branch, or one Tab-completed file (the full file on main/master, its changes on a branch)
 /amend <message>                              Rewrite the last commit message with git commit --amend
 /branch [<name>|-a|-b|-m|-d <name>]           List, switch, create, rename or delete a branch
 /cherry_pick <commit>                         Cherry-pick a commit onto the current branch

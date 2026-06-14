@@ -23,6 +23,20 @@ pub(crate) fn local_command_error(err: Error) -> CommandOutcome {
     }
 }
 
+/// Refuse the review when the branch is behind main/master: it would run
+/// against stale code, so point at `/rebase` instead. Returns the error outcome
+/// to surface, or `None` when the branch is up to date.
+fn behind_default_branch_guard(workspace: &Path) -> Option<CommandOutcome> {
+    match git::behind_default_branch(workspace) {
+        Ok((0, _)) => None,
+        Ok((behind, base_ref)) => Some(CommandOutcome::OutputError(format!(
+            "The branch is {behind} commit{} behind {base_ref}; run /rebase before reviewing.",
+            if behind == 1 { "" } else { "s" }
+        ))),
+        Err(err) => Some(local_command_error(err)),
+    }
+}
+
 /// Collect the launch data shared by `/review` and `/auto_review`, wrapped in
 /// the caller's `CommandOutcome` variant. A review only starts on an
 /// up-to-date branch: when the branch is behind main/master the review would
@@ -31,15 +45,8 @@ pub(crate) fn review_outcome(
     workspace: &Path,
     launch_outcome: impl FnOnce(ReviewLaunch) -> CommandOutcome,
 ) -> CommandOutcome {
-    match git::behind_default_branch(workspace) {
-        Ok((0, _)) => {}
-        Ok((behind, base_ref)) => {
-            return CommandOutcome::OutputError(format!(
-                "The branch is {behind} commit{} behind {base_ref}; run /rebase before reviewing.",
-                if behind == 1 { "" } else { "s" }
-            ));
-        }
-        Err(err) => return local_command_error(err),
+    if let Some(refusal) = behind_default_branch_guard(workspace) {
+        return refusal;
     }
     match collect_review_diff(workspace) {
         Ok(review) if review.files.is_empty() => CommandOutcome::Output(format!(
@@ -61,6 +68,119 @@ pub(crate) fn review_outcome(
         }
         Err(err) => local_command_error(err),
     }
+}
+
+/// Launch an `/auto_review` of a single file. On main/master the whole file is
+/// reviewed (a full read of its current content); on any other branch only the
+/// file's changes against the default branch are reviewed. This mirrors what
+/// Tab completion offers for `/auto_review <file>` (every tracked file on
+/// main/master, only the changed files on a branch). The report style is
+/// identical to a whole-branch run — there is just one file in the checklist.
+pub(crate) fn auto_review_file_outcome(workspace: &Path, file: &str) -> CommandOutcome {
+    let Some(repo_root) = git::discover_git_root(workspace) else {
+        return CommandOutcome::OutputError(
+            "auto review is only available inside a Git repository".to_string(),
+        );
+    };
+    let on_protected = match git::git_current_branch(&repo_root) {
+        Ok(branch) => git::is_protected_branch(&branch),
+        Err(err) => return local_command_error(err),
+    };
+
+    let entry = if on_protected {
+        match full_file_review_entry(workspace, &repo_root, file) {
+            Ok(entry) => entry,
+            Err(err) => return local_command_error(err),
+        }
+    } else {
+        // On a branch only the file's changes against main/master are reviewed,
+        // and only a file that actually changed can be reviewed — the same
+        // branch-must-be-rebased guard as a whole-branch run applies.
+        if let Some(refusal) = behind_default_branch_guard(workspace) {
+            return refusal;
+        }
+        match collect_review_diff(workspace) {
+            Ok(review) => {
+                let base_label = review.base_label.clone();
+                match review
+                    .files
+                    .into_iter()
+                    .find(|f| review_path_matches(&f.path, file))
+                {
+                    Some(f) => ReviewEntry {
+                        path: f.path,
+                        status: ReviewStatus::Unreviewed,
+                        diff_lines: f.lines,
+                        patch: f.patch,
+                    },
+                    None => {
+                        return CommandOutcome::OutputError(format!(
+                            "'{file}' has no changes against {base_label}."
+                        ));
+                    }
+                }
+            }
+            Err(err) => return local_command_error(err),
+        }
+    };
+
+    CommandOutcome::AutoReview(ReviewLaunch { files: vec![entry] })
+}
+
+/// Whether a changed file's repo-relative `path` matches the user's `arg`: the
+/// exact path (what Tab completion fills in), or a trailing path / basename
+/// match so a hand-typed bare name like `tui.rs` still resolves.
+fn review_path_matches(path: &str, arg: &str) -> bool {
+    path == arg
+        || path.ends_with(&format!("/{arg}"))
+        || Path::new(path).file_name().and_then(|name| name.to_str()) == Some(arg)
+}
+
+/// Read a file's current content and present it as an all-added unified diff so
+/// a single-file `/auto_review` on main/master reviews the whole file with the
+/// same per-category machinery used for a change: with every line marked added,
+/// the category prompts treat the entire file as in scope.
+fn full_file_review_entry(
+    workspace: &Path,
+    repo_root: &Path,
+    file: &str,
+) -> anyhow::Result<ReviewEntry> {
+    let candidate = Path::new(file);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace.join(candidate)
+    };
+    if !absolute.is_file() {
+        return Err(LocalError::Usage(format!("No such file '{file}' to review.")).into());
+    }
+    let content = std::fs::read_to_string(&absolute)
+        .map_err(|err| anyhow!("failed to read {file}: {err}"))?;
+    // Repo-relative path for the report and prompt headers.
+    let rel = absolute
+        .strip_prefix(repo_root)
+        .unwrap_or(candidate)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let line_count = content.lines().count().max(1);
+    let mut patch = format!(
+        "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{line_count} @@\n"
+    );
+    let mut diff_lines = Vec::new();
+    for line in content.lines() {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+        diff_lines.push(format!("+{line}"));
+    }
+
+    Ok(ReviewEntry {
+        path: rel,
+        status: ReviewStatus::Unreviewed,
+        diff_lines,
+        patch,
+    })
 }
 
 pub(crate) fn handle_command(
@@ -197,7 +317,10 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Review => Ok(review_outcome(workspace, CommandOutcome::Review)),
-        LocalCommand::AutoReview => Ok(review_outcome(workspace, CommandOutcome::AutoReview)),
+        LocalCommand::AutoReview(None) => Ok(review_outcome(workspace, CommandOutcome::AutoReview)),
+        LocalCommand::AutoReview(Some(file)) => {
+            Ok(auto_review_file_outcome(workspace, file.trim()))
+        }
         LocalCommand::Status => match status_output(workspace) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
@@ -475,6 +598,100 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn review_path_matches_accepts_exact_paths_and_bare_names() {
+        // The full repo-relative path (what Tab completion fills in) matches...
+        assert!(review_path_matches("src/tui.rs", "src/tui.rs"));
+        // ...as does a bare basename or a trailing path segment.
+        assert!(review_path_matches("src/tui.rs", "tui.rs"));
+        assert!(review_path_matches("a/b/tui.rs", "b/tui.rs"));
+        // A different file does not match.
+        assert!(!review_path_matches("src/tui.rs", "main.rs"));
+        assert!(!review_path_matches("src/tui.rs", "ui.rs"));
+    }
+
+    #[test]
+    fn auto_review_file_on_main_reviews_the_whole_file() {
+        let _env_lock = crate::process_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home = crate::git::EnvVarGuard::set_path("HOME", home.path());
+        crate::git::init_git_for_test(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::create_dir(workspace.path().join("src")).expect("src dir");
+        fs::write(
+            workspace.path().join("src/tui.rs"),
+            "fn main() {}\nlet x = 1;\n",
+        )
+        .expect("file");
+        crate::git::git_run(workspace.path(), &["add", "."]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+
+        // On main the whole file is reviewed: a one-file launch whose patch is
+        // the file content as an all-added diff.
+        match auto_review_file_outcome(workspace.path(), "src/tui.rs") {
+            CommandOutcome::AutoReview(launch) => {
+                assert_eq!(launch.files.len(), 1);
+                let entry = &launch.files[0];
+                assert_eq!(entry.path, "src/tui.rs");
+                assert!(
+                    entry
+                        .patch
+                        .starts_with("diff --git a/src/tui.rs b/src/tui.rs")
+                );
+                assert!(entry.patch.contains("+fn main() {}"));
+                assert!(entry.patch.contains("+let x = 1;"));
+            }
+            _ => panic!("expected an AutoReview outcome for a file on main"),
+        }
+
+        // An unknown file is refused.
+        assert!(matches!(
+            auto_review_file_outcome(workspace.path(), "src/missing.rs"),
+            CommandOutcome::OutputError(_)
+        ));
+    }
+
+    #[test]
+    fn auto_review_file_on_branch_reviews_only_the_change() {
+        let _env_lock = crate::process_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home = crate::git::EnvVarGuard::set_path("HOME", home.path());
+        crate::git::init_git_for_test(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::write(workspace.path().join("README.md"), "one\ntwo\n").expect("file");
+        crate::git::git_run(workspace.path(), &["add", "."]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+
+        crate::git::git_run(workspace.path(), &["checkout", "-b", "feature/x"]);
+        fs::write(workspace.path().join("README.md"), "one\ntwo\nthree\n").expect("edit");
+        crate::git::git_run(workspace.path(), &["commit", "-am", "edit"]);
+
+        // The changed file is reviewed against the merge base: the patch shows
+        // only the added line, not the whole file.
+        match auto_review_file_outcome(workspace.path(), "README.md") {
+            CommandOutcome::AutoReview(launch) => {
+                assert_eq!(launch.files.len(), 1);
+                let patch = &launch.files[0].patch;
+                assert!(patch.contains("+three"), "{patch:?}");
+                assert!(!patch.contains("+one"), "{patch:?}");
+            }
+            _ => panic!("expected an AutoReview outcome for a changed file on a branch"),
+        }
+
+        // A file with no changes on the branch is refused.
+        fs::write(workspace.path().join("other.txt"), "x\n").expect("other");
+        assert!(matches!(
+            auto_review_file_outcome(workspace.path(), "other.txt"),
+            CommandOutcome::OutputError(_)
+        ));
+    }
 
     #[test]
     fn open_file_failure_returns_output_instead_of_error() {

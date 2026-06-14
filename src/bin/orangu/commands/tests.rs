@@ -437,8 +437,23 @@ fn parses_review_commands() {
 fn parses_auto_review_commands() {
     for input in ["/auto_review", "auto review", "Auto Review"] {
         assert!(
-            matches!(parse_local_command(input), Some(LocalCommand::AutoReview)),
-            "expected {input:?} to parse as AutoReview"
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AutoReview(None))
+            ),
+            "expected {input:?} to parse as a whole-branch AutoReview"
+        );
+    }
+
+    // The slash command and its natural-language form both carry the file
+    // argument for a single-file review.
+    for input in ["/auto_review src/tui.rs", "auto review src/tui.rs"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AutoReview(Some(file))) if file == "src/tui.rs"
+            ),
+            "expected {input:?} to carry the path"
         );
     }
 }

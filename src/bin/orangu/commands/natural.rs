@@ -363,8 +363,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::Review);
     }
+    if let Some(file) = strip_ascii_prefix(input, "auto review ") {
+        let file = file.trim();
+        if !file.is_empty() {
+            return Some(LocalCommand::AutoReview(Some(Cow::Borrowed(file))));
+        }
+    }
     if matches_ci(input, &["auto review"]) {
-        return Some(LocalCommand::AutoReview);
+        return Some(LocalCommand::AutoReview(None));
     }
     // Checked before the more specific buffers: "export console" / "export
     // review" select a buffer, while a bare "export" defaults to the console.

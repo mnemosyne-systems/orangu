@@ -49,7 +49,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/prune" => Some(LocalCommand::Prune(None)),
         "/pull_request" => Some(LocalCommand::CreatePullRequest),
         "/review" => Some(LocalCommand::Review),
-        "/auto_review" => Some(LocalCommand::AutoReview),
+        "/auto_review" => Some(LocalCommand::AutoReview(None)),
         "/export" => Some(LocalCommand::Export(ExportTarget::Console)),
         "/push" => Some(LocalCommand::Push(false)),
         "/rebase" => Some(LocalCommand::Rebase),
@@ -94,6 +94,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(args) = input.strip_prefix("/show_file ") {
                 return Some(LocalCommand::ShowFile(Cow::Borrowed(args.trim())));
+            }
+            if let Some(args) = input.strip_prefix("/auto_review ") {
+                let file = args.trim();
+                return Some(LocalCommand::AutoReview(if file.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(file))
+                }));
             }
             if let Some(args) = input.strip_prefix("/export ") {
                 return parse_export_target(args.trim()).map(LocalCommand::Export);

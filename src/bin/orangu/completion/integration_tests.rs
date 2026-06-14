@@ -642,3 +642,75 @@ fn completes_cherry_pick_commits() {
         assert_eq!(start, "cherry pick ".len());
     }
 }
+
+#[test]
+fn auto_review_completes_files_by_name_per_branch() {
+    let _env_lock = crate::process_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let workspace = tempdir().expect("workspace");
+    let home = tempdir().expect("home");
+    let _home = crate::git::EnvVarGuard::set_path("HOME", home.path());
+    crate::git::init_git_for_test(workspace.path());
+
+    // A `main` branch with two committed files.
+    crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+    fs::create_dir(workspace.path().join("src")).expect("src dir");
+    fs::write(workspace.path().join("src/tui.rs"), "fn main() {}\n").expect("tui");
+    fs::write(workspace.path().join("README.md"), "# readme\n").expect("readme");
+    crate::git::git_run(workspace.path(), &["add", "."]);
+    crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+
+    // On main/master every tracked file is offered, completed by name not
+    // location: `t` resolves to `src/tui.rs`.
+    let (start, _, candidates) = completion_candidates(
+        "/auto_review t",
+        "/auto_review t".len(),
+        workspace.path(),
+        &[],
+        &[],
+    )
+    .expect("auto_review completion");
+    assert_eq!(start, "/auto_review ".len());
+    assert_eq!(candidates, vec!["src/tui.rs".to_string()]);
+
+    // The natural-language form completes the same way, case-insensitively.
+    let (start, _, candidates) = completion_candidates(
+        "Auto review t",
+        "Auto review t".len(),
+        workspace.path(),
+        &[],
+        &[],
+    )
+    .expect("auto review completion");
+    assert_eq!(start, "Auto review ".len());
+    assert_eq!(candidates, vec!["src/tui.rs".to_string()]);
+
+    // A feature branch that changes only README.md.
+    crate::git::git_run(workspace.path(), &["checkout", "-b", "feature/x"]);
+    fs::write(workspace.path().join("README.md"), "# readme\nmore\n").expect("readme edit");
+    crate::git::git_run(workspace.path(), &["commit", "-am", "edit readme"]);
+
+    // On the branch only the changed file is a candidate; the empty token lists
+    // exactly it...
+    let (_, _, candidates) = completion_candidates(
+        "/auto_review ",
+        "/auto_review ".len(),
+        workspace.path(),
+        &[],
+        &[],
+    )
+    .expect("auto_review completion");
+    assert_eq!(candidates, vec!["README.md".to_string()]);
+
+    // ...and `src/tui.rs`, unchanged on this branch, is not offered.
+    let (_, _, candidates) = completion_candidates(
+        "/auto_review t",
+        "/auto_review t".len(),
+        workspace.path(),
+        &[],
+        &[],
+    )
+    .expect("auto_review completion");
+    assert!(candidates.is_empty(), "{candidates:?}");
+}

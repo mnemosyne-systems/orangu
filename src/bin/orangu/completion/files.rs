@@ -18,7 +18,10 @@ use walkdir::WalkDir;
 
 use super::*;
 use crate::commands::{shell_words, strip_ascii_prefix};
-use crate::git::{discover_git_root, git_file_commit_hashes};
+use crate::git::{
+    discover_git_root, git_current_branch, git_file_commit_hashes, is_protected_branch,
+    review_changed_paths,
+};
 
 pub fn file_completion_candidates(token: &str, workspace: &Path) -> Vec<String> {
     let (directory, prefix) = match token.rsplit_once('/') {
@@ -111,6 +114,55 @@ pub fn show_file_completion_candidates(
     candidates.sort();
     candidates.dedup();
     Some(("/show_file ".len() + token_start, candidates))
+}
+
+/// The auto-review file argument inside `prefix`, as `(token_start, token)`:
+/// the slash command `/auto_review <file>` or the natural-language `auto review
+/// <file>` (case-insensitive). `None` when `prefix` is neither.
+fn auto_review_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
+    if let Some(token) = prefix.strip_prefix("/auto_review ") {
+        return Some(("/auto_review ".len(), token));
+    }
+    let token = strip_ascii_prefix(prefix, "auto review ")?;
+    Some((prefix.len() - token.len(), token))
+}
+
+/// Tab completion for `/auto_review <file>` and its natural-language form
+/// `auto review <file>`: the file argument completes by name, not by location —
+/// typing `t` offers `src/tui.rs`. On main/master every tracked file is a
+/// candidate (gitignored files excluded); on any other branch only the files
+/// that differ from the default branch are, matching what a single-file
+/// `/auto_review` will actually review there. Returns the token start and the
+/// candidate relative paths, or `None` when `prefix` is not an auto-review
+/// argument.
+pub fn auto_review_completion_candidates(
+    prefix: &str,
+    workspace: &Path,
+) -> Option<(usize, Vec<String>)> {
+    let (start, token) = auto_review_completion_prefix(prefix)?;
+
+    // Outside a repository, or when the branch cannot be determined, fall back
+    // to offering every file (as on main/master).
+    let on_protected = discover_git_root(workspace)
+        .and_then(|root| git_current_branch(&root).ok())
+        .map(|branch| is_protected_branch(&branch))
+        .unwrap_or(true);
+
+    let candidates = if on_protected {
+        open_file_completion_candidates(token, workspace)
+    } else {
+        review_changed_paths(workspace)
+            .into_iter()
+            .filter(|path| {
+                let file_name = Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(path.as_str());
+                open_file_completion_matches(path, file_name, token)
+            })
+            .collect()
+    };
+    Some((start, candidates))
 }
 
 pub fn open_file_completion_candidates(token: &str, workspace: &Path) -> Vec<String> {

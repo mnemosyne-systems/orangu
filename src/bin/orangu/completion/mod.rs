@@ -163,6 +163,10 @@ fn structured_completion_candidates(
         return Some((start, cursor, candidates));
     }
 
+    if let Some((start, candidates)) = auto_review_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
     if let Some((start, path_prefix)) = open_file_completion_prefix(prefix) {
         return Some((
             start,

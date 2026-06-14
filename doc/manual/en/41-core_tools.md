@@ -536,7 +536,7 @@ review branch
 
 `/auto_review` runs an LLM-driven review of the changes on the current branch, in a full-screen, two-pane view modeled on `/review`. The model reviews the changes overall and each file by itself, sorts what it finds into the **Overall**, **Code**, **Security**, **Memory**, **Performance**, **Test Suite**, and **Documentation** categories, and marks each file approved or rejected. It is available inside a Git repository and requires a connected LLM server.
 
-Enter it with the `/auto_review` command, or the natural-language form `auto review`.
+Enter it with the `/auto_review` command, or the natural-language form `auto review`. Give it a file — `/auto_review <file>` — to review just that one file instead of the whole branch (see *Reviewing a single file* below).
 
 ### What is reviewed
 
@@ -544,20 +544,29 @@ The same change set as `/review`: everything the current branch adds on top of t
 
 Like `/review`, the branch must be **up to date (rebased)** against the default branch before the auto review starts: when the branch is behind main/master, the command refuses with `The branch is N commits behind <base>; run /rebase before reviewing.` — reviewing against stale code would waste the run and could approve changes that conflict with the newer base.
 
+### Reviewing a single file
+
+`/auto_review <file>` reviews one file rather than the whole branch. The view, the categories, and the report are exactly the same as a whole-branch run — there is just one file in the checklist. What gets reviewed depends on the branch you are on:
+
+- **On `main`/`master`** the whole file is reviewed — a full read of its current content, every line in scope — not a diff. This is the way to have the model review a file that is not part of any in-progress change.
+- **On any other branch** only the file's **changes** against the default branch are reviewed, exactly as in a whole-branch run (the same rebased-branch guard applies).
+
+The natural-language form takes a file too: `auto review <file>` is equivalent to `/auto_review <file>`. The file argument is resolved by **Tab completion** in either form, and it completes on the file's **name, not its location** — typing `t` and pressing Tab offers `src/tui.rs`. The candidate list matches what will be reviewed: on `main`/`master` it is every tracked file (files ignored by `.gitignore` are excluded); on any other branch it is only the files that differ from the default branch. Selecting a candidate fills in its full repository-relative path; a hand-typed bare name (e.g. `tui.rs`) is resolved too. On a branch, a file with no changes against the default branch is refused with `'<file>' has no changes against <base>.`
+
 ### Layout
 
 The view opens with the tool header row at the top and under it the two panes, exactly like `/review`; the **status area** is the first row of the left pane, so the file checklist on the right keeps its full height. The input window stays empty — auto review takes no typed request.
 
 - **Header row** — the tool title (`Auto review: <branch>`) and the key help, with the `Files (n)` header of the right pane.
-- **Status area** — a highlighted bar across the left pane, just below the header, showing what is being worked on: the file (with its position in the file list), the category, the overall progress across all of the run's requests, and the total time spent on the run so far, e.g. `File: src/main.rs (2/5)  Category: Security  Progress: 8/26 (30%)  Time: 1m12s`. The time uses the same shortest form as the Thinking/Working timers (`5s`, `1m5s`, `1h2m3s`). After the run it shows `Done` (or `Cancelled`) with the time frozen at the run's total.
+- **Status area** — a highlighted bar across the left pane, just below the header, showing what is being worked on: the file (with its position in the file list), the category, the overall progress across all of the run's requests, the total time spent on the run so far, and the estimated time still to go, e.g. `File: src/main.rs (2/5)  Category: Security  Progress: 8/26 (30%)  Time: 1m12s  Estimated: 2m48s`. Both times use the same shortest form as the Thinking/Working timers (`5s`, `1m5s`, `1h2m3s`). The **estimate** is the average time per completed request so far extrapolated over the requests still to run; it is recomputed after each request finishes and counts down between them. It appears once the first request completes and drops away when the run ends — after the run the bar shows `Done` (or `Cancelled`) with the time frozen at the run's total.
 - **Left pane** — below the status area, the **report**, rendered from Markdown with the syntax markers consumed: one bold heading per category (Overall, Code, Security, Memory, Performance, Test Suite, Documentation), each listing the findings collected so far as a bullet list with the file names in bold, ending with the **Conclusion**. A category that has produced nothing yet shows `(pending)` while the run is in progress, and `No issues found` once it is done. The pane scrolls and pans independently.
 - **Right pane** — the checklist of changed files, one per row, as in `/review`. The file currently being reviewed is highlighted and its status box blinks a white dot until its review resolves to green or red. Once the run ends (or the whole-change pass starts) the highlight is cleared — nothing is being reviewed anymore; `Alt+j`/`Alt+k` bring it back to move through the list while browsing.
 
 While the run is in progress the header row offers the run keys (`Esc Esc Cancel  Alt+x Exit`); once the run has ended it switches to the browse keys (`Alt+j/k Switch file  Alt+a Approve  Alt+r Reject  Alt+e Open  Alt+x Exit`).
 
 ```
- Auto review: feature/x ...             |Files (3)
- File: src/main.rs (2/3) ... Time: 45s  |[*] README.md
+ Auto review: feature/x ...                          |Files (3)
+ File: src/main.rs (2/3) ... Time: 45s Estimated: 1m |[*] README.md
  Overall                                |[o] src/main.rs  <- reviewing (blinks)
    (pending)                            |[ ] src/git.rs
  Code                                   |
@@ -636,10 +645,17 @@ When the reject window is open it is modal:
 /auto_review
 ```
 
-Natural-language form:
+Review a single file (Tab-completes on the file name):
+
+```text
+/auto_review src/tui.rs
+```
+
+Natural-language form (a whole-branch review, or a single file):
 
 ```text
 auto review
+auto review src/tui.rs
 ```
 
 \newpage

@@ -236,7 +236,9 @@ pub enum LocalCommand<'a> {
     Diff(Option<Cow<'a, str>>),
     Grep(Option<Cow<'a, str>>),
     Review,
-    AutoReview,
+    /// `/auto_review` of the whole branch (`None`) or of a single file
+    /// (`Some(path)`), resolved by Tab completion.
+    AutoReview(Option<Cow<'a, str>>),
     Status,
     Log(Option<u64>),
     Pull(Option<u64>),
