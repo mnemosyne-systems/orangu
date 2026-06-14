@@ -47,32 +47,123 @@ pub(crate) const AUTO_REVIEW_CONCLUSION: &str = "Conclusion";
 
 /// File extensions detected as documentation. Such files skip the
 /// code-related checks and are reviewed only for the `Documentation` category.
-pub(crate) const AUTO_REVIEW_DOCUMENTATION_EXTENSIONS: [&str; 8] = [
-    "md", "markdown", "rst", "adoc", "asciidoc", "txt", "org", "tex",
+pub(crate) const AUTO_REVIEW_DOCUMENTATION_EXTENSIONS: [&str; 16] = [
+    "md", "markdown", "mkd", "mdown", "mdx", "rst", "adoc", "asciidoc", "txt", "text", "org",
+    "tex", "texi", "texinfo", "pod", "rdoc",
 ];
+
+/// File extensions whose changes a code review cannot act on, so a file
+/// carrying one is approved at once with no category requests — the "skip
+/// list". These are deterministic, machine-generated dependency lock files and
+/// binary assets (images, fonts, …) whose diffs are noise or unreadable.
+/// Matched alongside `AUTO_REVIEW_SKIP_FILENAMES`, which catches the lock and
+/// checksum files whose extension is shared with reviewable files.
+pub(crate) const AUTO_REVIEW_SKIP_EXTENSIONS: [&str; 20] = [
+    // Dependency lock files: Cargo.lock, poetry.lock, Pipfile.lock,
+    // Gemfile.lock, composer.lock, flake.lock, deno.lock, mix.lock, …
+    "lock", //
+    // Images.
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp", "tiff", "tif", //
+    // Fonts.
+    "otf", "ttf", "woff", "woff2", "eot", //
+    // Other binary artifacts.
+    "pdf", "p12", "jks", "keystore",
+];
+
+/// Exact file names approved at once like the skip extensions: generated lock
+/// and checksum files whose extension is shared with files a review must still
+/// read (`package-lock.json` is JSON, `pnpm-lock.yaml` is YAML, `go.sum` would
+/// match nothing), so they are matched by name rather than extension.
+pub(crate) const AUTO_REVIEW_SKIP_FILENAMES: [&str; 5] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "go.work.sum",
+];
+
+/// Exact file names that must go through the full per-file review regardless of
+/// their extension — build-system and metadata files whose extension would
+/// otherwise misclassify them. `CMakeLists.txt` and `requirements.txt` carry a
+/// `.txt` extension but are not documentation, so they are pulled back out of
+/// the documentation bucket here. Extensionless metadata (`Makefile`,
+/// `Dockerfile`) needs no entry: with no documentation or skip extension it
+/// already falls through to the full review.
+pub(crate) const AUTO_REVIEW_SOURCE_FILENAMES: [&str; 2] =
+    ["CMakeLists.txt", "requirements.txt"];
+
+/// The base file name of `path` (the final path component), or `""` when there
+/// is none.
+fn auto_review_file_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+}
+
+/// The extension of `path` (without the dot), or `""` when there is none.
+fn auto_review_extension(path: &str) -> &str {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+}
 
 /// Whether `path` is detected as documentation, by its file extension.
 pub(crate) fn auto_review_documentation_file(path: &str) -> bool {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("");
+    let extension = auto_review_extension(path);
     AUTO_REVIEW_DOCUMENTATION_EXTENSIONS
         .iter()
         .any(|known| extension.eq_ignore_ascii_case(known))
 }
 
-/// The categories scanned for `path`, enabled by its file extension: a file
-/// detected as documentation skips the code-related checks and is reviewed
-/// only for `Documentation`; everything else is scanned for every per-file
-/// category.
+/// Whether `path` is a metadata/build file that must take the full per-file
+/// review regardless of its extension (see `AUTO_REVIEW_SOURCE_FILENAMES`).
+/// Matched by name and takes precedence over the documentation and skip checks.
+pub(crate) fn auto_review_source_file(path: &str) -> bool {
+    let name = auto_review_file_name(path);
+    AUTO_REVIEW_SOURCE_FILENAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+/// Whether `path` is on the skip list: a generated lock file or binary asset
+/// whose diff a review cannot act on, matched by file name
+/// (`AUTO_REVIEW_SKIP_FILENAMES`) or by extension (`AUTO_REVIEW_SKIP_EXTENSIONS`).
+/// Such a file is approved at once, with no category requests.
+pub(crate) fn auto_review_skipped_file(path: &str) -> bool {
+    let name = auto_review_file_name(path);
+    if AUTO_REVIEW_SKIP_FILENAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+    {
+        return true;
+    }
+    let extension = auto_review_extension(path);
+    AUTO_REVIEW_SKIP_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+/// The categories scanned for `path`, enabled by its file name and extension.
+/// A forced-full metadata file (`CMakeLists.txt`, …) takes the full review
+/// whatever its extension; a skip-list file (lock files, binary assets) is
+/// approved at once with no categories; a documentation file is reviewed only
+/// for `Documentation`; and everything else — the fallback — is scanned for
+/// every per-file category.
 pub(crate) fn auto_review_file_categories(path: &str) -> &'static [(usize, &'static str)] {
+    if auto_review_source_file(path) {
+        return &AUTO_REVIEW_FILE_CATEGORIES[..];
+    }
+    if auto_review_skipped_file(path) {
+        // Approved at once: no category requests.
+        return &[];
+    }
     if auto_review_documentation_file(path) {
         // `Documentation` is the last per-file category.
-        &AUTO_REVIEW_FILE_CATEGORIES[AUTO_REVIEW_FILE_CATEGORIES.len() - 1..]
-    } else {
-        &AUTO_REVIEW_FILE_CATEGORIES[..]
+        return &AUTO_REVIEW_FILE_CATEGORIES[AUTO_REVIEW_FILE_CATEGORIES.len() - 1..];
     }
+    &AUTO_REVIEW_FILE_CATEGORIES[..]
 }
 
 /// The Alt+r reject window of `/auto_review`: the category receiving the
@@ -1728,8 +1819,8 @@ mod tests {
             &AUTO_REVIEW_FILE_CATEGORIES[..]
         );
         // Known documentation extensions go straight to Documentation,
-        // case-insensitively.
-        for path in ["README.md", "doc/manual.RST", "notes.txt"] {
+        // case-insensitively — including the extensions added to the list.
+        for path in ["README.md", "doc/manual.RST", "notes.txt", "guide.mdx"] {
             let categories = auto_review_file_categories(path);
             assert_eq!(
                 categories.len(),
@@ -1739,12 +1830,44 @@ mod tests {
             assert_eq!(AUTO_REVIEW_CATEGORIES[categories[0].0], "Documentation");
         }
 
+        // A skip-list file (lock file or binary asset) is approved at once: no
+        // categories, so no requests.
+        for path in [
+            "Cargo.lock",
+            "package-lock.json",
+            "go.sum",
+            "assets/logo.png",
+            "fonts/Inter.woff2",
+        ] {
+            assert!(
+                auto_review_file_categories(path).is_empty(),
+                "expected no categories for {path:?}"
+            );
+        }
+
+        // A forced-full metadata file takes the full review even though its
+        // `.txt` extension would otherwise read as documentation.
+        for path in ["CMakeLists.txt", "build/CMakeLists.txt", "requirements.txt"] {
+            assert_eq!(
+                auto_review_file_categories(path),
+                &AUTO_REVIEW_FILE_CATEGORIES[..],
+                "expected the full review for {path:?}"
+            );
+        }
+
         // The detection that decides whether a file's code-related checks
         // can be skipped.
-        use crate::review::auto_review_documentation_file;
+        use crate::review::{auto_review_documentation_file, auto_review_skipped_file};
         assert!(auto_review_documentation_file("README.md"));
         assert!(!auto_review_documentation_file("src/main.rs"));
         assert!(!auto_review_documentation_file("Makefile"));
+        // CMakeLists.txt is not documentation despite its extension: the
+        // metadata override wins.
+        assert!(auto_review_documentation_file("CMakeLists.txt"));
+        assert!(!auto_review_skipped_file("CMakeLists.txt"));
+        assert!(auto_review_skipped_file("Cargo.lock"));
+        assert!(auto_review_skipped_file("assets/logo.PNG"));
+        assert!(!auto_review_skipped_file("src/main.rs"));
     }
 
     #[test]
