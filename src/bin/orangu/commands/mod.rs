@@ -150,6 +150,8 @@ pub enum CommandOutcome {
     Export(ExportTarget),
     /// Enter the built-in manual viewer.
     Manual,
+    PendingList,
+    PendingDelete(usize),
 }
 
 /// Data handed to the interactive review mode: the changed files, each with its
@@ -269,6 +271,8 @@ pub enum LocalCommand<'a> {
     Build,
     Clear,
     Quit,
+    PendingList,
+    PendingDelete(Option<usize>),
 }
 
 pub struct CommandContext<'a> {

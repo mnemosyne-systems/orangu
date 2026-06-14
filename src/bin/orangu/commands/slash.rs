@@ -61,6 +61,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/usage" => Some(LocalCommand::Usage),
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
+        "/pending" => Some(LocalCommand::PendingList),
         _ => {
             if let Some(args) = input.strip_prefix("/session ") {
                 let uuid = args.trim();
@@ -268,6 +269,16 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 && args.trim().is_empty()
             {
                 return Some(LocalCommand::OpenFile(""));
+            }
+            if let Some(args) = input.strip_prefix("/pending ") {
+                let args = args.trim();
+                return Some(if args.eq_ignore_ascii_case("list") || args.is_empty() {
+                    LocalCommand::PendingList
+                } else if let Some(rest) = strip_ascii_prefix(args, "delete") {
+                    LocalCommand::PendingDelete(rest.trim().parse::<usize>().ok())
+                } else {
+                    LocalCommand::PendingList
+                });
             }
             parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
         }

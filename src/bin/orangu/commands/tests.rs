@@ -1095,3 +1095,39 @@ fn splits_editor_command_and_flags() {
         vec!["/tmp/my editor".to_string(), "--flag".to_string()]
     );
 }
+
+#[test]
+fn parses_pending_commands() {
+    assert!(matches!(
+        parse_local_command("/pending"),
+        Some(LocalCommand::PendingList)
+    ));
+    assert!(matches!(
+        parse_local_command("/pending list"),
+        Some(LocalCommand::PendingList)
+    ));
+    assert!(matches!(
+        parse_local_command("pending"),
+        Some(LocalCommand::PendingList)
+    ));
+    assert!(matches!(
+        parse_local_command("list pending"),
+        Some(LocalCommand::PendingList)
+    ));
+    assert!(matches!(
+        parse_local_command("show pending"),
+        Some(LocalCommand::PendingList)
+    ));
+    assert!(matches!(
+        parse_local_command("/pending delete"),
+        Some(LocalCommand::PendingDelete(None))
+    ));
+    match parse_local_command("/pending delete 2") {
+        Some(LocalCommand::PendingDelete(Some(2))) => {}
+        _ => panic!("expected pending delete 2"),
+    }
+    match parse_local_command("/pending delete 1") {
+        Some(LocalCommand::PendingDelete(Some(1))) => {}
+        _ => panic!("expected pending delete 1"),
+    }
+}
