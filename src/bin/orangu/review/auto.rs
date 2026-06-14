@@ -89,8 +89,7 @@ pub(crate) const AUTO_REVIEW_SKIP_FILENAMES: [&str; 5] = [
 /// the documentation bucket here. Extensionless metadata (`Makefile`,
 /// `Dockerfile`) needs no entry: with no documentation or skip extension it
 /// already falls through to the full review.
-pub(crate) const AUTO_REVIEW_SOURCE_FILENAMES: [&str; 2] =
-    ["CMakeLists.txt", "requirements.txt"];
+pub(crate) const AUTO_REVIEW_SOURCE_FILENAMES: [&str; 2] = ["CMakeLists.txt", "requirements.txt"];
 
 /// The base file name of `path` (the final path component), or `""` when there
 /// is none.
