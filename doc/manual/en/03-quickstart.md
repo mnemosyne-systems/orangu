@@ -4,6 +4,30 @@
 
 This chapter gets **orangu** running against a local OpenAI-compatible server such as **llama.cpp** with the sample configuration in `doc/etc/orangu.conf`.
 
+## Install orangu
+
+The quickest way to install the latest release binary is the one-liner installer.
+
+**Linux / macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.sh | sh
+```
+
+**Windows** (Command Prompt):
+
+```cmd
+curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.cmd -o install.cmd && install.cmd
+```
+
+**Windows** (PowerShell alternative):
+
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.cmd -OutFile install.cmd; .\install.cmd
+```
+
+The script installs to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows) and warns if the directory is not in your `PATH`. See [BUILDING.md](../../BUILDING.md) for instructions on building from source.
+
 ## Start llama.cpp
 
 Run `llama-server` with your preferred model, for example:
