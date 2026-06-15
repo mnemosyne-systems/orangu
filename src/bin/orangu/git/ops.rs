@@ -1443,6 +1443,64 @@ mod tests {
     }
 
     #[test]
+    fn bisect_good_bad_and_skip_mark_commits() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("git command")
+        };
+        let rev_parse = |spec: &str| {
+            String::from_utf8_lossy(&git(&["rev-parse", spec]).stdout)
+                .trim()
+                .to_string()
+        };
+        let commit = |name: &str, content: &str, msg: &str| {
+            std::fs::write(workspace.path().join(name), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+        git(&["checkout", "-B", "main"]);
+        // Five commits so the suspect range stays non-trivial: marking the
+        // tips good/bad leaves several commits to test, and skipping one keeps
+        // the session running instead of converging immediately.
+        for n in 1..=5 {
+            commit("a.txt", &format!("{n}\n"), &format!("commit {n}"));
+        }
+        let first = rev_parse("HEAD~4");
+        let last = rev_parse("HEAD");
+
+        bisect_start_output(workspace.path(), None).expect("start");
+
+        // Marking an explicit bad tip then an explicit good base narrows the
+        // search; git checks out a commit between them and the session lives on.
+        bisect_bad_output(workspace.path(), Some(&last)).expect("bad <last>");
+        bisect_good_output(workspace.path(), Some(&first)).expect("good <first>");
+
+        // Skipping the currently checked-out commit (HEAD default) is accepted
+        // and the session remains active with commits still to test.
+        bisect_skip_output(workspace.path(), None).expect("skip");
+
+        // The log records the good/bad marks we made.
+        let log = bisect_log_output(workspace.path()).expect("log");
+        assert!(
+            log.contains("good") && log.contains("bad"),
+            "log should record the good and bad marks: {log}"
+        );
+
+        bisect_reset_output(workspace.path()).expect("reset");
+        let bisect_start = workspace.path().join(".git").join("BISECT_START");
+        assert!(!bisect_start.exists(), "reset should clear the session");
+    }
+
+    #[test]
     fn delete_branch_blocked_on_protected_branches() {
         let workspace = tempdir().expect("workspace");
         std::process::Command::new("git")

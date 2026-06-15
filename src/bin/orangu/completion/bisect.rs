@@ -77,8 +77,11 @@ mod tests {
             assert_eq!(start, cmd.len(), "offset should point past '{cmd}'");
         }
         // Extra spaces and a partial token still anchor at the subcommand end.
-        let (start, _candidates) =
+        let (start, candidates) =
             bisect_completion_candidates("/bisect good   ab", dir.path()).expect("some");
         assert_eq!(start, "/bisect good ".len());
+        // Outside a repository there are no commit hashes to offer, but the
+        // subcommand is still recognised (Some), just with an empty list.
+        assert!(candidates.is_empty(), "no candidates outside a git repo");
     }
 }
