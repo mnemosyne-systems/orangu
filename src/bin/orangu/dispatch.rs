@@ -507,6 +507,38 @@ pub(crate) fn handle_command(
                 StashSubcommand::Drop => stash_drop_output(&ws),
             })))
         }
+        LocalCommand::Bisect(sub) => {
+            // BisectSubcommand<'a> borrows from the input string; materialise to
+            // owned data so the closure satisfies the 'static bound on Blocking.
+            enum BisectOp {
+                Start(Option<String>),
+                Good(Option<String>),
+                Bad(Option<String>),
+                Skip(Option<String>),
+                Reset,
+                Log,
+                Status,
+            }
+            let op = match sub {
+                BisectSubcommand::Start(a) => BisectOp::Start(a.map(|c| c.into_owned())),
+                BisectSubcommand::Good(c) => BisectOp::Good(c.map(|c| c.into_owned())),
+                BisectSubcommand::Bad(c) => BisectOp::Bad(c.map(|c| c.into_owned())),
+                BisectSubcommand::Skip(c) => BisectOp::Skip(c.map(|c| c.into_owned())),
+                BisectSubcommand::Reset => BisectOp::Reset,
+                BisectSubcommand::Log => BisectOp::Log,
+                BisectSubcommand::Status => BisectOp::Status,
+            };
+            let ws = workspace.to_path_buf();
+            Ok(CommandOutcome::Blocking(Box::new(move || match op {
+                BisectOp::Start(a) => bisect_start_output(&ws, a.as_deref()),
+                BisectOp::Good(c) => bisect_good_output(&ws, c.as_deref()),
+                BisectOp::Bad(c) => bisect_bad_output(&ws, c.as_deref()),
+                BisectOp::Skip(c) => bisect_skip_output(&ws, c.as_deref()),
+                BisectOp::Reset => bisect_reset_output(&ws),
+                BisectOp::Log => bisect_log_output(&ws),
+                BisectOp::Status => bisect_status_output(&ws),
+            })))
+        }
         LocalCommand::OpenFile(path) => {
             if path.is_empty() {
                 return Ok(CommandOutcome::OutputError(

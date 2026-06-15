@@ -166,6 +166,27 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "stash drop",
     "drop stash",
     "git stash drop",
+    // --- bisect ---
+    "bisect start",
+    "start bisect",
+    "git bisect start",
+    "bisect good",
+    "mark good",
+    "git bisect good",
+    "bisect bad",
+    "mark bad",
+    "git bisect bad",
+    "bisect skip",
+    "skip commit",
+    "git bisect skip",
+    "bisect reset",
+    "reset bisect",
+    "git bisect reset",
+    "bisect log",
+    "git bisect log",
+    "bisect status",
+    "bisect",
+    "git bisect",
     // --- rebase ---
     "rebase",
     "git rebase",
@@ -498,6 +519,75 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     if matches_ci(input, &["stash drop", "drop stash", "git stash drop"]) {
         return Some(LocalCommand::Stash(StashSubcommand::Drop));
+    }
+    for prefix in ["bisect start ", "start bisect ", "git bisect start "] {
+        if let Some(args) = strip_ascii_prefix(input, prefix) {
+            let args = args.trim();
+            return Some(LocalCommand::Bisect(BisectSubcommand::Start(
+                if args.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(args))
+                },
+            )));
+        }
+    }
+    if matches_ci(input, &["bisect start", "start bisect", "git bisect start"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Start(None)));
+    }
+    for prefix in ["bisect good ", "git bisect good "] {
+        if let Some(commit) = strip_ascii_prefix(input, prefix) {
+            let commit = commit.trim();
+            return Some(LocalCommand::Bisect(BisectSubcommand::Good(
+                if commit.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(commit))
+                },
+            )));
+        }
+    }
+    if matches_ci(input, &["bisect good", "mark good", "git bisect good"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Good(None)));
+    }
+    for prefix in ["bisect bad ", "git bisect bad "] {
+        if let Some(commit) = strip_ascii_prefix(input, prefix) {
+            let commit = commit.trim();
+            return Some(LocalCommand::Bisect(BisectSubcommand::Bad(
+                if commit.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(commit))
+                },
+            )));
+        }
+    }
+    if matches_ci(input, &["bisect bad", "mark bad", "git bisect bad"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Bad(None)));
+    }
+    for prefix in ["bisect skip ", "git bisect skip "] {
+        if let Some(commit) = strip_ascii_prefix(input, prefix) {
+            let commit = commit.trim();
+            return Some(LocalCommand::Bisect(BisectSubcommand::Skip(
+                if commit.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(commit))
+                },
+            )));
+        }
+    }
+    if matches_ci(input, &["bisect skip", "skip commit", "git bisect skip"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Skip(None)));
+    }
+    if matches_ci(input, &["bisect reset", "reset bisect", "git bisect reset"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Reset));
+    }
+    if matches_ci(input, &["bisect log", "git bisect log"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Log));
+    }
+    if matches_ci(input, &["bisect status", "bisect", "git bisect"]) {
+        return Some(LocalCommand::Bisect(BisectSubcommand::Status));
     }
     if matches_ci(input, &["rebase", "git rebase"]) {
         return Some(LocalCommand::Rebase);
