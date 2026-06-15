@@ -14,7 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use anyhow::{Context, Result, anyhow};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -978,6 +978,151 @@ pub fn stash_drop_output(workspace: &Path) -> Result<String> {
     })
 }
 
+/// Run `git -C <repo_root> bisect <args...>` and return its trimmed stdout.
+///
+/// On a non-zero exit the combined stdout/stderr is surfaced as the error so
+/// git's own message (e.g. "You need to start by 'git bisect start'") reaches
+/// the user. On success, an empty stdout is replaced with `fallback` so every
+/// subcommand has something to print.
+fn run_bisect(repo_root: &Path, args: &[&str], fallback: &str) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("bisect")
+        .args(args)
+        .output()
+        .context("failed to run git bisect")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = [stdout, stderr]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!(
+            "git bisect {} failed{}",
+            args.first().copied().unwrap_or(""),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if stdout.is_empty() {
+        fallback.to_string()
+    } else {
+        stdout
+    })
+}
+
+/// `/bisect start [<args>]` — begin a session. `args` is the optional rev
+/// specification (e.g. `<bad> <good>`), split on whitespace and forwarded to
+/// `git bisect start`.
+pub fn bisect_start_output(workspace: &Path, args: Option<&str>) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    let mut cmd_args = vec!["start"];
+    let args_owned;
+    let extra: Vec<&str>;
+    if let Some(a) = args {
+        args_owned = a.to_string();
+        extra = args_owned.split_whitespace().collect();
+        cmd_args.extend_from_slice(&extra);
+    }
+    run_bisect(&repo_root, &cmd_args, "Bisect session started")
+}
+
+/// `/bisect good [<commit>]` — mark a commit (default `HEAD`) as good.
+pub fn bisect_good_output(workspace: &Path, commit: Option<&str>) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    let mut args = vec!["good"];
+    if let Some(c) = commit {
+        args.push(c);
+    }
+    run_bisect(&repo_root, &args, "Marked as good")
+}
+
+/// `/bisect bad [<commit>]` — mark a commit (default `HEAD`) as bad.
+pub fn bisect_bad_output(workspace: &Path, commit: Option<&str>) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    let mut args = vec!["bad"];
+    if let Some(c) = commit {
+        args.push(c);
+    }
+    run_bisect(&repo_root, &args, "Marked as bad")
+}
+
+/// `/bisect skip [<commit>]` — skip a commit (default `HEAD`) that cannot be
+/// tested.
+pub fn bisect_skip_output(workspace: &Path, commit: Option<&str>) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    let mut args = vec!["skip"];
+    if let Some(c) = commit {
+        args.push(c);
+    }
+    run_bisect(&repo_root, &args, "Commit skipped")
+}
+
+/// `/bisect reset` — end the session and return to the original branch.
+pub fn bisect_reset_output(workspace: &Path) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    run_bisect(&repo_root, &["reset"], "Bisect session ended")
+}
+
+/// `/bisect log` — print the commits marked so far in the session.
+pub fn bisect_log_output(workspace: &Path) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    run_bisect(&repo_root, &["log"], "Bisect log is empty")
+}
+
+/// Returns the path of the git directory for `repo_root`, using
+/// `git rev-parse --git-dir` so that worktrees and non-standard `GIT_DIR`
+/// locations are handled correctly.
+fn git_dir(repo_root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let p = Path::new(&s);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        repo_root.join(p)
+    })
+}
+
+/// `/bisect status` (and a bare `/bisect`) — report the session state.
+///
+/// A session is detected by the presence of `BISECT_START` in the git
+/// directory (resolved via [`git_dir`] so worktrees are handled). When no
+/// session is active a friendly hint is returned instead of letting
+/// `git bisect log` fail; otherwise the bisect log is shown.
+pub fn bisect_status_output(workspace: &Path) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("bisect is only available inside a Git repository"))?;
+    let git_dir =
+        git_dir(&repo_root).ok_or_else(|| anyhow!("could not determine git directory"))?;
+    if !git_dir.join("BISECT_START").exists() {
+        return Ok("No bisect session in progress. Use /bisect start to begin.".to_string());
+    }
+    run_bisect(&repo_root, &["log"], "Bisect session in progress")
+}
+
 pub fn branch_list_output(workspace: &Path) -> Result<String> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("branch is only available inside a Git repository"))?;
@@ -1210,6 +1355,91 @@ mod tests {
         let result = init_repo_output(workspace.path());
         assert!(result.is_ok(), "init_repo_output failed: {:?}", result);
         assert!(workspace.path().join(".git").exists());
+    }
+
+    #[test]
+    fn bisect_requires_git_repository() {
+        // A throwaway directory that is not a git repository: every bisect
+        // entry point reports it clearly rather than shelling out to git.
+        let dir = tempdir().expect("workspace");
+        for result in [
+            bisect_status_output(dir.path()),
+            bisect_log_output(dir.path()),
+            bisect_reset_output(dir.path()),
+            bisect_good_output(dir.path(), None),
+        ] {
+            let err = result.expect_err("expected an error outside a repo");
+            assert!(
+                err.to_string().contains("Git repository"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bisect_status_reports_no_session() {
+        let workspace = tempdir().expect("workspace");
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(workspace.path())
+            .output()
+            .expect("git init");
+        let status = bisect_status_output(workspace.path()).expect("status");
+        assert!(
+            status.contains("No bisect session"),
+            "expected the no-session hint, got: {status}"
+        );
+    }
+
+    #[test]
+    fn bisect_start_status_and_reset_flow() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        init_git_for_test(workspace.path());
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git command");
+        };
+        let commit = |name: &str, content: &str, msg: &str| {
+            std::fs::write(workspace.path().join(name), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+        git(&["checkout", "-B", "main"]);
+        commit("a.txt", "1\n", "first");
+        commit("a.txt", "2\n", "second");
+        commit("a.txt", "3\n", "third");
+
+        let bisect_start = workspace.path().join(".git").join("BISECT_START");
+
+        // No session yet.
+        assert!(!bisect_start.exists());
+        let status = bisect_status_output(workspace.path()).expect("status");
+        assert!(status.contains("No bisect session"), "got: {status}");
+
+        // Starting a session creates BISECT_START, and status reflects it.
+        bisect_start_output(workspace.path(), None).expect("start");
+        assert!(bisect_start.exists());
+        let status = bisect_status_output(workspace.path()).expect("status");
+        assert!(
+            !status.contains("No bisect session"),
+            "session should be active: {status}"
+        );
+
+        // Resetting ends the session.
+        bisect_reset_output(workspace.path()).expect("reset");
+        assert!(!bisect_start.exists());
+        let status = bisect_status_output(workspace.path()).expect("status");
+        assert!(
+            status.contains("No bisect session"),
+            "session should be cleared: {status}"
+        );
     }
 
     #[test]

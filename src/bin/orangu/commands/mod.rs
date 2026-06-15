@@ -217,6 +217,28 @@ pub enum ExportTarget {
     Review,
 }
 
+/// A `/bisect` subcommand, wrapping `git bisect`. The `Start`, `Good`, `Bad`,
+/// and `Skip` variants carry an optional commit/rev argument; when it is `None`
+/// the corresponding `git bisect` command runs against the current `HEAD`.
+pub enum BisectSubcommand<'a> {
+    /// `start [<bad> [<good>...]]` — begin a session, optionally seeding the
+    /// known-bad and known-good revisions.
+    Start(Option<Cow<'a, str>>),
+    /// `good [<commit>]` — mark a commit (default `HEAD`) as good.
+    Good(Option<Cow<'a, str>>),
+    /// `bad [<commit>]` — mark a commit (default `HEAD`) as bad.
+    Bad(Option<Cow<'a, str>>),
+    /// `skip [<commit>]` — skip a commit (default `HEAD`) that cannot be tested.
+    Skip(Option<Cow<'a, str>>),
+    /// `reset` — end the session and return to the original branch.
+    Reset,
+    /// `log` — print the commits marked so far.
+    Log,
+    /// `status` — report whether a session is in progress (the default for a
+    /// bare `/bisect`).
+    Status,
+}
+
 pub enum BranchSubcommand<'a> {
     List,
     ListAll,
@@ -266,6 +288,9 @@ pub enum LocalCommand<'a> {
     InitRepo,
     Squash,
     Stash(StashSubcommand),
+    /// `/bisect [<subcommand>]` — drive `git bisect` from the prompt; see
+    /// [`BisectSubcommand`].
+    Bisect(BisectSubcommand<'a>),
     OpenFile(&'a str),
     Session(Option<Cow<'a, str>>),
     Export(ExportTarget),

@@ -330,6 +330,50 @@ drop stash
 
 \newpage
 
+## /bisect
+
+Runs a binary-search session to find the commit that introduced a bug.
+
+- `/bisect` or `/bisect status` — shows the current bisect state; reports "No bisect session in progress" when none is active.
+- `/bisect start [<commit>]` — begins a new bisect session, optionally marking `<commit>` as the first known-bad revision.
+- `/bisect good [<commit>]` — marks the current (or specified) commit as good.
+- `/bisect bad [<commit>]` — marks the current (or specified) commit as bad.
+- `/bisect skip [<commit>]` — tells Git to skip the current (or specified) commit when it cannot be tested.
+- `/bisect reset` — ends the bisect session and returns `HEAD` to its original position.
+- `/bisect log` — prints the log of all good/bad markings made so far.
+
+All subcommands run plain `git bisect <sub>`; there is no `gh` equivalent.
+
+### Examples
+
+```text
+/bisect start
+/bisect bad
+/bisect good abc1234
+/bisect skip
+/bisect log
+/bisect reset
+```
+
+Natural-language forms:
+
+```text
+bisect start
+start bisect
+bisect good
+mark good
+bisect bad
+mark bad
+bisect skip
+skip commit
+bisect reset
+reset bisect
+bisect log
+bisect
+```
+
+\newpage
+
 ## /branch
 
 Lists, switches, creates, renames, or deletes branches.

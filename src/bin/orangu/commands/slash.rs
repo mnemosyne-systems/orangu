@@ -56,6 +56,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/remove_file" => Some(LocalCommand::RemoveFile(None)),
         "/squash" => Some(LocalCommand::Squash),
         "/stash" => Some(LocalCommand::Stash(StashSubcommand::Push)),
+        "/bisect" => Some(LocalCommand::Bisect(BisectSubcommand::Status)),
         "/status" => Some(LocalCommand::Status),
         "/manual" => Some(LocalCommand::Manual),
         "/usage" => Some(LocalCommand::Usage),
@@ -257,6 +258,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     _ => StashSubcommand::Push,
                 }));
             }
+            if let Some(sub) = input.strip_prefix("/bisect ") {
+                return Some(LocalCommand::Bisect(parse_bisect_subcommand(sub)));
+            }
             if let Some(args) = input.strip_prefix("/delete ") {
                 let branch = args.trim();
                 if !branch.is_empty() {
@@ -282,5 +286,35 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
         }
+    }
+}
+
+/// Parse the text after `/bisect ` into a [`BisectSubcommand`].
+///
+/// The first whitespace-delimited word selects the subcommand
+/// (case-insensitively); any text after it is the optional commit/rev argument
+/// for `start`, `good`, `bad`, and `skip`. Matching the whole word — rather than
+/// a bare prefix — keeps inputs like `started` from being read as `start`. An
+/// empty or unrecognised verb maps to [`BisectSubcommand::Status`], mirroring a
+/// bare `/bisect`.
+pub(super) fn parse_bisect_subcommand(sub: &str) -> BisectSubcommand<'_> {
+    let sub = sub.trim();
+    let (verb, rest) = match sub.split_once(char::is_whitespace) {
+        Some((verb, rest)) => (verb, rest.trim()),
+        None => (sub, ""),
+    };
+    let arg = if rest.is_empty() {
+        None
+    } else {
+        Some(Cow::Borrowed(rest))
+    };
+    match verb.to_ascii_lowercase().as_str() {
+        "start" => BisectSubcommand::Start(arg),
+        "good" => BisectSubcommand::Good(arg),
+        "bad" => BisectSubcommand::Bad(arg),
+        "skip" => BisectSubcommand::Skip(arg),
+        "reset" => BisectSubcommand::Reset,
+        "log" => BisectSubcommand::Log,
+        _ => BisectSubcommand::Status,
     }
 }
