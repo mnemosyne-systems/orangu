@@ -41,15 +41,73 @@
 
 ## Installation
 
-### Install dependencies on Fedora
+### One-liner install (Linux, macOS, Windows)
 
-Install the tools needed to build and run **orangu** from source:
+**Linux / macOS** (requires `curl` or `wget`, and `tar`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.sh | sh
+```
+
+**Windows** (requires PowerShell, included with Windows 10 and later):
+
+```cmd
+curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.cmd -o install.cmd && install.cmd
+```
+
+Both scripts download the latest release binary, install it to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), and warn if the directory is not in your `PATH`.
+
+**Custom install directory:** set `INSTALL_DIR` before running the script:
+
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
+```cmd
+:: Windows
+set "INSTALL_DIR=C:\Tools" && install.cmd
+```
+
+**Shell completions:** after installing, run `orangu -s` to print the completion script for your shell:
+
+```sh
+# bash
+orangu -s >> ~/.bashrc && source ~/.bashrc
+
+# zsh
+orangu -s >> ~/.zshrc && source ~/.zshrc
+
+# fish
+orangu -s | source
+```
+
+On Windows, add `Invoke-Expression (orangu -s)` to your PowerShell `$PROFILE`.
+
+### Build from source
+
+#### Install dependencies
+
+**Fedora / RHEL:**
 
 ```sh
 dnf install -y git rust cargo
 ```
 
-### Release build
+**Debian / Ubuntu:**
+
+```sh
+apt-get install -y git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**macOS:**
+
+```sh
+brew install rust
+```
+
+#### Release build
 
 The following commands build an optimized release binary:
 
@@ -71,7 +129,7 @@ To install it system-wide:
 sudo install -Dm755 target/release/orangu /usr/local/bin/orangu
 ```
 
-### Debug build
+#### Debug build
 
 The following commands build a debug binary:
 
