@@ -1131,3 +1131,100 @@ fn parses_pending_commands() {
         _ => panic!("expected pending delete 1"),
     }
 }
+
+#[test]
+fn parses_bisect_commands() {
+    // bare /bisect and explicit status subcommand both map to Status
+    assert!(matches!(
+        parse_local_command("/bisect"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Status))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect status"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Status))
+    ));
+    // subcommands without arguments
+    assert!(matches!(
+        parse_local_command("/bisect start"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Start(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect good"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Good(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect bad"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Bad(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect skip"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Skip(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect reset"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Reset))
+    ));
+    assert!(matches!(
+        parse_local_command("/bisect log"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Log))
+    ));
+    // subcommands with an explicit commit argument
+    match parse_local_command("/bisect good abc123") {
+        Some(LocalCommand::Bisect(BisectSubcommand::Good(Some(c)))) if c == "abc123" => {}
+        _ => panic!("expected /bisect good abc123"),
+    }
+    match parse_local_command("/bisect bad deadbeef") {
+        Some(LocalCommand::Bisect(BisectSubcommand::Bad(Some(c)))) if c == "deadbeef" => {}
+        _ => panic!("expected /bisect bad deadbeef"),
+    }
+    match parse_local_command("/bisect skip abc123") {
+        Some(LocalCommand::Bisect(BisectSubcommand::Skip(Some(c)))) if c == "abc123" => {}
+        _ => panic!("expected /bisect skip abc123"),
+    }
+    // /bisect start accepts optional bad/good rev-range args
+    match parse_local_command("/bisect start v1.0 HEAD") {
+        Some(LocalCommand::Bisect(BisectSubcommand::Start(Some(a)))) if a == "v1.0 HEAD" => {}
+        _ => panic!("expected /bisect start v1.0 HEAD"),
+    }
+    // natural-language forms
+    assert!(matches!(
+        parse_local_command("bisect start"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Start(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("start bisect"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Start(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("mark good"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Good(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("mark bad"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Bad(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("skip commit"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Skip(None)))
+    ));
+    assert!(matches!(
+        parse_local_command("bisect reset"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Reset))
+    ));
+    assert!(matches!(
+        parse_local_command("reset bisect"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Reset))
+    ));
+    assert!(matches!(
+        parse_local_command("bisect log"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Log))
+    ));
+    assert!(matches!(
+        parse_local_command("bisect"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Status))
+    ));
+    assert!(matches!(
+        parse_local_command("git bisect"),
+        Some(LocalCommand::Bisect(BisectSubcommand::Status))
+    ));
+}

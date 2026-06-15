@@ -19,12 +19,14 @@ use crate::git::{
     discover_git_root, git_branch_names, git_local_branch_names, is_protected_branch,
 };
 
+mod bisect;
 mod files;
 mod ghost;
 mod git_refs;
 mod pull;
 mod session;
 
+pub use bisect::*;
 pub use files::*;
 pub use ghost::*;
 pub use git_refs::*;
@@ -68,6 +70,7 @@ pub const COMMANDS: &[&str] = &[
     "/init_repo",
     "/squash",
     "/stash",
+    "/bisect",
     "/open_file",
     "/pending",
     "/session",
@@ -233,6 +236,10 @@ fn structured_completion_candidates(
     }
 
     if let Some((start, candidates)) = cherry_pick_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
+    if let Some((start, candidates)) = bisect_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
 

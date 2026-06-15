@@ -217,6 +217,16 @@ pub enum ExportTarget {
     Review,
 }
 
+pub enum BisectSubcommand<'a> {
+    Start(Option<Cow<'a, str>>),
+    Good(Option<Cow<'a, str>>),
+    Bad(Option<Cow<'a, str>>),
+    Skip(Option<Cow<'a, str>>),
+    Reset,
+    Log,
+    Status,
+}
+
 pub enum BranchSubcommand<'a> {
     List,
     ListAll,
@@ -266,6 +276,7 @@ pub enum LocalCommand<'a> {
     InitRepo,
     Squash,
     Stash(StashSubcommand),
+    Bisect(BisectSubcommand<'a>),
     OpenFile(&'a str),
     Session(Option<Cow<'a, str>>),
     Export(ExportTarget),

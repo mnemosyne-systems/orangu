@@ -72,25 +72,26 @@ use uuid::Uuid;
 use anyhow::Error;
 use commands::ReviewLaunch;
 use commands::{
-    BranchSubcommand, CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand,
-    LocalError, PruneTarget, StashSubcommand, add_file_usage_message, amend_usage_message,
-    cherry_pick_usage_message, close_usage_message, comment_usage_message, commit_usage_message,
-    get_comments_usage_message, grep_usage_message, merge_usage_message, model_usage_message,
-    move_file_usage_message, open_file_usage_message, parse_local_command, prune_usage_message,
-    pull_usage_message, remove_file_usage_message, restore_usage_message, server_usage_message,
-    sorted_model_names, system_prompt,
+    BisectSubcommand, BranchSubcommand, CommandContext, CommandOutcome, CommandState, ExportTarget,
+    LocalCommand, LocalError, PruneTarget, StashSubcommand, add_file_usage_message,
+    amend_usage_message, cherry_pick_usage_message, close_usage_message, comment_usage_message,
+    commit_usage_message, get_comments_usage_message, grep_usage_message, merge_usage_message,
+    model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
+    prune_usage_message, pull_usage_message, remove_file_usage_message, restore_usage_message,
+    server_usage_message, sorted_model_names, system_prompt,
 };
 use dispatch::*;
 use git::{
-    Forge, add_file_output, amend_output, branch_create_output, branch_delete_output,
-    branch_list_all_output, branch_list_output, branch_rename_output, cherry_pick_output,
-    close_output, collect_review_diff, comment_output, commit_output, create_pull_request_output,
-    discover_git_root, fetch_active_pull_requests, get_comments_output, git_checkout,
-    git_diff_against_branch, git_workspace_diff, grep_output, init_repo_output,
-    list_workspace_files_tree, log_output, merge_output, move_file_output, open_in_editor,
-    pull_request_output, push_output, rebase_output, remove_file_output, restore_output,
-    squash_output, stash_drop_output, stash_list_output, stash_output, stash_pop_output,
-    status_output, sync_default_branch, workspace_branch_name,
+    Forge, add_file_output, amend_output, bisect_bad_output, bisect_good_output, bisect_log_output,
+    bisect_reset_output, bisect_skip_output, bisect_start_output, bisect_status_output,
+    branch_create_output, branch_delete_output, branch_list_all_output, branch_list_output,
+    branch_rename_output, cherry_pick_output, close_output, collect_review_diff, comment_output,
+    commit_output, create_pull_request_output, discover_git_root, fetch_active_pull_requests,
+    get_comments_output, git_checkout, git_diff_against_branch, git_workspace_diff, grep_output,
+    init_repo_output, list_workspace_files_tree, log_output, merge_output, move_file_output,
+    open_in_editor, pull_request_output, push_output, rebase_output, remove_file_output,
+    restore_output, squash_output, stash_drop_output, stash_list_output, stash_output,
+    stash_pop_output, status_output, sync_default_branch, workspace_branch_name,
 };
 use input::{
     EscapeCancelState, IDLE_STATUS_REFRESH_INTERVAL, InputContext, InputResult, InputState,

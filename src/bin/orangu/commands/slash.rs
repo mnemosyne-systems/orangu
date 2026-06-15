@@ -56,6 +56,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/remove_file" => Some(LocalCommand::RemoveFile(None)),
         "/squash" => Some(LocalCommand::Squash),
         "/stash" => Some(LocalCommand::Stash(StashSubcommand::Push)),
+        "/bisect" => Some(LocalCommand::Bisect(BisectSubcommand::Status)),
         "/status" => Some(LocalCommand::Status),
         "/manual" => Some(LocalCommand::Manual),
         "/usage" => Some(LocalCommand::Usage),
@@ -257,6 +258,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     _ => StashSubcommand::Push,
                 }));
             }
+            if let Some(sub) = input.strip_prefix("/bisect ") {
+                return Some(LocalCommand::Bisect(parse_bisect_subcommand(sub)));
+            }
             if let Some(args) = input.strip_prefix("/delete ") {
                 let branch = args.trim();
                 if !branch.is_empty() {
@@ -283,4 +287,47 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
         }
     }
+}
+
+pub(super) fn parse_bisect_subcommand(sub: &str) -> BisectSubcommand<'_> {
+    let sub = sub.trim();
+    if let Some(args) = sub.strip_prefix("start") {
+        let args = args.trim();
+        return BisectSubcommand::Start(if args.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(args))
+        });
+    }
+    if let Some(commit) = sub.strip_prefix("good") {
+        let commit = commit.trim();
+        return BisectSubcommand::Good(if commit.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(commit))
+        });
+    }
+    if let Some(commit) = sub.strip_prefix("bad") {
+        let commit = commit.trim();
+        return BisectSubcommand::Bad(if commit.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(commit))
+        });
+    }
+    if let Some(commit) = sub.strip_prefix("skip") {
+        let commit = commit.trim();
+        return BisectSubcommand::Skip(if commit.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(commit))
+        });
+    }
+    if sub.eq_ignore_ascii_case("reset") {
+        return BisectSubcommand::Reset;
+    }
+    if sub.eq_ignore_ascii_case("log") {
+        return BisectSubcommand::Log;
+    }
+    BisectSubcommand::Status
 }
