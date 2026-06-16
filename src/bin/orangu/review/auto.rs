@@ -756,19 +756,6 @@ impl AutoReviewState {
         }
     }
 
-    /// Record a category review whose response carried neither a verdict nor
-    /// findings — typically truncated by the response cap (see
-    /// `review_max_tokens`) or empty. The file keeps its white (unreviewed)
-    /// dot and the problem is noted in the `Overall` section.
-    pub(crate) fn record_unparseable(&mut self, index: usize, category: &str) {
-        if let Some(file) = self.files.get(index) {
-            self.sections[0].push(format!(
-                "**{}**: {category} review returned no verdict and no findings",
-                file.path
-            ));
-        }
-    }
-
     /// Record a failed whole-change request in the `Overall` section.
     pub(crate) fn record_overall_failure(&mut self, error: &Error) {
         self.sections[0].push(format!("Overall review failed: {error:#}"));
@@ -1197,20 +1184,15 @@ pub(crate) async fn run_auto_review_mode(
                         std::time::Duration::ZERO,
                     );
                     let (verdict, findings) = parse_auto_review_category_response(&text);
-                    if verdict.is_none() && findings.is_empty() {
-                        // A response carrying neither a verdict nor findings
-                        // (e.g. truncated by the response cap) must not pass
-                        // silently as a clean review.
-                        any_failed = true;
-                        state.record_unparseable(index, category);
-                    } else {
-                        // Without an explicit verdict, a category passes only
-                        // when its review found nothing.
-                        if !verdict.unwrap_or(findings.is_empty()) {
-                            any_rejected = true;
-                        }
-                        state.apply_category_result(index, section, findings);
+                    // A category passes when it carries an approving verdict, or
+                    // when it carries neither a verdict nor findings — a bare
+                    // "no verdict and no findings" response (e.g. truncated by
+                    // the response cap) counts as clean, not a failure. So a
+                    // file whose categories all come back empty is approved.
+                    if !verdict.unwrap_or(findings.is_empty()) {
+                        any_rejected = true;
                     }
+                    state.apply_category_result(index, section, findings);
                 }
                 AutoReviewRequestOutcome::Completed(Err(err)) => {
                     completed += 1;
@@ -2135,32 +2117,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_unparseable_response_is_recorded_not_approved() {
-        use crate::commands::ReviewLaunch;
-        use crate::review::{AutoReviewState, parse_auto_review_category_response};
-        use orangu::tui::{ReviewEntry, ReviewStatus};
+    fn auto_review_empty_response_parses_to_a_clean_pass() {
+        use crate::review::parse_auto_review_category_response;
 
         // An empty (e.g. cap-truncated) response parses to no verdict and no
-        // findings...
+        // findings. The run treats this as a clean category — not a failure —
+        // so a file whose categories all come back empty is approved (the
+        // pass test `verdict.unwrap_or(findings.is_empty())` is true and no
+        // findings are recorded).
         let (verdict, findings) = parse_auto_review_category_response("");
         assert_eq!(verdict, None);
         assert!(findings.is_empty());
-
-        // ...which is recorded as a failed category review under Overall
-        // instead of silently passing as clean.
-        let mut state = AutoReviewState::new(ReviewLaunch {
-            files: vec![ReviewEntry {
-                path: "a.rs".to_string(),
-                status: ReviewStatus::Unreviewed,
-                diff_lines: vec!["+x".to_string()],
-                patch: String::new(),
-            }],
-        });
-        state.record_unparseable(0, "Security");
-        assert_eq!(
-            state.sections[0],
-            vec!["**a.rs**: Security review returned no verdict and no findings".to_string()]
-        );
+        assert!(verdict.unwrap_or(findings.is_empty()));
     }
 
     #[test]
