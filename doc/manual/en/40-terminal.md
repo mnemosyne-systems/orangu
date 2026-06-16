@@ -175,7 +175,7 @@ Natural-language forms are recognized only for the built-in local command phrase
 
 As you type, a grey inline hint previews the command your input is growing into, drawn just after the cursor. It covers both slash commands and the natural-language bindings:
 
-- Typing `/q` shows `/q`​`uit`, with `uit` greyed; typing `c` shows `c`​`urrent model`.
+- Typing `/q` shows `/q``uit`, with `uit` greyed; typing `c` shows `c``urrent model`.
 - Press `Tab` to accept the hint, filling in the rest of the command (for an argument-taking form such as `diff against `, the cursor lands after the trailing space, ready for the argument).
 - When several commands share your prefix (for example `c` matches `current model`, `code review`, `checkout`, `commit`, and more), `Shift+Tab` cycles the hint through them in priority order, wrapping back to the first. `Tab` then accepts whichever candidate is currently shown.
 - The hint only appears while the cursor is at the end of the line, and disappears once your input already spells a complete command (so `status` and `diff` show no hint, even though `diff against ` shares the latter's prefix).
