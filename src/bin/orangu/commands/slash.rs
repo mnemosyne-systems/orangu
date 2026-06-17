@@ -26,6 +26,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/model" => Some(LocalCommand::ModelInfo),
         "/server" => Some(LocalCommand::ServerInfo),
         "/session" => Some(LocalCommand::Session(None)),
+        "/workspace" => Some(LocalCommand::Workspace(None)),
         "/list_files" => Some(LocalCommand::ListFiles),
         "/open_file" => Some(LocalCommand::OpenFile("")),
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
@@ -71,6 +72,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     None
                 } else {
                     Some(Cow::Borrowed(uuid))
+                }));
+            }
+            if let Some(args) = input.strip_prefix("/workspace ") {
+                let arg = args.trim();
+                return Some(LocalCommand::Workspace(if arg.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(arg))
                 }));
             }
             if let Some(args) = input.strip_prefix("/diff ") {

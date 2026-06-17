@@ -290,6 +290,11 @@ pub enum LocalCommand<'a> {
     Bisect(BisectSubcommand<'a>),
     OpenFile(&'a str),
     Session(Option<Cow<'a, str>>),
+    /// `/workspace [<number>|<path>]`: with no argument, report the active
+    /// workspace; with a number, switch to that tab; with anything else, open
+    /// (or switch to) that directory. The number-vs-path split happens in
+    /// dispatch, mirroring how `Session` disambiguates its argument.
+    Workspace(Option<Cow<'a, str>>),
     Export(ExportTarget),
     Manual,
     Usage,

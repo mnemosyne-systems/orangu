@@ -22,6 +22,43 @@ fn leaves_regular_prompts_unhandled() {
 }
 
 #[test]
+fn parses_workspace_commands() {
+    // Bare forms, slash and natural, list/report the active workspace.
+    assert!(matches!(
+        parse_local_command("/workspace"),
+        Some(LocalCommand::Workspace(None))
+    ));
+    assert!(matches!(
+        parse_local_command("workspace"),
+        Some(LocalCommand::Workspace(None))
+    ));
+    assert!(matches!(
+        parse_local_command("switch workspace"),
+        Some(LocalCommand::Workspace(None))
+    ));
+
+    // Number form (the tab to switch to).
+    match parse_local_command("/workspace 2") {
+        Some(LocalCommand::Workspace(Some(arg))) => assert_eq!(arg.as_ref(), "2"),
+        _ => panic!("expected /workspace 2 to parse with its argument"),
+    }
+    match parse_local_command("workspace 1") {
+        Some(LocalCommand::Workspace(Some(arg))) => assert_eq!(arg.as_ref(), "1"),
+        _ => panic!("expected natural `workspace 1` to parse with its argument"),
+    }
+
+    // Path form (a directory to open).
+    match parse_local_command("/workspace ~/project") {
+        Some(LocalCommand::Workspace(Some(arg))) => assert_eq!(arg.as_ref(), "~/project"),
+        _ => panic!("expected /workspace <path> to parse with its argument"),
+    }
+    match parse_local_command("switch workspace ~/project") {
+        Some(LocalCommand::Workspace(Some(arg))) => assert_eq!(arg.as_ref(), "~/project"),
+        _ => panic!("expected natural `switch workspace <path>` to parse"),
+    }
+}
+
+#[test]
 fn parses_open_file_commands() {
     match parse_local_command("/open_file README.md") {
         Some(LocalCommand::OpenFile(path)) => assert_eq!(path, "README.md"),

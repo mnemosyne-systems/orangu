@@ -817,6 +817,21 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::Session(None));
     }
+    // `workspace <number>` / `switch workspace <path>` — the argument forms are
+    // checked before the bare-word forms so `workspace 1` is a switch, not a
+    // no-op listing. `switch workspace` does not collide with the `switch to`
+    // branch-checkout prefix.
+    for prefix in ["switch workspace ", "workspace "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            let arg = rest.trim();
+            if !arg.is_empty() {
+                return Some(LocalCommand::Workspace(Some(Cow::Borrowed(arg))));
+            }
+        }
+    }
+    if matches_ci(input, &["workspace", "workspaces", "switch workspace"]) {
+        return Some(LocalCommand::Workspace(None));
+    }
     for prefix in ["prune session ", "prune sessions older than "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
             return Some(LocalCommand::Prune(parse_prune_args(rest.trim())));

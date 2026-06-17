@@ -597,6 +597,43 @@ pub(crate) fn handle_command(
                 Err(err) => Ok(local_command_error(err)),
             }
         }
+        LocalCommand::Workspace(None) => Ok(CommandOutcome::Output(format!(
+            "Active workspace: {}",
+            workspace.display()
+        ))),
+        LocalCommand::Workspace(Some(arg)) => {
+            let arg = arg.trim();
+            // A bare integer is a tab number ("number is the tab, everything
+            // else is a directory"). Until tabs share one process, the active
+            // workspace is the only one open, so it is tab 1; any other number
+            // has no tab to switch to yet.
+            if let Ok(number) = arg.parse::<usize>() {
+                if number == 0 {
+                    return Ok(CommandOutcome::OutputError(
+                        "Workspace numbers start at 1.".to_string(),
+                    ));
+                }
+                if number == 1 {
+                    return Ok(CommandOutcome::Output("Already in workspace 1".to_string()));
+                }
+                return Ok(CommandOutcome::OutputError(format!(
+                    "No workspace {number} is open."
+                )));
+            }
+            // Otherwise the argument is a directory: open it, or report it is
+            // already the active workspace. Re-exec into a real directory the
+            // same way `/session <path>` opens a new workspace.
+            match resolve_existing_dir_arg(arg) {
+                Some(dir) if dir == workspace => Ok(CommandOutcome::Output(format!(
+                    "Already in workspace {}",
+                    dir.display()
+                ))),
+                Some(dir) => Ok(CommandOutcome::SwitchWorkspace(dir)),
+                None => Ok(CommandOutcome::OutputError(format!(
+                    "No such directory: {arg}"
+                ))),
+            }
+        }
         LocalCommand::Prune(None) => Ok(CommandOutcome::OutputError(
             prune_usage_message().to_string(),
         )),
@@ -778,6 +815,91 @@ mod tests {
             outcome,
             CommandOutcome::OutputError(message) if message.starts_with("Error: ")
         ));
+    }
+
+    #[test]
+    fn workspace_command_switches_by_number_and_path() {
+        let other = tempdir().expect("other workspace");
+        // Bind the TempDir so the directory survives for the whole test; only
+        // its normalized path is needed for the comparisons below.
+        let here_dir = tempdir().expect("workspace");
+        let here = crate::normalize_path(here_dir.path());
+
+        // Run `input` with `here` as the active workspace.
+        let run = |input: &str| -> CommandOutcome {
+            let llms = HashMap::from([(
+                "llama".to_string(),
+                test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            )]);
+            let tools = ToolExecutor::new(&here);
+            let mut active_model = "llama".to_string();
+            let mut active_model_id = "gemma".to_string();
+            let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+            let mut session = ChatSession::new("system");
+            handle_command(
+                input,
+                CommandState {
+                    active_model: &mut active_model,
+                    active_model_id: &mut active_model_id,
+                    current_endpoint: &mut current_endpoint,
+                    session: &mut session,
+                    detect_model: &mut false,
+                },
+                CommandContext {
+                    startup_model: "llama",
+                    startup_endpoint: "http://localhost:8100/v1",
+                    llms: &llms,
+                    tools: &tools,
+                    workspace: &here,
+                    usage_stats: &super::UsageStats::new(),
+                    available_models: &[],
+                    virtual_width: 512,
+                    auto_rebase: false,
+                    auto_squash: false,
+                    terminal: "",
+                    forge: crate::git::Forge::GitHub,
+                    review_reports: crate::git::ReviewReports::default(),
+                },
+            )
+            .expect("handle command")
+        };
+
+        // No argument reports the active workspace.
+        match run("/workspace") {
+            CommandOutcome::Output(message) => assert!(message.contains("Active workspace")),
+            _ => panic!("expected the active workspace to be reported"),
+        }
+
+        // Tab 1 is the active workspace; 0 and any higher number have no tab.
+        assert!(matches!(run("/workspace 1"), CommandOutcome::Output(_)));
+        assert!(matches!(
+            run("/workspace 0"),
+            CommandOutcome::OutputError(_)
+        ));
+        assert!(matches!(
+            run("/workspace 2"),
+            CommandOutcome::OutputError(_)
+        ));
+
+        // The active workspace's own path is a no-op switch.
+        match run(&format!("/workspace {}", here.display())) {
+            CommandOutcome::Output(message) => assert!(message.contains("Already in workspace")),
+            _ => panic!("expected a no-op for the active workspace path"),
+        }
+
+        // A different existing directory re-execs into it.
+        match run(&format!("/workspace {}", other.path().display())) {
+            CommandOutcome::SwitchWorkspace(dir) => {
+                assert_eq!(dir, crate::normalize_path(other.path()));
+            }
+            _ => panic!("expected a workspace switch for a different directory"),
+        }
+
+        // A path that is not a directory is rejected.
+        match run("/workspace /no/such/orangu/dir") {
+            CommandOutcome::OutputError(message) => assert!(message.contains("No such directory")),
+            _ => panic!("expected an error for a missing directory"),
+        }
     }
 
     #[test]

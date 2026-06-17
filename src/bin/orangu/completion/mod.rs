@@ -75,6 +75,7 @@ pub const COMMANDS: &[&str] = &[
     "/open_file",
     "/pending",
     "/session",
+    "/workspace",
     "/manual",
     "/usage",
     "/build",
@@ -322,6 +323,22 @@ fn structured_completion_candidates(
             candidates = session_path_completion_candidates(arg_prefix);
         }
         return Some(("/session ".len(), cursor, candidates));
+    }
+
+    if let Some(arg_prefix) = prefix.strip_prefix("/workspace ") {
+        // `/workspace <arg>` takes a tab number or a directory. A bare number is
+        // typed directly, so completion only helps with the directory form:
+        // offer the workspaces seen in past sessions first, then fall back to
+        // filesystem directory completion so a brand-new directory can be
+        // navigated to (e.g. `/workspace ~/Pr<TAB>/po<TAB>`).
+        let mut candidates: Vec<String> = session_workspaces_newest_first()
+            .into_iter()
+            .filter(|w| w.starts_with(arg_prefix))
+            .collect();
+        if candidates.is_empty() {
+            candidates = session_path_completion_candidates(arg_prefix);
+        }
+        return Some(("/workspace ".len(), cursor, candidates));
     }
 
     if let Some(uuid_prefix) = prefix.strip_prefix("/prune ")

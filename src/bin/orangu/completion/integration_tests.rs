@@ -103,6 +103,30 @@ fn completes_open_file_commands_across_workspace() {
 }
 
 #[test]
+fn completes_workspace_directories() {
+    // `/workspace <path>` offers directories to open. A forward slash is
+    // appended to the typed portion so the path is recognised on every
+    // platform, matching how the session path completion is exercised.
+    let root = tempdir().expect("tempdir");
+    let base = root.path();
+    fs::create_dir(base.join("proj-alpha")).expect("dir");
+    fs::create_dir(base.join("proj-beta")).expect("dir");
+    fs::write(base.join("proj-notes.txt"), "").expect("file");
+
+    let input = format!("/workspace {}/proj-", base.display());
+    let (start, _, candidates) =
+        completion_candidates(&input, input.len(), base, &[], &[]).expect("workspace completion");
+    assert_eq!(start, "/workspace ".len());
+    assert!(candidates.contains(&format!("{}/proj-alpha", base.display())));
+    assert!(candidates.contains(&format!("{}/proj-beta", base.display())));
+    // Only directories are offered; the plain file is skipped.
+    assert!(
+        !candidates.iter().any(|c| c.ends_with("proj-notes.txt")),
+        "files must not be offered: {candidates:?}"
+    );
+}
+
+#[test]
 fn completes_show_file_commands_and_flags() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("README.md"), "").expect("root readme");
