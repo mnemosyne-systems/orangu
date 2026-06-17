@@ -18,3 +18,4 @@ pub mod llm;
 pub mod session;
 pub mod tools;
 pub mod tui;
+pub mod workspaces;

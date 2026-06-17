@@ -22,6 +22,7 @@ use std::{
 };
 
 use crate::tui::Banner;
+use crate::workspaces::WorkspacePlacement;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
@@ -37,6 +38,8 @@ pub struct ClientAppConfiguration {
     pub auto_squash: bool,
     pub terminal: String,
     pub platform: String,
+    /// Where the workspace tab bar is drawn.
+    pub workspaces: WorkspacePlacement,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,6 +105,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         parse_client_field(&client, "review_max_tokens", default_review_max_tokens)?;
     let code_max_tokens = parse_client_field(&client, "code_max_tokens", default_code_max_tokens)?;
     let width = parse_client_field(&client, "width", default_virtual_width)?;
+    let workspaces = parse_client_field(&client, "workspaces", WorkspacePlacement::default)?;
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
 
     // `[orangu].model` is the general default model id; a server section's own
@@ -138,6 +142,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         ),
         terminal: client.get("terminal").cloned().unwrap_or_default(),
         platform: client.get("platform").cloned().unwrap_or_default(),
+        workspaces,
     })
 }
 
@@ -399,6 +404,42 @@ mod tests {
         let conf = load_client_configuration(file.path()).unwrap();
         assert_eq!(conf.llms["a"].review_max_tokens, 2048);
         assert_eq!(conf.llms["a"].code_max_tokens, 4096);
+    }
+
+    #[test]
+    fn parses_workspaces_placement_with_default_and_validation() {
+        // Absent key defaults to the top placement.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.workspaces, WorkspacePlacement::Top);
+
+        // An explicit value is parsed case-insensitively.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\nworkspaces = Bottom\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.workspaces, WorkspacePlacement::Bottom);
+
+        // An unknown value is rejected, naming the key.
+        let mut bad = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            bad,
+            "[orangu]\nserver = a\nworkspaces = middle\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+        )
+        .unwrap();
+        let err = load_client_configuration(bad.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid value for [orangu].workspaces"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

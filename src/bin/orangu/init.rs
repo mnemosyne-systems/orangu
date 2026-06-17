@@ -54,6 +54,11 @@ const BANNER_OPTIONS: &[&str] = &["left", "center", "right"];
 /// Valid values for `[orangu].platform`, offered for completion and validated.
 const PLATFORM_OPTIONS: &[&str] = &["github", "gitlab"];
 
+/// Valid values for `[orangu].workspaces` (the workspace tab placement), offered
+/// for completion and validated. Must stay in step with the placements the
+/// loader accepts (see `orangu::workspaces::WorkspacePlacement`).
+const WORKSPACE_OPTIONS: &[&str] = &["top", "bottom", "left", "right"];
+
 /// Subset of an OpenAI-compatible `/v1/models` response, enough to pull out the
 /// first advertised model id for pre-filling the `Model` prompt.
 #[derive(Debug, Default, Deserialize)]
@@ -102,6 +107,7 @@ pub async fn run_init() -> Result<()> {
     let quotes = prompt_with_options("quotes", "none", QUOTE_OPTIONS)?;
     let width = prompt_number::<usize>("width", default_virtual_width())?;
     let banner = prompt_with_options("banner", "left", BANNER_OPTIONS)?;
+    let workspaces = prompt_with_options("workspaces", "top", WORKSPACE_OPTIONS)?;
     let feedback = prompt_bool("feedback", false)?;
     let auto_rebase = prompt_bool("auto_rebase", false)?;
     let auto_squash = prompt_bool("auto_squash", false)?;
@@ -137,6 +143,9 @@ pub async fn run_init() -> Result<()> {
     }
     if banner != "left" {
         client.push(format!("banner = {banner}"));
+    }
+    if workspaces != "top" {
+        client.push(format!("workspaces = {workspaces}"));
     }
     if feedback {
         client.push("feedback = on".to_string());
@@ -516,7 +525,22 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pager_executable, tool_status};
+    use super::{WORKSPACE_OPTIONS, pager_executable, tool_status};
+
+    #[test]
+    fn workspace_options_are_all_valid_placements() {
+        // Every value the wizard offers (and Tab-completes) must parse as a
+        // placement the loader accepts, so the wizard never writes a config the
+        // loader would later reject and the two lists never drift apart.
+        for option in WORKSPACE_OPTIONS {
+            assert!(
+                option
+                    .parse::<orangu::workspaces::WorkspacePlacement>()
+                    .is_ok(),
+                "wizard offers an invalid workspaces value: {option}"
+            );
+        }
+    }
 
     #[test]
     fn tool_status_reports_install_and_usage() {
