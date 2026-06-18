@@ -1414,6 +1414,40 @@ mod tests {
             Verdict::Rejected
         );
         assert_eq!(overall_verdict("**Patch approved**"), Verdict::Approved);
+        assert_eq!(overall_verdict("**Patch rejected**"), Verdict::Rejected);
+    }
+
+    #[test]
+    fn export_review_with_unreviewed_files_is_rejected() {
+        use orangu::tui::{ReviewEntry, ReviewStatus};
+
+        // A `/review` (or `/auto_review`) the user left with files not reviewed
+        // still has a report to export, and that report rejects the patch.
+        let files = vec![
+            ReviewEntry {
+                path: "a.txt".to_string(),
+                status: ReviewStatus::Approved,
+                diff_lines: vec!["+x".to_string()],
+                patch: String::new(),
+            },
+            ReviewEntry {
+                path: "b.txt".to_string(),
+                status: ReviewStatus::Unreviewed,
+                diff_lines: vec!["+y".to_string()],
+                patch: String::new(),
+            },
+        ];
+        let (_lines, markdown) = crate::review::review_exit_output(&files, &[], &[]);
+        assert!(markdown.contains("Not reviewed: **b.txt**"));
+        // A file left unreviewed rejects the patch (so the banner is red).
+        assert_eq!(overall_verdict(&markdown), Verdict::Rejected);
+
+        // The export still succeeds and writes a PDF.
+        let workspace = tempdir().expect("workspace");
+        let path = export_review(workspace.path(), &markdown, "model").expect("export");
+        assert!(path.exists());
+        let bytes = std::fs::read(&path).expect("read pdf");
+        assert!(bytes.starts_with(b"%PDF"));
     }
 
     #[test]
