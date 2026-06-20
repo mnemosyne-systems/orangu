@@ -99,6 +99,7 @@ pub(crate) struct ReviewChrome<'a> {
     pub(crate) current_model: &'a str,
     pub(crate) prompt_branch: Option<&'a str>,
     pub(crate) pending_count: usize,
+    pub(crate) skills: &'a orangu::skills::SkillRegistry,
 }
 
 impl ReviewState {
@@ -479,6 +480,8 @@ pub(crate) fn run_review_mode(
     input_state: &mut InputState,
     chrome: ReviewChrome<'_>,
     workspace: &Path,
+    server_names: &[String],
+    available_models: &[String],
 ) -> Result<ReviewSignal> {
     let mut escape_cancel = EscapeCancelState::default();
     loop {
@@ -498,8 +501,9 @@ pub(crate) fn run_review_mode(
             input_state.cursor(),
             input_state.ghost_index,
             workspace,
-            &[],
-            &[],
+            server_names,
+            available_models,
+            chrome.skills,
         )
         .unwrap_or_default();
         print_review_screen(state, input_state, viewport, chrome, None, &ghost);
@@ -666,7 +670,7 @@ pub(crate) fn run_review_mode(
             // every project file, like the main prompt — and Shift+Tab cycles
             // the ghost preview.
             (KeyCode::Tab, _, _) => {
-                crate::input::apply_completion(input_state, workspace, &[], &[]);
+                crate::input::apply_completion(input_state, workspace, &[], &[], chrome.skills);
             }
             (KeyCode::BackTab, _, _) => crate::input::cycle_ghost_suggestion(input_state),
             // Input window editing.

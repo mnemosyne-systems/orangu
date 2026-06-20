@@ -78,7 +78,7 @@ use commands::{
     commit_usage_message, get_comments_usage_message, grep_usage_message, merge_usage_message,
     model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
     prune_usage_message, pull_usage_message, remove_file_usage_message, restore_usage_message,
-    server_usage_message, sorted_model_names, system_prompt,
+    server_usage_message, sorted_model_names, system_prompt, system_prompt_with_skills,
 };
 use dispatch::*;
 use git::{
@@ -193,6 +193,7 @@ async fn run() -> Result<()> {
         false
     };
     let tools = ToolExecutor::new(&workspace);
+    let skills = orangu::skills::SkillRegistry::discover(&workspace);
 
     // Remove any binary staged by a previous `/restart`; it is only needed
     // across the exec handoff and must not accumulate.
@@ -214,11 +215,12 @@ async fn run() -> Result<()> {
     // server's resolved model and changed at runtime by `/model`.
     let mut active_model_id = startup_profile.model.clone();
     let mut active_model = startup_model.clone();
-    let mut session = ChatSession::new(system_prompt(
+    let mut session = ChatSession::new(&system_prompt_with_skills(
         config
             .llms
             .get(&active_model)
             .ok_or_else(|| anyhow!("missing configured server {}", active_model))?,
+        &skills,
     ));
     let mut current_endpoint = Some(startup_endpoint.clone());
 
@@ -374,6 +376,7 @@ async fn run() -> Result<()> {
             feedback: config.feedback,
             server_names: &server_names,
             available_models: &available_models,
+            skills: &skills,
         };
         // Collect the startup branch-sync result once its task finishes.
         if sync_handle
@@ -466,6 +469,7 @@ async fn run() -> Result<()> {
                     server_names: &server_names,
                     available_models: &available_models,
                     render,
+                    skills: &skills,
                 },
                 print_screen,
                 max_idle,
@@ -513,6 +517,7 @@ async fn run() -> Result<()> {
         std::io::stdout().flush()?;
 
         let mut detect_model = false;
+        let mut prompt_input = next_input.clone();
         let command_outcome = handle_command(
             &next_input,
             CommandState {
@@ -539,6 +544,7 @@ async fn run() -> Result<()> {
                     review: last_review_report.as_deref(),
                     auto_review: last_auto_review_report.as_deref(),
                 },
+                skills: &skills,
             },
         )?;
         // When `/server` (or `/reload`) selects a server, auto-detect an
@@ -649,6 +655,7 @@ async fn run() -> Result<()> {
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
+                    skills: &skills,
                 };
                 let result = wait_for_local_command(
                     WaitContext {
@@ -663,6 +670,7 @@ async fn run() -> Result<()> {
                         pending_commands: &mut pending_commands,
                         thinking_quote: None,
                         viewport: &mut viewport,
+                        skills: &skills,
                     },
                     handle,
                 )
@@ -702,6 +710,7 @@ async fn run() -> Result<()> {
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
+                    skills: &skills,
                 };
                 let result = wait_for_streaming_command(
                     WaitContext {
@@ -716,6 +725,7 @@ async fn run() -> Result<()> {
                         pending_commands: &mut pending_commands,
                         thinking_quote: None,
                         viewport: &mut viewport,
+                        skills: &skills,
                     },
                     handle,
                     &mut rx,
@@ -744,6 +754,7 @@ async fn run() -> Result<()> {
                         current_model: &active_model_id,
                         prompt_branch: prompt_branch.as_deref(),
                         pending_count: pending_commands.len(),
+                        skills: &skills,
                     };
                     match run_review_mode(
                         &mut review,
@@ -751,6 +762,8 @@ async fn run() -> Result<()> {
                         &mut input_state,
                         chrome,
                         &workspace,
+                        &server_names,
+                        &available_models,
                     )? {
                         ReviewSignal::Exit => break,
                         ReviewSignal::OpenFile { path } => {
@@ -890,6 +903,7 @@ async fn run() -> Result<()> {
                     current_model: &active_model_id,
                     prompt_branch: prompt_branch.as_deref(),
                     pending_count: pending_commands.len(),
+                    skills: &skills,
                 };
 
                 let state = run_auto_review_mode(
@@ -901,6 +915,7 @@ async fn run() -> Result<()> {
                     &workspace,
                     &config.terminal,
                     config.feedback,
+                    &skills,
                 )
                 .await?;
 
@@ -981,6 +996,9 @@ async fn run() -> Result<()> {
                 output_state.reset_scroll();
                 continue;
             }
+            CommandOutcome::OverridePrompt(prompt) => {
+                prompt_input = prompt;
+            }
             CommandOutcome::Unhandled => {}
         }
 
@@ -1023,7 +1041,7 @@ async fn run() -> Result<()> {
         let thinking_quote = quote_module.pick(seed);
         match wait_for_response(
             &mut session,
-            &next_input,
+            &prompt_input,
             &prompt_profile,
             &tools,
             WaitContext {
@@ -1041,6 +1059,7 @@ async fn run() -> Result<()> {
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
+                    skills: &skills,
                 },
                 history: &mut history,
                 history_path: &session_hist_path,
@@ -1052,6 +1071,7 @@ async fn run() -> Result<()> {
                 pending_commands: &mut pending_commands,
                 thinking_quote,
                 viewport: &mut viewport,
+                skills: &skills,
             },
         )
         .await

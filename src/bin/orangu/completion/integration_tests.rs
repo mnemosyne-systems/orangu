@@ -45,6 +45,7 @@ fn completes_open_file_commands_across_workspace() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("slash completion");
     assert_eq!(
@@ -52,23 +53,41 @@ fn completes_open_file_commands_across_workspace() {
         vec!["README.md".to_string(), "doc/README.md".to_string()]
     );
 
-    let (start, _, natural_candidates) =
-        completion_candidates("Open READ", "Open READ".len(), workspace.path(), &[], &[])
-            .expect("natural completion");
+    let (start, _, natural_candidates) = completion_candidates(
+        "Open READ",
+        "Open READ".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural completion");
     assert_eq!(start, "Open ".len());
     assert_eq!(
         natural_candidates,
         vec!["README.md".to_string(), "doc/README.md".to_string()]
     );
 
-    let (_, _, ignored_candidates) =
-        completion_candidates("Open ign", "Open ign".len(), workspace.path(), &[], &[])
-            .expect("ignored completion");
+    let (_, _, ignored_candidates) = completion_candidates(
+        "Open ign",
+        "Open ign".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("ignored completion");
     assert!(ignored_candidates.is_empty());
 
-    let (_, _, git_candidates) =
-        completion_candidates("Open con", "Open con".len(), workspace.path(), &[], &[])
-            .expect("git completion");
+    let (_, _, git_candidates) = completion_candidates(
+        "Open con",
+        "Open con".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("git completion");
     assert!(git_candidates.is_empty());
 
     let (_, _, target_candidates) = completion_candidates(
@@ -77,13 +96,20 @@ fn completes_open_file_commands_across_workspace() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("target completion");
     assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
 
-    let (start, _, show_candidates) =
-        completion_candidates("Show t", "Show t".len(), workspace.path(), &[], &[])
-            .expect("show completion");
+    let (start, _, show_candidates) = completion_candidates(
+        "Show t",
+        "Show t".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("show completion");
     assert_eq!(start, "Show ".len());
     assert_eq!(show_candidates, vec!["src/tui.rs".to_string()]);
 
@@ -93,6 +119,7 @@ fn completes_open_file_commands_across_workspace() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("show file completion");
     assert_eq!(start, "show file ".len());
@@ -114,8 +141,15 @@ fn completes_workspace_directories() {
     fs::write(base.join("proj-notes.txt"), "").expect("file");
 
     let input = format!("/workspace {}/proj-", base.display());
-    let (start, _, candidates) =
-        completion_candidates(&input, input.len(), base, &[], &[]).expect("workspace completion");
+    let (start, _, candidates) = completion_candidates(
+        &input,
+        input.len(),
+        base,
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("workspace completion");
     assert_eq!(start, "/workspace ".len());
     assert!(candidates.contains(&format!("{}/proj-alpha", base.display())));
     assert!(candidates.contains(&format!("{}/proj-beta", base.display())));
@@ -147,6 +181,7 @@ fn completes_show_file_commands_and_flags() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("initial file completion");
     assert_eq!(
@@ -164,6 +199,7 @@ fn completes_show_file_commands_and_flags() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("flag completion");
     assert_eq!(
@@ -177,6 +213,7 @@ fn completes_show_file_commands_and_flags() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("file completion");
     assert_eq!(
@@ -190,6 +227,7 @@ fn completes_show_file_commands_and_flags() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("quoted file completion");
     assert_eq!(
@@ -203,6 +241,7 @@ fn completes_show_file_commands_and_flags() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("target completion");
     assert_eq!(target_candidates, vec!["src/tui.rs".to_string()]);
@@ -223,14 +262,26 @@ fn completion_respects_repo_gitignore_when_workspace_is_ignored_subdir() {
 
     let workspace = repo.path().join("target/debug");
 
-    let (_, _, open_candidates) =
-        completion_candidates("/open_file ", "/open_file ".len(), &workspace, &[], &[])
-            .expect("open completion");
+    let (_, _, open_candidates) = completion_candidates(
+        "/open_file ",
+        "/open_file ".len(),
+        &workspace,
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("open completion");
     assert!(open_candidates.is_empty());
 
-    let (_, _, show_candidates) =
-        completion_candidates("/show_file ", "/show_file ".len(), &workspace, &[], &[])
-            .expect("show completion");
+    let (_, _, show_candidates) = completion_candidates(
+        "/show_file ",
+        "/show_file ".len(),
+        &workspace,
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("show completion");
     assert!(show_candidates.is_empty());
 }
 
@@ -283,6 +334,7 @@ fn completes_checkout_branches_and_files() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("checkout completion");
     assert_eq!(start, "/checkout ".len());
@@ -293,9 +345,15 @@ fn completes_checkout_branches_and_files() {
     );
     assert!(candidates.contains(&"main.rs".to_string()), "file missing");
 
-    let (start, _, nat_candidates) =
-        completion_candidates("checkout m", "checkout m".len(), workspace.path(), &[], &[])
-            .expect("natural checkout completion");
+    let (start, _, nat_candidates) = completion_candidates(
+        "checkout m",
+        "checkout m".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural checkout completion");
     assert_eq!(start, "checkout ".len());
     assert!(
         nat_candidates.contains(&"main".to_string()),
@@ -325,34 +383,67 @@ fn completes_fetch_remotes_with_origin_first() {
     }
 
     // Empty argument offers every remote, origin first.
-    let (start, _, candidates) =
-        completion_candidates("/fetch ", "/fetch ".len(), workspace.path(), &[], &[])
-            .expect("fetch completion");
+    let (start, _, candidates) = completion_candidates(
+        "/fetch ",
+        "/fetch ".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("fetch completion");
     assert_eq!(start, "/fetch ".len());
     assert_eq!(candidates, vec!["origin", "fork", "upstream"]);
 
     // The grey ghost previews the default (origin) when nothing is typed.
     assert_eq!(
-        completion_ghost_suffix("/fetch ", "/fetch ".len(), workspace.path(), &[], &[]).as_deref(),
+        completion_ghost_suffix(
+            "/fetch ",
+            "/fetch ".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+        )
+        .as_deref(),
         Some("origin")
     );
 
     // Typing narrows; `/fetch u` -> `upstream`.
-    let (start, _, narrowed) =
-        completion_candidates("/fetch u", "/fetch u".len(), workspace.path(), &[], &[])
-            .expect("fetch completion");
+    let (start, _, narrowed) = completion_candidates(
+        "/fetch u",
+        "/fetch u".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("fetch completion");
     assert_eq!(start, "/fetch ".len());
     assert_eq!(narrowed, vec!["upstream"]);
     assert_eq!(
-        completion_ghost_suffix("/fetch u", "/fetch u".len(), workspace.path(), &[], &[])
-            .as_deref(),
+        completion_ghost_suffix(
+            "/fetch u",
+            "/fetch u".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+        )
+        .as_deref(),
         Some("pstream")
     );
 
     // The natural-language form completes the same way.
-    let (start, _, nat_candidates) =
-        completion_candidates("fetch f", "fetch f".len(), workspace.path(), &[], &[])
-            .expect("natural fetch completion");
+    let (start, _, nat_candidates) = completion_candidates(
+        "fetch f",
+        "fetch f".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural fetch completion");
     assert_eq!(start, "fetch ".len());
     assert_eq!(nat_candidates, vec!["fork"]);
 }
@@ -400,9 +491,15 @@ fn completes_rebase_targets_local_then_remotes_then_remote_branches() {
             .success()
     );
 
-    let (start, _, candidates) =
-        completion_candidates("/rebase ", "/rebase ".len(), workspace.path(), &[], &[])
-            .expect("rebase completion");
+    let (start, _, candidates) = completion_candidates(
+        "/rebase ",
+        "/rebase ".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("rebase completion");
     assert_eq!(start, "/rebase ".len());
     // Local branches come first, then the remote, then remote-tracking branches.
     let main_local = candidates.iter().position(|c| c == "main");
@@ -421,8 +518,15 @@ fn completes_rebase_targets_local_then_remotes_then_remote_branches() {
 
     // The grey ghost previews the first local branch when nothing is typed.
     assert_eq!(
-        completion_ghost_suffix("/rebase ", "/rebase ".len(), workspace.path(), &[], &[])
-            .as_deref(),
+        completion_ghost_suffix(
+            "/rebase ",
+            "/rebase ".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+        )
+        .as_deref(),
         Some("feature")
     );
 
@@ -434,6 +538,7 @@ fn completes_rebase_targets_local_then_remotes_then_remote_branches() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("natural rebase completion");
     assert_eq!(start, "rebase ".len());
@@ -505,6 +610,7 @@ fn completes_switch_to_branches_and_tags_but_not_files() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("switch to completion");
     assert_eq!(start, "switch to ".len());
@@ -527,6 +633,7 @@ fn completes_switch_to_branches_and_tags_but_not_files() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("switch to branch completion");
     assert_eq!(start, "switch to branch ".len());
@@ -570,7 +677,15 @@ fn ghost_previews_first_structured_completion() {
     // The first matching branch is previewed as the trailing ghost suffix.
     let input = "switch to branch m";
     assert_eq!(
-        completion_ghost_suffix(input, input.len(), workspace.path(), &[], &[]).as_deref(),
+        completion_ghost_suffix(
+            input,
+            input.len(),
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+        )
+        .as_deref(),
         Some("ain")
     );
 
@@ -582,7 +697,8 @@ fn ghost_previews_first_structured_completion() {
             "/server lo".len(),
             workspace.path(),
             &servers,
-            &[]
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
         )
         .as_deref(),
         Some("cal")
@@ -596,14 +712,22 @@ fn ghost_previews_first_structured_completion() {
             "tell me about main".len(),
             workspace.path(),
             &[],
-            &[]
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
         ),
         None
     );
 
     // No ghost when the cursor is not at the end of the input.
     assert_eq!(
-        completion_ghost_suffix(input, 0, workspace.path(), &[], &[]),
+        completion_ghost_suffix(
+            input,
+            0,
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+        ),
         None
     );
 }
@@ -640,6 +764,7 @@ fn completes_add_file_untracked() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("add_file completion");
     assert_eq!(start, "/add_file ".len());
@@ -649,9 +774,15 @@ fn completes_add_file_untracked() {
     assert!(!candidates.contains(&"tracked.rs".to_string()));
 
     // Natural-language form
-    let (start, _, nat_candidates) =
-        completion_candidates("add n", "add n".len(), workspace.path(), &[], &[])
-            .expect("natural add_file completion");
+    let (start, _, nat_candidates) = completion_candidates(
+        "add n",
+        "add n".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural add_file completion");
     assert_eq!(start, "add ".len());
     assert_eq!(nat_candidates[0], "newdir/");
 }
@@ -688,6 +819,7 @@ fn completes_remove_file_tracked() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("remove_file completion");
     assert_eq!(start, "/remove_file ".len());
@@ -697,9 +829,15 @@ fn completes_remove_file_tracked() {
     assert!(!candidates.contains(&"untracked.txt".to_string()));
 
     // Natural-language form
-    let (start, _, nat_candidates) =
-        completion_candidates("remove s", "remove s".len(), workspace.path(), &[], &[])
-            .expect("natural remove_file completion");
+    let (start, _, nat_candidates) = completion_candidates(
+        "remove s",
+        "remove s".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural remove_file completion");
     assert_eq!(start, "remove ".len());
     assert_eq!(nat_candidates[0], "src/");
 }
@@ -736,6 +874,7 @@ fn completes_move_file_targets() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("move_file source completion");
     assert_eq!(start, "/move_file ".len());
@@ -749,15 +888,22 @@ fn completes_move_file_targets() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("move_file destination completion");
     assert_eq!(start, "/move_file src/main.rs ".len());
     assert!(dst_candidates.contains(&"untracked.txt".to_string()));
 
     // Natural-language form — first arg
-    let (start, _, nat_candidates) =
-        completion_candidates("move s", "move s".len(), workspace.path(), &[], &[])
-            .expect("natural move_file completion");
+    let (start, _, nat_candidates) = completion_candidates(
+        "move s",
+        "move s".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("natural move_file completion");
     assert_eq!(start, "move ".len());
     assert_eq!(nat_candidates[0], "src/");
 }
@@ -791,6 +937,7 @@ fn completes_cherry_pick_commits() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     );
     if let Some((start, _, candidates)) = result {
         assert_eq!(start, "/cherry_pick ".len());
@@ -805,6 +952,7 @@ fn completes_cherry_pick_commits() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     );
     if let Some((start, _, _)) = nl_result {
         assert_eq!(start, "cherry pick ".len());
@@ -837,6 +985,7 @@ fn auto_review_completes_files_by_name_per_branch() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("auto_review completion");
     assert_eq!(start, "/auto_review ".len());
@@ -849,6 +998,7 @@ fn auto_review_completes_files_by_name_per_branch() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("auto review completion");
     assert_eq!(start, "Auto review ".len());
@@ -867,6 +1017,7 @@ fn auto_review_completes_files_by_name_per_branch() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("auto_review completion");
     assert_eq!(candidates, vec!["README.md".to_string()]);
@@ -878,6 +1029,7 @@ fn auto_review_completes_files_by_name_per_branch() {
         workspace.path(),
         &[],
         &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
     .expect("auto_review completion");
     assert!(candidates.is_empty(), "{candidates:?}");

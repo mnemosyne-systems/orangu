@@ -117,6 +117,9 @@ pub fn shell_words(input: &str) -> Result<Vec<String>> {
 
 pub enum CommandOutcome {
     Unhandled,
+    /// The input was intercepted locally and should be replaced with the
+    /// provided prompt text before sending anything to the model.
+    OverridePrompt(String),
     Quiet,
     /// Command ran and produced informational output (success).
     Output(String),
@@ -303,6 +306,7 @@ pub enum LocalCommand<'a> {
     Quit,
     PendingList,
     PendingDelete(Option<usize>),
+    Skills,
 }
 
 pub struct CommandContext<'a> {
@@ -319,6 +323,7 @@ pub struct CommandContext<'a> {
     pub terminal: &'a str,
     pub forge: crate::git::Forge,
     pub review_reports: crate::git::ReviewReports<'a>,
+    pub skills: &'a orangu::skills::SkillRegistry,
 }
 
 pub struct CommandState<'a> {
@@ -343,6 +348,19 @@ pub fn system_prompt(profile: &LlmConfiguration) -> &str {
         "You are Orangu, a coding environment assistant connected to a local workspace. Use the available local tools to inspect files, edit files on disk, fetch external URLs for knowledge, and run shell commands when needed. Be precise, explain what you changed, and surface tool failures explicitly."
     } else {
         &profile.system_prompt
+    }
+}
+
+pub fn system_prompt_with_skills(
+    profile: &LlmConfiguration,
+    skills: &orangu::skills::SkillRegistry,
+) -> String {
+    let base = system_prompt(profile);
+    let index = skills.system_prompt_index();
+    if index.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n\n{index}")
     }
 }
 

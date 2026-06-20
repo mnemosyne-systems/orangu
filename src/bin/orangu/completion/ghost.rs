@@ -32,15 +32,22 @@ pub fn input_ghost_suffix(
     workspace: &Path,
     server_names: &[String],
     available_models: &[String],
+    skills: &orangu::skills::SkillRegistry,
 ) -> Option<String> {
     if cursor != input.len() {
         return None;
     }
-    command_ghost_suffix(input)
-        .or_else(|| natural_language_ghost_suffix_at(input, ghost_index))
-        .map(str::to_string)
+    command_ghost_suffix(input, skills)
+        .or_else(|| natural_language_ghost_suffix_at(input, ghost_index).map(str::to_string))
         .or_else(|| {
-            completion_ghost_suffix(input, cursor, workspace, server_names, available_models)
+            completion_ghost_suffix(
+                input,
+                cursor,
+                workspace,
+                server_names,
+                available_models,
+                skills,
+            )
         })
 }
 
@@ -52,14 +59,26 @@ pub fn input_ghost_suffix(
 /// typed (no whitespace yet) that matches a known command. The first matching
 /// command in [`COMMANDS`] wins, so the suggestion narrows as more letters are
 /// typed. An already-complete command yields `None`.
-pub fn command_ghost_suffix(input: &str) -> Option<&'static str> {
+pub fn command_ghost_suffix(input: &str, skills: &orangu::skills::SkillRegistry) -> Option<String> {
     if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
         return None;
     }
-    let candidate = COMMANDS.iter().find(|command| command.starts_with(input))?;
-    candidate
-        .strip_prefix(input)
-        .filter(|rest| !rest.is_empty())
+    if let Some(candidate) = COMMANDS.iter().find(|command| command.starts_with(input)) {
+        return candidate
+            .strip_prefix(input)
+            .filter(|rest| !rest.is_empty())
+            .map(|s| s.to_string());
+    }
+    for skill in skills.all() {
+        let cmd = format!("/{}", skill.name);
+        if cmd.starts_with(input) {
+            return cmd
+                .strip_prefix(input)
+                .filter(|rest| !rest.is_empty())
+                .map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 /// Every natural-language binding the user's part-typed input could still grow
@@ -164,19 +183,61 @@ mod tests {
     #[test]
     fn suggests_ghost_suffix_for_partial_slash_commands() {
         // A unique prefix completes to the rest of the command.
-        assert_eq!(command_ghost_suffix("/q"), Some("uit"));
-        assert_eq!(command_ghost_suffix("/qui"), Some("t"));
+        assert_eq!(
+            command_ghost_suffix(
+                "/q",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            Some("uit".to_string())
+        );
+        assert_eq!(
+            command_ghost_suffix(
+                "/qui",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            Some("t".to_string())
+        );
 
         // The first matching command wins, so the hint narrows as letters arrive.
-        assert_eq!(command_ghost_suffix("/"), Some("help"));
+        assert_eq!(
+            command_ghost_suffix(
+                "/",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            Some("help".to_string())
+        );
 
         // A fully typed command and unmatched prefixes have nothing to suggest.
-        assert_eq!(command_ghost_suffix("/quit"), None);
-        assert_eq!(command_ghost_suffix("/zzz"), None);
+        assert_eq!(
+            command_ghost_suffix(
+                "/quit",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            None
+        );
+        assert_eq!(
+            command_ghost_suffix(
+                "/zzz",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            None
+        );
 
         // Once an argument is being typed (whitespace) the name hint stops.
-        assert_eq!(command_ghost_suffix("/quit "), None);
-        assert_eq!(command_ghost_suffix("not a command"), None);
+        assert_eq!(
+            command_ghost_suffix(
+                "/quit ",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            None
+        );
+        assert_eq!(
+            command_ghost_suffix(
+                "not a command",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -270,17 +331,35 @@ mod tests {
         // and the next Tab accepts that word too.
         let mut input_state = InputState::default();
         input_state.set_buffer("pus".to_string());
-        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        apply_completion(
+            &mut input_state,
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        );
         assert_eq!(input_state.as_str(), "push ");
         assert_eq!(input_state.cursor(), "push ".len());
         assert_eq!(natural_language_ghost_suffix_at("push ", 0), Some("force"));
-        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        apply_completion(
+            &mut input_state,
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        );
         assert_eq!(input_state.as_str(), "push force");
 
         // A fully typed binding has no ghost, so Tab leaves it untouched.
         let mut input_state = InputState::default();
         input_state.set_buffer("commit".to_string());
-        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        apply_completion(
+            &mut input_state,
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        );
         assert_eq!(input_state.as_str(), "commit");
 
         // The binding ghost wins over a same-prefixed filename: typing "c" with
@@ -290,7 +369,13 @@ mod tests {
         std::fs::create_dir(repo.path().join("contrib")).expect("contrib dir");
         let mut input_state = InputState::default();
         input_state.set_buffer("c".to_string());
-        apply_completion(&mut input_state, repo.path(), &[], &[]);
+        apply_completion(
+            &mut input_state,
+            repo.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        );
         assert_eq!(input_state.as_str(), "current ");
 
         // Shift+Tab advances the preview; Tab then accepts the first word of the
@@ -303,7 +388,13 @@ mod tests {
         );
         cycle_ghost_suggestion(&mut input_state);
         assert_eq!(input_state.ghost_index, 1);
-        apply_completion(&mut input_state, workspace.path(), &[], &[]);
+        apply_completion(
+            &mut input_state,
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        );
         assert_eq!(input_state.as_str(), second);
 
         // Editing the line resets the cycle back to the first candidate.

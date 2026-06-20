@@ -104,6 +104,7 @@ pub fn print_screen(render: RenderContext<'_>, screen: ScreenState<'_>) {
         render.workspace,
         render.server_names,
         render.available_models,
+        render.skills,
     );
     let ghost = structured_ghost.as_deref().unwrap_or("");
     print!("{CLEAR_TERMINAL_SEQUENCE}");

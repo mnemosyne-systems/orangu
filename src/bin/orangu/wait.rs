@@ -39,6 +39,7 @@ pub(crate) async fn wait_for_response(
         pending_commands,
         thinking_quote,
         viewport,
+        skills,
     } = wait_context;
     let streamed_state = Arc::new(Mutex::new(StreamRenderState::default()));
     let prompt_output = Arc::clone(&streamed_state);
@@ -176,6 +177,7 @@ pub(crate) async fn wait_for_response(
                             server_names,
                             available_models,
                             render,
+                            skills,
                         },
                     );
                     render.actual_width = viewport.actual_width;
@@ -281,6 +283,7 @@ pub(crate) async fn wait_for_local_command(
         pending_commands,
         thinking_quote: _,
         viewport,
+        skills,
     } = wait_context;
     let started = std::time::Instant::now();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
@@ -309,6 +312,7 @@ pub(crate) async fn wait_for_local_command(
                             server_names,
                             available_models,
                             render,
+                            skills,
                         },
                     );
                     render.actual_width = viewport.actual_width;
@@ -354,6 +358,7 @@ pub(crate) async fn wait_for_streaming_command(
         pending_commands,
         thinking_quote: _,
         viewport,
+        skills,
     } = wait_context;
     let started = std::time::Instant::now();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
@@ -389,6 +394,7 @@ pub(crate) async fn wait_for_streaming_command(
                             server_names,
                             available_models,
                             render,
+                            skills,
                         },
                     );
                     render.actual_width = viewport.actual_width;

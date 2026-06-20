@@ -79,6 +79,7 @@ pub const COMMANDS: &[&str] = &[
     "/manual",
     "/usage",
     "/build",
+    "/skills",
     "/clear",
     "/quit",
 ];
@@ -89,6 +90,7 @@ pub fn completion_candidates(
     workspace: &Path,
     server_names: &[String],
     available_models: &[String],
+    skills: &orangu::skills::SkillRegistry,
 ) -> Option<(usize, usize, Vec<String>)> {
     let cursor = cursor.min(input.len());
     let prefix = &input[..cursor];
@@ -107,6 +109,7 @@ pub fn completion_candidates(
                 .iter()
                 .filter(|command| command.starts_with(prefix))
                 .map(|command| (*command).to_string())
+                .chain(skills_for_prefix(prefix, skills))
                 .collect(),
         ));
     }
@@ -119,6 +122,17 @@ pub fn completion_candidates(
         .unwrap_or(0);
     let token = &prefix[start..];
     Some((start, cursor, file_completion_candidates(token, workspace)))
+}
+
+fn skills_for_prefix<'a>(
+    prefix: &'a str,
+    skills: &'a orangu::skills::SkillRegistry,
+) -> impl Iterator<Item = String> + 'a {
+    skills
+        .all()
+        .iter()
+        .map(|skill| format!("/{}", skill.name))
+        .filter(move |command| command.starts_with(prefix) && !COMMANDS.contains(&command.as_str()))
 }
 
 /// The grey inline "ghost" suffix previewing the first structured completion
@@ -138,6 +152,7 @@ pub fn completion_ghost_suffix(
     workspace: &Path,
     server_names: &[String],
     available_models: &[String],
+    _skills: &orangu::skills::SkillRegistry,
 ) -> Option<String> {
     if cursor != input.len() {
         return None;
@@ -366,10 +381,35 @@ mod tests {
     fn auto_review_command_completes_from_the_command_list() {
         // `/auto_review` is registered in the completion list...
         assert!(COMMANDS.contains(&"/auto_review"));
+        assert!(COMMANDS.contains(&"/skills"));
         // ...the inline ghost hint completes it once the prefix is unambiguous...
-        assert_eq!(command_ghost_suffix("/auto"), Some("_review"));
+        assert_eq!(
+            command_ghost_suffix(
+                "/auto",
+                &orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))
+            ),
+            Some("_review".to_string())
+        );
         // ...and the natural-language ghost knows the alias too.
         assert!(natural_language_ghost_candidates("auto re").contains(&"view"));
+    }
+
+    #[test]
+    fn slash_completion_includes_discovered_skills() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents/skills/deploy");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Deploy the app\n---\nDeploy it\n",
+        )
+        .expect("skill");
+        let skills = orangu::skills::SkillRegistry::discover(workspace.path());
+
+        let (_, _, candidates) =
+            completion_candidates("/dep", 4, workspace.path(), &[], &[], &skills)
+                .expect("slash completion");
+        assert!(candidates.contains(&"/deploy".to_string()));
     }
 
     #[test]

@@ -31,6 +31,35 @@ show available commands
 
 \newpage
 
+## /skills
+
+Lists the discovered Agent Skills.
+
+Each line shows the slash command name, the skill description, and whether the
+skill came from the project or the user scope. Skills are discovered from
+`~/.orangu/skills/`, `~/.agents/skills/`, `<workspace>/.orangu/skills/`, and
+`<workspace>/.agents/skills/`, with project skills overriding user skills that
+share the same name.
+
+Invoke a listed skill directly with `/skill-name`. When a skill is invoked,
+orangu injects the skill instructions into the next model request in a
+structured wrapper that also identifies the skill directory and any bundled
+resource files.
+
+### Examples
+
+```text
+/skills
+```
+
+Invoke the bundled debugging skill:
+
+```text
+/debugging reproduce the failing request path and identify the root cause
+```
+
+\newpage
+
 ## /tools
 
 Lists the model-facing workspace tools — `read_file`, `edit_file`, `list_directory`, `fetch_url`, and `run_shell_command` — that the active model may call. These are the tools described in the Tools chapter and are distinct from the local slash commands documented here.

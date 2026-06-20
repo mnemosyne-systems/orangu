@@ -29,12 +29,35 @@ The wizard:
    example `delta` installed but not set as your Git diff pager. See
    [Optional external tools](#optional-external-tools) for how each one is
    activated.
-5. Shows the resulting configuration and asks for confirmation before writing.
+5. Installs bundled skills into `~/.orangu/skills/` when they are not already
+   present. At the moment this includes `debugging`.
+6. Shows the resulting configuration and asks for confirmation before writing.
 
 The provider is assumed to be `llama.cpp`. Only values that differ from their
 default are written, so the generated file stays minimal. It is written to
 `~/.orangu/orangu.conf`, creating `~/.orangu/` if needed and overwriting any
-existing file.
+existing file. Bundled skills are written to `~/.orangu/skills/<skill>/SKILL.md`
+and are left untouched when the file already exists.
+
+## Agent Skills
+
+orangu supports Agent Skills: directories containing a `SKILL.md` file with
+YAML frontmatter and markdown instructions. Skills are discovered from four
+locations:
+
+1. `~/.orangu/skills/`
+2. `~/.agents/skills/`
+3. `<workspace>/.orangu/skills/`
+4. `<workspace>/.agents/skills/`
+
+Project skills override user skills with the same name. The `/skills` command
+lists the discovered skills. A skill can be invoked explicitly with
+`/skill-name`; for example, the bundled `debugging` skill is typically
+available after `--init`:
+
+```text
+/debugging reproduce the failing request path and identify the root cause
+```
 
 ## `[orangu]`
 
