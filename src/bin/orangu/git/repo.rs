@@ -616,7 +616,12 @@ mod tests {
         init_git_for_test(&workspace);
         git_run(
             &workspace,
-            &["remote", "add", "origin", "https://example.com/owner/orangu.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/owner/orangu.git",
+            ],
         );
         assert_eq!(git_repository_name(&workspace).as_deref(), Some("orangu"));
     }
