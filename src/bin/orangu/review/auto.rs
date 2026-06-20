@@ -1115,6 +1115,14 @@ pub(crate) fn auto_review_finding_location(path: &str, line: Option<&str>) -> St
 /// punctuation. The model emits these when a category is clean, and they must
 /// never reach the report.
 pub(crate) fn auto_review_is_placeholder(text: &str) -> bool {
+    const PHRASES: [&str; 6] = [
+        "none",
+        "no findings",
+        "no issues",
+        "no issues found",
+        "nothing",
+        "n/a",
+    ];
     // Drop a trailing `(...)` justification, but only when something precedes
     // it — a finding that is wholly parenthesized is kept as content.
     let core = match text
@@ -1125,12 +1133,20 @@ pub(crate) fn auto_review_is_placeholder(text: &str) -> bool {
         _ => text.trim(),
     };
     let lower = core.to_ascii_lowercase();
-    let lower = lower.trim_end_matches(['.', '!']);
-    lower.is_empty()
-        || matches!(
-            lower,
-            "none" | "no findings" | "no issues" | "no issues found" | "nothing" | "n/a"
-        )
+    // The whole text is a bare placeholder (possibly with trailing `.`/`!`).
+    let trimmed = lower.trim_end_matches(['.', '!']);
+    if trimmed.is_empty() || PHRASES.contains(&trimmed) {
+        return true;
+    }
+    // Or it opens with a placeholder as its own sentence — `None. <prose>` is
+    // still a "nothing to report" affirmation, so the whole finding is dropped.
+    // A word that merely starts with the phrase (`None of the changes …`) keeps
+    // going, so it is not mistaken for one.
+    PHRASES.iter().any(|phrase| {
+        lower
+            .strip_prefix(phrase)
+            .is_some_and(|rest| rest.starts_with(['.', '!', ',', ';', ':']))
+    })
 }
 
 /// The body of a finding line: bullet markers and list numbering stripped;
@@ -1146,6 +1162,12 @@ pub(crate) fn auto_review_finding_body(line: &str) -> Option<String> {
         }
         _ => body,
     };
+    // A stray `VERDICT: …` line is never a finding — the whole-change pass
+    // sometimes emits one even though only findings were asked for, and the
+    // verdict is already recorded elsewhere — so drop it.
+    if auto_review_header_rest(body, "verdict").is_some() {
+        return None;
+    }
     // A finding may carry a leading `line:` / `start-end:` reference; look past
     // it for the placeholder check. A clean category may also fill the line
     // slot itself with `None`, leaving the bare line `None: None`, so the
@@ -2051,6 +2073,66 @@ mod tests {
                 "verdict handling is wrong".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn apply_overall_drops_verdict_lines_and_none_affirmations() {
+        use crate::commands::ReviewLaunch;
+        use crate::review::AutoReviewState;
+        use orangu::tui::{ReviewEntry, ReviewStatus};
+
+        let mut state = AutoReviewState::new(ReviewLaunch {
+            files: vec![ReviewEntry {
+                path: "a.rs".to_string(),
+                status: ReviewStatus::Approved,
+                diff_lines: vec!["+x".to_string()],
+                patch: String::new(),
+            }],
+        });
+
+        // The whole-change pass sometimes emits a stray verdict and "nothing to
+        // report" affirmations alongside the real bullets. The verdict is
+        // recorded elsewhere, and a leading `None.`/`Nothing.` sentence is noise,
+        // so only the genuine observations reach the `Overall` section.
+        state.apply_overall(
+            "- None.\n\
+             - VERDICT: REJECT\n\
+             - None. Everything is consistent.\n\
+             - The change set is cohesive and ready to merge.\n\
+             - None of the modules grow unbounded.\n",
+        );
+        assert_eq!(
+            state.sections[0],
+            vec![
+                "The change set is cohesive and ready to merge.".to_string(),
+                "None of the modules grow unbounded.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_review_is_placeholder_catches_leading_none_sentence() {
+        use crate::review::auto_review_is_placeholder;
+
+        // Bare placeholders, and a placeholder that opens a sentence.
+        for text in [
+            "None",
+            "None.",
+            "Nothing!",
+            "N/A",
+            "None. Everything looks good.",
+            "None; the patch is clean.",
+        ] {
+            assert!(auto_review_is_placeholder(text), "{text:?}");
+        }
+        // Real content that merely begins with the word `None` is kept.
+        for text in [
+            "None of the changes are risky",
+            "Nonexistent field referenced",
+            "unwrap may panic",
+        ] {
+            assert!(!auto_review_is_placeholder(text), "{text:?}");
+        }
     }
 
     #[test]
