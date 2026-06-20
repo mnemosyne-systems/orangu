@@ -204,7 +204,10 @@ The completion modes are checked in order:
 11. If the line starts with `/model `, complete the models available on the selected server, cycling through them. If the line starts with `/server `, complete the names of all INI sections identified as servers; selecting one switches the active server.
 12. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
 13. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
-14. If the line starts with `/`, complete built-in slash commands such as `/help`, `/model`, `/server`, `/list_files`, `/show_file`, `/tools`, and `/quit`.
+14. If the line starts with `/`, complete built-in slash commands and any
+    discovered Agent Skills. Examples include `/help`, `/skills`, `/model`,
+    `/server`, `/list_files`, `/show_file`, `/tools`, `/quit`, and a discovered
+    skill such as `/debugging`.
 15. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
 
 Path-completion details:

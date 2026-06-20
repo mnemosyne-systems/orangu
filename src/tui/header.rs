@@ -175,6 +175,7 @@ pub fn help_text() -> &'static str {
 /status                                       Show working tree status with color highlighting
 /manual                                       Open the built-in manual in a full-screen viewer
 /usage                                        Show usage statistics for this session
+/skills                                       List discovered Agent Skills; invoke one with /skill-name
 /clear                                        Clear the current conversation
 /quit                                         Exit the client
 

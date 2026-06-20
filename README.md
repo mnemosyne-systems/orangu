@@ -35,6 +35,7 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 - **A single fast native binary** — written entirely in Rust, with quick startup, no runtime to install, no garbage-collector pauses, and a small download.
 - **The whole Git loop lives in the prompt** — branch, commit, rebase, squash, cherry-pick, stash, bisect, push, and GitHub/GitLab pull requests, comments, and issues, all without leaving the terminal.
 - **Tuned for llama.cpp** — live tokens/second in the footer, and an interactive `--init` wizard that auto-detects the model your server is serving.
+- **Agent Skills support** — discovers reusable `SKILL.md` skills from both orangu-native and cross-client `.agents/skills` directories, and ships a bundled `debugging` skill installed by `--init`.
 - **Natural to drive** — dozens of slash commands, each with plain-English aliases (`review`, `auto review`, `commit "..."`, `merge feature/foo`, `pull 58`).
 
 ## Features
@@ -44,6 +45,8 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 **Code review built in.** orangu's standout feature is a pair of in-terminal review workflows — an interactive reviewer and a fully automated, LLM-driven one — covered in [Code review and auto review](#code-review-and-auto-review) below.
 
 **Workspace-aware tooling.** Local tools read, edit, list, search (`/grep`), and fetch files, and run shell commands — all scoped to your workspace. A full set of Git commands (`/status`, `/diff`, `/log`, `/commit`, `/amend`, `/squash`, `/rebase`, `/merge`, `/cherry_pick`, `/branch`, `/stash`, `/bisect`, `/push`, `/pull`, …) and forge integration (`/pull_request`, `/comment`, `/close`, `/get_comments` on GitHub and GitLab) keep the whole change-and-review loop in one place.
+
+**Agent Skills, with progressive disclosure.** orangu discovers skills from four locations: `~/.orangu/skills/`, `~/.agents/skills/`, `<workspace>/.orangu/skills/`, and `<workspace>/.agents/skills/`. At startup it discloses only each skill's name, description, and `SKILL.md` location to the model; the full skill instructions are loaded only when relevant or when you invoke a skill directly with `/skill-name`. Project skills override user skills with the same name.
 
 **Comfortable terminal experience.**
 
@@ -225,7 +228,9 @@ pre-fills it as the **Model**), then walks every option showing its default.
 Anything left at its default is omitted from the file, and the result is shown
 for confirmation before being written to `~/.orangu/orangu.conf` (creating the
 directory if needed, and overwriting any existing file). The provider is
-assumed to be [llama.cpp](https://github.com/ggml-org/llama.cpp).
+assumed to be [llama.cpp](https://github.com/ggml-org/llama.cpp). The wizard
+also installs bundled skills into `~/.orangu/skills/` when they are not
+already present; currently this includes `debugging`.
 
 Alternatively, start from the sample configuration:
 
@@ -260,10 +265,12 @@ Useful first commands:
 
 ```text
 /help
+/skills
 /tools
 /list_files
 /open_file README.md
 /show_file README.md
+/debugging reproduce the failing request path and identify the root cause
 /amend "[#42] My feature"
 /cherry_pick abc1234
 /commit "[#42] My feature"

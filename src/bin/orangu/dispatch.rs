@@ -189,6 +189,17 @@ pub(crate) fn handle_command(
     context: CommandContext<'_>,
 ) -> anyhow::Result<CommandOutcome> {
     let Some(command) = parse_local_command(input) else {
+        if let Some(cmd) = input.trim_start().strip_prefix('/') {
+            let (name, arguments) = match cmd.split_once(char::is_whitespace) {
+                Some((n, a)) => (n, a.trim()),
+                None => (cmd, ""),
+            };
+            if let Some(skill) = context.skills.find(name) {
+                return Ok(CommandOutcome::OverridePrompt(
+                    skill.render_activation(arguments),
+                ));
+            }
+        }
         if input.trim_start().starts_with('/') {
             return Ok(CommandOutcome::OutputError(format!(
                 "Unknown command '{}'. Use /help to see available commands.",
@@ -219,10 +230,27 @@ pub(crate) fn handle_command(
         terminal,
         forge,
         review_reports,
+        skills,
     } = context;
 
     match command {
         LocalCommand::Help => Ok(CommandOutcome::Output(orangu::tui::help_text().to_string())),
+        LocalCommand::Skills => {
+            let mut out = String::from("Available skills:\n");
+            if skills.all().is_empty() {
+                out.push_str("  (None discovered)\n");
+            } else {
+                for skill in skills.all() {
+                    out.push_str(&format!(
+                        "  /{:<14} {} [{}]\n",
+                        skill.name,
+                        skill.description.trim(),
+                        skill.source
+                    ));
+                }
+            }
+            Ok(CommandOutcome::Output(out))
+        }
         LocalCommand::Disconnect => Ok({
             *current_endpoint = None;
             CommandOutcome::Quiet
@@ -234,7 +262,7 @@ pub(crate) fn handle_command(
                 .get(startup_model)
                 .ok_or_else(|| anyhow!("unknown server '{startup_model}'"))?;
             *active_model_id = profile.model.clone();
-            session.clear(system_prompt(profile));
+            session.clear(&system_prompt_with_skills(profile, skills));
             *detect_model = true;
             Ok(CommandOutcome::Quiet)
         }
@@ -302,7 +330,7 @@ pub(crate) fn handle_command(
             *active_model = name.to_string();
             *active_model_id = profile.model.clone();
             *current_endpoint = Some(endpoint);
-            session.set_system_prompt(system_prompt(profile));
+            session.set_system_prompt(&system_prompt_with_skills(profile, skills));
             // Re-run the startup-style model detection against the selected
             // server, even when it is the server we were already on.
             *detect_model = true;
@@ -653,11 +681,12 @@ pub(crate) fn handle_command(
             })))
         }
         LocalCommand::Clear => {
-            let prompt = system_prompt(
+            let prompt = system_prompt_with_skills(
                 llms.get(active_model)
                     .ok_or_else(|| anyhow!("unknown server '{active_model}'"))?,
+                skills,
             );
-            session.clear(prompt);
+            session.clear(&prompt);
             Ok(CommandOutcome::Cleared)
         }
         LocalCommand::Quit => Ok(CommandOutcome::Quit),
@@ -794,6 +823,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "llama",
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -815,6 +845,121 @@ mod tests {
             outcome,
             CommandOutcome::OutputError(message) if message.starts_with("Error: ")
         ));
+    }
+
+    #[test]
+    fn explicit_skill_invocation_overrides_the_prompt() {
+        let workspace = tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents/skills/code-review");
+        std::fs::create_dir_all(skill_dir.join("references")).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Review code\n---\nReview focus: $ARGUMENTS\n",
+        )
+        .expect("skill");
+        std::fs::write(skill_dir.join("references/checklist.md"), "checklist").expect("resource");
+        let skills = orangu::skills::SkillRegistry::discover(workspace.path());
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut active_model_id = "gemma".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/code-review auth",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &skills,
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        match outcome {
+            CommandOutcome::OverridePrompt(prompt) => {
+                assert!(prompt.contains("<skill_content name=\"code-review\">"));
+                assert!(prompt.contains("Review focus: auth"));
+                assert!(prompt.contains("<file>references/checklist.md</file>"));
+            }
+            _ => panic!("expected an overridden prompt"),
+        }
+    }
+
+    #[test]
+    fn clear_keeps_skill_catalog_in_the_system_prompt() {
+        let workspace = tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents/skills/code-review");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Review code\n---\nReview focus: $ARGUMENTS\n",
+        )
+        .expect("skill");
+        let skills = orangu::skills::SkillRegistry::discover(workspace.path());
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+        )]);
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = "llama".to_string();
+        let mut active_model_id = "gemma".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new(&system_prompt_with_skills(&llms["llama"], &skills));
+
+        let outcome = handle_command(
+            "/clear",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &skills,
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(matches!(outcome, CommandOutcome::Cleared));
+        let system_message = session.messages().first().expect("system message");
+        assert!(system_message.content.contains("<available_skills>"));
+        assert!(system_message.content.contains("<name>code-review</name>"));
     }
 
     #[test]
@@ -846,6 +991,7 @@ mod tests {
                     detect_model: &mut false,
                 },
                 CommandContext {
+                    skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                     startup_model: "llama",
                     startup_endpoint: "http://localhost:8100/v1",
                     llms: &llms,
@@ -940,6 +1086,7 @@ mod tests {
                     detect_model: &mut false,
                 },
                 CommandContext {
+                    skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                     startup_model: "llama",
                     startup_endpoint: "http://localhost:8100/v1",
                     llms: &llms,
@@ -1007,6 +1154,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "llama",
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1064,6 +1212,7 @@ mod tests {
                 detect_model: &mut detect_model,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: GEMMA,
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1123,6 +1272,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: GEMMA,
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1177,6 +1327,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: SERVER,
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1237,6 +1388,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "bravo",
                 startup_endpoint: "http://localhost:8200/v1",
                 llms: &llms,
@@ -1299,6 +1451,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "default",
                 startup_endpoint: "http://localhost:11434/v1",
                 llms: &llms,
@@ -1346,6 +1499,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "llama",
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1389,6 +1543,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "llama",
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,
@@ -1432,6 +1587,7 @@ mod tests {
                 detect_model: &mut false,
             },
             CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
                 startup_model: "llama",
                 startup_endpoint: "http://localhost:8100/v1",
                 llms: &llms,

@@ -24,6 +24,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 rustyline = "17.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+serde_yaml = "0.9.34"
 syntect = "5.3.0"
 terminal_size = "0.4.1"
 ttf-parser = "0.19.2"

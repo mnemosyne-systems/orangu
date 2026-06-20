@@ -1401,6 +1401,7 @@ pub(crate) async fn run_auto_review_mode(
     workspace: &Path,
     terminal: &str,
     feedback: bool,
+    skills: &orangu::skills::SkillRegistry,
 ) -> Result<AutoReviewState> {
     let mut state = AutoReviewState::new(launch);
     state.model = chrome.current_model.to_string();
@@ -1554,7 +1555,7 @@ pub(crate) async fn run_auto_review_mode(
     }
     // Keep the report on screen for browsing until Alt+x/Esc Esc.
     if !exit_requested {
-        run_auto_review_browse(&mut state, viewport, chrome, workspace, terminal)?;
+        run_auto_review_browse(&mut state, viewport, chrome, workspace, terminal, skills)?;
     }
     Ok(state)
 }
@@ -1772,6 +1773,7 @@ pub(crate) fn run_auto_review_browse(
     chrome: ReviewChrome<'_>,
     workspace: &Path,
     terminal: &str,
+    skills: &orangu::skills::SkillRegistry,
 ) -> Result<()> {
     let mut escape_cancel = EscapeCancelState::default();
     // The browse-phase input window: `/open_file <path>` or `open <path>` here
@@ -1797,6 +1799,7 @@ pub(crate) fn run_auto_review_browse(
             workspace,
             &[],
             &[],
+            skills,
         )
         .unwrap_or_default();
         print_auto_review_screen(
@@ -1928,7 +1931,7 @@ pub(crate) fn run_auto_review_browse(
             // Tab completes the input window over every project file, like the
             // main prompt; Shift+Tab cycles the ghost preview.
             (KeyCode::Tab, _, _) => {
-                crate::input::apply_completion(&mut input_state, workspace, &[], &[]);
+                crate::input::apply_completion(&mut input_state, workspace, &[], &[], skills);
             }
             (KeyCode::BackTab, _, _) => crate::input::cycle_ghost_suggestion(&mut input_state),
             // Once the run is done Up/Down move between report items (not

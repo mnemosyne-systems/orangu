@@ -89,6 +89,7 @@ pub struct RenderContext<'a> {
     /// Available model ids, used to hint `/model` argument completions in the
     /// inline ghost.
     pub available_models: &'a [String],
+    pub skills: &'a orangu::skills::SkillRegistry,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +213,7 @@ pub struct InputContext<'a> {
     pub server_names: &'a [String],
     pub available_models: &'a [String],
     pub render: RenderContext<'a>,
+    pub skills: &'a orangu::skills::SkillRegistry,
 }
 
 pub struct WaitContext<'a> {
@@ -226,6 +228,7 @@ pub struct WaitContext<'a> {
     pub pending_commands: &'a mut VecDeque<String>,
     pub thinking_quote: Option<&'static str>,
     pub viewport: &'a mut ViewportState,
+    pub skills: &'a orangu::skills::SkillRegistry,
 }
 
 #[derive(Default)]
@@ -756,6 +759,7 @@ pub fn handle_input_event(
                         input_context.workspace,
                         input_context.server_names,
                         input_context.available_models,
+                        input_context.skills,
                     );
                     redraw = true;
                 }
@@ -871,6 +875,7 @@ pub fn apply_completion(
     workspace: &Path,
     server_names: &[String],
     available_models: &[String],
+    skills: &orangu::skills::SkillRegistry,
 ) {
     if let Some(state) = input_state.completion.as_mut()
         && !state.candidates.is_empty()
@@ -911,6 +916,7 @@ pub fn apply_completion(
         workspace,
         server_names,
         available_models,
+        skills,
     ) && !candidates.is_empty()
     {
         let original = input_state.buffer.clone();

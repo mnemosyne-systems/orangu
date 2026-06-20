@@ -65,6 +65,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
+        "/skills" => Some(LocalCommand::Skills),
         _ => {
             if let Some(args) = input.strip_prefix("/session ") {
                 let uuid = args.trim();

@@ -59,6 +59,13 @@ const PLATFORM_OPTIONS: &[&str] = &["github", "gitlab"];
 /// loader accepts (see `orangu::workspaces::WorkspacePlacement`).
 const WORKSPACE_OPTIONS: &[&str] = &["top", "bottom", "left", "right"];
 
+/// Bundled skills that will be installed into `~/.orangu/skills/` during `--init`
+/// if they do not already exist.
+const BUNDLED_SKILLS: &[(&str, &str)] = &[(
+    "debugging",
+    include_str!("../../../contrib/skills/debugging/SKILL.md"),
+)];
+
 /// Subset of an OpenAI-compatible `/v1/models` response, enough to pull out the
 /// first advertised model id for pre-filling the `Model` prompt.
 #[derive(Debug, Default, Deserialize)]
@@ -199,6 +206,34 @@ pub async fn run_init() -> Result<()> {
     std::fs::write(&path, contents)
         .with_context(|| format!("failed to write {}", path.display()))?;
     println!("Wrote {}", path.display());
+
+    let skills_dir = dir.join("skills");
+    for (name, content) in BUNDLED_SKILLS {
+        let skill_dir = skills_dir.join(name);
+        if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+            eprintln!(
+                "Warning: failed to create skill directory {}: {}",
+                skill_dir.display(),
+                e
+            );
+            continue;
+        }
+        let skill_path = skill_dir.join("SKILL.md");
+        if !skill_path.exists() {
+            if let Err(e) = std::fs::write(&skill_path, content) {
+                eprintln!(
+                    "Warning: failed to write skill {}: {}",
+                    skill_path.display(),
+                    e
+                );
+            } else {
+                println!(
+                    "Installed bundled skill '{name}' to {}",
+                    skill_path.display()
+                );
+            }
+        }
+    }
 
     Ok(())
 }

@@ -33,11 +33,13 @@ pub(crate) fn test_profile(provider: &str, endpoint: &str, model: &str) -> LlmCo
 }
 
 pub(crate) fn test_input_context<'a>(workspace: &'a std::path::Path) -> InputContext<'a> {
+    static EMPTY_STRINGS: Vec<String> = Vec::new();
+    static SKILLS: std::sync::OnceLock<orangu::skills::SkillRegistry> = std::sync::OnceLock::new();
     InputContext {
-        history: &[],
+        history: &EMPTY_STRINGS,
         workspace,
-        server_names: &[],
-        available_models: &[],
+        server_names: &EMPTY_STRINGS,
+        available_models: &EMPTY_STRINGS,
         render: RenderContext {
             current_model: "default",
             endpoint: "http://localhost:11434/v1",
@@ -56,6 +58,10 @@ pub(crate) fn test_input_context<'a>(workspace: &'a std::path::Path) -> InputCon
             feedback: false,
             server_names: &[],
             available_models: &[],
+            skills: SKILLS
+                .get_or_init(|| orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))),
         },
+        skills: SKILLS
+            .get_or_init(|| orangu::skills::SkillRegistry::discover(std::path::Path::new("/"))),
     }
 }

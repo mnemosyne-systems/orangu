@@ -51,7 +51,8 @@ http://localhost:8100/v1
 ## Create a configuration
 
 The fastest path is the interactive wizard, which auto-detects a model from the
-server and writes `~/.orangu/orangu.conf`:
+server, writes `~/.orangu/orangu.conf`, and installs any bundled skills into
+`~/.orangu/skills/` when they are not already present:
 
 ```sh
 orangu --init
@@ -86,6 +87,7 @@ Then start with:
 
 ```text
 /help
+/skills
 /server
 /disconnect
 /reload
@@ -95,6 +97,7 @@ Then start with:
 /list_files
 /open_file README.md
 /show_file README.md
+/debugging reproduce the failing request path
 /build
 /add_file README.md
 /auto_review
@@ -129,6 +132,16 @@ Then start with:
 ```
 
 Most of these are thin wrappers around the matching `git`/`gh` commands. Two open full-screen views instead: `/review` walks you through the branch's diff file by file for a manual review, and `/auto_review` has the connected model review the branch's changes by itself — per file and per category (Code, Security, Memory, Performance, Test Suite, Documentation) — lets you override its verdicts afterwards (approve a file, or reject it with your own categorized comments), and copies the resulting report to the clipboard on exit. `/auto_review <file>` (Tab-completes on the file name) reviews a single file — the whole file on main/master, or just its changes on a branch. Both are described in detail in the Core tools chapter.
+
+orangu also supports Agent Skills: reusable directories containing a
+`SKILL.md`. Skills are discovered from `~/.orangu/skills/`,
+`~/.agents/skills/`, `<workspace>/.orangu/skills/`, and
+`<workspace>/.agents/skills/`. Use `/skills` to list them. Invoke one directly
+with `/skill-name`, for example:
+
+```text
+/debugging reproduce the failing request path and identify the root cause
+```
 
 ## Review your first branch
 

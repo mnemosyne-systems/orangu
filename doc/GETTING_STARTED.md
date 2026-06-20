@@ -15,7 +15,8 @@ llama-server \
 
 The quickest way is the interactive wizard, which asks for the LLM URL,
 auto-detects a model the server advertises, walks every option showing its
-default, and writes `~/.orangu/orangu.conf` after a confirmation:
+default, writes `~/.orangu/orangu.conf` after a confirmation, and installs any
+bundled skills into `~/.orangu/skills/` if they are not already present:
 
 ```sh
 orangu --init
@@ -58,6 +59,7 @@ orangu --config ./orangu.conf
 ## 4. Try a few commands
 
 - `/help`
+- `/skills`
 - `/server`
 - `/disconnect`
 - `/reload`
@@ -67,6 +69,7 @@ orangu --config ./orangu.conf
 - `/list_files`
 - `/open_file README.md`
 - `/show_file README.md`
+- `/debugging reproduce the failing request path`
 - `/build`
 - `/add_file README.md`
 - `/auto_review`
@@ -107,6 +110,26 @@ Then try a natural-language request such as:
 
 ```text
 list files
+```
+
+You can also create or copy Agent Skills. orangu discovers skills from:
+
+- `~/.orangu/skills/`
+- `~/.agents/skills/`
+- `<workspace>/.orangu/skills/`
+- `<workspace>/.agents/skills/`
+
+Each skill lives in its own directory and must contain a `SKILL.md` file. List
+the discovered skills with:
+
+```text
+/skills
+```
+
+Invoke one directly with its directory or frontmatter name:
+
+```text
+/debugging reproduce the failing request path and identify the root cause
 ```
 
 Built-in commands also accept natural-language forms, for example:
