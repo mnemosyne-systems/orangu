@@ -125,6 +125,40 @@ pub fn git_remote_names(repo_root: &Path) -> Vec<String> {
     remotes
 }
 
+/// The repository's name taken from its `origin` remote URL — the final path
+/// segment with any trailing `.git` removed (so `git@host:owner/orangu.git` and
+/// `https://host/owner/orangu` both yield `orangu`). Returns `None` when there
+/// is no `origin` remote, the command fails, or the URL has no usable segment;
+/// callers fall back to the directory name. This is what names an export, so the
+/// PDF carries the repository's name even when it was cloned into a differently
+/// named directory.
+pub fn git_repository_name(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    repository_name_from_url(url.trim())
+}
+
+/// Extract the repository name from a remote URL: drop any trailing slashes and
+/// `.git` suffix, then take the segment after the last `/` or `:`.
+fn repository_name_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let name = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 pub fn git_current_branch(repo_root: &Path) -> Result<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -552,6 +586,46 @@ mod tests {
             git_remote_names(workspace.path()),
             vec!["origin", "fork", "upstream"]
         );
+    }
+
+    #[test]
+    fn repository_name_from_url_handles_common_forms() {
+        for (url, expected) in [
+            ("https://github.com/owner/orangu.git", "orangu"),
+            ("git@github.com:owner/orangu.git", "orangu"),
+            ("https://github.com/owner/orangu", "orangu"),
+            ("https://github.com/owner/orangu/", "orangu"),
+            ("/home/user/official/orangu", "orangu"),
+        ] {
+            assert_eq!(
+                repository_name_from_url(url).as_deref(),
+                Some(expected),
+                "url {url}"
+            );
+        }
+        assert_eq!(repository_name_from_url(""), None);
+    }
+
+    #[test]
+    fn git_repository_name_reads_origin_not_directory() {
+        // The repo lives in a directory named `official` but its `origin` points
+        // at `orangu`; the export name follows the remote, not the directory.
+        let parent = tempdir().expect("parent");
+        let workspace = parent.path().join("official");
+        std::fs::create_dir(&workspace).expect("workspace dir");
+        init_git_for_test(&workspace);
+        git_run(
+            &workspace,
+            &["remote", "add", "origin", "https://example.com/owner/orangu.git"],
+        );
+        assert_eq!(git_repository_name(&workspace).as_deref(), Some("orangu"));
+    }
+
+    #[test]
+    fn git_repository_name_is_none_without_origin() {
+        let workspace = tempdir().expect("workspace");
+        init_git_for_test(workspace.path());
+        assert_eq!(git_repository_name(workspace.path()), None);
     }
 
     #[test]

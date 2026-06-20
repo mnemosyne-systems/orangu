@@ -54,7 +54,7 @@ use std::{
 use orangu::tui::TranscriptLine;
 
 use crate::VERSION;
-use crate::git::{discover_git_root, workspace_branch_name};
+use crate::git::{discover_git_root, git_repository_name, workspace_branch_name};
 
 // --- Embedded brand font (Red Hat Text, SIL OFL — see assets/fonts/LICENSE) ---
 const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/RedHatText-Regular.otf");
@@ -252,13 +252,16 @@ fn export_file_path(workspace: &Path, kind: &str) -> PathBuf {
     workspace.join(format!("{repository}-{branch}-{kind}.pdf"))
 }
 
-/// The repository (Git root, else workspace) directory name, for display.
+/// The repository name, for display. Taken from the `origin` remote (so a repo
+/// cloned into a differently named directory still exports under its own name),
+/// falling back to the Git root — else the workspace — directory name.
 fn repository_display(workspace: &Path) -> String {
     let root = discover_git_root(workspace).unwrap_or_else(|| workspace.to_path_buf());
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = git_repository_name(&root).unwrap_or_else(|| {
+        root.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
     non_empty(name, "workspace")
 }
 
