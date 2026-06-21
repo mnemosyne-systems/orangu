@@ -1497,18 +1497,21 @@ async fn run() -> Result<()> {
 }
 
 /// Determine the feedback-dot status of a parked (non-active) workspace tab.
-/// Checks whether the tab's recorded branch is still the workspace's live
-/// branch; a mismatch signals that the branch was deleted or merged.
+///
+/// The dot is green (Valid) when the workspace directory still exists and no
+/// background LLM task is running, and red (BranchGone) only when the
+/// directory itself has disappeared (deleted project, unmounted drive, …).
+///
+/// A branch-mismatch check was tried here but produced false positives: two
+/// tabs that share the same workspace path read the same `.git/HEAD`, so any
+/// branch change in one tab incorrectly turns the other tab red. Branch state
+/// is already visible in each tab's status bar, so the dot does not need to
+/// duplicate it.
 fn parked_tab_status(tab: &WorkspaceTab) -> TabStatus {
     if tab.pending_response.is_some() {
         return TabStatus::Working;
     }
     if !tab.workspace.is_dir() {
-        return TabStatus::BranchGone;
-    }
-    if let Some(recorded) = &tab.current_branch
-        && workspace_branch_name(&tab.workspace).as_deref() != Some(recorded.as_str())
-    {
         return TabStatus::BranchGone;
     }
     TabStatus::Valid
