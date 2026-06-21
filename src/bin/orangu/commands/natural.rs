@@ -406,7 +406,12 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::AutoReview(None, false));
     }
     // Checked before the more specific buffers: "export console" / "export
-    // review" select a buffer, while a bare "export" defaults to the console.
+    // review" / "export auto review" select a buffer, while a bare "export"
+    // defaults to the console. The auto-review form is matched before the plain
+    // review form so "export auto review" is not mistaken for it.
+    if matches_ci(input, &["export auto review"]) {
+        return Some(LocalCommand::Export(ExportTarget::AutoReview));
+    }
     if matches_ci(input, &["export review"]) {
         return Some(LocalCommand::Export(ExportTarget::Review));
     }

@@ -726,6 +726,9 @@ It takes one optional argument selecting what to export:
 
 - `/export` or `/export console` — the **console output window**: everything currently in the main output window (prompts, command output, and model responses), with the terminal ANSI styling removed and the lines printed verbatim.
 - `/export review` — the **review buffer**: the Markdown of the last `/review` (or, if none, the last `/auto_review`) report from this session. If no review has been run yet, the command reports that there is nothing to export.
+- `/export auto review` — the **auto-review buffer** specifically: the Markdown of the last `/auto_review` report. If no auto review has been run yet, the command reports that there is nothing to export.
+
+The argument **Tab-completes** (and shows the inline ghost hint): pressing Tab after `/export` offers `console`, `review`, and `auto review`, and the multi-word `auto review` completes from `auto`.
 
 The file is saved in the workspace root as `{repository}-{branch}-console.pdf` or `{repository}-{branch}-review.pdf`, where `{repository}` is the Git repository (or workspace) directory name and `{branch}` is the current branch (`nobranch` when not on one); both are sanitized for use in a filename, so a branch such as `feature/x` becomes `feature-x`. An existing file with the same name is overwritten. On success the saved path is printed to the output window.
 
@@ -750,10 +753,11 @@ Export the output window (the default):
 /export console
 ```
 
-Export the last review report:
+Export the last review report (or the auto-review report specifically):
 
 ```text
 /export review
+/export auto review
 ```
 
 Natural-language forms:
@@ -762,4 +766,5 @@ Natural-language forms:
 export
 export console
 export review
+export auto review
 ```

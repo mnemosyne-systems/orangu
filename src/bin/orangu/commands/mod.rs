@@ -274,9 +274,16 @@ pub enum StashSubcommand {
 pub enum ExportTarget {
     /// The console output window (`export console`, the default).
     Console,
-    /// The last `/review` (or `/auto_review`) report (`export review`).
+    /// The last `/review` report — or, if none, the last `/auto_review` report
+    /// (`export review`).
     Review,
+    /// The last `/auto_review` report specifically (`export auto review`).
+    AutoReview,
 }
+
+/// The `/export` target words, in offer order, used for Tab completion and the
+/// inline ghost. Kept in step with [`parse_export_target`].
+pub const EXPORT_TARGETS: [&str; 3] = ["console", "review", "auto review"];
 
 /// A `/bisect` subcommand, wrapping `git bisect`. The `Start`, `Good`, `Bad`,
 /// and `Skip` variants carry an optional commit/rev argument; when it is `None`

@@ -170,6 +170,23 @@ pub fn completion_ghost_suffix(
         .map(str::to_string)
 }
 
+/// Tab/ghost completion for the `/export <target>` argument, as
+/// `(token_start, candidates)`: the target words `console`, `review`, and
+/// `auto review` that extend what is typed. The whole argument (after
+/// `/export `) is matched as one prefix so the multi-word `auto review` option
+/// completes from `auto`. Returns `None` when `prefix` is not an `/export`
+/// argument.
+fn export_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
+    let value = prefix.strip_prefix("/export ")?;
+    let lower = value.to_ascii_lowercase();
+    let candidates = crate::commands::EXPORT_TARGETS
+        .iter()
+        .filter(|target| target.starts_with(lower.as_str()))
+        .map(|target| (*target).to_string())
+        .collect();
+    Some(("/export ".len(), candidates))
+}
+
 /// The completion candidates tied to a recognised command (branch, tag, file,
 /// model, server, session, ... arguments). Returns `None` when the input is not
 /// one of those forms, leaving [`completion_candidates`] to fall back to the
@@ -240,6 +257,10 @@ fn structured_completion_candidates(
     }
 
     if let Some((start, candidates)) = issue_completion_candidates(prefix) {
+        return Some((start, cursor, candidates));
+    }
+
+    if let Some((start, candidates)) = export_completion_candidates(prefix) {
         return Some((start, cursor, candidates));
     }
 
@@ -412,6 +433,46 @@ mod tests {
             candidates.iter().any(|c| c == "immediate"),
             "{candidates:?}"
         );
+    }
+
+    #[test]
+    fn export_completes_console_review_and_auto_review() {
+        // The bare argument offers all three targets, in order.
+        let (start, all) = export_completion_candidates("/export ").expect("export argument");
+        assert_eq!(start, "/export ".len());
+        assert_eq!(all, vec!["console", "review", "auto review"]);
+
+        // Typing narrows; `auto review` completes from `auto` (multi-word).
+        assert_eq!(
+            export_completion_candidates("/export re")
+                .expect("argument")
+                .1,
+            vec!["review".to_string()]
+        );
+        assert_eq!(
+            export_completion_candidates("/export auto")
+                .expect("argument")
+                .1,
+            vec!["auto review".to_string()]
+        );
+
+        // The inline ghost extends the typed token the same way.
+        let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+        assert_eq!(
+            completion_ghost_suffix(
+                "/export auto",
+                12,
+                std::path::Path::new("/"),
+                &[],
+                &[],
+                &skills
+            ),
+            Some(" review".to_string())
+        );
+
+        // Not an export argument.
+        assert!(export_completion_candidates("/export").is_none());
+        assert!(export_completion_candidates("/exports x").is_none());
     }
 
     #[test]

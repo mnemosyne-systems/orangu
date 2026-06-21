@@ -23,6 +23,7 @@ pub fn parse_export_target(arg: &str) -> Option<ExportTarget> {
     match arg.trim().to_ascii_lowercase().as_str() {
         "" | "console" => Some(ExportTarget::Console),
         "review" => Some(ExportTarget::Review),
+        "auto review" | "auto_review" | "auto-review" => Some(ExportTarget::AutoReview),
         _ => None,
     }
 }

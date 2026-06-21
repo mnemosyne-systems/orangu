@@ -1276,6 +1276,10 @@ async fn run() -> Result<()> {
                             )),
                         }
                     }
+                    ExportTarget::AutoReview => match last_auto_review_report.as_deref() {
+                        Some(report) => export::export_review(&workspace, report, &active_model_id),
+                        None => Err(anyhow!("No auto review to export; run /auto_review first")),
+                    },
                 };
                 match result {
                     Ok(path) => {
