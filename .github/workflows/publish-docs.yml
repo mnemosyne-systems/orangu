@@ -1,0 +1,62 @@
+name: Publish docs
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  publish-docs:
+    name: Publish docs to website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      - name: Generate HTML pages
+        run: |
+          set -euo pipefail
+          mkdir -p target/web-doc
+          MANUAL=doc/manual/en
+          TMPL=doc/manual/web-template.html
+          PANDOC="pandoc --template $TMPL --toc --toc-depth=2 -f markdown-smart+raw_tex -t html5"
+
+          # source file:output page:page title
+          while IFS=: read -r src out title; do
+            src=$(echo "$src" | xargs); out=$(echo "$out" | xargs); title=$(echo "$title" | xargs)
+            $PANDOC "$MANUAL/$src" --metadata "title=$title" -o "target/web-doc/$out"
+            echo "  $src → $out"
+          done <<'PAGES'
+          01-introduction.md:introduction.html:Introduction
+          03-quickstart.md:quickstart.html:Quick Start
+          20-configuration.md:configuration.html:Configuration
+          31-workspaces.md:workspaces.html:Workspaces
+          32-skills.md:skills.html:Skills
+          40-terminal.md:terminal.html:Terminal Interface
+          41-core_tools.md:core-tools.html:Core Tools
+          42-git_tools.md:git-tools.html:Git Tools
+          43-usage_tools.md:usage-tools.html:Usage Tools
+          70-dev.md:building.html:Building
+          73-openai.md:local-llm.html:Local LLM
+          PAGES
+
+      - name: Push to website repo
+        env:
+          WEBSITE_PAT: ${{ secrets.WEBSITE_PAT }}
+        run: |
+          set -euo pipefail
+          git clone \
+            "https://x-access-token:${WEBSITE_PAT}@github.com/mnemosyne-systems/mnemosyne-systems.github.io.git" \
+            website
+          cp target/web-doc/*.html website/orangu/doc/
+          cd website
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add orangu/doc/
+          git diff --cached --quiet && echo "No doc changes to push." && exit 0
+          git commit -m "orangu: sync docs from ${{ github.ref_name }}"
+          git push
