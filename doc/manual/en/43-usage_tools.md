@@ -42,7 +42,7 @@ The report covers:
 - total tokens generated (counted with the bundled tokenizer),
 - average tokens per second,
 - context cache statistics (reads, hits, misses, rate, bytes saved), and
-- shell compression statistics (lines saved, patterns applied).
+- context compression statistics (lines saved, patterns applied).
 
 ### Examples
 

@@ -91,42 +91,42 @@ fn short_output() -> String {
 fn bench_cargo_build(c: &mut Criterion) {
     let input = cargo_build_large();
     c.bench_function("compress cargo build (80 crates + error)", |b| {
-        b.iter(|| compress_shell_output(black_box("cargo build"), black_box(&input)))
+        b.iter(|| compress_shell_output(black_box("cargo build"), black_box(&input), 20))
     });
 }
 
 fn bench_cargo_test(c: &mut Criterion) {
     let input = cargo_test_mixed();
     c.bench_function("compress cargo test (120 tests, 2 failed)", |b| {
-        b.iter(|| compress_shell_output(black_box("cargo test"), black_box(&input)))
+        b.iter(|| compress_shell_output(black_box("cargo test"), black_box(&input), 20))
     });
 }
 
 fn bench_git_diff(c: &mut Criterion) {
     let input = git_diff_large();
     c.bench_function("compress git diff (600 lines)", |b| {
-        b.iter(|| compress_shell_output(black_box("git diff HEAD"), black_box(&input)))
+        b.iter(|| compress_shell_output(black_box("git diff HEAD"), black_box(&input), 20))
     });
 }
 
 fn bench_git_log(c: &mut Criterion) {
     let input = git_log_many();
     c.bench_function("compress git log (50 commits)", |b| {
-        b.iter(|| compress_shell_output(black_box("git log"), black_box(&input)))
+        b.iter(|| compress_shell_output(black_box("git log"), black_box(&input), 20))
     });
 }
 
 fn bench_short_passthrough(c: &mut Criterion) {
     let input = short_output();
     c.bench_function("compress short output (passthrough)", |b| {
-        b.iter(|| compress_shell_output(black_box("cargo build"), black_box(&input)))
+        b.iter(|| compress_shell_output(black_box("cargo build"), black_box(&input), 20))
     });
 }
 
 fn bench_with_stats(c: &mut Criterion) {
     let input = cargo_build_large();
     c.bench_function("compress_with_stats cargo build", |b| {
-        b.iter(|| compress_shell_output_with_stats(black_box("cargo build"), black_box(&input)))
+        b.iter(|| compress_shell_output_with_stats(black_box("cargo build"), black_box(&input), 20))
     });
 }
 

@@ -1340,42 +1340,48 @@ pub(crate) fn parse_auto_review_category_response(
 /// category instruction follows, so a file's category requests share their
 /// prefix and the server's prompt cache (e.g. llama.cpp) can reuse the
 /// processed diff across them.
-pub(crate) fn build_auto_review_category_prompt(
+pub(crate) fn build_auto_review_category_prompt_with_stats(
     path: &str,
     category: &str,
     focus: &str,
     patch: &str,
     compression_enabled: bool,
     diff_file_cap: usize,
-) -> String {
-    let context =
-        orangu::compression::prepare_llm_diff_context(patch, compression_enabled, diff_file_cap);
+) -> (String, orangu::compression::CompressionStats) {
+    let (context, stats) = orangu::compression::prepare_llm_diff_context_with_stats(
+        patch,
+        compression_enabled,
+        diff_file_cap,
+    );
     let note = context
         .note
         .map(|note| format!("{note}\n\n"))
         .unwrap_or_default();
-    format!(
-        "You are performing an automated code review of the changes made to `{path}` in the diff below.\n\
-         \n\
-         {note}\
-         ```diff\n{}\n```\n\
-         \n\
-         Review only the changes — the added, removed, and modified lines — for {category} issues ({focus}), and judge how the changes fit into the surrounding context. Do not review pre-existing content the change does not touch.\n\
-         \n\
-         GUIDELINES:\n\
-         1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.\n\
-         2. The bug is discrete and actionable (not pedantic nitpicks).\n\
-         3. Ignore trivial style unless it obscures meaning.\n\
-         4. Give every finding a Confidence Score from 0 to 100 based on certainty.\n\
-         \n\
-         Respond in exactly this format, with no other prose:\n\
-         \n\
-         VERDICT: APPROVE or REJECT\n\
-         FINDINGS:\n\
-         - <line>: [Score: <0-100>] <finding, or None>\n\
-         \n\
-         List at most five findings, one short line each, prefixed with the affected line number — or range, as `<start>-<end>` — in the new version of the file (the right side of the diff, the lines marked with `+` or unchanged). Only report real {category} issues introduced by the changes. Answer REJECT only when a finding must be fixed before merging; otherwise answer APPROVE.",
-        context.content
+    (
+        format!(
+            "You are performing an automated code review of the changes made to `{path}` in the diff below.\n\
+             \n\
+             {note}\
+             ```diff\n{}\n```\n\
+             \n\
+             Review only the changes — the added, removed, and modified lines — for {category} issues ({focus}), and judge how the changes fit into the surrounding context. Do not review pre-existing content the change does not touch.\n\
+             \n\
+             GUIDELINES:\n\
+             1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.\n\
+             2. The bug is discrete and actionable (not pedantic nitpicks).\n\
+             3. Ignore trivial style unless it obscures meaning.\n\
+             4. Give every finding a Confidence Score from 0 to 100 based on certainty.\n\
+             \n\
+             Respond in exactly this format, with no other prose:\n\
+             \n\
+             VERDICT: APPROVE or REJECT\n\
+             FINDINGS:\n\
+             - <line>: [Score: <0-100>] <finding, or None>\n\
+             \n\
+             List at most five findings, one short line each, prefixed with the affected line number — or range, as `<start>-<end>` — in the new version of the file (the right side of the diff, the lines marked with `+` or unchanged). Only report real {category} issues introduced by the changes. Answer REJECT only when a finding must be fixed before merging; otherwise answer APPROVE.",
+            context.content
+        ),
+        stats,
     )
 }
 
@@ -1545,6 +1551,7 @@ pub(crate) async fn run_auto_review_mode(
     feedback: bool,
     compression_enabled: bool,
     diff_file_cap: usize,
+    compression_metrics: std::sync::Arc<std::sync::Mutex<orangu::compression::CompressionMetrics>>,
     skills: &orangu::skills::SkillRegistry,
 ) -> Result<AutoReviewState> {
     let immediate = launch.immediate;
@@ -1617,7 +1624,7 @@ pub(crate) async fn run_auto_review_mode(
                 index + 1,
                 auto_review_progress_label(completed, total_requests),
             );
-            let prompt = build_auto_review_category_prompt(
+            let (prompt, stats) = build_auto_review_category_prompt_with_stats(
                 &path,
                 category,
                 focus,
@@ -1625,6 +1632,9 @@ pub(crate) async fn run_auto_review_mode(
                 compression_enabled,
                 diff_file_cap,
             );
+            if let Ok(mut metrics) = compression_metrics.lock() {
+                metrics.record(&stats);
+            }
             let mut scratch = ChatSession::new(&enhanced_prompt);
             let llm_start = std::time::Instant::now();
             let outcome = run_auto_review_request(
@@ -2850,7 +2860,9 @@ mod tests {
 
     #[test]
     fn auto_review_category_prompts_share_their_diff_prefix() {
-        use crate::review::{AUTO_REVIEW_FILE_CATEGORIES, build_auto_review_category_prompt};
+        use crate::review::{
+            AUTO_REVIEW_FILE_CATEGORIES, build_auto_review_category_prompt_with_stats,
+        };
 
         // The diff leads the prompt and the category instruction follows, so a
         // file's category requests share their prefix and the server's prompt
@@ -2858,9 +2870,15 @@ mod tests {
         let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-x\n+y\n";
         let (_, code_focus) = AUTO_REVIEW_FILE_CATEGORIES[0];
         let (_, security_focus) = AUTO_REVIEW_FILE_CATEGORIES[1];
-        let code =
-            build_auto_review_category_prompt("src/main.rs", "Code", code_focus, patch, false, 20);
-        let security = build_auto_review_category_prompt(
+        let (code, _) = build_auto_review_category_prompt_with_stats(
+            "src/main.rs",
+            "Code",
+            code_focus,
+            patch,
+            false,
+            20,
+        );
+        let (security, _) = build_auto_review_category_prompt_with_stats(
             "src/main.rs",
             "Security",
             security_focus,

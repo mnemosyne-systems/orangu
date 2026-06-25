@@ -248,14 +248,30 @@ pub fn prepare_llm_diff_context(
     compression_enabled: bool,
     diff_file_cap: usize,
 ) -> LlmContext {
+    prepare_llm_diff_context_with_stats(diff, compression_enabled, diff_file_cap).0
+}
+
+pub fn prepare_llm_diff_context_with_stats(
+    diff: &str,
+    compression_enabled: bool,
+    diff_file_cap: usize,
+) -> (LlmContext, CompressionStats) {
+    let original_lines = diff.lines().count();
+
     if !compression_enabled {
-        return LlmContext {
-            content: diff.to_string(),
-            note: None,
-        };
+        return (
+            LlmContext {
+                content: diff.to_string(),
+                note: None,
+            },
+            CompressionStats {
+                original_lines,
+                compressed_lines: original_lines,
+                pattern_matched: None,
+            },
+        );
     }
 
-    let original_lines = diff.lines().count();
     let compressed = compress_git_diff(diff, diff_file_cap);
     let compressed_lines = compressed.lines().count();
     let note = (compressed_lines < original_lines).then(|| {
@@ -265,25 +281,48 @@ pub fn prepare_llm_diff_context(
         )
     });
 
-    LlmContext {
-        content: compressed,
-        note,
-    }
+    (
+        LlmContext {
+            content: compressed,
+            note,
+        },
+        CompressionStats {
+            original_lines,
+            compressed_lines,
+            pattern_matched: Some("git_diff".to_string()),
+        },
+    )
 }
 
 pub fn prepare_llm_file_context(
-    _path: &str,
+    path: &str,
     content: &str,
     compression_enabled: bool,
 ) -> LlmContext {
+    prepare_llm_file_context_with_stats(path, content, compression_enabled).0
+}
+
+pub fn prepare_llm_file_context_with_stats(
+    _path: &str,
+    content: &str,
+    compression_enabled: bool,
+) -> (LlmContext, CompressionStats) {
+    let original_lines = content.lines().count();
+
     if !compression_enabled {
-        return LlmContext {
-            content: content.to_string(),
-            note: None,
-        };
+        return (
+            LlmContext {
+                content: content.to_string(),
+                note: None,
+            },
+            CompressionStats {
+                original_lines,
+                compressed_lines: original_lines,
+                pattern_matched: None,
+            },
+        );
     }
 
-    let original_lines = content.lines().count();
     let compressed = compress_generic(content);
     let compressed_lines = compressed.lines().count();
     let note = (compressed_lines < original_lines).then(|| {
@@ -293,10 +332,17 @@ pub fn prepare_llm_file_context(
         )
     });
 
-    LlmContext {
-        content: compressed,
-        note,
-    }
+    (
+        LlmContext {
+            content: compressed,
+            note,
+        },
+        CompressionStats {
+            original_lines,
+            compressed_lines,
+            pattern_matched: Some("file".to_string()),
+        },
+    )
 }
 
 /// Compress grep output into compact `file:line: snippet` citations for the
@@ -307,11 +353,28 @@ pub fn prepare_llm_grep_context(
     output: &str,
     compression_enabled: bool,
 ) -> LlmContext {
+    prepare_llm_grep_context_with_stats(pattern, output, compression_enabled).0
+}
+
+pub fn prepare_llm_grep_context_with_stats(
+    pattern: &str,
+    output: &str,
+    compression_enabled: bool,
+) -> (LlmContext, CompressionStats) {
+    let original_lines = output.lines().count();
+
     if !compression_enabled {
-        return LlmContext {
-            content: output.to_string(),
-            note: None,
-        };
+        return (
+            LlmContext {
+                content: output.to_string(),
+                note: None,
+            },
+            CompressionStats {
+                original_lines,
+                compressed_lines: original_lines,
+                pattern_matched: None,
+            },
+        );
     }
 
     const MAX_MATCHES: usize = 40;
@@ -320,10 +383,17 @@ pub fn prepare_llm_grep_context(
     let total_matches = output.lines().filter(|l| !l.is_empty()).count();
 
     if total_matches == 0 {
-        return LlmContext {
-            content: output.to_string(),
-            note: None,
-        };
+        return (
+            LlmContext {
+                content: output.to_string(),
+                note: None,
+            },
+            CompressionStats {
+                original_lines: 0,
+                compressed_lines: 0,
+                pattern_matched: None,
+            },
+        );
     }
 
     // Build a compact citation block: keep up to MAX_MATCHES lines, each as
@@ -347,14 +417,23 @@ pub fn prepare_llm_grep_context(
             omitted
         ));
         Some(format!(
-            "Context note: orangu showing {} of {} grep matches for `{}`.",
-            MAX_MATCHES, total_matches, pattern
+            "Context note: orangu truncated these grep results ({} matches found, sending first {} to the model).",
+            total_matches, MAX_MATCHES
         ))
     } else {
         None
     };
 
-    LlmContext { content, note }
+    let compressed_lines = content.lines().count();
+
+    (
+        LlmContext { content, note },
+        CompressionStats {
+            original_lines,
+            compressed_lines,
+            pattern_matched: Some("grep".to_string()),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

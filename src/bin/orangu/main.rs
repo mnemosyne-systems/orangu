@@ -1321,13 +1321,16 @@ async fn run() -> Result<()> {
                             let mut prompt_profile = profile.clone();
                             prompt_profile.endpoint = endpoint.to_string();
                             prompt_profile.model = active_model_id.clone();
-                            let prompt = build_review_prompt(
+                            let (prompt, stats) = build_review_prompt_with_stats(
                                 &path,
                                 &request,
                                 &patch,
                                 config.compression,
                                 config.diff_file_cap,
                             );
+                            if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                                metrics.record(&stats);
+                            }
                             let llm_start = std::time::Instant::now();
                             let tool_before = tools.total_tool_duration();
                             let result = run_review_request(
@@ -1431,6 +1434,7 @@ async fn run() -> Result<()> {
                     config.feedback,
                     config.compression,
                     config.diff_file_cap,
+                    tools.compression_metrics.clone(),
                     &skills,
                 )
                 .await?;

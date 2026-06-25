@@ -110,7 +110,7 @@ impl UsageStats {
                 0.0
             };
             out.push_str(&format!(
-                "\n\nShell Compression:\nOriginal lines   : {}\nCompressed lines : {}\nLines saved      : {} ({:.1}%)",
+                "\n\nContext Compression:\nOriginal lines   : {}\nCompressed lines : {}\nLines saved      : {} ({:.1}%)",
                 metrics.total_original_lines,
                 metrics.total_compressed_lines,
                 saved,

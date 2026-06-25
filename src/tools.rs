@@ -1003,6 +1003,7 @@ pub fn standalone() {}
         let ctx = prepare_llm_grep_context("item", &output, true);
         assert!(ctx.note.is_some(), "should have truncation note");
         let note = ctx.note.unwrap();
-        assert!(note.contains("40 of 50"), "should mention counts");
+        assert!(note.contains("50 matches found"), "should mention counts");
+        assert!(note.contains("first 40"), "should mention counts");
     }
 }

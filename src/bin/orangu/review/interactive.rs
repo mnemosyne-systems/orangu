@@ -280,13 +280,13 @@ impl ReviewState {
     }
 }
 
-pub(crate) fn build_review_prompt(
+pub(crate) fn build_review_prompt_with_stats(
     path: &str,
     request: &str,
     patch: &str,
     compression_enabled: bool,
     diff_file_cap: usize,
-) -> String {
+) -> (String, orangu::compression::CompressionStats) {
     let request = request.trim();
     let instruction = if request.is_empty() {
         format!(
@@ -295,13 +295,19 @@ pub(crate) fn build_review_prompt(
     } else {
         format!("Please review the following changes to `{path}`. {request}")
     };
-    let context =
-        orangu::compression::prepare_llm_diff_context(patch, compression_enabled, diff_file_cap);
+    let (context, stats) = orangu::compression::prepare_llm_diff_context_with_stats(
+        patch,
+        compression_enabled,
+        diff_file_cap,
+    );
     let note = context
         .note
         .map(|note| format!("\n\n{note}"))
         .unwrap_or_default();
-    format!("{instruction}{note}\n\n```diff\n{}\n```", context.content)
+    (
+        format!("{instruction}{note}\n\n```diff\n{}\n```", context.content),
+        stats,
+    )
 }
 
 /// The recorded review comments bucketed by category, in

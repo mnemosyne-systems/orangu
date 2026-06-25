@@ -408,6 +408,30 @@ fn structured_completion_candidates(
     None
 }
 
+pub fn slash_command_dropdown_candidates(
+    prefix: &str,
+    skills: &orangu::skills::SkillRegistry,
+) -> Vec<(String, String)> {
+    let mut candidates = Vec::new();
+
+    for cmd in SlashCommand::iter() {
+        let cmd_str = cmd.command();
+        if cmd_str.starts_with(prefix) {
+            candidates.push((cmd_str, cmd.description().to_string()));
+        }
+    }
+
+    for skill in skills.all() {
+        let cmd = format!("/{}", skill.name);
+        if cmd.starts_with(prefix) && !SlashCommand::iter().any(|c| c.command() == cmd) {
+            let desc = skill.description.clone();
+            candidates.push((cmd, desc));
+        }
+    }
+
+    candidates
+}
+
 #[cfg(test)]
 mod integration_tests;
 
@@ -576,28 +600,4 @@ mod tests {
             );
         }
     }
-}
-
-pub fn slash_command_dropdown_candidates(
-    prefix: &str,
-    skills: &orangu::skills::SkillRegistry,
-) -> Vec<(String, String)> {
-    let mut candidates = Vec::new();
-
-    for cmd in SlashCommand::iter() {
-        let cmd_str = cmd.command();
-        if cmd_str.starts_with(prefix) {
-            candidates.push((cmd_str, cmd.description().to_string()));
-        }
-    }
-
-    for skill in skills.all() {
-        let cmd = format!("/{}", skill.name);
-        if cmd.starts_with(prefix) && !SlashCommand::iter().any(|c| c.command() == cmd) {
-            let desc = skill.description.clone();
-            candidates.push((cmd, desc));
-        }
-    }
-
-    candidates
 }

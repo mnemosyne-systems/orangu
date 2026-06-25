@@ -288,11 +288,14 @@ pub(crate) fn handle_command(
         LocalCommand::ShowFile(args) => {
             match show_file_output(workspace, args.as_ref(), virtual_width) {
                 Ok(output) => {
-                    let context = orangu::compression::prepare_llm_file_context(
+                    let (context, stats) = orangu::compression::prepare_llm_file_context_with_stats(
                         args.as_ref(),
                         &output,
                         compression,
                     );
+                    if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                        metrics.record(&stats);
+                    }
                     let mut llm_msg = String::new();
                     llm_msg.push_str(&format!(
                         "The user executed `/show_file {}`. Output:\n\n",
@@ -389,11 +392,14 @@ pub(crate) fn handle_command(
         }
         LocalCommand::Diff(None) => match git_workspace_diff(workspace) {
             Ok(output) => {
-                let context = orangu::compression::prepare_llm_diff_context(
+                let (context, stats) = orangu::compression::prepare_llm_diff_context_with_stats(
                     &output,
                     compression,
                     tools.diff_file_cap(),
                 );
+                if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                    metrics.record(&stats);
+                }
                 let mut llm_msg = String::new();
                 llm_msg.push_str("The user executed `/diff`. Output:\n\n");
                 if let Some(note) = context.note {
@@ -412,11 +418,14 @@ pub(crate) fn handle_command(
         },
         LocalCommand::Diff(Some(branch)) => match git_diff_against_branch(workspace, &branch) {
             Ok(output) => {
-                let context = orangu::compression::prepare_llm_diff_context(
+                let (context, stats) = orangu::compression::prepare_llm_diff_context_with_stats(
                     &output,
                     compression,
                     tools.diff_file_cap(),
                 );
+                if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                    metrics.record(&stats);
+                }
                 let mut llm_msg = String::new();
                 llm_msg.push_str(&format!(
                     "The user executed `/diff {}`. Output:\n\n",
@@ -453,8 +462,14 @@ pub(crate) fn handle_command(
         )),
         LocalCommand::Grep(Some(pattern)) => match grep_output(workspace, &pattern) {
             Ok(output) => {
-                let context =
-                    orangu::compression::prepare_llm_grep_context(&pattern, &output, compression);
+                let (context, stats) = orangu::compression::prepare_llm_grep_context_with_stats(
+                    &pattern,
+                    &output,
+                    compression,
+                );
+                if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                    metrics.record(&stats);
+                }
                 let mut llm_msg = String::new();
                 llm_msg.push_str(&format!(
                     "The user executed `/grep {}`. Output:\n\n",

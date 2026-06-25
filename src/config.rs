@@ -452,6 +452,36 @@ fn normalize_llm_configuration(llm: &mut LlmConfiguration) -> Result<()> {
     }
 }
 
+pub fn load_agents_instructions(workspace: &std::path::Path) -> String {
+    let global_agents = home::home_dir()
+        .map(|h| h.join(".orangu/AGENTS.md"))
+        .unwrap_or_default();
+    let local_agents = workspace.join("AGENTS.md");
+
+    let mut agents_content = String::new();
+    if global_agents.exists()
+        && let Ok(content) = std::fs::read_to_string(&global_agents)
+    {
+        agents_content.push_str(&content);
+        agents_content.push('\n');
+    }
+    if local_agents.exists()
+        && let Ok(content) = std::fs::read_to_string(&local_agents)
+    {
+        agents_content.push_str(&content);
+        agents_content.push('\n');
+    }
+
+    if agents_content.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n# AGENTS.md instructions for project\n<INSTRUCTIONS>\n{}</INSTRUCTIONS>\n",
+            agents_content
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,35 +739,5 @@ mod tests {
         assert_eq!(conf.find_server_for_role("explorer"), "b");
         assert_eq!(conf.find_server_for_role("review"), "a");
         assert_eq!(conf.find_server_for_role("missing"), "a"); // fallback
-    }
-}
-
-pub fn load_agents_instructions(workspace: &std::path::Path) -> String {
-    let global_agents = home::home_dir()
-        .map(|h| h.join(".orangu/AGENTS.md"))
-        .unwrap_or_default();
-    let local_agents = workspace.join("AGENTS.md");
-
-    let mut agents_content = String::new();
-    if global_agents.exists()
-        && let Ok(content) = std::fs::read_to_string(&global_agents)
-    {
-        agents_content.push_str(&content);
-        agents_content.push('\n');
-    }
-    if local_agents.exists()
-        && let Ok(content) = std::fs::read_to_string(&local_agents)
-    {
-        agents_content.push_str(&content);
-        agents_content.push('\n');
-    }
-
-    if agents_content.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n# AGENTS.md instructions for project\n<INSTRUCTIONS>\n{}</INSTRUCTIONS>\n",
-            agents_content
-        )
     }
 }
