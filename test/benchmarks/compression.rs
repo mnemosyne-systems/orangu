@@ -20,8 +20,9 @@
 //!
 //! Results are written to `target/criterion/`.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use orangu::compression::{compress_shell_output, compress_shell_output_with_stats};
+use std::hint::black_box;
 
 // ── Representative fixture generators ────────────────────────────────────────
 

@@ -60,7 +60,11 @@ impl ContextCache {
 
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
 
         FileFingerprint {
             size,

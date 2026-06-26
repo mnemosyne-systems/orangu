@@ -46,12 +46,13 @@ use markdown::{
     to_mdast,
 };
 use printpdf::{
-    Actions, BorderArray, BuiltinFont, Color, IndirectFontRef, Line, LinkAnnotation, Mm,
-    PdfDocument, PdfDocumentReference, PdfLayerReference, Point, Rect, Rgb, path::PaintMode,
+    Actions, BorderArray, BuiltinFont, Color, Line, LinePoint, LinkAnnotation, Mm, Op, PaintMode,
+    ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, Rect, Rgb,
+    TextItem,
 };
 use std::{
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
@@ -929,15 +930,15 @@ fn push_span(out: &mut Vec<Span>, text: &str, bold: bool, italic: bool) {
 /// the embedded Red Hat Text family or, if it cannot be loaded, the builtin
 /// Helvetica family.
 struct DocFonts {
-    regular: IndirectFontRef,
-    bold: IndirectFontRef,
-    italic: IndirectFontRef,
-    bold_italic: IndirectFontRef,
+    regular: PdfFontHandle,
+    bold: PdfFontHandle,
+    italic: PdfFontHandle,
+    bold_italic: PdfFontHandle,
     measurer: Measurer,
 }
 
 impl DocFonts {
-    fn font(&self, bold: bool, italic: bool) -> &IndirectFontRef {
+    fn font(&self, bold: bool, italic: bool) -> &PdfFontHandle {
         match (bold, italic) {
             (true, true) => &self.bold_italic,
             (true, false) => &self.bold,
@@ -986,24 +987,30 @@ impl Measurer {
 
 /// Load the embedded Red Hat Text family into `doc`, falling back to the closest
 /// printpdf-native face (Helvetica) if it cannot be embedded or parsed.
-fn load_fonts(doc: &PdfDocumentReference) -> Result<DocFonts> {
+fn load_fonts(doc: &mut PdfDocument) -> Result<DocFonts> {
     if let Some(fonts) = load_embedded_fonts(doc) {
         return Ok(fonts);
     }
     Ok(DocFonts {
-        regular: doc.add_builtin_font(BuiltinFont::Helvetica)?,
-        bold: doc.add_builtin_font(BuiltinFont::HelveticaBold)?,
-        italic: doc.add_builtin_font(BuiltinFont::HelveticaOblique)?,
-        bold_italic: doc.add_builtin_font(BuiltinFont::HelveticaBoldOblique)?,
+        regular: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
+        bold: PdfFontHandle::Builtin(BuiltinFont::HelveticaBold),
+        italic: PdfFontHandle::Builtin(BuiltinFont::HelveticaOblique),
+        bold_italic: PdfFontHandle::Builtin(BuiltinFont::HelveticaBoldOblique),
         measurer: Measurer::Approximate,
     })
 }
 
-fn load_embedded_fonts(doc: &PdfDocumentReference) -> Option<DocFonts> {
-    let regular = doc.add_external_font(FONT_REGULAR).ok()?;
-    let bold = doc.add_external_font(FONT_BOLD).ok()?;
-    let italic = doc.add_external_font(FONT_ITALIC).ok()?;
-    let bold_italic = doc.add_external_font(FONT_BOLD_ITALIC).ok()?;
+/// Parse and register one embedded face, returning its document font handle.
+fn add_external_font(doc: &mut PdfDocument, bytes: &'static [u8]) -> Option<PdfFontHandle> {
+    let parsed = ParsedFont::from_bytes(bytes, 0, &mut Vec::new())?;
+    Some(PdfFontHandle::External(doc.add_font(&parsed)))
+}
+
+fn load_embedded_fonts(doc: &mut PdfDocument) -> Option<DocFonts> {
+    let regular = add_external_font(doc, FONT_REGULAR)?;
+    let bold = add_external_font(doc, FONT_BOLD)?;
+    let italic = add_external_font(doc, FONT_ITALIC)?;
+    let bold_italic = add_external_font(doc, FONT_BOLD_ITALIC)?;
     let faces = Box::new([
         ttf_parser::Face::parse(FONT_REGULAR, 0).ok()?,
         ttf_parser::Face::parse(FONT_BOLD, 0).ok()?,
@@ -1024,42 +1031,45 @@ fn load_embedded_fonts(doc: &PdfDocumentReference) -> Option<DocFonts> {
 /// Incremental PDF builder: owns the document and fonts, tracks the current
 /// page and the content cursor, and draws every page's header/footer bands.
 struct Pdf {
-    doc: PdfDocumentReference,
+    doc: PdfDocument,
     fonts: DocFonts,
     header: String,
     footer: String,
-    layer: PdfLayerReference,
+    /// Drawing operations accumulated for the page currently being built.
+    ops: Vec<Op>,
+    /// Pages already finished (flushed by `new_page`/`save`), in order.
+    pages: Vec<PdfPage>,
     cursor_y: f32,
 }
 
 impl Pdf {
     fn new(header: &str, model: &str) -> Result<Self> {
-        let (doc, page, layer) = PdfDocument::new(
-            "orangu export",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "Layer 1",
-        );
-        let fonts = load_fonts(&doc)?;
-        let layer = doc.get_page(page).get_layer(layer);
-        let pdf = Pdf {
+        let mut doc = PdfDocument::new("orangu export");
+        let fonts = load_fonts(&mut doc)?;
+        let mut pdf = Pdf {
             doc,
             fonts,
             header: header.to_string(),
             footer: format!("orangu {VERSION} ({model})"),
-            layer,
+            ops: Vec::new(),
+            pages: Vec::new(),
             cursor_y: CONTENT_TOP_MM,
         };
         pdf.draw_furniture();
         Ok(pdf)
     }
 
+    /// Finish the page under construction, pushing its accumulated ops as a new
+    /// `PdfPage`.
+    fn finish_page(&mut self) {
+        let ops = std::mem::take(&mut self.ops);
+        self.pages
+            .push(PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops));
+    }
+
     /// Start a fresh page (with its bands) and reset the content cursor.
     fn new_page(&mut self) {
-        let (page, layer) = self
-            .doc
-            .add_page(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "Layer 1");
-        self.layer = self.doc.get_page(page).get_layer(layer);
+        self.finish_page();
         self.cursor_y = CONTENT_TOP_MM;
         self.draw_furniture();
     }
@@ -1091,7 +1101,7 @@ impl Pdf {
                 block.hanging_mm
             };
             draw_line(
-                &self.layer,
+                &mut self.ops,
                 &line,
                 indent,
                 block.size,
@@ -1105,7 +1115,7 @@ impl Pdf {
 
     /// Draw a single line of text at `(x, baseline)` in the given colour.
     fn text(
-        &self,
+        &mut self,
         text: &str,
         bold: bool,
         x: f32,
@@ -1113,37 +1123,39 @@ impl Pdf {
         size: f32,
         color: (f32, f32, f32),
     ) {
-        let (r, g, b) = color;
-        self.layer
-            .set_fill_color(Color::Rgb(Rgb::new(r, g, b, None)));
-        self.layer.use_text(
-            text,
-            size,
-            Mm(x),
-            Mm(baseline),
-            self.fonts.font(bold, false),
-        );
+        let font = self.fonts.font(bold, false).clone();
+        emit_text(&mut self.ops, text, &font, size, x, baseline, color);
     }
 
-    fn fill_rect(&self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32)) {
+    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32)) {
         let (r, g, b) = color;
-        self.layer
-            .set_fill_color(Color::Rgb(Rgb::new(r, g, b, None)));
-        self.layer
-            .add_rect(Rect::new(Mm(x0), Mm(y0), Mm(x1), Mm(y1)).with_mode(PaintMode::Fill));
+        let rect = Rect {
+            x: Mm(x0).into(),
+            y: Mm(y0).into(),
+            width: Mm(x1 - x0).into(),
+            height: Mm(y1 - y0).into(),
+            mode: Some(PaintMode::Fill),
+            winding_order: None,
+        };
+        self.ops.push(Op::SetFillColor {
+            col: Color::Rgb(Rgb::new(r, g, b, None)),
+        });
+        self.ops.push(Op::DrawPolygon {
+            polygon: rect.to_polygon(),
+        });
     }
 
-    fn rule(&self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32), thickness: f32) {
+    fn rule(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32), thickness: f32) {
         let (r, g, b) = color;
-        self.layer
-            .set_outline_color(Color::Rgb(Rgb::new(r, g, b, None)));
-        self.layer.set_outline_thickness(thickness);
-        self.layer.add_line(Line {
-            points: vec![
-                (Point::new(Mm(x0), Mm(y0)), false),
-                (Point::new(Mm(x1), Mm(y1)), false),
-            ],
-            is_closed: false,
+        self.ops.push(Op::SetOutlineColor {
+            col: Color::Rgb(Rgb::new(r, g, b, None)),
+        });
+        self.ops.push(Op::SetOutlineThickness { pt: Pt(thickness) });
+        self.ops.push(Op::DrawLine {
+            line: Line {
+                points: vec![line_point(x0, y0), line_point(x1, y1)],
+                is_closed: false,
+            },
         });
     }
 
@@ -1247,23 +1259,15 @@ impl Pdf {
 
     /// Draw the header and footer bands (brand fill, centered white text) on the
     /// current page, with the footer's `orangu` underlined and linked.
-    fn draw_furniture(&self) {
-        let layer = &self.layer;
-        let (br, bg, bb) = BRAND_COLOR;
-        layer.set_fill_color(Color::Rgb(Rgb::new(br, bg, bb, None)));
-        layer.add_rect(
-            Rect::new(
-                Mm(0.0),
-                Mm(PAGE_HEIGHT_MM - HEADER_BAND_MM),
-                Mm(PAGE_WIDTH_MM),
-                Mm(PAGE_HEIGHT_MM),
-            )
-            .with_mode(PaintMode::Fill),
+    fn draw_furniture(&mut self) {
+        self.fill_rect(
+            0.0,
+            PAGE_HEIGHT_MM - HEADER_BAND_MM,
+            PAGE_WIDTH_MM,
+            PAGE_HEIGHT_MM,
+            BRAND_COLOR,
         );
-        layer.add_rect(
-            Rect::new(Mm(0.0), Mm(0.0), Mm(PAGE_WIDTH_MM), Mm(FOOTER_BAND_MM))
-                .with_mode(PaintMode::Fill),
-        );
+        self.fill_rect(0.0, 0.0, PAGE_WIDTH_MM, FOOTER_BAND_MM, BRAND_COLOR);
 
         let cap = BAND_TEXT_SIZE * 0.7 * PT_TO_MM;
         let header_baseline = (PAGE_HEIGHT_MM - HEADER_BAND_MM / 2.0) - cap / 2.0;
@@ -1279,58 +1283,70 @@ impl Pdf {
             .text_width_mm(&self.footer, false, false, BAND_TEXT_SIZE);
         let footer_x = ((PAGE_WIDTH_MM - footer_width) / 2.0).max(MARGIN_MM);
 
-        let (wr, wg, wb) = WHITE;
-        layer.set_fill_color(Color::Rgb(Rgb::new(wr, wg, wb, None)));
-        layer.use_text(
-            self.header.as_str(),
+        let header = self.header.clone();
+        let footer = self.footer.clone();
+        self.text(
+            &header,
+            true,
+            header_x,
+            header_baseline,
             BAND_TEXT_SIZE,
-            Mm(header_x),
-            Mm(header_baseline),
-            self.fonts.font(true, false),
+            WHITE,
         );
-        layer.use_text(
-            self.footer.as_str(),
+        self.text(
+            &footer,
+            false,
+            footer_x,
+            footer_baseline,
             BAND_TEXT_SIZE,
-            Mm(footer_x),
-            Mm(footer_baseline),
-            self.fonts.font(false, false),
+            WHITE,
         );
 
         // Underline "orangu" (it opens the footer) and make it a link.
         let orangu_width = self
             .fonts
             .text_width_mm("orangu", false, false, BAND_TEXT_SIZE);
-        layer.set_outline_color(Color::Rgb(Rgb::new(wr, wg, wb, None)));
-        layer.set_outline_thickness(0.6);
-        layer.add_line(Line {
-            points: vec![
-                (Point::new(Mm(footer_x), Mm(footer_baseline - 1.2)), false),
-                (
-                    Point::new(Mm(footer_x + orangu_width), Mm(footer_baseline - 1.2)),
-                    false,
-                ),
-            ],
-            is_closed: false,
+        let (wr, wg, wb) = WHITE;
+        self.ops.push(Op::SetOutlineColor {
+            col: Color::Rgb(Rgb::new(wr, wg, wb, None)),
         });
-        layer.add_link_annotation(LinkAnnotation::new(
-            Rect::new(
-                Mm(footer_x),
-                Mm(1.0),
-                Mm(footer_x + orangu_width),
-                Mm(FOOTER_BAND_MM - 1.0),
+        self.ops.push(Op::SetOutlineThickness { pt: Pt(0.6) });
+        self.ops.push(Op::DrawLine {
+            line: Line {
+                points: vec![
+                    line_point(footer_x, footer_baseline - 1.2),
+                    line_point(footer_x + orangu_width, footer_baseline - 1.2),
+                ],
+                is_closed: false,
+            },
+        });
+        self.ops.push(Op::LinkAnnotation {
+            link: LinkAnnotation::new(
+                Rect {
+                    x: Mm(footer_x).into(),
+                    y: Mm(1.0).into(),
+                    width: Mm(orangu_width).into(),
+                    height: Mm(FOOTER_BAND_MM - 2.0).into(),
+                    mode: None,
+                    winding_order: None,
+                },
+                Actions::uri(ORANGU_URL.to_string()),
+                Some(BorderArray::Solid([0.0, 0.0, 0.0])),
+                None,
+                None,
             ),
-            Some(BorderArray::Solid([0.0, 0.0, 0.0])),
-            None,
-            Actions::uri(ORANGU_URL.to_string()),
-            None,
-        ));
+        });
     }
 
-    fn save(self, path: &Path) -> Result<()> {
+    fn save(mut self, path: &Path) -> Result<()> {
+        self.finish_page();
+        let pages = std::mem::take(&mut self.pages);
+        self.doc.with_pages(pages);
+        let bytes = self.doc.save(&PdfSaveOptions::default(), &mut Vec::new());
         let file =
             File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-        self.doc
-            .save(&mut BufWriter::new(file))
+        BufWriter::new(file)
+            .write_all(&bytes)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
@@ -1460,7 +1476,7 @@ fn wrap(
 type RunStyle = (bool, bool, (f32, f32, f32));
 
 fn draw_line(
-    layer: &PdfLayerReference,
+    ops: &mut Vec<Op>,
     line: &[StyledChar],
     indent_mm: f32,
     size: f32,
@@ -1477,18 +1493,18 @@ fn draw_line(
         // the block default resolved here, so the run carries a concrete colour.
         let style = (sc.bold, sc.italic, sc.color.unwrap_or(default_color));
         if run_style != Some(style) {
-            x = flush_run(layer, &mut run, x, y, size, run_style, fonts);
+            x = flush_run(ops, &mut run, x, y, size, run_style, fonts);
             run_style = Some(style);
         }
         run.push(sc.ch);
     }
-    flush_run(layer, &mut run, x, y, size, run_style, fonts);
+    flush_run(ops, &mut run, x, y, size, run_style, fonts);
 }
 
 /// Draw `run` at `(x, y)` (mm) in its style's colour and return the x just past
 /// it.
 fn flush_run(
-    layer: &PdfLayerReference,
+    ops: &mut Vec<Op>,
     run: &mut String,
     x: f32,
     y: f32,
@@ -1499,12 +1515,53 @@ fn flush_run(
     if run.is_empty() {
         return x;
     }
-    let (bold, italic, (r, g, b)) = style.unwrap_or((false, false, TEXT_COLOR));
-    layer.set_fill_color(Color::Rgb(Rgb::new(r, g, b, None)));
+    let (bold, italic, color) = style.unwrap_or((false, false, TEXT_COLOR));
     let width = fonts.text_width_mm(run, bold, italic, size);
-    layer.use_text(run.as_str(), size, Mm(x), Mm(y), fonts.font(bold, italic));
+    emit_text(ops, run, fonts.font(bold, italic), size, x, y, color);
     run.clear();
     x + width
+}
+
+/// A non-bezier line vertex at `(x, y)` millimetres.
+fn line_point(x: f32, y: f32) -> LinePoint {
+    LinePoint {
+        p: Point::new(Mm(x), Mm(y)),
+        bezier: false,
+    }
+}
+
+/// Append the ops drawing one absolutely-positioned text run: a self-contained
+/// text section (`BT … ET`) whose single `Td` places the baseline at `(x, y)`
+/// millimetres from the page's bottom-left. Each run is its own section so the
+/// text matrix resets and `Td` acts as an absolute move.
+fn emit_text(
+    ops: &mut Vec<Op>,
+    text: &str,
+    font: &PdfFontHandle,
+    size: f32,
+    x: f32,
+    y: f32,
+    color: (f32, f32, f32),
+) {
+    if text.is_empty() {
+        return;
+    }
+    let (r, g, b) = color;
+    ops.push(Op::StartTextSection);
+    ops.push(Op::SetFillColor {
+        col: Color::Rgb(Rgb::new(r, g, b, None)),
+    });
+    ops.push(Op::SetFont {
+        font: font.clone(),
+        size: Pt(size),
+    });
+    ops.push(Op::SetTextCursor {
+        pos: Point::new(Mm(x), Mm(y)),
+    });
+    ops.push(Op::ShowText {
+        items: vec![TextItem::Text(text.to_string())],
+    });
+    ops.push(Op::EndTextSection);
 }
 
 /// Remove ANSI escape sequences (CSI, plus the `ESC O x` cursor keys) so the
