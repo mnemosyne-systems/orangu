@@ -53,11 +53,13 @@ pub(crate) struct TerminalUiGuard;
 impl TerminalUiGuard {
     pub(crate) fn new() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        // Keyboard enhancement is not supported on all terminals (e.g. Windows legacy console).
+        // If it fails, we gracefully ignore the error.
+        let _ = execute!(
             std::io::stdout(),
-            EnterAlternateScreen,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
+        );
         Ok(Self)
     }
 }
