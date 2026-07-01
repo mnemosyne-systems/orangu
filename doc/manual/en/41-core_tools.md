@@ -429,18 +429,20 @@ show file README.md
 
 ## /build
 
-Builds the workspace project, detecting the toolchain from the workspace root.
+Builds the workspace project, detecting the toolchain from the workspace root. Takes an optional profile, `debug` or `release`; the default is `release`.
 
-Each step is reported individually and the pipeline stops on the first failure:
+Each step is reported individually and the pipeline stops on the first failure. The profile is mapped onto each toolchain's own notion of a build profile:
 
-- **Rust** (`Cargo.toml`) — runs `cargo fmt`, `cargo clippy`, `cargo build`, and `cargo test`.
-- **C** (`CMakeLists.txt`) — runs `clang-format.sh` (if present), creates a `build/` directory if needed, runs `cmake ..` on the first build, then `make`.
-- **Java** (`pom.xml`) — installs frontend dependencies with `npm ci` when outdated, runs `npm run fix` and `npm run check` for the frontend (if `src/frontend/` exists), then `mvn package`.
+- **Rust** (`Cargo.toml`) — runs `cargo fmt`, `cargo clippy`, then `cargo build` and `cargo test`, adding `--release` for the release profile (omitted for debug).
+- **C** (`CMakeLists.txt`) — runs `clang-format.sh` (if present), then configures and builds in a profile-specific directory (`build-debug/` or `build-release/`) with `-DCMAKE_BUILD_TYPE=Debug` or `-DCMAKE_BUILD_TYPE=Release` passed to `cmake` on the first build, then `make`.
+- **Java** (`pom.xml`) — installs frontend dependencies with `npm ci` when outdated, runs `npm run fix` and `npm run check` for the frontend (if `src/frontend/` exists), then `mvn package` for debug, or `mvn -P release package` for release (this assumes the project defines a Maven profile named `release` in its `pom.xml`; Maven has no built-in debug/release axis).
 
 ### Examples
 
 ```text
 /build
+/build debug
+/build release
 ```
 
 Natural-language forms:
@@ -449,6 +451,10 @@ Natural-language forms:
 build
 build project
 run build
+build debug
+debug build
+build release
+release build
 ```
 
 \newpage

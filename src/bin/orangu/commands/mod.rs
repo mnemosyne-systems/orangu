@@ -408,7 +408,9 @@ pub enum LocalCommand<'a> {
     Export(ExportTarget),
     Manual,
     Usage,
-    Build,
+    /// `/build [debug|release]`: build the workspace project. Defaults to
+    /// `release`.
+    Build(crate::build::BuildProfile),
     Clear,
     Quit,
     PendingList,

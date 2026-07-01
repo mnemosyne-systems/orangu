@@ -72,6 +72,10 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "show available models",
     "models",
     // --- build ---
+    "build debug",
+    "debug build",
+    "build release",
+    "release build",
     "build",
     "build project",
     "run build",
@@ -383,8 +387,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::ModelInfo);
     }
+    if matches_ci(input, &["build debug", "debug build"]) {
+        return Some(LocalCommand::Build(crate::build::BuildProfile::Debug));
+    }
+    if matches_ci(input, &["build release", "release build"]) {
+        return Some(LocalCommand::Build(crate::build::BuildProfile::Release));
+    }
     if matches_ci(input, &["build", "build project", "run build"]) {
-        return Some(LocalCommand::Build);
+        return Some(LocalCommand::Build(crate::build::BuildProfile::default()));
     }
     if matches_ci(input, &["diff", "show diff", "git diff"]) {
         return Some(LocalCommand::Diff(None));

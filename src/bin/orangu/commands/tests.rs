@@ -60,6 +60,57 @@ fn parses_prune_commands() {
 }
 
 #[test]
+fn parses_build_commands() {
+    use crate::build::BuildProfile;
+
+    // Bare forms, slash and natural, default to release.
+    for input in ["/build", "build", "build project", "run build"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Build(BuildProfile::Release))
+            ),
+            "expected release build for {input:?}"
+        );
+    }
+
+    // An explicit profile, slash or natural, in either order.
+    for input in ["/build debug", "build debug", "debug build"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Build(BuildProfile::Debug))
+            ),
+            "expected debug build for {input:?}"
+        );
+    }
+    for input in ["/build release", "build release", "release build"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Build(BuildProfile::Release))
+            ),
+            "expected release build for {input:?}"
+        );
+    }
+
+    // Case-insensitive, and surrounding whitespace on the slash argument is
+    // trimmed.
+    assert!(matches!(
+        parse_local_command("/build DEBUG"),
+        Some(LocalCommand::Build(BuildProfile::Debug))
+    ));
+    assert!(matches!(
+        parse_local_command("/build  release  "),
+        Some(LocalCommand::Build(BuildProfile::Release))
+    ));
+
+    // An unrecognized profile is not a build command at all (falls through
+    // to the "unknown command" error rather than silently building).
+    assert!(parse_local_command("/build nightly").is_none());
+}
+
+#[test]
 fn parses_workspace_commands() {
     // Bare forms, slash and natural, list/report the active workspace.
     assert!(matches!(

@@ -882,10 +882,10 @@ pub(crate) fn handle_command(
         LocalCommand::Export(target) => Ok(CommandOutcome::Export(target)),
         LocalCommand::Manual => Ok(CommandOutcome::Manual),
         LocalCommand::Usage => Ok(CommandOutcome::Output(usage_stats.format(tools))),
-        LocalCommand::Build => {
+        LocalCommand::Build(profile) => {
             let ws = workspace.to_path_buf();
             Ok(CommandOutcome::Streaming(Box::new(move |sink| {
-                build::build_output(&ws, &sink)
+                build::build_output(&ws, profile, &sink)
             })))
         }
         LocalCommand::Clear => {
