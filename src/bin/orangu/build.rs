@@ -62,9 +62,14 @@ pub fn build_output(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -
         meson_build(workspace, profile, sink)
     } else if workspace.join("pom.xml").exists() {
         java_build(workspace, profile, sink)
+    } else if workspace.join("pyproject.toml").exists()
+        || workspace.join("setup.py").exists()
+        || workspace.join("setup.cfg").exists()
+    {
+        python_build(workspace, profile, sink)
     } else {
         Err(anyhow!(
-            "no supported project found (expected Cargo.toml, CMakeLists.txt, configure, meson.build, or pom.xml)"
+            "no supported project found (expected Cargo.toml, CMakeLists.txt, configure, meson.build, pom.xml, pyproject.toml, setup.py, or setup.cfg)"
         ))
     }
 }
@@ -381,6 +386,21 @@ fn java_build(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -> Resu
     };
     steps.run("mvn package", make_cmd("mvn", mvn_args, workspace))?;
 
+    Ok(())
+}
+
+/// Python projects (`pyproject.toml`, `setup.py`, or `setup.cfg` at the
+/// workspace root, checked in that order). `pip install -e .` covers both the
+/// initial install and picking up subsequent source changes, so it is the
+/// whole build step; unlike the compiled backends there is no separate
+/// debug/release artifact, so `profile` is accepted for signature parity with
+/// `build_output`'s other branches but otherwise unused.
+fn python_build(workspace: &Path, _profile: BuildProfile, sink: &BuildSink) -> Result<()> {
+    let mut steps = BuildSteps::new(sink);
+    steps.run(
+        "pip install -e .",
+        make_cmd("pip", &["install", "-e", "."], workspace),
+    )?;
     Ok(())
 }
 
