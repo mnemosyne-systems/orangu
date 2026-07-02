@@ -99,6 +99,7 @@ Then start with:
 /show_file README.md
 /debugging reproduce the failing request path
 /build
+/shell ls -la
 /add_file README.md
 /auto_review
 /amend "[#42] My feature"

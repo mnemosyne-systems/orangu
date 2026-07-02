@@ -888,6 +888,16 @@ pub(crate) fn handle_command(
                 build::build_output(&ws, profile, &sink)
             })))
         }
+        LocalCommand::Shell(None) => Ok(CommandOutcome::OutputError(
+            "Usage: /shell <command>".to_string(),
+        )),
+        LocalCommand::Shell(Some(command)) => {
+            let ws = workspace.to_path_buf();
+            let command = command.into_owned();
+            Ok(CommandOutcome::Streaming(Box::new(move |sink| {
+                shell_command::shell_output(&ws, &command, &sink)
+            })))
+        }
         LocalCommand::Clear => {
             let prompt = build_workspace_system_prompt(
                 llms.get(active_model)

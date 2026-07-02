@@ -411,6 +411,9 @@ pub enum LocalCommand<'a> {
     /// `/build [debug|release]`: build the workspace project. Defaults to
     /// `release`.
     Build(crate::build::BuildProfile),
+    /// `/shell <command>`: run a shell command in the workspace, streaming its
+    /// output. `None` is a usage error (the command line is required).
+    Shell(Option<Cow<'a, str>>),
     Clear,
     Quit,
     PendingList,

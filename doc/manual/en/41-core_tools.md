@@ -434,7 +434,7 @@ Builds the workspace project, detecting the toolchain from the workspace root. T
 Each step is reported individually and the pipeline stops on the first failure. The profile is mapped onto each toolchain's own notion of a build profile:
 
 - **Rust** (`Cargo.toml`) — runs `cargo fmt`, `cargo clippy`, then `cargo build` and `cargo test`, adding `--release` for the release profile (omitted for debug).
-- **C/C++, CMake** (`CMakeLists.txt`) — runs `clang-format.sh` (if present), then configures and builds in a profile-specific directory (`build-debug/` or `build-release/`) with `-DCMAKE_BUILD_TYPE=Debug` or `-DCMAKE_BUILD_TYPE=Release` passed to `cmake` on the first build, then `make`.
+- **C/C++, CMake** (`CMakeLists.txt`) — runs `clang-format.sh` (if present), then configures and builds in a single reused `build/` directory, then `make`. The first build runs `cmake .. -DCMAKE_BUILD_TYPE=Debug` (or `Release`); later builds skip straight to `make` when the directory is already configured for the requested profile, and reconfigure with the new `-DCMAKE_BUILD_TYPE` (which `cmake` applies in place) when it isn't — so switching between `/build debug` and `/build release` reconfigures the same directory rather than building each profile separately.
 - **C/C++, Autotools** (`configure`, checked when there is no `CMakeLists.txt`; takes priority over Meson when a project has both, e.g. PostgreSQL mid-migration) — runs `clang-format.sh` (if present), then builds in place, like a plain `./configure && make`. If the workspace root already has a `config.status`/`GNUmakefile` (an existing configuration, from a previous `/build` or a manual run), it runs `make distclean` first — autotools has no separate build-type flag, and an out-of-tree VPATH build does not mix safely with an in-tree one, so any previous configuration is wiped rather than built alongside. Then it runs `sh ./configure CFLAGS=... CXXFLAGS=...` (`-g -O0` for debug, `-O2` for release) and `make`.
 - **C/C++, Meson** (`meson.build`, checked when there is no `CMakeLists.txt` or `configure`) — runs `clang-format.sh` (if present), cleans up a stale in-tree Autotools configuration the same way as above if one is found, then builds in a single reused `build/` directory (Meson refuses to build in place). The first build runs `meson setup build --buildtype=debug|release`; later builds run `meson configure build --buildtype=...` instead — a cheap no-op if the profile is unchanged, and a correct incremental rebuild if it isn't — then `meson compile -C build`.
 - **Java** (`pom.xml`) — installs frontend dependencies with `npm ci` when outdated, runs `npm run fix` and `npm run check` for the frontend (if `src/frontend/` exists), then `mvn package` for debug, or `mvn -P release package` for release (this assumes the project defines a Maven profile named `release` in its `pom.xml`; Maven has no built-in debug/release axis).
@@ -457,6 +457,30 @@ build debug
 debug build
 build release
 release build
+```
+
+\newpage
+
+## /shell
+
+Runs a shell command in the workspace, streaming its output to the output window line by line as it is produced — long-running commands (a test suite, a script that tails a log) show output live rather than all at once when they finish.
+
+```text
+/shell <command>
+```
+
+The command line runs through `bash -lc`, exactly like the model-facing `run_shell_command` tool (see the Tools chapter), so it supports everything a login shell does: pipes, redirects, globs, and any executable on `$PATH`, not a fixed allow-list. It runs with the workspace as its current directory. `/shell` requires a command — a bare `/shell` reports usage instead of doing nothing quietly.
+
+The command exits non-zero the same way it would at a real terminal — `/shell` reports the failure but the output already streamed stays in the output window.
+
+Tab completion after `/shell ` completes the token being typed against files in the workspace, one path segment at a time, exactly like a real shell: `/shell ./te` offers `./test/`, and once inside that directory `/shell ./test/c` offers `./test/check.sh`. Only the last word of the command line completes this way — the program name and any earlier arguments are left alone. The inline ghost hint previews the same completion.
+
+### Examples
+
+```text
+/shell ls -la
+/shell cargo test
+/shell ./test/check.sh
 ```
 
 \newpage

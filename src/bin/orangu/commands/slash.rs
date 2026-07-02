@@ -50,6 +50,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/open_file" => Some(LocalCommand::OpenFile("")),
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
         "/build" => Some(LocalCommand::Build(crate::build::BuildProfile::default())),
+        "/shell" => Some(LocalCommand::Shell(None)),
         "/add_file" => Some(LocalCommand::AddFile(None)),
         "/amend" => Some(LocalCommand::Amend(None)),
         "/branch" => Some(LocalCommand::Branch(BranchSubcommand::List)),
@@ -146,6 +147,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(args) = input.strip_prefix("/build ") {
                 return crate::build::BuildProfile::parse(args).map(LocalCommand::Build);
+            }
+            if let Some(args) = input.strip_prefix("/shell ") {
+                let command = args.trim();
+                return Some(LocalCommand::Shell(if command.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(command))
+                }));
             }
             if let Some(args) = input.strip_prefix("/duplicates ") {
                 return Some(LocalCommand::Duplicates(parse_similarity_threshold(

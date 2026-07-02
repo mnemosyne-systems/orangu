@@ -111,6 +111,31 @@ fn parses_build_commands() {
 }
 
 #[test]
+fn parses_shell_commands() {
+    // A bare `/shell` has no command line, which is a usage error at dispatch
+    // rather than an unrecognized command.
+    assert!(matches!(
+        parse_local_command("/shell"),
+        Some(LocalCommand::Shell(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/shell   "),
+        Some(LocalCommand::Shell(None))
+    ));
+
+    // The whole remainder is kept as one command line, including internal
+    // whitespace and flags — only the outer whitespace is trimmed.
+    match parse_local_command("/shell ls -la ./src") {
+        Some(LocalCommand::Shell(Some(command))) => assert_eq!(command, "ls -la ./src"),
+        _ => panic!("expected a shell command"),
+    }
+    match parse_local_command("  /shell   echo hi  ") {
+        Some(LocalCommand::Shell(Some(command))) => assert_eq!(command, "echo hi"),
+        _ => panic!("expected a shell command"),
+    }
+}
+
+#[test]
 fn parses_workspace_commands() {
     // Bare forms, slash and natural, list/report the active workspace.
     assert!(matches!(

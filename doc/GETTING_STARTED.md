@@ -71,6 +71,7 @@ orangu --config ./orangu.conf
 - `/show_file README.md`
 - `/debugging reproduce the failing request path`
 - `/build`
+- `/shell ls -la`
 - `/add_file README.md`
 - `/auto_review`
 - `/amend <message>`

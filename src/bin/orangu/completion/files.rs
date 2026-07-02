@@ -69,6 +69,20 @@ pub fn file_completion_candidates(token: &str, workspace: &Path) -> Vec<String> 
     matches
 }
 
+/// Tab completion for `/shell <command>`: the token currently being typed
+/// completes against files in the workspace, one path segment at a time —
+/// `/shell ./te` offers `./test/`, and once inside that directory `/shell
+/// ./test/c` offers `./test/check.sh` — exactly like a real shell's filename
+/// completion. Earlier words in the command line (the program name and any
+/// prior arguments) are left alone; only the last (possibly quoted) token is
+/// completed.
+pub fn shell_completion_candidates(prefix: &str, workspace: &Path) -> Option<(usize, Vec<String>)> {
+    let args = prefix.strip_prefix("/shell ")?;
+    let (token_start, token) = last_shell_token(args);
+    let absolute_start = "/shell ".len() + token_start;
+    Some((absolute_start, file_completion_candidates(token, workspace)))
+}
+
 pub fn show_file_completion_candidates(
     prefix: &str,
     workspace: &Path,

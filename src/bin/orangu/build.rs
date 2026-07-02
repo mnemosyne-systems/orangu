@@ -76,8 +76,10 @@ fn make_cmd(program: &str, args: &[&str], cwd: &Path) -> Command {
     cmd
 }
 
-/// Forward every line from a child pipe to the sink as it is produced.
-fn stream_pipe<R: Read>(pipe: R, sink: &BuildSink) {
+/// Forward every line from a child pipe to the sink as it is produced. Also
+/// used by `/shell` (see `shell_command.rs`) to stream a plain command's
+/// output through the same sink type.
+pub(crate) fn stream_pipe<R: Read>(pipe: R, sink: &BuildSink) {
     let reader = BufReader::new(pipe);
     for line in reader.lines() {
         match line {
@@ -198,24 +200,48 @@ fn clean_stale_autotools_build(workspace: &Path, steps: &mut BuildSteps) -> Resu
     Ok(())
 }
 
+/// The `CMAKE_BUILD_TYPE` an existing `build/` directory was last configured
+/// with, read straight out of its `CMakeCache.txt` (`CMAKE_BUILD_TYPE:STRING=
+/// Debug`, one `key:type=value` entry per line). `None` when the directory
+/// has not been configured yet.
+fn cmake_cached_build_type(build_dir: &Path) -> Option<String> {
+    let cache = std::fs::read_to_string(build_dir.join("CMakeCache.txt")).ok()?;
+    cache.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.starts_with("CMAKE_BUILD_TYPE:") {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// A single `build/` directory is reused across both profiles (unlike
+/// Autotools' in-place build, CMake keeps generated files out of the source
+/// tree by convention, and there is nothing that stops one build directory
+/// from serving both). Switching profiles reconfigures that same directory:
+/// `cmake` happily updates `CMAKE_BUILD_TYPE` in an existing cache in place,
+/// so — unlike Meson, which refuses to change a configured directory's build
+/// type without its own `configure` subcommand — a plain `cmake ..
+/// -DCMAKE_BUILD_TYPE=...` handles both the first configure and any later
+/// profile switch. It only reruns when the cached build type differs from
+/// the requested one, so repeat `/build`s in the same profile skip straight
+/// to `make`.
 fn cmake_build(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -> Result<()> {
     let mut steps = BuildSteps::new(sink);
     c_format(workspace, &mut steps)?;
 
-    // Each profile gets its own build directory so switching between debug
-    // and release never reconfigures an existing CMakeCache.txt with a
-    // mismatched CMAKE_BUILD_TYPE.
-    let (dir_name, build_type) = match profile {
-        BuildProfile::Debug => ("build-debug", "Debug"),
-        BuildProfile::Release => ("build-release", "Release"),
+    let build_type = match profile {
+        BuildProfile::Debug => "Debug",
+        BuildProfile::Release => "Release",
     };
-    let build_dir = workspace.join(dir_name);
+    let build_dir = workspace.join("build");
     if !build_dir.exists() {
         std::fs::create_dir(&build_dir)
             .with_context(|| format!("failed to create {}", build_dir.display()))?;
     }
 
-    if !build_dir.join("CMakeCache.txt").exists() {
+    if cmake_cached_build_type(&build_dir).as_deref() != Some(build_type) {
         let build_type_arg = format!("-DCMAKE_BUILD_TYPE={build_type}");
         steps.run(
             "cmake",
@@ -376,7 +402,27 @@ fn is_newer(a: &Path, b: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::BuildProfile;
+    use super::{BuildProfile, cmake_cached_build_type};
+
+    #[test]
+    fn cmake_cached_build_type_reads_the_cache_entry() {
+        let build_dir = tempfile::tempdir().expect("build dir");
+        std::fs::write(
+            build_dir.path().join("CMakeCache.txt"),
+            "// comment\nCMAKE_BUILD_TYPE:STRING=Debug\nOTHER:BOOL=ON\n",
+        )
+        .expect("cache file");
+        assert_eq!(
+            cmake_cached_build_type(build_dir.path()),
+            Some("Debug".to_string())
+        );
+    }
+
+    #[test]
+    fn cmake_cached_build_type_is_none_without_a_cache() {
+        let build_dir = tempfile::tempdir().expect("build dir");
+        assert_eq!(cmake_cached_build_type(build_dir.path()), None);
+    }
 
     #[test]
     fn build_profile_parse_defaults_to_release() {

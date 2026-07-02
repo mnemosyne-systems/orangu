@@ -28,6 +28,7 @@ mod render;
 mod review;
 mod session_store;
 mod shell;
+mod shell_command;
 mod slash_command;
 mod stats;
 mod terminal;

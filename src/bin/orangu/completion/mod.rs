@@ -165,6 +165,10 @@ fn structured_completion_candidates(
         return Some((start, cursor, candidates));
     }
 
+    if let Some((start, candidates)) = shell_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
     if let Some((start, candidates)) = auto_review_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
@@ -590,6 +594,50 @@ mod tests {
             completion_ghost_suffix("/stash p", "/stash p".len(), workspace, &[], &[], &skills),
             Some("op".to_string())
         );
+    }
+
+    #[test]
+    fn shell_completes_workspace_files_one_segment_at_a_time() {
+        // `/shell ./te<Tab>` -> `/shell ./test/` -> typing `c` and `Tab` again ->
+        // `/shell ./test/check.sh`, exactly like a real shell's filename
+        // completion: each Tab only fills in the current path segment.
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("test")).expect("test dir");
+        std::fs::write(workspace.path().join("test").join("check.sh"), "").expect("check.sh");
+        let skills = orangu::skills::SkillRegistry::discover(workspace.path());
+
+        let (start, _, candidates) =
+            completion_candidates("/shell ./te", 11, workspace.path(), &[], &[], &skills)
+                .expect("shell completion");
+        assert_eq!(start, "/shell ".len());
+        assert_eq!(candidates, vec!["./test/".to_string()]);
+
+        let (start, _, candidates) =
+            completion_candidates("/shell ./test/c", 15, workspace.path(), &[], &[], &skills)
+                .expect("shell completion");
+        assert_eq!(start, "/shell ".len());
+        assert_eq!(candidates, vec!["./test/check.sh".to_string()]);
+
+        // The inline ghost previews the same completion.
+        assert_eq!(
+            completion_ghost_suffix(
+                "/shell ./te",
+                "/shell ./te".len(),
+                workspace.path(),
+                &[],
+                &[],
+                &skills
+            ),
+            Some("st/".to_string())
+        );
+
+        // An earlier argument in the command line is left untouched; only the
+        // last token completes.
+        let (start, _, candidates) =
+            completion_candidates("/shell cat ./te", 15, workspace.path(), &[], &[], &skills)
+                .expect("shell completion");
+        assert_eq!(start, "/shell cat ".len());
+        assert_eq!(candidates, vec!["./test/".to_string()]);
     }
 
     #[test]

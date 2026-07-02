@@ -71,6 +71,7 @@ pub enum SlashCommand {
     Manual,
     Usage,
     Build,
+    Shell,
     Skills,
     Graph,
     Clear,
@@ -131,6 +132,7 @@ impl SlashCommand {
             SlashCommand::Manual => "Opens the built-in manual",
             SlashCommand::Usage => "Shows token usage statistics",
             SlashCommand::Build => "Builds the workspace project",
+            SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",
             SlashCommand::Graph => {
                 "Generates an HTML visualization of the codebase Knowledge Graph"
