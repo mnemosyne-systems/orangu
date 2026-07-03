@@ -20,6 +20,7 @@ pub mod config;
 pub mod context;
 pub mod diff;
 pub mod duplicates;
+pub mod embeddings;
 pub mod explorer;
 pub mod graph;
 pub mod llm;

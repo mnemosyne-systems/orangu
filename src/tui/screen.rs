@@ -392,6 +392,39 @@ pub fn render_tool_running_status(frame: usize, elapsed: Duration) -> StatusFrag
     }
 }
 
+/// Like [`render_tool_running_status`] but with a completion percentage and,
+/// once there is enough to extrapolate from, an estimate of the time remaining
+/// — e.g. `Working (7%) (10m3s, ~2h10m left)`. `permille` is progress in
+/// thousandths (0..=1000); `eta_total_ms` is the task's current estimate of the
+/// *total* run time. The remaining time is `estimate − elapsed`, so it counts
+/// down between updates rather than drifting up.
+pub fn render_tool_progress_status(
+    frame: usize,
+    elapsed: Duration,
+    permille: u64,
+    eta_total_ms: u64,
+) -> StatusFragment {
+    let permille = permille.min(1000);
+    let percent = permille / 10;
+    let eta = if eta_total_ms > 0 && permille < 1000 {
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let remaining = Duration::from_millis(eta_total_ms.saturating_sub(elapsed_ms));
+        format!(", ~{} left", format_status_duration(remaining))
+    } else {
+        String::new()
+    };
+    let suffix = format!(" ({percent}%) ({}{eta})", format_status_duration(elapsed));
+    StatusFragment {
+        rendered: format!(
+            "{}{}{}",
+            render_rolling_text(WORKING_TEXT, frame),
+            ANSI_RESET,
+            suffix
+        ),
+        visible_width: WORKING_TEXT.chars().count() + suffix.chars().count(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusFragment {
     pub rendered: String,

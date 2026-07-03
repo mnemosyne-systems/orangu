@@ -468,7 +468,11 @@ pub(crate) async fn wait_for_streaming_command(
     wait_context: WaitContext<'_>,
     mut handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    control: Option<crate::commands::StreamControl>,
 ) -> anyhow::Result<anyhow::Result<()>> {
+    let cancel = control.as_ref().map(|c| c.cancel.clone());
+    let progress = control.as_ref().map(|c| c.progress.clone());
+    let eta = control.as_ref().map(|c| c.eta.clone());
     let WaitContext {
         mut render,
         history,
@@ -488,6 +492,11 @@ pub(crate) async fn wait_for_streaming_command(
     let started = std::time::Instant::now();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut frame = 0usize;
+    // Double-`Esc` sets the cooperative cancel flag (when the command supplied
+    // one); the task then stops itself at its next check and this loop returns
+    // via the `handle` arm. `spawn_blocking` tasks can't be aborted, so this
+    // cooperative flag is the only way to interrupt them.
+    let mut escape_cancel_state = EscapeCancelState::default();
     loop {
         tokio::select! {
             result = &mut handle => {
@@ -507,8 +516,20 @@ pub(crate) async fn wait_for_streaming_command(
                     output_state.push_text(&line);
                 }
                 while event::poll(std::time::Duration::ZERO)? {
+                    let event = event::read()?;
+                    // When the command is cancellable, a double-Esc within the
+                    // window flips its cancel flag; the task then winds down.
+                    if let Some(cancel) = &cancel
+                        && is_wait_cancel_escape(&event)
+                    {
+                        if escape_cancel_state.handle_escape(std::time::Instant::now()) {
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    escape_cancel_state.reset();
                     let result = handle_input_event(
-                        event::read()?,
+                        event,
                         input_state,
                         interrupt_state,
                         output_state,
@@ -540,7 +561,22 @@ pub(crate) async fn wait_for_streaming_command(
                     render.actual_height = viewport.actual_height;
                     render.x_offset = viewport.x_offset;
                 }
-                let left_status = Some(render_tool_running_status(frame, elapsed));
+                // When the command reports progress, show a percentage and a
+                // counting-down time estimate; otherwise the plain rolling
+                // "Working …" timer.
+                let permille =
+                    progress.as_ref().map(|p| p.load(std::sync::atomic::Ordering::Relaxed));
+                let eta_total_ms =
+                    eta.as_ref().map(|e| e.load(std::sync::atomic::Ordering::Relaxed));
+                let left_status = Some(match permille {
+                    Some(permille) if permille > 0 => orangu::tui::render_tool_progress_status(
+                        frame,
+                        elapsed,
+                        permille,
+                        eta_total_ms.unwrap_or(0),
+                    ),
+                    _ => render_tool_running_status(frame, elapsed),
+                });
                 let live = live_tab_statuses(parked_tabs, render.tab_bar);
                 print_screen(
                     RenderContext { tab_statuses: &live, ..render },

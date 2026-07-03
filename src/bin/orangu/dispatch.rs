@@ -262,6 +262,7 @@ pub(crate) fn handle_command(
         tools,
         workspace,
         session_dir,
+        embeddings_server,
         usage_stats,
         available_models,
         virtual_width,
@@ -526,6 +527,104 @@ pub(crate) fn handle_command(
             }
             Err(err) => Ok(local_command_error(err)),
         },
+        LocalCommand::Search(None) => Ok(CommandOutcome::OutputError(
+            "Usage: /search <query>".to_string(),
+        )),
+        LocalCommand::Search(Some(query)) => {
+            // Semantic search is enabled only when an embeddings-capable endpoint
+            // was detected at startup; `embeddings_server` holds that server's
+            // name, or is empty when none responded.
+            if embeddings_server.is_empty() {
+                return Ok(CommandOutcome::OutputError(
+                    "Semantic /search is unavailable: no embeddings-capable server was detected \
+                     at startup. Give a server section `role = embeddings` (or load an embedding \
+                     model on your default server) and restart. Meanwhile, use /grep or the \
+                     knowledge graph."
+                        .to_string(),
+                ));
+            }
+            let Some(profile) = llms.get(embeddings_server) else {
+                return Ok(CommandOutcome::OutputError(format!(
+                    "The embeddings server '{embeddings_server}' is not a configured server \
+                     section."
+                )));
+            };
+            let client = match orangu::embeddings::EmbeddingClient::from_profile(profile) {
+                Ok(client) => client,
+                Err(err) => {
+                    return Ok(CommandOutcome::OutputError(format!(
+                        "Could not initialise embeddings client: {err:#}"
+                    )));
+                }
+            };
+            let workspace = workspace.to_path_buf();
+            let query = query.into_owned();
+            let graph = tools.graph_store.clone();
+            // Cancel (double-Esc) and progress are shared with the run loop,
+            // which sets the cancel flag and renders the progress percentage and
+            // ETA in the status bar.
+            let control = crate::commands::StreamControl::new();
+            let task_cancel = control.cancel.clone();
+            let task_progress = control.progress.clone();
+            let task_eta = control.eta.clone();
+            Ok(CommandOutcome::Streaming(
+                Box::new(move |sink| {
+                    // How many hybrid results to surface.
+                    const TOP_K: usize = 10;
+                    use orangu::tui::format_status_duration;
+                    use std::sync::atomic::Ordering;
+                    let started = std::time::Instant::now();
+                    // The embedding build + query embedding are async; drive them
+                    // to completion here, off the UI thread. build_or_update
+                    // publishes progress (0–50% analysing, 50–100% embedding) and
+                    // a total-time estimate to the shared atomics, appends the
+                    // cache incrementally, and checks the cancel flag between
+                    // files so a double-Esc stops it promptly.
+                    let index = tokio::runtime::Handle::current().block_on(async {
+                        orangu::embeddings::EmbeddingIndex::build_or_update(
+                            &workspace,
+                            &client,
+                            &task_cancel,
+                            compile_workers,
+                            &task_progress,
+                            &task_eta,
+                        )
+                        .await
+                    })?;
+
+                    if task_cancel.load(Ordering::Relaxed) {
+                        let _ = sink.send("Request cancelled.".to_string());
+                        return Ok(());
+                    }
+                    if index.is_empty() {
+                        let _ = sink.send(
+                            "The embedding index is empty — no supported source files found to \
+                             search."
+                                .to_string(),
+                        );
+                        return Ok(());
+                    }
+                    let query_vector = tokio::runtime::Handle::current()
+                        .block_on(async { client.embed_one(&query).await })?;
+                    // Hold the knowledge-graph lock only for the brief,
+                    // synchronous ranking step, never across the embedding build.
+                    let hits = {
+                        let guard = graph
+                            .lock()
+                            .map_err(|_| anyhow!("graph_store mutex poisoned"))?;
+                        index.search(&query_vector, guard.as_ref(), TOP_K)
+                    };
+                    let _ = sink.send(format!(
+                        "Searched {} symbols in {}.",
+                        index.len(),
+                        format_status_duration(started.elapsed())
+                    ));
+                    let _ = sink.send(orangu::embeddings::format_hits(&query, &hits));
+                    Ok(())
+                }),
+                Some(control),
+            ))
+        }
         LocalCommand::Log(count) => match log_output(workspace, count) {
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
@@ -885,9 +984,10 @@ pub(crate) fn handle_command(
         LocalCommand::Usage => Ok(CommandOutcome::Output(usage_stats.format(tools))),
         LocalCommand::Build(profile) => {
             let ws = workspace.to_path_buf();
-            Ok(CommandOutcome::Streaming(Box::new(move |sink| {
-                build::build_output(&ws, profile, compile_workers, &sink)
-            })))
+            Ok(CommandOutcome::Streaming(
+                Box::new(move |sink| build::build_output(&ws, profile, compile_workers, &sink)),
+                None,
+            ))
         }
         LocalCommand::Shell(None) => Ok(CommandOutcome::OutputError(
             "Usage: /shell <command>".to_string(),
@@ -895,9 +995,10 @@ pub(crate) fn handle_command(
         LocalCommand::Shell(Some(command)) => {
             let ws = workspace.to_path_buf();
             let command = command.into_owned();
-            Ok(CommandOutcome::Streaming(Box::new(move |sink| {
-                shell_command::shell_output(&ws, &command, &sink)
-            })))
+            Ok(CommandOutcome::Streaming(
+                Box::new(move |sink| shell_command::shell_output(&ws, &command, &sink)),
+                None,
+            ))
         }
         LocalCommand::Clear => {
             let prompt = build_workspace_system_prompt(
@@ -1089,6 +1190,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1148,6 +1250,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1215,6 +1318,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1271,6 +1375,7 @@ mod tests {
                     tools: &tools,
                     workspace: &here,
                     session_dir: &here,
+                    embeddings_server: "",
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1355,6 +1460,7 @@ mod tests {
                     tools: &tools,
                     workspace: &here,
                     session_dir: &here,
+                    embeddings_server: "",
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1464,6 +1570,7 @@ mod tests {
                     tools: &tools,
                     workspace: workspace.path(),
                     session_dir: workspace.path(),
+                    embeddings_server: "",
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1535,6 +1642,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1596,6 +1704,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1659,6 +1768,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1717,6 +1827,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &available,
                 virtual_width: 512,
@@ -1781,6 +1892,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1850,6 +1962,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1901,6 +2014,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1948,6 +2062,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1995,6 +2110,7 @@ mod tests {
                 tools: &tools,
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
+                embeddings_server: "",
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,

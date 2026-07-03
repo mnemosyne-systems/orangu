@@ -391,6 +391,26 @@ async fn run() -> Result<()> {
         output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
     }
 
+    // Semantic /search is enabled only when an embeddings-capable endpoint is
+    // reachable at startup. Resolve the candidate server by role and probe its
+    // `/v1/embeddings`; a chat-only server (no embedding model loaded) fails the
+    // probe and search stays dormant. Holds the resolved server name, or empty.
+    // A failed probe prints its reason once, so "not detected" is diagnosable
+    // instead of a silent dead end.
+    let embeddings_server: String = match config.embeddings_server() {
+        Some(name) => match config.llms.get(&name) {
+            Some(profile) => match orangu::embeddings::probe_endpoint(profile).await {
+                Ok(()) => name,
+                Err(reason) => {
+                    output_state.push_text(&format!("Semantic /search unavailable: {reason}"));
+                    String::new()
+                }
+            },
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+
     // In a Git repository, fast-forward the local default branch to origin on
     // startup. Run it in the background so it never blocks the UI; its progress
     // and result are shown on the left of the status bar.
@@ -1052,6 +1072,7 @@ async fn run() -> Result<()> {
                 tools: &tools,
                 workspace: &workspace,
                 session_dir: &session_dir,
+                embeddings_server: &embeddings_server,
                 usage_stats: &usage_stats,
                 available_models: &available_models,
                 virtual_width: viewport.virtual_width,
@@ -1401,9 +1422,12 @@ async fn run() -> Result<()> {
                 output_state.reset_scroll();
                 continue;
             }
-            CommandOutcome::Streaming(f) => {
+            CommandOutcome::Streaming(f, control) => {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                 let handle = tokio::task::spawn_blocking(move || f(tx));
+                // Kept so the feedback dot can be red when the command was
+                // cancelled (`control` itself is moved into the wait loop).
+                let cancel_flag = control.as_ref().map(|c| c.cancel.clone());
                 // Recreate render here — handle_command's mutable borrows have ended.
                 let blocking_render = RenderContext {
                     current_model: &active_model_id,
@@ -1444,12 +1468,21 @@ async fn run() -> Result<()> {
                     },
                     handle,
                     &mut rx,
+                    control,
                 )
                 .await?;
                 match result {
                     Ok(()) => {
+                        // A cancelled command shows the red dot, not the green one.
+                        let cancelled = cancel_flag
+                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(false);
                         if config.feedback {
-                            output_state.push_text(FEEDBACK_OK);
+                            output_state.push_text(if cancelled {
+                                FEEDBACK_ERR
+                            } else {
+                                FEEDBACK_OK
+                            });
                         }
                     }
                     Err(err) => {

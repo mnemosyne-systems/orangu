@@ -57,6 +57,30 @@ impl ClientAppConfiguration {
         }
         self.default_server.clone()
     }
+
+    /// The server section that can serve embeddings for semantic `/search`,
+    /// resolved by role: a section whose `role` is `embeddings` wins; otherwise
+    /// the default server serves it as part of the `all` role, and failing that
+    /// any `all` server does. Returns `None` when no section qualifies.
+    ///
+    /// Whether the endpoint actually serves embeddings is confirmed by probing
+    /// it at startup — this only names the candidate.
+    pub fn embeddings_server(&self) -> Option<String> {
+        for (name, profile) in &self.llms {
+            if profile.role == "embeddings" {
+                return Some(name.clone());
+            }
+        }
+        if let Some(profile) = self.llms.get(&self.default_server)
+            && matches!(profile.role.as_str(), "all" | "embeddings")
+        {
+            return Some(self.default_server.clone());
+        }
+        self.llms
+            .iter()
+            .find(|(_, profile)| profile.role == "all")
+            .map(|(name, _)| name.clone())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -331,11 +355,17 @@ fn normalize_client_configuration(
         normalize_llm_configuration(llm)?;
     }
 
-    // Each server must point at a distinct endpoint: a server is one host, and
-    // `/model` cycles the models that single host offers. Endpoints are compared
-    // canonically, so `http://x` and `http://x/v1/` count as the same host.
+    // Each chat server must point at a distinct endpoint: a server is one host,
+    // and `/model` cycles the models that single host offers. Endpoints are
+    // compared canonically, so `http://x` and `http://x/v1/` count as the same
+    // host. An `embeddings` server is exempt — it is selected by role, never in
+    // the `/server` rotation, so it may share a chat server's host (e.g. Ollama,
+    // which serves chat and embeddings on one endpoint).
     let mut endpoints: HashMap<&str, &str> = HashMap::new();
     for (name, llm) in &conf.llms {
+        if llm.role == "embeddings" {
+            continue;
+        }
         let canonical = llm.endpoint.strip_suffix("/v1").unwrap_or(&llm.endpoint);
         if let Some(existing) = endpoints.insert(canonical, name.as_str()) {
             return Err(anyhow!(
@@ -769,6 +799,20 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_server_may_share_a_chat_server_endpoint() {
+        // Ollama serves chat and embeddings on one endpoint; an `embeddings`
+        // server is exempt from the unique-endpoint rule, so this must load.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = chat\n\n[chat]\nprovider = openai\nendpoint = http://localhost:11434/v1\nmodel = llama3.1\n\n[embed]\nrole = embeddings\nprovider = openai\nendpoint = http://localhost:11434/v1\nmodel = nomic-embed-text\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).expect("shared embeddings endpoint");
+        assert_eq!(conf.embeddings_server().as_deref(), Some("embed"));
+    }
+
+    #[test]
     fn parses_and_finds_roles() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
@@ -780,5 +824,28 @@ mod tests {
         assert_eq!(conf.find_server_for_role("explorer"), "b");
         assert_eq!(conf.find_server_for_role("review"), "a");
         assert_eq!(conf.find_server_for_role("missing"), "a"); // fallback
+    }
+
+    #[test]
+    fn embeddings_server_prefers_embeddings_role_then_default_all() {
+        // An explicit `embeddings` role wins over the default `all` server.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\nrole = all\n\n[e]\nprovider = llama.cpp\nendpoint = http://z/v1\nmodel = k\nrole = embeddings\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.embeddings_server().as_deref(), Some("e"));
+
+        // With no `embeddings` server, the default `all` server serves it.
+        let mut file2 = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file2,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\nrole = all\n"
+        )
+        .unwrap();
+        let conf2 = load_client_configuration(file2.path()).unwrap();
+        assert_eq!(conf2.embeddings_server().as_deref(), Some("a"));
     }
 }

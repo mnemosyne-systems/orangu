@@ -156,12 +156,17 @@ pub enum CommandOutcome {
     Blocking(Box<dyn FnOnce() -> anyhow::Result<String> + Send + 'static>),
     /// A long-running command that streams its output line by line through the
     /// sink as it is produced, rather than returning it all at once.
+    ///
+    /// The optional [`StreamControl`] lets a command be cancelled with a
+    /// double-`Esc` and report progress in the status bar. Commands that need
+    /// neither (like `/build` and `/shell`) pass `None`.
     Streaming(
         Box<
             dyn FnOnce(tokio::sync::mpsc::UnboundedSender<String>) -> anyhow::Result<()>
                 + Send
                 + 'static,
         >,
+        Option<StreamControl>,
     ),
     /// Enter the interactive `/review` mode with a collected branch diff.
     Review(ReviewLaunch),
@@ -182,6 +187,40 @@ pub enum CommandOutcome {
     /// Remove the queued command at the given 1-based index
     /// (`/pending delete <n>`).
     PendingDelete(usize),
+}
+
+/// Live control for a streaming command, shared between the command's task and
+/// the run loop that drives it.
+#[derive(Clone)]
+pub struct StreamControl {
+    /// Cooperative cancellation: a double-`Esc` sets it and the task stops at its
+    /// next check.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Progress in permille (0..=1000); `0` means indeterminate. The task stores
+    /// its byte-weighted progress here and the run loop renders it as a
+    /// percentage in the status bar.
+    pub progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The task's current estimate of the *total* run time in milliseconds
+    /// (`0` = unknown). The run loop counts down from this — `estimate − elapsed`
+    /// — so the remaining time falls as work proceeds instead of drifting up
+    /// between updates.
+    pub eta: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl StreamControl {
+    pub fn new() -> Self {
+        Self {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eta: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for StreamControl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Data handed to the interactive review mode: the changed files, each with its
@@ -356,6 +395,7 @@ pub enum LocalCommand<'a> {
     SetVerbosity(&'a str),
     Diff(Option<Cow<'a, str>>),
     Grep(Option<Cow<'a, str>>),
+    Search(Option<Cow<'a, str>>),
     Review,
     /// `/auto_review [<file>] [immediate]`: an optional single-file target and
     /// whether to start the run at once (the `immediate` keyword).
@@ -432,6 +472,7 @@ pub struct CommandContext<'a> {
     pub tools: &'a ToolExecutor,
     pub workspace: &'a Path,
     pub session_dir: &'a std::path::Path,
+    pub embeddings_server: &'a str,
     pub usage_stats: &'a crate::UsageStats,
     pub available_models: &'a [String],
     pub virtual_width: usize,

@@ -59,6 +59,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/restore" => Some(LocalCommand::Restore(None)),
         "/diff" => Some(LocalCommand::Diff(None)),
         "/grep" => Some(LocalCommand::Grep(None)),
+        "/search" => Some(LocalCommand::Search(None)),
         "/init_repo" => Some(LocalCommand::InitRepo),
         "/log" => Some(LocalCommand::Log(None)),
         "/show" => Some(LocalCommand::Show(None)),
@@ -123,6 +124,14 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     None
                 } else {
                     Some(Cow::Borrowed(pattern))
+                }));
+            }
+            if let Some(args) = input.strip_prefix("/search ") {
+                let query = args.trim();
+                return Some(LocalCommand::Search(if query.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(query))
                 }));
             }
             if let Some(name) = input.strip_prefix("/model ") {

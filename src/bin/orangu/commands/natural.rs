@@ -460,6 +460,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             }
         }
     }
+    for prefix in ["search for ", "search ", "semantic search "] {
+        if let Some(query) = strip_ascii_prefix(input, prefix) {
+            let query = query.trim();
+            if !query.is_empty() {
+                return Some(LocalCommand::Search(Some(Cow::Borrowed(query))));
+            }
+        }
+    }
     for prefix in ["log ", "show log ", "git log ", "git lg "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix)
             && let Ok(count) = rest.trim().parse::<u64>()

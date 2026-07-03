@@ -951,3 +951,83 @@ show graph
 generate graph
 visualize codebase
 ```
+
+\newpage
+
+## /search
+
+Semantic code search. Where `/grep` matches text and the Knowledge Graph matches
+symbol names and structure, `/search` matches *meaning*: a query like
+`where is rate-limiting handled?` can surface a `throttle_requests` function whose
+name shares no words with the query.
+
+```text
+/search <query>
+```
+
+The first time it runs, orangu embeds every extractable symbol in the workspace
+and stores the vectors under `~/.orangu/embeddings/workspace/<hash>/`, keyed by a
+hash of the workspace path so the cache is shared across sessions without
+cluttering the workspace tree. The directory holds `chunks.json` (one embedded
+chunk per line), a small `meta.json` (version and per-file hashes), and a
+`processed.log` recording each file's path and the time it was embedded. Every
+subsequent search re-embeds only the files whose contents changed and drops
+chunks for files that no longer exist — the same incremental sha256 approach the
+Knowledge Graph cache uses — so the cache is always consistent with the current
+workspace and stays cheap to keep current. Everything is computed locally through
+the server's OpenAI-compatible `/v1/embeddings` endpoint — nothing leaves the
+machine.
+
+That first indexing pass can take a while on a large codebase with a local
+embedding model. It runs in two phases, each half of the progress bar. The first
+half (0–50%) does all the local work up front: it parses every file into chunks
+in parallel — across `compile_workers` threads, or every CPU thread when it is
+`0` — logs each to `processed.log`, and writes the full `meta.json` when done, so
+the on-disk state lists every file before anything is uploaded. The second half
+(50–100%) uploads: it embeds the parsed chunks, keeping several requests in flight
+at once so the embedding server — the real bottleneck — stays busy rather than
+idling between round-trips (a llama-server started with `-np N` embeds them in
+parallel). Each request stays within a conservative token budget — chunks are
+grouped so a request comfortably fits under a stock llama.cpp server's default
+physical batch size (`-b`/`--batch-size 512`), so `/search` works out of the box
+without needing that flag raised. The status bar shows the percentage and an
+estimate of the time remaining that counts down (`Working (57%) (4m10s, ~3m
+left)`); on completion it reports the total (`Searched 2000 symbols in 3m12s.`).
+
+Vectors are appended to `chunks.json` as each file finishes — the existing
+vectors are never rewritten — so persistence stays cheap no matter how large the
+index grows, and the work on disk builds up as the pass proceeds, surviving even
+a hard kill. The pass can also be stopped with a double-`Esc`, which aborts the
+in-flight requests at once; either way the
+files embedded so far are kept, and the next `/search` resumes from where it left
+off rather than starting over.
+
+Ranking is hybrid. The query is embedded and scored against every chunk by cosine
+similarity; the strongest matches are then expanded along the Knowledge Graph's
+call edges — a semantic seed followed by structural expansion — so a relevant
+function pulls in its callers and callees. Each result is anchored to its
+`file:line` for quick navigation, and results expanded from a semantic hit are
+marked `(via <symbol>)`.
+
+Semantic search enables itself automatically. At startup orangu probes the
+`/v1/embeddings` endpoint of the server that serves the `embeddings` role — a
+server with `role = embeddings`, or the default `all` server — and turns `/search`
+on when it responds. To dedicate a server to embeddings, give its section
+`role = embeddings` (see the Configuration chapter). When no server serves
+embeddings, `/search` explains how to enable it and existing retrieval (`/grep`,
+the Knowledge Graph) is unaffected.
+
+### Examples
+
+```text
+/search where is the retry backoff computed
+/search session persistence
+```
+
+Natural-language forms:
+
+```text
+search for where the config is parsed
+search rate limiting
+semantic search token budget
+```

@@ -180,6 +180,7 @@ model = ggml-org/gemma-4-E4B-it-GGUF
 | `endpoint` | Yes | OpenAI-compatible API URL |
 | `model` | No | Model identifier used in chat completion requests. Overrides the general `[orangu].model` when set |
 | `api_key` | No | API key sent as `Authorization: Bearer <key>` on every request to the server. Required when a llama.cpp server runs with `--api-key`, or for any authenticated OpenAI-compatible endpoint |
+| `role` | No | A specific role this server fulfills. Valid roles are: `all` (default), `code`, `review`, `explorer`, and `embeddings`. If a specific subsystem needs a server and one is tagged with its role, it will use that server instead of the default. `embeddings` designates the server that embeds code for semantic `/search`; an `all` server also serves it, and search auto-enables when that endpoint responds at startup |
 
 - At least one of `[orangu].model` or a server's own `model` must be set, so every server resolves to a non-empty model
 - The endpoint may be configured either with or without `/v1`
