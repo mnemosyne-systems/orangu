@@ -93,11 +93,10 @@ use git::{
     branch_rename_output, cherry_pick_output, close_output, collect_review_diff, comment_output,
     commit_output, create_pull_request_output, discover_git_root, fetch_active_pull_requests,
     fetch_issue_metadata, fetch_output, fetch_pull_request_details, get_comments_output,
-    git_checkout, git_diff_against_branch,
-    git_workspace_diff, grep_output, init_repo_output, issue_field_output,
-    list_workspace_files_tree, log_output, merge_output, move_file_output, open_in_editor,
-    pull_request_output, push_output, rebase_output, remove_file_output, restore_output,
-    show_output, squash_output, stash_drop_output, stash_list_output, stash_output,
+    git_checkout, git_diff_against_branch, git_workspace_diff, grep_output, init_repo_output,
+    issue_field_output, list_workspace_files_tree, log_output, merge_output, move_file_output,
+    open_in_editor, pull_request_output, push_output, rebase_output, remove_file_output,
+    restore_output, show_output, squash_output, stash_drop_output, stash_list_output, stash_output,
     stash_pop_output, status_output, sync_default_branch, workspace_branch_name,
 };
 use input::{

@@ -537,11 +537,31 @@ fn pr_stats_rows(repository: &str, prs: &[PullRequestDetail]) -> Vec<(String, Ro
     let ready = prs.iter().filter(|pr| !pr.draft).count();
     let conflicts = prs.iter().filter(|pr| pr.conflicting == Some(true)).count();
     let mut rows = vec![
-        ("Repository".to_string(), RowValue::Text(repository.to_string()), false),
-        ("Generated".to_string(), RowValue::Text(format_timestamp()), false),
-        ("Open".to_string(), RowValue::Text(prs.len().to_string()), false),
-        ("Ready".to_string(), RowValue::Text(ready.to_string()), false),
-        ("Conflicts".to_string(), RowValue::Text(conflicts.to_string()), false),
+        (
+            "Repository".to_string(),
+            RowValue::Text(repository.to_string()),
+            false,
+        ),
+        (
+            "Generated".to_string(),
+            RowValue::Text(format_timestamp()),
+            false,
+        ),
+        (
+            "Open".to_string(),
+            RowValue::Text(prs.len().to_string()),
+            false,
+        ),
+        (
+            "Ready".to_string(),
+            RowValue::Text(ready.to_string()),
+            false,
+        ),
+        (
+            "Conflicts".to_string(),
+            RowValue::Text(conflicts.to_string()),
+            false,
+        ),
     ];
     let (oldest, newest) = oldest_and_newest(prs);
     // With exactly one open pull request, "Oldest" and "Newest" would be the
@@ -572,7 +592,9 @@ fn pr_link_or_na(pr: Option<&PullRequestDetail>) -> RowValue {
 /// `YYYY-MM-DD HH:MM:SS` string, which sorts lexicographically) — `None` for
 /// either when no pull request has a known creation date. The same pull
 /// request is returned for both when there is only one.
-fn oldest_and_newest(prs: &[PullRequestDetail]) -> (Option<&PullRequestDetail>, Option<&PullRequestDetail>) {
+fn oldest_and_newest(
+    prs: &[PullRequestDetail],
+) -> (Option<&PullRequestDetail>, Option<&PullRequestDetail>) {
     let mut oldest: Option<&PullRequestDetail> = None;
     let mut newest: Option<&PullRequestDetail> = None;
     for pr in prs {
@@ -614,7 +636,11 @@ fn pr_header_rows(pr: &PullRequestDetail) -> Vec<(String, RowValue, bool)> {
             false,
         ),
         ("Branch".to_string(), RowValue::Text(pr.head.clone()), false),
-        ("Draft".to_string(), RowValue::Text(draft.to_string()), draft == "Yes"),
+        (
+            "Draft".to_string(),
+            RowValue::Text(draft.to_string()),
+            draft == "Yes",
+        ),
         (
             "Conflicts".to_string(),
             RowValue::Text(conflicts.to_string()),
@@ -630,7 +656,11 @@ fn pr_header_rows(pr: &PullRequestDetail) -> Vec<(String, RowValue, bool)> {
             RowValue::Text(list_or_none(&pr.assignees)),
             false,
         ),
-        ("Reviewers".to_string(), RowValue::Reviewers(pr.reviewers.clone()), false),
+        (
+            "Reviewers".to_string(),
+            RowValue::Reviewers(pr.reviewers.clone()),
+            false,
+        ),
         (
             "Labels".to_string(),
             RowValue::Text(list_or_none(&pr.labels)),
@@ -729,7 +759,11 @@ fn truncate_comment(body: &str) -> String {
 /// the row height) and the comment's wrapped, truncated lines — shared by
 /// [`Pdf::draw_last_comment_table`] and [`last_comment_table_height_mm`] so
 /// they can never drift apart.
-fn last_comment_table_layout(author: &str, body: &str, fonts: &DocFonts) -> (f32, f32, Vec<String>) {
+fn last_comment_table_layout(
+    author: &str,
+    body: &str,
+    fonts: &DocFonts,
+) -> (f32, f32, Vec<String>) {
     let x0 = MARGIN_MM;
     let x1 = PAGE_WIDTH_MM - MARGIN_MM;
     let row_height = BODY_SIZE * 1.9 * PT_TO_MM;
@@ -1780,9 +1814,21 @@ impl Pdf {
     ) {
         self.draw_block(&heading("Review", BODY_SIZE + 5.0));
         let mut rows = vec![
-            ("Repository".to_string(), RowValue::Text(repository.to_string()), false),
-            ("Branch".to_string(), RowValue::Text(branch.to_string()), false),
-            ("Generated".to_string(), RowValue::Text(format_timestamp()), false),
+            (
+                "Repository".to_string(),
+                RowValue::Text(repository.to_string()),
+                false,
+            ),
+            (
+                "Branch".to_string(),
+                RowValue::Text(branch.to_string()),
+                false,
+            ),
+            (
+                "Generated".to_string(),
+                RowValue::Text(format_timestamp()),
+                false,
+            ),
         ];
         for section in sections {
             rows.push((
@@ -1805,9 +1851,21 @@ impl Pdf {
     ) {
         self.draw_block(&heading("Duplicate code report", BODY_SIZE + 5.0));
         let mut rows = vec![
-            ("Repository".to_string(), RowValue::Text(repository.to_string()), false),
-            ("Branch".to_string(), RowValue::Text(branch.to_string()), false),
-            ("Generated".to_string(), RowValue::Text(format_timestamp()), false),
+            (
+                "Repository".to_string(),
+                RowValue::Text(repository.to_string()),
+                false,
+            ),
+            (
+                "Branch".to_string(),
+                RowValue::Text(branch.to_string()),
+                false,
+            ),
+            (
+                "Generated".to_string(),
+                RowValue::Text(format_timestamp()),
+                false,
+            ),
             (
                 "Threshold".to_string(),
                 RowValue::Text(format!("{}%", report.threshold_percent())),
@@ -1830,7 +1888,11 @@ impl Pdf {
             new_functions,
         } = &report.scope
         {
-            rows.push(("Compared against".to_string(), RowValue::Text(base.clone()), false));
+            rows.push((
+                "Compared against".to_string(),
+                RowValue::Text(base.clone()),
+                false,
+            ));
             rows.push((
                 "New/changed functions".to_string(),
                 RowValue::Text(new_functions.to_string()),
@@ -1951,7 +2013,14 @@ impl Pdf {
                     self.draw_link(url, divider + 3.0, baseline, *bold);
                 }
                 RowValue::Link(_) => {
-                    self.text("unknown", *bold, divider + 3.0, baseline, BODY_SIZE, TEXT_COLOR);
+                    self.text(
+                        "unknown",
+                        *bold,
+                        divider + 3.0,
+                        baseline,
+                        BODY_SIZE,
+                        TEXT_COLOR,
+                    );
                 }
                 RowValue::LinkWithText(url, text) if !url.is_empty() => {
                     self.draw_link(url, divider + 3.0, baseline, *bold);
@@ -2024,8 +2093,17 @@ impl Pdf {
                 self.text(separator, false, cursor_x, baseline, BODY_SIZE, TEXT_COLOR);
                 cursor_x += self.fonts.text_width_mm(separator, false, false, BODY_SIZE);
             }
-            self.text(&reviewer.login, false, cursor_x, baseline, BODY_SIZE, TEXT_COLOR);
-            cursor_x += self.fonts.text_width_mm(&reviewer.login, false, false, BODY_SIZE);
+            self.text(
+                &reviewer.login,
+                false,
+                cursor_x,
+                baseline,
+                BODY_SIZE,
+                TEXT_COLOR,
+            );
+            cursor_x += self
+                .fonts
+                .text_width_mm(&reviewer.login, false, false, BODY_SIZE);
             cursor_x += 1.5;
             cursor_x += self.draw_review_icon(review_icon(&reviewer.state), cursor_x, baseline);
         }
@@ -2719,9 +2797,20 @@ mod tests {
         let prs = vec![sample_pull_request()];
         let path = export_pr(workspace.path(), &prs, "gemma").expect("export");
         assert!(path.exists());
-        assert!(path.file_name().unwrap().to_string_lossy().ends_with("-pr.pdf"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-pr.pdf")
+        );
         // Unlike the other exports, the branch is not part of the filename.
-        assert!(!path.file_name().unwrap().to_string_lossy().contains("nobranch"));
+        assert!(
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("nobranch")
+        );
         let bytes = std::fs::read(&path).expect("read pdf");
         assert!(bytes.starts_with(b"%PDF"));
     }
@@ -2807,7 +2896,11 @@ mod tests {
         let prs = vec![oldest, newest];
 
         let rows = pr_stats_rows("orangu", &prs);
-        let find = |label: &str| rows.iter().find(|(key, _, _)| key == label).map(|(_, value, _)| value);
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(key, _, _)| key == label)
+                .map(|(_, value, _)| value)
+        };
         assert_eq!(
             find("Oldest"),
             Some(&RowValue::LinkWithText(
@@ -2827,7 +2920,11 @@ mod tests {
     #[test]
     fn pr_stats_rows_use_na_for_oldest_and_newest_when_empty() {
         let rows = pr_stats_rows("orangu", &[]);
-        let find = |label: &str| rows.iter().find(|(key, _, _)| key == label).map(|(_, value, _)| value);
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(key, _, _)| key == label)
+                .map(|(_, value, _)| value)
+        };
         assert_eq!(find("Oldest"), Some(&RowValue::Text("N/A".to_string())));
         assert_eq!(find("Newest"), Some(&RowValue::Text("N/A".to_string())));
     }
@@ -2838,7 +2935,11 @@ mod tests {
         pr.created_at = "2026-03-01 00:00:00".to_string();
         pr.url = "https://github.com/o/r/pull/1".to_string();
         let rows = pr_stats_rows("orangu", std::slice::from_ref(&pr));
-        let find = |label: &str| rows.iter().find(|(key, _, _)| key == label).map(|(_, value, _)| value);
+        let find = |label: &str| {
+            rows.iter()
+                .find(|(key, _, _)| key == label)
+                .map(|(_, value, _)| value)
+        };
         // "Oldest" and "Newest" would be the same entry with only one pull
         // request, so "Oldest" is left empty instead of repeating it.
         assert_eq!(find("Oldest"), Some(&RowValue::Text(String::new())));
@@ -2856,12 +2957,18 @@ mod tests {
         let pr = sample_pull_request();
         let title = pr_title_block(&pr);
         assert_eq!(title.spans[0].text, "#42 Add pull completion");
-        assert_eq!(title.link.as_deref(), Some("https://github.com/o/r/pull/42"));
+        assert_eq!(
+            title.link.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
     }
 
     /// Look up a `pr_header_rows` row's text value by label — `None` for the
     /// "Reviewers" row, whose value is the raw reviewer list, not text.
-    fn find_row_text<'a>(rows: &'a [(String, RowValue, bool)], label: &str) -> Option<(&'a str, bool)> {
+    fn find_row_text<'a>(
+        rows: &'a [(String, RowValue, bool)],
+        label: &str,
+    ) -> Option<(&'a str, bool)> {
         rows.iter()
             .find(|(key, _, _)| key == label)
             .and_then(|(_, value, bold)| match value {
@@ -2875,10 +2982,15 @@ mod tests {
         let pr = sample_pull_request();
         let rows = pr_header_rows(&pr);
         assert_eq!(find_row_text(&rows, "Author"), Some(("alice", false)));
-        let link_row = rows.iter().find(|(key, _, _)| key == "Link").map(|(_, value, _)| value);
+        let link_row = rows
+            .iter()
+            .find(|(key, _, _)| key == "Link")
+            .map(|(_, value, _)| value);
         assert_eq!(
             link_row,
-            Some(&RowValue::Link("https://github.com/o/r/pull/42".to_string()))
+            Some(&RowValue::Link(
+                "https://github.com/o/r/pull/42".to_string()
+            ))
         );
         assert_eq!(find_row_text(&rows, "Draft"), Some(("No", false)));
         // "Yes" is bolded, so a draft or a conflict catches the eye.
@@ -2887,8 +2999,14 @@ mod tests {
         assert_eq!(find_row_text(&rows, "Labels"), Some(("enhancement", false)));
         // Reviewers carries the raw list — icon selection happens at draw
         // time (`review_icon`/`draw_review_icon`), not as formatted text.
-        let reviewers_row = rows.iter().find(|(key, _, _)| key == "Reviewers").map(|(_, value, _)| value);
-        assert_eq!(reviewers_row, Some(&RowValue::Reviewers(pr.reviewers.clone())));
+        let reviewers_row = rows
+            .iter()
+            .find(|(key, _, _)| key == "Reviewers")
+            .map(|(_, value, _)| value);
+        assert_eq!(
+            reviewers_row,
+            Some(&RowValue::Reviewers(pr.reviewers.clone()))
+        );
         // The changed-files table has its own section — no longer duplicated
         // as a row in the header table.
         assert!(find_row_text(&rows, "Changed files").is_none());
@@ -2910,7 +3028,9 @@ mod tests {
         pr.url = String::new();
         let rows = pr_header_rows(&pr);
         assert_eq!(
-            rows.iter().find(|(key, _, _)| key == "Link").map(|(_, value, _)| value),
+            rows.iter()
+                .find(|(key, _, _)| key == "Link")
+                .map(|(_, value, _)| value),
             Some(&RowValue::Link(String::new()))
         );
         // draw_kv_table renders an empty Link as plain "unknown" text rather
@@ -2945,7 +3065,10 @@ mod tests {
         assert!(pr_is_ready(&pr));
 
         pr.conflicting = None;
-        assert!(pr_is_ready(&pr), "an unknown mergeable state is not a conflict");
+        assert!(
+            pr_is_ready(&pr),
+            "an unknown mergeable state is not a conflict"
+        );
 
         pr.conflicting = Some(true);
         assert!(!pr_is_ready(&pr));

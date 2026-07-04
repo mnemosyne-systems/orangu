@@ -935,7 +935,10 @@ pub fn fetch_pull_request_details(
             "number,title,author,createdAt,updatedAt,baseRefName,headRefName,isDraft,mergeable,\
              comments,reviews,reviewRequests,assignees,labels,files,url",
         ],
-        Forge::GitLab => vec!["api", "projects/:id/merge_requests?state=opened&per_page=100"],
+        Forge::GitLab => vec![
+            "api",
+            "projects/:id/merge_requests?state=opened&per_page=100",
+        ],
     };
     let output = match std::process::Command::new(cli)
         .args(&args)
@@ -967,10 +970,7 @@ pub fn fetch_pull_request_details(
 /// number are skipped; every other field falls back to its empty/default
 /// value rather than failing the whole parse, since forges vary in which
 /// optional fields they populate.
-pub fn parse_pull_request_details(
-    stdout: &[u8],
-    forge: Forge,
-) -> Result<Vec<PullRequestDetail>> {
+pub fn parse_pull_request_details(stdout: &[u8], forge: Forge) -> Result<Vec<PullRequestDetail>> {
     let text = String::from_utf8_lossy(stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1008,7 +1008,10 @@ fn json_changed_files(entry: &serde_json::Value, key: &str) -> Vec<ChangedFile> 
             items
                 .iter()
                 .filter_map(|item| {
-                    let path = item.get("path").and_then(serde_json::Value::as_str)?.to_string();
+                    let path = item
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string();
                     Some(ChangedFile {
                         path,
                         additions: item
@@ -1106,7 +1109,10 @@ fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
             }
         }
     }
-    if let Some(requests) = entry.get("reviewRequests").and_then(serde_json::Value::as_array) {
+    if let Some(requests) = entry
+        .get("reviewRequests")
+        .and_then(serde_json::Value::as_array)
+    {
         for request in requests {
             let login = request
                 .get("login")
@@ -1207,7 +1213,11 @@ fn parse_gitlab_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
         draft: entry
             .get("draft")
             .and_then(serde_json::Value::as_bool)
-            .or_else(|| entry.get("work_in_progress").and_then(serde_json::Value::as_bool))
+            .or_else(|| {
+                entry
+                    .get("work_in_progress")
+                    .and_then(serde_json::Value::as_bool)
+            })
             .unwrap_or(false),
         conflicting,
         comment_count,

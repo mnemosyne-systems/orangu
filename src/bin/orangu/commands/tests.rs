@@ -375,7 +375,13 @@ fn parse_export_target_handles_buffers_and_rejects_unknown() {
         parse_export_target("  Duplicates "),
         Some(ExportTarget::Duplicates)
     ));
-    for arg in ["pr", "PR", "pull requests", "pull_requests", "pull-requests"] {
+    for arg in [
+        "pr",
+        "PR",
+        "pull requests",
+        "pull_requests",
+        "pull-requests",
+    ] {
         assert!(
             matches!(parse_export_target(arg), Some(ExportTarget::Pr)),
             "{arg:?}"
