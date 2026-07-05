@@ -371,6 +371,23 @@ pub(crate) fn handle_command(
             save_session_settings(session_dir, Some(active_model), Some(active_model_id));
             Ok(CommandOutcome::Quiet)
         }
+        LocalCommand::Information => {
+            let profile = llms[active_model].clone();
+            let server_name = active_model.clone();
+            let model_id = active_model_id.clone();
+            let is_embeddings_server = active_model.as_str() == embeddings_server;
+            Ok(CommandOutcome::Blocking(Box::new(move || {
+                let capabilities = tokio::runtime::Handle::current().block_on(async {
+                    crate::information::gather_server_information(&profile, is_embeddings_server)
+                        .await
+                });
+                Ok(crate::information::format_information_table(
+                    &server_name,
+                    &model_id,
+                    &capabilities,
+                ))
+            })))
+        }
         LocalCommand::ServerInfo => {
             // The active server is marked active (green dot); every other
             // configured server is listed as inactive (red dot).
@@ -1916,6 +1933,59 @@ mod tests {
             }
             _ => panic!("expected output from /server"),
         }
+    }
+
+    #[test]
+    fn information_runs_off_the_ui_thread() {
+        const SERVER: &str = "local";
+
+        let llms = HashMap::from([(
+            SERVER.to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = SERVER.to_string();
+        let mut active_model_id = "model-a".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/information",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                startup_model: SERVER,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                session_dir: workspace.path(),
+                embeddings_server: "",
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                compile_workers: 1,
+                compression: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        // The probes hit the network, so /information runs like /duplicates and
+        // /search: off the UI thread, via `CommandOutcome::Blocking`, rather than
+        // producing its report synchronously.
+        assert!(matches!(outcome, CommandOutcome::Blocking(_)));
     }
 
     #[test]

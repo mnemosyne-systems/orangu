@@ -19,6 +19,7 @@ mod completion;
 mod dispatch;
 mod export;
 mod git;
+mod information;
 mod init;
 mod input;
 mod manual;

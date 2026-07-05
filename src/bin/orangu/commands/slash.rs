@@ -41,6 +41,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/restart" => Some(LocalCommand::Restart),
         "/model" => Some(LocalCommand::ModelInfo),
         "/server" => Some(LocalCommand::ServerInfo),
+        "/information" => Some(LocalCommand::Information),
 
         "/verbosity" => Some(LocalCommand::SetVerbosity("")),
         "/tools" => Some(LocalCommand::Tools),

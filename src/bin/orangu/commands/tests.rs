@@ -288,6 +288,22 @@ fn parses_list_files_commands() {
 }
 
 #[test]
+fn parses_information_command_and_aliases() {
+    for input in [
+        "/information",
+        "information",
+        "show information",
+        "server information",
+        "llm information",
+    ] {
+        assert!(
+            matches!(parse_local_command(input), Some(LocalCommand::Information)),
+            "expected {input:?} to parse as Information"
+        );
+    }
+}
+
+#[test]
 fn parses_manual_command_and_aliases() {
     for input in ["/manual", "manual", "show manual", "open manual"] {
         assert!(

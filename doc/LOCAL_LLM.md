@@ -31,6 +31,8 @@ Run the client:
 orangu --config ./orangu.conf
 ```
 
+Once connected, run `/information` inside `orangu` to see which OpenAI and llama.cpp-native endpoints the server exposes (models, `/health`, `/props`, `/slots`, `/metrics`, embeddings) and whether each is enabled.
+
 ## Notes
 
 - The endpoint may be configured as either the server root or the `/v1` path.

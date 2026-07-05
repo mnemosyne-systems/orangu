@@ -387,6 +387,17 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::ModelInfo);
     }
+    if matches_ci(
+        input,
+        &[
+            "information",
+            "show information",
+            "server information",
+            "llm information",
+        ],
+    ) {
+        return Some(LocalCommand::Information);
+    }
     if matches_ci(input, &["build debug", "debug build"]) {
         return Some(LocalCommand::Build(crate::build::BuildProfile::Debug));
     }

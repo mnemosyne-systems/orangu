@@ -33,6 +33,37 @@ pub(crate) struct ModelEntry {
     name: String,
 }
 
+impl ModelsResponse {
+    /// Every advertised model id, preferring `id`, then `model`, then `name`
+    /// for entries that only carry one of those fields.
+    ///
+    /// `data` and `models` are two different shapes a `/v1/models` response
+    /// might use (plain OpenAI vs. some llama.cpp/Ollama-style servers); most
+    /// servers populate only one, leaving the other empty, but a response
+    /// that happens to fill in both would otherwise list every model twice —
+    /// once from each field — so entries are deduplicated by their resolved
+    /// id, keeping the first occurrence.
+    pub(crate) fn model_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.data
+            .iter()
+            .chain(self.models.iter())
+            .filter_map(|entry| {
+                if !entry.id.is_empty() {
+                    Some(entry.id.clone())
+                } else if !entry.model.is_empty() {
+                    Some(entry.model.clone())
+                } else if !entry.name.is_empty() {
+                    Some(entry.name.clone())
+                } else {
+                    None
+                }
+            })
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    }
+}
+
 /// Build a GET request to a server's `/v1/models` endpoint, attaching the
 /// optional bearer token. OpenAI-compatible servers — including a llama.cpp
 /// server started with `--api-key` — require `Authorization: Bearer <key>` on
@@ -73,24 +104,8 @@ pub(crate) async fn probe_header_status(
     {
         server_ok = true;
         if let Ok(models) = response.json::<ModelsResponse>().await {
-            for entry in models.data.iter().chain(models.models.iter()) {
-                let id = if !entry.id.is_empty() {
-                    &entry.id
-                } else if !entry.model.is_empty() {
-                    &entry.model
-                } else if !entry.name.is_empty() {
-                    &entry.name
-                } else {
-                    continue;
-                };
-                if id == active_model_id
-                    || entry.model == active_model_id
-                    || entry.name == active_model_id
-                {
-                    model_ok = true;
-                }
-                available_models.push(id.clone());
-            }
+            available_models = models.model_ids();
+            model_ok = available_models.iter().any(|id| id == active_model_id);
         }
     }
 
@@ -140,23 +155,7 @@ pub(crate) async fn try_startup_model_switch(
         return None;
     }
     let models = response.json::<ModelsResponse>().await.ok()?;
-
-    let available: Vec<String> = models
-        .data
-        .iter()
-        .chain(models.models.iter())
-        .filter_map(|entry| {
-            if !entry.id.is_empty() {
-                Some(entry.id.clone())
-            } else if !entry.model.is_empty() {
-                Some(entry.model.clone())
-            } else if !entry.name.is_empty() {
-                Some(entry.name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let available = models.model_ids();
 
     // The server already serves the configured model — nothing to switch.
     if available.iter().any(|model| model == active_model_id) {
@@ -179,6 +178,26 @@ mod tests {
             server_ok,
             model_ok,
         }
+    }
+
+    #[test]
+    fn model_ids_deduplicates_entries_shared_by_data_and_models() {
+        // A server whose `/v1/models` response fills in both the OpenAI-style
+        // `data` array and a `models` array with the same entries would
+        // otherwise list every model twice — once per field.
+        let response = super::ModelsResponse {
+            data: vec![super::ModelEntry {
+                id: "gemma".to_string(),
+                model: String::new(),
+                name: String::new(),
+            }],
+            models: vec![super::ModelEntry {
+                id: "gemma".to_string(),
+                model: String::new(),
+                name: String::new(),
+            }],
+        };
+        assert_eq!(response.model_ids(), vec!["gemma".to_string()]);
     }
 
     #[test]

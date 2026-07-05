@@ -163,6 +163,56 @@ select server local-llama
 
 \newpage
 
+## /information
+
+Reports everything `orangu` can learn about the active server: every OpenAI-compatible endpoint orangu itself talks to (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever llama.cpp-native endpoints it exposes. It is handled entirely locally, needs no arguments, and never sends anything to the model.
+
+`/information` probes each capability independently — a plain OpenAI-compatible server (which has no llama.cpp-native endpoints) still gets a full report, just with those rows marked unavailable rather than the whole command failing. The result is a table, one row per capability, with a green dot for a capability that is available and enabled and a red dot for one that is not:
+
+Most probes are side-effect-free `GET` requests, so they run unconditionally. `/v1/chat/completions` is the one exception — it only accepts real generation requests — so it is only actually sent on a local llama.cpp server; on a hosted API it is not sent, to avoid a needless (potentially billed) request (see the `/v1/chat/completions` row below).
+
+```text
+Server  main-server
+Model   ggml-org/gemma-4-E4B-it-GGUF
+
+STATUS  API        ENDPOINT              DETAILS
+●       OpenAI     /v1/models            ggml-org/gemma-4-E4B-it-GGUF
+●       OpenAI     /v1/chat/completions  Ok
+✗       OpenAI     /v1/embeddings        Not available
+●       llama.cpp  /health               Ok
+●       llama.cpp  /props                n_ctx=32768 n_predict=-1 total_slots=1 temperature=0.8 top_k=40 top_p=0.95 model_path=/models/gemma.gguf bos_token=<bos> eos_token=<eos> build=b4200-abc1234 chat_template=yes
+✗       llama.cpp  /slots                Not available
+✗       llama.cpp  /metrics              Not available
+```
+
+Each row:
+
+- **`/v1/models`** — the standard OpenAI model listing, the same request `/model` and startup detection use; the details column lists every advertised model id, comma-separated (a single advertised model is shown bare, with no count prefix).
+- **`/v1/chat/completions`** — the endpoint every prompt and tool round-trip actually goes through. On a local llama.cpp server (`provider = llama.cpp`) a real generation costs nothing worth avoiding, so `/information` actually sends one: a minimal, non-streaming request capped at a single response token (`ggml-org/gemma-4-E4B-it-GGUF`'s row above shows this). On any other provider — potentially a hosted, billed API — it is not sent a real request; its availability is instead inferred from `/v1/models`, since any server that speaks the OpenAI protocol well enough to list models is expected to serve chat completions too.
+- **`/v1/embeddings`** — likewise never sent a real request; this row reflects whether the active server is the one `orangu` already detected at startup as embeddings-capable (the same detection `/search` relies on — see the `role = embeddings` configuration option).
+- **`/health`** — a llama.cpp health check; the details column shows the server's reported `status` (`Ok`, `Loading model`, …, capitalized) when present.
+- **`/props`** — the closest thing llama.cpp exposes over HTTP to *how the server was started*: the context size (`--ctx-size`), the default max response length (`--n-predict`), the parallel slot count (`--parallel`), the sampling defaults (`--temp`, `--top-k`, `--top-p`), the loaded model's path and tokenizer boundary tokens, the build version, and whether a chat template is configured. The details column reads back whichever of these the server's response actually included (the schema is not identical across llama.cpp versions, so fields it omits are simply left out rather than reported as an error). llama.cpp does not expose hardware-only startup flags — thread count, GPU layer count, batch size — through any HTTP endpoint, so `/information` cannot report those; they only ever appear in the server's own startup log.
+- **`/slots`** and **`/metrics`** — llama.cpp diagnostics endpoints that a server operator can disable at startup; a red dot here usually means the corresponding llama.cpp flag (`--no-slots`, `--metrics`) was not passed, not that something is broken. Their JSON body isn't worth summarizing field by field, so a reachable `/slots` simply reads `Ok` and a reachable `/metrics` reads `reachable`; either one, when unavailable, reads a flat `Not available` regardless of the underlying reason (disabled, not implemented, unreachable, …).
+
+A llama.cpp-native endpoint outside `/slots`/`/metrics` that is unreachable (connection refused, timeout) or answers with an unexpected status is reported the same way as one the server never implemented — `/information` only distinguishes "the server told us it's disabled" (`HTTP 501`) from "the server doesn't know this path" (`HTTP 404`) from any other response, shown as its raw HTTP status.
+
+### Examples
+
+```text
+/information
+```
+
+Natural-language forms:
+
+```text
+information
+show information
+server information
+llm information
+```
+
+\newpage
+
 ## /disconnect
 
 Disconnects from the current server.
