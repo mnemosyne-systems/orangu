@@ -46,7 +46,9 @@ struct CacheFile {
 
 /// Manages loading and saving the knowledge graph cache.
 ///
-/// The cache lives at `.orangu/kg_cache.json` inside the workspace and stores:
+/// The cache lives at `~/.orangu/workspace/<hash>/graph/cache.json` — out of the
+/// workspace tree, in the same global, per-workspace directory the embeddings
+/// index uses (see [`crate::workspace_cache`]) — and stores:
 /// - Per-file sha256 hashes for incremental re-scanning
 /// - The full serialised graph (nodes + edges)
 pub struct GraphCache {
@@ -55,6 +57,12 @@ pub struct GraphCache {
 }
 
 impl GraphCache {
+    /// The on-disk path of the cache for `workspace`:
+    /// `~/.orangu/workspace/<sha256(path)>/graph/cache.json`.
+    pub fn cache_path(workspace: &Path) -> std::path::PathBuf {
+        crate::workspace_cache::workspace_cache_dir(workspace, "graph").join("cache.json")
+    }
+
     /// Loads the cache from `path`. Returns `None` if the file doesn't exist or
     /// is invalid / version-mismatch (triggers a full rescan).
     pub fn load(path: &Path) -> Option<(GraphCache, GraphStore)> {

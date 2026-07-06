@@ -264,12 +264,12 @@ fn sha256(content: &str) -> String {
 /// Designed to be called from `tokio::task::spawn_blocking`.
 ///
 /// Strategy:
-///   1. Try to load `.orangu/kg_cache.json`.
+///   1. Try to load the cache from `~/.orangu/workspace/<hash>/graph/cache.json`.
 ///   2. For each source file, compare its sha256 to the cached hash.
 ///   3. Re-scan only stale or new files; keep cached nodes/edges for unchanged ones.
 ///   4. Save updated cache back to disk.
 pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
-    let cache_path = workspace.join(".orangu").join("kg_cache.json");
+    let cache_path = GraphCache::cache_path(workspace);
     let project_type = detect_project_type(workspace);
     let files = collect_source_files(workspace);
 

@@ -15,7 +15,7 @@
 
 //! The persistent embedding index and hybrid search.
 //!
-//! The index lives under `~/.orangu/embeddings/workspace/<hash>/`, keyed by a
+//! The index lives under `~/.orangu/workspace/<hash>/embeddings/`, keyed by a
 //! hash of the workspace path so it is shared across sessions without cluttering
 //! the workspace tree. Vectors are stored append-only in `chunks.json`, with a
 //! small `meta.json` sidecar (version + per-file hashes) and a `processed.log`.
@@ -123,10 +123,10 @@ struct Meta {
 
 impl EmbeddingIndex {
     /// The cache directory for `workspace`, kept out of the workspace tree in the
-    /// global orangu directory and keyed by a hash of the workspace path:
+    /// global, per-workspace orangu directory:
     ///
     /// ```text
-    /// ~/.orangu/embeddings/workspace/<sha256(path)>/
+    /// ~/.orangu/workspace/<sha256(path)>/embeddings/
     /// ```
     ///
     /// It holds `chunks.json` (one embedded chunk per line, appended as files
@@ -134,17 +134,7 @@ impl EmbeddingIndex {
     /// `processed.log` (each file's path and completion time). Falls back to the
     /// workspace tree when no home directory resolves.
     pub fn cache_dir(workspace: &Path) -> PathBuf {
-        let canonical =
-            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-        let key = sha256(&canonical.to_string_lossy());
-        match home::home_dir() {
-            Some(home) => home
-                .join(".orangu")
-                .join("embeddings")
-                .join("workspace")
-                .join(key),
-            None => workspace.join(".orangu").join("embeddings"),
-        }
+        crate::workspace_cache::workspace_cache_dir(workspace, "embeddings")
     }
 
     fn chunks_path(dir: &Path) -> PathBuf {

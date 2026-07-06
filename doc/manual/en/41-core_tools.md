@@ -1016,11 +1016,12 @@ name shares no words with the query.
 ```
 
 The first time it runs, orangu embeds every extractable symbol in the workspace
-and stores the vectors under `~/.orangu/embeddings/workspace/<hash>/`, keyed by a
+and stores the vectors under `~/.orangu/workspace/<hash>/embeddings/`, keyed by a
 hash of the workspace path so the cache is shared across sessions without
-cluttering the workspace tree. The directory holds `chunks.json` (one embedded
-chunk per line), a small `meta.json` (version and per-file hashes), and a
-`processed.log` recording each file's path and the time it was embedded. Every
+cluttering the workspace tree — the same per-workspace cache root the Knowledge
+Graph uses (at `.../graph/` alongside it). The directory holds `chunks.json` (one
+embedded chunk per line), a small `meta.json` (version and per-file hashes), and
+a `processed.log` recording each file's path and the time it was embedded. Every
 subsequent search re-embeds only the files whose contents changed and drops
 chunks for files that no longer exist — the same incremental sha256 approach the
 Knowledge Graph cache uses — so the cache is always consistent with the current

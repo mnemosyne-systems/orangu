@@ -180,6 +180,7 @@ connections and the probe will report it unreachable.
 The cached vectors are specific to the embedding model that produced them, and
 are keyed by the endpoint you configured. If you restart the embedding server
 with a **different model** (or point `role = embeddings` at a different endpoint),
-the cache no longer matches — delete `~/.orangu/embeddings/` and run `/search`
-again to re-index. Restarting with the **same** model reuses the cache and only
-re-embeds files that changed.
+the cache no longer matches — delete the workspace's `embeddings/` subdirectory
+under `~/.orangu/workspace/<hash>/` and run `/search` again to re-index.
+Restarting with the **same** model reuses the cache and only re-embeds files that
+changed.

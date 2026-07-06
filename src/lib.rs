@@ -29,4 +29,5 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod tui;
+pub mod workspace_cache;
 pub mod workspaces;

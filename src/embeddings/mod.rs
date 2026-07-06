@@ -16,9 +16,10 @@
 //! Local semantic code search.
 //!
 //! Embeds the workspace's symbols offline through the server that serves the
-//! `embeddings` role, persists the vectors under `~/.orangu/embeddings/`
-//! (incrementally, like the knowledge graph cache), and answers `/search`
-//! queries by cosine similarity fused with the knowledge graph's call edges.
+//! `embeddings` role, persists the vectors under
+//! `~/.orangu/workspace/<hash>/embeddings/` (incrementally, like the knowledge
+//! graph cache), and answers `/search` queries by cosine similarity fused with
+//! the knowledge graph's call edges.
 //!
 //! Semantic search enables itself when the embeddings endpoint responds at
 //! startup; otherwise the whole subsystem stays dormant and retrieval falls back
