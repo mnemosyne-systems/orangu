@@ -19,7 +19,7 @@ home = "0.5.11"
 html2text = "0.17.1"
 ignore = "0.4.24"
 markdown = "1.0.0"
-printpdf = { version = "0.9.1", default-features = false, features = ["text_layout"] }
+printpdf = { version = "0.10.0", default-features = false, features = ["text_layout"] }
 regex = "1.10"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rustyline = "18.0.1"
@@ -44,7 +44,7 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.24"
 tree-sitter-bash = "0.25"
-tree-sitter-scala = "0.24"
+tree-sitter-scala = "0.26"
 tree-sitter-ocaml = "0.25"
 tree-sitter-haskell = "0.23"
 tree-sitter-julia = "0.23"
