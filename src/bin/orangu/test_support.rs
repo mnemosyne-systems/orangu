@@ -50,8 +50,9 @@ pub(crate) fn test_input_context<'a>(workspace: &'a std::path::Path) -> InputCon
             prompt_branch: None,
             header_status: HeaderStatus {
                 workspace_ok: true,
-                server_ok: true,
-                model_ok: true,
+                server_ok: orangu::tui::ConnStatus::Ok,
+                model_ok: orangu::tui::ConnStatus::Ok,
+                is_coordinator: false,
             },
             virtual_width: 80,
             actual_width: 80,

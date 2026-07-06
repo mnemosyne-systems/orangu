@@ -50,12 +50,22 @@ impl ClientAppConfiguration {
     /// Returns the name of the first server configured with the given role.
     /// If no server specifies this role, returns the `default_server`.
     pub fn find_server_for_role(&self, role: &str) -> String {
+        self.find_server_for_role_or(role, &self.default_server)
+    }
+
+    /// Returns the name of the first server configured with the given role,
+    /// or `fallback` if no server specifies this role. Lets a caller prefer a
+    /// dedicated role (e.g. `review`) while falling back to something more
+    /// specific than the static config default — such as whatever server the
+    /// interactive session is currently connected to — when no server opts
+    /// into that role.
+    pub fn find_server_for_role_or(&self, role: &str, fallback: &str) -> String {
         for (name, profile) in &self.llms {
             if profile.role == role {
                 return name.clone();
             }
         }
-        self.default_server.clone()
+        fallback.to_string()
     }
 
     /// The server section that can serve embeddings for semantic `/search`,
@@ -355,22 +365,28 @@ fn normalize_client_configuration(
         normalize_llm_configuration(llm)?;
     }
 
-    // Each chat server must point at a distinct endpoint: a server is one host,
-    // and `/model` cycles the models that single host offers. Endpoints are
-    // compared canonically, so `http://x` and `http://x/v1/` count as the same
-    // host. An `embeddings` server is exempt — it is selected by role, never in
-    // the `/server` rotation, so it may share a chat server's host (e.g. Ollama,
-    // which serves chat and embeddings on one endpoint).
-    let mut endpoints: HashMap<&str, &str> = HashMap::new();
+    // Each chat server must resolve to a distinct (endpoint, model) pair: a
+    // server is one host serving one model, and `/model` cycles the models
+    // that single host offers. Endpoints are compared canonically, so
+    // `http://x` and `http://x/v1/` count as the same host. Two servers *may*
+    // share a host as long as their `model` differs — this is how Ollama
+    // serves several models off one endpoint, and how an orangu-coordinator
+    // instance fronts several role-specific models behind a single proxy
+    // address. An `embeddings` server is exempt entirely — it is selected by
+    // role, never in the `/server` rotation, so it may share both endpoint and
+    // model with a chat server.
+    let mut endpoints: HashMap<(&str, &str), &str> = HashMap::new();
     for (name, llm) in &conf.llms {
         if llm.role == "embeddings" {
             continue;
         }
         let canonical = llm.endpoint.strip_suffix("/v1").unwrap_or(&llm.endpoint);
-        if let Some(existing) = endpoints.insert(canonical, name.as_str()) {
+        let key = (canonical, llm.model.as_str());
+        if let Some(existing) = endpoints.insert(key, name.as_str()) {
             return Err(anyhow!(
-                "Servers '{existing}' and '{name}' share endpoint '{}'; each server must use a unique endpoint",
-                llm.endpoint
+                "Servers '{existing}' and '{name}' share endpoint '{}' and model '{}'; servers sharing an endpoint must use distinct models",
+                llm.endpoint,
+                llm.model
             ));
         }
     }
@@ -766,17 +782,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_servers_sharing_an_endpoint() {
+    fn rejects_servers_sharing_an_endpoint_and_model() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = two\n"
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n"
         )
         .unwrap();
 
         let err = load_client_configuration(file.path()).unwrap_err();
         assert!(
-            err.to_string().contains("unique endpoint"),
+            err.to_string().contains("distinct models"),
             "unexpected error: {err:#}"
         );
     }
@@ -787,15 +803,32 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1/\nmodel = two\n"
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1/\nmodel = one\n"
         )
         .unwrap();
 
         let err = load_client_configuration(file.path()).unwrap_err();
         assert!(
-            err.to_string().contains("unique endpoint"),
+            err.to_string().contains("distinct models"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn servers_may_share_an_endpoint_with_distinct_models() {
+        // An orangu-coordinator instance fronts several role-specific models
+        // behind one proxy address; servers distinguish themselves by `model`
+        // rather than by endpoint in that setup.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = one\nrole = all\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = two\nrole = explorer\n"
+        )
+        .unwrap();
+
+        let conf = load_client_configuration(file.path()).expect("shared coordinator endpoint");
+        assert_eq!(conf.find_server_for_role("explorer"), "b");
+        assert_eq!(conf.llms["a"].endpoint, conf.llms["b"].endpoint);
     }
 
     #[test]
@@ -824,6 +857,12 @@ mod tests {
         assert_eq!(conf.find_server_for_role("explorer"), "b");
         assert_eq!(conf.find_server_for_role("review"), "a");
         assert_eq!(conf.find_server_for_role("missing"), "a"); // fallback
+
+        // A custom fallback lets a caller prefer "whatever is currently
+        // active" over the static config default when no server opts into
+        // the role — e.g. review falling back to the live chat connection.
+        assert_eq!(conf.find_server_for_role_or("explorer", "custom"), "b");
+        assert_eq!(conf.find_server_for_role_or("review", "custom"), "custom");
     }
 
     #[test]

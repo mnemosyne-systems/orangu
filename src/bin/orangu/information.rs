@@ -15,12 +15,14 @@
 
 //! `/information` gathers as much information as possible about the active
 //! server: every OpenAI-compatible endpoint orangu itself talks to
-//! (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever
+//! (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), whatever
 //! llama.cpp-native endpoints (`/health`, `/props`, `/slots`, `/metrics`) it
-//! exposes. Every capability is probed independently, so a plain
-//! OpenAI-compatible server (which lacks the llama.cpp-native endpoints)
-//! still gets a full report — those rows just come back unavailable rather
-//! than failing the whole command.
+//! exposes, and whether it is actually an orangu-coordinator proxy
+//! (`/v1/coordinator`) rather than llama.cpp or a generic OpenAI-compatible
+//! server. Every capability is probed independently, so a plain
+//! OpenAI-compatible server (which lacks the llama.cpp-native endpoints and
+//! `/v1/coordinator`) still gets a full report — those rows just come back
+//! unavailable rather than failing the whole command.
 //!
 //! `/v1/chat/completions` is the one endpoint where "probe" can mean a real
 //! request rather than a side-effect-free GET: on a local llama.cpp server a
@@ -75,8 +77,20 @@ pub(crate) async fn gather_server_information(
         chat_completions_capability(&models, &profile.model)
     };
     let embeddings = embeddings_capability(is_embeddings_server);
+    let coordinator = simplify_unavailable(
+        probe_get(
+            &client,
+            &endpoint,
+            "orangu-coordinator",
+            "/v1/coordinator",
+            api_key,
+            summarize_coordinator,
+        )
+        .await,
+    );
 
     vec![
+        coordinator,
         models,
         chat_completions,
         embeddings,
@@ -410,6 +424,17 @@ fn summarize_props(value: &Value) -> String {
     parts.join(" ")
 }
 
+/// Summarize `/v1/coordinator`: show the orangu-coordinator version when the
+/// field is present, confirming the connected server actually is an
+/// orangu-coordinator proxy rather than llama.cpp or a generic
+/// OpenAI-compatible server.
+fn summarize_coordinator(value: &Value) -> String {
+    match value.get("version").and_then(Value::as_str) {
+        Some(version) if !version.is_empty() => format!("orangu-coordinator v{version}"),
+        _ => "reachable".to_string(),
+    }
+}
+
 /// Summarize `/health`: show the `status` field llama.cpp reports (`ok`,
 /// `loading model`, `error`, …), capitalized, when present, otherwise just
 /// note it responded.
@@ -595,6 +620,13 @@ mod tests {
         let loading = serde_json::json!({"status": "loading model"});
         assert_eq!(summarize_health(&loading), "Loading model");
         assert_eq!(summarize_health(&serde_json::json!({})), "reachable");
+    }
+
+    #[test]
+    fn summarize_coordinator_reads_version_field() {
+        let value = serde_json::json!({"orangu_coordinator": true, "version": "0.11.0"});
+        assert_eq!(summarize_coordinator(&value), "orangu-coordinator v0.11.0");
+        assert_eq!(summarize_coordinator(&serde_json::json!({})), "reachable");
     }
 
     #[test]

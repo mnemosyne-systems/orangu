@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+pub mod coordinator;
 pub mod openai;
 pub mod slots;
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+pub use coordinator::probe_coordinator;
 pub use openai::{OpenAiClient, normalized_openai_endpoint};
 pub use slots::{SaveRestoreOutcome, SlotRegistry};
 

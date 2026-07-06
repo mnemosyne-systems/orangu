@@ -10,9 +10,14 @@ authors = ["Jesper Pedersen <jesperpedersen.db@gmail.com>"]
 name = "orangu"
 path = "src/bin/orangu/main.rs"
 
+[[bin]]
+name = "orangu-coordinator"
+path = "src/bin/orangu-coordinator/main.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 arboard = { version = "3.6.1", default-features = false }
+axum = "0.8.9"
 clap = { version = "4.5.39", features = ["derive"] }
 crossterm = "0.29.0"
 home = "0.5.11"
@@ -21,13 +26,14 @@ ignore = "0.4.24"
 markdown = "1.0.0"
 printpdf = { version = "0.10.0", default-features = false, features = ["text_layout"] }
 regex = "1.10"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rust-fontconfig = "4.4.4"
 rustyline = "18.0.1"
 rayon = "1.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
+shell-words = "1.1"
 syntect = "5.3.0"
 terminal_size = "0.4.1"
 ttf-parser = "0.25.1"
@@ -65,6 +71,10 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5.0"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

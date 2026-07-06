@@ -263,6 +263,7 @@ pub(crate) fn handle_command(
         workspace,
         session_dir,
         embeddings_server,
+        is_coordinator,
         usage_stats,
         available_models,
         virtual_width,
@@ -566,14 +567,26 @@ pub(crate) fn handle_command(
                      section."
                 )));
             };
-            let client = match orangu::embeddings::EmbeddingClient::from_profile(profile) {
-                Ok(client) => client,
-                Err(err) => {
-                    return Ok(CommandOutcome::OutputError(format!(
-                        "Could not initialise embeddings client: {err:#}"
-                    )));
-                }
-            };
+            // Under a confirmed coordinator, it alone owns model/role
+            // decisions: force `.model = "embeddings"` on the active
+            // connection rather than sending whatever it's normally
+            // configured with (e.g. "all"), which — since a coordinator
+            // matches an exact model/role name before it ever considers the
+            // request path — could otherwise route this to the wrong
+            // backend entirely.
+            let mut embeddings_profile = profile.clone();
+            if is_coordinator {
+                embeddings_profile.model = "embeddings".to_string();
+            }
+            let client =
+                match orangu::embeddings::EmbeddingClient::from_profile(&embeddings_profile) {
+                    Ok(client) => client,
+                    Err(err) => {
+                        return Ok(CommandOutcome::OutputError(format!(
+                            "Could not initialise embeddings client: {err:#}"
+                        )));
+                    }
+                };
             let workspace = workspace.to_path_buf();
             let query = query.into_owned();
             let graph = tools.graph_store.clone();
@@ -1061,7 +1074,7 @@ pub(crate) fn handle_command(
                             let path_display =
                                 path.file_name().unwrap_or_default().to_string_lossy();
                             Ok(CommandOutcome::MarkdownOutput(format!(
-                                "Knowledge Graph written to:\n  [{path_display}]({file_url})\nExtracted {} nodes and {} edges.",
+                                "Knowledge Graph written to: [{path_display}]({file_url}) ({} nodes / {} edges)",
                                 stats.node_count, stats.edge_count
                             )))
                         }
@@ -1208,6 +1221,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1268,6 +1282,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1336,6 +1351,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1393,6 +1409,7 @@ mod tests {
                     workspace: &here,
                     session_dir: &here,
                     embeddings_server: "",
+                    is_coordinator: false,
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1478,6 +1495,7 @@ mod tests {
                     workspace: &here,
                     session_dir: &here,
                     embeddings_server: "",
+                    is_coordinator: false,
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1588,6 +1606,7 @@ mod tests {
                     workspace: workspace.path(),
                     session_dir: workspace.path(),
                     embeddings_server: "",
+                    is_coordinator: false,
                     usage_stats: &super::UsageStats::new(),
                     available_models: &[],
                     virtual_width: 512,
@@ -1660,6 +1679,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1722,6 +1742,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1786,6 +1807,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1845,6 +1867,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &available,
                 virtual_width: 512,
@@ -1910,6 +1933,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -1968,6 +1992,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -2033,6 +2058,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -2085,6 +2111,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -2133,6 +2160,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,
@@ -2181,6 +2209,7 @@ mod tests {
                 workspace: workspace.path(),
                 session_dir: workspace.path(),
                 embeddings_server: "",
+                is_coordinator: false,
                 usage_stats: &super::UsageStats::new(),
                 available_models: &[],
                 virtual_width: 512,

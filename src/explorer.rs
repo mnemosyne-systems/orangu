@@ -13,12 +13,41 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::config::{default_client_config_path, load_client_configuration};
+use crate::config::{
+    ClientAppConfiguration, LlmConfiguration, default_client_config_path, load_client_configuration,
+};
 use crate::session::ChatSession;
 use crate::tools::ToolExecutor;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
+
+/// Resolves which server the explorer subagent should use.
+///
+/// Once a coordinator is confirmed (`is_coordinator`), it alone owns every
+/// model/role decision: a local `role = explorer` section in orangu.conf is
+/// never consulted — the default connection is reused as-is with `.model`
+/// forced to `explorer`, and the coordinator resolves that to whatever real
+/// model actually backs it (falling back to `all` if it has none).
+///
+/// Otherwise, a dedicated `role = explorer` section is used if one is
+/// configured (falling back to the default server otherwise), exactly as
+/// before this existed.
+fn explorer_target_profile(
+    client_app_config: &ClientAppConfiguration,
+    is_coordinator: bool,
+) -> Option<LlmConfiguration> {
+    let default_profile = client_app_config
+        .llms
+        .get(&client_app_config.default_server)?;
+    if is_coordinator {
+        let mut profile = default_profile.clone();
+        profile.model = "explorer".to_string();
+        return Some(profile);
+    }
+    let target_server = client_app_config.find_server_for_role("explorer");
+    client_app_config.llms.get(&target_server).cloned()
+}
 
 const EXPLORER_SYSTEM_PROMPT: &str = r#"
 You are a codebase exploration specialist focused exclusively on searching and analyzing existing code.
@@ -65,11 +94,19 @@ pub fn run_explorer_subagent<'a>(
         let client_app_config = load_client_configuration(&config_path)
             .context("failed to load LLM configuration for subagent")?;
 
-        let target_server = client_app_config.find_server_for_role("explorer");
-
-        let config = client_app_config
+        let default_profile = client_app_config
             .llms
-            .get(&target_server)
+            .get(&client_app_config.default_server)
+            .context("missing default server in config")?;
+        let http_client = reqwest::Client::new();
+        let is_coordinator = crate::llm::probe_coordinator(
+            &http_client,
+            &default_profile.endpoint,
+            default_profile.api_key.as_deref(),
+        )
+        .await
+        .is_some();
+        let config = explorer_target_profile(&client_app_config, is_coordinator)
             .context("missing target server in config")?;
 
         let mut dir_listing = String::new();
@@ -120,4 +157,59 @@ pub fn run_explorer_subagent<'a>(
             response
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn explorer_target_profile_under_a_coordinator_ignores_local_role_sections() {
+        // Once a coordinator is confirmed, it alone owns model/role
+        // decisions: even a dedicated `role = explorer` section (with its
+        // own distinct endpoint/model) must be ignored in favor of the
+        // default connection with `.model` forced to "explorer".
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nprovider = llama.cpp\nendpoint = http://localhost:9111/v1\nmodel = explorer\nrole = explorer\n"
+        )
+        .unwrap();
+        let config = load_client_configuration(file.path()).unwrap();
+
+        let profile = explorer_target_profile(&config, true).expect("default server resolves");
+        assert_eq!(profile.endpoint, "http://localhost:9000/v1");
+        assert_eq!(profile.model, "explorer");
+    }
+
+    #[test]
+    fn explorer_target_profile_without_a_coordinator_uses_the_dedicated_role_section() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nprovider = llama.cpp\nendpoint = http://localhost:9111/v1\nmodel = org/qwen\nrole = explorer\n"
+        )
+        .unwrap();
+        let config = load_client_configuration(file.path()).unwrap();
+
+        let profile = explorer_target_profile(&config, false).expect("explorer server resolves");
+        assert_eq!(profile.endpoint, "http://localhost:9111/v1");
+        assert_eq!(profile.model, "org/qwen");
+    }
+
+    #[test]
+    fn explorer_target_profile_without_a_coordinator_falls_back_to_default_server() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n"
+        )
+        .unwrap();
+        let config = load_client_configuration(file.path()).unwrap();
+
+        let profile = explorer_target_profile(&config, false).expect("default server resolves");
+        assert_eq!(profile.endpoint, "http://localhost:9000/v1");
+        assert_eq!(profile.model, "all");
+    }
 }

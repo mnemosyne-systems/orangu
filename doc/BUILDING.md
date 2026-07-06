@@ -1,6 +1,8 @@
 # Building orangu
 
-`orangu` is a Rust project with a single interactive client binary.
+`orangu` is a Rust project with two binaries: the interactive client
+(`orangu`) and an optional HTTP proxy that starts/stops llama.cpp on demand
+(`orangu-coordinator`, see [doc/COORDINATOR.md](COORDINATOR.md)).
 
 ## Prerequisites
 
@@ -41,4 +43,8 @@ The script writes HTML and PDF output to `target/doc/`.
 
 ```sh
 cargo run --bin orangu -- --config ./doc/etc/orangu.conf
+```
+
+```sh
+cargo run --bin orangu-coordinator -- --config ./doc/etc/orangu-coordinator.conf
 ```

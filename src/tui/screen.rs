@@ -180,9 +180,14 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
     // The prompt frame keeps the full width; a bottom bar shrinks its height.
     let frame_height = actual_height.saturating_sub(bottom_row).max(1);
 
+    // Computed once and reused for both the header and the prompt frame's
+    // status line below, so the two never disagree about whether "Automatic"
+    // should be shown.
+    let current_model = display_model_name(args.status.is_coordinator, args.current_model);
+
     let header = render_header(
         args.version,
-        args.current_model,
+        current_model,
         args.endpoint,
         args.workspace,
         args.status,
@@ -303,7 +308,7 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
 
     screen.push_str(&render_prompt_frame(PromptFrameArgs {
         header_height: banner_rows,
-        current_model: args.current_model,
+        current_model,
         left_status: args.left_status,
         pending_count: args.pending_count,
         prompt_prefix: &prompt_prefix,

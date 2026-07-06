@@ -478,6 +478,12 @@ pub struct CommandContext<'a> {
     pub workspace: &'a Path,
     pub session_dir: &'a std::path::Path,
     pub embeddings_server: &'a str,
+    /// Whether the active connection is a confirmed orangu-coordinator —
+    /// see [`crate::models::is_active_connection_a_coordinator`]. Used by
+    /// `/search` to force `.model = "embeddings"` on the active connection
+    /// rather than sending whatever it's normally configured with, since the
+    /// coordinator alone owns which real model backs that role.
+    pub is_coordinator: bool,
     pub usage_stats: &'a crate::UsageStats,
     pub available_models: &'a [String],
     pub virtual_width: usize,

@@ -44,11 +44,48 @@ impl std::str::FromStr for Banner {
     }
 }
 
+/// Tri-state connectivity indicator for the header's `Server`/`Model` rows:
+/// `Pending` (white dot) while a check is still in flight — most notably at
+/// startup, so the UI can render instantly instead of blocking on the first
+/// probe — `Ok` (green) once confirmed good, `Failed` (red) once confirmed
+/// bad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnStatus {
+    Pending,
+    Ok,
+    Failed,
+}
+
+impl ConnStatus {
+    pub fn from_bool(ok: bool) -> Self {
+        if ok { Self::Ok } else { Self::Failed }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HeaderStatus {
     pub workspace_ok: bool,
-    pub server_ok: bool,
-    pub model_ok: bool,
+    pub server_ok: ConnStatus,
+    pub model_ok: ConnStatus,
+    /// Whether the active server identified itself as an orangu-coordinator
+    /// proxy (`GET /v1/coordinator`) rather than llama.cpp or a generic
+    /// OpenAI-compatible server. When set, the header shows "Automatic" for
+    /// the model instead of the configured wire model id, since the
+    /// coordinator — not the user — decides which model is actually loaded.
+    pub is_coordinator: bool,
+}
+
+/// The model name to display anywhere in the UI: under a confirmed
+/// coordinator, the wire model id pinned here isn't a meaningful "what's
+/// loaded" answer (the coordinator — not the user — decides which model is
+/// actually loaded), so "Automatic" is shown instead; otherwise `model_id`
+/// itself.
+pub fn display_model_name(is_coordinator: bool, model_id: &str) -> &str {
+    if is_coordinator {
+        "Automatic"
+    } else {
+        model_id
+    }
 }
 
 pub fn render_header(
@@ -60,10 +97,11 @@ pub fn render_header(
     alignment: Banner,
     actual_width: usize,
 ) -> String {
+    let current_model = display_model_name(status.is_coordinator, current_model);
     let status_lines = [
         status_text_line(&format!("Version: {version}")),
         status_text_line(""),
-        status_indicator_line(
+        bool_status_indicator_line(
             &format!("Workspace: {}", workspace.display()),
             status.workspace_ok,
         ),
@@ -196,11 +234,11 @@ Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up /
 /manual opens the built-in manual in a full-screen viewer: the text on the left, the table of contents on the right. Alt+J/Alt+K switch sections, Up/Down move the highlighted line, Alt+S opens a search window over the entire manual (Enter jumps to the next match, Esc closes it), Alt+Up/Alt+Down scroll, PageUp/PageDown page, Left/Right pan, and Alt+X (or Esc Esc) exits."#
 }
 
-fn indicator(ok: bool) -> String {
-    if ok {
-        format!("{STATUS_GREEN}●{ANSI_RESET}")
-    } else {
-        format!("{STATUS_RED}●{ANSI_RESET}")
+fn indicator(status: ConnStatus) -> String {
+    match status {
+        ConnStatus::Pending => format!("{STATUS_WHITE}●{ANSI_RESET}"),
+        ConnStatus::Ok => format!("{STATUS_GREEN}●{ANSI_RESET}"),
+        ConnStatus::Failed => format!("{STATUS_RED}●{ANSI_RESET}"),
     }
 }
 
@@ -217,9 +255,113 @@ fn status_text_line(text: &str) -> HeaderLine {
     }
 }
 
-fn status_indicator_line(text: &str, ok: bool) -> HeaderLine {
+fn status_indicator_line(text: &str, status: ConnStatus) -> HeaderLine {
     HeaderLine {
-        rendered: format!("{text} {}", indicator(ok)),
+        rendered: format!("{text} {}", indicator(status)),
         visible_width: text.chars().count() + 2,
+    }
+}
+
+fn bool_status_indicator_line(text: &str, ok: bool) -> HeaderLine {
+    status_indicator_line(text, ConnStatus::from_bool(ok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(is_coordinator: bool) -> HeaderStatus {
+        HeaderStatus {
+            workspace_ok: true,
+            server_ok: ConnStatus::Ok,
+            model_ok: ConnStatus::Ok,
+            is_coordinator,
+        }
+    }
+
+    #[test]
+    fn display_model_name_shows_automatic_only_when_coordinator() {
+        assert_eq!(
+            display_model_name(true, "ggml-org/gemma-4-E4B-it-GGUF"),
+            "Automatic"
+        );
+        assert_eq!(
+            display_model_name(false, "ggml-org/gemma-4-E4B-it-GGUF"),
+            "ggml-org/gemma-4-E4B-it-GGUF"
+        );
+    }
+
+    #[test]
+    fn shows_automatic_when_connected_to_a_coordinator() {
+        let header = render_header(
+            "1.0.0",
+            "ggml-org/gemma-4-E4B-it-GGUF",
+            "http://localhost:9000/v1",
+            std::path::Path::new("/tmp"),
+            status(true),
+            Banner::Left,
+            120,
+        );
+        assert!(header.contains("Model: Automatic"));
+        assert!(!header.contains("gemma"));
+    }
+
+    #[test]
+    fn shows_the_real_model_id_otherwise() {
+        let header = render_header(
+            "1.0.0",
+            "ggml-org/gemma-4-E4B-it-GGUF",
+            "http://localhost:8100/v1",
+            std::path::Path::new("/tmp"),
+            status(false),
+            Banner::Left,
+            120,
+        );
+        assert!(header.contains("Model: ggml-org/gemma-4-E4B-it-GGUF"));
+        assert!(!header.contains("Automatic"));
+    }
+
+    #[test]
+    fn indicator_shows_a_distinct_color_for_each_conn_status() {
+        // Regression test: Pending (white, still resolving — used while
+        // startup connectivity checks are still running in the background)
+        // must render differently from both Ok (green) and Failed (red).
+        let pending = indicator(ConnStatus::Pending);
+        let ok = indicator(ConnStatus::Ok);
+        let failed = indicator(ConnStatus::Failed);
+        assert!(pending.contains(STATUS_WHITE));
+        assert!(ok.contains(STATUS_GREEN));
+        assert!(failed.contains(STATUS_RED));
+        assert_ne!(pending, ok);
+        assert_ne!(pending, failed);
+        assert_ne!(ok, failed);
+    }
+
+    #[test]
+    fn conn_status_from_bool_maps_true_to_ok_and_false_to_failed() {
+        assert_eq!(ConnStatus::from_bool(true), ConnStatus::Ok);
+        assert_eq!(ConnStatus::from_bool(false), ConnStatus::Failed);
+    }
+
+    #[test]
+    fn render_header_shows_pending_as_a_white_dot() {
+        let header = render_header(
+            "1.0.0",
+            "ggml-org/gemma-4-E4B-it-GGUF",
+            "http://localhost:8100/v1",
+            std::path::Path::new("/tmp"),
+            HeaderStatus {
+                workspace_ok: true,
+                server_ok: ConnStatus::Pending,
+                model_ok: ConnStatus::Pending,
+                is_coordinator: false,
+            },
+            Banner::Left,
+            120,
+        );
+        assert!(header.contains(&format!("Server: http://localhost:8100/v1 {STATUS_WHITE}")));
+        assert!(header.contains(&format!(
+            "Model: ggml-org/gemma-4-E4B-it-GGUF {STATUS_WHITE}"
+        )));
     }
 }

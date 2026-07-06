@@ -300,6 +300,7 @@ Useful first commands:
 
 - [Latest manual](https://github.com/mnemosyne-systems/orangu/tree/main/doc/manual/en)
 - [Getting Started](https://github.com/mnemosyne-systems/orangu/blob/main/doc/GETTING_STARTED.md)
+- [orangu-coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/COORDINATOR.md) — auto-start/stop llama.cpp for machines that only run one local model at a time
 - [Quick start](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/03-quickstart.md)
 - [Configuration](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/20-configuration.md)
 - [Workspaces](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/31-workspaces.md)

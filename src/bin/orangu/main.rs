@@ -51,7 +51,10 @@ use crossterm::{
 };
 use orangu::{
     agents::hooks::{rescan_changed_files, run_session_start_hook},
-    config::{LlmConfiguration, default_client_config_path, load_client_configuration},
+    config::{
+        ClientAppConfiguration, LlmConfiguration, default_client_config_path,
+        load_client_configuration,
+    },
     llm::{ChatMessage, StreamMetrics, normalized_openai_endpoint},
     session::ChatSession,
     tools::ToolExecutor,
@@ -407,34 +410,22 @@ async fn run() -> Result<()> {
     active_model_id = initial_active_model_id;
     current_endpoint = initial_current_endpoint;
 
-    // If the active server isn't serving the configured model at startup, switch
-    // to a model it does advertise.
-    if let Some(active_profile) = config.llms.get(&active_model)
-        && let Some((old_model, new_model)) = try_startup_model_switch(
-            &status_http_client,
-            active_profile,
-            &mut active_model_id,
-            current_endpoint.as_deref(),
-        )
-        .await
-    {
-        output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
-    }
-
-    // Semantic /search is enabled only when an embeddings-capable endpoint is
-    // reachable at startup. Resolve the candidate server by role and probe its
-    // `/v1/embeddings`; a chat-only server (no embedding model loaded) fails the
-    // probe and search stays dormant. Holds the resolved server name, or empty.
-    let embeddings_server: String = match config.embeddings_server() {
-        Some(name) => match config.llms.get(&name) {
-            Some(profile) => match orangu::embeddings::probe_endpoint(profile).await {
-                Ok(()) => name,
-                Err(_) => String::new(),
-            },
-            None => String::new(),
-        },
-        None => String::new(),
-    };
+    // Resolves server connectivity (with auto-failover to another configured
+    // server if the default doesn't respond), model pinning, and semantic
+    // `/search`'s embeddings capability — all in the background, so the very
+    // first render never blocks on it. Until this completes, the header
+    // shows "Server"/"Model" as pending (a white dot); the main loop below
+    // applies the result the moment it's ready and prints a notice if a
+    // different server was chosen. `embeddings_server` starts empty (search
+    // unavailable) until then, matching its existing "empty means
+    // unavailable" convention.
+    let mut startup_resolution_handle: Option<tokio::task::JoinHandle<StartupResolution>> =
+        Some(tokio::spawn(resolve_startup_state(
+            status_http_client.clone(),
+            config.clone(),
+            server_names.clone(),
+        )));
+    let mut embeddings_server = String::new();
 
     // In a Git repository, fast-forward the local default branch to origin on
     // startup. Run it in the background so it never blocks the UI; its progress
@@ -790,20 +781,62 @@ async fn run() -> Result<()> {
             *s = TabStatus::Working;
         }
         let prompt_branch = workspace_branch_name(tools.workspace());
-        let active_profile = config
-            .llms
-            .get(&active_model)
-            .ok_or_else(|| anyhow!("missing configured server {}", active_model))?;
-        let (mut header_status, server_models) = probe_header_status(
-            &status_http_client,
-            tools.workspace(),
-            &active_model_id,
-            active_profile,
-            current_endpoint.as_deref(),
-        )
-        .await;
-        // Models advertised by the selected server, used for `/model` completion.
-        let available_models = server_models;
+
+        // Apply the background startup resolution's result the moment it's
+        // ready (server auto-failover, model pinning, embeddings detection —
+        // see `resolve_startup_state`), announcing any switch it made.
+        if let Some(handle) = startup_resolution_handle.take() {
+            if handle.is_finished() {
+                if let Ok(resolution) = handle.await {
+                    if resolution.switched_server {
+                        output_state
+                            .push_text(&format!("Switched to server: {}", resolution.server));
+                    }
+                    if let Some((old_model, new_model)) = &resolution.model_switched {
+                        output_state
+                            .push_text(&format!("Switched model from {old_model} to {new_model}"));
+                    }
+                    active_model = resolution.server;
+                    active_model_id = resolution.active_model_id;
+                    current_endpoint = config
+                        .llms
+                        .get(&active_model)
+                        .map(|profile| profile.endpoint.clone());
+                    embeddings_server = resolution.embeddings_server;
+                }
+                // Left as `None`: the normal per-iteration probe below now
+                // applies, reflecting whatever was just settled on.
+            } else {
+                startup_resolution_handle = Some(handle);
+            }
+        }
+        // While that resolution is still pending, show "Server"/"Model" as
+        // pending (white) instead of blocking this render on the same
+        // network check the background task is already doing.
+        let (mut header_status, available_models) = if startup_resolution_handle.is_some() {
+            (
+                orangu::tui::HeaderStatus {
+                    workspace_ok: tools.workspace().exists(),
+                    server_ok: orangu::tui::ConnStatus::Pending,
+                    model_ok: orangu::tui::ConnStatus::Pending,
+                    is_coordinator: false,
+                },
+                Vec::new(),
+            )
+        } else {
+            let active_profile = config
+                .llms
+                .get(&active_model)
+                .ok_or_else(|| anyhow!("missing configured server {}", active_model))?;
+            probe_header_status(
+                &status_http_client,
+                tools.workspace(),
+                &active_model_id,
+                active_profile,
+                current_endpoint.as_deref(),
+            )
+            .await
+        };
         // The idle status refresh also re-checks the model: if the server is up
         // but no longer serves the model we are pinned to (e.g. it swapped the
         // loaded model while we sat idle), switch to one it advertises so the
@@ -813,7 +846,7 @@ async fn run() -> Result<()> {
             let new_model = new_model.to_string();
             let old_model = std::mem::replace(&mut active_model_id, new_model.clone());
             output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
-            header_status.model_ok = true;
+            header_status.model_ok = orangu::tui::ConnStatus::Ok;
         }
         let endpoint = current_endpoint.as_deref().unwrap_or("(disconnected)");
         let render = RenderContext {
@@ -1061,7 +1094,12 @@ async fn run() -> Result<()> {
             || sync_notice
                 .as_ref()
                 .is_some_and(|(_, deadline)| std::time::Instant::now() < *deadline);
-        let max_idle = if sync_active {
+        let max_idle = if startup_resolution_handle.is_some() {
+            // Poll quickly so the pending (white) "Server"/"Model" dots turn
+            // green/red the instant the background resolution finishes,
+            // rather than sitting idle for a normal refresh cycle.
+            std::time::Duration::from_millis(50)
+        } else if sync_active {
             std::time::Duration::from_millis(500)
         } else {
             IDLE_STATUS_REFRESH_INTERVAL
@@ -1164,6 +1202,7 @@ async fn run() -> Result<()> {
                 workspace: &workspace,
                 session_dir: &session_dir,
                 embeddings_server: &embeddings_server,
+                is_coordinator: header_status.is_coordinator,
                 usage_stats: &usage_stats,
                 available_models: &available_models,
                 virtual_width: viewport.virtual_width,
@@ -1182,18 +1221,37 @@ async fn run() -> Result<()> {
         )?;
         // When `/server` (or `/reload`) selects a server, auto-detect an
         // available model on it — exactly like the startup model switch. This
-        // runs even when re-selecting the server we are already on.
-        if detect_model
-            && let Some(profile) = config.llms.get(&active_model)
-            && let Some((old_model, new_model)) = try_startup_model_switch(
+        // runs even when re-selecting the server we are already on. Under a
+        // confirmed coordinator, it alone owns every model/role decision, so
+        // neither this nor the embeddings re-detection below applies.
+        if detect_model {
+            let is_coordinator = is_active_connection_a_coordinator(
                 &status_http_client,
-                profile,
-                &mut active_model_id,
+                &config,
+                &active_model,
                 current_endpoint.as_deref(),
             )
-            .await
-        {
-            output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
+            .await;
+            if !is_coordinator
+                && let Some(profile) = config.llms.get(&active_model)
+                && let Some((old_model, new_model)) = try_startup_model_switch(
+                    &status_http_client,
+                    profile,
+                    &mut active_model_id,
+                    current_endpoint.as_deref(),
+                )
+                .await
+            {
+                output_state.push_text(&format!("Switched model from {old_model} to {new_model}"));
+            }
+            // Re-detect embeddings capability against whichever connection is
+            // now active: switching to (or away from) a coordinator
+            // mid-session changes what's actually embeddings-capable, and the
+            // startup-only detection would otherwise leave /search
+            // permanently disabled (or stuck pointed at a server no longer in
+            // use) for the rest of the session.
+            embeddings_server =
+                detect_embeddings_server(&config, &active_model, is_coordinator).await;
         }
         match command_outcome {
             CommandOutcome::Quit => {
@@ -1590,10 +1648,30 @@ async fn run() -> Result<()> {
                 continue;
             }
             CommandOutcome::Review(launch) => {
+                if header_status.is_coordinator
+                    && let Some(endpoint) = current_endpoint.as_deref()
+                    && let Some(profile) = review_prompt_profile(
+                        &config,
+                        &active_model,
+                        &active_model_id,
+                        endpoint,
+                        header_status.is_coordinator,
+                    )
+                {
+                    spawn_coordinator_activation_hint(
+                        status_http_client.clone(),
+                        profile.endpoint.clone(),
+                        profile.model.clone(),
+                        profile.api_key.clone(),
+                    );
+                }
                 let mut review = ReviewState::new(launch);
                 loop {
                     let chrome = ReviewChrome {
-                        current_model: &active_model_id,
+                        current_model: orangu::tui::display_model_name(
+                            header_status.is_coordinator,
+                            &active_model_id,
+                        ),
                         prompt_branch: prompt_branch.as_deref(),
                         pending_count: pending_commands.len(),
                         skills: &skills,
@@ -1642,7 +1720,13 @@ async fn run() -> Result<()> {
                                 });
                                 continue;
                             };
-                            let Some(profile) = config.llms.get(&active_model) else {
+                            let Some(prompt_profile) = review_prompt_profile(
+                                &config,
+                                &active_model,
+                                &active_model_id,
+                                endpoint,
+                                header_status.is_coordinator,
+                            ) else {
                                 review.feedback = Some(FeedbackWindow {
                                     title,
                                     question,
@@ -1652,9 +1736,6 @@ async fn run() -> Result<()> {
                                 });
                                 continue;
                             };
-                            let mut prompt_profile = profile.clone();
-                            prompt_profile.endpoint = endpoint.to_string();
-                            prompt_profile.model = active_model_id.clone();
                             let (prompt, stats) = build_review_prompt_with_stats(
                                 &path,
                                 &request,
@@ -1751,16 +1832,34 @@ async fn run() -> Result<()> {
                     output_state.reset_scroll();
                     continue;
                 };
-                let Some(profile) = config.llms.get(&active_model) else {
+                let Some(prompt_profile) = review_prompt_profile(
+                    &config,
+                    &active_model,
+                    &active_model_id,
+                    &endpoint,
+                    header_status.is_coordinator,
+                ) else {
                     output_state.push_text(&format!("Error: unknown server '{active_model}'"));
                     output_state.reset_scroll();
                     continue;
                 };
-                let mut prompt_profile = profile.clone();
-                prompt_profile.endpoint = endpoint;
-                prompt_profile.model = active_model_id.clone();
+                // Hint the coordinator to start swapping to the review role
+                // now, in parallel with the prestart screen / per-file setup
+                // run_auto_review_mode is about to do, instead of only
+                // starting the swap once the first real request fires.
+                if header_status.is_coordinator {
+                    spawn_coordinator_activation_hint(
+                        status_http_client.clone(),
+                        prompt_profile.endpoint.clone(),
+                        prompt_profile.model.clone(),
+                        prompt_profile.api_key.clone(),
+                    );
+                }
                 let chrome = ReviewChrome {
-                    current_model: &active_model_id,
+                    current_model: orangu::tui::display_model_name(
+                        header_status.is_coordinator,
+                        &active_model_id,
+                    ),
                     prompt_branch: prompt_branch.as_deref(),
                     pending_count: pending_commands.len(),
                     skills: &skills,
@@ -1927,7 +2026,7 @@ async fn run() -> Result<()> {
             output_state.reset_scroll();
             continue;
         };
-        if !header_status.model_ok {
+        if header_status.model_ok != orangu::tui::ConnStatus::Ok {
             if config.feedback {
                 output_state.push_text(FEEDBACK_ERR);
                 output_state.reset_scroll();
@@ -1942,9 +2041,21 @@ async fn run() -> Result<()> {
             output_state.reset_scroll();
             continue;
         }
+        // Under a confirmed coordinator, it alone owns model/role decisions:
+        // plain chat always names the conventional `code` role — orangu is
+        // fundamentally a coding assistant, so ordinary chat is the `code`
+        // role in spirit, while `all` is reserved as the coordinator's
+        // required universal fallback. If no dedicated `code` profile is
+        // configured, the coordinator falls back to `all` on its own; either
+        // way this ignores whatever wire model id orangu.conf (or a prior
+        // /model switch) happens to carry.
         let mut prompt_profile = profile.clone();
         prompt_profile.endpoint = endpoint.to_string();
-        prompt_profile.model = active_model_id.clone();
+        prompt_profile.model = if header_status.is_coordinator {
+            "code".to_string()
+        } else {
+            active_model_id.clone()
+        };
 
         if let Some((hash, diff)) = orangu::context::world_state::get_current_workspace_diff(
             &workspace,
@@ -2257,7 +2368,7 @@ mod tests {
 
     use super::{llm_prompt_block_reason, resolve_workspace_root};
 
-    use orangu::tui::HeaderStatus;
+    use orangu::tui::{ConnStatus, HeaderStatus};
 
     use std::path::PathBuf;
 
@@ -2286,8 +2397,9 @@ mod tests {
                 Some("http://localhost:8100/v1"),
                 HeaderStatus {
                     workspace_ok: true,
-                    server_ok: true,
-                    model_ok: false,
+                    server_ok: ConnStatus::Ok,
+                    model_ok: ConnStatus::Failed,
+                    is_coordinator: false,
                 }
             ),
             None
@@ -2297,8 +2409,9 @@ mod tests {
                 Some("http://localhost:8100/v1"),
                 HeaderStatus {
                     workspace_ok: true,
-                    server_ok: true,
-                    model_ok: true,
+                    server_ok: ConnStatus::Ok,
+                    model_ok: ConnStatus::Ok,
+                    is_coordinator: false,
                 }
             ),
             None
