@@ -12,6 +12,13 @@
 - `src/tools.rs` - workspace-scoped local tool execution
 - `src/tui.rs` - header, prompt frame, and status rendering
 
+## Prompt Construction & KV Caching
+
+Orangu is specifically optimized for local LLMs (like `llama.cpp`) which rely on exact token prefix matching to reuse KV cache and avoid massive prefill latencies. When developing features that touch `ChatSession`, you must preserve this cache:
+
+1. **Append-Only System Updates**: When updating the system prompt mid-session (e.g., changing workspaces or verbosity), `ChatSession::set_system_prompt()` appends the new instructions as a `user` message with a `[System Update]` prefix. It **never** mutates the initial system message (`messages[0]`). Mutating the first message would instantly destroy the prefix cache for the entire conversation.
+2. **In-Place Tool Eviction**: When context limits are reached, `compact_transcript` replaces old tool outputs with a tiny stub `[Tool output evicted...]`. Because this mutation happens in-place further down the array, it perfectly preserves the KV cache prefix for all messages that preceded it.
+
 ## Development workflow
 
 ```sh

@@ -66,11 +66,17 @@ impl ChatSession {
     }
 
     pub fn set_system_prompt(&mut self, prompt: &str) {
-        match self.messages.first_mut() {
-            Some(message) if message.role == "system" => {
-                message.content = prompt.to_string();
+        let has_user_turns = self.messages.iter().any(|m| m.role == "user");
+        if has_user_turns {
+            self.messages
+                .push(ChatMessage::user(&format!("[System Update]\n{}", prompt)));
+        } else {
+            match self.messages.first_mut() {
+                Some(message) if message.role == "system" => {
+                    message.content = prompt.to_string();
+                }
+                _ => self.messages.insert(0, ChatMessage::system(prompt)),
             }
-            _ => self.messages.insert(0, ChatMessage::system(prompt)),
         }
     }
 
