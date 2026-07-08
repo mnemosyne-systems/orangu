@@ -21,7 +21,7 @@ A bare number switches to the open tab with that number. Anything else is treate
 Tab completion offers the workspaces seen in earlier sessions first, then completes filesystem directories, so a directory that has never been opened can still be navigated to a segment at a time:
 
 ```text
-/workspace ~/pro⇥/ora⇥
+/workspace ~/pro<Tab>/ora<Tab>
 ```
 
 It is handled locally and works regardless of server or model state.

@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use super::*;
+use crate::llm::StreamPromptProgress;
 use crate::workspaces::WorkspacePlacement;
 use std::time::Duration;
 use terminal_size::{Height, Width, terminal_size};
@@ -454,6 +455,39 @@ pub fn render_working_status(frame: usize, rate: f64, elapsed: Duration) -> Stat
     }
 }
 
+/// Like [`render_thinking_status`] but for the prefill phase of a llama.cpp
+/// request, when the server has reported [`StreamPromptProgress`] — shows how
+/// much of the prompt is being served from its KV cache rather than
+/// reprocessed, e.g. `Thinking (41% cached, 620/1500 tok) (2s)`. This is the
+/// user-visible signal that orangu's append-only prompt discipline (see
+/// `doc/manual/en/70-dev.md`) is actually paying off.
+pub fn render_prefill_status(
+    frame: usize,
+    progress: StreamPromptProgress,
+    elapsed: Duration,
+) -> StatusFragment {
+    let total = progress.total.max(0);
+    let percent_cached = if total > 0 {
+        progress.cache.max(0) * 100 / total
+    } else {
+        0
+    };
+    let suffix = format!(
+        " ({percent_cached}% cached, {}/{total} tok) {}",
+        progress.processed.max(0),
+        format_elapsed_timer(elapsed)
+    );
+    StatusFragment {
+        rendered: format!(
+            "{}{}{}",
+            render_rolling_text(THINKING_TEXT, frame),
+            ANSI_RESET,
+            suffix
+        ),
+        visible_width: THINKING_TEXT.chars().count() + suffix.chars().count(),
+    }
+}
+
 /// An elapsed duration in its shortest form — `5s`, `1m5s`, `1h2m3s` — as used
 /// by the Thinking/Working status timers and the auto review status area.
 pub fn format_status_duration(elapsed: Duration) -> String {
@@ -806,6 +840,40 @@ mod tests {
         for ch in THINKING_TEXT.chars() {
             assert!(frame_zero.rendered.contains(ch));
         }
+    }
+
+    #[test]
+    fn prefill_status_shows_cache_percent_and_token_counts() {
+        let progress = StreamPromptProgress {
+            total: 1500,
+            cache: 615,
+            processed: 620,
+            time_ms: 2_000,
+        };
+        let frame_zero = render_prefill_status(0, progress, Duration::from_secs(2));
+        let frame_one = render_prefill_status(1, progress, Duration::from_secs(2));
+
+        // 615 * 100 / 1500 = 41 (integer division).
+        assert!(frame_zero.rendered.contains("41% cached"));
+        assert!(frame_zero.rendered.contains("620/1500 tok"));
+        assert!(frame_zero.rendered.contains("(2s)"));
+        assert_ne!(frame_zero.rendered, frame_one.rendered);
+        assert_eq!(
+            frame_zero.visible_width,
+            THINKING_TEXT.chars().count() + " (41% cached, 620/1500 tok) (2s)".chars().count()
+        );
+    }
+
+    #[test]
+    fn prefill_status_handles_zero_total_without_dividing_by_zero() {
+        let progress = StreamPromptProgress {
+            total: 0,
+            cache: 0,
+            processed: 0,
+            time_ms: 0,
+        };
+        let status = render_prefill_status(0, progress, Duration::from_secs(1));
+        assert!(status.rendered.contains("0% cached, 0/0 tok"));
     }
 
     #[test]

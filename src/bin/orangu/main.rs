@@ -112,7 +112,10 @@ use session_store::*;
 use stats::*;
 use terminal::*;
 use wait::*;
-use workspace_tab::{TabAction, TabServerConfig, WorkspaceRing, WorkspaceTab};
+use workspace_tab::{
+    TabAction, TabServerConfig, WorkspaceRing, WorkspaceTab, restore_session_slot,
+    save_session_slot, spawn_slot_save,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -223,6 +226,9 @@ async fn run() -> Result<()> {
     let status_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()?;
+    // Shared llama.cpp `id_slot` assignment across every tab's interactive
+    // session on this server (see `orangu::llm::SlotRegistry`).
+    let slot_registry = orangu::llm::SlotRegistry::default();
 
     // Server section names, used for `/server` completion.
     let server_names = sorted_model_names(&config.llms);
@@ -283,12 +289,33 @@ async fn run() -> Result<()> {
             model_id: active_model_id.clone(),
             endpoint: current_endpoint.clone(),
             llms: &config.llms,
+            slots: slot_registry.clone(),
         },
     )?;
     // Load the initial tab's branch from session metadata so that Alt+./, and
     // checkout_tab_branch! can restore the right branch on next tab switch.
     if let Some(branch) = load_session_branch(&initial_tab.session_id) {
         initial_tab.current_branch = Some(branch);
+    }
+    // Restore this tab's llama.cpp slot from disk, if one was saved for the
+    // same server+model in a previous run (see `SlotRegistry`) — skips
+    // re-prefilling a prefix llama.cpp already has cached, on both an
+    // explicit `--resume` and an automatic workspace+branch resume. A no-op
+    // for a brand-new session (nothing was ever saved for it).
+    if let Some(profile) = config.llms.get(&initial_tab.active_model)
+        && let Some(notice) = restore_session_slot(
+            &mut initial_tab.session,
+            &initial_tab.session_slot_path,
+            &initial_tab.session_id,
+            initial_tab.current_endpoint.as_deref(),
+            &initial_tab.active_model_id,
+            &slot_registry,
+            &status_http_client,
+            profile,
+        )
+        .await
+    {
+        initial_tab.output_state.push_text(&notice);
     }
     let mut ring = WorkspaceRing::new();
     // If -a/--all, reopen the workspace tabs that were open at the end of the
@@ -314,6 +341,7 @@ async fn run() -> Result<()> {
                         model_id: active_model_id.clone(),
                         endpoint: current_endpoint.clone(),
                         llms: &config.llms,
+                        slots: slot_registry.clone(),
                     },
                 )
             {
@@ -360,6 +388,7 @@ async fn run() -> Result<()> {
         mut session_hist_path,
         mut session_messages_path,
         mut session_metadata_path,
+        mut session_slot_path,
         mut current_branch,
         mut last_review_report,
         mut last_auto_review_report,
@@ -476,6 +505,7 @@ async fn run() -> Result<()> {
                 session_hist_path,
                 session_messages_path,
                 session_metadata_path,
+                session_slot_path,
                 current_branch,
                 last_review_report,
                 last_auto_review_report,
@@ -508,6 +538,7 @@ async fn run() -> Result<()> {
             session_hist_path = tab.session_hist_path;
             session_messages_path = tab.session_messages_path;
             session_metadata_path = tab.session_metadata_path;
+            session_slot_path = tab.session_slot_path;
             current_branch = tab.current_branch;
             last_review_report = tab.last_review_report;
             last_auto_review_report = tab.last_auto_review_report;
@@ -523,19 +554,67 @@ async fn run() -> Result<()> {
             current_endpoint = tab.current_endpoint;
         }};
     }
+    // Fire-and-forget save of the about-to-be-parked tab's llama.cpp slot (see
+    // `SlotRegistry`), so switching tabs doesn't block on a network
+    // round-trip. MUST be called before current_tab!()/ring.rotate/open, i.e.
+    // while `session` etc. still refer to the tab being left.
+    macro_rules! park_active_slot {
+        () => {
+            spawn_slot_save(
+                session.assigned_slot(),
+                &session_slot_path,
+                &session_id,
+                current_endpoint.as_deref(),
+                &active_model_id,
+                &slot_registry,
+                &status_http_client,
+            );
+        };
+    }
+    // Restore the newly active tab's llama.cpp slot from disk, if one was
+    // saved for the same server+model — skips re-prefilling a prefix
+    // llama.cpp already has cached. Awaited (not fire-and-forget): the user
+    // has to look at the tab before typing anyway, and the failure mode is
+    // parity with today's full-reprocess behavior.
+    //
+    // MUST be called after load_tab! so `session`/`active_model`/
+    // `current_endpoint` all refer to the incoming (newly active) tab.
+    macro_rules! restore_active_slot {
+        () => {
+            if let Some(profile) = config.llms.get(&active_model)
+                && let Some(notice) = restore_session_slot(
+                    &mut session,
+                    &session_slot_path,
+                    &session_id,
+                    current_endpoint.as_deref(),
+                    &active_model_id,
+                    &slot_registry,
+                    &status_http_client,
+                    profile,
+                )
+                .await
+            {
+                output_state.push_text(&notice);
+            }
+        };
+    }
     macro_rules! apply_tab_action {
         ($action:expr) => {{
             match $action {
                 TabAction::Next => {
                     current_branch = workspace_branch_name(tools.workspace());
+                    park_active_slot!();
                     let target = ring.rotate(current_tab!(), 1);
                     load_tab!(target);
+                    restore_active_slot!();
                     checkout_tab_branch!();
                 }
                 TabAction::Previous => {
                     current_branch = workspace_branch_name(tools.workspace());
+                    park_active_slot!();
                     let target = ring.rotate(current_tab!(), -1);
                     load_tab!(target);
+                    restore_active_slot!();
                     checkout_tab_branch!();
                 }
                 TabAction::SwitchTo(index) => {
@@ -543,8 +622,10 @@ async fn run() -> Result<()> {
                         output_state.push_text(&format!("No workspace {} is open.", index + 1));
                     } else {
                         current_branch = workspace_branch_name(tools.workspace());
+                        park_active_slot!();
                         let target = ring.switch_to(current_tab!(), index);
                         load_tab!(target);
+                        restore_active_slot!();
                         checkout_tab_branch!();
                     }
                 }
@@ -565,9 +646,13 @@ async fn run() -> Result<()> {
                             model_id: active_model_id.clone(),
                             endpoint: current_endpoint.clone(),
                             llms: &config.llms,
+                            slots: slot_registry.clone(),
                         },
                     ) {
                         Ok(new_tab) => {
+                            // No restore afterward: this is a brand-new
+                            // session with nothing saved to restore.
+                            park_active_slot!();
                             let target = ring.open(current_tab!(), new_tab);
                             load_tab!(target);
                         }
@@ -579,7 +664,7 @@ async fn run() -> Result<()> {
                         output_state.push_text("Only /quit exits orangu.");
                     } else {
                         let parked = current_tab!();
-                        let _ = parked.save();
+                        let _ = parked.save(&slot_registry, &status_http_client).await;
                         // `total > 1` guarantees a neighbour to focus.
                         let target = ring.close(parked).expect("more than one tab is open");
                         load_tab!(target);
@@ -637,8 +722,18 @@ async fn run() -> Result<()> {
             save_session_messages(&session_messages_path, session.messages())?;
             let active_branch = workspace_branch_name(tools.workspace());
             update_session_metadata_branch(&session_metadata_path, active_branch.as_deref())?;
+            save_session_slot(
+                session.assigned_slot(),
+                &session_slot_path,
+                &session_id,
+                current_endpoint.as_deref(),
+                &active_model_id,
+                &slot_registry,
+                &status_http_client,
+            )
+            .await;
             for tab in ring.parked() {
-                let _ = tab.save();
+                let _ = tab.save(&slot_registry, &status_http_client).await;
             }
             {
                 let active_pos = ring.active_pos();
@@ -1159,6 +1254,7 @@ async fn run() -> Result<()> {
                         model_id: active_model_id.clone(),
                         endpoint: current_endpoint.clone(),
                         llms: &config.llms,
+                        slots: slot_registry.clone(),
                     },
                 ) {
                     Ok(new_tab) => {
@@ -1203,6 +1299,7 @@ async fn run() -> Result<()> {
                             model_id: active_model_id.clone(),
                             endpoint: current_endpoint.clone(),
                             llms: &config.llms,
+                            slots: slot_registry.clone(),
                         },
                     ) {
                         Ok(new_tab) => {

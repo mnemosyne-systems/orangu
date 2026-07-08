@@ -167,7 +167,7 @@ select server local-llama
 
 Reports everything `orangu` can learn about the active server: every OpenAI-compatible endpoint orangu itself talks to (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever llama.cpp-native endpoints it exposes. It is handled entirely locally, needs no arguments, and never sends anything to the model.
 
-`/information` probes each capability independently — a plain OpenAI-compatible server (which has no llama.cpp-native endpoints) still gets a full report, just with those rows marked unavailable rather than the whole command failing. The result is a table, one row per capability, with a green dot for a capability that is available and enabled and a red dot for one that is not:
+`/information` probes each capability independently — a plain OpenAI-compatible server (which has no llama.cpp-native endpoints) still gets a full report, just with those rows marked unavailable rather than the whole command failing. The result is a table, one row per capability, with a green dot for a capability that is available and enabled and a red dot for one that is not (shown below as `x`, since this static example cannot render color):
 
 Most probes are side-effect-free `GET` requests, so they run unconditionally. `/v1/chat/completions` is the one exception — it only accepts real generation requests — so it is only actually sent on a local llama.cpp server; on a hosted API it is not sent, to avoid a needless (potentially billed) request (see the `/v1/chat/completions` row below).
 
@@ -178,11 +178,11 @@ Model   ggml-org/gemma-4-E4B-it-GGUF
 STATUS  API        ENDPOINT              DETAILS
 ●       OpenAI     /v1/models            ggml-org/gemma-4-E4B-it-GGUF
 ●       OpenAI     /v1/chat/completions  Ok
-✗       OpenAI     /v1/embeddings        Not available
+x       OpenAI     /v1/embeddings        Not available
 ●       llama.cpp  /health               Ok
 ●       llama.cpp  /props                n_ctx=32768 n_predict=-1 total_slots=1 temperature=0.8 top_k=40 top_p=0.95 model_path=/models/gemma.gguf bos_token=<bos> eos_token=<eos> build=b4200-abc1234 chat_template=yes
-✗       llama.cpp  /slots                Not available
-✗       llama.cpp  /metrics              Not available
+x       llama.cpp  /slots                Not available
+x       llama.cpp  /metrics              Not available
 ```
 
 Each row:

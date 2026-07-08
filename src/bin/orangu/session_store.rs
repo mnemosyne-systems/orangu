@@ -406,6 +406,38 @@ pub(crate) fn is_leap_year(y: u32) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
+/// Sidecar recording which server/model a session's saved llama.cpp slot (see
+/// `orangu::llm::SlotRegistry::save_slot`) was captured under, so a later
+/// restore attempt can be gated on both matching — restoring a KV cache saved
+/// under a different model is unsafe (tensor shapes are model-specific), and
+/// the server API doesn't protect against it.
+pub(crate) const SESSION_SLOT_FILE: &str = "slot.json";
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SessionSlotInfo {
+    pub(crate) server_endpoint: String,
+    pub(crate) model: String,
+    pub(crate) saved_at: u64,
+}
+
+pub(crate) fn save_session_slot_info(path: &Path, info: &SessionSlotInfo) -> Result<()> {
+    let json = serde_json::to_string(info).context("failed to serialize session slot info")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write session slot info {}", path.display()))
+}
+
+pub(crate) fn load_session_slot_info(path: &Path) -> Result<Option<SessionSlotInfo>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session slot info {}", path.display()))
+            .map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read session slot info {}", path.display()))
+        }
+    }
+}
+
 pub(crate) fn save_session_metadata(path: &Path, metadata: &SessionMetadata) -> Result<()> {
     let json = serde_json::to_string(metadata).context("failed to serialize session metadata")?;
     std::fs::write(path, json)

@@ -634,6 +634,11 @@ pub(crate) fn render_left_status(
     }
 
     if rendered_output.is_empty() {
+        if profile.provider.eq_ignore_ascii_case("llama.cpp")
+            && let Some(progress) = metrics.prompt_progress.filter(|p| p.total > 0)
+        {
+            return Some(orangu::tui::render_prefill_status(frame, progress, elapsed));
+        }
         return Some(render_thinking_status(frame, elapsed));
     }
 
@@ -822,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn llama_cpp_left_status_prefers_native_metrics() {
+    fn llama_cpp_left_status_shows_prefill_cache_progress_during_prefill() {
         let profile = LlmConfiguration {
             provider: "llama.cpp".to_string(),
             model: "model".to_string(),
@@ -838,7 +843,9 @@ mod tests {
             model_verbosity: None,
         };
 
-        let thinking = render_left_status(
+        // Still in prefill (no output yet) with cache progress reported: shows
+        // the cache-hit percentage rather than the plain thinking spinner.
+        let prefill = render_left_status(
             &profile,
             "",
             &StreamMetrics {
@@ -849,6 +856,26 @@ mod tests {
                     time_ms: 2_000,
                 }),
                 prompt_per_second: Some(15.0),
+                predicted_per_second: None,
+            },
+            None,
+            Duration::from_secs(2),
+            0,
+            None,
+        )
+        .expect("prefill status");
+        assert!(prefill.rendered.contains("20% cached"));
+        assert!(prefill.rendered.contains("60/100 tok"));
+        assert!(prefill.rendered.contains("(2s)"));
+
+        // Still in prefill with no progress reported yet (e.g. a non-llama.cpp
+        // server, or before the first progress event arrives): plain spinner.
+        let thinking = render_left_status(
+            &profile,
+            "",
+            &StreamMetrics {
+                prompt_progress: None,
+                prompt_per_second: None,
                 predicted_per_second: None,
             },
             None,

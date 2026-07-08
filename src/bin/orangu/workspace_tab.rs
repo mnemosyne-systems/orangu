@@ -35,6 +35,10 @@ pub(crate) struct TabServerConfig<'a> {
     pub(crate) model_id: String,
     pub(crate) endpoint: Option<String>,
     pub(crate) llms: &'a std::collections::HashMap<String, orangu::config::LlmConfiguration>,
+    /// Shared `id_slot` registry (see [`orangu::llm::SlotRegistry`]), so every
+    /// tab's interactive session pins its requests through the same
+    /// per-endpoint round-robin assignment.
+    pub(crate) slots: orangu::llm::SlotRegistry,
 }
 
 /// Everything that belongs to one workspace tab. The run loop reads and mutates
@@ -54,6 +58,9 @@ pub(crate) struct WorkspaceTab {
     pub(crate) session_hist_path: PathBuf,
     pub(crate) session_messages_path: PathBuf,
     pub(crate) session_metadata_path: PathBuf,
+    /// Sidecar recording which server/model this tab's saved llama.cpp slot
+    /// (if any) was captured under — see `session_store::SessionSlotInfo`.
+    pub(crate) session_slot_path: PathBuf,
     pub(crate) current_branch: Option<String>,
     /// The last `/review` summary and `/auto_review` report (Markdown), kept so
     /// `/comment <number> with [auto] review` can post them. Per tab, since a
@@ -124,6 +131,7 @@ impl WorkspaceTab {
             model_id: default_model_id,
             endpoint: default_endpoint,
             llms: config_llms,
+            slots,
         } = server_config;
         let workspace_created = if !workspace.exists() {
             std::fs::create_dir_all(&workspace)
@@ -182,6 +190,7 @@ impl WorkspaceTab {
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");
         let session_metadata_path = session_dir.join("metadata");
+        let session_slot_path = session_dir.join(SESSION_SLOT_FILE);
 
         if !is_resumed {
             save_session_metadata(
@@ -206,7 +215,7 @@ impl WorkspaceTab {
             ep.push_str(&orangu::config::load_agents_instructions(&workspace));
             ep
         };
-        let mut session = ChatSession::new(&enhanced_prompt);
+        let mut session = ChatSession::new(&enhanced_prompt).with_slots(slots);
         if is_resumed {
             session.restore(load_session_messages(&session_messages_path)?);
         }
@@ -239,6 +248,7 @@ impl WorkspaceTab {
             session_hist_path,
             session_messages_path,
             session_metadata_path,
+            session_slot_path,
             current_branch,
             last_review_report: None,
             last_auto_review_report: None,
@@ -256,9 +266,16 @@ impl WorkspaceTab {
     }
 
     /// Persist this tab's conversation and bump its session's last-updated
-    /// timestamp. Called when leaving a tab (switch/close) and on quit, so every
-    /// tab a run touched is resumable afterwards.
-    pub(crate) fn save(&self) -> Result<()> {
+    /// timestamp, then (best-effort, blocking) save its assigned llama.cpp
+    /// slot's KV cache to disk — see [`save_session_slot`]. Called when
+    /// leaving a tab (close) and on quit, so every tab a run touched is both
+    /// resumable and, where the server supports it, resumable without a full
+    /// re-prefill.
+    pub(crate) async fn save(
+        &self,
+        slots: &orangu::llm::SlotRegistry,
+        client: &reqwest::Client,
+    ) -> Result<()> {
         // While a background streaming task owns the real session, `self.session`
         // is a placeholder. Skip the message write so we don't overwrite the last
         // good save with an empty placeholder conversation.
@@ -269,6 +286,16 @@ impl WorkspaceTab {
             &self.session_metadata_path,
             self.current_branch.as_deref(),
         )?;
+        save_session_slot(
+            self.session.assigned_slot(),
+            &self.session_slot_path,
+            &self.session_id,
+            self.current_endpoint.as_deref(),
+            &self.active_model_id,
+            slots,
+            client,
+        )
+        .await;
         Ok(())
     }
 
@@ -297,6 +324,129 @@ impl WorkspaceTab {
             return TabStatus::BranchGone;
         }
         TabStatus::Valid
+    }
+}
+
+/// Persist `assigned_slot`'s KV cache to disk (see
+/// [`orangu::llm::SlotRegistry::save_slot`]) and record a
+/// [`SessionSlotInfo`] sidecar recording the server/model it was saved
+/// under, so a later restore can be gated on both still matching. A no-op
+/// when no slot is assigned (nothing to save) or the tab is disconnected.
+/// Best-effort: failures are silent here — the one-time user-facing notice
+/// lives on the restore path (see [`restore_session_slot`]), since a save
+/// often has no live output surface the user will see before the tab or
+/// process is gone.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_session_slot(
+    assigned_slot: Option<u32>,
+    session_slot_path: &Path,
+    session_id: &str,
+    current_endpoint: Option<&str>,
+    active_model_id: &str,
+    slots: &orangu::llm::SlotRegistry,
+    client: &reqwest::Client,
+) {
+    let Some(id_slot) = assigned_slot else {
+        return;
+    };
+    let Some(endpoint) = current_endpoint else {
+        return;
+    };
+    let filename = format!("{session_id}.bin");
+    let outcome = slots
+        .save_slot(client, endpoint, None, id_slot, &filename)
+        .await;
+    if outcome == orangu::llm::SaveRestoreOutcome::Ok {
+        let info = SessionSlotInfo {
+            server_endpoint: endpoint.to_string(),
+            model: active_model_id.to_string(),
+            saved_at: current_unix_timestamp(),
+        };
+        let _ = save_session_slot_info(session_slot_path, &info);
+    }
+}
+
+/// Fire-and-forget version of [`save_session_slot`] for parking a tab
+/// (switching away from it), where the switch itself must not block on a
+/// network round-trip. Losing this save to a near-simultaneous `/quit` is
+/// harmless — [`WorkspaceTab::save`]'s blocking version (used on close/quit)
+/// is authoritative; this is purely a latency optimization for the next
+/// activation of this tab.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_slot_save(
+    assigned_slot: Option<u32>,
+    session_slot_path: &Path,
+    session_id: &str,
+    current_endpoint: Option<&str>,
+    active_model_id: &str,
+    slots: &orangu::llm::SlotRegistry,
+    client: &reqwest::Client,
+) {
+    let session_slot_path = session_slot_path.to_path_buf();
+    let session_id = session_id.to_string();
+    let current_endpoint = current_endpoint.map(str::to_string);
+    let active_model_id = active_model_id.to_string();
+    let slots = slots.clone();
+    let client = client.clone();
+    tokio::spawn(async move {
+        save_session_slot(
+            assigned_slot,
+            &session_slot_path,
+            &session_id,
+            current_endpoint.as_deref(),
+            &active_model_id,
+            &slots,
+            &client,
+        )
+        .await;
+    });
+}
+
+/// Resolve a slot for `session` on `profile`'s endpoint and, if a matching
+/// [`SessionSlotInfo`] sidecar was saved for the same server and model,
+/// restore it — so switching a tab back in, or resuming a session at
+/// startup, skips re-prefilling a prefix llama.cpp already has cached on
+/// disk. A mismatched or missing sidecar skips the restore silently (normal
+/// full reprocessing, no functional loss).
+///
+/// Returns `Some(notice)` exactly once per server the first time it's found
+/// not to support slot persistence, for the caller to show the user; `None`
+/// otherwise (including on every ordinary successful/no-op restore).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_session_slot(
+    session: &mut ChatSession,
+    session_slot_path: &Path,
+    session_id: &str,
+    current_endpoint: Option<&str>,
+    active_model_id: &str,
+    slots: &orangu::llm::SlotRegistry,
+    client: &reqwest::Client,
+    profile: &orangu::config::LlmConfiguration,
+) -> Option<String> {
+    let endpoint = current_endpoint?;
+    // Check the sidecar before assigning a slot: a missing/mismatched sidecar
+    // means there is nothing to restore, so skip the network probe behind
+    // `ensure_slot_assigned` entirely — it still happens lazily on this
+    // session's first prompt (see `ChatSession::prompt`), just not here.
+    let info = load_session_slot_info(session_slot_path).ok().flatten()?;
+    if info.server_endpoint != endpoint || info.model != active_model_id {
+        return None;
+    }
+    let id_slot = session.ensure_slot_assigned(profile, client).await?;
+    let filename = format!("{session_id}.bin");
+    let outcome = slots
+        .restore_slot(client, endpoint, None, id_slot, &filename)
+        .await;
+    if outcome == orangu::llm::SaveRestoreOutcome::Unsupported
+        && slots.notify_save_restore_unsupported(endpoint)
+    {
+        Some(
+            "KV cache persistence unavailable on this server (no --slot-save-path configured); \
+             prompts will fully reprocess on tab switch."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -436,6 +586,7 @@ mod tests {
             session_hist_path: PathBuf::from(workspace),
             session_messages_path: PathBuf::from(workspace),
             session_metadata_path: PathBuf::from(workspace),
+            session_slot_path: PathBuf::from(workspace),
             current_branch: None,
             last_review_report: None,
             last_auto_review_report: None,
@@ -543,5 +694,144 @@ mod tests {
             ring.position_of(&active.workspace, std::path::Path::new("/z")),
             None
         );
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("orangu-slot-test-{nanos}-{name}"))
+    }
+
+    /// Serve exactly one `POST /slots/{id}?action=save|restore` request,
+    /// answering `200 OK`.
+    fn serve_one_slot_ok(listener: std::net::TcpListener) {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+    }
+
+    #[tokio::test]
+    async fn save_session_slot_is_a_no_op_without_an_assigned_slot_or_endpoint() {
+        let sidecar = unique_temp_path("no-slot.json");
+        let slots = orangu::llm::SlotRegistry::default();
+        let client = reqwest::Client::new();
+
+        // No assigned slot: nothing to save, no request made, no sidecar.
+        save_session_slot(
+            None,
+            &sidecar,
+            "session-1",
+            Some("http://127.0.0.1:1"),
+            "model",
+            &slots,
+            &client,
+        )
+        .await;
+        assert!(!sidecar.exists());
+
+        // Assigned slot but no endpoint (disconnected tab): same no-op.
+        save_session_slot(
+            Some(0),
+            &sidecar,
+            "session-1",
+            None,
+            "model",
+            &slots,
+            &client,
+        )
+        .await;
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn save_session_slot_writes_a_sidecar_on_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        serve_one_slot_ok(listener);
+        let endpoint = format!("http://{addr}");
+        let sidecar = unique_temp_path("saved.json");
+        let slots = orangu::llm::SlotRegistry::default();
+        let client = reqwest::Client::new();
+
+        save_session_slot(
+            Some(0),
+            &sidecar,
+            "session-1",
+            Some(endpoint.as_str()),
+            "model-a",
+            &slots,
+            &client,
+        )
+        .await;
+
+        let info = load_session_slot_info(&sidecar)
+            .expect("read sidecar")
+            .expect("sidecar written");
+        assert_eq!(info.server_endpoint, endpoint);
+        assert_eq!(info.model, "model-a");
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[tokio::test]
+    async fn restore_session_slot_skips_silently_on_model_mismatch() {
+        let sidecar = unique_temp_path("mismatch.json");
+        save_session_slot_info(
+            &sidecar,
+            &SessionSlotInfo {
+                server_endpoint: "http://127.0.0.1:9".to_string(),
+                model: "old-model".to_string(),
+                saved_at: 0,
+            },
+        )
+        .expect("write sidecar");
+
+        // No assign_slot listener is set up: a real llama.cpp server would be
+        // needed for `ensure_slot_assigned` to succeed, but the mismatch check
+        // (different model) must skip before any restore request is even
+        // considered, regardless — this exercises the model-gating path.
+        let mut session = orangu::session::ChatSession::new("system")
+            .with_slots(orangu::llm::SlotRegistry::default());
+        let profile = orangu::config::LlmConfiguration {
+            provider: "llama.cpp".to_string(),
+            endpoint: "http://127.0.0.1:9".to_string(),
+            model: "new-model".to_string(),
+            role: "all".to_string(),
+            api_key: None,
+            request_timeout_seconds: 1,
+            max_tool_rounds: 10,
+            review_max_tokens: 512,
+            review_confidence_threshold: 80,
+            code_max_tokens: 0,
+            system_prompt: "".to_string(),
+            model_verbosity: None,
+        };
+        let slots = orangu::llm::SlotRegistry::default();
+        let client = reqwest::Client::new();
+
+        let notice = restore_session_slot(
+            &mut session,
+            &sidecar,
+            "session-1",
+            Some("http://127.0.0.1:9"),
+            "new-model",
+            &slots,
+            &client,
+            &profile,
+        )
+        .await;
+        assert_eq!(notice, None);
+        let _ = std::fs::remove_file(&sidecar);
     }
 }

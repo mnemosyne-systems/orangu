@@ -30,19 +30,27 @@ for example for an AMD/Vulkan based platform.
 
 **Running**
 
-Small model
+`role = all`
 
 ```sh
-llama-server -hf ggml-org/gemma-4-E4B-it-GGUF \
+llama-server -hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
              --port 8100 \
-             --ctx-size 65536 \
+             --ctx-size 262144 \
              -sm layer \
              -t 4 \
              --webui-mcp-proxy \
-             --fit on
+             --fit on \
+             --tools all \
+             -b 2048 \
+             -ub 2048 \
+             --cache-reuse 256 \
+             --slot-save-path ~/.orangu/llama-slots \
+             -fa on \
+             -ctk q8_0 \
+             -ctv q8_0
 ```
 
-Coding model
+`role = code`
 
 ```sh
 llama-server -hf yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF \
@@ -52,48 +60,45 @@ llama-server -hf yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF \
              --webui-mcp-proxy \
              --fit on \
              --image-min-tokens 1024 \
-             --tools all
+             --tools all \
+             -b 2048 \
+             -ub 2048 \
+             --cache-reuse 256 \
+             --slot-save-path ~/.orangu/llama-slots \
+             -fa on \
+             -ctk q8_0 \
+             -ctv q8_0
 ```
 
-or
+`role = review`
 
 ```sh
-llama-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
+llama-server -hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
              --port 8100 \
              --ctx-size 262144 \
+             -np 1 \
+             -fa on \
              -sm layer \
              -t 4 \
              --webui-mcp-proxy \
-             --fit on
+             --fit on \
+             --tools all \
+             -b 2048 \
+             -ub 2048 \
+             --cache-reuse 256 \
+             --slot-save-path ~/.orangu/llama-slots \
+             --reasoning-budget 0 \
+             --reasoning off \
+             -ctk q8_0 \
+             -ctv q8_0
 ```
 
-Big model
+`role = explorer`
 
 ```sh
-llama-server -hf bartowski/Qwen_Qwen3.6-27B-GGUF \
+llama-server -hf bartowski/gemma-4-12B-it-GGUF \
              --port 8100 \
-             --ctx-size 65536 \
-             -t 4 \
-             --webui-mcp-proxy \
-             --fit on
-```
-
-Review model
-
-[Gemma4](https://huggingface.co/collections/ggml-org/gemma-4) models will work locally.
-
-For example
-
-* gemma-4-E4B-it-GGUF
-* gemma-4-12B-it-GGUF
-* gemma-4-31B-it-GGUF
-
-depending on your machine size, and then
-
-```sh
-llama-server -hf ggml-org/gemma-4-12B-it-GGUF \
-             --port 8100 \
-             --ctx-size 262144 \
+             --ctx-size 131072 \
              -np 1 \
              -fa on \
              -ctk q8_0 \
@@ -101,8 +106,7 @@ llama-server -hf ggml-org/gemma-4-12B-it-GGUF \
              -b 2048 \
              -ub 2048 \
              --cache-reuse 256 \
-             --reasoning-budget 0 \
-             --reasoning off \
+             --slot-save-path ~/.orangu/llama-slots \
              --temp 0.7 \
              --top-p 0.8 \
              --top-k 20 \
@@ -111,23 +115,22 @@ llama-server -hf ggml-org/gemma-4-12B-it-GGUF \
              --fit on
 ```
 
-Or, you can use a Qwen model which might give more feedback, but many more false positives
+`--slot-save-path PATH` turns on llama.cpp's slot save/restore endpoints; `orangu`
+uses them automatically when present to persist a session's KV cache to disk on
+tab park/close/quit and reload it on tab activate/resume, avoiding a full
+re-prefill of the conversation so far. **Create the directory before starting
+the server** — llama-server exits immediately with "not a directory" if `PATH`
+does not already exist:
 
 ```sh
-llama-server -hf bartowski/Qwen_Qwen3.6-35B-A3B-GGUF \
-             --port 8100 \
-             --ctx-size 32768 \
-             -np 1 \
-             -fa on \
-             -ctk q8_0 -ctv q8_0 \
-             -b 2048 -ub 2048 \
-             --cache-reuse 256 \
-             --reasoning-budget 0 \
-             --chat-template-kwargs '{"enable_thinking": false}' \
-             --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 \
-             --jinja \
-             --fit on
+mkdir -p ~/.orangu/llama-slots
 ```
+
+The flag is optional: without it, `orangu` detects the server doesn't support
+slot persistence (one informational notice, not an error) and behaves exactly
+as before. Combined with `--cache-reuse`, above, both layers of `orangu`'s KV
+cache cooperation are then active — in-memory reuse across requests within a
+session, and on-disk persistence across tab switches and restarts.
 
 Embedding model
 

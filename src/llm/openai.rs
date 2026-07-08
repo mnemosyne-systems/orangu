@@ -33,6 +33,10 @@ pub struct OpenAiClient {
     /// Response-token cap sent as `max_tokens`; `None` leaves the server's
     /// default in place.
     max_tokens: Option<u32>,
+    /// llama.cpp `id_slot` to pin this request to, from
+    /// [`crate::llm::SlotRegistry`]; `None` lets the server assign any idle
+    /// slot (today's behavior). Never sent to a non-llama.cpp server.
+    id_slot: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +52,8 @@ struct OpenAiChatRequest<'a> {
     timings_per_token: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     return_progress: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_slot: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -132,6 +138,7 @@ impl OpenAiClient {
             // Normal chat/tool responses are capped by the configured
             // `code_max_tokens` (0 = no cap).
             max_tokens: (profile.code_max_tokens > 0).then_some(profile.code_max_tokens),
+            id_slot: None,
         })
     }
 
@@ -140,6 +147,13 @@ impl OpenAiClient {
     /// never sent to the server, which would request an empty response.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = (max_tokens > 0).then_some(max_tokens);
+        self
+    }
+
+    /// Pin every request from this client to a specific llama.cpp `id_slot`
+    /// (see [`crate::llm::SlotRegistry`]). Ignored on non-llama.cpp servers.
+    pub fn with_id_slot(mut self, id_slot: Option<u32>) -> Self {
+        self.id_slot = id_slot;
         self
     }
 
@@ -163,6 +177,7 @@ impl OpenAiClient {
             max_tokens: self.max_tokens,
             timings_per_token: self.llama_cpp.then_some(true),
             return_progress: self.llama_cpp.then_some(true),
+            id_slot: self.llama_cpp.then_some(self.id_slot).flatten(),
         };
 
         let mut builder = self.http_client.post(&url).json(&request);
@@ -495,6 +510,7 @@ mod tests {
             max_tokens: Some(512),
             timings_per_token: None,
             return_progress: None,
+            id_slot: None,
         };
 
         let encoded = serde_json::to_value(&request).expect("serialize request");
@@ -502,6 +518,65 @@ mod tests {
             encoded.get("max_tokens"),
             Some(&serde_json::Value::Number(512.into()))
         );
+    }
+
+    #[test]
+    fn id_slot_serializes_only_when_set() {
+        let unset = OpenAiChatRequest {
+            model: "model",
+            messages: &[],
+            stream: true,
+            tools: None,
+            max_tokens: None,
+            timings_per_token: None,
+            return_progress: None,
+            id_slot: None,
+        };
+        let encoded = serde_json::to_value(&unset).expect("serialize request");
+        assert_eq!(encoded.get("id_slot"), None);
+
+        let pinned = OpenAiChatRequest {
+            id_slot: Some(2),
+            ..unset
+        };
+        let encoded = serde_json::to_value(&pinned).expect("serialize request");
+        assert_eq!(
+            encoded.get("id_slot"),
+            Some(&serde_json::Value::Number(2.into()))
+        );
+    }
+
+    #[test]
+    fn with_id_slot_sets_the_field_regardless_of_provider() {
+        // `chat()` itself is what drops `id_slot` for non-llama.cpp providers
+        // (`self.llama_cpp.then_some(self.id_slot).flatten()`); the builder
+        // just records what was requested.
+        let mut profile = LlmConfiguration {
+            provider: "openai".to_string(),
+            endpoint: "http://localhost:8100".to_string(),
+            model: "model".to_string(),
+            role: "all".to_string(),
+            api_key: None,
+            request_timeout_seconds: 5,
+            max_tool_rounds: 10,
+            review_max_tokens: 512,
+            review_confidence_threshold: 80,
+            code_max_tokens: 0,
+            system_prompt: "".to_string(),
+            model_verbosity: None,
+        };
+        let client = OpenAiClient::from_profile(&profile)
+            .expect("client")
+            .with_id_slot(Some(3));
+        assert!(!client.llama_cpp);
+        assert_eq!(client.id_slot, Some(3));
+
+        profile.provider = "llama.cpp".to_string();
+        let client = OpenAiClient::from_profile(&profile)
+            .expect("client")
+            .with_id_slot(Some(3));
+        assert!(client.llama_cpp);
+        assert_eq!(client.id_slot, Some(3));
     }
 
     #[test]
@@ -514,6 +589,7 @@ mod tests {
             max_tokens: None,
             timings_per_token: Some(true),
             return_progress: Some(true),
+            id_slot: None,
         };
 
         let encoded = serde_json::to_value(&request).expect("serialize request");

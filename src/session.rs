@@ -15,7 +15,7 @@
 
 use crate::{
     config::LlmConfiguration,
-    llm::{ChatMessage, LlmResponse, OpenAiClient, StreamMetrics},
+    llm::{ChatMessage, LlmResponse, OpenAiClient, SlotRegistry, StreamMetrics},
     tools::ToolExecutor,
 };
 use anyhow::{Result, anyhow};
@@ -26,6 +26,22 @@ pub struct ChatSession {
     /// connection pool survives between requests. Rebuilt only when the
     /// profile fields that shape the client change.
     client: Option<(ClientKey, OpenAiClient)>,
+
+    /// The `id_slot` registry to pin this session's requests through, set via
+    /// [`Self::with_slots`]. `None` (the default) means this session never
+    /// pins a slot — the right choice for scratch/one-shot sessions
+    /// (`/auto_review`, `explorer.rs`, tests) that gain nothing from it and
+    /// would otherwise each pay a redundant `/props` probe.
+    slots: Option<SlotRegistry>,
+    /// This session's currently assigned slot, and the endpoint it was
+    /// assigned for — re-resolved by [`Self::ensure_slot_assigned`] whenever
+    /// the profile's endpoint changes (e.g. after `/server`).
+    assigned_slot: Option<u32>,
+    assigned_slot_endpoint: Option<String>,
+    /// A plain client used only for the (at most once per endpoint) `/props`
+    /// probe behind slot assignment — distinct from `client`'s
+    /// [`OpenAiClient`], which is rebuilt on profile changes and not exposed.
+    probe_client: reqwest::Client,
 
     pub model_verbosity_override: Option<String>,
 }
@@ -60,9 +76,51 @@ impl ChatSession {
         Self {
             messages: vec![ChatMessage::system(system_prompt)],
             client: None,
+            slots: None,
+            assigned_slot: None,
+            assigned_slot_endpoint: None,
+            probe_client: reqwest::Client::new(),
 
             model_verbosity_override: None,
         }
+    }
+
+    /// Attach a shared [`SlotRegistry`] so this session's requests pin to a
+    /// specific llama.cpp `id_slot`. Only the interactive per-tab session
+    /// should call this — see the `slots` field doc.
+    pub fn with_slots(mut self, slots: SlotRegistry) -> Self {
+        self.slots = Some(slots);
+        self
+    }
+
+    pub fn assigned_slot(&self) -> Option<u32> {
+        self.assigned_slot
+    }
+
+    /// (Re)resolve `assigned_slot` for `profile`'s endpoint if a
+    /// [`SlotRegistry`] is attached and the endpoint changed since the last
+    /// assignment (e.g. a `/server` switch). A no-op returning `None` when no
+    /// registry is attached. Called automatically by [`Self::prompt`] /
+    /// [`Self::prompt_without_tools`]; Feature C's tab-activate/resume path
+    /// calls it explicitly to resolve a slot before attempting a restore.
+    pub async fn ensure_slot_assigned(
+        &mut self,
+        profile: &LlmConfiguration,
+        client: &reqwest::Client,
+    ) -> Option<u32> {
+        let slots = self.slots.as_ref()?;
+        if !profile.provider.eq_ignore_ascii_case("llama.cpp") {
+            self.assigned_slot = None;
+            self.assigned_slot_endpoint = None;
+            return None;
+        }
+        if self.assigned_slot_endpoint.as_deref() != Some(profile.endpoint.as_str()) {
+            self.assigned_slot = slots
+                .assign_slot(client, &profile.endpoint, profile.api_key.as_deref())
+                .await;
+            self.assigned_slot_endpoint = Some(profile.endpoint.clone());
+        }
+        self.assigned_slot
     }
 
     pub fn set_system_prompt(&mut self, prompt: &str) {
@@ -137,10 +195,14 @@ impl ChatSession {
         F: FnMut(&str),
         G: FnMut(StreamMetrics),
     {
+        let probe_client = self.probe_client.clone();
+        let id_slot = self.ensure_slot_assigned(profile, &probe_client).await;
         // Built per call rather than cached: the cached client is keyed for
         // the tool-enabled flow and carries that flow's response cap, not
         // this request's.
-        let client = OpenAiClient::from_profile(profile)?.with_max_tokens(max_response_tokens);
+        let client = OpenAiClient::from_profile(profile)?
+            .with_max_tokens(max_response_tokens)
+            .with_id_slot(id_slot);
         let checkpoint = self.checkpoint();
         self.messages.push(ChatMessage::user(user_input));
         match client
@@ -191,13 +253,19 @@ impl ChatSession {
         {
             self.client = Some((key, OpenAiClient::from_profile(profile)?));
         }
+        let probe_client = self.probe_client.clone();
+        let id_slot = self.ensure_slot_assigned(profile, &probe_client).await;
         // Cheap clone: shares the underlying reqwest connection pool.
+        // `id_slot` is applied to the clone, not the cached client, since the
+        // assignment can change (e.g. after `/server`) without invalidating
+        // the connection pool `ClientKey` intentionally leaves it out of.
         let client = self
             .client
             .as_ref()
             .expect("client populated above")
             .1
-            .clone();
+            .clone()
+            .with_id_slot(id_slot);
         let tool_definitions = tools.definitions();
         let checkpoint = self.checkpoint();
         self.messages.push(ChatMessage::user(user_input));
