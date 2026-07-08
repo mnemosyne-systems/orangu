@@ -142,6 +142,11 @@ static MARCO_PIERRE_WHITE: &[&str] = &[
     "Once you accept you are being judged by people who have less knowledge than yourself, then what's it worth?",
     "People who can give themselves every day. They're the people that I admire, they're real people.",
     "A person who works with their hands is a labourer, a person who works with their hands and their brain is a craftsman, a person who works with their hands, their brain and their heart is an artist. Ask yourself, who are you?",
+    "Taste. Taste. Taste.",
+    "Keep it simple.",
+    "Look at each individual ingredient for what it is, not for what you want it to be.",
+    "If you look at my hand what do you see ? A palm. I see four knuckles. We are looking at the same thing, but we are seeing something very different.",
+    "Never allow the obvious to blind you.",
 ];
 
 static GORDON_RAMSAY: &[&str] = &[
