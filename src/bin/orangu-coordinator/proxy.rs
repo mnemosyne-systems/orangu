@@ -144,20 +144,36 @@ pub async fn proxy(
     let implied_role = implied_role_for_path(uri.path());
     let entry = coordinator
         .resolve_entry(model_hint.as_deref(), implied_role)
-        .await
-        .clone();
+        .await;
 
-    let origin = match coordinator.ensure_active(&entry).await {
-        Ok(origin) => origin,
+    let (origin, effective_entry) = match coordinator.ensure_active(&entry).await {
+        Ok(origin) => (origin, entry),
         Err(err) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "orangu-coordinator: failed to start '{}': {err:#}",
-                    entry.name
-                ),
-            )
-                .into_response();
+            let default_entry = coordinator.default_entry();
+            if entry.name != default_entry.name {
+                eprintln!(
+                    "warning: failed to start '{}': {err:#}; falling back to '{}'",
+                    entry.name, default_entry.name
+                );
+                match coordinator.ensure_active(&default_entry).await {
+                    Ok(origin) => (origin, default_entry),
+                    Err(fallback_err) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("orangu-coordinator: failed to start both '{}' and fallback '{}': {fallback_err:#}", entry.name, default_entry.name),
+                        ).into_response();
+                    }
+                }
+            } else {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "orangu-coordinator: failed to start default profile '{}': {err:#}",
+                        entry.name
+                    ),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -174,7 +190,7 @@ pub async fn proxy(
         }
         request = request.header(name, value);
     }
-    if let Some(api_key) = &entry.api_key {
+    if let Some(api_key) = &effective_entry.api_key {
         request = request.bearer_auth(api_key);
     }
 

@@ -138,7 +138,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match build_runtime().block_on(run(args, config, std_listener)) {
+    match build_runtime().block_on(run(args, config, std_listener, config_path)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -175,6 +175,7 @@ async fn run(
     args: Args,
     config: CoordinatorConfiguration,
     std_listener: std::net::TcpListener,
+    config_path: PathBuf,
 ) -> Result<()> {
     let _terminal_title_guard = (!args.daemon).then(|| TerminalTitleGuard::new(TERMINAL_TITLE));
     let listen = config.listen_addr();
@@ -187,6 +188,7 @@ async fn run(
         .collect();
     profile_summary.sort();
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let coordinator = Arc::new(Coordinator::new(config, args.quiet)?);
 
     // Eagerly activate the `all`-role profile so the default model is
@@ -211,6 +213,45 @@ async fn run(
         }
     });
 
+    let background_coordinator = coordinator.clone();
+    let config_path_clone = config_path.clone();
+    tokio::spawn(async move {
+        let mut last_modified = tokio::fs::metadata(&config_path_clone)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            // Check config
+            if let Ok(metadata) = tokio::fs::metadata(&config_path_clone).await
+                && let Ok(modified) = metadata.modified()
+                && Some(modified) != last_modified
+            {
+                last_modified = Some(modified);
+                if let Ok(new_config) = load_coordinator_configuration(&config_path_clone) {
+                    if !quiet {
+                        println!(
+                            "reloaded configuration from {}",
+                            config_path_clone.display()
+                        );
+                    }
+                    background_coordinator.reload_config(new_config);
+                    // Reconcile: if the active profile was removed or its
+                    // command changed, stop the now-stale process.
+                    background_coordinator.stop_if_stale().await;
+                } else if !quiet {
+                    eprintln!("warning: failed to reload configuration; keeping previous state");
+                }
+            }
+
+            // Check idle
+            if let Some(timeout_secs) = background_coordinator.idle_timeout() {
+                background_coordinator.unload_if_idle(timeout_secs).await;
+            }
+        }
+    });
+
     let app = Router::new()
         .route(
             "/v1/coordinator",
@@ -219,6 +260,30 @@ async fn run(
         .route(
             "/v1/coordinator/activate",
             axum::routing::post(proxy::activate),
+        )
+        .route(
+            "/v1/coordinator/shutdown",
+            axum::routing::get({
+                let tx = shutdown_tx.clone();
+                let shutdown_coordinator = coordinator.clone();
+                move |connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+                      query: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    // Defense-in-depth: reject non-loopback even with a valid token.
+                    if !connect_info.0.ip().is_loopback() {
+                        return (axum::http::StatusCode::FORBIDDEN, "shutdown is only available from localhost\n");
+                    }
+                    // Require a matching shutdown_token from config.
+                    let Some(expected) = shutdown_coordinator.shutdown_token() else {
+                        return (axum::http::StatusCode::NOT_FOUND, "shutdown endpoint is disabled; set shutdown_token in config to enable\n");
+                    };
+                    let provided = query.get("token").map(|s| s.as_str()).unwrap_or("");
+                    if provided != expected {
+                        return (axum::http::StatusCode::FORBIDDEN, "invalid shutdown token\n");
+                    }
+                    let _ = tx.send(()).await;
+                    (axum::http::StatusCode::OK, "shutting down...\n")
+                }
+            }),
         )
         .fallback(proxy::proxy)
         .layer(DefaultBodyLimit::max(max_body_bytes))
@@ -236,10 +301,16 @@ async fn run(
 
     let shutdown_coordinator = coordinator.clone();
     let result = tokio::select! {
-        result = axum::serve(listener, app) => result.context("server error"),
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.context("server error"),
         _ = tokio::signal::ctrl_c() => {
             if !args.quiet {
                 println!("shutting down...");
+            }
+            Ok(())
+        },
+        _ = shutdown_rx.recv() => {
+            if !args.quiet {
+                println!("shutting down via API...");
             }
             Ok(())
         }

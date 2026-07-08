@@ -72,6 +72,7 @@ llamacpp = llama-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF --host loc
 | `port` | `[orangu-coordinator]` | No | Port the proxy listens on. Defaults to `9000` |
 | `startup_timeout` | `[orangu-coordinator]` | No | Seconds to wait for a newly started llama.cpp to answer `/v1/models` before giving up. Defaults to `180` |
 | `max_body_bytes` | `[orangu-coordinator]` | No | Request/response body size cap in bytes. Defaults to `67108864` (64 MiB) |
+| `idle_timeout` | `[orangu-coordinator]` | No | Seconds of inactivity before automatically unloading the active model to free system resources (RAM/VRAM). Disabled by default. |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile |
 | `llamacpp` | profile | Yes | Full shell-style command line used to start llama.cpp for this profile, e.g. `llama-server -hf org/Model-GGUF --host localhost --port 8100 --ctx-size 32768`. There is no separate `model`, `host`, or `port` key — they're all read straight off this command line (`-hf`/`--hf-repo`/`-m`/`--model` for the model, `--host`/`--port` for where the coordinator proxies to). Leading `KEY=VALUE` tokens (e.g. `LLAMA_CACHE=/models llama-server ...`) are recognized and set as environment variables on the spawned process, and a leading `~`/`~/...` in any argument or value (e.g. `--slot-save-path ~/.orangu/llama-slots`) is expanded to the home directory — both are shell conveniences this command line would otherwise lose, since it's run directly rather than through a real shell |
 | `api_key` | profile | No | Sent as `Authorization: Bearer <key>` on the coordinator's own requests to this profile's llama.cpp, if `llamacpp` starts it with `--api-key` |
@@ -153,7 +154,9 @@ specialized model.
   `orangu.conf` enough headroom for a full cold load, not just a quick
   health check — otherwise `/search` may report itself unavailable simply
   because the very first detection attempt gave up too early.
-- On shutdown (`Ctrl+C`), the coordinator stops whatever `llama-server`
+- **Dynamic Hot-Reloading**: The coordinator watches `orangu-coordinator.conf` and hot-reloads changes automatically (polled every ~5 seconds) without needing a restart.
+- **Fallback Routing**: If a requested profile fails to load (e.g. out of memory), the coordinator automatically falls back to starting the `all`-role profile rather than failing the request entirely.
+- On shutdown (`Ctrl+C` or the internal `GET /v1/coordinator/shutdown` API), the coordinator gracefully stops whatever `llama-server`
   process is currently active — or still starting up — so nothing is left
   running in the background.
 

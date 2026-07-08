@@ -40,6 +40,8 @@ pub async fn run_init() -> Result<()> {
     let port = prompt_number::<u16>("port", default_port())?;
     let startup_timeout = prompt_number::<u64>("startup_timeout", default_startup_timeout())?;
     let max_body_bytes = prompt_number::<usize>("max_body_bytes", default_max_body_bytes())?;
+    let idle_timeout = prompt_optional_number::<u64>("idle_timeout")?;
+    let shutdown_token = prompt_optional_string("shutdown_token")?;
 
     let mut roles = vec![("all".to_string(), prompt_required_llamacpp("all")?)];
     for role in OPTIONAL_ROLES {
@@ -51,12 +53,18 @@ pub async fn run_init() -> Result<()> {
     // `[orangu-coordinator]` values are always written, even when left at
     // their default, so the generated file documents every mandatory
     // property explicitly.
-    let client = [
+    let mut client = vec![
         format!("host = {host}"),
         format!("port = {port}"),
         format!("startup_timeout = {startup_timeout}"),
         format!("max_body_bytes = {max_body_bytes}"),
     ];
+    if let Some(t) = idle_timeout {
+        client.push(format!("idle_timeout = {t}"));
+    }
+    if let Some(tok) = shutdown_token {
+        client.push(format!("shutdown_token = {tok}"));
+    }
 
     let mut contents = format!("[orangu-coordinator]\n{}\n", client.join("\n"));
     for (role, llamacpp) in &roles {
@@ -170,6 +178,34 @@ where
             Ok(parsed) => return Ok(parsed),
             Err(_) => println!("'{value}' is not a valid number."),
         }
+    }
+}
+
+/// Prompt for an optional value that must parse as `T` (e.g. a `u64`),
+/// re-prompting on anything that does not. An empty entry returns `None`.
+fn prompt_optional_number<T>(label: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr + std::fmt::Display,
+{
+    loop {
+        let value = prompt(&format!("{label} [none]: "))?;
+        if value.is_empty() {
+            return Ok(None);
+        }
+        match value.parse::<T>() {
+            Ok(parsed) => return Ok(Some(parsed)),
+            Err(_) => println!("'{value}' is not a valid number."),
+        }
+    }
+}
+
+/// Prompt for an optional string value. An empty entry returns `None`.
+fn prompt_optional_string(label: &str) -> Result<Option<String>> {
+    let value = prompt(&format!("{label} [none]: "))?;
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
     }
 }
 

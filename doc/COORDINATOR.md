@@ -82,6 +82,7 @@ dynamically per the routing order in [How it works](#how-it-works):
 | `GET /metrics` | *(none)* | Same as above |
 | `GET /v1/coordinator` | *(none — special)* | **Not pass-through.** Answered directly by the coordinator itself; see below |
 | `POST /v1/coordinator/activate` | Whatever `model` names | **Not pass-through.** A pre-warming hint, answered directly; see below |
+| `GET /v1/coordinator/shutdown` | *(none — special)* | **Not pass-through.** Cleanly terminates the proxy process and unloads the active model. Disabled unless `shutdown_token` is configured; requires `?token=<secret>` and a loopback source IP |
 
 The "currently active" fallback for the model-less rows matters in practice:
 without it, something like `/information` probing a server's `/health` would
@@ -178,6 +179,8 @@ llamacpp = llama-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF --host loc
 | `port` | `[orangu-coordinator]` | No | Port the proxy listens on. Defaults to `9000` |
 | `startup_timeout` | `[orangu-coordinator]` | No | Seconds to wait for a newly started llama.cpp to answer `/v1/models` before giving up. Defaults to `180` |
 | `max_body_bytes` | `[orangu-coordinator]` | No | Request/response body size cap in bytes. Defaults to `67108864` (64 MiB) |
+| `idle_timeout` | `[orangu-coordinator]` | No | Seconds of inactivity before automatically unloading the active model to free system resources (RAM/VRAM). Disabled by default. |
+| `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile |
 | `llamacpp` | profile | Yes | Full shell-style command line used to start llama.cpp for this profile, e.g. `llama-server -hf org/Model-GGUF --host localhost --port 8100 --ctx-size 32768`. Parsed like a shell command line (quoting works, e.g. `--chat-template-kwargs '{"enable_thinking": false}'`), but run directly — no shell is invoked, so stopping the profile always stops the real `llama-server` process, not just a wrapper. Leading `KEY=VALUE` tokens (the shell convention for setting one-off variables before a command, e.g. `LLAMA_CACHE=/models llama-server ...`) are recognized explicitly and set as environment variables on the spawned process, since there's no real shell to interpret them. A leading `~` or `~/...` in any argument or `KEY=VALUE` value (e.g. `--slot-save-path ~/.orangu/llama-slots`) is expanded to the home directory for the same reason — a real shell would otherwise have done this automatically (`~otheruser` forms are not supported). There is no separate `model`, `host`, or `port` key: they're all read straight off this command line, so there's exactly one place each is named — `-hf`/`--hf-repo` or `-m`/`--model` for the model (required — profiles *may* share a model, e.g. the same model configured once per role; `resolve_entry` breaks any resulting tie by profile name), `--host`/`--port` for where the coordinator proxies to (default to `127.0.0.1:8080`, same as llama.cpp itself, when omitted) |
 | `api_key` | profile | No | Sent as `Authorization: Bearer <key>` on the coordinator's own requests to this profile's llama.cpp, if `llamacpp` starts it with `--api-key` |
@@ -274,6 +277,8 @@ coordinator. Behind a confirmed coordinator, those sections' own `role` and
 
 - The coordinator does not manage remote/already-running llama.cpp instances;
   `llamacpp` is always a command it spawns and owns the lifecycle of.
+- **Dynamic Hot-Reloading**: The coordinator watches `orangu-coordinator.conf` and hot-reloads changes automatically (polled every ~5 seconds) without needing a restart.
+- **Fallback Routing**: If a requested profile fails to load (e.g. out of memory), the coordinator automatically falls back to starting the `all`-role profile rather than failing the request entirely.
 - The first request after a swap waits for the new model to finish loading;
   size `startup_timeout` generously for large models.
 - Once orangu confirms it's talking to a coordinator, it shows "Automatic"

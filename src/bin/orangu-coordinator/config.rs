@@ -40,6 +40,11 @@ pub struct CoordinatorConfiguration {
     pub startup_timeout_seconds: u64,
     /// Request/response body size cap in bytes.
     pub max_body_bytes: usize,
+    /// How long to wait before unloading an idle model. Defaults to None (disabled).
+    pub idle_timeout_seconds: Option<u64>,
+    /// Shared secret required to use `GET /v1/coordinator/shutdown`. When
+    /// absent the endpoint is disabled entirely.
+    pub shutdown_token: Option<String>,
     pub llms: HashMap<String, CoordinatorLlmEntry>,
     /// Name of the section whose `role` is `all`; used whenever a request's
     /// `model` field is absent or matches no configured entry.
@@ -231,6 +236,19 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         None => default_max_body_bytes(),
     };
 
+    let idle_timeout_seconds =
+        match client.get("idle_timeout") {
+            Some(value) => Some(value.trim().parse::<u64>().map_err(|err| {
+                anyhow!("invalid value for [{CLIENT_SECTION}].idle_timeout: {err}")
+            })?),
+            None => None,
+        };
+
+    let shutdown_token = client
+        .get("shutdown_token")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     if sections.is_empty() {
         return Err(anyhow!("At least one named LLM profile must be defined"));
     }
@@ -256,6 +274,8 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         port,
         startup_timeout_seconds,
         max_body_bytes,
+        idle_timeout_seconds,
+        shutdown_token,
         llms,
         default_entry,
     })

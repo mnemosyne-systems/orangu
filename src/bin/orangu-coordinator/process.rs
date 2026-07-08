@@ -19,7 +19,15 @@
 
 use crate::config::{CoordinatorConfiguration, CoordinatorLlmEntry};
 use anyhow::{Context, Result, anyhow};
-use std::{collections::HashMap, collections::VecDeque, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    collections::VecDeque,
+    process::Stdio,
+    sync::Arc,
+    sync::Mutex as StdMutex,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
@@ -31,6 +39,9 @@ use tokio::{
 struct ActiveProcess {
     entry_name: String,
     child: tokio::process::Child,
+    /// The `llamacpp` command that was used to start this process, so
+    /// hot-reload can detect when a profile's command changed.
+    llamacpp_at_start: String,
     /// Kept for the process's whole lifetime (not just while starting) so a
     /// crash discovered later — e.g. while it was actively serving a
     /// request — can still be reported with its own diagnostic output
@@ -48,7 +59,8 @@ const OUTPUT_TAIL_LINES: usize = 20;
 type OutputTail = Arc<Mutex<VecDeque<String>>>;
 
 pub struct Coordinator {
-    config: CoordinatorConfiguration,
+    /// RwLock to allow hot-reloading config.
+    config: std::sync::RwLock<CoordinatorConfiguration>,
     http_client: reqwest::Client,
     active: Mutex<Option<ActiveProcess>>,
     /// PID of whatever llama.cpp process is currently starting or active, if
@@ -59,11 +71,13 @@ pub struct Coordinator {
     /// `shutdown` must not have to wait on that same lock just to kill a
     /// still-starting process, so this is tracked separately and only ever
     /// locked briefly.
-    current_pid: Mutex<Option<u32>>,
+    current_pid: AtomicU32,
     /// Suppresses echoing a starting/active process's stdout/stderr to the
     /// coordinator's own output, mirroring `--quiet`. The lines are still
     /// captured into each process's tail regardless, for error reporting.
     quiet: bool,
+    /// When the coordinator was last accessed by a request (for idle timeout).
+    last_accessed: StdMutex<Instant>,
 }
 
 /// Per-attempt timeout for the `/v1/models` health-check probe only — kept
@@ -88,11 +102,12 @@ impl Coordinator {
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
-            config,
+            config: std::sync::RwLock::new(config),
             http_client,
             active: Mutex::new(None),
-            current_pid: Mutex::new(None),
+            current_pid: AtomicU32::new(0),
             quiet,
+            last_accessed: StdMutex::new(Instant::now()),
         })
     }
 
@@ -104,8 +119,13 @@ impl Coordinator {
 
     /// The model each conventional role resolves to, for `GET
     /// /v1/coordinator` — see [`CoordinatorConfiguration::models_by_role`].
-    pub fn models_by_role(&self) -> Vec<(&str, &str)> {
-        self.config.models_by_role()
+    pub fn models_by_role(&self) -> Vec<(String, String)> {
+        let config = self.config.read().unwrap();
+        config
+            .models_by_role()
+            .into_iter()
+            .map(|(r, m)| (r.to_string(), m.to_string()))
+            .collect()
     }
 
     /// Matches `hint` against a real model id, then a role name — see
@@ -114,7 +134,70 @@ impl Coordinator {
     /// `all`-role fallback: an explicit activation request that names
     /// nothing configured is a caller error, not something to paper over.
     pub fn match_hint(&self, hint: &str) -> Option<CoordinatorLlmEntry> {
-        match_hint(&self.config.llms, hint).cloned()
+        let config = self.config.read().unwrap();
+        match_hint(&config.llms, hint).cloned()
+    }
+
+    pub fn idle_timeout(&self) -> Option<u64> {
+        self.config.read().unwrap().idle_timeout_seconds
+    }
+
+    pub fn shutdown_token(&self) -> Option<String> {
+        self.config.read().unwrap().shutdown_token.clone()
+    }
+
+    pub fn default_entry(&self) -> CoordinatorLlmEntry {
+        let config = self.config.read().unwrap();
+        config.llms[&config.default_entry].clone()
+    }
+
+    pub fn reload_config(&self, new_config: CoordinatorConfiguration) {
+        *self.config.write().unwrap() = new_config;
+    }
+
+    /// After a config reload, stop the active process if its profile was
+    /// removed or its `llamacpp` command changed — otherwise it would keep
+    /// running with stale settings indefinitely.
+    pub async fn stop_if_stale(&self) {
+        // Snapshot the active identity without holding the async mutex while
+        // reading the (blocking) config lock.
+        let (entry_name, llamacpp_at_start) = {
+            let guard = self.active.lock().await;
+            let Some(active) = guard.as_ref() else {
+                return;
+            };
+            (active.entry_name.clone(), active.llamacpp_at_start.clone())
+        };
+
+        let should_stop = {
+            let config = self.config.read().unwrap();
+            match config.llms.get(&entry_name) {
+                None => true, // profile was removed
+                Some(entry) => entry.llamacpp != llamacpp_at_start,
+            }
+        };
+
+        if !should_stop {
+            return;
+        }
+
+        // Re-lock and verify the active process is still the same one we
+        // snapshotted — a concurrent request could have swapped it.
+        let mut guard = self.active.lock().await;
+        if let Some(active) = guard.as_ref()
+            && active.entry_name == entry_name
+            && active.llamacpp_at_start == llamacpp_at_start
+        {
+            let active = guard.take().expect("checked above");
+            if !self.quiet {
+                println!(
+                    "stopping '{}' — profile was removed or changed in reloaded config",
+                    active.entry_name
+                );
+            }
+            self.current_pid.store(0, Ordering::Relaxed);
+            Self::stop(active).await;
+        }
     }
 
     /// Picks the configured entry a request should be routed to, trying each
@@ -145,20 +228,23 @@ impl Coordinator {
         &self,
         model_hint: Option<&str>,
         implied_role: Option<&str>,
-    ) -> &CoordinatorLlmEntry {
+    ) -> CoordinatorLlmEntry {
+        self.touch_last_accessed();
         let active_entry_name = self
             .active
             .lock()
             .await
             .as_ref()
             .map(|active| active.entry_name.clone());
+        let config = self.config.read().unwrap();
         select_entry(
-            &self.config.llms,
-            &self.config.default_entry,
+            &config.llms,
+            &config.default_entry,
             model_hint,
             implied_role,
             active_entry_name.as_deref(),
         )
+        .clone()
     }
 
     /// Ensures `entry`'s llama.cpp is the active process, starting it (and
@@ -187,13 +273,14 @@ impl Coordinator {
             // Clear `current_pid` before reaping: once `stop` returns, that
             // pid is gone and the OS is free to recycle it, so it must not
             // linger as a stale value a concurrent `shutdown` could kill.
-            *self.current_pid.lock().await = None;
+            self.current_pid.store(0, Ordering::Relaxed);
             Self::stop(guard.take().expect("checked above")).await;
         }
 
         let (child, tail) = self.start(entry).await?;
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
+            llamacpp_at_start: entry.llamacpp.clone(),
             child,
             tail,
         });
@@ -207,20 +294,63 @@ impl Coordinator {
     /// would miss, since `active` isn't populated until the health check
     /// succeeds.
     pub async fn shutdown(&self) {
-        if let Some(pid) = self.current_pid.lock().await.take() {
-            kill_pid(pid);
-        }
+        self.current_pid.store(0, Ordering::Relaxed);
         let mut guard = self.active.lock().await;
-        if let Some(mut active) = guard.take() {
-            // Already signalled above (if it was this same process); this
-            // just reaps it so it doesn't linger as a zombie.
-            let _ = active.child.wait().await;
+        if let Some(active) = guard.take() {
+            Self::stop(active).await;
+        }
+        // If no active process exists but a stale PID was recorded (still
+        // mid-startup), we intentionally do NOT signal it here: the startup
+        // code path still holds the Child handle, and `kill_on_drop(true)`
+        // ensures the process is cleaned up when that handle is dropped.
+        // Signalling a bare PID risks hitting an unrelated process if the
+        // OS has already recycled it.
+    }
+
+    pub fn touch_last_accessed(&self) {
+        *self.last_accessed.lock().unwrap() = Instant::now();
+    }
+
+    pub async fn unload_if_idle(&self, timeout_secs: u64) {
+        let last_accessed = *self.last_accessed.lock().unwrap();
+        if last_accessed.elapsed().as_secs() >= timeout_secs {
+            let mut guard = self.active.lock().await;
+            let last_accessed = *self.last_accessed.lock().unwrap();
+            if last_accessed.elapsed().as_secs() >= timeout_secs
+                && let Some(active) = guard.take()
+            {
+                if !self.quiet {
+                    println!(
+                        "unloading active profile '{}' due to idle timeout",
+                        active.entry_name
+                    );
+                }
+                self.current_pid.store(0, Ordering::Relaxed);
+                Self::stop(active).await;
+            }
         }
     }
 
     async fn stop(mut active: ActiveProcess) {
-        let _ = active.child.start_kill();
-        let _ = active.child.wait().await;
+        #[cfg(unix)]
+        {
+            if let Some(pid) = active.child.id() {
+                kill_pid(pid);
+            }
+            // Wait up to 5 seconds for graceful shutdown
+            if tokio::time::timeout(Duration::from_secs(5), active.child.wait())
+                .await
+                .is_err()
+            {
+                let _ = active.child.start_kill();
+                let _ = active.child.wait().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = active.child.start_kill();
+            let _ = active.child.wait().await;
+        }
     }
 
     async fn start(
@@ -241,6 +371,7 @@ impl Coordinator {
             .stdin(std::process::Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| {
                 format!(
@@ -252,7 +383,8 @@ impl Coordinator {
         // Record the PID *before* the (possibly long) health-check wait
         // below, so a concurrent `shutdown` can always kill this process,
         // no matter how long it takes to become ready.
-        *self.current_pid.lock().await = child.id();
+        self.current_pid
+            .store(child.id().unwrap_or(0), Ordering::Relaxed);
 
         let tail: OutputTail = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stdout) = child.stdout.take() {
@@ -265,7 +397,7 @@ impl Coordinator {
         if let Err(err) = self.wait_until_healthy(entry, &mut child, &tail).await {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            *self.current_pid.lock().await = None;
+            self.current_pid.store(0, Ordering::Relaxed);
             return Err(err);
         }
 
@@ -278,7 +410,8 @@ impl Coordinator {
         child: &mut tokio::process::Child,
         tail: &OutputTail,
     ) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(self.config.startup_timeout_seconds);
+        let startup_timeout = self.config.read().unwrap().startup_timeout_seconds;
+        let deadline = Instant::now() + Duration::from_secs(startup_timeout);
         let probe_url = format!("{}/v1/models", entry.origin());
 
         loop {
@@ -306,7 +439,7 @@ impl Coordinator {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "timed out after {}s waiting for llama.cpp ('{}') to become ready at {}{}",
-                    self.config.startup_timeout_seconds,
+                    startup_timeout,
                     entry.name,
                     probe_url,
                     format_output_tail(tail).await
@@ -506,7 +639,7 @@ fn match_hint<'a>(
 #[cfg(unix)]
 fn kill_pid(pid: u32) {
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
     }
 }
 
@@ -904,7 +1037,8 @@ mod tests {
         // Let the health-check loop actually start (and record the pid)
         // before shutting down.
         let pid = loop {
-            if let Some(pid) = *coordinator.current_pid.lock().await {
+            let pid = coordinator.current_pid.load(Ordering::Relaxed);
+            if pid != 0 {
                 break pid;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
