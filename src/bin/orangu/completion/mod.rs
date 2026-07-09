@@ -476,8 +476,9 @@ mod tests {
     fn auto_review_completes_the_all_keyword() {
         let workspace = tempfile::tempdir().expect("workspace");
         // Typing a prefix of `all` offers it as a candidate.
-        let (_, candidates) = auto_review_completion_candidates("/auto_review al", workspace.path())
-            .expect("auto-review argument");
+        let (_, candidates) =
+            auto_review_completion_candidates("/auto_review al", workspace.path())
+                .expect("auto-review argument");
         assert!(candidates.iter().any(|c| c == "all"), "{candidates:?}");
     }
 
