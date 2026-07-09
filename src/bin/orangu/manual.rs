@@ -499,6 +499,8 @@ fn render_manual_screen(args: &ManualScreenArgs<'_>) -> String {
             .notice
             .map(|notice| StatusFragment::plain(notice.to_string())),
         pending_count: args.pending_count,
+        // The Graph status dot is `/auto_review`-only.
+        graph_status: None,
         prompt_prefix: &prompt_prefix,
         input: "",
         cursor: 0,

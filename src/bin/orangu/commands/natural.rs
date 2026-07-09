@@ -431,13 +431,17 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::Review);
     }
     if let Some(args) = strip_ascii_prefix(input, "auto review ") {
-        let (target, immediate) = parse_auto_review_args(args.trim());
-        if !matches!(target, AutoReviewTarget::Branch) || immediate {
-            return Some(LocalCommand::AutoReview(target, immediate));
+        let (target, immediate, deep) = parse_auto_review_args(args.trim());
+        if !matches!(target, AutoReviewTarget::Branch) || immediate || deep {
+            return Some(LocalCommand::AutoReview(target, immediate, deep));
         }
     }
     if matches_ci(input, &["auto review"]) {
-        return Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, false));
+        return Some(LocalCommand::AutoReview(
+            AutoReviewTarget::Branch,
+            false,
+            false,
+        ));
     }
     // Checked before the more specific buffers: "export console" / "export
     // review" / "export auto review" select a buffer, while a bare "export"

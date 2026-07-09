@@ -16,4 +16,5 @@
 pub mod cache;
 pub mod extract;
 pub mod html;
+pub mod status;
 pub mod store;

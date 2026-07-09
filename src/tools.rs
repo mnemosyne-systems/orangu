@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::graph::status::GraphBuildStatus;
 use crate::graph::store::GraphStore;
 use crate::llm::{FunctionDefinition, ToolDefinition};
 use anyhow::{Result, anyhow};
@@ -46,6 +47,10 @@ pub struct ToolExecutor {
     /// Shared knowledge graph, populated by the startup scan.
     /// `None` while the background scan is still running.
     pub graph_store: Arc<Mutex<Option<GraphStore>>>,
+    /// The startup scan's build status, updated alongside `graph_store` —
+    /// see `GraphBuildStatus`. Surfaced as the Graph dot in `/auto_review`'s
+    /// status bar.
+    pub graph_status: Arc<Mutex<GraphBuildStatus>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,6 +136,7 @@ impl ToolExecutor {
             )),
             session_dir,
             graph_store: Arc::new(Mutex::new(None)),
+            graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
         }
     }
 

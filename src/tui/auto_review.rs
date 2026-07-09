@@ -46,6 +46,32 @@ pub struct AutoReviewDiffView<'a> {
     pub x_offset: usize,
 }
 
+/// Alt+m in the `/auto_review` pre-start phase cycles a file through these
+/// three modes, in order: `Normal` is the default review; `Deep` still
+/// reviews the file but with extra passes (no diff compression, cross-file
+/// graph context, and a verify pass on rejected findings); `Ignore` skips the
+/// file from the run entirely. Only `Ignore` changes what runs — `Deep` opts
+/// into more, not less.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoReviewFileMode {
+    #[default]
+    Normal,
+    Deep,
+    Ignore,
+}
+
+impl AutoReviewFileMode {
+    /// Alt+m: advance to the next mode in the Normal → Deep → Ignore → Normal
+    /// cycle.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::Deep,
+            Self::Deep => Self::Ignore,
+            Self::Ignore => Self::Normal,
+        }
+    }
+}
+
 /// Inputs for the `/auto_review` screen: the categorized report in the left
 /// pane — topped by the status area — and the file checklist (with auto-set
 /// status dots) in the right pane.
@@ -76,13 +102,13 @@ pub struct AutoReviewScreenArgs<'a> {
     /// browse keys (Alt+j/k, Alt+a, Alt+r, Alt+e) instead of the run keys.
     pub browsing: bool,
     /// The run has not started yet (pre-start phase): the header offers Alt+s
-    /// Start, Alt+j/k Switch file, and Alt+m Mode, and ignored files show a
-    /// blue dot. Cleared once the run begins.
+    /// Start, Alt+j/k Switch file, and Alt+m Mode, and Ignore/Deep files show
+    /// their blue/purple dot. Cleared once the run begins.
     pub prestart: bool,
-    /// Per-file Ignore flags (parallel to `files`): an ignored file shows a
-    /// blue dot and is skipped from the run. Read with `.get().copied()` so a
-    /// shorter (or empty) slice is treated as "none ignored".
-    pub ignored: &'a [bool],
+    /// Per-file mode (parallel to `files`), cycled with Alt+m. Read with
+    /// `.get().copied().unwrap_or_default()` so a shorter (or empty) slice is
+    /// treated as "every file Normal".
+    pub modes: &'a [AutoReviewFileMode],
     /// When set, the Alt+r reject window is drawn over the panes.
     pub reject: Option<AutoReviewRejectView<'a>>,
     /// When set, the Enter diff popup is drawn over the panes.
@@ -99,6 +125,11 @@ pub struct AutoReviewScreenArgs<'a> {
     pub prompt_branch: Option<&'a str>,
     pub left_status: Option<StatusFragment>,
     pub pending_count: usize,
+    /// The knowledge graph's build status, shown as a `Graph: ●` indicator in
+    /// the status bar — the one screen this is wired up for, since Deep
+    /// mode's cross-file context depends on the graph having finished
+    /// building. `None` while the caller hasn't resolved a status yet.
+    pub graph_status: Option<ConnStatus>,
     pub actual_width: usize,
     pub actual_height: usize,
 }
@@ -145,6 +176,7 @@ pub fn render_auto_review_screen(args: AutoReviewScreenArgs<'_>) -> String {
         current_model: args.current_model,
         left_status: args.left_status,
         pending_count: args.pending_count,
+        graph_status: args.graph_status,
         prompt_prefix: &prompt_prefix,
         input: args.input,
         cursor: args.cursor,
@@ -227,14 +259,21 @@ fn render_auto_review_panes(
         let file_index = list_start + row;
         let right = match args.files.get(file_index) {
             Some(file) => {
-                // Before the run starts an ignored file shows a blue dot
-                // (skipped); once the run starts it is approved, so the dot
-                // follows its status (green) like any other. The file under
-                // review blinks a white dot; otherwise the dot is the status.
-                let ignored = args.ignored.get(file_index).copied().unwrap_or(false);
-                let status_box = if args.prestart && ignored {
+                // Before the run starts every file shows its mode as a dot —
+                // white for Normal, blue for Ignore (skipped), purple for Deep
+                // (reviewed with extra passes) — so the three modes read the
+                // same way at a glance. Once the run starts the dot follows
+                // the file's real status instead (Ignore is approved up
+                // front, Deep and Normal are reviewed alike). The file under
+                // review blinks a white dot meanwhile.
+                let mode = args.modes.get(file_index).copied().unwrap_or_default();
+                let status_box = if args.prestart && mode == AutoReviewFileMode::Ignore {
                     format!("[{STATUS_BLUE}●{ANSI_RESET}]")
-                } else if args.reviewing == Some(file_index) {
+                } else if args.prestart && mode == AutoReviewFileMode::Deep {
+                    format!("[{STATUS_PURPLE}●{ANSI_RESET}]")
+                } else if (args.prestart && mode == AutoReviewFileMode::Normal)
+                    || args.reviewing == Some(file_index)
+                {
                     format!("[{STATUS_WHITE}●{ANSI_RESET}]")
                 } else {
                     review_status_box(file.status)
@@ -451,22 +490,24 @@ mod tests {
     #[test]
     fn auto_review_ignored_file_shows_a_blue_dot_until_the_run_starts() {
         let blue_dot = format!("[{}●", super::STATUS_BLUE);
+        let white_dot = format!("[{}●", super::STATUS_WHITE);
         let green_dot = format!("[{}●", super::STATUS_GREEN);
-        let ignored = [false, true];
+        let modes = [AutoReviewFileMode::Normal, AutoReviewFileMode::Ignore];
         let report: Vec<String> = Vec::new();
 
         // Pre-start: the ignored file (b.rs) carries the blue dot; the normal
-        // one keeps its empty box.
+        // one (a.rs) carries the white dot.
         let files = vec![
             review_entry("a.rs", ReviewStatus::Unreviewed, &[]),
             review_entry("b.rs", ReviewStatus::Unreviewed, &[]),
         ];
         let mut args = auto_review_args(&files, &report, 80, 12);
         args.prestart = true;
-        args.ignored = &ignored;
+        args.modes = &modes;
         let screen = render_auto_review_screen(args);
         assert!(screen.contains(&blue_dot), "{screen:?}");
-        assert!(screen.contains("[ ] a.rs"), "{screen:?}");
+        assert!(screen.contains(&white_dot), "{screen:?}");
+        assert!(screen.contains("a.rs") && screen.contains("b.rs"), "{screen:?}");
 
         // Once the run starts the ignored file is approved: no blue dot any
         // more, just the green status dot.
@@ -476,10 +517,34 @@ mod tests {
         ];
         let mut args = auto_review_args(&files, &report, 80, 12);
         args.prestart = false;
-        args.ignored = &ignored;
+        args.modes = &modes;
         let screen = render_auto_review_screen(args);
         assert!(!screen.contains(&blue_dot), "{screen:?}");
         assert!(screen.contains(&green_dot), "{screen:?}");
+    }
+
+    #[test]
+    fn auto_review_deep_file_shows_a_purple_dot_only_before_the_run_starts() {
+        let purple_dot = format!("[{}●", super::STATUS_PURPLE);
+        let modes = [AutoReviewFileMode::Deep];
+        let report: Vec<String> = Vec::new();
+
+        // Pre-start: the Deep file carries the purple dot.
+        let files = vec![review_entry("a.rs", ReviewStatus::Unreviewed, &[])];
+        let mut args = auto_review_args(&files, &report, 80, 12);
+        args.prestart = true;
+        args.modes = &modes;
+        let screen = render_auto_review_screen(args);
+        assert!(screen.contains(&purple_dot), "{screen:?}");
+
+        // Once reviewed, Deep is reviewed like Normal: its real status dot
+        // shows, not purple.
+        let files = vec![review_entry("a.rs", ReviewStatus::Approved, &[])];
+        let mut args = auto_review_args(&files, &report, 80, 12);
+        args.prestart = false;
+        args.modes = &modes;
+        let screen = render_auto_review_screen(args);
+        assert!(!screen.contains(&purple_dot), "{screen:?}");
     }
 
     #[test]

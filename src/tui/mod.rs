@@ -48,6 +48,11 @@ pub(crate) const STATUS_WHITE: &str = "\x1b[38;2;230;230;230m";
 /// The Ignore dot in `/auto_review`: a file marked Ignore (Alt+m) is skipped
 /// from the run and shown with this blue dot.
 pub(crate) const STATUS_BLUE: &str = "\x1b[38;2;100;160;230m";
+/// The Deep dot in `/auto_review`: a file marked Deep (Alt+m) is reviewed with
+/// extra passes (no diff compression, cross-file graph context, and a verify
+/// pass on rejected findings) and shown with this purple dot before the run
+/// starts.
+pub(crate) const STATUS_PURPLE: &str = "\x1b[38;2;170;120;220m";
 pub(crate) const ANSI_RESET: &str = "\x1b[0m";
 pub const FEEDBACK_OK: &str = "\x1b[38;2;80;200;120m●\x1b[0m";
 pub const FEEDBACK_ERR: &str = "\x1b[38;2;220;80;80m●\x1b[0m";
@@ -109,7 +114,7 @@ pub(crate) mod test_fixtures {
             reviewing: None,
             browsing: false,
             prestart: false,
-            ignored: &[],
+            modes: &[],
             reject: None,
             diff: None,
             report_lines,
@@ -124,6 +129,7 @@ pub(crate) mod test_fixtures {
             prompt_branch: Some("feature/x"),
             left_status: None,
             pending_count: 0,
+            graph_status: None,
             actual_width,
             actual_height,
         }

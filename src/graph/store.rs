@@ -92,7 +92,21 @@ impl GraphStore {
 
     pub fn add_edge(&mut self, edge: ExtractedEdge) {
         let src = self.node_map.get(&edge.source).cloned();
-        let tgt = self.node_map.get(&edge.target).cloned();
+        // `GraphExtractor::extract_from_file` can only recognize a call as
+        // "local" — and so emit the callee's real id — when the callee is
+        // defined in the *same file* it's scanning; a call to a symbol
+        // defined elsewhere gets a synthetic `external::<name>` target
+        // instead (its confidence is already `Inferred` for exactly this
+        // reason). `resolve_external_target` is the fallback that turns that
+        // placeholder into the real cross-file node once the whole graph —
+        // every file's nodes — is known, which by the time `add_edge` runs it
+        // always is (callers add every node before any edge; see
+        // `agents::hooks::run_session_start_hook`'s two-pass structure).
+        let tgt = self
+            .node_map
+            .get(&edge.target)
+            .cloned()
+            .or_else(|| self.resolve_external_target(&edge.target));
 
         if let (Some(s), Some(t)) = (src, tgt) {
             // Deduplicate: skip if an edge with the same relation already exists
@@ -113,6 +127,28 @@ impl GraphStore {
                 );
             }
         }
+    }
+
+    /// Resolve a synthetic `external::<name>` edge target — the placeholder
+    /// `add_edge` receives for a call whose callee isn't defined in the
+    /// calling file (see its doc comment) — against every node in the graph
+    /// by bare name (`GraphNode::label`, the same bare identifier the
+    /// extractor captured at the call site). Resolves only when exactly one
+    /// node anywhere carries that label: a cross-file name collision (two
+    /// files each defining, say, `new()`) is worse to guess wrong on than to
+    /// simply leave the edge dropped, so 0 or 2+ matches both return `None`.
+    /// A no-op (`None`) for any `target` that isn't an `external::` id.
+    fn resolve_external_target(&self, target: &str) -> Option<NodeIndex> {
+        let name = target.strip_prefix("external::")?;
+        let mut matches = self
+            .graph
+            .node_indices()
+            .filter(|&idx| self.graph[idx].label == name);
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(only)
     }
 
     /// Removes all nodes (and their edges) whose `source_file` matches `file_path`.
@@ -166,6 +202,32 @@ impl GraphStore {
         is_cyclic_directed(&self.graph)
     }
 
+    /// The callers (in-edges) and callees (out-edges) of the node at `idx`, as
+    /// `(callers, callees)`. Shared by `lookup` and `cross_file_context`.
+    fn neighbours(&self, idx: NodeIndex) -> (Vec<NeighbourEdge>, Vec<NeighbourEdge>) {
+        let callers = self
+            .graph
+            .edges_directed(idx, petgraph::Direction::Incoming)
+            .map(|e| NeighbourEdge {
+                node_id: self.graph[e.source()].id.clone(),
+                node_label: self.graph[e.source()].label.clone(),
+                relation: e.weight().relation.clone(),
+                confidence: e.weight().confidence.clone(),
+            })
+            .collect();
+        let callees = self
+            .graph
+            .edges_directed(idx, petgraph::Direction::Outgoing)
+            .map(|e| NeighbourEdge {
+                node_id: self.graph[e.target()].id.clone(),
+                node_label: self.graph[e.target()].label.clone(),
+                relation: e.weight().relation.clone(),
+                confidence: e.weight().confidence.clone(),
+            })
+            .collect();
+        (callers, callees)
+    }
+
     /// Looks up all nodes whose `id` or `label` contains `symbol` (case-insensitive).
     /// For each match returns the node itself plus all its in-edges (callers) and
     /// out-edges (callees), formatted for direct use in the `graph_lookup` tool.
@@ -180,32 +242,9 @@ impl GraphStore {
                 n.id.to_lowercase().contains(&needle) || n.label.to_lowercase().contains(&needle)
             })
             .map(|idx| {
-                let node = &self.graph[idx];
-
-                let callers: Vec<NeighbourEdge> = self
-                    .graph
-                    .edges_directed(idx, petgraph::Direction::Incoming)
-                    .map(|e| NeighbourEdge {
-                        node_id: self.graph[e.source()].id.clone(),
-                        node_label: self.graph[e.source()].label.clone(),
-                        relation: e.weight().relation.clone(),
-                        confidence: e.weight().confidence.clone(),
-                    })
-                    .collect();
-
-                let callees: Vec<NeighbourEdge> = self
-                    .graph
-                    .edges_directed(idx, petgraph::Direction::Outgoing)
-                    .map(|e| NeighbourEdge {
-                        node_id: self.graph[e.target()].id.clone(),
-                        node_label: self.graph[e.target()].label.clone(),
-                        relation: e.weight().relation.clone(),
-                        confidence: e.weight().confidence.clone(),
-                    })
-                    .collect();
-
+                let (callers, callees) = self.neighbours(idx);
                 LookupResult {
-                    node: node.clone(),
+                    node: self.graph[idx].clone(),
                     callers,
                     callees,
                     god_rank: None,
@@ -214,6 +253,48 @@ impl GraphStore {
             .collect();
 
         // Sort results so the most highly connected matches appear first.
+        results.sort_by(|a, b| {
+            let degree_a = a.callers.len() + a.callees.len();
+            let degree_b = b.callers.len() + b.callees.len();
+            degree_b.cmp(&degree_a)
+        });
+
+        results
+    }
+
+    /// The nodes defined in `file_path`, each with only the callers/callees
+    /// that live in a *different* file — the cross-file relationships a
+    /// diff-plus-whole-file review can't see on its own (e.g. a signature
+    /// change breaking a caller elsewhere). Nodes with no cross-file
+    /// neighbours are omitted; same-file neighbours are dropped since they're
+    /// already visible in the file content the review sends. Used by
+    /// `/auto_review`'s Deep mode.
+    pub fn cross_file_context(&self, file_path: &str) -> Vec<LookupResult> {
+        let mut results: Vec<LookupResult> = self
+            .graph
+            .node_indices()
+            .filter(|&idx| self.graph[idx].source_file == file_path)
+            .filter_map(|idx| {
+                let (callers, callees) = self.neighbours(idx);
+                let is_cross_file = |edge: &NeighbourEdge| {
+                    self.node_map
+                        .get(&edge.node_id)
+                        .is_some_and(|&other| self.graph[other].source_file != file_path)
+                };
+                let callers: Vec<_> = callers.into_iter().filter(is_cross_file).collect();
+                let callees: Vec<_> = callees.into_iter().filter(is_cross_file).collect();
+                if callers.is_empty() && callees.is_empty() {
+                    return None;
+                }
+                Some(LookupResult {
+                    node: self.graph[idx].clone(),
+                    callers,
+                    callees,
+                    god_rank: None,
+                })
+            })
+            .collect();
+
         results.sort_by(|a, b| {
             let degree_a = a.callers.len() + a.callees.len();
             let degree_b = b.callers.len() + b.callees.len();
@@ -370,10 +451,14 @@ mod tests {
     use crate::graph::extract::{Confidence, ExtractedEdge, ExtractedNode};
 
     fn make_node(id: &str, kind: &str) -> ExtractedNode {
+        make_node_in(id, kind, "test.rs")
+    }
+
+    fn make_node_in(id: &str, kind: &str, source_file: &str) -> ExtractedNode {
         ExtractedNode {
             id: id.to_string(),
             label: id.to_string(),
-            source_file: "test.rs".to_string(),
+            source_file: source_file.to_string(),
             source_location: "L1-L5".to_string(),
             kind: kind.to_string(),
         }
@@ -421,11 +506,91 @@ mod tests {
         assert!(store.has_cycles());
     }
 
+    /// A node as `GraphExtractor::extract_from_file` actually produces one:
+    /// `id` is `<file_stem>::<name>` (qualified) but `label` is the bare
+    /// symbol name alone — the distinction `resolve_external_target` (and
+    /// these tests) depend on. `make_node`/`make_node_in` set `label` equal
+    /// to `id`, which doesn't exercise that distinction, so the two tests
+    /// below build the node directly instead.
+    fn make_extracted_node(id: &str, label: &str, source_file: &str) -> ExtractedNode {
+        ExtractedNode {
+            id: id.to_string(),
+            label: label.to_string(),
+            source_file: source_file.to_string(),
+            source_location: "L1-L5".to_string(),
+            kind: "fn".to_string(),
+        }
+    }
+
+    #[test]
+    fn add_edge_resolves_an_external_target_to_the_real_cross_file_node() {
+        // Mirrors what `GraphExtractor::extract_from_file` emits for a call
+        // whose callee isn't defined in the calling file: a synthetic
+        // `external::<name>` target instead of the real cross-file id.
+        let mut store = GraphStore::new();
+        store.add_node(make_extracted_node("b::caller", "caller", "b.rs"));
+        store.add_node(make_extracted_node("a::changed", "changed", "a.rs"));
+        store.add_edge(ExtractedEdge {
+            source: "b::caller".to_string(),
+            target: "external::changed".to_string(),
+            relation: "calls".to_string(),
+            confidence: Confidence::Inferred,
+        });
+
+        let context = store.cross_file_context("a.rs");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].callers.len(), 1);
+        assert_eq!(context[0].callers[0].node_id, "b::caller");
+    }
+
+    #[test]
+    fn add_edge_leaves_an_ambiguous_external_target_unresolved() {
+        // Two files each define a `changed` symbol: the bare name alone
+        // can't say which one the call meant, so the edge is dropped rather
+        // than guessed.
+        let mut store = GraphStore::new();
+        store.add_node(make_extracted_node("b::caller", "caller", "b.rs"));
+        store.add_node(make_extracted_node("a::changed", "changed", "a.rs"));
+        store.add_node(make_extracted_node("c::changed", "changed", "c.rs"));
+        store.add_edge(ExtractedEdge {
+            source: "b::caller".to_string(),
+            target: "external::changed".to_string(),
+            relation: "calls".to_string(),
+            confidence: Confidence::Inferred,
+        });
+
+        assert!(store.cross_file_context("a.rs").is_empty());
+        assert!(store.cross_file_context("c.rs").is_empty());
+    }
+
     #[test]
     fn serialises_to_json() {
         let mut store = GraphStore::new();
         store.add_node(make_node("a::foo", "fn"));
         let json = store.to_json().unwrap();
         assert!(json.contains("a::foo"));
+    }
+
+    #[test]
+    fn cross_file_context_keeps_only_neighbours_in_other_files() {
+        let mut store = GraphStore::new();
+        store.add_node(make_node_in("a::changed", "fn", "a.rs"));
+        store.add_node(make_node_in("a::same_file_helper", "fn", "a.rs"));
+        store.add_node(make_node_in("b::caller", "fn", "b.rs"));
+        store.add_node(make_node_in("c::unrelated", "fn", "c.rs"));
+        // A same-file edge (dropped: already visible in the file content) and
+        // a cross-file edge (kept: the review can't otherwise see it).
+        store.add_edge(make_edge("a::changed", "a::same_file_helper", "calls"));
+        store.add_edge(make_edge("b::caller", "a::changed", "calls"));
+
+        let context = store.cross_file_context("a.rs");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].node.id, "a::changed");
+        assert_eq!(context[0].callers.len(), 1);
+        assert_eq!(context[0].callers[0].node_id, "b::caller");
+        assert!(context[0].callees.is_empty());
+
+        // A file with no cross-file neighbours contributes nothing.
+        assert!(store.cross_file_context("c.rs").is_empty());
     }
 }

@@ -483,6 +483,16 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_completes_the_deep_keyword() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Typing a prefix of `deep` offers it as a candidate.
+        let (_, candidates) =
+            auto_review_completion_candidates("/auto_review de", workspace.path())
+                .expect("auto-review argument");
+        assert!(candidates.iter().any(|c| c == "deep"), "{candidates:?}");
+    }
+
+    #[test]
     fn export_completes_console_review_auto_review_and_duplicates() {
         // The bare argument offers all six targets, in order.
         let (start, all) = export_completion_candidates("/export ").expect("export argument");

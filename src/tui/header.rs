@@ -189,7 +189,7 @@ pub fn help_text() -> &'static str {
 /export [console|review|auto review|duplicates|pr|statistics] Export the output window (console), the last review report (review), the last auto-review report (auto review), a fresh duplicate-code report (duplicates), open pull requests (pr), or persistent activity history (statistics) to a PDF in the workspace root
 /duplicates [<threshold>]                       Scan source functions (Rust, C/C++, Go, Python, JS/TS, and ~20 more languages) for duplicates; on a non-default branch only the functions it adds/changes are compared against the project; optional threshold is a percentage (default 80%)
 /add_file <path>                                Stage a file or directory with git add
-/auto_review [<file>|all] [immediate]           LLM auto review in a split view: the whole branch, one Tab-completed file (the full file on main/master, its changes on a branch), or every Git-tracked project file with all; add immediate to start the run at once
+/auto_review [<file>|all] [immediate] [deep]    LLM auto review in a split view: the whole branch, one Tab-completed file (the full file on main/master, its changes on a branch), or every Git-tracked project file with all; add immediate to start the run at once; add deep to start every file in Deep mode (no diff truncation, cross-file graph context, a verify pass on rejects)
 /amend <message>                                Rewrite the last commit message with git commit --amend
 /bisect [start|good|bad|skip|reset|log]         Binary-search history for the commit that introduced a bug (git bisect); bare /bisect shows the session status
 /branch [<name>|-a|-b|-m|-d <name>]             List, switch, create, rename or delete a branch
@@ -235,7 +235,7 @@ Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up /
 /manual opens the built-in manual in a full-screen viewer: the text on the left, the table of contents on the right. Alt+J/Alt+K switch sections, Up/Down move the highlighted line, Alt+S opens a search window over the entire manual (Enter jumps to the next match, Esc closes it), Alt+Up/Alt+Down scroll, PageUp/PageDown page, Left/Right pan, and Alt+X (or Esc Esc) exits."#
 }
 
-fn indicator(status: ConnStatus) -> String {
+pub(crate) fn indicator(status: ConnStatus) -> String {
     match status {
         ConnStatus::Pending => format!("{STATUS_WHITE}●{ANSI_RESET}"),
         ConnStatus::Ok => format!("{STATUS_GREEN}●{ANSI_RESET}"),

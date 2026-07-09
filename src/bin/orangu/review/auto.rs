@@ -441,10 +441,9 @@ pub(crate) struct AutoReviewState {
     /// `(Press Alt+s)` placeholders and files can be navigated (Alt+j/Alt+k)
     /// and marked Ignore (Alt+m) before the run begins.
     pub(crate) run_started: bool,
-    /// Per-file Ignore flag (parallel to `files`): an ignored file is skipped
-    /// from the run entirely and shown with a blue dot. Toggled with Alt+m
-    /// during the pre-start phase.
-    pub(crate) ignored: Vec<bool>,
+    /// Per-file mode (parallel to `files`), cycled Normal → Deep → Ignore with
+    /// Alt+m during the pre-start phase.
+    pub(crate) modes: Vec<AutoReviewFileMode>,
     /// The run was cancelled with Esc Esc.
     pub(crate) cancelled: bool,
     /// When set, the Alt+r reject window is open over the panes (browse
@@ -458,11 +457,25 @@ pub(crate) struct AutoReviewState {
     /// A workspace-switch key pressed during streaming; applied by `main` after
     /// the auto review mode exits.
     pub(crate) pending_tab: Option<crate::workspace_tab::TabAction>,
+    /// The knowledge graph's build status, read fresh on every render for the
+    /// status bar's `Graph: ●` indicator. Set to the real shared handle
+    /// (`tools.graph_status`) by `run_auto_review_mode` right after
+    /// construction; defaults to a private, always-`Building` handle so tests
+    /// building `AutoReviewState` directly don't need to supply one.
+    pub(crate) graph_status: std::sync::Arc<std::sync::Mutex<orangu::graph::status::GraphBuildStatus>>,
 }
 
 impl AutoReviewState {
     pub(crate) fn new(launch: ReviewLaunch) -> Self {
-        let ignored = vec![false; launch.files.len()];
+        // The `deep` launch keyword starts every file in Deep mode instead of
+        // the usual per-file Normal default — the same Deep the Alt+m
+        // pre-start cycle offers, just pre-selected for the whole run.
+        let initial_mode = if launch.deep {
+            AutoReviewFileMode::Deep
+        } else {
+            AutoReviewFileMode::default()
+        };
+        let modes = vec![initial_mode; launch.files.len()];
         Self {
             files: launch.files,
             selected: None,
@@ -477,31 +490,45 @@ impl AutoReviewState {
             projected_finish: None,
             done: false,
             run_started: false,
-            ignored,
+            modes,
             cancelled: false,
             reject: None,
             diff_view: None,
             model: String::new(),
             pending_tab: None,
+            graph_status: std::sync::Arc::new(std::sync::Mutex::new(
+                orangu::graph::status::GraphBuildStatus::default(),
+            )),
         }
+    }
+
+    /// The mode of the file at `index`, `Normal` when out of range.
+    pub(crate) fn mode(&self, index: usize) -> AutoReviewFileMode {
+        self.modes.get(index).copied().unwrap_or_default()
     }
 
     /// Whether the file at `index` is marked Ignore (skipped from the run).
     pub(crate) fn is_ignored(&self, index: usize) -> bool {
-        self.ignored.get(index).copied().unwrap_or(false)
+        self.mode(index) == AutoReviewFileMode::Ignore
     }
 
-    /// Alt+m during the pre-start phase: toggle the highlighted file between
-    /// Ignore and Normal. A no-op with no file highlighted or once the run has
-    /// started (Ignore can only be set before the review begins).
-    pub(crate) fn toggle_ignore_selected(&mut self) {
+    /// Whether the file at `index` is marked Deep (reviewed with extra passes).
+    pub(crate) fn is_deep(&self, index: usize) -> bool {
+        self.mode(index) == AutoReviewFileMode::Deep
+    }
+
+    /// Alt+m during the pre-start phase: advance the highlighted file to the
+    /// next mode (Normal → Deep → Ignore → Normal). A no-op with no file
+    /// highlighted or once the run has started (the mode can only be set
+    /// before the review begins).
+    pub(crate) fn cycle_mode_selected(&mut self) {
         if self.run_started {
             return;
         }
         if let Some(index) = self.selected
-            && let Some(flag) = self.ignored.get_mut(index)
+            && let Some(mode) = self.modes.get_mut(index)
         {
-            *flag = !*flag;
+            *mode = mode.next();
         }
     }
 
@@ -839,6 +866,47 @@ impl AutoReviewState {
                 finding.starts_with(&without_line) || finding.starts_with(&with_line)
             })
         })
+    }
+
+    /// The findings recorded against `path` across every category section, as
+    /// `(section, index_in_section, finding_text)`, in category order — the
+    /// numbered list Deep mode's verify pass presents back to the model, and
+    /// the ordinals `remove_findings` expects back.
+    fn findings_for_path(&self, path: &str) -> Vec<(usize, usize, String)> {
+        let (without_line, with_line) = Self::finding_prefixes(path);
+        let mut found = Vec::new();
+        for (section, findings) in self.sections.iter().enumerate() {
+            for (index, finding) in findings.iter().enumerate() {
+                if finding.starts_with(&without_line) || finding.starts_with(&with_line) {
+                    found.push((section, index, finding.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// Remove the findings at the given `(section, index)` locations, as
+    /// returned by `findings_for_path` — used by Deep mode's verify pass to
+    /// prune findings the model no longer stands behind. Removes each
+    /// section's indices highest-first so earlier indices in the same section
+    /// stay valid as later ones are removed.
+    fn remove_findings(&mut self, locations: &[(usize, usize)]) {
+        let mut by_section: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &(section, index) in locations {
+            by_section.entry(section).or_default().push(index);
+        }
+        for (section, mut indices) in by_section {
+            indices.sort_unstable_by(|a, b| b.cmp(a));
+            indices.dedup();
+            for index in indices {
+                if let Some(findings) = self.sections.get_mut(section)
+                    && index < findings.len()
+                {
+                    findings.remove(index);
+                }
+            }
+        }
     }
 
     /// The file path a finding is bound to — the `path` inside its leading
@@ -1386,6 +1454,82 @@ fn auto_review_code_window(workspace: &Path, path: &str, line: usize) -> (usize,
     (start + 1, window)
 }
 
+/// Line cap on the whole-file content folded into a review prompt
+/// (`auto_review_read_full_file`). Above this the file falls back to
+/// diff-only context — the file is unusually large, and pinning a slot's KV
+/// cache to that much text would cost more than the extra context is worth.
+const AUTO_REVIEW_FULL_FILE_MAX_LINES: usize = 4000;
+
+/// Convert `repo_relative_path` — the convention every `/auto_review` file
+/// path uses (relative to the git repo root) — into the path the knowledge
+/// graph indexes by (relative to `workspace`, wherever orangu was actually
+/// launched from — see `run_session_start_hook`/`ExtractedNode::source_file`
+/// in `agents::hooks`). The two coincide whenever orangu is launched from the
+/// repo root itself, but diverge whenever `workspace` is a sub- or
+/// super-directory of the repo — without this conversion,
+/// `GraphStore::cross_file_context`'s exact-string match would silently never
+/// find anything in that case. Returns the path unchanged when there's no
+/// repo root to convert from (`repo_root: None`), or `None` when `workspace`
+/// isn't nested with `repo_root` at all — nothing sensible to map to, so the
+/// graph lookup is skipped rather than queried with a path it can't match.
+pub(crate) fn auto_review_graph_relative_path(
+    workspace: &Path,
+    repo_root: Option<&Path>,
+    repo_relative_path: &str,
+) -> Option<String> {
+    let Some(repo_root) = repo_root else {
+        return Some(repo_relative_path.to_string());
+    };
+    let absolute = repo_root.join(repo_relative_path);
+    let relative = absolute.strip_prefix(workspace).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Deep mode's cross-file context section: the callers/callees of `path`'s
+/// symbols that live in *other* files, read from the (already-built,
+/// incrementally cached) knowledge graph — the relationships a diff plus the
+/// whole file alone can't show, e.g. a signature change breaking a caller
+/// elsewhere. `None` when the graph isn't built yet, the lock is poisoned,
+/// `workspace` and `repo_root` don't nest (see
+/// `auto_review_graph_relative_path`), or the file has no cross-file
+/// neighbours.
+pub(crate) fn auto_review_graph_context(
+    graph_store: &std::sync::Mutex<Option<orangu::graph::store::GraphStore>>,
+    workspace: &Path,
+    repo_root: Option<&Path>,
+    path: &str,
+) -> Option<String> {
+    let graph_path = auto_review_graph_relative_path(workspace, repo_root, path)?;
+    let guard = graph_store.lock().ok()?;
+    let store = guard.as_ref()?;
+    let results = store.cross_file_context(&graph_path);
+    if results.is_empty() {
+        return None;
+    }
+    Some(
+        results
+            .iter()
+            .map(|result| result.format())
+            .collect::<Vec<_>>()
+            .join("\n---\n"),
+    )
+}
+
+/// The whole content of `path` (the reviewed, i.e. new, version), read from
+/// `workspace`, for the "Full file" section of a category prompt — the
+/// surrounding context a diff alone doesn't carry. `None` when the file no
+/// longer exists (a deletion), isn't valid UTF-8, or exceeds
+/// `AUTO_REVIEW_FULL_FILE_MAX_LINES`; the diff alone still carries the review
+/// in that case.
+fn auto_review_read_full_file(workspace: &Path, path: &str) -> Option<String> {
+    let resolved = orangu::tools::resolve_workspace_path(workspace, path).ok()?;
+    let content = std::fs::read_to_string(&resolved).ok()?;
+    if content.lines().count() > AUTO_REVIEW_FULL_FILE_MAX_LINES {
+        return None;
+    }
+    Some(content)
+}
+
 /// Whether `text` is a "no findings" placeholder rather than a real finding:
 /// empty, or a `None`/`no issues`/... affirmation — possibly with a trailing
 /// parenthetical justification (`None (no direct memory risk)`) or surrounding
@@ -1650,12 +1794,19 @@ pub(crate) fn parse_auto_review_category_response(
 
 /// The per-file, per-category prompt: ask for a verdict plus findings for one
 /// category only, in a fixed plain-text format that
-/// `parse_auto_review_category_response` understands. The diff leads and the
-/// category instruction follows, so a file's category requests share their
-/// prefix and the server's prompt cache (e.g. llama.cpp) can reuse the
-/// processed diff across them.
+/// `parse_auto_review_category_response` understands. The full file (when
+/// `file_content` is given) leads, the diff follows, then the cross-file
+/// graph context (Deep mode, when `graph_context` is given), and the category
+/// instruction comes last, so a file's category requests share their prefix
+/// and — pinned to the same llama.cpp slot (`run_auto_review_mode` attaches
+/// one `ChatSession` per file to a single `id_slot`) — the server's KV cache
+/// can reuse the processed file and diff across them instead of
+/// reprocessing it for every category.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_auto_review_category_prompt_with_stats(
     path: &str,
+    file_content: Option<&str>,
+    graph_context: Option<&str>,
     category: &str,
     focus: &str,
     patch: &str,
@@ -1673,13 +1824,25 @@ pub(crate) fn build_auto_review_category_prompt_with_stats(
         .note
         .map(|note| format!("{note}\n\n"))
         .unwrap_or_default();
+    let file_section = file_content
+        .map(|content| format!("Full file (after the change):\n```\n{content}\n```\n\n"))
+        .unwrap_or_default();
+    let graph_section = graph_context
+        .map(|context| {
+            format!(
+                "Cross-file context (how the changed symbols are used elsewhere in the codebase):\n{context}\n\n"
+            )
+        })
+        .unwrap_or_default();
     (
         format!(
             "You are performing an automated code review of the changes made to `{path}` in the diff below.\n\
              \n\
              {note}\
+             {file_section}\
              ```diff\n{}\n```\n\
              \n\
+             {graph_section}\
              Review only the changes — the added, removed, and modified lines — for {category} issues ({focus}), and judge how the changes fit into the surrounding context. Do not review pre-existing content the change does not touch.\n\
              \n\
              GUIDELINES:\n\
@@ -1722,6 +1885,55 @@ pub(crate) fn build_auto_review_overall_prompt(state: &AutoReviewState) -> Strin
     format!(
         "You are performing an automated code review and have reviewed each changed file, with the results below. Describe briefly how the changes fit together as one change set — readiness, risk, and common themes — as 2 to 6 short bullet points, one line each. Respond with only the bullet points.\n\n{summary}"
     )
+}
+
+/// Deep mode's verify pass: after a file's categories end with at least one
+/// rejection, list every finding recorded against it — `findings` as returned
+/// by `AutoReviewState::findings_for_path` — and ask the model to re-examine
+/// each against the file, diff, and (when Deep) graph context already sent
+/// earlier in this pinned session, confirming or dropping it. Sent through
+/// the same session as the category requests, so none of that context needs
+/// resending.
+pub(crate) fn build_auto_review_verify_prompt(findings: &[(usize, usize, String)]) -> String {
+    let mut list = String::new();
+    for (ordinal, (_, _, finding)) in findings.iter().enumerate() {
+        list.push_str(&format!("{}. {finding}\n", ordinal + 1));
+    }
+    format!(
+        "You previously flagged the following potential issues in the file and diff already shown above. Re-examine each one against that same context and decide whether it truly needs to be fixed before merging, or was a false positive.\n\
+         \n\
+         {list}\n\
+         Respond in exactly this format, with no other prose, one line per finding, in the same order and numbering as above:\n\
+         \n\
+         <n>. CONFIRM or DROP\n\
+         \n\
+         CONFIRM a finding only if it still holds up as a real, actionable issue; DROP it if closer reading shows it doesn't apply or isn't worth fixing."
+    )
+}
+
+/// Parse Deep mode's verify-pass response into a per-finding drop decision,
+/// parallel to the `findings` list `build_auto_review_verify_prompt` numbered.
+/// A numbered line that says DROP marks that index `true`; CONFIRM, an
+/// unparseable line, or a missing number all default to `false` (kept) — a
+/// truncated or malformed response never silently discards a real finding.
+pub(crate) fn parse_auto_review_verify_response(text: &str, count: usize) -> Vec<bool> {
+    let mut drop = vec![false; count];
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']);
+        let Some((head, rest)) = line.split_once('.') else {
+            continue;
+        };
+        let Ok(ordinal) = head.trim().parse::<usize>() else {
+            continue;
+        };
+        if ordinal == 0 || ordinal > count {
+            continue;
+        }
+        if rest.trim_start().to_ascii_uppercase().starts_with("DROP") {
+            drop[ordinal - 1] = true;
+        }
+    }
+    drop
 }
 
 /// Build the auto review exit report: the lines rendered for the output
@@ -1788,6 +2000,20 @@ pub(crate) fn auto_review_exit_output(state: &AutoReviewState) -> (Vec<String>, 
     (lines, markdown.join("\n"))
 }
 
+/// `GraphBuildStatus` (the graph module's backend-facing signal) as the
+/// status bar's `ConnStatus` (the tui module's display-facing tri-state) —
+/// `Building` reads as `Pending` (white), `Ready` as `Ok` (green), `Failed`
+/// as `Failed` (red).
+pub(crate) fn auto_review_graph_conn_status(
+    status: orangu::graph::status::GraphBuildStatus,
+) -> orangu::tui::ConnStatus {
+    match status {
+        orangu::graph::status::GraphBuildStatus::Building => orangu::tui::ConnStatus::Pending,
+        orangu::graph::status::GraphBuildStatus::Ready => orangu::tui::ConnStatus::Ok,
+        orangu::graph::status::GraphBuildStatus::Failed => orangu::tui::ConnStatus::Failed,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn print_auto_review_screen(
     state: &AutoReviewState,
@@ -1832,7 +2058,7 @@ pub(crate) fn print_auto_review_screen(
             // Pre-start phase: the run has not begun and is neither done nor
             // cancelled.
             prestart: !state.run_started && !state.done && !state.cancelled,
-            ignored: &state.ignored,
+            modes: &state.modes,
             reject,
             diff,
             report_lines: &report_lines,
@@ -1852,6 +2078,11 @@ pub(crate) fn print_auto_review_screen(
             prompt_branch: chrome.prompt_branch,
             left_status,
             pending_count: chrome.pending_count,
+            graph_status: state
+                .graph_status
+                .lock()
+                .ok()
+                .map(|status| auto_review_graph_conn_status(*status)),
             actual_width: viewport.actual_width,
             actual_height: viewport.actual_height,
         })
@@ -1877,10 +2108,14 @@ pub(crate) async fn run_auto_review_mode(
     compression_metrics: std::sync::Arc<std::sync::Mutex<orangu::compression::CompressionMetrics>>,
     compression_store: std::sync::Arc<orangu::compression_cache::CompressionStore>,
     skills: &orangu::skills::SkillRegistry,
+    slots: orangu::llm::SlotRegistry,
+    graph_store: std::sync::Arc<std::sync::Mutex<Option<orangu::graph::store::GraphStore>>>,
+    graph_status: std::sync::Arc<std::sync::Mutex<orangu::graph::status::GraphBuildStatus>>,
 ) -> Result<AutoReviewState> {
     let immediate = launch.immediate;
     let mut state = AutoReviewState::new(launch);
     state.model = chrome.current_model.to_string();
+    state.graph_status = graph_status;
     let mut exit_requested = false;
 
     // Pre-start phase: unless `immediate` was given, the run waits for Alt+s so
@@ -1938,6 +2173,32 @@ pub(crate) async fn run_auto_review_mode(
             (file.path.clone(), file.patch.clone())
         };
         state.reviewing = Some(index);
+        // The whole file (when it's not too large — see
+        // `AUTO_REVIEW_FULL_FILE_MAX_LINES`), read once per file and folded
+        // into every category prompt below, so the model sees more than just
+        // the changed lines.
+        let file_content = auto_review_read_full_file(workspace, &path);
+        let deep = state.is_deep(index);
+        // Deep mode: never truncate the diff, and fold in the changed
+        // symbols' cross-file callers/callees from the knowledge graph — the
+        // two extra passes `AutoReviewFileMode::Deep`'s doc comment promises,
+        // on top of the whole-file context every mode already gets.
+        let file_compression_enabled = compression_enabled && !deep;
+        let graph_context = deep
+            .then(|| {
+                auto_review_graph_context(&graph_store, workspace, repo_root.as_deref(), &path)
+            })
+            .flatten();
+        // One scratch session — and, when the server is llama.cpp, one pinned
+        // `id_slot` — per file: every category request for this file goes
+        // through it, so the file+diff prefix they share is prompt-processed
+        // once by the server and reused from its KV cache instead of being
+        // recomputed for each category. `rollback` resets the session back to
+        // just its system message after each request (below), so the
+        // requests stay independent — only the server-side slot, not the
+        // client-side history, carries the shared context between them.
+        let mut scratch = ChatSession::new(&enhanced_prompt).with_slots(slots.clone());
+        let session_start = scratch.checkpoint();
         let mut any_rejected = false;
         let mut any_failed = false;
         for (section, focus) in *categories {
@@ -1950,17 +2211,18 @@ pub(crate) async fn run_auto_review_mode(
             );
             let (prompt, stats) = build_auto_review_category_prompt_with_stats(
                 &path,
+                file_content.as_deref(),
+                graph_context.as_deref(),
                 category,
                 focus,
                 &patch,
-                compression_enabled,
+                file_compression_enabled,
                 diff_file_cap,
                 Some(compression_store.as_ref()),
             );
             if let Ok(mut metrics) = compression_metrics.lock() {
                 metrics.record(&stats);
             }
-            let mut scratch = ChatSession::new(&enhanced_prompt);
             let llm_start = std::time::Instant::now();
             let outcome = run_auto_review_request(
                 &mut scratch,
@@ -1972,6 +2234,13 @@ pub(crate) async fn run_auto_review_mode(
                 feedback,
             )
             .await?;
+            // Reset to just the system message: the next category's request
+            // starts fresh (no growing chat history, no cross-category
+            // contamination), while `scratch`'s pinned `id_slot` — a property
+            // of the session, not of `messages` — stays put, so the server
+            // still recognizes the shared file+diff prefix. A no-op when the
+            // request failed or was rolled back already.
+            scratch.rollback(session_start);
             match outcome {
                 AutoReviewRequestOutcome::Completed(Ok(text)) => {
                     completed += 1;
@@ -2016,6 +2285,65 @@ pub(crate) async fn run_auto_review_mode(
                 }
             }
         }
+        // Deep mode's verify pass: a rejected file gets one more request,
+        // reusing the same pinned session (no need to resend the file/diff/
+        // graph context already in it), asking the model to re-confirm each
+        // finding now that every category's had its say. Findings it drops
+        // are pruned; if that clears every finding, the file is approved
+        // after all instead of rejected on a false positive.
+        if deep && any_rejected {
+            let findings = state.findings_for_path(&path);
+            if !findings.is_empty() {
+                state.status = format!("File: {path} ({}/{total})  Category: Deep verify", index + 1);
+                let prompt = build_auto_review_verify_prompt(&findings);
+                let llm_start = std::time::Instant::now();
+                let outcome = run_auto_review_request(
+                    &mut scratch,
+                    &prompt,
+                    prompt_profile,
+                    &mut state,
+                    viewport,
+                    chrome,
+                    feedback,
+                )
+                .await?;
+                scratch.rollback(session_start);
+                match outcome {
+                    AutoReviewRequestOutcome::Completed(Ok(text)) => {
+                        usage_stats.record_response(
+                            llm_start.elapsed(),
+                            &text,
+                            std::time::Duration::ZERO,
+                        );
+                        let drop = parse_auto_review_verify_response(&text, findings.len());
+                        let to_remove: Vec<(usize, usize)> = findings
+                            .iter()
+                            .zip(drop)
+                            .filter(|(_, drop)| *drop)
+                            .map(|((section, index, _), _)| (*section, *index))
+                            .collect();
+                        state.remove_findings(&to_remove);
+                        any_rejected = state.file_has_findings(&path);
+                    }
+                    // A failed verify request changes nothing: the findings
+                    // it would have judged stay put, so the file keeps its
+                    // rejection rather than losing it to a request error.
+                    AutoReviewRequestOutcome::Completed(Err(_)) => {}
+                    AutoReviewRequestOutcome::Cancelled => {
+                        state.cancel();
+                        break 'auto;
+                    }
+                    AutoReviewRequestOutcome::Exit => {
+                        exit_requested = true;
+                        break 'auto;
+                    }
+                    AutoReviewRequestOutcome::SwitchTab(tab) => {
+                        state.pending_tab = Some(tab);
+                        break 'auto;
+                    }
+                }
+            }
+        }
         // Mark the file: red when any category rejected, white when a request
         // failed, green otherwise.
         let status = if any_rejected {
@@ -2038,7 +2366,7 @@ pub(crate) async fn run_auto_review_mode(
             auto_review_progress_label(completed, total_requests),
         );
         let prompt = build_auto_review_overall_prompt(&state);
-        let mut scratch = ChatSession::new(&enhanced_prompt);
+        let mut scratch = ChatSession::new(&enhanced_prompt).with_slots(slots.clone());
         let llm_start = std::time::Instant::now();
         let outcome = run_auto_review_request(
             &mut scratch,
@@ -2151,7 +2479,7 @@ pub(crate) fn run_auto_review_prestart(
             (KeyCode::Char('x'), true) => return Ok(PreStartOutcome::Exit),
             (KeyCode::Char('j'), true) => state.select_next(),
             (KeyCode::Char('k'), true) => state.select_prev(),
-            (KeyCode::Char('m'), true) => state.toggle_ignore_selected(),
+            (KeyCode::Char('m'), true) => state.cycle_mode_selected(),
             // Alt+e opens the selected file's diff in `$EDITOR`, like `/diff`.
             (KeyCode::Char('e'), true) => {
                 if let Err(err) = open_selected_file_diff(state, terminal) {
@@ -2250,16 +2578,29 @@ pub(crate) fn auto_review_source_window(rendered: Vec<String>, line: Option<usiz
         .unwrap_or_default()
 }
 
-/// The pre-start status bar: how many files will be reviewed and how many are
-/// marked Ignore, with a reminder to start.
+/// The pre-start status bar: how many files will be reviewed, how many of
+/// those are marked Deep, and how many are marked Ignore, with a reminder to
+/// start.
 fn auto_review_prestart_status(state: &AutoReviewState) -> String {
-    let ignored = state.ignored.iter().filter(|flag| **flag).count();
+    let ignored = state
+        .modes
+        .iter()
+        .filter(|mode| **mode == AutoReviewFileMode::Ignore)
+        .count();
+    let deep = state
+        .modes
+        .iter()
+        .filter(|mode| **mode == AutoReviewFileMode::Deep)
+        .count();
     let to_review = state.files.len().saturating_sub(ignored);
-    if ignored > 0 {
-        format!("Ready: {to_review} to review, {ignored} ignored  Press Alt+s to start")
-    } else {
-        format!("Ready: {to_review} to review  Press Alt+s to start")
+    let mut suffix = String::new();
+    if deep > 0 {
+        suffix.push_str(&format!(", {deep} deep"));
     }
+    if ignored > 0 {
+        suffix.push_str(&format!(", {ignored} ignored"));
+    }
+    format!("Ready: {to_review} to review{suffix}  Press Alt+s to start")
 }
 
 /// Result of one auto review LLM request.
@@ -2274,6 +2615,16 @@ pub(crate) enum AutoReviewRequestOutcome {
     /// The user pressed a workspace-switch key (Alt+,/./Insert/Delete) —
     /// cancel the current request and leave auto review to perform the switch.
     SwitchTab(crate::workspace_tab::TabAction),
+}
+
+/// The dot character the terminal title blinks on, per whether the file
+/// currently under review is Deep. A title is set via a plain OSC escape —
+/// its text reaches the OS's native window-title widget, not the terminal's
+/// own text renderer, so it can't carry ANSI color the way the `/auto_review`
+/// pane's dots do. `◆` vs `●` distinguishes Deep by shape instead, so both
+/// render at the same size.
+pub(crate) fn auto_review_terminal_title_dot(reviewing_deep: bool) -> &'static str {
+    if reviewing_deep { "◆" } else { "●" }
 }
 
 /// Drive one auto review request, rendering the screen with a live status
@@ -2417,11 +2768,16 @@ pub(crate) async fn run_auto_review_request(
                 let blink_on = (frame / 4).is_multiple_of(2);
                 // With feedback on, mirror the progress in the terminal title so
                 // a backgrounded window still shows the run is alive: `orangu ●`
-                // with the dot blinking once per second off the whole-run clock.
+                // (`orangu ◆` while the file under review is Deep) with the dot
+                // blinking once per second off the whole-run clock.
                 if feedback {
                     let dot_on = state.elapsed().as_secs().is_multiple_of(2);
+                    let reviewing_deep = state.reviewing.is_some_and(|index| state.is_deep(index));
                     let title = if dot_on {
-                        format!("{TERMINAL_TITLE} ●")
+                        format!(
+                            "{TERMINAL_TITLE} {}",
+                            auto_review_terminal_title_dot(reviewing_deep)
+                        )
                     } else {
                         TERMINAL_TITLE.to_string()
                     };
@@ -2823,6 +3179,79 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_verify_prompt_numbers_the_findings_in_order() {
+        use crate::review::build_auto_review_verify_prompt;
+
+        let findings = vec![
+            (1usize, 0usize, "**a.rs:3**: unwrap may panic".to_string()),
+            (2, 0, "**a.rs:9**: missing bounds check".to_string()),
+        ];
+        let prompt = build_auto_review_verify_prompt(&findings);
+        assert!(prompt.contains("1. **a.rs:3**: unwrap may panic"));
+        assert!(prompt.contains("2. **a.rs:9**: missing bounds check"));
+        assert!(prompt.find("1. **a.rs:3**").unwrap() < prompt.find("2. **a.rs:9**").unwrap());
+    }
+
+    #[test]
+    fn parse_auto_review_verify_response_drops_only_explicit_drops() {
+        use crate::review::parse_auto_review_verify_response;
+
+        let text = "1. CONFIRM\n2. DROP\n3. drop (false positive)\n";
+        assert_eq!(
+            parse_auto_review_verify_response(text, 3),
+            vec![false, true, true]
+        );
+
+        // A malformed or truncated response defaults every finding to kept,
+        // never silently discarding one.
+        assert_eq!(
+            parse_auto_review_verify_response("not the requested format", 2),
+            vec![false, false]
+        );
+        assert_eq!(parse_auto_review_verify_response("1. DROP\n", 2), vec![
+            true, false
+        ]);
+        // Out-of-range and zero ordinals are ignored rather than panicking.
+        assert_eq!(
+            parse_auto_review_verify_response("0. DROP\n5. DROP\n", 2),
+            vec![false, false]
+        );
+    }
+
+    #[test]
+    fn auto_review_state_finds_and_removes_findings_by_path() {
+        use crate::commands::ReviewLaunch;
+        use crate::review::AutoReviewState;
+        use orangu::tui::{ReviewEntry, ReviewStatus};
+
+        let entry = |path: &str| ReviewEntry {
+            path: path.to_string(),
+            status: ReviewStatus::Unreviewed,
+            diff_lines: Vec::new(),
+            patch: String::new(),
+        };
+        let mut state = AutoReviewState::new(ReviewLaunch {
+            immediate: false,
+            deep: false,
+            files: vec![entry("a.rs"), entry("b.rs")],
+        });
+        state.apply_category_result(0, 1, vec!["3: unwrap may panic".to_string()]);
+        state.apply_category_result(0, 2, vec!["9: unchecked input".to_string()]);
+        state.apply_category_result(1, 1, vec!["1: unrelated finding".to_string()]);
+
+        let findings = state.findings_for_path("a.rs");
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|(_, _, text)| text.contains("a.rs")));
+
+        // Removing both of a.rs's findings drops only those, leaving b.rs's
+        // finding (a different file) untouched.
+        let locations: Vec<(usize, usize)> = findings.iter().map(|(s, i, _)| (*s, *i)).collect();
+        state.remove_findings(&locations);
+        assert!(state.findings_for_path("a.rs").is_empty());
+        assert_eq!(state.findings_for_path("b.rs").len(), 1);
+    }
+
+    #[test]
     fn apply_overall_drops_verdict_lines_and_none_affirmations() {
         use crate::commands::ReviewLaunch;
         use crate::review::AutoReviewState;
@@ -2830,6 +3259,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Approved,
@@ -2924,6 +3354,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
 
@@ -2968,6 +3399,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
         // A mix of line-bearing (`**path:line**:`) and line-less (`**path**:`,
@@ -3026,6 +3458,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Rejected,
@@ -3083,6 +3516,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Rejected,
@@ -3139,6 +3573,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
         state.sections[1].push("**a.rs:42**: broken loop".to_string());
@@ -3197,6 +3632,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
         // Code (two findings), Security (one), and the Conclusion (two rejected
@@ -3253,6 +3689,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
         state.sections[1].push("**a.rs:42**: broken loop".to_string());
@@ -3327,6 +3764,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Approved,
@@ -3385,6 +3823,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Approved,
@@ -3454,6 +3893,8 @@ mod tests {
         let (_, security_focus) = AUTO_REVIEW_FILE_CATEGORIES[1];
         let (code, _) = build_auto_review_category_prompt_with_stats(
             "src/main.rs",
+            None,
+            None,
             "Code",
             code_focus,
             patch,
@@ -3463,6 +3904,8 @@ mod tests {
         );
         let (security, _) = build_auto_review_category_prompt_with_stats(
             "src/main.rs",
+            None,
+            None,
             "Security",
             security_focus,
             patch,
@@ -3480,6 +3923,243 @@ mod tests {
     }
 
     #[test]
+    fn auto_review_category_prompt_includes_the_full_file_when_given() {
+        use crate::review::build_auto_review_category_prompt_with_stats;
+
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let file = "fn main() {\n    y();\n}\n";
+        let (with_file, _) = build_auto_review_category_prompt_with_stats(
+            "src/main.rs",
+            Some(file),
+            None,
+            "Code",
+            "correctness, error handling, and style",
+            patch,
+            false,
+            20,
+            None,
+        );
+        let (without_file, _) = build_auto_review_category_prompt_with_stats(
+            "src/main.rs",
+            None,
+            None,
+            "Code",
+            "correctness, error handling, and style",
+            patch,
+            false,
+            20,
+            None,
+        );
+
+        // The full file appears ahead of the diff when given, and is simply
+        // absent — not an empty section — when not.
+        assert!(with_file.contains("Full file (after the change):"));
+        assert!(with_file.contains(file));
+        assert!(with_file.find(file).unwrap() < with_file.find(patch).unwrap());
+        assert!(!without_file.contains("Full file (after the change):"));
+    }
+
+    #[test]
+    fn auto_review_category_prompt_includes_graph_context_after_the_diff_when_given() {
+        use crate::review::build_auto_review_category_prompt_with_stats;
+
+        let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let graph_context = "[Graph Lookup: \"main\"]\nmain (fn, src/main.rs)\n";
+        let (with_graph, _) = build_auto_review_category_prompt_with_stats(
+            "src/main.rs",
+            None,
+            Some(graph_context),
+            "Code",
+            "correctness, error handling, and style",
+            patch,
+            false,
+            20,
+            None,
+        );
+        let (without_graph, _) = build_auto_review_category_prompt_with_stats(
+            "src/main.rs",
+            None,
+            None,
+            "Code",
+            "correctness, error handling, and style",
+            patch,
+            false,
+            20,
+            None,
+        );
+
+        assert!(with_graph.contains("Cross-file context"));
+        assert!(with_graph.contains(graph_context));
+        assert!(with_graph.find(patch).unwrap() < with_graph.find(graph_context).unwrap());
+        assert!(!without_graph.contains("Cross-file context"));
+    }
+
+    #[test]
+    fn auto_review_graph_context_reads_cross_file_neighbours_from_the_store() {
+        use crate::review::auto_review_graph_context;
+        use orangu::graph::extract::{Confidence, ExtractedEdge, ExtractedNode};
+        use orangu::graph::store::GraphStore;
+
+        let mut graph = GraphStore::new();
+        graph.add_node(ExtractedNode {
+            id: "a::changed".to_string(),
+            label: "changed".to_string(),
+            source_file: "a.rs".to_string(),
+            source_location: "L1-L3".to_string(),
+            kind: "fn".to_string(),
+        });
+        graph.add_node(ExtractedNode {
+            id: "b::caller".to_string(),
+            label: "caller".to_string(),
+            source_file: "b.rs".to_string(),
+            source_location: "L1-L3".to_string(),
+            kind: "fn".to_string(),
+        });
+        graph.add_edge(ExtractedEdge {
+            source: "b::caller".to_string(),
+            target: "a::changed".to_string(),
+            relation: "calls".to_string(),
+            confidence: Confidence::Extracted,
+        });
+        let store = std::sync::Mutex::new(Some(graph));
+        let workspace = std::path::Path::new("/repo");
+
+        // `repo_root: None` — the common case where the /auto_review path is
+        // already graph-relative — leaves it unchanged.
+        let context = auto_review_graph_context(&store, workspace, None, "a.rs")
+            .expect("cross-file neighbour");
+        assert!(context.contains("caller"));
+
+        // No entry, no build yet, and a file with no cross-file neighbours all
+        // come back `None` rather than an empty section.
+        let empty_store = std::sync::Mutex::new(None);
+        assert!(auto_review_graph_context(&empty_store, workspace, None, "a.rs").is_none());
+        assert!(auto_review_graph_context(&store, workspace, None, "c.rs").is_none());
+    }
+
+    #[test]
+    fn auto_review_graph_context_converts_repo_relative_to_workspace_relative() {
+        use crate::review::auto_review_graph_context;
+        use orangu::graph::extract::ExtractedNode;
+        use orangu::graph::store::GraphStore;
+        use std::path::Path;
+
+        // orangu was launched from a subdirectory of the repo: the graph
+        // indexes `foo.rs` (workspace-relative), but /auto_review's diff
+        // reports the file as `src/foo.rs` (repo-root-relative).
+        let mut graph = GraphStore::new();
+        graph.add_node(ExtractedNode {
+            id: "foo".to_string(),
+            label: "foo".to_string(),
+            source_file: "foo.rs".to_string(),
+            source_location: "L1-L3".to_string(),
+            kind: "fn".to_string(),
+        });
+        let store = std::sync::Mutex::new(Some(graph));
+        let workspace = Path::new("/repo/src");
+        let repo_root = Path::new("/repo");
+
+        // Without the conversion this would look up "src/foo.rs" against a
+        // graph keyed by "foo.rs" and always miss; the node itself has no
+        // cross-file neighbours, but the call must not skip the graph
+        // entirely (a `None` graph_store would also return `None` here, so
+        // this only proves the path resolved, not that a match was found —
+        // paired with the `auto_review_graph_relative_path` unit test below
+        // for the actual mapping).
+        assert!(
+            auto_review_graph_context(&store, workspace, Some(repo_root), "src/foo.rs").is_none()
+        );
+    }
+
+    #[test]
+    fn auto_review_graph_relative_path_maps_repo_root_to_workspace() {
+        use crate::review::auto_review_graph_relative_path;
+        use std::path::Path;
+
+        // The common case: orangu launched from the repo root itself, so the
+        // two conventions already coincide.
+        assert_eq!(
+            auto_review_graph_relative_path(Path::new("/repo"), Some(Path::new("/repo")), "a.rs"),
+            Some("a.rs".to_string())
+        );
+
+        // orangu launched from a subdirectory: the repo-root-relative path
+        // gets narrowed to workspace-relative.
+        assert_eq!(
+            auto_review_graph_relative_path(
+                Path::new("/repo/src"),
+                Some(Path::new("/repo")),
+                "src/foo.rs"
+            ),
+            Some("foo.rs".to_string())
+        );
+
+        // No repo root known (e.g. not a git repo): the path passes through
+        // unchanged.
+        assert_eq!(
+            auto_review_graph_relative_path(Path::new("/repo"), None, "a.rs"),
+            Some("a.rs".to_string())
+        );
+
+        // workspace and repo_root don't nest: nothing sensible to map to.
+        assert_eq!(
+            auto_review_graph_relative_path(
+                Path::new("/elsewhere"),
+                Some(Path::new("/repo")),
+                "a.rs"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_review_graph_conn_status_maps_each_build_status() {
+        use crate::review::auto_review_graph_conn_status;
+        use orangu::graph::status::GraphBuildStatus;
+        use orangu::tui::ConnStatus;
+
+        assert_eq!(
+            auto_review_graph_conn_status(GraphBuildStatus::Building),
+            ConnStatus::Pending
+        );
+        assert_eq!(
+            auto_review_graph_conn_status(GraphBuildStatus::Ready),
+            ConnStatus::Ok
+        );
+        assert_eq!(
+            auto_review_graph_conn_status(GraphBuildStatus::Failed),
+            ConnStatus::Failed
+        );
+    }
+
+    #[test]
+    fn auto_review_terminal_title_dot_changes_shape_not_color_while_reviewing_deep() {
+        use crate::review::auto_review_terminal_title_dot;
+
+        // Both plain characters, same rendered size — a title can't carry
+        // color, so Deep is distinguished by shape instead.
+        assert_eq!(auto_review_terminal_title_dot(false), "●");
+        assert_eq!(auto_review_terminal_title_dot(true), "◆");
+    }
+
+    #[test]
+    fn auto_review_state_defaults_to_a_building_graph_status() {
+        use crate::commands::ReviewLaunch;
+        use crate::review::AutoReviewState;
+        use orangu::graph::status::GraphBuildStatus;
+
+        // A state built without `run_auto_review_mode` wiring in a real
+        // handle (e.g. every other test in this module) still reads a
+        // well-defined status rather than panicking on a missing field.
+        let state = AutoReviewState::new(ReviewLaunch {
+            immediate: false,
+            deep: false,
+            files: Vec::new(),
+        });
+        assert_eq!(*state.graph_status.lock().unwrap(), GraphBuildStatus::Building);
+    }
+
+    #[test]
     fn auto_review_status_text_appends_the_run_time() {
         use crate::commands::ReviewLaunch;
         use crate::review::AutoReviewState;
@@ -3489,6 +4169,7 @@ mod tests {
         let mut state = AutoReviewState::new(ReviewLaunch {
             files: Vec::new(),
             immediate: false,
+            deep: false,
         });
         state.status = "Category: Code  Progress: 1/13 (7%)".to_string();
         let text = state.status_text();
@@ -3529,6 +4210,7 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs"), entry("b.rs")],
         });
 
@@ -3555,6 +4237,7 @@ mod tests {
         // Cancelling clears the highlight too.
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs")],
         });
         state.selected = Some(0);
@@ -3716,6 +4399,7 @@ mod tests {
 
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![ReviewEntry {
                 path: "a.rs".to_string(),
                 status: ReviewStatus::Approved,
@@ -3834,6 +4518,7 @@ mod tests {
         };
         let state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![
                 entry("a.rs", ReviewStatus::Approved),
                 entry("b.rs", ReviewStatus::Unreviewed),
@@ -3857,6 +4542,7 @@ mod tests {
         // All approved: a clean verdict with no file list.
         let state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![entry("a.rs", ReviewStatus::Approved)],
         });
         assert_eq!(state.conclusion_verdict(), "orangu approves this patch");
@@ -3877,20 +4563,27 @@ mod tests {
         };
         let mut state = AutoReviewState::new(ReviewLaunch {
             immediate: false,
+            deep: false,
             files: vec![
                 entry("a.rs", ReviewStatus::Approved),
                 entry("b.rs", ReviewStatus::Unreviewed),
             ],
         });
 
-        // Alt+m on the highlighted b.rs marks it Ignore; a toggle flips it back.
+        // Alt+m on the highlighted b.rs cycles Normal -> Deep -> Ignore ->
+        // Normal.
         state.selected = Some(1);
-        state.toggle_ignore_selected();
-        assert!(state.is_ignored(1));
+        assert!(!state.is_deep(1) && !state.is_ignored(1));
+        state.cycle_mode_selected();
+        assert!(state.is_deep(1));
         assert!(!state.is_ignored(0));
-        state.toggle_ignore_selected();
-        assert!(!state.is_ignored(1));
-        state.toggle_ignore_selected();
+        state.cycle_mode_selected();
+        assert!(state.is_ignored(1));
+        assert!(!state.is_deep(1));
+        state.cycle_mode_selected();
+        assert!(!state.is_deep(1) && !state.is_ignored(1));
+        state.cycle_mode_selected();
+        state.cycle_mode_selected();
         assert!(state.is_ignored(1));
 
         // Before the run starts the ignored file keeps its unreviewed status.
@@ -3905,10 +4598,10 @@ mod tests {
         assert_eq!(state.conclusion_verdict(), "orangu approves this patch");
         assert!(state.conclusion_findings().is_empty());
 
-        // Ignore can only be set before the run starts.
+        // The mode can only be set before the run starts.
         state.selected = Some(0);
-        state.toggle_ignore_selected();
-        assert!(!state.is_ignored(0));
+        state.cycle_mode_selected();
+        assert!(!state.is_deep(0) && !state.is_ignored(0));
     }
 
     #[test]
@@ -3919,6 +4612,7 @@ mod tests {
         let mut state = AutoReviewState::new(ReviewLaunch {
             files: Vec::new(),
             immediate: false,
+            deep: false,
         });
         // Before the run starts the placeholder invites Alt+s.
         let lines = state.report_lines();

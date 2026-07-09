@@ -830,7 +830,7 @@ fn parses_auto_review_commands() {
         assert!(
             matches!(
                 parse_local_command(input),
-                Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, false))
+                Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, false, false))
             ),
             "expected {input:?} to parse as a whole-branch AutoReview"
         );
@@ -842,7 +842,7 @@ fn parses_auto_review_commands() {
         assert!(
             matches!(
                 parse_local_command(input),
-                Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), false)) if file == "src/tui.rs"
+                Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), false, false)) if file == "src/tui.rs"
             ),
             "expected {input:?} to carry the path"
         );
@@ -852,19 +852,19 @@ fn parses_auto_review_commands() {
     // alongside a file, in either order.
     assert!(matches!(
         parse_local_command("/auto_review immediate"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, true))
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, true, false))
     ));
     assert!(matches!(
         parse_local_command("auto review immediate"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, true))
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, true, false))
     ));
     assert!(matches!(
         parse_local_command("/auto_review src/tui.rs immediate"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), true)) if file == "src/tui.rs"
+        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), true, false)) if file == "src/tui.rs"
     ));
     assert!(matches!(
         parse_local_command("/auto_review immediate src/tui.rs"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), true)) if file == "src/tui.rs"
+        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), true, false)) if file == "src/tui.rs"
     ));
 
     // The `all` keyword requests every project file — alone, with `immediate`
@@ -873,24 +873,69 @@ fn parses_auto_review_commands() {
         assert!(
             matches!(
                 parse_local_command(input),
-                Some(LocalCommand::AutoReview(AutoReviewTarget::All, false))
+                Some(LocalCommand::AutoReview(AutoReviewTarget::All, false, false))
             ),
             "expected {input:?} to parse as an All AutoReview"
         );
     }
     assert!(matches!(
         parse_local_command("/auto_review all immediate"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::All, true))
+        Some(LocalCommand::AutoReview(AutoReviewTarget::All, true, false))
     ));
     assert!(matches!(
         parse_local_command("/auto_review immediate all"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::All, true))
+        Some(LocalCommand::AutoReview(AutoReviewTarget::All, true, false))
     ));
     // `all` wins over a file argument if both are somehow given.
     assert!(matches!(
         parse_local_command("/auto_review src/tui.rs all"),
-        Some(LocalCommand::AutoReview(AutoReviewTarget::All, false))
+        Some(LocalCommand::AutoReview(AutoReviewTarget::All, false, false))
     ));
+
+    // The `deep` keyword starts every file in Deep mode — alone (whole
+    // branch), with a file, with `all`, and its natural-language form —
+    // mirroring `immediate` and `all` exactly, in any order.
+    for input in ["/auto_review deep", "auto review deep", "/auto_review DEEP"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, false, true))
+            ),
+            "expected {input:?} to parse as a Deep whole-branch AutoReview"
+        );
+    }
+    assert!(matches!(
+        parse_local_command("/auto_review deep src/tui.rs"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), false, true)) if file == "src/tui.rs"
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review src/tui.rs deep"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), false, true)) if file == "src/tui.rs"
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review deep all"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::All, false, true))
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review all deep"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::All, false, true))
+    ));
+    // `deep`, `immediate`, and `all` combine freely in any order — the
+    // longest accepted form.
+    for input in [
+        "/auto_review deep all immediate",
+        "/auto_review all immediate deep",
+        "/auto_review immediate deep all",
+        "auto review deep all immediate",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AutoReview(AutoReviewTarget::All, true, true))
+            ),
+            "expected {input:?} to parse as a Deep, immediate, All AutoReview"
+        );
+    }
 }
 
 #[test]

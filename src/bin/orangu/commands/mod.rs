@@ -230,6 +230,11 @@ pub struct ReviewLaunch {
     /// `/auto_review` only: start the run at once, skipping the pre-start phase
     /// (the `immediate` argument). Always `false` for `/review`.
     pub immediate: bool,
+    /// `/auto_review` only: start every file in **Deep** mode instead of
+    /// Normal (the `deep` argument) — the same Deep the Alt+m pre-start cycle
+    /// offers per file, just applied to the whole launch at once. Always
+    /// `false` for `/review`.
+    pub deep: bool,
 }
 
 /// The `/auto_review` keyword argument that starts the run at once, skipping
@@ -240,6 +245,10 @@ pub const AUTO_REVIEW_IMMEDIATE: &str = "immediate";
 /// instead of the branch diff or a single file. Offered by Tab completion and
 /// the inline ghost.
 pub const AUTO_REVIEW_ALL: &str = "all";
+
+/// The `/auto_review` keyword argument that starts every file in **Deep**
+/// mode instead of Normal. Offered by Tab completion and the inline ghost.
+pub const AUTO_REVIEW_DEEP: &str = "deep";
 
 /// What `/auto_review` reviews: the branch diff (the default), a single file
 /// (`/auto_review <file>`), or every file in the project (`/auto_review
@@ -428,10 +437,12 @@ pub enum LocalCommand<'a> {
     Grep(Option<Cow<'a, str>>),
     Search(Option<Cow<'a, str>>),
     Review,
-    /// `/auto_review [<file>|all] [immediate]`: the review target (the
-    /// branch diff, a single file, or every project file with `all`) and
-    /// whether to start the run at once (the `immediate` keyword).
-    AutoReview(AutoReviewTarget<'a>, bool),
+    /// `/auto_review [<file>|all] [immediate] [deep]`: the review target (the
+    /// branch diff, a single file, or every project file with `all`),
+    /// whether to start the run at once (the `immediate` keyword), and
+    /// whether to start every file in Deep mode (the `deep` keyword). The
+    /// three keywords and a file argument may appear in any order.
+    AutoReview(AutoReviewTarget<'a>, bool, bool),
     /// `/duplicates [<threshold>]`: scan the workspace for duplicated functions
     /// (across every language in [`orangu::duplicates::LANGUAGES`]) and print a
     /// similarity report. The optional argument overrides

@@ -185,6 +185,9 @@ pub fn render_review_screen(args: ReviewScreenArgs<'_>) -> String {
         current_model: args.current_model,
         left_status: args.left_status,
         pending_count: args.pending_count,
+        // The Graph status dot is `/auto_review`-only; `/review` keeps its
+        // `Pending: N` display exactly as before.
+        graph_status: None,
         prompt_prefix: &prompt_prefix,
         input: args.input,
         cursor: args.cursor,

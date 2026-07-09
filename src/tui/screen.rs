@@ -77,12 +77,17 @@ pub struct ScreenRenderArgs<'a> {
 }
 
 /// Inputs for the bottom prompt frame (separator, input window, status bar),
-/// shared by the normal screen, `/review` mode, and the manual viewer.
+/// shared by the normal screen, `/review` mode, `/auto_review`, and the
+/// manual viewer.
 pub struct PromptFrameArgs<'a> {
     pub header_height: usize,
     pub current_model: &'a str,
     pub left_status: Option<StatusFragment>,
     pub pending_count: usize,
+    /// The knowledge graph's build status, shown as a `Graph: ●` indicator
+    /// centered alongside `Pending: N`. `None` omits it entirely — today only
+    /// `/auto_review` wires up a real value; the other screens pass `None`.
+    pub graph_status: Option<ConnStatus>,
     pub prompt_prefix: &'a str,
     pub input: &'a str,
     pub cursor: usize,
@@ -311,6 +316,10 @@ pub fn render_screen(args: ScreenRenderArgs<'_>) -> String {
         current_model,
         left_status: args.left_status,
         pending_count: args.pending_count,
+        // The Graph status dot is `/auto_review`-only (see
+        // `AutoReviewScreenArgs::graph_status`) — the main chat screen keeps
+        // its `Pending: N` display exactly as before.
+        graph_status: None,
         prompt_prefix: &prompt_prefix,
         input: args.input,
         cursor: args.cursor,
@@ -594,6 +603,7 @@ pub fn render_prompt_frame(args: PromptFrameArgs<'_>) -> String {
         args.left_status.as_ref(),
         args.current_model,
         args.pending_count,
+        args.graph_status,
     );
     frame.push_str(&format!(
         "\x1b[{bottom_row};1H{separator}\x1b[{model_row};1H{status_line}\x1b[{cursor_row};{display_cursor_col}H"
@@ -659,49 +669,68 @@ pub fn prompt_prefix(branch_name: Option<&str>) -> String {
     }
 }
 
+/// Center `text` (which may carry ANSI color codes — its width is measured
+/// with `visible_line_width`, not `text.len()`) within `width` visible
+/// columns, padding with plain spaces on both sides. Returns `text` unchanged
+/// if it doesn't fit — callers gate on `visible_line_width(text) <= width`
+/// before calling this, so that's only ever reached defensively.
+fn centered(text: &str, width: usize) -> String {
+    let visible = visible_line_width(text);
+    if visible >= width {
+        return text.to_string();
+    }
+    let total_pad = width - visible;
+    let left_pad = total_pad / 2;
+    let right_pad = total_pad - left_pad;
+    format!("{}{text}{}", " ".repeat(left_pad), " ".repeat(right_pad))
+}
+
 fn render_status_line(
     width: usize,
     left_status: Option<&StatusFragment>,
     current_model: &str,
     pending_count: usize,
+    graph_status: Option<ConnStatus>,
 ) -> String {
-    // Priority: left_status (Working/Thinking) > model name > Pending.
+    // Priority: left_status (Working/Thinking) > model name > Graph/Pending.
     let left_visible_width = left_status.map_or(0, |s| s.visible_width);
     let right_space = width.saturating_sub(left_visible_width);
 
     let model_width = current_model.chars().count();
     let show_model = right_space >= model_width;
-
-    let pending_text = (pending_count > 0).then(|| format!("Pending: {pending_count}"));
-    let pending_width = pending_text.as_ref().map_or(0, |s| s.chars().count());
     // Gap is the space between the left status and the model name (or right edge if no model).
     let gap = if show_model {
         right_space.saturating_sub(model_width)
     } else {
         right_space
     };
-    let show_pending = show_model && pending_text.is_some() && gap >= pending_width;
 
-    let mut right_cells = vec![' '; right_space];
-    if show_model {
-        let start = right_space - model_width;
-        for (i, ch) in current_model.chars().enumerate() {
-            if start + i < right_space {
-                right_cells[start + i] = ch;
-            }
-        }
-    }
-    if show_pending {
-        let pending = pending_text.as_deref().unwrap_or("");
-        let start = (gap - pending_width) / 2;
-        for (i, ch) in pending.chars().enumerate() {
-            if start + i < right_space {
-                right_cells[start + i] = ch;
-            }
-        }
-    }
+    // The centered content: `Graph: ●` and `Pending: N`, joined when both are
+    // present and both fit; if the pair doesn't fit but the Graph indicator
+    // alone would, it's shown alone rather than dropped for a Pending count
+    // that only matters while a command queue is building up.
+    let graph_text = graph_status.map(|status| format!("Graph: {}", indicator(status)));
+    let pending_text = (pending_count > 0).then(|| format!("Pending: {pending_count}"));
+    let combined = match (&graph_text, &pending_text) {
+        (Some(graph), Some(pending)) => Some(format!("{graph}   {pending}")),
+        (Some(graph), None) => Some(graph.clone()),
+        (None, Some(pending)) => Some(pending.clone()),
+        (None, None) => None,
+    };
+    let middle = combined.filter(|text| show_model && visible_line_width(text) <= gap).or_else(
+        || graph_text.filter(|text| show_model && visible_line_width(text) <= gap),
+    );
 
-    let right: String = right_cells.into_iter().collect();
+    let gap_content = match &middle {
+        Some(text) => centered(text, gap),
+        None => " ".repeat(gap),
+    };
+    let right = if show_model {
+        format!("{gap_content}{current_model}")
+    } else {
+        gap_content
+    };
+
     if let Some(left) = left_status.filter(|s| s.visible_width > 0) {
         format!("{}{}", left.rendered, right)
     } else {
@@ -916,10 +945,37 @@ mod tests {
             Some(&StatusFragment::plain("2.5t/s".to_string())),
             "gpt-4.1",
             3,
+            None,
         );
         assert!(line.starts_with("2.5t/s"));
         assert!(line.contains("Pending: 3"));
         assert!(line.ends_with("gpt-4.1"));
+    }
+
+    #[test]
+    fn status_line_shows_graph_dot_alongside_pending() {
+        let line = render_status_line(40, None, "gpt-4.1", 3, Some(ConnStatus::Ok));
+        assert!(line.contains("Graph: "));
+        assert!(line.contains(&indicator(ConnStatus::Ok)));
+        assert!(line.contains("Pending: 3"));
+        assert!(line.ends_with("gpt-4.1"));
+        // Graph precedes Pending in the combined centered text.
+        assert!(line.find("Graph:").unwrap() < line.find("Pending:").unwrap());
+    }
+
+    #[test]
+    fn status_line_shows_graph_dot_alone_without_pending() {
+        let line = render_status_line(30, None, "gpt-4.1", 0, Some(ConnStatus::Failed));
+        assert!(line.contains("Graph: "));
+        assert!(line.contains(&indicator(ConnStatus::Failed)));
+        assert!(!line.contains("Pending:"));
+    }
+
+    #[test]
+    fn status_line_omits_graph_dot_when_not_given() {
+        let line = render_status_line(30, None, "gpt-4.1", 3, None);
+        assert!(!line.contains("Graph:"));
+        assert!(line.contains("Pending: 3"));
     }
 
     #[test]

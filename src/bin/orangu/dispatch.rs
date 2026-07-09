@@ -96,6 +96,7 @@ pub(crate) fn review_outcome(
             launch_outcome(ReviewLaunch {
                 files,
                 immediate: false,
+                deep: false,
             })
         }
         Err(err) => local_command_error(err),
@@ -112,6 +113,7 @@ pub(crate) fn auto_review_file_outcome(
     workspace: &Path,
     file: &str,
     immediate: bool,
+    deep: bool,
 ) -> CommandOutcome {
     let Some(repo_root) = git::discover_git_root(workspace) else {
         return CommandOutcome::OutputError(
@@ -163,6 +165,7 @@ pub(crate) fn auto_review_file_outcome(
     CommandOutcome::AutoReview(ReviewLaunch {
         files: vec![entry],
         immediate,
+        deep,
     })
 }
 
@@ -173,7 +176,11 @@ pub(crate) fn auto_review_file_outcome(
 /// so being behind the default branch does not matter. Untracked and
 /// gitignored files are never included, since `git ls-files` is the source of
 /// the file list.
-pub(crate) fn auto_review_all_outcome(workspace: &Path, immediate: bool) -> CommandOutcome {
+pub(crate) fn auto_review_all_outcome(
+    workspace: &Path,
+    immediate: bool,
+    deep: bool,
+) -> CommandOutcome {
     let Some(repo_root) = git::discover_git_root(workspace) else {
         return CommandOutcome::OutputError(
             "auto review is only available inside a Git repository".to_string(),
@@ -198,7 +205,11 @@ pub(crate) fn auto_review_all_outcome(workspace: &Path, immediate: bool) -> Comm
         return CommandOutcome::Output("No files to review.".to_string());
     }
 
-    CommandOutcome::AutoReview(ReviewLaunch { files, immediate })
+    CommandOutcome::AutoReview(ReviewLaunch {
+        files,
+        immediate,
+        deep,
+    })
 }
 
 /// Whether a changed file's repo-relative `path` matches the user's `arg`: the
@@ -412,6 +423,9 @@ pub(crate) fn handle_command(
             let server_name = active_model.clone();
             let model_id = active_model_id.clone();
             let is_embeddings_server = active_model.as_str() == embeddings_server;
+            let graph_status = crate::information::graph_status_label(
+                tools.graph_status.lock().map(|status| *status).unwrap_or_default(),
+            );
             Ok(CommandOutcome::Blocking(Box::new(move || {
                 let capabilities = tokio::runtime::Handle::current().block_on(async {
                     crate::information::gather_server_information(&profile, is_embeddings_server)
@@ -420,6 +434,7 @@ pub(crate) fn handle_command(
                 Ok(crate::information::format_information_table(
                     &server_name,
                     &model_id,
+                    graph_status,
                     &capabilities,
                 ))
             })))
@@ -535,17 +550,18 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Review => Ok(review_outcome(workspace, CommandOutcome::Review)),
-        LocalCommand::AutoReview(AutoReviewTarget::Branch, immediate) => {
+        LocalCommand::AutoReview(AutoReviewTarget::Branch, immediate, deep) => {
             Ok(review_outcome(workspace, |mut launch| {
                 launch.immediate = immediate;
+                launch.deep = deep;
                 CommandOutcome::AutoReview(launch)
             }))
         }
-        LocalCommand::AutoReview(AutoReviewTarget::File(file), immediate) => {
-            Ok(auto_review_file_outcome(workspace, file.trim(), immediate))
-        }
-        LocalCommand::AutoReview(AutoReviewTarget::All, immediate) => {
-            Ok(auto_review_all_outcome(workspace, immediate))
+        LocalCommand::AutoReview(AutoReviewTarget::File(file), immediate, deep) => Ok(
+            auto_review_file_outcome(workspace, file.trim(), immediate, deep),
+        ),
+        LocalCommand::AutoReview(AutoReviewTarget::All, immediate, deep) => {
+            Ok(auto_review_all_outcome(workspace, immediate, deep))
         }
         LocalCommand::Duplicates(threshold) => Ok(CommandOutcome::Duplicates(
             threshold.unwrap_or(orangu::duplicates::DEFAULT_THRESHOLD),
@@ -1172,7 +1188,7 @@ mod tests {
 
         // On main the whole file is reviewed: a one-file launch whose patch is
         // the file content as an all-added diff.
-        match auto_review_file_outcome(workspace.path(), "src/tui.rs", false) {
+        match auto_review_file_outcome(workspace.path(), "src/tui.rs", false, false) {
             CommandOutcome::AutoReview(launch) => {
                 assert_eq!(launch.files.len(), 1);
                 let entry = &launch.files[0];
@@ -1190,7 +1206,7 @@ mod tests {
 
         // An unknown file is refused.
         assert!(matches!(
-            auto_review_file_outcome(workspace.path(), "src/missing.rs", false),
+            auto_review_file_outcome(workspace.path(), "src/missing.rs", false, false),
             CommandOutcome::OutputError(_)
         ));
     }
@@ -1215,7 +1231,7 @@ mod tests {
 
         // The changed file is reviewed against the merge base: the patch shows
         // only the added line, not the whole file.
-        match auto_review_file_outcome(workspace.path(), "README.md", false) {
+        match auto_review_file_outcome(workspace.path(), "README.md", false, false) {
             CommandOutcome::AutoReview(launch) => {
                 assert_eq!(launch.files.len(), 1);
                 let patch = &launch.files[0].patch;
@@ -1228,7 +1244,7 @@ mod tests {
         // A file with no changes on the branch is refused.
         fs::write(workspace.path().join("other.txt"), "x\n").expect("other");
         assert!(matches!(
-            auto_review_file_outcome(workspace.path(), "other.txt", false),
+            auto_review_file_outcome(workspace.path(), "other.txt", false, false),
             CommandOutcome::OutputError(_)
         ));
     }
@@ -1253,7 +1269,7 @@ mod tests {
         fs::write(workspace.path().join("untracked.rs"), "fn x() {}\n").expect("untracked");
         fs::write(workspace.path().join("ignored.txt"), "secret\n").expect("ignored");
 
-        match auto_review_all_outcome(workspace.path(), false) {
+        match auto_review_all_outcome(workspace.path(), false, false) {
             CommandOutcome::AutoReview(launch) => {
                 let paths: Vec<&str> = launch.files.iter().map(|f| f.path.as_str()).collect();
                 assert!(paths.contains(&"README.md"), "{paths:?}");

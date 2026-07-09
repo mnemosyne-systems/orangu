@@ -60,12 +60,12 @@ use orangu::{
     session::ChatSession,
     tools::ToolExecutor,
     tui::{
-        AutoReviewDiffView, AutoReviewRejectView, AutoReviewScreenArgs, FEEDBACK_ERR, FEEDBACK_OK,
-        ReviewCommentEditor, ReviewEntry, ReviewFeedbackView, ReviewScreenArgs, ReviewStatus,
-        ScreenRenderArgs, StatusFragment, TabStatus, WorkspaceTabsView,
-        auto_review_pane_body_height, render_auto_review_screen, render_review_screen,
-        render_screen, render_thinking_status, render_tool_running_status, render_working_status,
-        review_pane_body_height, terminal_height, terminal_width,
+        AutoReviewDiffView, AutoReviewFileMode, AutoReviewRejectView, AutoReviewScreenArgs,
+        FEEDBACK_ERR, FEEDBACK_OK, ReviewCommentEditor, ReviewEntry, ReviewFeedbackView,
+        ReviewScreenArgs, ReviewStatus, ScreenRenderArgs, StatusFragment, TabStatus,
+        WorkspaceTabsView, auto_review_pane_body_height, render_auto_review_screen,
+        render_review_screen, render_screen, render_thinking_status, render_tool_running_status,
+        render_working_status, review_pane_body_height, terminal_height, terminal_width,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -460,8 +460,11 @@ async fn run() -> Result<()> {
     // collected in the event loop below, exactly like `sync_handle` / `pr_handle`.
     //
     // `kg_store` is shared between `tools` (reads it for `graph_lookup`) and
-    // the event loop below (writes into it once the scan finishes).
+    // the event loop below (writes into it once the scan finishes). `kg_status`
+    // is the same pairing for the build-status signal `/auto_review`'s status
+    // bar reads (`GraphBuildStatus`): `Building` until this block sets it.
     let kg_store = tools.graph_store.clone(); // Arc pointer shared with ToolExecutor
+    let kg_status = tools.graph_status.clone();
     let scan_workspace = tools.workspace().to_path_buf();
     let mut kg_scan_handle: Option<tokio::task::JoinHandle<_>> =
         Some(tokio::task::spawn_blocking(move || {
@@ -1047,9 +1050,15 @@ async fn run() -> Result<()> {
                     if let Ok(mut guard) = kg_store.lock() {
                         *guard = Some(result.store);
                     }
+                    if let Ok(mut status) = kg_status.lock() {
+                        *status = orangu::graph::status::GraphBuildStatus::Ready;
+                    }
                 }
                 Err(err) => {
                     output_state.push_text(&format!("Knowledge graph scan failed: {err:#}"));
+                    if let Ok(mut status) = kg_status.lock() {
+                        *status = orangu::graph::status::GraphBuildStatus::Failed;
+                    }
                 }
             }
         }
@@ -1881,6 +1890,9 @@ async fn run() -> Result<()> {
                     tools.compression_metrics.clone(),
                     tools.compression_store.clone(),
                     &skills,
+                    slot_registry.clone(),
+                    tools.graph_store.clone(),
+                    tools.graph_status.clone(),
                 )
                 .await?;
 

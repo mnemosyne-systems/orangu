@@ -16,22 +16,26 @@
 use super::*;
 use std::borrow::Cow;
 
-/// Parse the argument string of `/auto_review` into `(target, immediate)`:
-/// the `immediate` keyword (case-insensitive) requests an at-once start, the
-/// `all` keyword (case-insensitive) requests a review of every project file,
-/// and otherwise the first remaining token, if any, is the single-file
-/// target. So `immediate`, `all`, `src/main.rs`, `src/main.rs immediate`, and
-/// `all immediate` are all accepted, in any order; `all` wins over a file
-/// argument if both are somehow given.
-pub(crate) fn parse_auto_review_args(args: &str) -> (AutoReviewTarget<'_>, bool) {
+/// Parse the argument string of `/auto_review` into `(target, immediate,
+/// deep)`: the `immediate` keyword (case-insensitive) requests an at-once
+/// start, the `all` keyword (case-insensitive) requests a review of every
+/// project file, the `deep` keyword (case-insensitive) requests every file
+/// start in Deep mode, and otherwise the first remaining token, if any, is
+/// the single-file target. So `immediate`, `all`, `deep`, `src/main.rs`,
+/// `src/main.rs immediate`, and `deep all immediate` are all accepted, in any
+/// order; `all` wins over a file argument if both are somehow given.
+pub(crate) fn parse_auto_review_args(args: &str) -> (AutoReviewTarget<'_>, bool, bool) {
     let mut file = None;
     let mut immediate = false;
     let mut all = false;
+    let mut deep = false;
     for token in args.split_whitespace() {
         if token.eq_ignore_ascii_case(AUTO_REVIEW_IMMEDIATE) {
             immediate = true;
         } else if token.eq_ignore_ascii_case(AUTO_REVIEW_ALL) {
             all = true;
+        } else if token.eq_ignore_ascii_case(AUTO_REVIEW_DEEP) {
+            deep = true;
         } else if file.is_none() {
             file = Some(token);
         }
@@ -43,7 +47,7 @@ pub(crate) fn parse_auto_review_args(args: &str) -> (AutoReviewTarget<'_>, bool)
     } else {
         AutoReviewTarget::Branch
     };
-    (target, immediate)
+    (target, immediate, deep)
 }
 
 pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
@@ -88,7 +92,11 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/prune" => Some(LocalCommand::Prune(None)),
         "/pull_request" => Some(LocalCommand::CreatePullRequest),
         "/review" => Some(LocalCommand::Review),
-        "/auto_review" => Some(LocalCommand::AutoReview(AutoReviewTarget::Branch, false)),
+        "/auto_review" => Some(LocalCommand::AutoReview(
+            AutoReviewTarget::Branch,
+            false,
+            false,
+        )),
         "/duplicates" => Some(LocalCommand::Duplicates(None)),
         "/export" => Some(LocalCommand::Export(ExportTarget::Console)),
         "/push" => Some(LocalCommand::Push(false)),
@@ -163,8 +171,8 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::ShowFile(Cow::Borrowed(args.trim())));
             }
             if let Some(args) = input.strip_prefix("/auto_review ") {
-                let (target, immediate) = parse_auto_review_args(args.trim());
-                return Some(LocalCommand::AutoReview(target, immediate));
+                let (target, immediate, deep) = parse_auto_review_args(args.trim());
+                return Some(LocalCommand::AutoReview(target, immediate, deep));
             }
             if let Some(args) = input.strip_prefix("/export ") {
                 return parse_export_target(args.trim()).map(LocalCommand::Export);

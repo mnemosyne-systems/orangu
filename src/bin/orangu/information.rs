@@ -503,17 +503,36 @@ fn embeddings_capability(is_embeddings_server: bool) -> Capability {
     }
 }
 
+/// The knowledge graph's build status, worded for `/information`'s report:
+/// `"Building"` while the startup scan is still running, `"Complete"` once it
+/// has populated the graph, `"None"` if the scan task itself failed (there is
+/// no usable graph this session). See `orangu::graph::status::GraphBuildStatus`
+/// — the same signal `/auto_review`'s status bar reads.
+pub(crate) fn graph_status_label(status: orangu::graph::status::GraphBuildStatus) -> &'static str {
+    match status {
+        orangu::graph::status::GraphBuildStatus::Building => "Building",
+        orangu::graph::status::GraphBuildStatus::Ready => "Complete",
+        orangu::graph::status::GraphBuildStatus::Failed => "None",
+    }
+}
+
 /// Render the gathered capabilities as two aligned tables, styled like
-/// `/session`'s listing: a small two-row table naming the server and model,
-/// then a header row followed by one row per capability with a green/red
-/// status dot, each column sized to its widest value.
+/// `/session`'s listing: a small header table naming the server, model, and
+/// knowledge graph status, then a header row followed by one row per
+/// capability with a green/red status dot, each column sized to its widest
+/// value.
 pub(crate) fn format_information_table(
     server_name: &str,
     model_id: &str,
+    graph_status: &str,
     capabilities: &[Capability],
 ) -> String {
-    let w_field = "Server".len().max("Model".len());
-    let w_value = server_name.chars().count().max(model_id.chars().count());
+    let w_field = "Server".len().max("Model".len()).max("Graph".len());
+    let w_value = server_name
+        .chars()
+        .count()
+        .max(model_id.chars().count())
+        .max(graph_status.chars().count());
 
     let col_width = |header: &str, value: &dyn Fn(&Capability) -> &str| {
         capabilities
@@ -529,6 +548,7 @@ pub(crate) fn format_information_table(
     let mut lines = vec![
         format!("{:<w_field$}  {:<w_value$}", "Server", server_name),
         format!("{:<w_field$}  {:<w_value$}", "Model", model_id),
+        format!("{:<w_field$}  {:<w_value$}", "Graph", graph_status),
         String::new(),
         format!(
             "{:<6}  {:<w_api$}  {:<w_endpoint$}  DETAILS",
@@ -731,12 +751,23 @@ mod tests {
                 details: "disabled by the server (missing startup flag)".to_string(),
             },
         ];
-        let table = format_information_table("main-server", "gemma", &capabilities);
-        assert!(table.contains("Server  main-server\nModel   gemma      "));
+        let table = format_information_table("main-server", "gemma", "Complete", &capabilities);
+        assert!(table.contains(
+            "Server  main-server\nModel   gemma      \nGraph   Complete   "
+        ));
         assert!(table.contains("STATUS  API        ENDPOINT    DETAILS"));
         assert!(table.contains(&format!("{FEEDBACK_OK}       OpenAI     /v1/models  gemma")));
         assert!(table.contains(&format!(
             "{FEEDBACK_ERR}       llama.cpp  /metrics    disabled by the server (missing startup flag)"
         )));
+    }
+
+    #[test]
+    fn graph_status_label_words_each_build_status() {
+        use orangu::graph::status::GraphBuildStatus;
+
+        assert_eq!(graph_status_label(GraphBuildStatus::Building), "Building");
+        assert_eq!(graph_status_label(GraphBuildStatus::Ready), "Complete");
+        assert_eq!(graph_status_label(GraphBuildStatus::Failed), "None");
     }
 }
