@@ -28,6 +28,7 @@ mod models;
 mod quotes;
 mod render;
 mod review;
+mod schedule;
 mod session_store;
 mod shell;
 mod shell_command;
@@ -749,6 +750,10 @@ async fn run() -> Result<()> {
         }};
     }
 
+    // `/schedule`: minutes already over when orangu starts never fire, so the
+    // marker begins at the current minute.
+    let mut schedule_last_minute = session_store::current_unix_timestamp() / 60;
+
     loop {
         // Apply a pending tab switch before anything borrows the active tab's
         // locals this iteration (the render context below borrows `tools`).
@@ -1116,8 +1121,17 @@ async fn run() -> Result<()> {
             IDLE_STATUS_REFRESH_INTERVAL
         };
 
+        // Enqueue any cron jobs whose minute has passed since the last check;
+        // they drain through the same queue as commands typed mid-request.
+        schedule::enqueue_due_jobs(&mut schedule_last_minute, &mut pending_commands);
+
+        // Set when this iteration's command came from the scheduler: its `&&`
+        // chain id, used to run unattended and to drop the chain's remainder
+        // if the command fails.
+        let mut current_chain: Option<u64> = None;
         let next_input = if let Some(queued) = pending_commands.pop_front() {
-            queued
+            current_chain = queued.chain;
+            queued.text
         } else {
             match read_input(
                 &mut input_state,
@@ -1442,6 +1456,17 @@ async fn run() -> Result<()> {
                 output_state.push_text(&output);
                 if config.feedback {
                     output_state.push_text(FEEDBACK_ERR);
+                }
+                // A failed scheduled command drops the rest of its `&&`
+                // chain, like a shell would.
+                if let Some(chain) = current_chain {
+                    let dropped = wait::drop_chain_remainder(&mut pending_commands, chain);
+                    if dropped > 0 {
+                        output_state.push_text(&format!(
+                            "Scheduled chain stopped: skipped {dropped} follow-up command{}.",
+                            if dropped == 1 { "" } else { "s" }
+                        ));
+                    }
                 }
                 output_state.reset_scroll();
                 continue;
@@ -1893,6 +1918,10 @@ async fn run() -> Result<()> {
                     slot_registry.clone(),
                     tools.graph_store.clone(),
                     tools.graph_status.clone(),
+                    // A scheduled auto review runs unattended: it starts at
+                    // once and returns as soon as the run finishes, so a
+                    // chained `export auto review` can pick up the report.
+                    current_chain.is_some(),
                 )
                 .await?;
 
@@ -2346,7 +2375,7 @@ fn prepare_submitted_input(
     history: &mut Vec<String>,
     history_path: &Path,
     output_state: &mut OutputState,
-    pending_commands: Option<&mut VecDeque<String>>,
+    pending_commands: Option<&mut VecDeque<crate::wait::PendingCommand>>,
 ) -> Result<Option<String>> {
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.starts_with('\\') {
@@ -2363,7 +2392,7 @@ fn prepare_submitted_input(
     }
 
     if let Some(pending_commands) = pending_commands {
-        pending_commands.push_back(trimmed.to_string());
+        pending_commands.push_back(crate::wait::PendingCommand::typed(trimmed));
         return Ok(None);
     }
 

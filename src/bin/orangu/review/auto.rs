@@ -2112,6 +2112,7 @@ pub(crate) async fn run_auto_review_mode(
     slots: orangu::llm::SlotRegistry,
     graph_store: std::sync::Arc<std::sync::Mutex<Option<orangu::graph::store::GraphStore>>>,
     graph_status: std::sync::Arc<std::sync::Mutex<orangu::graph::status::GraphBuildStatus>>,
+    unattended: bool,
 ) -> Result<AutoReviewState> {
     let immediate = launch.immediate;
     let mut state = AutoReviewState::new(launch);
@@ -2122,7 +2123,9 @@ pub(crate) async fn run_auto_review_mode(
     // Pre-start phase: unless `immediate` was given, the run waits for Alt+s so
     // the user can navigate the files (Alt+j/Alt+k) and mark any as Ignore
     // (Alt+m) first. Leaving here (Alt+x or Esc Esc) returns without reviewing.
-    if !immediate {
+    // An unattended run (launched by `/schedule`, nobody at the keyboard to
+    // press Alt+s) always starts at once.
+    if !immediate && !unattended {
         if !state.files.is_empty() {
             state.selected = Some(0);
         }
@@ -2411,8 +2414,11 @@ pub(crate) async fn run_auto_review_mode(
         set_terminal_title(Some(TERMINAL_TITLE));
         std::io::stdout().flush()?;
     }
-    // Keep the report on screen for browsing until Alt+x/Esc Esc.
-    if !exit_requested {
+    // Keep the report on screen for browsing until Alt+x/Esc Esc — except
+    // unattended, where nobody is there to exit: return at once so the report
+    // lands in the output window and any chained command (e.g. `export auto
+    // review`) runs next.
+    if !exit_requested && !unattended {
         run_auto_review_browse(&mut state, viewport, chrome, workspace, terminal, skills)?;
     }
     Ok(state)

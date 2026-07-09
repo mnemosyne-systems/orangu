@@ -22,6 +22,44 @@ fn leaves_regular_prompts_unhandled() {
 }
 
 #[test]
+fn parses_schedule_commands() {
+    assert!(matches!(
+        parse_local_command("/schedule"),
+        Some(LocalCommand::Schedule)
+    ));
+    assert!(matches!(
+        parse_local_command("schedule"),
+        Some(LocalCommand::Schedule)
+    ));
+    // `show schedule` is the schedule listing, not a request to show a file
+    // named "schedule" (which the `show <file>` natural form would otherwise
+    // claim first).
+    assert!(matches!(
+        parse_local_command("show schedule"),
+        Some(LocalCommand::Schedule)
+    ));
+}
+
+#[test]
+fn show_forms_resolve_to_their_commands_not_files() {
+    // Like `show manual` and `show pending`, these must resolve before the
+    // `show <file>` natural form claims them as file names.
+    assert!(matches!(
+        parse_local_command("show usage"),
+        Some(LocalCommand::Usage)
+    ));
+    assert!(matches!(
+        parse_local_command("show statistics"),
+        Some(LocalCommand::Statistics(false))
+    ));
+    // A real file target still goes to show-file.
+    assert!(matches!(
+        parse_local_command("show README.md"),
+        Some(LocalCommand::ShowFile(_))
+    ));
+}
+
+#[test]
 fn parses_prune_commands() {
     // The natural "older than" form maps the day count to `OlderThan`, matching
     // the `/prune --older-than <days>` slash flag — previously the bare number

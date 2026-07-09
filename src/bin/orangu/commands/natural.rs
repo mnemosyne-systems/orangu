@@ -324,6 +324,9 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "statistics",
     "show statistics",
     "activity",
+    // --- schedule ---
+    "schedule",
+    "show schedule",
     // --- clear conversation ---
     "clear",
     "clear conversation",
@@ -558,6 +561,18 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     // it. (The other pending phrasings do not collide and are handled below.)
     if matches_ci(input, &["show pending"]) {
         return Some(LocalCommand::PendingList);
+    }
+    // Likewise `show usage`, `show statistics`, and `show schedule` are those
+    // commands' forms, not files named "usage"/"statistics"/"schedule"; their
+    // other phrasings do not collide and are handled below.
+    if matches_ci(input, &["show usage"]) {
+        return Some(LocalCommand::Usage);
+    }
+    if matches_ci(input, &["show statistics"]) {
+        return Some(LocalCommand::Statistics(false));
+    }
+    if matches_ci(input, &["show schedule"]) {
+        return Some(LocalCommand::Schedule);
     }
     if let Some(args) = parse_show_file_natural_language_args(input) {
         return Some(LocalCommand::ShowFile(args));
@@ -950,7 +965,7 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::PendingList);
     }
-    if matches_ci(input, &["usage", "show usage"]) {
+    if matches_ci(input, &["usage"]) {
         return Some(LocalCommand::Usage);
     }
     if matches_ci(
@@ -963,8 +978,11 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::Statistics(true));
     }
-    if matches_ci(input, &["statistics", "show statistics", "activity"]) {
+    if matches_ci(input, &["statistics", "activity"]) {
         return Some(LocalCommand::Statistics(false));
+    }
+    if matches_ci(input, &["schedule"]) {
+        return Some(LocalCommand::Schedule);
     }
     if matches_ci(
         input,

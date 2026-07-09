@@ -111,6 +111,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/manual" => Some(LocalCommand::Manual),
         "/usage" => Some(LocalCommand::Usage),
         "/statistics" => Some(LocalCommand::Statistics(false)),
+        "/schedule" => Some(LocalCommand::Schedule),
         "/clear" => Some(LocalCommand::Clear),
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),

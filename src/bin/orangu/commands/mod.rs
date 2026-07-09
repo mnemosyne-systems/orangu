@@ -499,6 +499,9 @@ pub enum LocalCommand<'a> {
     /// from `~/.orangu/workspace/<hash>/stats/activity.json`, either for the
     /// current workspace or aggregated across all of them.
     Statistics(bool),
+    /// `/schedule`: list the cron-style scheduled jobs from
+    /// `~/.orangu/schedule` with their next run times.
+    Schedule,
     /// `/build [debug|release]`: build the workspace project. Defaults to
     /// `release`.
     Build(crate::build::BuildProfile),

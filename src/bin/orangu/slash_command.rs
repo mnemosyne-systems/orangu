@@ -73,6 +73,7 @@ pub enum SlashCommand {
     Manual,
     Usage,
     Statistics,
+    Schedule,
     Build,
     Shell,
     Skills,
@@ -141,6 +142,7 @@ impl SlashCommand {
             SlashCommand::Statistics => {
                 "Shows persistent, cross-session activity history and a daily heatmap"
             }
+            SlashCommand::Schedule => "Lists the cron-style scheduled jobs from ~/.orangu/schedule",
             SlashCommand::Build => "Builds the workspace project",
             SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",

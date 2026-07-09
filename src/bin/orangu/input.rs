@@ -262,7 +262,7 @@ pub struct WaitContext<'a> {
     pub interrupt_state: &'a mut InterruptState,
     pub output_state: &'a mut OutputState,
     pub input_state: &'a mut InputState,
-    pub pending_commands: &'a mut VecDeque<String>,
+    pub pending_commands: &'a mut VecDeque<crate::wait::PendingCommand>,
     pub thinking_quote: Option<&'static str>,
     pub viewport: &'a mut ViewportState,
     pub skills: &'a orangu::skills::SkillRegistry,

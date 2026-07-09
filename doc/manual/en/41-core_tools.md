@@ -294,6 +294,53 @@ activity total
 
 \newpage
 
+## /schedule
+
+Runs commands on a schedule, cron style. Jobs live in `~/.orangu/schedule`, one per line in classic crontab form — five time fields, then the command to run:
+
+```text
+# hourly pull request report
+0 * * * * /export pr
+30 6 * * 1-5 /statistics
+```
+
+The command is anything you could type at the prompt — a slash command, a natural-language form, or a free-form prompt for the model. While orangu is running, a job whose minute arrives is queued exactly like a command typed while a request is in flight: it waits its turn behind whatever is running, echoes into the output window as `> /export pr`, and executes in the **active workspace tab**. If orangu was busy (or idle in the background) when the minute passed, the job still runs as soon as the loop comes back around — every minute boundary since the last check is considered, so nothing is silently skipped. Minutes that passed before orangu started never fire, and orangu must be running for anything to run at all: this is a scheduler inside the client, not a system daemon.
+
+`&&` chains commands, shell style — each part runs after the one before it, and a part that fails drops the rest of its chain (the output window notes how many follow-ups were skipped):
+
+```text
+0 6 * * * auto review immediate && export auto review
+```
+
+Scheduled commands run **unattended**. `/auto_review` normally opens interactive phases — a pre-start screen waiting for Alt+s, and the finished report kept on screen until Alt+x — but when launched by the scheduler it starts at once and returns as soon as the run completes, so a chained `export auto review` can pick up the report with nobody at the keyboard. The report still lands in the output window (and the clipboard) exactly as if the run had been watched.
+
+The five fields are minute (0-59), hour (0-23), day of month (1-31), month (1-12), and day of week (0-7, both 0 and 7 meaning Sunday), each supporting `*`, lists (`1,15`), ranges (`1-5`), and steps (`*/10`, `8-18/2`). Fields are numeric — no `JAN`/`MON` names. When both day-of-month and day-of-week are restricted the job runs when either matches, like classic cron. **Times are UTC**, since orangu carries no timezone database. Blank lines and `#` comments are skipped. The file is re-read every minute, so edits apply without a restart.
+
+Bare `/schedule` lists the jobs with the next time each will run, and points out any lines that didn't parse instead of silently ignoring them:
+
+```text
+Scheduled jobs (~/.orangu/schedule, times UTC):
+/export pr                               next: 2026-07-09 14:00
+/statistics                              next: 2026-07-10 06:30
+```
+
+With no schedule file (or an empty one) it says how to create one.
+
+### Examples
+
+```text
+/schedule
+```
+
+Natural-language forms:
+
+```text
+schedule
+show schedule
+```
+
+\newpage
+
 ## /disconnect
 
 Disconnects from the current server.

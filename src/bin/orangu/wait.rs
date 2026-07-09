@@ -673,17 +673,44 @@ pub(crate) fn is_wait_cancel_escape(event: &Event) -> bool {
     )
 }
 
+/// One queued command line, waiting its turn in the run loop: typed while a
+/// request was in flight, or enqueued by the `/schedule` cron loop.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingCommand {
+    pub(crate) text: String,
+    /// `None` for a typed command; for a scheduled one, the id of the `&&`
+    /// chain its crontab line was split into. A scheduled command runs
+    /// unattended (`/auto_review` skips its interactive phases), and when it
+    /// fails, the rest of its chain is dropped from the queue.
+    pub(crate) chain: Option<u64>,
+}
+
+impl PendingCommand {
+    /// A command typed at the prompt (no chain, runs attended).
+    pub(crate) fn typed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            chain: None,
+        }
+    }
+}
+
 /// Render the queue of pending commands for the output window: a header
-/// followed by each command on its own 1-based numbered line, or a short notice
-/// when the queue is empty. The numbering matches the index
-/// [`apply_pending_delete`] expects.
-pub(crate) fn format_pending_list(pending: &VecDeque<String>) -> String {
+/// followed by each command on its own 1-based numbered line (scheduled ones
+/// marked), or a short notice when the queue is empty. The numbering matches
+/// the index [`apply_pending_delete`] expects.
+pub(crate) fn format_pending_list(pending: &VecDeque<PendingCommand>) -> String {
     if pending.is_empty() {
         "No pending commands.".to_string()
     } else {
         let mut lines = vec!["Pending commands:".to_string()];
         for (i, cmd) in pending.iter().enumerate() {
-            lines.push(format!("  {}. {}", i + 1, cmd));
+            let marker = if cmd.chain.is_some() {
+                "  (scheduled)"
+            } else {
+                ""
+            };
+            lines.push(format!("  {}. {}{marker}", i + 1, cmd.text));
         }
         lines.join("\n")
     }
@@ -695,7 +722,7 @@ pub(crate) fn format_pending_list(pending: &VecDeque<String>) -> String {
 /// command exists.
 pub(crate) fn apply_pending_delete(
     index: usize,
-    pending: &mut VecDeque<String>,
+    pending: &mut VecDeque<PendingCommand>,
     output_state: &mut OutputState,
 ) {
     if index == 0 || index > pending.len() {
@@ -704,8 +731,24 @@ pub(crate) fn apply_pending_delete(
         ));
     } else {
         let removed = pending.remove(index - 1).expect("index validated");
-        output_state.push_text(&format!("Removed: {removed}"));
+        output_state.push_text(&format!("Removed: {}", removed.text));
     }
+}
+
+/// Drop the rest of a failed scheduled command's `&&` chain: every queued
+/// command at the front of the queue still carrying the same chain id. Later
+/// entries (typed commands, other chains) are untouched. Returns how many
+/// were dropped.
+pub(crate) fn drop_chain_remainder(pending: &mut VecDeque<PendingCommand>, chain: u64) -> usize {
+    let mut dropped = 0;
+    while pending
+        .front()
+        .is_some_and(|command| command.chain == Some(chain))
+    {
+        pending.pop_front();
+        dropped += 1;
+    }
+    dropped
 }
 
 pub(crate) fn final_pending_line(streamed_output: &str, response: &str) -> Option<String> {
@@ -775,19 +818,25 @@ mod tests {
             "No pending commands."
         );
 
-        let pending = VecDeque::from(vec!["first".to_string(), "second".to_string()]);
+        let pending = VecDeque::from(vec![
+            PendingCommand::typed("first"),
+            PendingCommand {
+                text: "second".to_string(),
+                chain: Some(7),
+            },
+        ]);
         assert_eq!(
             format_pending_list(&pending),
-            "Pending commands:\n  1. first\n  2. second"
+            "Pending commands:\n  1. first\n  2. second  (scheduled)"
         );
     }
 
     #[test]
     fn apply_pending_delete_removes_by_one_based_index() {
         let mut pending = VecDeque::from(vec![
-            "first".to_string(),
-            "second".to_string(),
-            "third".to_string(),
+            PendingCommand::typed("first"),
+            PendingCommand::typed("second"),
+            PendingCommand::typed("third"),
         ]);
         let mut output_state = OutputState::default();
 
@@ -796,7 +845,10 @@ mod tests {
         apply_pending_delete(2, &mut pending, &mut output_state);
         assert_eq!(
             pending,
-            VecDeque::from(vec!["first".to_string(), "third".to_string()])
+            VecDeque::from(vec![
+                PendingCommand::typed("first"),
+                PendingCommand::typed("third")
+            ])
         );
         assert_eq!(
             output_state.lines(),
@@ -809,6 +861,27 @@ mod tests {
             apply_pending_delete(index, &mut pending, &mut output_state);
             assert_eq!(pending, before, "index {index} should not remove anything");
         }
+    }
+
+    #[test]
+    fn drop_chain_remainder_only_drops_the_leading_chain() {
+        let mut pending = VecDeque::from(vec![
+            PendingCommand {
+                text: "export auto review".to_string(),
+                chain: Some(1),
+            },
+            PendingCommand {
+                text: "/statistics".to_string(),
+                chain: Some(2),
+            },
+            PendingCommand::typed("typed later"),
+        ]);
+        // Chain 1's remainder is dropped; chain 2 and the typed command stay.
+        assert_eq!(drop_chain_remainder(&mut pending, 1), 1);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].chain, Some(2));
+        // A chain with no queued remainder drops nothing.
+        assert_eq!(drop_chain_remainder(&mut pending, 1), 0);
     }
 
     #[test]

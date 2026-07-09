@@ -50,7 +50,7 @@ pub(crate) struct WorkspaceTab {
     pub(crate) skills: orangu::skills::SkillRegistry,
     pub(crate) session: ChatSession,
     pub(crate) output_state: OutputState,
-    pub(crate) pending_commands: VecDeque<String>,
+    pub(crate) pending_commands: VecDeque<crate::wait::PendingCommand>,
     pub(crate) usage_stats: UsageStats,
     pub(crate) history: Vec<String>,
     pub(crate) session_id: String,
