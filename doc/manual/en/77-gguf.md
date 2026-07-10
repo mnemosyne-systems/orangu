@@ -424,25 +424,44 @@ even the smallest rung (1B) doesn't (rendered as `-`).
 
 **Two budgets, two tables.** `format_suggestion` computes two separate
 budgets and prints a labeled `push_suggestion_block` for each, `"Suggested
-model size (Dedicated)"` and `"Suggested model size (Shared)"`:
+model size (Dedicated)"` and `"Suggested model size (Shared)"`. Both sum each
+eligible GPU's own `vram_total_bytes` — deliberately *not* reduced by
+`vram_used_bytes`, since `suggest` estimates the hardware's own capability
+(this file's module doc — "likely to run comfortably on this machine",
+picked before any model is chosen), not how much happens to be free at the
+exact moment it runs; whatever else is transiently using VRAM (a compositor,
+a browser, an already-running `llama-server`) shouldn't shrink a
+hardware-based estimate:
 
-- `dedicated_vram_budget_bytes` sums every `Dedicated` GPU's
-  `vram_total_bytes` alone (multiple dedicated cards add up, matching the
-  role wizard's `-sm layer` multi-GPU tensor split) — `0` when there's no
-  dedicated GPU at all, which `suggest_param_count` then correctly reports
-  as nothing on the ladder fitting.
-- `combined_gpu_budget_bytes` sums every GPU's `vram_total_bytes`,
-  `Dedicated` and `Shared` alike (a `Shared` GPU's is already the system RAM
+- `dedicated_vram_budget_bytes` sums every GPU `is_dedicated_for_budget`
+  accepts (multiple dedicated cards add up, matching the role wizard's
+  `-sm layer` multi-GPU tensor split) — `0` when there's none at all, which
+  `suggest_param_count` then correctly reports as nothing on the ladder
+  fitting.
+- `combined_gpu_budget_bytes` sums every GPU `is_combined_budget_eligible`
+  accepts (a `Shared` GPU's `vram_total_bytes` is already the system RAM
   total via `apply_shared_memory_total`, described above) — the more
   permissive figure, representing every device `--fit on` could spread
   layers across at once. Falls back to the CPU's own `total_memory_bytes`
-  when that sum is `0` (no GPU detected at all, or only `Unknown`-kind
-  ones).
+  when that sum is `0` (no GPU detected at all).
 
-`Unknown`-kind GPUs are never counted in either budget — there's no safe
-way to know whether their reported figure is a hard VRAM ceiling or already
-system RAM, and double-counting or miscounting either way would make both
-suggestions worse than not counting them at all.
+**`Unknown`-kind GPUs: a Windows-specific path.** On Linux/macOS,
+`is_dedicated_for_budget`/`is_combined_budget_eligible` only ever see
+`Dedicated`/`Shared` GPUs — `MemoryKind` is already reliably known there (see
+above), so both functions have a plain, `cfg`-free body for those targets.
+Windows is different: `windows_memory_kind` classifies *any* AMD adapter
+`Unknown`, discrete Radeon and integrated APU alike, since that distinction
+only exists in DXGI's `DXGI_ADAPTER_DESC` — unreachable from the WMI query
+`detect_windows_gpus` uses. Rather than counting every `Unknown` GPU
+(overcounts an APU's tiny carve-out as if it were a hard VRAM ceiling) or
+none (undercounts a real discrete Radeon card), the `#[cfg(target_os =
+"windows")]` variants of both functions trust an `Unknown` GPU's own
+`vram_total_bytes` only above `WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`
+(1 GiB — comfortably above a typical integrated carve-out, comfortably below
+any real discrete card). Below the threshold it's treated like a `Shared`
+GPU: excluded from both budgets, since its real ceiling is system RAM, which
+`combined_gpu_budget_bytes`'s own `total_memory_bytes` fallback already
+supplies once nothing else in the sum counts it.
 
 ### The role wizard (`roles.rs`)
 

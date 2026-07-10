@@ -122,46 +122,93 @@ fn suggest_param_count(budget_bytes: u64, context_size: u64, bits_per_weight: f6
     })
 }
 
-/// The sum of every `Dedicated` GPU's VRAM (multi-GPU tensor-split, matching
-/// the role wizard's `-sm layer`), `0` when there's no dedicated GPU at all.
-/// The conservative, GPU-only budget: everything fits in real VRAM, no
-/// spillover to a shared pool or system RAM.
+/// On Windows, `system::windows_memory_kind` classifies *any* AMD adapter as
+/// `Unknown` — it can't tell an integrated APU's small BIOS-reserved
+/// carve-out from a real discrete Radeon card's VRAM by name alone (that
+/// distinction only exists in DXGI, unreachable from a plain WMI query). An
+/// `Unknown` GPU's own `vram_total_bytes` is trusted as real dedicated VRAM
+/// only above this threshold, chosen well above the few-hundred-MiB to
+/// low-GiB carve-out a typical integrated GPU reports and comfortably below
+/// any real discrete card's VRAM. Below it, the GPU is treated the same as
+/// a `Shared` one: no dedicated capacity of its own, real ceiling is system
+/// RAM. Linux and macOS need no such guess — `linux_memory_kind` and
+/// `macos_memory_kind` already classify every GPU as `Dedicated` or `Shared`
+/// directly from a reliable per-platform signal.
+#[cfg(target_os = "windows")]
+const WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Whether `gpu` counts as having real, hard-ceiling dedicated VRAM for the
+/// conservative budget. Only `Dedicated`-kind on Linux/macOS, where
+/// `MemoryKind` is already reliably known; on Windows, an `Unknown`-kind GPU
+/// (see [`WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`]) above the threshold
+/// counts too.
+#[cfg(not(target_os = "windows"))]
+fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
+    gpu.memory_kind == MemoryKind::Dedicated
+}
+
+#[cfg(target_os = "windows")]
+fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
+    gpu.memory_kind == MemoryKind::Dedicated
+        || (gpu.memory_kind == MemoryKind::Unknown
+            && gpu.vram_total_bytes.unwrap_or(0) >= WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES)
+}
+
+/// Whether `gpu` counts toward the permissive, every-device budget:
+/// `Dedicated` or `Shared` on Linux/macOS; on Windows, also an `Unknown`-kind
+/// GPU above [`WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`] (a below-threshold
+/// one is excluded here too — like a genuine `Shared` GPU, its real ceiling
+/// is system RAM, which `combined_gpu_budget_bytes`'s own fallback already
+/// supplies whenever nothing else in the sum counts it).
+#[cfg(not(target_os = "windows"))]
+fn is_combined_budget_eligible(gpu: &GpuInfo) -> bool {
+    matches!(gpu.memory_kind, MemoryKind::Dedicated | MemoryKind::Shared)
+}
+
+#[cfg(target_os = "windows")]
+fn is_combined_budget_eligible(gpu: &GpuInfo) -> bool {
+    matches!(gpu.memory_kind, MemoryKind::Dedicated | MemoryKind::Shared)
+        || (gpu.memory_kind == MemoryKind::Unknown
+            && gpu.vram_total_bytes.unwrap_or(0) >= WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES)
+}
+
+/// The sum of every dedicated GPU's `vram_total_bytes` (multi-GPU
+/// tensor-split, matching the role wizard's `-sm layer`), `0` when there's
+/// none at all (see [`is_dedicated_for_budget`] for what counts as dedicated
+/// per platform). The conservative, GPU-only budget: everything fits in real
+/// VRAM, no spillover to a shared pool or system RAM.
+///
+/// Deliberately *not* reduced by `vram_used_bytes`: `suggest` estimates the
+/// hardware's own capability (`suggest.rs`'s module doc — "likely to run
+/// comfortably on this machine", picked before any model is chosen), not how
+/// much happens to be free right now. Whatever else is transiently using
+/// VRAM when `suggest` runs (a compositor, a browser, an already-running
+/// `llama-server`) shouldn't shrink a hardware-based estimate.
 fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
     gpus.iter()
-        .filter(|g| matches!(g.memory_kind, MemoryKind::Dedicated | MemoryKind::Unknown))
-        .filter_map(|g| {
-            g.vram_total_bytes
-                .map(|total| total.saturating_sub(g.vram_used_bytes.unwrap_or(0)))
-        })
+        .filter(|g| is_dedicated_for_budget(g))
+        .filter_map(|g| g.vram_total_bytes)
         .sum()
 }
 
-/// The sum of every GPU's own reported `vram_total_bytes`, `Dedicated` and
-/// `Shared` alike (a `Shared` GPU's is already the system RAM total, via
-/// `system::apply_shared_memory_total`) — the more permissive budget,
-/// representing every device `--fit on` could spread layers across at once.
-/// Falls back to the CPU's own available RAM when that sum is `0` (no GPU
-/// detected at all). `Unknown`-kind GPUs (macOS/Windows edge cases
-/// `system.rs` itself can't classify, such as Windows AMD) are now included
-/// since their `vram_total_bytes` represents dedicated memory capacity.
+/// The sum of every GPU's own reported `vram_total_bytes` that counts as
+/// budget-eligible per platform (see [`is_combined_budget_eligible`]) —
+/// `Dedicated` and `Shared` alike (a `Shared` GPU's is already the system
+/// RAM total, via `system::apply_shared_memory_total`) — the more permissive
+/// budget, representing every device `--fit on` could spread layers across
+/// at once. Falls back to the CPU's own total RAM when that sum is `0` (no
+/// GPU detected at all). Like [`dedicated_vram_budget_bytes`], deliberately
+/// not reduced by currently-used memory — see its doc for why.
 fn combined_gpu_budget_bytes(cpu: &CpuInfo, gpus: &[GpuInfo]) -> u64 {
     let total: u64 = gpus
         .iter()
-        .filter(|g| {
-            matches!(
-                g.memory_kind,
-                MemoryKind::Dedicated | MemoryKind::Shared | MemoryKind::Unknown
-            )
-        })
-        .filter_map(|g| {
-            g.vram_total_bytes
-                .map(|total| total.saturating_sub(g.vram_used_bytes.unwrap_or(0)))
-        })
+        .filter(|g| is_combined_budget_eligible(g))
+        .filter_map(|g| g.vram_total_bytes)
         .sum();
     if total > 0 {
         total
     } else {
-        cpu.available_memory_bytes
+        cpu.total_memory_bytes
     }
 }
 
@@ -336,21 +383,58 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_vram_budget_bytes_ignores_shared_and_subtracts_used() {
+    fn dedicated_vram_budget_bytes_ignores_currently_used_vram() {
+        // A hardware-capability estimate shouldn't shrink just because
+        // something else happens to be using VRAM right now.
+        let gpus = vec![GpuInfo {
+            vendor: "Test".to_string(),
+            name: "Test GPU 1".to_string(),
+            vram_total_bytes: Some(24 * GIB),
+            vram_used_bytes: Some(4 * GIB),
+            driver: None,
+            memory_kind: MemoryKind::Dedicated,
+        }];
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 24 * GIB);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn dedicated_vram_budget_bytes_ignores_shared_and_unknown() {
         let gpus = vec![
-            GpuInfo {
-                vendor: "Test".to_string(),
-                name: "Test GPU 1".to_string(),
-                vram_total_bytes: Some(24 * GIB),
-                vram_used_bytes: Some(4 * GIB),
-                driver: None,
-                memory_kind: MemoryKind::Dedicated,
-            },
+            gpu(MemoryKind::Dedicated, Some(24 * GIB)),
             gpu(MemoryKind::Shared, Some(64 * GIB)),
-            gpu(MemoryKind::Unknown, Some(16 * GIB)),
+            gpu(MemoryKind::Unknown, Some(999 * GIB)),
         ];
-        // 20 GiB from Dedicated (24 - 4) + 16 GiB from Unknown = 36 GiB
-        assert_eq!(dedicated_vram_budget_bytes(&gpus), 36 * GIB);
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 24 * GIB);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dedicated_vram_budget_bytes_trusts_unknown_above_threshold_on_windows() {
+        let gpus = vec![
+            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
+            gpu(
+                MemoryKind::Unknown,
+                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES),
+            ),
+        ];
+        assert_eq!(
+            dedicated_vram_budget_bytes(&gpus),
+            4 * GIB + WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dedicated_vram_budget_bytes_ignores_unknown_below_threshold_on_windows() {
+        let gpus = vec![
+            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
+            gpu(
+                MemoryKind::Unknown,
+                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES - 1),
+            ),
+        ];
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 4 * GIB);
     }
 
     #[test]
@@ -370,28 +454,59 @@ mod tests {
     }
 
     #[test]
-    fn combined_gpu_budget_bytes_includes_unknown_and_subtracts_used() {
+    fn combined_gpu_budget_bytes_ignores_currently_used_vram() {
+        let gpus = vec![GpuInfo {
+            vendor: "Test".to_string(),
+            name: "Test GPU 1".to_string(),
+            vram_total_bytes: Some(4 * GIB),
+            vram_used_bytes: Some(1 * GIB),
+            driver: None,
+            memory_kind: MemoryKind::Dedicated,
+        }];
+        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 4 * GIB);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn combined_gpu_budget_bytes_ignores_unknown_gpus() {
         let gpus = vec![
-            GpuInfo {
-                vendor: "Test".to_string(),
-                name: "Test GPU 1".to_string(),
-                vram_total_bytes: Some(4 * GIB),
-                vram_used_bytes: Some(1 * GIB),
-                driver: None,
-                memory_kind: MemoryKind::Dedicated,
-            },
-            gpu(MemoryKind::Unknown, Some(12 * GIB)),
+            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
+            gpu(MemoryKind::Unknown, Some(999 * GIB)),
         ];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 15 * GIB);
+        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 4 * GIB);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn combined_gpu_budget_bytes_includes_unknown_above_threshold_on_windows() {
+        let gpus = vec![
+            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
+            gpu(
+                MemoryKind::Unknown,
+                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES),
+            ),
+        ];
+        assert_eq!(
+            combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus),
+            4 * GIB + WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn combined_gpu_budget_bytes_falls_back_to_system_ram_below_threshold_on_windows() {
+        // A below-threshold `Unknown` GPU (likely an integrated APU's small
+        // BIOS carve-out) shouldn't count at face value — its real ceiling
+        // is system RAM, same as a genuine `Shared` GPU.
+        let gpus = vec![gpu(
+            MemoryKind::Unknown,
+            Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES - 1),
+        )];
+        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &gpus), 16 * GIB);
     }
 
     #[test]
     fn combined_gpu_budget_bytes_falls_back_to_system_ram_without_any_gpu() {
-        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &[]), 16 * GIB);
-    }
-
-    #[test]
-    fn combined_gpu_budget_bytes_falls_back_to_system_ram_with_no_gpu() {
         assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &[]), 16 * GIB);
     }
 
