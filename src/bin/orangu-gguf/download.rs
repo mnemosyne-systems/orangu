@@ -592,6 +592,14 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
     // then two more reach the repo root, then descend into `blobs/<oid>`.
     let ups = "../".repeat(file_path.matches('/').count() + 2);
     let target = format!("{ups}blobs/{oid}");
+    // Windows only resolves symlink targets with backslash separators: a
+    // forward-slash target creates a link that Windows itself cannot follow
+    // (every native read fails with "the filename, directory name, or volume
+    // label syntax is incorrect"), so the model would be invisible to `list`
+    // and unreadable by llama-server, even though POSIX-emulating shells
+    // resolve it fine.
+    #[cfg(windows)]
+    let target = target.replace('/', "\\");
 
     #[cfg(unix)]
     let symlink_result = std::os::unix::fs::symlink(&target, link);

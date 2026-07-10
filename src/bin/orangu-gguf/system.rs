@@ -129,8 +129,20 @@ pub fn detect_gpus(total_memory_bytes: u64) -> Vec<GpuInfo> {
     #[cfg(target_os = "macos")]
     gpus.extend(detect_macos_gpus());
 
+    // Like the Linux sysfs scan, skip the NVIDIA adapters WMI reports when
+    // `nvidia-smi` already listed them above with better data (real VRAM
+    // use, and totals beyond `AdapterRAM`'s 32-bit cap) — without this the
+    // same card shows up twice. When `nvidia-smi` isn't available (it found
+    // nothing), WMI is the only source, so its NVIDIA entries are kept.
     #[cfg(target_os = "windows")]
-    gpus.extend(detect_windows_gpus());
+    {
+        let have_nvidia_smi = !gpus.is_empty();
+        gpus.extend(
+            detect_windows_gpus()
+                .into_iter()
+                .filter(|gpu| !have_nvidia_smi || !gpu.name.to_lowercase().contains("nvidia")),
+        );
+    }
 
     apply_shared_memory_total(&mut gpus, total_memory_bytes);
     gpus
@@ -529,9 +541,17 @@ pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
         if index > 0 {
             out.push('\n');
         }
+        // Skip the vendor prefix when the device name already leads with it
+        // (nvidia-smi reports "NVIDIA GeForce ..."), so the line doesn't
+        // read "NVIDIA NVIDIA GeForce ...".
+        let redundant_vendor = gpu.vendor.is_empty()
+            || gpu
+                .name
+                .to_lowercase()
+                .starts_with(&gpu.vendor.to_lowercase());
         out.push_str(&format!(
             "  [{index}] {}{}\n",
-            if gpu.vendor.is_empty() {
+            if redundant_vendor {
                 String::new()
             } else {
                 format!("{} ", gpu.vendor)
