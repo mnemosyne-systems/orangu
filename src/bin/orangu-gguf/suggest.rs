@@ -128,8 +128,11 @@ fn suggest_param_count(budget_bytes: u64, context_size: u64, bits_per_weight: f6
 /// spillover to a shared pool or system RAM.
 fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
     gpus.iter()
-        .filter(|g| g.memory_kind == MemoryKind::Dedicated)
-        .filter_map(|g| g.vram_total_bytes)
+        .filter(|g| matches!(g.memory_kind, MemoryKind::Dedicated | MemoryKind::Unknown))
+        .filter_map(|g| {
+            g.vram_total_bytes
+                .map(|total| total.saturating_sub(g.vram_used_bytes.unwrap_or(0)))
+        })
         .sum()
 }
 
@@ -137,21 +140,28 @@ fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
 /// `Shared` alike (a `Shared` GPU's is already the system RAM total, via
 /// `system::apply_shared_memory_total`) — the more permissive budget,
 /// representing every device `--fit on` could spread layers across at once.
-/// Falls back to the CPU's own total RAM when that sum is `0` (no GPU
-/// detected at all, or only `Unknown`-kind ones). `Unknown`-kind GPUs
-/// (macOS/Windows edge cases `system.rs` itself can't classify) are never
-/// counted directly, since there's no safe way to know whether their
-/// reported figure is a hard VRAM ceiling or already system RAM.
+/// Falls back to the CPU's own available RAM when that sum is `0` (no GPU
+/// detected at all). `Unknown`-kind GPUs (macOS/Windows edge cases
+/// `system.rs` itself can't classify, such as Windows AMD) are now included
+/// since their `vram_total_bytes` represents dedicated memory capacity.
 fn combined_gpu_budget_bytes(cpu: &CpuInfo, gpus: &[GpuInfo]) -> u64 {
     let total: u64 = gpus
         .iter()
-        .filter(|g| matches!(g.memory_kind, MemoryKind::Dedicated | MemoryKind::Shared))
-        .filter_map(|g| g.vram_total_bytes)
+        .filter(|g| {
+            matches!(
+                g.memory_kind,
+                MemoryKind::Dedicated | MemoryKind::Shared | MemoryKind::Unknown
+            )
+        })
+        .filter_map(|g| {
+            g.vram_total_bytes
+                .map(|total| total.saturating_sub(g.vram_used_bytes.unwrap_or(0)))
+        })
         .sum();
     if total > 0 {
         total
     } else {
-        cpu.total_memory_bytes
+        cpu.available_memory_bytes
     }
 }
 
@@ -326,13 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_vram_budget_bytes_ignores_shared_and_unknown() {
+    fn dedicated_vram_budget_bytes_ignores_shared_and_subtracts_used() {
         let gpus = vec![
-            gpu(MemoryKind::Dedicated, Some(24 * GIB)),
+            GpuInfo {
+                vendor: "Test".to_string(),
+                name: "Test GPU 1".to_string(),
+                vram_total_bytes: Some(24 * GIB),
+                vram_used_bytes: Some(4 * GIB),
+                driver: None,
+                memory_kind: MemoryKind::Dedicated,
+            },
             gpu(MemoryKind::Shared, Some(64 * GIB)),
-            gpu(MemoryKind::Unknown, Some(999 * GIB)),
+            gpu(MemoryKind::Unknown, Some(16 * GIB)),
         ];
-        assert_eq!(dedicated_vram_budget_bytes(&gpus), 24 * GIB);
+        // 20 GiB from Dedicated (24 - 4) + 16 GiB from Unknown = 36 GiB
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 36 * GIB);
     }
 
     #[test]
@@ -352,12 +370,19 @@ mod tests {
     }
 
     #[test]
-    fn combined_gpu_budget_bytes_ignores_unknown_gpus() {
+    fn combined_gpu_budget_bytes_includes_unknown_and_subtracts_used() {
         let gpus = vec![
-            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
-            gpu(MemoryKind::Unknown, Some(999 * GIB)),
+            GpuInfo {
+                vendor: "Test".to_string(),
+                name: "Test GPU 1".to_string(),
+                vram_total_bytes: Some(4 * GIB),
+                vram_used_bytes: Some(1 * GIB),
+                driver: None,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            gpu(MemoryKind::Unknown, Some(12 * GIB)),
         ];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 4 * GIB);
+        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 15 * GIB);
     }
 
     #[test]
@@ -366,9 +391,8 @@ mod tests {
     }
 
     #[test]
-    fn combined_gpu_budget_bytes_falls_back_to_system_ram_with_only_unknown_gpus() {
-        let gpus = vec![gpu(MemoryKind::Unknown, Some(999 * GIB))];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &gpus), 16 * GIB);
+    fn combined_gpu_budget_bytes_falls_back_to_system_ram_with_no_gpu() {
+        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &[]), 16 * GIB);
     }
 
     #[test]
