@@ -27,6 +27,7 @@ mod models;
 mod prompt;
 mod roles;
 mod shell;
+mod suggest;
 mod system;
 
 use anyhow::{Context, Result, anyhow};
@@ -98,6 +99,9 @@ fn print_shell_completions() -> Result<()> {
 enum Commands {
     /// Detect the machine's CPU and GPU(s) and print their statistics.
     System,
+    /// Suggest a GGUF model size (not yet a specific model) likely to run
+    /// comfortably on this machine's detected hardware.
+    Suggest,
     /// List every .gguf file found under the configured models directory.
     List,
     /// Print a GGUF file's full metadata.
@@ -114,7 +118,7 @@ enum Commands {
         tensors: bool,
     },
     /// Download a GGUF model from Hugging Face into the configured models
-    /// directory, laid out exactly like llama.cpp's own `-hf` downloads.
+    /// directory.
     Download {
         /// A Hugging Face repo, `<user>/<model>[:quant]`. Without `:quant`,
         /// prefers Q4_K_M then Q8_0, falling back to the first GGUF file
@@ -171,6 +175,12 @@ fn run(config_arg: Option<PathBuf>, command: Commands) -> Result<()> {
             let cpu = system::detect_cpu();
             let gpus = system::detect_gpus(cpu.total_memory_bytes);
             print!("{}", system::format_report(&cpu, &gpus));
+            Ok(())
+        }
+        Commands::Suggest => {
+            let cpu = system::detect_cpu();
+            let gpus = system::detect_gpus(cpu.total_memory_bytes);
+            print!("{}", suggest::format_suggestion(&cpu, &gpus));
             Ok(())
         }
         Commands::List => {

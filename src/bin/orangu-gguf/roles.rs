@@ -314,18 +314,11 @@ fn build_command(
             role.default_ctx_size, role.name
         ));
     }
-    if role.name == "embeddings" {
-        notes.push(
-            "8100 matches the other role examples in the manual — if running this alongside \
-             a chat role's server at the same time, give it a separate port (e.g. 8300) instead."
-                .to_string(),
-        );
-        if pooling_metadata.is_none() {
-            notes.push(format!(
-                "No usable pooling_type metadata found on this model — defaulting to \
-                 --pooling {pooling}; check the model's card if results look off."
-            ));
-        }
+    if role.name == "embeddings" && pooling_metadata.is_none() {
+        notes.push(format!(
+            "No usable pooling_type metadata found on this model — defaulting to \
+             --pooling {pooling}; check the model's card if results look off."
+        ));
     }
 
     RecommendedCommand {

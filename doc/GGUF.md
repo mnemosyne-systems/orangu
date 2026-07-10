@@ -6,6 +6,7 @@ runtime, but that matter when *getting* and *choosing* a model to run:
 
 - Fetching a model from Hugging Face in the first place (`download`).
 - What hardware is available to run a model on (`system`)?
+- Roughly how large a model that hardware can run comfortably (`suggest`)?
 - What models are actually on disk, and what's in them (`list`, `show`)?
 - Given a role and a model, what `llama-server` command line actually fits
   this machine (the role wizard, below)?
@@ -204,6 +205,83 @@ Renoir APU above genuinely has only a 512 MiB BIOS-reserved carve-out
 according to `amdgpu`, but system RAM (62.19 GiB) is the real ceiling on how
 much it can actually draw on, and the only figure worth showing as its
 total.
+
+## `suggest`: a hardware-based model-size suggestion
+
+```sh
+orangu-gguf suggest
+```
+
+```
+CPU
+  Model            : AMD Ryzen 7 4800H with Radeon Graphics
+  ...
+
+GPU
+  [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
+      Memory type  : Dedicated
+      VRAM total   : 3.98 GiB
+      ...
+
+Suggested model size (Dedicated)
+  Estimated budget : 3.98 GiB
+
+  Context  Suggestion (Q2_K)  Suggestion (Q4_K_M)  Suggestion (Q8_0)
+  -------  -----------------  -------------------  -----------------
+  1K       ~9B parameters     ~4B parameters       ~3B parameters
+  2K       ~9B parameters     ~4B parameters       ~3B parameters
+  4K       ~9B parameters     ~4B parameters       ~3B parameters
+  8K       ~8B parameters     ~4B parameters       ~2B parameters
+  16K      ~4B parameters     ~4B parameters       ~2B parameters
+  32K      ~4B parameters     ~2B parameters       ~1B parameters
+  64K      ~2B parameters     ~1B parameters       -
+  128K     -                  -                    -
+  256K     -                  -                    -
+
+Suggested model size (Shared)
+  Estimated budget : 66.17 GiB
+
+  Context  Suggestion (Q2_K)  Suggestion (Q4_K_M)  Suggestion (Q8_0)
+  -------  -----------------  -------------------  -----------------
+  1K       ~120B parameters   ~110B parameters     ~65B parameters
+  2K       ~120B parameters   ~110B parameters     ~65B parameters
+  4K       ~120B parameters   ~110B parameters     ~34B parameters
+  8K       ~120B parameters   ~110B parameters     ~34B parameters
+  16K      ~120B parameters   ~70B parameters      ~34B parameters
+  32K      ~120B parameters   ~70B parameters      ~34B parameters
+  64K      ~120B parameters   ~70B parameters      ~34B parameters
+  128K     ~70B parameters    ~34B parameters      ~32B parameters
+  256K     ~34B parameters    ~30B parameters      ~14B parameters
+```
+
+Prints the same CPU/GPU report `system` does, then estimates how large a
+model (in parameters) is likely to run comfortably — as a table, one row per
+context length (1K to 256K tokens) and one column per quantization (`Q2_K`,
+`Q4_K_M` — the same default `download` and the role wizard already assume —
+and `Q8_0`). Not a specific model recommendation yet — just a size class to
+aim `download` at.
+
+Two such tables are printed, sized against two different budgets:
+
+- **Dedicated**: the sum of every **dedicated** GPU's VRAM alone (multiple
+  dedicated cards add up, matching `-sm layer`'s multi-GPU tensor split) —
+  everything fits in real VRAM, no spillover.
+- **Shared**: the sum of *every* GPU's own reported total, dedicated and
+  shared alike (a shared/integrated GPU's is already the system's total RAM,
+  per the note above) — the more permissive figure, representing every
+  device `--fit on` could spread layers across at once. Falls back to the
+  CPU's own total RAM when there's no GPU detected at all.
+
+The memory-estimation formula mirrors [Sam McLeod's GGUF VRAM
+Estimator](https://smcleod.net/vram-estimator/) (read directly from its
+published source, not guessed) and the general shape of
+[erans/selfhostllm](https://github.com/erans/selfhostllm)'s calculator:
+model weight bytes scale as parameters × bits-per-weight ÷ 8, KV cache bytes
+scale with context length × layers × hidden size, plus a small fixed runtime
+overhead. Since there's no real GGUF file to read yet, hidden size and layer
+count are themselves estimated from the parameter count via the standard
+transformer parameter-count approximation (params ≈ 12 × layers ×
+hidden_size²).
 
 ## `list` and `show`: reading GGUF files
 

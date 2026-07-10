@@ -10,7 +10,7 @@ cache, config-reload, or background process to reason about.
 
 ### Module layout
 
-- `main.rs` — clap `Args`/`Commands` (`system`, `list`, `show`,
+- `main.rs` — clap `Args`/`Commands` (`system`, `suggest`, `list`, `show`,
   `download`), dispatch, and `format_show`/`format_bytes` (the latter shared
   by `system`'s RAM/VRAM figures and `list`'s file sizes).
 - `gguf.rs` — the GGUF binary-format reader (`GgufFile::open`).
@@ -21,6 +21,8 @@ cache, config-reload, or background process to reason about.
   see below.
 - `system.rs` — CPU (via `sysinfo`) and GPU (layered platform-specific
   probes) detection.
+- `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
+  top of `system.rs`'s own detection; see below.
 - `config.rs`, `init.rs` — `orangu-gguf.conf` loading and the `--init`
   wizard, following the same shape as `orangu-coordinator`'s. `init.rs`'s
   `models` prompt uses `rustyline` (already a project dependency; see
@@ -364,6 +366,83 @@ figure worth showing as its total; `vram_used_bytes` is left untouched
 (whatever the platform reported, or `None`), since "how much of the shared
 pool is currently claimed as graphics memory" is a real and distinct
 figure from the override, unlike the total.
+
+### Hardware-based model-size suggestion (`suggest.rs`)
+
+`main.rs`'s `Commands::Suggest` arm calls the same `system::detect_cpu`/
+`detect_gpus` pair `Commands::System` does, then passes the result to
+`suggest::format_suggestion`, which appends two size-suggestion tables after
+`system::format_report`'s own CPU/GPU listing (via the shared
+`push_suggestion_block` helper). There is no separate detection path —
+`suggest` is purely a second interpretation of the same hardware inventory
+`system` already knows how to gather.
+
+**The memory-estimation formula.** `estimate_total_vram_bytes` mirrors [Sam
+McLeod's GGUF VRAM Estimator](https://smcleod.net/vram-estimator/)'s own
+`calculateMemoryBreakdown` function (read directly from its published
+`vram-calculator.min.js`, not guessed) and the general shape of
+[erans/selfhostllm](https://github.com/erans/selfhostllm)'s calculator:
+
+- Model weight bytes: `params × bits_per_weight ÷ 8`, plus a fixed 500 MiB
+  runtime/CUDA-context overhead (`RUNTIME_OVERHEAD_BYTES`, matching
+  smcleod's own `CUDA_SIZE` constant exactly).
+- KV cache bytes: `context_size × 2 (K and V) × layers × hidden_size ×
+  (kv_cache_bits ÷ 8)`, plus a smaller "compute buffer" term for attention
+  scratch space, `context_size × hidden_size × 3 × (bits_per_weight ÷ 8)`.
+
+Since `suggest` runs before any model is chosen, there's no real GGUF file
+to read `hidden_size`/`layers` from (unlike `roles.rs`'s
+`architecture_metadata_u64`, which reads them from an actual model).
+`estimate_hidden_dims` instead estimates both from the parameter count
+alone, via the standard transformer parameter-count approximation params ≈
+12 × layers × hidden_size² (solved for `hidden_size = sqrt(params / 12)`,
+then `layers` from that) — the exact same fallback smcleod's own calculator
+uses when it has no real GGUF metadata to read either.
+
+`DEFAULT_BITS_PER_WEIGHT` (4.83, Q4_K_M) and `KV_CACHE_BITS` (8, Q8_0) match
+this project's own established defaults (`download.rs`'s
+`DEFAULT_TAG_PREFERENCE`, and the role wizard's `-ctk q8_0 -ctv q8_0`)
+rather than assuming full FP16 throughout.
+
+**A table, not a single guess.** Actual context usage varies far too much to
+guess well from hardware alone, and bits-per-weight depends on which
+quantization tag you end up downloading — so instead of picking one of each,
+`push_suggestion_block` prints a row per context length in `CONTEXT_LADDER`
+(1K up to the role wizard's own largest default, 262144) and a column per
+quantization in `QUANT_LADDER` (`Q2_K` at 3.00 bits/weight, `Q4_K_M` at
+`DEFAULT_BITS_PER_WEIGHT`, and `Q8_0` at 8.5 — all three bits-per-weight
+figures read from smcleod's own table, the same source as the formula
+itself). Each cell is independently computed by `suggest_param_count`, so
+the suggested size correctly shrinks along a row as quantization gets
+heavier, and down a column as context grows.
+
+**Picking a size.** `suggest_param_count` walks `PARAM_LADDER_BILLIONS` — a
+curated list of common open-weight parameter counts, largest first — and
+returns the first whose `estimate_total_vram_bytes` result (at that cell's
+context length and bits-per-weight) fits within the budget, or `None` if
+even the smallest rung (1B) doesn't (rendered as `-`).
+
+**Two budgets, two tables.** `format_suggestion` computes two separate
+budgets and prints a labeled `push_suggestion_block` for each, `"Suggested
+model size (Dedicated)"` and `"Suggested model size (Shared)"`:
+
+- `dedicated_vram_budget_bytes` sums every `Dedicated` GPU's
+  `vram_total_bytes` alone (multiple dedicated cards add up, matching the
+  role wizard's `-sm layer` multi-GPU tensor split) — `0` when there's no
+  dedicated GPU at all, which `suggest_param_count` then correctly reports
+  as nothing on the ladder fitting.
+- `combined_gpu_budget_bytes` sums every GPU's `vram_total_bytes`,
+  `Dedicated` and `Shared` alike (a `Shared` GPU's is already the system RAM
+  total via `apply_shared_memory_total`, described above) — the more
+  permissive figure, representing every device `--fit on` could spread
+  layers across at once. Falls back to the CPU's own `total_memory_bytes`
+  when that sum is `0` (no GPU detected at all, or only `Unknown`-kind
+  ones).
+
+`Unknown`-kind GPUs are never counted in either budget — there's no safe
+way to know whether their reported figure is a hard VRAM ceiling or already
+system RAM, and double-counting or miscounting either way would make both
+suggestions worse than not counting them at all.
 
 ### The role wizard (`roles.rs`)
 

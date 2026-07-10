@@ -60,7 +60,7 @@ _orangu_gguf() {
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "system list show download help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "system suggest list show download help" -- "$cur") )
         return 0
     fi
 }
@@ -102,6 +102,7 @@ _orangu_gguf() {
         command)
             _values 'command' \
                 'system[Detect the machine'"'"'s CPU and GPU(s)]' \
+                'suggest[Suggest a GGUF model size for this machine'"'"'s hardware]' \
                 'list[List every .gguf file under the models directory]' \
                 'show[Print a GGUF file'"'"'s full metadata]' \
                 'download[Download a GGUF model from Hugging Face]' \
@@ -130,6 +131,7 @@ function __orangu_gguf_models
 end
 
 complete -c orangu-gguf -n '__fish_use_subcommand' -a system   -d 'Detect the machine\'s CPU and GPU(s)'
+complete -c orangu-gguf -n '__fish_use_subcommand' -a suggest  -d 'Suggest a GGUF model size for this machine\'s hardware'
 complete -c orangu-gguf -n '__fish_use_subcommand' -a list     -d 'List every .gguf file under the models directory'
 complete -c orangu-gguf -n '__fish_use_subcommand' -a show     -d 'Print a GGUF file\'s full metadata'
 complete -c orangu-gguf -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
