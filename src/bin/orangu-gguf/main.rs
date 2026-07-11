@@ -20,20 +20,16 @@
 //! dump one file's full metadata (`show`).
 
 mod config;
-mod download;
-mod gguf;
 mod init;
-mod models;
 mod prompt;
 mod roles;
 mod shell;
 mod suggest;
-mod system;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use config::{default_gguf_config_path, load_gguf_configuration};
-use gguf::{GgufFile, ggml_type_name};
+use orangu::gguf::{GgufFile, ggml_type_name};
 use std::{path::PathBuf, process::ExitCode};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -164,21 +160,21 @@ fn run(config_arg: Option<PathBuf>, command: Commands) -> Result<()> {
             roles::run_wizard(&conf)
         }
         Commands::System => {
-            let cpu = system::detect_cpu();
-            let gpus = system::detect_gpus(cpu.total_memory_bytes);
-            print!("{}", system::format_report(&cpu, &gpus));
+            let cpu = orangu::hardware::detect_cpu();
+            let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+            print!("{}", orangu::hardware::format_report(&cpu, &gpus));
             Ok(())
         }
         Commands::Suggest => {
-            let cpu = system::detect_cpu();
-            let gpus = system::detect_gpus(cpu.total_memory_bytes);
+            let cpu = orangu::hardware::detect_cpu();
+            let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
             print!("{}", suggest::format_suggestion(&cpu, &gpus));
             Ok(())
         }
         Commands::List => {
             let conf = load_config(config_arg)?;
-            let models = models::scan_models_dir(&conf.models)?;
-            print!("{}", models::format_list(&models, &conf.models));
+            let models = orangu::model_spec::scan_models_dir(&conf.models)?;
+            print!("{}", orangu::model_spec::format_list(&models, &conf.models));
             Ok(())
         }
         Commands::Show {
@@ -187,14 +183,16 @@ fn run(config_arg: Option<PathBuf>, command: Commands) -> Result<()> {
             tensors,
         } => {
             let conf = load_config(config_arg)?;
-            let path = models::resolve_show_target(&conf.models, &file)?;
+            let path = orangu::model_spec::resolve_show_target(&conf.models, &file)?;
             let gguf = GgufFile::open(&path)?;
             print!("{}", format_show(&gguf, full, tensors));
             Ok(())
         }
         Commands::Download { repo } => {
             let conf = load_config(config_arg)?;
-            download::run_download(&conf, &repo)
+            let path = orangu::model_download::download_model(&conf.models, &repo)?;
+            println!("Downloaded to {}", path.display());
+            Ok(())
         }
     }
 }
@@ -257,34 +255,4 @@ fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {
     }
 
     out
-}
-
-/// Formats a byte count as a human-readable size (e.g. `4.92 GiB`), shared
-/// by the `system` (RAM/VRAM) and `list` (file size) output.
-pub(crate) fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.2} {}", UNITS[unit])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_byte_sizes() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.00 KiB");
-        assert_eq!(format_bytes(1024 * 1024 * 5), "5.00 MiB");
-        assert_eq!(format_bytes(4_929_003_520), "4.59 GiB");
-    }
 }

@@ -13,26 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod agents;
-pub mod compression;
-pub mod compression_cache;
-pub mod config;
-pub mod context;
-pub mod diff;
-pub mod duplicates;
-pub mod embeddings;
-pub mod explorer;
-pub mod format;
-pub mod gguf;
-pub mod graph;
-pub mod hardware;
-pub mod llm;
-pub mod model_download;
-pub mod model_spec;
-
-pub mod session;
-pub mod skills;
-pub mod tools;
-pub mod tui;
-pub mod workspace_cache;
-pub mod workspaces;
+pub mod arch;
+pub mod backend;
+pub mod batch;
+pub mod chat_template;
+pub mod generate;
+pub mod kv_cache;
+pub mod loader;
+pub mod quant;
+pub mod sampling;
+pub mod scheduler;
+pub mod tensor;
+pub mod tokenizer;

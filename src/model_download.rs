@@ -44,7 +44,6 @@
 //! [`ProgressBoard`] so every in-flight file's percentage stays visible at
 //! once until all are done.
 
-use crate::config::GgufConfiguration;
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -61,7 +60,14 @@ const HUB_ENDPOINT: &str = "https://huggingface.co";
 /// in that order, first match wins.
 const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
 
-pub fn run_download(config: &GgufConfiguration, spec: &str) -> Result<()> {
+/// Downloads `spec` (`<user>/<model>[:quant]`) from the Hugging Face Hub
+/// into `models_dir`, and returns the local path of the primary model file
+/// (the first shard, for a multi-part model) once every selected file
+/// (every shard, plus a bundled `mmproj` sidecar if the repo has one) is in
+/// place. Used both by `orangu-gguf download` (which only cares that the
+/// files land on disk) and `orangu-server` (which also needs the resulting
+/// path to load).
+pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
     let (repo, tag) = split_repo_tag(spec)?;
     let client = build_client()?;
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
@@ -70,12 +76,13 @@ pub fn run_download(config: &GgufConfiguration, spec: &str) -> Result<()> {
     let files = list_repo_files(&client, &repo, &commit, token.as_deref())?;
     let mut selected = select_files_to_download(&files, tag.as_deref())
         .with_context(|| format!("no matching GGUF file in {repo}"))?;
+    let primary_path = selected[0].path.clone();
 
     if let Some(mmproj) = find_best_mmproj(&files, &selected[0].path) {
         selected.push(mmproj);
     }
 
-    let repo_dir = config.models.join(repo_folder_name(&repo));
+    let repo_dir = models_dir.join(repo_folder_name(&repo));
     let blobs_dir = repo_dir.join("blobs");
     let snapshot_dir = repo_dir.join("snapshots").join(&commit);
     fs::create_dir_all(&blobs_dir)
@@ -129,7 +136,7 @@ pub fn run_download(config: &GgufConfiguration, spec: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(snapshot_dir.join(primary_path))
 }
 
 fn build_client() -> Result<reqwest::blocking::Client> {

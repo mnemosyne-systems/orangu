@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>orangu-server</title>
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  // Applied before first paint so a saved preference doesn't flash the
+  // wrong theme for a frame — the rest of the toggle lives in app.js.
+  (() => {
+    const saved = localStorage.getItem("orangu-theme");
+    if (saved) document.documentElement.setAttribute("data-theme", saved);
+  })();
+</script>
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div id="brand">orangu-server</div>
+    <div id="model-name">{{MODEL}}</div>
+    <div id="topbar-actions">
+      <button id="new-chat-btn" class="icon-btn" type="button" aria-label="New chat" title="New chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </button>
+      <button id="history-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="History" title="History">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/></svg>
+      </button>
+      <button id="theme-toggle-btn" class="icon-btn" type="button" aria-label="Switch to light mode" title="Switch to light mode"></button>
+    </div>
+  </header>
+
+  <nav id="history-panel" hidden>
+    <div id="history-list"></div>
+  </nav>
+
+  <main id="transcript" aria-live="polite"></main>
+
+  <form id="composer">
+    <textarea id="input" placeholder="Message orangu-server… (Enter to send, Shift+Enter for a new line)" rows="2"></textarea>
+    <button id="send-btn" class="icon-btn" type="submit" aria-label="Send" title="Send">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+    </button>
+  </form>
+
+  <footer id="footer">
+    <span>Powered by <a href="https://mnemosyne-systems.github.io/orangu/" target="_blank" rel="noopener noreferrer">orangu</a> {{VERSION}}</span>
+    <span>{{YEAR}} <a href="https://mnemosyne-systems.ai" target="_blank" rel="noopener noreferrer">mnemosyne-systems.ai</a></span>
+  </footer>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

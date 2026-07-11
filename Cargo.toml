@@ -18,6 +18,10 @@ path = "src/bin/orangu-coordinator/main.rs"
 name = "orangu-gguf"
 path = "src/bin/orangu-gguf/main.rs"
 
+[[bin]]
+name = "orangu-server"
+path = "src/bin/orangu-server/main.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 arboard = { version = "3.6.1", default-features = false }
@@ -38,7 +42,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
 shell-words = "1.1"
-syntect = "5.3.0"
+syntect = { version = "5.3.0", features = ["html"] }
 terminal_size = "0.4.1"
 ttf-parser = "0.25.1"
 sha2 = "0.11.0"
@@ -76,6 +80,23 @@ tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+minijinja = "2.5"
+minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+half = "2.4"
+memmap2 = "0.9"
+rand = "0.9"
+tokio-stream = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+wgpu = { version = "30.0.0", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl", "std"] }
+pollster = "1.0.1"
+bytemuck = { version = "1.25.1", features = ["derive"] }
+cudarc = { version = "0.19.8", features = ["cuda-12000"] }
+opencl3 = "0.12.3"
+cubecl-hip-sys = { version = "7", optional = true }
+
+[features]
+rocm = ["dep:cubecl-hip-sys"]
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
@@ -89,3 +110,8 @@ tempfile = "3.20.0"
 name = "compression"
 path = "test/benchmarks/compression.rs"
 harness = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = 1
+panic = "unwind"

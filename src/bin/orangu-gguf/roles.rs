@@ -28,11 +28,11 @@
 //! change with them.
 
 use crate::config::GgufConfiguration;
-use crate::gguf::{GgufFile, GgufValue};
-use crate::models::{self, ModelGroup};
 use crate::prompt::prompt;
-use crate::system::{self, CpuInfo};
 use anyhow::{Context, Result};
+use orangu::gguf::{GgufFile, GgufValue};
+use orangu::hardware::{self as system, CpuInfo};
+use orangu::model_spec::{self as models, ModelGroup};
 
 /// The conventional roles `orangu.conf`/`orangu-coordinator.conf` document,
 /// in the order they're listed there.

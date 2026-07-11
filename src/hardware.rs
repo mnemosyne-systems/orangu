@@ -27,7 +27,7 @@
 //! doesn't show up — this is inventory, not a hard dependency of anything
 //! else `orangu-gguf` does.
 
-use crate::format_bytes;
+use crate::format::format_bytes;
 use std::process::Command;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 

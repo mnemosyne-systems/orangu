@@ -38,8 +38,8 @@
 //! hidden_size²) — the same fallback smcleod's own calculator uses when it
 //! has no real GGUF metadata to read.
 
-use crate::format_bytes;
-use crate::system::{self, CpuInfo, GpuInfo, MemoryKind};
+use orangu::format::format_bytes;
+use orangu::hardware::{self as system, CpuInfo, GpuInfo, MemoryKind};
 
 /// Fixed CUDA/runtime overhead added on top of model weights — matches
 /// smcleod's `CUDA_SIZE` constant (500 MiB) exactly.

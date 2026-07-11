@@ -1,0 +1,26 @@
+# AVX2, FMA (its near-universal real-hardware companion — every Haswell+
+# Intel and Excavator+/Zen+ AMD chip has both), and SSE4.2 as a compile-time
+# baseline for x86_64 builds. SSE4.2 is listed explicitly even though AVX2
+# already requires it as a hardware prerequisite (confirmed via `rustc
+# --print cfg -C target-feature=+avx2`: sse4.2/sse4.1/ssse3/sse3/sse2 all
+# come back enabled already) — no x86_64 CPU has AVX2 without SSE4.2, so
+# this changes nothing about codegen today, but makes the floor explicit
+# rather than implicit, and keeps it mandatory even if `+avx2,+fma` is ever
+# dropped from this list on its own. Scoped to `cfg(target_arch = "x86_64")`
+# rather than a blanket `[build]` section so it doesn't break
+# cross-compiling the aarch64/musl/macOS-arm legs in
+# .github/workflows/release.yml, where none of these are valid target
+# features at all.
+#
+# `engine::tensor` (orangu-server's hot inner loops) already does its own
+# *runtime* is_x86_feature_detected! dispatch with a scalar fallback,
+# independent of this flag — so it still runs (just unvectorized) on an
+# x86_64 CPU built without this file's defaults in play. What this flag
+# buys on top of that: LLVM's autovectorizer can use AVX2/FMA for every
+# *other* plain elementwise loop in the engine (RMSNorm's scale step,
+# residual adds, SwiGLU/GEGLU's elementwise multiply, etc.) without each
+# one needing its own hand-written intrinsics. The tradeoff: a release
+# binary built with this in effect requires an AVX2+FMA-capable x86_64 CPU
+# to run at all (SIGILL otherwise) — see doc/BUILDING.md.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+avx2,+fma,+sse4.2"]

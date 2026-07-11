@@ -1,0 +1,351 @@
+:root {
+  /* Light is the baseline; the dark media query and an explicit
+     data-theme attribute (set by the topbar toggle, see app.js) both
+     override it — an attribute selector on :root outranks a plain :root
+     inside @media, so the explicit choice always wins regardless of
+     source order. */
+  --bg: #f5f6f8;
+  --bg-raised: #ffffff;
+  --bg-input: #eef0f3;
+  --border: #d7dbe0;
+  --text: #1b1e23;
+  --text-dim: #62697a;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --user-bubble: #dbe6ff;
+  --assistant-bubble: #ffffff;
+  --error: #d92d20;
+  --radius: 10px;
+
+  /* The "orangu" brand brown — the header/footer bars, deliberately the
+     same in light and dark mode (a brand color, not a theme color), so
+     it's defined once here rather than repeated in every theme block. */
+  --brand-bg: #5c3a21;
+  --brand-border: #432911;
+  --brand-text: #f3e6d8;
+  --brand-text-dim: #cbb49b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1e23;
+    --bg-raised: #23272e;
+    --bg-input: #2a2f38;
+    --border: #343a45;
+    --text: #e6e8eb;
+    --text-dim: #9aa3b2;
+    --accent: #5b9dff;
+    --accent-text: #0c1420;
+    --user-bubble: #2b3a55;
+    --assistant-bubble: #23272e;
+    --error: #ff6b6b;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --bg-raised: #ffffff;
+  --bg-input: #eef0f3;
+  --border: #d7dbe0;
+  --text: #1b1e23;
+  --text-dim: #62697a;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --user-bubble: #dbe6ff;
+  --assistant-bubble: #ffffff;
+  --error: #d92d20;
+}
+
+:root[data-theme="dark"] {
+  --bg: #1b1e23;
+  --bg-raised: #23272e;
+  --bg-input: #2a2f38;
+  --border: #343a45;
+  --text: #e6e8eb;
+  --text-dim: #9aa3b2;
+  --accent: #5b9dff;
+  --accent-text: #0c1420;
+  --user-bubble: #2b3a55;
+  --assistant-bubble: #23272e;
+  --error: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--brand-bg);
+  border-bottom: 1px solid var(--brand-border);
+  flex-shrink: 0;
+}
+
+#brand {
+  color: var(--brand-text);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+#model-name {
+  color: var(--brand-text-dim);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+#topbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* New Chat / History / theme toggle / Send: icon-only, the label lives in
+   the native `title` tooltip (and `aria-label` for screen readers) instead
+   of visible text. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  padding: 0;
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* The header sits outside the light/dark toggle's scope (see #topbar),
+   so its buttons get their own fixed brand-brown styling rather than the
+   theme-variable colors the generic `button` rule above uses. */
+#topbar-actions button {
+  border-color: var(--brand-border);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--brand-text);
+}
+
+#topbar-actions button:hover {
+  border-color: var(--brand-text-dim);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+#send-btn {
+  background: var(--brand-bg);
+  color: #ffffff;
+  border-color: var(--brand-bg);
+  font-weight: 600;
+}
+
+#send-btn:hover {
+  border-color: var(--brand-text-dim);
+}
+
+#history-panel {
+  position: absolute;
+  top: 54px;
+  right: 16px;
+  width: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+}
+
+#history-panel[hidden] {
+  display: none;
+}
+
+.history-item {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.history-item:last-child {
+  border-bottom: none;
+}
+
+.history-item:hover {
+  background: var(--bg-input);
+}
+
+.history-title {
+  font-size: 0.92em;
+}
+
+.history-date {
+  font-size: 0.78em;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.history-empty {
+  padding: 14px;
+  color: var(--text-dim);
+  font-size: 0.9em;
+}
+
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.message {
+  max-width: 72ch;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: var(--user-bubble);
+}
+
+.message.assistant {
+  align-self: flex-start;
+  background: var(--assistant-bubble);
+  border: 1px solid var(--border);
+}
+
+.message.error {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--error);
+  color: var(--error);
+  font-size: 1.6em;
+  line-height: 1;
+}
+
+.message p {
+  margin: 0 0 0.6em;
+}
+
+.message p:last-child {
+  margin-bottom: 0;
+}
+
+.message pre {
+  overflow-x: auto;
+  padding: 10px;
+  border-radius: 8px;
+  font-size: 0.88em;
+}
+
+.message code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.message :not(pre) > code {
+  background: var(--bg-input);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.message table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+
+.message th, .message td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+}
+
+#composer {
+  display: flex;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#input {
+  flex: 1;
+  resize: none;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font: inherit;
+}
+
+#input:focus, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.8em;
+  color: var(--brand-text-dim);
+  padding: 8px 16px;
+  background: var(--brand-bg);
+  border-top: 1px solid var(--brand-border);
+  flex-shrink: 0;
+}
+
+#footer a {
+  color: var(--brand-text);
+  text-decoration: none;
+}
+
+#footer a:hover {
+  text-decoration: underline;
+}

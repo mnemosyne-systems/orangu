@@ -19,9 +19,9 @@
 //! touches tensor data, so scanning a directory of multi-gigabyte model
 //! files stays fast.
 
-use crate::format_bytes;
+use crate::format::format_bytes;
 use crate::gguf::{GgufFile, ggml_type_name};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -168,6 +168,21 @@ pub fn resolve_show_target(models_dir: &Path, requested: &str) -> Result<PathBuf
                 "'{requested}' was not found as a file, an NR, or a MODEL name; run 'orangu-gguf list' to see valid values"
             )
         })
+}
+
+/// Resolves a model the caller named — a direct/bare file path, an `NR`/
+/// `MODEL` label already present under `models_dir` (exactly like
+/// [`resolve_show_target`]), or a `<user>/<model>[:quant]` Hugging Face
+/// repo — to a local `.gguf` path, **fetching it from the Hub first** when
+/// it names a repo not already cached under `models_dir`. This is what lets
+/// `orangu-server <spec>` and `orangu-gguf download <spec>` both start from
+/// the same bare model reference with no separate download step.
+pub fn resolve_or_fetch_model(models_dir: &Path, requested: &str) -> Result<PathBuf> {
+    if let Ok(path) = resolve_show_target(models_dir, requested) {
+        return Ok(path);
+    }
+    crate::model_download::download_model(models_dir, requested)
+        .with_context(|| format!("'{requested}' was not found locally and could not be fetched"))
 }
 
 /// One row of the `list` output: a model, collapsed from every shard file
