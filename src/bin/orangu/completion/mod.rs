@@ -148,6 +148,35 @@ fn export_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
     Some((token_start, candidates))
 }
 
+/// Tab/ghost completion for the `/build [debug|release] [<target>]` argument
+/// as `(token_start, candidates)`: the profile keywords plus the workspace's
+/// discovered build targets (cargo binary names, Makefile rule names — see
+/// `build::completion_targets`). Only the token under the cursor is
+/// completed, so `/build release do` offers `docs` without re-offering the
+/// profile. Returns `None` when `prefix` is not a `/build` argument.
+fn build_completion_candidates(prefix: &str, workspace: &Path) -> Option<(usize, Vec<String>)> {
+    let value = prefix.strip_prefix("/build ")?;
+    // Complete the token under the cursor — the one after the last space.
+    let token_start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let token = &prefix[token_start..];
+
+    let mut candidates: Vec<String> = Vec::new();
+    // The profile keywords are only offered while typing the first argument
+    // token; once a profile (or target) is already given, only targets remain.
+    if !value.trim_end().contains(char::is_whitespace) {
+        candidates.extend(["debug".to_string(), "release".to_string()]);
+    }
+    candidates.extend(crate::build::completion_targets(workspace));
+    let lower = token.to_ascii_lowercase();
+    candidates.retain(|candidate| candidate.to_ascii_lowercase().starts_with(&lower));
+    Some((token_start, candidates))
+}
+
 /// The completion candidates tied to a recognised command (branch, tag, file,
 /// model, server, session, ... arguments). Returns `None` when the input is not
 /// one of those forms, leaving [`completion_candidates`] to fall back to the
@@ -226,6 +255,10 @@ fn structured_completion_candidates(
     }
 
     if let Some((start, candidates)) = export_completion_candidates(prefix) {
+        return Some((start, cursor, candidates));
+    }
+
+    if let Some((start, candidates)) = build_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
 
@@ -490,6 +523,40 @@ mod tests {
             auto_review_completion_candidates("/auto_review de", workspace.path())
                 .expect("auto-review argument");
         assert!(candidates.iter().any(|c| c == "deep"), "{candidates:?}");
+    }
+
+    #[test]
+    fn build_completes_profiles_and_workspace_targets() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("Makefile"),
+            "all: docs\n\ttrue\ndocs:\n\ttrue\ninstall:\n\ttrue\n",
+        )
+        .expect("makefile");
+
+        // The bare argument offers the profiles, then the discovered rules.
+        let (start, all) =
+            build_completion_candidates("/build ", workspace.path()).expect("build argument");
+        assert_eq!(start, "/build ".len());
+        assert_eq!(all, vec!["debug", "release", "all", "docs", "install"]);
+
+        // Typing narrows to whatever still matches, profile or target.
+        assert_eq!(
+            build_completion_candidates("/build d", workspace.path())
+                .expect("argument")
+                .1,
+            vec!["debug".to_string(), "docs".to_string()]
+        );
+
+        // After a first token, only targets are offered, and only the token
+        // under the cursor completes.
+        let (start, second) =
+            build_completion_candidates("/build release do", workspace.path()).expect("argument");
+        assert_eq!(start, "/build release ".len());
+        assert_eq!(second, vec!["docs".to_string()]);
+
+        // Not a /build argument at all.
+        assert!(build_completion_candidates("/builder ", workspace.path()).is_none());
     }
 
     #[test]

@@ -101,51 +101,55 @@ fn parses_prune_commands() {
 fn parses_build_commands() {
     use crate::build::BuildProfile;
 
-    // Bare forms, slash and natural, default to release.
+    let build_of = |input: &str| match parse_local_command(input) {
+        Some(LocalCommand::Build(request)) => Some(request),
+        _ => None,
+    };
+
+    // Bare forms, slash and natural, default to release with no target.
     for input in ["/build", "build", "build project", "run build"] {
-        assert!(
-            matches!(
-                parse_local_command(input),
-                Some(LocalCommand::Build(BuildProfile::Release))
-            ),
-            "expected release build for {input:?}"
-        );
+        let request = build_of(input).unwrap_or_else(|| panic!("no build for {input:?}"));
+        assert_eq!(request.profile, BuildProfile::Release, "for {input:?}");
+        assert_eq!(request.target, None, "for {input:?}");
     }
 
     // An explicit profile, slash or natural, in either order.
     for input in ["/build debug", "build debug", "debug build"] {
-        assert!(
-            matches!(
-                parse_local_command(input),
-                Some(LocalCommand::Build(BuildProfile::Debug))
-            ),
-            "expected debug build for {input:?}"
-        );
+        let request = build_of(input).unwrap_or_else(|| panic!("no build for {input:?}"));
+        assert_eq!(request.profile, BuildProfile::Debug, "for {input:?}");
     }
     for input in ["/build release", "build release", "release build"] {
-        assert!(
-            matches!(
-                parse_local_command(input),
-                Some(LocalCommand::Build(BuildProfile::Release))
-            ),
-            "expected release build for {input:?}"
-        );
+        let request = build_of(input).unwrap_or_else(|| panic!("no build for {input:?}"));
+        assert_eq!(request.profile, BuildProfile::Release, "for {input:?}");
     }
 
     // Case-insensitive, and surrounding whitespace on the slash argument is
     // trimmed.
-    assert!(matches!(
-        parse_local_command("/build DEBUG"),
-        Some(LocalCommand::Build(BuildProfile::Debug))
-    ));
-    assert!(matches!(
-        parse_local_command("/build  release  "),
-        Some(LocalCommand::Build(BuildProfile::Release))
-    ));
+    assert_eq!(
+        build_of("/build DEBUG").unwrap().profile,
+        BuildProfile::Debug
+    );
+    assert_eq!(
+        build_of("/build  release  ").unwrap().profile,
+        BuildProfile::Release
+    );
 
-    // An unrecognized profile is not a build command at all (falls through
-    // to the "unknown command" error rather than silently building).
-    assert!(parse_local_command("/build nightly").is_none());
+    // A non-profile token is the build target — with or without a profile,
+    // in either order.
+    let request = build_of("/build docs").unwrap();
+    assert_eq!(request.profile, BuildProfile::Release);
+    assert_eq!(request.target.as_deref(), Some("docs"));
+    let request = build_of("/build debug orangu-gguf").unwrap();
+    assert_eq!(request.profile, BuildProfile::Debug);
+    assert_eq!(request.target.as_deref(), Some("orangu-gguf"));
+    let request = build_of("/build install release").unwrap();
+    assert_eq!(request.profile, BuildProfile::Release);
+    assert_eq!(request.target.as_deref(), Some("install"));
+
+    // Two profiles or two targets are rejected rather than one silently
+    // dropped.
+    assert!(parse_local_command("/build debug release").is_none());
+    assert!(parse_local_command("/build docs install").is_none());
 }
 
 #[test]

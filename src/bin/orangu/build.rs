@@ -51,34 +51,96 @@ impl BuildProfile {
     }
 }
 
+/// The full `/build` request: the optimization profile plus an optional
+/// build target, each backend mapping the target to its own native concept —
+/// a Makefile rule for the make-driven backends, `--bin` for cargo, a goal
+/// for Maven, a package path for Go (see [`build_output`]).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct BuildRequest {
+    pub profile: BuildProfile,
+    pub target: Option<String>,
+}
+
+impl BuildRequest {
+    /// Parse the argument of `/build [debug|release] [<target>]`. The profile
+    /// keyword and the target may come in either order (`/build docs release`
+    /// works too); the profile defaults to `Release` when absent. Rejected
+    /// (`None`) when two profiles or two targets are given, so `/build debug
+    /// release` or `/build docs install` doesn't silently drop one.
+    pub fn parse(arg: &str) -> Option<Self> {
+        let mut profile: Option<BuildProfile> = None;
+        let mut target: Option<String> = None;
+        for token in arg.split_whitespace() {
+            // `split_whitespace` never yields an empty token, so this only
+            // matches the literal profile keywords.
+            if let Some(parsed) = BuildProfile::parse(token) {
+                if profile.replace(parsed).is_some() {
+                    return None;
+                }
+            } else if target.replace(token.to_string()).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            profile: profile.unwrap_or_default(),
+            target,
+        })
+    }
+}
+
+/// Run the workspace's build, streaming each output line through `sink`. An
+/// optional `target` narrows the build to one backend-native target:
+///
+/// - cargo: a binary name (`cargo build --bin <target>`, tests scoped the
+///   same way)
+/// - CMake, Autotools, plain Makefile: a Makefile rule (`make <target>`)
+/// - Meson: a compile target (`meson compile <target>`)
+/// - Maven: a lifecycle phase or goal, replacing the default `package`
+/// - Go: a package path, replacing the default `./...`
+/// - Python: rejected — `pip install -e .` has no target concept
 pub fn build_output(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
     if workspace.join("Cargo.toml").exists() {
-        rust_build(workspace, profile, compile_workers, sink)
+        rust_build(workspace, profile, target, compile_workers, sink)
     } else if workspace.join("CMakeLists.txt").exists() {
-        cmake_build(workspace, profile, compile_workers, sink)
+        cmake_build(workspace, profile, target, compile_workers, sink)
     } else if workspace.join("configure").exists() {
-        autotools_build(workspace, profile, compile_workers, sink)
+        autotools_build(workspace, profile, target, compile_workers, sink)
     } else if workspace.join("meson.build").exists() {
-        meson_build(workspace, profile, compile_workers, sink)
+        meson_build(workspace, profile, target, compile_workers, sink)
     } else if workspace.join("pom.xml").exists() {
-        java_build(workspace, profile, sink)
+        java_build(workspace, profile, target, sink)
     } else if workspace.join("pyproject.toml").exists()
         || workspace.join("setup.py").exists()
         || workspace.join("setup.cfg").exists()
     {
-        python_build(workspace, profile, sink)
+        python_build(workspace, profile, target, sink)
     } else if workspace.join("go.mod").exists() {
-        go_build(workspace, profile, compile_workers, sink)
+        go_build(workspace, profile, target, compile_workers, sink)
+    } else if makefile_path(workspace).is_some() {
+        makefile_build(workspace, target, compile_workers, sink)
     } else {
         Err(anyhow!(
-            "no supported project found (expected Cargo.toml, CMakeLists.txt, configure, meson.build, pom.xml, pyproject.toml, setup.py, setup.cfg, or go.mod)"
+            "no supported project found (expected Cargo.toml, CMakeLists.txt, configure, meson.build, pom.xml, pyproject.toml, setup.py, setup.cfg, go.mod, or a Makefile)"
         ))
     }
+}
+
+/// The workspace's plain Makefile, if any — checked in GNU make's own lookup
+/// order (`GNUmakefile`, `makefile`, `Makefile`). Only consulted as the last
+/// resort in [`build_output`]: every managed build system above (CMake,
+/// Autotools, Meson) generates or ships its own Makefile, so a bare one only
+/// drives the build when nothing else claims the workspace.
+pub fn makefile_path(workspace: &Path) -> Option<std::path::PathBuf> {
+    ["GNUmakefile", "makefile", "Makefile"]
+        .iter()
+        .map(|name| workspace.join(name))
+        .find(|path| path.is_file())
 }
 
 fn make_cmd(program: &str, args: &[&str], cwd: &Path) -> Command {
@@ -163,6 +225,7 @@ impl<'a> BuildSteps<'a> {
 fn rust_build(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
@@ -174,11 +237,18 @@ fn rust_build(
         BuildProfile::Debug => &[],
         BuildProfile::Release => &["--release"],
     };
+    // A target names one binary: both the build and its tests are scoped to
+    // it (`--bin <target>`), leaving the rest of the workspace untouched.
+    let bin_flags: Vec<&str> = match target {
+        Some(target) => vec!["--bin", target],
+        None => Vec::new(),
+    };
     // `0` means unused: omit the flag entirely and let Cargo pick its own
     // (already-parallel) default rather than forcing a job count on it.
     let jobs_arg = (compile_workers > 0).then(|| format!("--jobs={compile_workers}"));
     let mut build_args = vec!["build"];
     build_args.extend_from_slice(release_flag);
+    build_args.extend_from_slice(&bin_flags);
     if let Some(arg) = jobs_arg.as_deref() {
         build_args.push(arg);
     }
@@ -186,6 +256,7 @@ fn rust_build(
 
     let mut test_args = vec!["test"];
     test_args.extend_from_slice(release_flag);
+    test_args.extend_from_slice(&bin_flags);
     if let Some(arg) = jobs_arg.as_deref() {
         test_args.push(arg);
     }
@@ -256,6 +327,7 @@ fn cmake_cached_build_type(build_dir: &Path) -> Option<String> {
 fn cmake_build(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
@@ -286,6 +358,11 @@ fn cmake_build(
     if let Some(arg) = jobs_arg.as_deref() {
         make_args.push(arg);
     }
+    // A target is one of the generated Makefile's rules (CMake emits one per
+    // add_executable/add_library target, plus install and friends).
+    if let Some(target) = target {
+        make_args.push(target);
+    }
     steps.run("make", make_cmd("make", &make_args, &build_dir))?;
 
     Ok(())
@@ -302,6 +379,7 @@ fn cmake_build(
 fn meson_build(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
@@ -335,6 +413,11 @@ fn meson_build(
         compile_args.push("-j");
         compile_args.push(&jobs_arg);
     }
+    // A target is one of Meson's own compile targets (`meson compile
+    // <target>`, e.g. an executable or library name from meson.build).
+    if let Some(target) = target {
+        compile_args.push(target);
+    }
     steps.run("meson compile", make_cmd("meson", &compile_args, workspace))?;
 
     Ok(())
@@ -351,6 +434,7 @@ fn meson_build(
 fn autotools_build(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
@@ -381,12 +465,50 @@ fn autotools_build(
     if let Some(arg) = jobs_arg.as_deref() {
         make_args.push(arg);
     }
+    // A target is a rule in the generated Makefile (`make <target>`).
+    if let Some(target) = target {
+        make_args.push(target);
+    }
     steps.run("make", make_cmd("make", &make_args, workspace))?;
 
     Ok(())
 }
 
-fn java_build(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -> Result<()> {
+/// Plain-Makefile projects — the last-resort backend, only reached when no
+/// managed build system (Cargo, CMake, Autotools, Meson, Maven, Python, Go)
+/// claims the workspace (see [`build_output`]). Runs `make`, optionally with
+/// one rule (`/build <target>` — the `make docs`/`make install` case). Plain
+/// make has no universal debug/release convention, so the profile is
+/// accepted but not mapped to anything.
+fn makefile_build(
+    workspace: &Path,
+    target: Option<&str>,
+    compile_workers: usize,
+    sink: &BuildSink,
+) -> Result<()> {
+    let mut steps = BuildSteps::new(sink);
+    c_format(workspace, &mut steps)?;
+
+    // `0` means unused: run a bare `make`, its own (serial) default.
+    let jobs_arg = (compile_workers > 0).then(|| format!("-j{compile_workers}"));
+    let mut make_args: Vec<&str> = Vec::new();
+    if let Some(arg) = jobs_arg.as_deref() {
+        make_args.push(arg);
+    }
+    if let Some(target) = target {
+        make_args.push(target);
+    }
+    steps.run("make", make_cmd("make", &make_args, workspace))?;
+
+    Ok(())
+}
+
+fn java_build(
+    workspace: &Path,
+    profile: BuildProfile,
+    target: Option<&str>,
+    sink: &BuildSink,
+) -> Result<()> {
     let mut steps = BuildSteps::new(sink);
 
     let frontend_dir = workspace.join("src").join("frontend");
@@ -432,12 +554,15 @@ fn java_build(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -> Resu
 
     // Maven has no built-in debug/release axis, so this maps onto its own
     // profile activation: release packaging is expected to be defined as a
-    // Maven profile named "release" in the project's pom.xml.
+    // Maven profile named "release" in the project's pom.xml. A target is a
+    // Maven lifecycle phase or goal, replacing the default `package` (e.g.
+    // `/build verify` runs `mvn verify`).
+    let goal = target.unwrap_or("package");
     let mvn_args: &[&str] = match profile {
-        BuildProfile::Debug => &["package"],
-        BuildProfile::Release => &["-P", "release", "package"],
+        BuildProfile::Debug => &[goal],
+        BuildProfile::Release => &["-P", "release", goal],
     };
-    steps.run("mvn package", make_cmd("mvn", mvn_args, workspace))?;
+    steps.run(&format!("mvn {goal}"), make_cmd("mvn", mvn_args, workspace))?;
 
     Ok(())
 }
@@ -447,8 +572,19 @@ fn java_build(workspace: &Path, profile: BuildProfile, sink: &BuildSink) -> Resu
 /// initial install and picking up subsequent source changes, so it is the
 /// whole build step; unlike the compiled backends there is no separate
 /// debug/release artifact, so `profile` is accepted for signature parity with
-/// `build_output`'s other branches but otherwise unused.
-fn python_build(workspace: &Path, _profile: BuildProfile, sink: &BuildSink) -> Result<()> {
+/// `build_output`'s other branches but otherwise unused. There's no target
+/// concept either, so a requested one is rejected rather than ignored.
+fn python_build(
+    workspace: &Path,
+    _profile: BuildProfile,
+    target: Option<&str>,
+    sink: &BuildSink,
+) -> Result<()> {
+    if let Some(target) = target {
+        return Err(anyhow!(
+            "build targets are not supported for Python projects (got '{target}'); pip install -e . is the whole build"
+        ));
+    }
     let mut steps = BuildSteps::new(sink);
     steps.run(
         "pip install -e .",
@@ -461,9 +597,12 @@ fn python_build(workspace: &Path, _profile: BuildProfile, sink: &BuildSink) -> R
 /// debug/release artifact; debug instead disables optimizations and inlining
 /// (`-gcflags=all=-N -l`), mirroring the C backends' `-O0` so a debugger (e.g.
 /// delve) can step through unoptimized code. Release passes no extra flags.
+/// A target is a package path (e.g. `./cmd/server`), replacing the default
+/// whole-module `./...`.
 fn go_build(
     workspace: &Path,
     profile: BuildProfile,
+    target: Option<&str>,
     compile_workers: usize,
     sink: &BuildSink,
 ) -> Result<()> {
@@ -484,10 +623,102 @@ fn go_build(
     if let Some(arg) = jobs_arg.as_deref() {
         args.push(arg);
     }
-    args.push("./...");
+    args.push(target.unwrap_or("./..."));
     steps.run("go build", make_cmd("go", &args, workspace))?;
 
     Ok(())
+}
+
+/// The build targets Tab completion offers for `/build` in this workspace:
+/// cargo binary names for a Cargo project, Makefile rule names for anything
+/// driven by a checked-in Makefile (plain make, and Autotools projects whose
+/// generated Makefile is present). Best-effort and possibly empty — an
+/// unlisted target can still be typed by hand.
+pub fn completion_targets(workspace: &Path) -> Vec<String> {
+    let mut targets = Vec::new();
+    if workspace.join("Cargo.toml").exists() {
+        targets.extend(cargo_bin_names(workspace));
+    } else if let Some(makefile) = makefile_path(workspace)
+        && let Ok(content) = std::fs::read_to_string(&makefile)
+    {
+        targets.extend(makefile_rule_names(&content));
+    }
+    targets
+}
+
+/// The rule names defined in a Makefile's `content`, in order of appearance:
+/// lines starting a rule (`name:` at column 0), skipping recipes (tab
+/// indented), variable assignments (`:=`), pattern rules (`%`), and the
+/// special dot rules (`.PHONY` and friends).
+pub fn makefile_rule_names(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in content.lines() {
+        if line.starts_with(['\t', ' ', '#', '.']) {
+            continue;
+        }
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        // `:=`, `::=` and `?=`-style lines are assignments, not rules.
+        if line[colon..].starts_with(":=") || line[colon..].starts_with("::=") {
+            continue;
+        }
+        // One line can declare several targets (`a b: deps`).
+        for name in line[..colon].split_whitespace() {
+            if !name.is_empty()
+                && !name.contains(['%', '$', '='])
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The workspace's cargo binary names: `[[bin]] name = "..."` entries in
+/// Cargo.toml, plus the auto-discovered `src/bin/<name>.rs` files and
+/// `src/bin/<name>/main.rs` directories.
+fn cargo_bin_names(workspace: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(manifest) = std::fs::read_to_string(workspace.join("Cargo.toml")) {
+        let mut in_bin_section = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_bin_section = trimmed == "[[bin]]";
+                continue;
+            }
+            if in_bin_section
+                && let Some(rest) = trimmed.strip_prefix("name")
+                && let Some(value) = rest.trim_start().strip_prefix('=')
+            {
+                let name = value.trim().trim_matches('"');
+                if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(workspace.join("src").join("bin")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = if path.is_dir() && path.join("main.rs").is_file() {
+                path.file_name().map(|n| n.to_string_lossy().into_owned())
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                path.file_stem().map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            if let Some(name) = name
+                && !names.iter().any(|existing| existing == &name)
+            {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 fn is_newer(a: &Path, b: &Path) -> bool {
@@ -550,5 +781,110 @@ mod tests {
     #[test]
     fn build_profile_parse_rejects_unknown_input() {
         assert_eq!(BuildProfile::parse("nightly"), None);
+    }
+
+    #[test]
+    fn build_request_parse_takes_profile_and_target_in_either_order() {
+        use super::BuildRequest;
+
+        assert_eq!(
+            BuildRequest::parse(""),
+            Some(BuildRequest {
+                profile: BuildProfile::Release,
+                target: None
+            })
+        );
+        assert_eq!(
+            BuildRequest::parse("debug"),
+            Some(BuildRequest {
+                profile: BuildProfile::Debug,
+                target: None
+            })
+        );
+        assert_eq!(
+            BuildRequest::parse("docs"),
+            Some(BuildRequest {
+                profile: BuildProfile::Release,
+                target: Some("docs".to_string())
+            })
+        );
+        assert_eq!(
+            BuildRequest::parse("debug docs"),
+            BuildRequest::parse("docs debug"),
+        );
+        // Two profiles or two targets are rejected.
+        assert_eq!(BuildRequest::parse("debug release"), None);
+        assert_eq!(BuildRequest::parse("docs install"), None);
+    }
+
+    #[test]
+    fn makefile_rule_names_skips_recipes_assignments_and_pattern_rules() {
+        let content = "\
+CC := gcc
+VERSION ?= 1.0
+.PHONY: all clean
+all: build docs
+\tmake -C src
+%.o: %.c
+\t$(CC) -c $<
+clean install:
+\trm -rf build
+$(GENERATED): deps
+";
+        assert_eq!(
+            super::makefile_rule_names(content),
+            vec!["all", "clean", "install"]
+        );
+    }
+
+    #[test]
+    fn makefile_path_prefers_gnu_make_lookup_order() {
+        // Compared case-insensitively: on a case-insensitive filesystem
+        // (Windows, default macOS) the `makefile` probe matches a checked-in
+        // `Makefile`, so the reported casing follows the probe, not the file.
+        let name_of = |path: Option<std::path::PathBuf>| {
+            path.and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        assert_eq!(super::makefile_path(dir.path()), None);
+        std::fs::write(dir.path().join("Makefile"), "all:\n").expect("write");
+        assert_eq!(
+            name_of(super::makefile_path(dir.path())),
+            Some("makefile".to_string())
+        );
+        std::fs::write(dir.path().join("GNUmakefile"), "all:\n").expect("write");
+        assert_eq!(
+            name_of(super::makefile_path(dir.path())),
+            Some("gnumakefile".to_string())
+        );
+    }
+
+    #[test]
+    fn completion_targets_reads_cargo_bins_and_makefile_rules() {
+        // A cargo workspace: [[bin]] names plus src/bin entries.
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n\n[[bin]]\nname = \"demo-cli\"\npath = \"src/main.rs\"\n",
+        )
+        .expect("manifest");
+        let bin_dir = dir.path().join("src").join("bin");
+        std::fs::create_dir_all(bin_dir.join("helper")).expect("bin dir");
+        std::fs::write(bin_dir.join("tool.rs"), "fn main() {}\n").expect("bin file");
+        std::fs::write(bin_dir.join("helper").join("main.rs"), "fn main() {}\n")
+            .expect("bin dir main");
+        assert_eq!(
+            super::completion_targets(dir.path()),
+            vec!["demo-cli", "helper", "tool"]
+        );
+
+        // A plain-Makefile workspace: the rule names.
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "all: docs\n\ttrue\ndocs:\n\ttrue\n",
+        )
+        .expect("makefile");
+        assert_eq!(super::completion_targets(dir.path()), vec!["all", "docs"]);
     }
 }

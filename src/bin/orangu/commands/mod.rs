@@ -505,9 +505,10 @@ pub enum LocalCommand<'a> {
     /// `/schedule`: list the cron-style scheduled jobs from
     /// `~/.orangu/schedule` with their next run times.
     Schedule,
-    /// `/build [debug|release]`: build the workspace project. Defaults to
-    /// `release`.
-    Build(crate::build::BuildProfile),
+    /// `/build [debug|release] [<target>]`: build the workspace project,
+    /// optionally narrowed to one backend-native target (a Makefile rule, a
+    /// cargo binary, a Maven goal, ...). The profile defaults to `release`.
+    Build(crate::build::BuildRequest),
     /// `/shell <command>`: run a shell command in the workspace, streaming its
     /// output. `None` is a usage error (the command line is required).
     Shell(Option<Cow<'a, str>>),

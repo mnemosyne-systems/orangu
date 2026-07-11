@@ -1079,10 +1079,18 @@ pub(crate) fn handle_command(
         LocalCommand::Schedule => Ok(CommandOutcome::Output(
             crate::schedule::format_schedule_list(),
         )),
-        LocalCommand::Build(profile) => {
+        LocalCommand::Build(request) => {
             let ws = workspace.to_path_buf();
             Ok(CommandOutcome::Streaming(
-                Box::new(move |sink| build::build_output(&ws, profile, compile_workers, &sink)),
+                Box::new(move |sink| {
+                    build::build_output(
+                        &ws,
+                        request.profile,
+                        request.target.as_deref(),
+                        compile_workers,
+                        &sink,
+                    )
+                }),
                 None,
             ))
         }

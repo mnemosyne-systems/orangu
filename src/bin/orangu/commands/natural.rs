@@ -406,13 +406,19 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::Information);
     }
     if matches_ci(input, &["build debug", "debug build"]) {
-        return Some(LocalCommand::Build(crate::build::BuildProfile::Debug));
+        return Some(LocalCommand::Build(crate::build::BuildRequest {
+            profile: crate::build::BuildProfile::Debug,
+            target: None,
+        }));
     }
     if matches_ci(input, &["build release", "release build"]) {
-        return Some(LocalCommand::Build(crate::build::BuildProfile::Release));
+        return Some(LocalCommand::Build(crate::build::BuildRequest {
+            profile: crate::build::BuildProfile::Release,
+            target: None,
+        }));
     }
     if matches_ci(input, &["build", "build project", "run build"]) {
-        return Some(LocalCommand::Build(crate::build::BuildProfile::default()));
+        return Some(LocalCommand::Build(crate::build::BuildRequest::default()));
     }
     if matches_ci(input, &["diff", "show diff", "git diff"]) {
         return Some(LocalCommand::Diff(None));

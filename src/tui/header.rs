@@ -184,7 +184,7 @@ pub fn help_text() -> &'static str {
 /list_files                                     List workspace files as a tree
 /open_file <path>                               Open a workspace file in $EDITOR
 /show_file [--hash] [--author] <path> [<ref>]   Show a file; optional ref uses git show
-/build [debug|release]                          Build the project (default: release)
+/build [debug|release] [<target>]               Build the project (default: release), optionally one target (a Makefile rule, cargo binary, Maven goal, ...; Tab completes discovered targets)
 /shell <command>                                Run a shell command in the workspace, streaming its output (Tab completes workspace files one path segment at a time)
 /export [console|review|auto review|duplicates|pr|statistics] Export the output window (console), the last review report (review), the last auto-review report (auto review), a fresh duplicate-code report (duplicates), open pull requests (pr), or persistent activity history (statistics) to a PDF in the workspace root
 /duplicates [<threshold>]                       Scan source functions (Rust, C/C++, Go, Python, JS/TS, and ~20 more languages) for duplicates; on a non-default branch only the functions it adds/changes are compared against the project; optional threshold is a percentage (default 80%)
