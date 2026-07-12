@@ -49,6 +49,16 @@ impl BuildProfile {
             _ => None,
         }
     }
+
+    /// The lowercase keyword for this profile (`"debug"` / `"release"`), the
+    /// inverse of [`parse`](Self::parse) and the form persisted in the build
+    /// fingerprint.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
 }
 
 /// The full `/build` request: the optimization profile plus an optional
@@ -297,6 +307,121 @@ fn clean_stale_autotools_build(workspace: &Path, steps: &mut BuildSteps) -> Resu
     Ok(())
 }
 
+/// The set of source files git knows about in `workspace`, sorted — both the
+/// tracked files and the untracked-but-not-ignored ones, so a freshly added
+/// file counts even before it is committed while gitignored build artifacts
+/// never do. This is the add/remove signal for [`build_environment_reusable`]:
+/// deliberately just the file *set*, not their contents, since editing a file
+/// that already exists is what `make` already rebuilds incrementally, whereas
+/// adding or removing one is what leaves the generated build files stale.
+///
+/// `None` when the workspace is not a git repository or git cannot be run,
+/// which the caller treats as "not sure" and so regenerates from scratch.
+fn workspace_source_files(workspace: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut files: Vec<String> = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect();
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+/// Where the recorded build-environment fingerprint for `key` (a backend name)
+/// lives: under orangu's per-workspace cache, never in the source tree, so it
+/// can never be committed and is shared across every session on the workspace.
+fn build_state_path(workspace: &Path, key: &str) -> std::path::PathBuf {
+    orangu::workspace_cache::workspace_cache_dir(workspace, "build").join(format!("{key}.files"))
+}
+
+/// Serialize a recorded fingerprint: the profile keyword on the first line,
+/// then one file path per line (the caller passes them already sorted).
+fn encode_build_state(profile: BuildProfile, files: &[String]) -> String {
+    std::iter::once(profile.keyword().to_string())
+        .chain(files.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse a recorded fingerprint written by [`encode_build_state`]. `None` when
+/// it is empty or its first line is not a valid profile keyword.
+fn decode_build_state(content: &str) -> Option<(BuildProfile, Vec<String>)> {
+    let mut lines = content.lines();
+    let profile = match lines.next()? {
+        "debug" => BuildProfile::Debug,
+        "release" => BuildProfile::Release,
+        _ => return None,
+    };
+    let files = lines.map(|line| line.to_string()).collect();
+    Some((profile, files))
+}
+
+/// Whether a recorded fingerprint still describes the current build: the
+/// profile matches and the source-file set is identical (nothing added or
+/// removed). This is the pure heart of [`build_environment_reusable`].
+fn environment_matches(
+    current: &[String],
+    recorded: &(BuildProfile, Vec<String>),
+    profile: BuildProfile,
+) -> bool {
+    recorded.0 == profile && recorded.1 == current
+}
+
+/// The profile and source-file set last recorded for `key`, or `None` when
+/// nothing has been recorded yet (or the record is unreadable).
+fn read_build_state(workspace: &Path, key: &str) -> Option<(BuildProfile, Vec<String>)> {
+    let content = std::fs::read_to_string(build_state_path(workspace, key)).ok()?;
+    decode_build_state(&content)
+}
+
+/// Record the profile and current source-file set for `key`, so the next
+/// build can tell whether the environment still matches. Best-effort: a
+/// failure to write just means the next build regenerates, which is safe.
+fn record_build_environment(workspace: &Path, key: &str, profile: BuildProfile) {
+    let Some(files) = workspace_source_files(workspace) else {
+        return;
+    };
+    let path = build_state_path(workspace, key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, encode_build_state(profile, &files));
+}
+
+/// Whether the last-generated build environment for `key` can be reused as-is
+/// rather than regenerated. True only when all of these hold: git could list
+/// the source files, a fingerprint was recorded before, the recorded profile
+/// matches the requested one, and the source-file set is unchanged (nothing
+/// added or removed). Every uncertain case — no git, no record, a changed set
+/// — returns false, so the caller starts over. That is the deliberately
+/// conservative default for issue #171: never reuse a possibly-stale
+/// environment, and refine the "unchanged" test over time.
+fn build_environment_reusable(workspace: &Path, key: &str, profile: BuildProfile) -> bool {
+    let Some(current) = workspace_source_files(workspace) else {
+        return false;
+    };
+    match read_build_state(workspace, key) {
+        Some(recorded) => environment_matches(&current, &recorded, profile),
+        None => false,
+    }
+}
+
 /// The `CMAKE_BUILD_TYPE` an existing `build/` directory was last configured
 /// with, read straight out of its `CMakeCache.txt` (`CMAKE_BUILD_TYPE:STRING=
 /// Debug`, one `key:type=value` entry per line). `None` when the directory
@@ -321,9 +446,10 @@ fn cmake_cached_build_type(build_dir: &Path) -> Option<String> {
 /// so — unlike Meson, which refuses to change a configured directory's build
 /// type without its own `configure` subcommand — a plain `cmake ..
 /// -DCMAKE_BUILD_TYPE=...` handles both the first configure and any later
-/// profile switch. It only reruns when the cached build type differs from
-/// the requested one, so repeat `/build`s in the same profile skip straight
-/// to `make`.
+/// profile switch. It only reruns when the cached build type differs from the
+/// requested one, or when the source-file set changed (a file added or
+/// removed, which the generated Makefiles would otherwise miss), so repeat
+/// `/build`s in the same profile with the same files skip straight to `make`.
 fn cmake_build(
     workspace: &Path,
     profile: BuildProfile,
@@ -344,12 +470,18 @@ fn cmake_build(
             .with_context(|| format!("failed to create {}", build_dir.display()))?;
     }
 
-    if cmake_cached_build_type(&build_dir).as_deref() != Some(build_type) {
+    // Reconfigure when the cached build type does not match the request, or
+    // when the source-file set changed (a file added or removed, which the
+    // existing generated Makefiles would not pick up). A repeat build in the
+    // same profile with the same files skips straight to `make`.
+    let profile_matches = cmake_cached_build_type(&build_dir).as_deref() == Some(build_type);
+    if !profile_matches || !build_environment_reusable(workspace, "cmake", profile) {
         let build_type_arg = format!("-DCMAKE_BUILD_TYPE={build_type}");
         steps.run(
             "cmake",
             make_cmd("cmake", &["..", build_type_arg.as_str()], &build_dir),
         )?;
+        record_build_environment(workspace, "cmake", profile);
     }
 
     // `0` means unused: run a bare `make`, its own (serial) default.
@@ -373,9 +505,10 @@ fn cmake_build(
 /// PostgreSQL mid-migration). Meson cannot build in place — it refuses to let
 /// the build directory equal the source directory — so it gets a single
 /// reused `build/` directory (Meson's own convention) rather than one per
-/// profile; switching profiles reconfigures that same directory with `meson
-/// configure`, which is a cheap no-op when the profile is unchanged and
-/// triggers the right incremental rebuild when it isn't.
+/// profile. After the first setup it is only regenerated (`meson setup
+/// --reconfigure`, which re-reads meson.build and applies the build type)
+/// when the profile or the source-file set changed; an otherwise-unchanged
+/// repeat build skips straight to `meson compile`.
 fn meson_build(
     workspace: &Path,
     profile: BuildProfile,
@@ -393,16 +526,28 @@ fn meson_build(
     };
     let buildtype_arg = format!("--buildtype={buildtype}");
 
+    // First configure sets the directory up; afterwards it is only regenerated
+    // when the profile or the source-file set changed. A repeat build in the
+    // same profile with the same files skips straight to `meson compile`
+    // (previously it re-ran `meson configure` every time). `meson setup
+    // --reconfigure` re-reads meson.build so an added or removed file is picked
+    // up, and applies the requested build type in the same call.
     if !workspace.join("build").join("build.ninja").exists() {
         steps.run(
             "meson setup",
             make_cmd("meson", &["setup", "build", &buildtype_arg], workspace),
         )?;
-    } else {
+        record_build_environment(workspace, "meson", profile);
+    } else if !build_environment_reusable(workspace, "meson", profile) {
         steps.run(
-            "meson configure",
-            make_cmd("meson", &["configure", "build", &buildtype_arg], workspace),
+            "meson setup",
+            make_cmd(
+                "meson",
+                &["setup", "build", "--reconfigure", &buildtype_arg],
+                workspace,
+            ),
         )?;
+        record_build_environment(workspace, "meson", profile);
     }
 
     // `0` means unused: omit `-j` and let `meson compile` fall back to its
@@ -428,9 +573,15 @@ fn meson_build(
 /// autotools has no separate build-type flag, and an out-of-tree VPATH build
 /// does not mix safely with an in-tree one (GNU Make's VPATH search can pick
 /// up stale headers/objects from whichever configuration is lying around,
-/// producing confusing failures unrelated to the actual code). So instead of
-/// building alongside any existing configuration, wipe it with `make
-/// distclean` first, then reconfigure from scratch for the requested profile.
+/// producing confusing failures unrelated to the actual code). So when the
+/// configuration has to change, any existing one is wiped with `make
+/// distclean` first, then reconfigured from scratch for the requested profile.
+///
+/// That wipe-and-reconfigure only happens when it is actually needed: a repeat
+/// build in the same profile with the same source-file set skips straight to
+/// an incremental `make` (see [`build_environment_reusable`]) rather than
+/// throwing away every object file every time. A profile switch, or a file
+/// added or removed, forces the full clean and reconfigure.
 fn autotools_build(
     workspace: &Path,
     profile: BuildProfile,
@@ -440,24 +591,32 @@ fn autotools_build(
 ) -> Result<()> {
     let mut steps = BuildSteps::new(sink);
     c_format(workspace, &mut steps)?;
-    clean_stale_autotools_build(workspace, &mut steps)?;
 
-    let opt_flags = match profile {
-        BuildProfile::Debug => "-g -O0",
-        BuildProfile::Release => "-O2",
-    };
-    let cflags_arg = format!("CFLAGS={opt_flags}");
-    let cxxflags_arg = format!("CXXFLAGS={opt_flags}");
-    // Invoked via `sh` rather than executed directly so a missing executable
-    // bit on the checked-in script doesn't matter.
-    steps.run(
-        "configure",
-        make_cmd(
-            "sh",
-            &["./configure", &cflags_arg, &cxxflags_arg],
-            workspace,
-        ),
-    )?;
+    // Only reconfigure when there is no reusable configuration in place. An
+    // existing config with the same profile and file set goes straight to the
+    // incremental `make` below.
+    let configured = workspace.join("config.status").exists();
+    if !configured || !build_environment_reusable(workspace, "autotools", profile) {
+        clean_stale_autotools_build(workspace, &mut steps)?;
+
+        let opt_flags = match profile {
+            BuildProfile::Debug => "-g -O0",
+            BuildProfile::Release => "-O2",
+        };
+        let cflags_arg = format!("CFLAGS={opt_flags}");
+        let cxxflags_arg = format!("CXXFLAGS={opt_flags}");
+        // Invoked via `sh` rather than executed directly so a missing
+        // executable bit on the checked-in script doesn't matter.
+        steps.run(
+            "configure",
+            make_cmd(
+                "sh",
+                &["./configure", &cflags_arg, &cxxflags_arg],
+                workspace,
+            ),
+        )?;
+        record_build_environment(workspace, "autotools", profile);
+    }
 
     // `0` means unused: run a bare `make`, its own (serial) default.
     let jobs_arg = (compile_workers > 0).then(|| format!("-j{compile_workers}"));
@@ -759,6 +918,97 @@ mod tests {
     fn cmake_cached_build_type_is_none_without_a_cache() {
         let build_dir = tempfile::tempdir().expect("build dir");
         assert_eq!(cmake_cached_build_type(build_dir.path()), None);
+    }
+
+    #[test]
+    fn build_state_round_trips_through_encode_decode() {
+        use super::{decode_build_state, encode_build_state};
+
+        let files = vec!["a.c".to_string(), "src/b.c".to_string()];
+        let encoded = encode_build_state(BuildProfile::Debug, &files);
+        assert_eq!(
+            decode_build_state(&encoded),
+            Some((BuildProfile::Debug, files))
+        );
+
+        // A profile with no files still round-trips.
+        assert_eq!(
+            decode_build_state(&encode_build_state(BuildProfile::Release, &[])),
+            Some((BuildProfile::Release, Vec::new()))
+        );
+
+        // Garbage (empty, or an unknown first line) is unreadable, not a panic.
+        assert_eq!(decode_build_state(""), None);
+        assert_eq!(decode_build_state("nightly\na.c"), None);
+    }
+
+    #[test]
+    fn environment_matches_only_on_same_profile_and_file_set() {
+        use super::environment_matches;
+
+        let recorded = (
+            BuildProfile::Release,
+            vec!["a.c".to_string(), "b.c".to_string()],
+        );
+        let current = vec!["a.c".to_string(), "b.c".to_string()];
+
+        // Same profile, same files: reusable.
+        assert!(environment_matches(
+            &current,
+            &recorded,
+            BuildProfile::Release
+        ));
+        // Different profile: not reusable.
+        assert!(!environment_matches(
+            &current,
+            &recorded,
+            BuildProfile::Debug
+        ));
+        // A file added: not reusable.
+        let added = vec!["a.c".to_string(), "b.c".to_string(), "c.c".to_string()];
+        assert!(!environment_matches(
+            &added,
+            &recorded,
+            BuildProfile::Release
+        ));
+        // A file removed: not reusable.
+        let removed = vec!["a.c".to_string()];
+        assert!(!environment_matches(
+            &removed,
+            &recorded,
+            BuildProfile::Release
+        ));
+    }
+
+    #[test]
+    fn workspace_source_files_lists_tracked_and_untracked_but_not_ignored() {
+        use super::workspace_source_files;
+        use std::process::Command;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let dir = workspace.path();
+
+        // A directory with no git repo cannot be fingerprinted, so the caller
+        // falls back to reconfiguring.
+        assert_eq!(workspace_source_files(dir), None);
+
+        let git_init = Command::new("git").args(["init"]).current_dir(dir).status();
+        // Skip on machines without git rather than fail the suite.
+        if !matches!(git_init, Ok(status) if status.success()) {
+            return;
+        }
+
+        std::fs::write(dir.join("a.c"), "int main(){}").expect("a.c");
+        std::fs::write(dir.join("b.c"), "").expect("b.c");
+        std::fs::write(dir.join(".gitignore"), "build/\n").expect("gitignore");
+        std::fs::create_dir(dir.join("build")).expect("build dir");
+        std::fs::write(dir.join("build").join("junk.o"), "").expect("junk");
+
+        let files = workspace_source_files(dir).expect("git listing");
+        // Sorted, includes the untracked-but-not-ignored sources, excludes the
+        // gitignored build output.
+        assert_eq!(files, vec![".gitignore", "a.c", "b.c"]);
+        assert!(!files.iter().any(|f| f.contains("junk.o")), "{files:?}");
     }
 
     #[test]
