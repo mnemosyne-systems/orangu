@@ -322,6 +322,11 @@ mod tests {
             frequency_mhz: 0,
             total_memory_bytes,
             available_memory_bytes: total_memory_bytes,
+            features: system::CpuFeatures {
+                sse4_2: false,
+                avx2: false,
+                avx512f: false,
+            },
         }
     }
 

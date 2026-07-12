@@ -40,6 +40,39 @@ pub struct CpuInfo {
     pub frequency_mhz: u64,
     pub total_memory_bytes: u64,
     pub available_memory_bytes: u64,
+    pub features: CpuFeatures,
+}
+
+/// SIMD instruction sets that llama.cpp's CPU backend probes for at startup
+/// to pick its matmul kernels. Detected via CPUID at run time (not compile
+/// time) so a binary built on one machine reports accurately on whatever
+/// machine it actually runs on — the two can easily differ.
+pub struct CpuFeatures {
+    pub sse4_2: bool,
+    pub avx2: bool,
+    pub avx512f: bool,
+}
+
+/// Runs the actual CPUID checks. Only meaningful on x86/x86_64: the feature
+/// names themselves (`is_x86_feature_detected!`) don't exist on other
+/// architectures, so ARM/RISC-V etc. simply report all three as absent.
+fn detect_cpu_features() -> CpuFeatures {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        CpuFeatures {
+            sse4_2: is_x86_feature_detected!("sse4.2"),
+            avx2: is_x86_feature_detected!("avx2"),
+            avx512f: is_x86_feature_detected!("avx512f"),
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        CpuFeatures {
+            sse4_2: false,
+            avx2: false,
+            avx512f: false,
+        }
+    }
 }
 
 pub struct GpuInfo {
@@ -108,6 +141,7 @@ pub fn detect_cpu() -> CpuInfo {
         frequency_mhz,
         total_memory_bytes: sys.total_memory(),
         available_memory_bytes: sys.available_memory(),
+        features: detect_cpu_features(),
     }
 }
 
@@ -503,6 +537,10 @@ fn windows_memory_kind(name: &str) -> MemoryKind {
     }
 }
 
+fn yes_no(value: bool) -> &'static str {
+    if value { "Yes" } else { "No" }
+}
+
 pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
     let mut out = String::new();
     out.push_str("CPU\n");
@@ -531,6 +569,18 @@ pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
     out.push_str(&format!(
         "  Memory available : {}\n",
         format_bytes(cpu.available_memory_bytes)
+    ));
+    out.push_str(&format!(
+        "  SSE4.2           : {}\n",
+        yes_no(cpu.features.sse4_2)
+    ));
+    out.push_str(&format!(
+        "  AVX2             : {}\n",
+        yes_no(cpu.features.avx2)
+    ));
+    out.push_str(&format!(
+        "  AVX512           : {}\n",
+        yes_no(cpu.features.avx512f)
     ));
 
     out.push_str("\nGPU\n");
