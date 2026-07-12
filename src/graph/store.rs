@@ -304,6 +304,41 @@ impl GraphStore {
         results
     }
 
+    /// Pluribus Predictive Group Vectors: Predicts the most strongly coupled files
+    /// (subsystems) to `file_path` that the LLM is likely to need next.
+    /// Returns a list of predicted file paths, sorted by coupling strength.
+    pub fn predictive_group_vectors(&self, file_path: &str) -> Vec<String> {
+        let mut file_scores: HashMap<String, usize> = HashMap::new();
+
+        for idx in self.graph.node_indices() {
+            if self.graph[idx].source_file == file_path {
+                for edge in self
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                {
+                    let other_file = &self.graph[edge.source()].source_file;
+                    if other_file != file_path {
+                        *file_scores.entry(other_file.clone()).or_insert(0) += 1;
+                    }
+                }
+                for edge in self
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
+                {
+                    let other_file = &self.graph[edge.target()].source_file;
+                    if other_file != file_path {
+                        *file_scores.entry(other_file.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut predictions: Vec<(String, usize)> = file_scores.into_iter().collect();
+        predictions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        predictions.into_iter().map(|(f, _)| f).collect()
+    }
+
     /// Returns all nodes in the graph as a flat list.
     pub fn all_nodes(&self) -> Vec<&GraphNode> {
         self.graph.node_weights().collect()
@@ -592,5 +627,32 @@ mod tests {
 
         // A file with no cross-file neighbours contributes nothing.
         assert!(store.cross_file_context("c.rs").is_empty());
+    }
+
+    #[test]
+    fn predictive_group_vectors_ranks_files_by_coupling_strength() {
+        let mut store = GraphStore::new();
+        store.add_node(make_node_in("a::changed1", "fn", "a.rs"));
+        store.add_node(make_node_in("a::changed2", "fn", "a.rs"));
+
+        store.add_node(make_node_in("b::coupled1", "fn", "b.rs"));
+        store.add_node(make_node_in("b::coupled2", "fn", "b.rs"));
+        store.add_node(make_node_in("b::coupled3", "fn", "b.rs"));
+
+        store.add_node(make_node_in("c::weak_coupled1", "fn", "c.rs"));
+
+        // a.rs has 3 edges with b.rs
+        store.add_edge(make_edge("a::changed1", "b::coupled1", "calls"));
+        store.add_edge(make_edge("a::changed1", "b::coupled2", "calls"));
+        store.add_edge(make_edge("b::coupled3", "a::changed2", "calls"));
+
+        // a.rs has 1 edge with c.rs
+        store.add_edge(make_edge("c::weak_coupled1", "a::changed1", "calls"));
+
+        let predictions = store.predictive_group_vectors("a.rs");
+
+        assert_eq!(predictions.len(), 2);
+        assert_eq!(predictions[0], "b.rs"); // strongest coupling (3 edges)
+        assert_eq!(predictions[1], "c.rs"); // weaker coupling (1 edge)
     }
 }

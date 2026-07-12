@@ -544,6 +544,7 @@ pub struct CommandContext<'a> {
     pub forge: crate::git::Forge,
     pub review_reports: crate::git::ReviewReports<'a>,
     pub skills: &'a orangu::skills::SkillRegistry,
+    pub semantic_budget_tokens: usize,
 }
 
 pub struct CommandState<'a> {

@@ -1242,6 +1242,7 @@ async fn run() -> Result<()> {
                     auto_review: last_auto_review_report.as_deref(),
                 },
                 skills: &skills,
+                semantic_budget_tokens: config.semantic_budget_tokens,
             },
         )?;
         // When `/server` (or `/reload`) selects a server, auto-detect an

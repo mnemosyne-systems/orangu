@@ -44,6 +44,7 @@ pub struct ClientAppConfiguration {
     pub platform: String,
     pub workspaces: WorkspacePlacement,
     pub drop_down: bool,
+    pub semantic_budget_tokens: usize,
 }
 
 impl ClientAppConfiguration {
@@ -211,6 +212,11 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let compile_workers = parse_client_field(&client, "compile_workers", default_compile_workers)?;
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
 
+    let semantic_budget_tokens = client
+        .get("semantic_budget_tokens")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(16384);
+
     // `[orangu].model` is the general default model id; a server section's own
     // `model` takes precedence over it.
     let default_model = client
@@ -251,6 +257,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         auto_squash: parse_feedback_bool(
             client.get("auto_squash").map(String::as_str).unwrap_or(""),
         ),
+        semantic_budget_tokens,
         compile_workers,
         terminal: client.get("terminal").cloned().unwrap_or_default(),
         platform: client.get("platform").cloned().unwrap_or_default(),

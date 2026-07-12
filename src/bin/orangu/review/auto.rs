@@ -1504,16 +1504,34 @@ pub(crate) fn auto_review_graph_context(
     let guard = graph_store.lock().ok()?;
     let store = guard.as_ref()?;
     let results = store.cross_file_context(&graph_path);
-    if results.is_empty() {
+
+    let mut out = String::new();
+    if !results.is_empty() {
+        out.push_str(
+            &results
+                .iter()
+                .map(|result| result.format())
+                .collect::<Vec<_>>()
+                .join("\n---\n"),
+        );
+    }
+
+    let predictions = store.predictive_group_vectors(&graph_path);
+    if !predictions.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n---\n");
+        }
+        out.push_str("Highly Coupled Subsystems (Predictive Group Vectors):\n");
+        out.push_str("These files are strongly related to the current file and may be relevant for cross-file consistency:\n");
+        for (i, p) in predictions.iter().take(3).enumerate() {
+            out.push_str(&format!("{}. {}\n", i + 1, p));
+        }
+    }
+
+    if out.is_empty() {
         return None;
     }
-    Some(
-        results
-            .iter()
-            .map(|result| result.format())
-            .collect::<Vec<_>>()
-            .join("\n---\n"),
-    )
+    Some(out)
 }
 
 /// The whole content of `path` (the reviewed, i.e. new, version), read from

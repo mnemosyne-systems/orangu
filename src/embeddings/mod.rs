@@ -28,12 +28,14 @@
 pub mod chunk;
 pub mod client;
 pub mod index;
+pub mod sketch;
 
 use crate::config::LlmConfiguration;
 use crate::llm::normalized_openai_endpoint;
 
 pub use client::EmbeddingClient;
 pub use index::{EmbeddedChunk, EmbeddingIndex, SearchHit};
+pub use sketch::{EllipsoidSketch, SketchMatch};
 
 /// Probe a server's `/v1/embeddings` endpoint with a trivial request. `Ok(())`
 /// means it responded successfully and semantic `/search` can be enabled;
