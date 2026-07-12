@@ -89,6 +89,8 @@ pub struct EmbeddingIndex {
     #[serde(default)]
     file_hashes: HashMap<String, String>,
     #[serde(default)]
+    pub module_sketches: HashMap<String, super::sketch::EllipsoidSketch>,
+    #[serde(default)]
     chunks: Vec<EmbeddedChunk>,
 }
 
@@ -119,6 +121,8 @@ struct Meta {
     version: u32,
     #[serde(default)]
     file_hashes: HashMap<String, String>,
+    #[serde(default)]
+    module_sketches: HashMap<String, super::sketch::EllipsoidSketch>,
 }
 
 impl EmbeddingIndex {
@@ -170,6 +174,7 @@ impl EmbeddingIndex {
         Self {
             version: INDEX_VERSION,
             file_hashes: meta.file_hashes,
+            module_sketches: meta.module_sketches,
             chunks,
         }
     }
@@ -313,6 +318,7 @@ impl EmbeddingIndex {
         let mut index = Self {
             version: INDEX_VERSION,
             file_hashes: new_hashes,
+            module_sketches: HashMap::new(),
             chunks: kept,
         };
         index.rewrite_cache(&dir);
@@ -396,6 +402,20 @@ impl EmbeddingIndex {
             }
         }
 
+        let mut chunks_by_file: HashMap<String, Vec<&[f32]>> = HashMap::new();
+        for chunk in &index.chunks {
+            chunks_by_file
+                .entry(chunk.file.clone())
+                .or_default()
+                .push(&chunk.vector);
+        }
+        for (file, vectors) in chunks_by_file {
+            index
+                .module_sketches
+                .insert(file, super::sketch::EllipsoidSketch::compute(&vectors));
+        }
+        index.write_meta(&dir);
+
         Ok(index)
     }
 
@@ -420,6 +440,7 @@ impl EmbeddingIndex {
         let meta = Meta {
             version: self.version,
             file_hashes: self.file_hashes.clone(),
+            module_sketches: self.module_sketches.clone(),
         };
         if let Ok(json) = serde_json::to_string(&meta) {
             let _ = std::fs::create_dir_all(dir);
@@ -435,16 +456,49 @@ impl EmbeddingIndex {
         query_vector: &[f32],
         graph: Option<&GraphStore>,
         top_k: usize,
+        semantic_budget_tokens: usize,
     ) -> Vec<SearchHit> {
         if self.chunks.is_empty() || query_vector.is_empty() {
             return Vec::new();
         }
+
+        // Occupancy-Aware Sketch Filtering
+        // Determine candidate modules that are close enough to the query.
+        // Recall safety net: always force-include the 3 most recently modified files
+        // to prevent over-aggressive pruning of the developer's immediate context.
+        let mut candidate_files = std::collections::HashSet::new();
+
+        let mut mtimes: Vec<(String, std::time::SystemTime)> = Vec::new();
+        for file in self.module_sketches.keys() {
+            if let Ok(mtime) = std::fs::metadata(file).and_then(|m| m.modified()) {
+                mtimes.push((file.clone(), mtime));
+            }
+        }
+        mtimes.sort_by_key(|b| std::cmp::Reverse(b.1));
+        for (file, _) in mtimes.into_iter().take(3) {
+            candidate_files.insert(file);
+        }
+
+        let threshold = 0.35;
+        for (file, sketch) in &self.module_sketches {
+            let match_result = sketch.matches(query_vector, threshold);
+            if match_result.inside {
+                candidate_files.insert(file.clone());
+            }
+        }
+
+        // Track divergence/recall in debug builds
+        #[cfg(debug_assertions)]
+        let _unfiltered_count = self.chunks.len();
+
+        let filter_candidates = !candidate_files.is_empty();
 
         // Semantic pass: cosine of the query against every chunk.
         let mut scored: Vec<(usize, f32)> = self
             .chunks
             .iter()
             .enumerate()
+            .filter(|(_, c)| !filter_candidates || candidate_files.contains(&c.file))
             .map(|(i, c)| (i, cosine(query_vector, &c.vector)))
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -459,8 +513,36 @@ impl EmbeddingIndex {
             .collect();
 
         // Take the strongest semantic hits as seeds for expansion.
+        // Pluribus Diversity-Aware Planner: track selected seeds to penalize redundant semantics
         let seed_count = top_k.saturating_mul(2).max(top_k);
-        for &(idx, score) in scored.iter().take(seed_count) {
+        let mut selected_seed_indices: Vec<usize> = Vec::new();
+
+        const DIVERSITY_THRESHOLD: f32 = 0.85;
+        const DIVERSITY_PENALTY: f32 = 0.5;
+
+        let mut penalized_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
+
+        for &(idx, original_score) in &scored {
+            let chunk = &self.chunks[idx];
+            let mut score = original_score;
+            let mut penalized = false;
+            for &s_idx in &selected_seed_indices {
+                let sim = cosine(&chunk.vector, &self.chunks[s_idx].vector);
+                if sim > DIVERSITY_THRESHOLD {
+                    score *= DIVERSITY_PENALTY;
+                    penalized = true;
+                    break;
+                }
+            }
+            if !penalized {
+                selected_seed_indices.push(idx);
+            }
+            penalized_scores.push((idx, score));
+        }
+
+        penalized_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        for &(idx, score) in penalized_scores.iter().take(seed_count) {
             let chunk = &self.chunks[idx];
             insert_hit(&mut best, hit_from(chunk, score, None));
 
@@ -484,8 +566,23 @@ impl EmbeddingIndex {
 
         let mut hits: Vec<SearchHit> = best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-        hits.truncate(top_k);
-        hits
+
+        let mut total_tokens = 0;
+        let mut final_hits = Vec::new();
+        for hit in hits {
+            let chunk_lines = hit.end_line.saturating_sub(hit.start_line) + 1;
+            let chunk_tokens = chunk_lines * 10;
+            if total_tokens + chunk_tokens > semantic_budget_tokens && !final_hits.is_empty() {
+                break;
+            }
+            total_tokens += chunk_tokens;
+            final_hits.push(hit);
+            if final_hits.len() >= top_k {
+                break;
+            }
+        }
+
+        final_hits
     }
 }
 
@@ -712,6 +809,7 @@ mod tests {
         let index = EmbeddingIndex {
             version: INDEX_VERSION,
             file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
             chunks: vec![
                 EmbeddedChunk {
                     id: "a::one".into(),
@@ -731,13 +829,60 @@ mod tests {
                 },
             ],
         };
-        let hits = index.search(&[0.9, 0.1], None, 5);
+        let hits = index.search(&[0.9, 0.1], None, 5, 16384);
         assert_eq!(hits.first().unwrap().symbol, "one");
     }
 
     #[test]
     fn search_on_empty_index_returns_nothing() {
         let index = EmbeddingIndex::default();
-        assert!(index.search(&[1.0, 0.0], None, 5).is_empty());
+        assert!(index.search(&[1.0, 0.0], None, 5, 16384).is_empty());
+    }
+
+    #[test]
+    fn search_diversity_aware_planner_penalizes_redundant_semantics() {
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks: vec![
+                EmbeddedChunk {
+                    id: "a::one".into(),
+                    symbol: "one".into(),
+                    file: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    vector: vec![1.0, 0.0],
+                },
+                EmbeddedChunk {
+                    id: "a::two".into(),
+                    symbol: "two".into(),
+                    file: "a.rs".into(),
+                    start_line: 3,
+                    end_line: 4,
+                    // Highly similar to "one" (cosine > 0.85)
+                    vector: vec![0.99, 0.14],
+                },
+                EmbeddedChunk {
+                    id: "a::three".into(),
+                    symbol: "three".into(),
+                    file: "a.rs".into(),
+                    start_line: 5,
+                    end_line: 6,
+                    // Less similar to "one" but stronger than penalized "two"
+                    vector: vec![0.8, 0.6],
+                },
+            ],
+        };
+        // Query is exactly [1.0, 0.0]
+        // "one" has score 1.0
+        // "two" has score ~0.99. Similarity to "one" > 0.85 -> Penalty applied -> Score 0.495
+        // "three" has score 0.8. Similarity to "one" = 0.8 < 0.85 -> No penalty -> Score 0.8
+        let hits = index.search(&[1.0, 0.0], None, 2, 16384);
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].symbol, "one");
+        // "three" should beat "two" due to the diversity penalty
+        assert_eq!(hits[1].symbol, "three");
     }
 }

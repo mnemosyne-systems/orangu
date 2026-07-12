@@ -322,6 +322,7 @@ pub(crate) fn handle_command(
         forge,
         review_reports,
         skills,
+        semantic_budget_tokens,
     } = context;
 
     match command {
@@ -703,7 +704,7 @@ pub(crate) fn handle_command(
                         let guard = graph
                             .lock()
                             .map_err(|_| anyhow!("graph_store mutex poisoned"))?;
-                        index.search(&query_vector, guard.as_ref(), TOP_K)
+                        index.search(&query_vector, guard.as_ref(), TOP_K, semantic_budget_tokens)
                     };
                     let _ = sink.send(format!(
                         "Searched {} symbols in {}.",
@@ -1347,6 +1348,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1408,6 +1410,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1478,6 +1481,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1536,6 +1540,7 @@ mod tests {
                     compression: false,
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
+                    semantic_budget_tokens: 16384,
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -1622,6 +1627,7 @@ mod tests {
                     compression: false,
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
+                    semantic_budget_tokens: 16384,
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -1733,6 +1739,7 @@ mod tests {
                     compression: false,
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
+                    semantic_budget_tokens: 16384,
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -1806,6 +1813,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1869,6 +1877,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1934,6 +1943,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1994,6 +2004,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2060,6 +2071,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2119,6 +2131,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2185,6 +2198,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2238,6 +2252,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2287,6 +2302,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2336,6 +2352,7 @@ mod tests {
                 compression: false,
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
