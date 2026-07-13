@@ -441,6 +441,16 @@ mod tests {
     }
 
     #[test]
+    fn fenced_json_tool_call_text_remains_text() {
+        let content =
+            "```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}\n```";
+
+        let response = finalize_stream_response(content.to_string(), Vec::new()).expect("finalize");
+
+        assert!(matches!(response, LlmResponse::Text(text) if text == content));
+    }
+
+    #[test]
     fn stream_event_extracts_llama_cpp_metrics() {
         let mut content = String::new();
         let mut tool_calls = Vec::new();

@@ -427,15 +427,30 @@ pub fn with_explicit_pager_width(command: &str, terminal_width: usize) -> String
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or(first.as_str());
-    if executable != "delta"
-        || parts
-            .iter()
-            .any(|part| part == "--width" || part.starts_with("--width="))
-    {
+    if executable != "delta" {
         return command.to_string();
     }
+    let has_width = parts
+        .iter()
+        .any(|part| part == "--width" || part.starts_with("--width="));
+    let has_mode = parts
+        .iter()
+        .any(|part| part == "--light" || part == "--dark");
 
-    format!("{command} --width={terminal_width}")
+    let mut modified = command.to_string();
+    if !has_width {
+        modified = format!("{modified} --width={terminal_width}");
+    }
+    if !has_mode {
+        let mode = if orangu::tui::Theme::is_dark() {
+            "--dark"
+        } else {
+            "--light"
+        };
+        modified = format!("{modified} {mode}");
+    }
+
+    modified
 }
 
 pub fn run_git_diff_pager(
@@ -445,11 +460,19 @@ pub fn run_git_diff_pager(
     terminal_width: usize,
 ) -> Result<String> {
     let pager_command = with_explicit_pager_width(pager_command, terminal_width);
+
+    let bat_theme = if orangu::tui::Theme::is_dark() {
+        "base16-ocean.dark"
+    } else {
+        "base16-ocean.light"
+    };
+
     let mut pager = std::process::Command::new("sh")
         .arg("-c")
         .arg(&pager_command)
         .current_dir(repo_root)
         .env("COLUMNS", terminal_width.to_string())
+        .env("BAT_THEME", bat_theme)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -756,11 +779,11 @@ mod tests {
     fn adds_explicit_width_to_delta_pager_command() {
         assert_eq!(
             with_explicit_pager_width("delta --side-by-side", 123),
-            "delta --side-by-side --width=123"
+            "delta --side-by-side --width=123 --dark"
         );
         assert_eq!(
             with_explicit_pager_width("/usr/bin/delta --width=90 --side-by-side", 123),
-            "/usr/bin/delta --width=90 --side-by-side"
+            "/usr/bin/delta --width=90 --side-by-side --dark"
         );
         assert_eq!(with_explicit_pager_width("less -FRX", 123), "less -FRX");
     }

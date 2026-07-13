@@ -437,6 +437,7 @@ pub enum LocalCommand<'a> {
     SetModelId(&'a str),
     ServerInfo,
     SetServer(&'a str),
+    SetTheme(&'a str),
     /// `/information`: probe the active server for as much information as it
     /// will give up — advertised models over the OpenAI-compatible API, plus
     /// any native endpoints (`/health`, `/props`, `/slots`,
@@ -562,6 +563,7 @@ pub struct CommandContext<'a> {
     pub review_reports: crate::git::ReviewReports<'a>,
     pub skills: &'a orangu::skills::SkillRegistry,
     pub semantic_budget_tokens: usize,
+    pub config_path: &'a std::path::Path,
 }
 
 pub struct CommandState<'a> {

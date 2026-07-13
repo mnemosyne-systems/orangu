@@ -421,6 +421,7 @@ pub(crate) struct AutoReviewState {
     /// browsing afterwards. `None` once the run ends, until the user
     /// navigates.
     pub(crate) selected: Option<usize>,
+    pub(crate) list_offset: usize,
     /// The report item highlighted in the left pane while browsing: an index
     /// into `build_report`'s item list, moved by Up/Down and acted on by `-`.
     /// `None` until the user navigates (or once the report has no items left).
@@ -480,6 +481,16 @@ pub(crate) struct AutoReviewState {
 }
 
 impl AutoReviewState {
+    pub(crate) fn update_list_offset(&mut self, right_body_height: usize) {
+        if let Some(selected) = self.selected {
+            if selected < self.list_offset {
+                self.list_offset = selected;
+            } else if selected >= self.list_offset + right_body_height {
+                self.list_offset = selected.saturating_sub(right_body_height).saturating_add(1);
+            }
+        }
+    }
+
     pub(crate) fn new(launch: ReviewLaunch) -> Self {
         // The `deep` launch keyword starts every file in Deep mode instead of
         // the usual per-file Normal default — the same Deep the Alt+m
@@ -493,6 +504,7 @@ impl AutoReviewState {
         Self {
             files: launch.files,
             selected: None,
+            list_offset: 0,
             selected_item: None,
             reviewing: None,
             scroll: 0,
@@ -786,10 +798,32 @@ impl AutoReviewState {
             .map(|item| (item.start, item.end))
     }
 
+    fn report_visible_rows(body_height: usize) -> usize {
+        body_height.saturating_sub(1).max(1)
+    }
+
+    fn max_scroll_for_lines(line_count: usize, visible_rows: usize) -> usize {
+        line_count.saturating_sub(visible_rows.max(1))
+    }
+
+    fn apply_scroll_offset(offset: &mut usize, delta: isize, max_scroll: usize) {
+        *offset = offset.saturating_add_signed(delta).min(max_scroll);
+    }
+
+    pub(crate) fn scroll_report(&mut self, delta: isize, body_height: usize) {
+        let visible_rows = Self::report_visible_rows(body_height);
+        let max_scroll = Self::max_scroll_for_lines(self.report_lines().len(), visible_rows);
+        Self::apply_scroll_offset(&mut self.scroll, delta, max_scroll);
+    }
+
     /// Clamp scroll/pan offsets to the report's size.
     pub(crate) fn clamp(&mut self, body_height: usize, left_width: usize) {
         let lines = self.report_lines();
-        self.scroll = self.scroll.min(lines.len().saturating_sub(body_height));
+        self.scroll = self.scroll.min(
+            lines
+                .len()
+                .saturating_sub(Self::report_visible_rows(body_height)),
+        );
         let content_width = lines
             .iter()
             .map(|line| orangu::tui::visible_line_width(line))
@@ -1168,10 +1202,10 @@ impl AutoReviewState {
 
     /// Scroll the open diff popup by `delta` rows (negative scrolls up), clamped
     /// so at least one line stays in view. A no-op when the popup is closed.
-    pub(crate) fn scroll_diff_view(&mut self, delta: isize) {
+    pub(crate) fn scroll_diff_view(&mut self, delta: isize, visible_rows: usize) {
         if let Some(diff) = self.diff_view.as_mut() {
-            let max = diff.lines.len().saturating_sub(1);
-            diff.scroll = diff.scroll.saturating_add_signed(delta).min(max);
+            let max = Self::max_scroll_for_lines(diff.lines.len(), visible_rows);
+            Self::apply_scroll_offset(&mut diff.scroll, delta, max);
         }
     }
 
@@ -2051,6 +2085,7 @@ pub(crate) fn print_auto_review_screen(
     input: &str,
     cursor: usize,
     ghost: &str,
+    print_screen_fn: &mut impl FnMut(AutoReviewScreenArgs<'_>),
 ) {
     let report_lines = state.report_lines();
     let status_text = state.status_text();
@@ -2073,47 +2108,44 @@ pub(crate) fn print_auto_review_screen(
             text: reject.editor.as_str(),
             cursor: reject.editor.cursor(),
         });
-    print!("{CLEAR_TERMINAL_SEQUENCE}");
-    print!(
-        "{}",
-        render_auto_review_screen(AutoReviewScreenArgs {
-            files: &state.files,
-            selected: state.selected,
-            // Pulsing the index on the render tick makes the dot blink.
-            reviewing: state.reviewing.filter(|_| blink_on),
-            browsing: state.done || state.cancelled,
-            // Pre-start phase: the run has not begun and is neither done nor
-            // cancelled.
-            prestart: !state.run_started && !state.done && !state.cancelled,
-            modes: &state.modes,
-            reject,
-            diff,
-            report_lines: &report_lines,
-            // Highlight the Up/Down item cursor only while browsing the report.
-            selected_lines: if state.done || state.cancelled {
-                state.selected_item_span()
-            } else {
-                None
-            },
-            scroll: state.scroll,
-            x_offset: state.x_offset,
-            status: &status_text,
-            input,
-            cursor,
-            ghost,
-            current_model: chrome.current_model,
-            prompt_branch: chrome.prompt_branch,
-            left_status,
-            pending_count: chrome.pending_count,
-            graph_status: state
-                .graph_status
-                .lock()
-                .ok()
-                .map(|status| auto_review_graph_conn_status(*status)),
-            actual_width: viewport.actual_width,
-            actual_height: viewport.actual_height,
-        })
-    );
+    print_screen_fn(AutoReviewScreenArgs {
+        files: &state.files,
+        selected: state.selected,
+        list_offset: state.list_offset,
+        // Pulsing the index on the render tick makes the dot blink.
+        reviewing: state.reviewing.filter(|_| blink_on),
+        browsing: state.done || state.cancelled,
+        // Pre-start phase: the run has not begun and is neither done nor
+        // cancelled.
+        prestart: !state.run_started && !state.done && !state.cancelled,
+        modes: &state.modes,
+        reject,
+        diff,
+        report_lines: &report_lines,
+        // Highlight the Up/Down item cursor only while browsing the report.
+        selected_lines: if state.done || state.cancelled {
+            state.selected_item_span()
+        } else {
+            None
+        },
+        scroll: state.scroll,
+        x_offset: state.x_offset,
+        status: &status_text,
+        input,
+        cursor,
+        ghost,
+        current_model: chrome.current_model,
+        prompt_branch: chrome.prompt_branch,
+        left_status,
+        pending_count: chrome.pending_count,
+        graph_status: state
+            .graph_status
+            .lock()
+            .ok()
+            .map(|status| auto_review_graph_conn_status(*status)),
+        actual_width: viewport.actual_width,
+        actual_height: viewport.actual_height,
+    });
 }
 
 /// Drive a whole `/auto_review` run: each file's per-category requests, the
@@ -2139,6 +2171,7 @@ pub(crate) async fn run_auto_review_mode(
     graph_store: std::sync::Arc<std::sync::Mutex<Option<orangu::graph::store::GraphStore>>>,
     graph_status: std::sync::Arc<std::sync::Mutex<orangu::graph::status::GraphBuildStatus>>,
     unattended: bool,
+    print_screen_fn: &mut impl FnMut(AutoReviewScreenArgs<'_>),
 ) -> Result<AutoReviewState> {
     let immediate = launch.immediate;
     let mut state = AutoReviewState::new(launch);
@@ -2155,7 +2188,7 @@ pub(crate) async fn run_auto_review_mode(
         if !state.files.is_empty() {
             state.selected = Some(0);
         }
-        match run_auto_review_prestart(&mut state, viewport, chrome, terminal)? {
+        match run_auto_review_prestart(&mut state, viewport, chrome, terminal, print_screen_fn)? {
             PreStartOutcome::Start => {}
             PreStartOutcome::Exit => return Ok(state),
         }
@@ -2262,6 +2295,7 @@ pub(crate) async fn run_auto_review_mode(
                 viewport,
                 chrome,
                 feedback,
+                print_screen_fn,
             )
             .await?;
             // Reset to just the system message: the next category's request
@@ -2338,6 +2372,7 @@ pub(crate) async fn run_auto_review_mode(
                     viewport,
                     chrome,
                     feedback,
+                    print_screen_fn,
                 )
                 .await?;
                 scratch.rollback(session_start);
@@ -2409,6 +2444,7 @@ pub(crate) async fn run_auto_review_mode(
             viewport,
             chrome,
             feedback,
+            print_screen_fn,
         )
         .await?;
         match outcome {
@@ -2445,7 +2481,15 @@ pub(crate) async fn run_auto_review_mode(
     // lands in the output window and any chained command (e.g. `export auto
     // review`) runs next.
     if !exit_requested && !unattended {
-        run_auto_review_browse(&mut state, viewport, chrome, workspace, terminal, skills)?;
+        run_auto_review_browse(
+            &mut state,
+            viewport,
+            chrome,
+            workspace,
+            terminal,
+            skills,
+            print_screen_fn,
+        )?;
     }
     Ok(state)
 }
@@ -2469,6 +2513,7 @@ pub(crate) fn run_auto_review_prestart(
     viewport: &mut ViewportState,
     chrome: ReviewChrome<'_>,
     terminal: &str,
+    print_screen_fn: &mut impl FnMut(AutoReviewScreenArgs<'_>),
 ) -> Result<PreStartOutcome> {
     let mut escape_cancel = EscapeCancelState::default();
     loop {
@@ -2479,15 +2524,71 @@ pub(crate) fn run_auto_review_prestart(
             viewport.actual_width,
         );
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
-        let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
+        let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
         state.clamp(body_height, left_width);
         state.status = auto_review_prestart_status(state);
-        print_auto_review_screen(state, viewport, chrome, None, false, "", 0, "");
+
+        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let prompt_frame_height =
+            orangu::tui::screen::wrapped_input_lines("", viewport.actual_width, &prefix).len() + 3;
+        // The native layout uses two rows for the mode header, plus the
+        // right pane's one-row top padding and `Files` heading.
+        let right_body_height = viewport
+            .actual_height
+            .saturating_sub(prompt_frame_height)
+            .saturating_sub(4)
+            .max(1);
+        state.update_list_offset(right_body_height);
+
+        print_auto_review_screen(
+            state,
+            viewport,
+            chrome,
+            None,
+            false,
+            "",
+            0,
+            "",
+            print_screen_fn,
+        );
         std::io::stdout().flush()?;
 
         let (code, modifiers) = match event::read()? {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
+                continue;
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind, column, row, ..
+            }) => {
+                match kind {
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        state.scroll_report(
+                            -(crate::input::wheel_scroll_lines(body_height) as isize),
+                            body_height,
+                        );
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        state.scroll_report(
+                            crate::input::wheel_scroll_lines(body_height) as isize,
+                            body_height,
+                        );
+                    }
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if column as usize >= left_width =>
+                    {
+                        let list_start = state.list_offset;
+                        if row >= 4 {
+                            let click_y = (row - 4) as usize;
+                            let file_index = list_start + click_y;
+                            if file_index < state.files.len() {
+                                state.selected = Some(file_index);
+                                state.scroll = 0;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             Event::Key(KeyEvent {
@@ -2522,12 +2623,18 @@ pub(crate) fn run_auto_review_prestart(
                     state.status = format!("Open diff failed: {err:#}");
                 }
             }
-            (KeyCode::Up, _) => state.scroll = state.scroll.saturating_sub(1),
-            (KeyCode::Down, _) => state.scroll = state.scroll.saturating_add(1),
+            (KeyCode::Up, _) => state.scroll_report(-1, body_height),
+            (KeyCode::Down, _) => state.scroll_report(1, body_height),
             (KeyCode::Left, _) => state.x_offset = state.x_offset.saturating_sub(1),
             (KeyCode::Right, _) => state.x_offset = state.x_offset.saturating_add(1),
-            (KeyCode::PageUp, _) => state.scroll = state.scroll.saturating_sub(body_height),
-            (KeyCode::PageDown, _) => state.scroll = state.scroll.saturating_add(body_height),
+            (KeyCode::PageUp, _) => state.scroll_report(
+                -(crate::input::page_scroll_lines(body_height) as isize),
+                body_height,
+            ),
+            (KeyCode::PageDown, _) => state.scroll_report(
+                crate::input::page_scroll_lines(body_height) as isize,
+                body_height,
+            ),
             _ => {}
         }
     }
@@ -2669,6 +2776,7 @@ pub(crate) fn auto_review_terminal_title_dot(reviewing_deep: bool) -> &'static s
 /// response length, so a review can neither start tool rounds nor generate
 /// unbounded output. The report stays scrollable while the model works;
 /// `Esc` `Esc` cancels the run and `Alt+x` exits the mode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_auto_review_request(
     scratch: &mut ChatSession,
     prompt: &str,
@@ -2677,6 +2785,7 @@ pub(crate) async fn run_auto_review_request(
     viewport: &mut ViewportState,
     chrome: ReviewChrome<'_>,
     feedback: bool,
+    print_screen_fn: &mut impl FnMut(AutoReviewScreenArgs<'_>),
 ) -> Result<AutoReviewRequestOutcome> {
     let streamed_state = Arc::new(Mutex::new(StreamRenderState::default()));
     let prompt_output = Arc::clone(&streamed_state);
@@ -2717,6 +2826,24 @@ pub(crate) async fn run_auto_review_request(
                     let (code, modifiers) = match event::read()? {
                         Event::Resize(width, height) => {
                             viewport.on_resize(usize::from(width), usize::from(height));
+                            continue;
+                        }
+                        Event::Mouse(crossterm::event::MouseEvent { kind, .. }) => {
+                            match kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    state.scroll_report(
+                                        -(crate::input::wheel_scroll_lines(body_height) as isize),
+                                        body_height,
+                                    );
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    state.scroll_report(
+                                        crate::input::wheel_scroll_lines(body_height) as isize,
+                                        body_height,
+                                    );
+                                }
+                                _ => {}
+                            }
                             continue;
                         }
                         Event::Key(KeyEvent { code, modifiers, kind, .. })
@@ -2765,22 +2892,24 @@ pub(crate) async fn run_auto_review_request(
                                 crate::workspace_tab::TabAction::Close,
                             ));
                         }
-                        (KeyCode::Up, _) => state.scroll = state.scroll.saturating_sub(1),
-                        (KeyCode::Down, _) => state.scroll = state.scroll.saturating_add(1),
+                        (KeyCode::Up, _) => state.scroll_report(-1, body_height),
+                        (KeyCode::Down, _) => state.scroll_report(1, body_height),
                         (KeyCode::Left, _) => state.x_offset = state.x_offset.saturating_sub(1),
                         (KeyCode::Right, _) => state.x_offset = state.x_offset.saturating_add(1),
-                        (KeyCode::PageUp, _) => {
-                            state.scroll = state.scroll.saturating_sub(body_height);
-                        }
-                        (KeyCode::PageDown, _) => {
-                            state.scroll = state.scroll.saturating_add(body_height);
-                        }
+                        (KeyCode::PageUp, _) => state.scroll_report(
+                            -(crate::input::page_scroll_lines(body_height) as isize),
+                            body_height,
+                        ),
+                        (KeyCode::PageDown, _) => state.scroll_report(
+                            crate::input::page_scroll_lines(body_height) as isize,
+                            body_height,
+                        ),
                         _ => {}
                     }
                 }
                 let right_width =
                     orangu::tui::review_right_width(&state.files, viewport.actual_width);
-                let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
+                let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
                 state.clamp(body_height, left_width);
                 let frame = (started.elapsed().as_millis()
                     / THINKING_FRAME_INTERVAL.as_millis().max(1)) as usize;
@@ -2818,7 +2947,7 @@ pub(crate) async fn run_auto_review_request(
                     };
                     set_terminal_title(Some(&title));
                 }
-                print_auto_review_screen(state, viewport, chrome, status, blink_on, "", 0, "");
+                print_auto_review_screen(state, viewport, chrome, status, blink_on, "", 0, "", print_screen_fn);
                 std::io::stdout().flush()?;
             }
         }
@@ -2894,6 +3023,7 @@ pub(crate) fn run_auto_review_browse(
     workspace: &Path,
     terminal: &str,
     skills: &orangu::skills::SkillRegistry,
+    print_screen_fn: &mut impl FnMut(AutoReviewScreenArgs<'_>),
 ) -> Result<()> {
     let mut escape_cancel = EscapeCancelState::default();
     // The browse-phase input window: `/open_file <path>` or `open <path>` here
@@ -2908,9 +3038,9 @@ pub(crate) fn run_auto_review_browse(
             viewport.actual_width,
         );
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
-        let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
+        let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
         state.clamp(body_height, left_width);
-        state.ensure_item_visible(body_height);
+        state.ensure_item_visible(AutoReviewState::report_visible_rows(body_height));
         // Preview the file/command Tab would fill in, exactly like `/review`.
         let ghost = crate::completion::input_ghost_suffix(
             input_state.as_str(),
@@ -2922,6 +3052,24 @@ pub(crate) fn run_auto_review_browse(
             skills,
         )
         .unwrap_or_default();
+
+        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let prompt_frame_height = orangu::tui::screen::wrapped_input_lines(
+            input_state.as_str(),
+            viewport.actual_width,
+            &prefix,
+        )
+        .len()
+            + 3;
+        // The native layout uses two rows for the mode header, plus the
+        // right pane's one-row top padding and `Files` heading.
+        let right_body_height = viewport
+            .actual_height
+            .saturating_sub(prompt_frame_height)
+            .saturating_sub(4)
+            .max(1);
+        state.update_list_offset(right_body_height);
+
         print_auto_review_screen(
             state,
             viewport,
@@ -2931,12 +3079,50 @@ pub(crate) fn run_auto_review_browse(
             input_state.as_str(),
             input_state.cursor(),
             &ghost,
+            print_screen_fn,
         );
         std::io::stdout().flush()?;
 
         let (code, modifiers) = match event::read()? {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
+                continue;
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind, column, row, ..
+            }) => {
+                match kind {
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        let scroll_rows = crate::input::wheel_scroll_lines(body_height);
+                        if state.diff_view.is_some() {
+                            state.scroll_diff_view(-(scroll_rows as isize), body_height);
+                        } else {
+                            state.scroll_report(-(scroll_rows as isize), body_height);
+                        }
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        let scroll_rows = crate::input::wheel_scroll_lines(body_height);
+                        if state.diff_view.is_some() {
+                            state.scroll_diff_view(scroll_rows as isize, body_height);
+                        } else {
+                            state.scroll_report(scroll_rows as isize, body_height);
+                        }
+                    }
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if column as usize >= left_width =>
+                    {
+                        let list_start = state.list_offset;
+                        if row >= 4 {
+                            let click_y = (row - 4) as usize;
+                            let file_index = list_start + click_y;
+                            if file_index < state.files.len() {
+                                state.selected = Some(file_index);
+                                state.scroll = 0;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             Event::Key(KeyEvent {
@@ -2959,13 +3145,19 @@ pub(crate) fn run_auto_review_browse(
             escape_cancel.reset();
             match (code, alt) {
                 (KeyCode::Esc, _) => state.close_diff_view(),
-                (KeyCode::Up, _) => state.scroll_diff_view(-1),
-                (KeyCode::Down, _) => state.scroll_diff_view(1),
+                (KeyCode::Up, _) => state.scroll_diff_view(-1, body_height),
+                (KeyCode::Down, _) => state.scroll_diff_view(1, body_height),
                 (KeyCode::PageUp, _) => {
-                    state.scroll_diff_view(-(body_height as isize));
+                    state.scroll_diff_view(
+                        -(crate::input::page_scroll_lines(body_height) as isize),
+                        body_height,
+                    );
                 }
                 (KeyCode::PageDown, _) => {
-                    state.scroll_diff_view(body_height as isize);
+                    state.scroll_diff_view(
+                        crate::input::page_scroll_lines(body_height) as isize,
+                        body_height,
+                    );
                 }
                 (KeyCode::Left, true) => state.pan_diff_view(-1),
                 (KeyCode::Right, true) => state.pan_diff_view(1),

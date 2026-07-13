@@ -47,7 +47,8 @@ pub const ANSI_RESET: &str = "\x1b[0m";
 
 pub struct SyntaxHighlightAssets {
     pub syntaxes: SyntaxSet,
-    pub theme: Theme,
+    pub dark_theme: Theme,
+    pub light_theme: Theme,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,13 +62,23 @@ pub fn syntax_highlight_assets() -> &'static SyntaxHighlightAssets {
     ASSETS.get_or_init(|| {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         let themes = ThemeSet::load_defaults();
-        let theme = themes
+        let dark_theme = themes
             .themes
             .get("base16-ocean.dark")
             .cloned()
             .or_else(|| themes.themes.values().next().cloned())
             .unwrap_or_default();
-        SyntaxHighlightAssets { syntaxes, theme }
+        let light_theme = themes
+            .themes
+            .get("base16-ocean.light")
+            .or_else(|| themes.themes.get("InspiredGitHub"))
+            .cloned()
+            .unwrap_or_default();
+        SyntaxHighlightAssets {
+            syntaxes,
+            dark_theme,
+            light_theme,
+        }
     })
 }
 
@@ -189,7 +200,12 @@ pub fn render_show_file_content(
         .ok()
         .flatten()
         .unwrap_or_else(|| assets.syntaxes.find_syntax_plain_text());
-    let mut highlighter = HighlightLines::new(syntax, &assets.theme);
+    let theme = if orangu::tui::Theme::is_dark() {
+        &assets.dark_theme
+    } else {
+        &assets.light_theme
+    };
+    let mut highlighter = HighlightLines::new(syntax, theme);
     let line_count = content.lines().count().max(1);
     let line_number_width = line_count.to_string().len();
     let mut rendered = Vec::new();
@@ -332,6 +348,49 @@ pub fn git_blame_metadata_at_rev(
     }
 
     Ok(metadata)
+}
+
+pub enum MarkdownChunk {
+    Text(String),
+    Code {
+        language: Option<String>,
+        content: String,
+    },
+}
+
+pub fn parse_markdown_chunks(text: &str) -> Vec<MarkdownChunk> {
+    if text.is_empty() {
+        return vec![];
+    }
+
+    match to_mdast(text, &ParseOptions::default()) {
+        Ok(mut tree) => {
+            resolve_reference_links(&mut tree);
+            let mut chunks = Vec::new();
+            if let Node::Root(root) = tree {
+                for child in root.children {
+                    match child {
+                        Node::Code(code) => {
+                            chunks.push(MarkdownChunk::Code {
+                                language: code.lang.clone(),
+                                content: code.value.clone(),
+                            });
+                        }
+                        _ => {
+                            let rendered = render_markdown_node(&child);
+                            if !rendered.trim().is_empty() {
+                                chunks.push(MarkdownChunk::Text(rendered));
+                            }
+                        }
+                    }
+                }
+            } else {
+                chunks.push(MarkdownChunk::Text(render_markdown_node(&tree)));
+            }
+            chunks
+        }
+        Err(_) => vec![MarkdownChunk::Text(text.to_string())],
+    }
 }
 
 pub fn render_markdown_for_console(text: &str) -> String {
@@ -545,7 +604,12 @@ pub fn render_syntax_highlighted_code(language: Option<&str>, value: &str) -> Ve
         return render_plain_code_lines(value);
     };
 
-    let mut highlighter = HighlightLines::new(syntax, &assets.theme);
+    let theme = if orangu::tui::Theme::is_dark() {
+        &assets.dark_theme
+    } else {
+        &assets.light_theme
+    };
+    let mut highlighter = HighlightLines::new(syntax, theme);
     let mut rendered = Vec::new();
     for line in LinesWithEndings::from(value) {
         match highlighter.highlight_line(line, &assets.syntaxes) {

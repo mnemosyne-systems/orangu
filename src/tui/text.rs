@@ -13,6 +13,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthChar;
+
+pub fn clip_ratatui_line<'a>(
+    line: &Line<'a>,
+    mut x_offset: usize,
+    visible_width: usize,
+) -> Line<'a> {
+    let mut new_spans = Vec::new();
+    let mut current_width = 0;
+
+    for span in &line.spans {
+        if current_width >= visible_width {
+            break;
+        }
+
+        let span_width = span.width();
+        if x_offset >= span_width {
+            x_offset -= span_width;
+            continue;
+        }
+
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if x_offset > 0 {
+                // A viewport cannot render half of a wide character, so skip
+                // the entire character when its leading cell is clipped.
+                x_offset = x_offset.saturating_sub(ch_width);
+                continue;
+            }
+
+            if current_width + ch_width > visible_width {
+                break;
+            }
+
+            content.push(ch);
+            current_width += ch_width;
+        }
+
+        if !content.is_empty() {
+            new_spans.push(Span::styled(content, span.style));
+        }
+    }
+
+    let mut new_line = Line::from(new_spans);
+    if let Some(align) = line.alignment {
+        new_line = new_line.alignment(align);
+    }
+    new_line
+}
+
 pub fn clip_line(line: &str, x_offset: usize, visible_width: usize) -> String {
     let mut result = String::new();
     let mut col = 0usize;

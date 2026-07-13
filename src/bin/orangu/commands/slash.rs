@@ -58,6 +58,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/restart" => Some(LocalCommand::Restart),
         "/model" => Some(LocalCommand::ModelInfo),
         "/server" => Some(LocalCommand::ServerInfo),
+        "/theme" => Some(LocalCommand::SetTheme("")),
         "/information" => Some(LocalCommand::Information),
 
         "/verbosity" => Some(LocalCommand::SetVerbosity("")),
@@ -166,6 +167,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(name) = input.strip_prefix("/server ") {
                 return Some(LocalCommand::SetServer(name.trim()));
+            }
+            if let Some(name) = input.strip_prefix("/theme ") {
+                return Some(LocalCommand::SetTheme(name.trim()));
             }
 
             if let Some(level) = input.strip_prefix("/verbosity ") {

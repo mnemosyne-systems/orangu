@@ -64,9 +64,9 @@ use orangu::{
         AutoReviewDiffView, AutoReviewFileMode, AutoReviewRejectView, AutoReviewScreenArgs,
         FEEDBACK_ERR, FEEDBACK_OK, ReviewCommentEditor, ReviewEntry, ReviewFeedbackView,
         ReviewScreenArgs, ReviewStatus, ScreenRenderArgs, StatusFragment, TabStatus,
-        WorkspaceTabsView, auto_review_pane_body_height, render_auto_review_screen,
-        render_review_screen, render_screen, render_thinking_status, render_tool_running_status,
-        render_working_status, review_pane_body_height, terminal_height, terminal_width,
+        WorkspaceTabsView, auto_review_pane_body_height, render_thinking_status,
+        render_tool_running_status, render_working_status, review_pane_body_height,
+        terminal_height, terminal_width,
     },
     workspaces::{normalize_path, resolve_workspace_root},
 };
@@ -110,7 +110,7 @@ use git::{
 use input::{
     EscapeCancelState, IDLE_STATUS_REFRESH_INTERVAL, InputContext, InputResult, InputState,
     InterruptState, OutputState, PendingResponse, RenderContext, ScreenState, StreamRenderState,
-    ViewportState, WaitContext, WaitResult, handle_input_event, read_input,
+    ViewportState, WaitContext, WaitResult, read_input,
 };
 use models::*;
 use render::{format_tools, render_markdown_for_console, show_file_output};
@@ -130,6 +130,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Override the configured TUI theme. Pass a shipped/user theme name, or a
+    /// path to a `.theme` file (typically under `~/.orangu/themes/`).
+    #[arg(long)]
+    theme: Option<String>,
     #[arg(short, long)]
     workspace: Option<PathBuf>,
     #[arg(short, long)]
@@ -225,6 +229,22 @@ async fn run() -> Result<()> {
         }
     };
     let config = load_client_configuration(&config_path)?;
+    let cli_theme_override = args.theme.clone();
+    orangu::tui::theme::Theme::set_auto_theme_names(
+        &config.auto_dark_theme,
+        &config.auto_light_theme,
+    );
+    let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
+    if let Some(cli_theme) = cli_theme_override.as_deref() {
+        orangu::tui::theme::Theme::apply_cli_override(cli_theme)
+            .with_context(|| format!("failed to apply --theme {}", cli_theme))?;
+    } else if let Err(err) = orangu::tui::theme::Theme::apply_named(requested_theme) {
+        eprintln!(
+            "warning: failed to apply configured theme '{}': {err}",
+            requested_theme
+        );
+    }
+
     let quote_module = quotes::QuoteModule::from_str(&config.quotes);
     // Remove any binary staged by a previous `/restart`; it is only needed
     // across the exec handoff and must not accumulate.
@@ -360,7 +380,7 @@ async fn run() -> Result<()> {
         }
     }
 
-    let _terminal_ui_guard = TerminalUiGuard::new()?;
+    let mut _terminal_ui_guard = TerminalUiGuard::new(config.mouse)?;
 
     let vw = terminal_width();
     let vh = terminal_height();
@@ -395,6 +415,7 @@ async fn run() -> Result<()> {
         mut session_hist_path,
         mut session_messages_path,
         mut session_metadata_path,
+        mut session_theme_override,
         mut session_slot_path,
         mut current_branch,
         mut last_review_report,
@@ -413,6 +434,19 @@ async fn run() -> Result<()> {
     active_model = initial_active_model;
     active_model_id = initial_active_model_id;
     current_endpoint = initial_current_endpoint;
+    let apply_session_theme = |session_theme_override: &Option<String>| {
+        if cli_theme_override.is_some() {
+            return;
+        }
+        let theme_name = session_theme_override.as_deref().unwrap_or(&config.theme);
+        if let Err(err) = orangu::tui::Theme::apply_named(theme_name) {
+            eprintln!(
+                "warning: failed to apply session theme '{}': {err}",
+                theme_name
+            );
+        }
+    };
+    apply_session_theme(&session_theme_override);
 
     // Resolves server connectivity (with auto-failover to another configured
     // server if the default doesn't respond), model pinning, and semantic
@@ -488,7 +522,8 @@ async fn run() -> Result<()> {
     // another active. The macros close over the run-loop locals by definition
     // site, so the loop body keeps using those locals unchanged.
     macro_rules! current_tab {
-        () => {
+        () => {{
+            let session_theme_override = load_session_theme(&session_dir);
             WorkspaceTab {
                 workspace,
                 tools,
@@ -503,6 +538,7 @@ async fn run() -> Result<()> {
                 session_hist_path,
                 session_messages_path,
                 session_metadata_path,
+                session_theme_override,
                 session_slot_path,
                 current_branch,
                 last_review_report,
@@ -518,7 +554,7 @@ async fn run() -> Result<()> {
                 active_model_id: active_model_id.clone(),
                 current_endpoint: current_endpoint.clone(),
             }
-        };
+        }};
     }
     macro_rules! load_tab {
         ($tab:expr) => {{
@@ -536,6 +572,8 @@ async fn run() -> Result<()> {
             session_hist_path = tab.session_hist_path;
             session_messages_path = tab.session_messages_path;
             session_metadata_path = tab.session_metadata_path;
+            session_theme_override = tab.session_theme_override;
+            apply_session_theme(&session_theme_override);
             session_slot_path = tab.session_slot_path;
             current_branch = tab.current_branch;
             last_review_report = tab.last_review_report;
@@ -924,6 +962,7 @@ async fn run() -> Result<()> {
                     deferred_tab: &mut deferred_tab_during_wait,
                     parked_tabs: ring.parked(),
                 },
+                &mut |r, s| _terminal_ui_guard.print_screen(r, s),
             )
             .await;
             match pr_result {
@@ -1074,6 +1113,10 @@ async fn run() -> Result<()> {
             .map(|_| StatusFragment::plain(format!("Resuming session {session_id}")));
         // The branch sync takes priority on the left of the status bar while it
         // runs and for a few seconds after it completes.
+        let mut print_screen = |r: RenderContext<'_>, s: ScreenState<'_>| {
+            _terminal_ui_guard.print_screen(r, s);
+        };
+
         let left_status = if sync_handle.is_some() {
             Some(StatusFragment::plain("Syncing with origin…".to_string()))
         } else {
@@ -1087,10 +1130,11 @@ async fn run() -> Result<()> {
             render,
             ScreenState {
                 transcript: output_state.lines(),
+                transcript_epoch: output_state.render_epoch(),
                 scroll_offset: output_state.scroll_offset(),
                 left_status,
                 pending_count: pending_commands.len(),
-                pending_line: None,
+                pending_lines: &[],
                 input: input_state.as_str(),
                 cursor: input_state.cursor(),
                 ghost_index: input_state.ghost_index,
@@ -1142,7 +1186,7 @@ async fn run() -> Result<()> {
                     render,
                     skills: &skills,
                 },
-                print_screen,
+                &mut print_screen,
                 max_idle,
             )? {
                 InputResult::Submitted(line) => {
@@ -1184,17 +1228,16 @@ async fn run() -> Result<()> {
             }
         };
 
-        output_state.push_input(&format!("> {next_input}"));
-        output_state.reset_scroll();
         startup_notice_until = None;
         print_screen(
             render,
             ScreenState {
                 transcript: output_state.lines(),
+                transcript_epoch: output_state.render_epoch(),
                 scroll_offset: output_state.scroll_offset(),
                 left_status: None,
                 pending_count: pending_commands.len(),
-                pending_line: None,
+                pending_lines: &[],
                 input: input_state.as_str(),
                 cursor: input_state.cursor(),
                 ghost_index: input_state.ghost_index,
@@ -1238,6 +1281,7 @@ async fn run() -> Result<()> {
                 },
                 skills: &skills,
                 semantic_budget_tokens: config.semantic_budget_tokens,
+                config_path: &config_path,
             },
         )?;
         // When `/server` (or `/reload`) selects a server, auto-detect an
@@ -1547,6 +1591,7 @@ async fn run() -> Result<()> {
                         parked_tabs: ring.parked(),
                     },
                     handle,
+                    &mut |r, s| _terminal_ui_guard.print_screen(r, s),
                 )
                 .await?;
                 match result {
@@ -1612,6 +1657,7 @@ async fn run() -> Result<()> {
                         parked_tabs: ring.parked(),
                     },
                     handle,
+                    &mut |r, s| _terminal_ui_guard.print_screen(r, s),
                 )
                 .await?;
                 match result {
@@ -1680,6 +1726,7 @@ async fn run() -> Result<()> {
                     handle,
                     &mut rx,
                     control,
+                    &mut |r, s| _terminal_ui_guard.print_screen(r, s),
                 )
                 .await?;
                 match result {
@@ -1744,6 +1791,13 @@ async fn run() -> Result<()> {
                         &workspace,
                         &server_names,
                         &available_models,
+                        &mut |args: orangu::tui::ReviewScreenArgs<'_>| {
+                            if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                                orangu::tui::review_native::draw_review_screen(f, args);
+                            }) {
+                                eprintln!("failed to draw review screen: {err}");
+                            }
+                        },
                     )? {
                         ReviewSignal::Exit => break,
                         ReviewSignal::OpenFile { path } => {
@@ -1818,6 +1872,13 @@ async fn run() -> Result<()> {
                                 &input_state,
                                 &mut viewport,
                                 chrome,
+                                &mut |args: orangu::tui::ReviewScreenArgs<'_>| {
+                                    if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                                        orangu::tui::review_native::draw_review_screen(f, args);
+                                    }) {
+                                        eprintln!("failed to draw review screen: {err}");
+                                    }
+                                },
                             )
                             .await?;
                             let lines = match result {
@@ -1950,6 +2011,13 @@ async fn run() -> Result<()> {
                     // once and returns as soon as the run finishes, so a
                     // chained `export auto review` can pick up the report.
                     current_chain.is_some(),
+                    &mut |args: orangu::tui::AutoReviewScreenArgs<'_>| {
+                        if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                            orangu::tui::auto_review_native::draw_auto_review_screen(f, args);
+                        }) {
+                            eprintln!("failed to draw auto-review screen: {err}");
+                        }
+                    },
                 )
                 .await?;
 
@@ -2076,6 +2144,7 @@ async fn run() -> Result<()> {
                         prompt_branch: prompt_branch.as_deref(),
                         pending_count: pending_commands.len(),
                     },
+                    &mut _terminal_ui_guard,
                 )?;
                 // The modal view overwrote the screen; the next loop iteration
                 // redraws the normal interface from the top.
@@ -2206,6 +2275,7 @@ async fn run() -> Result<()> {
                 deferred_tab: &mut deferred_tab_during_wait,
                 parked_tabs: ring.parked(),
             },
+            &mut |r, s| _terminal_ui_guard.print_screen(r, s),
         )
         .await
         {
@@ -2387,9 +2457,10 @@ fn prepare_submitted_input(
     history.push(trimmed.to_string());
     append_history_entry(history_path, trimmed)?;
 
+    output_state.push_input(&format!("> {trimmed}"));
+    output_state.reset_scroll();
+
     if trimmed.starts_with('#') {
-        output_state.push_input(&format!("> {trimmed}"));
-        output_state.reset_scroll();
         return Ok(None);
     }
 

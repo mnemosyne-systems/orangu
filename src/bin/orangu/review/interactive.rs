@@ -61,6 +61,7 @@ pub(crate) fn review_category_name(category: usize) -> &'static str {
 pub(crate) struct ReviewState {
     pub(crate) files: Vec<ReviewEntry>,
     pub(crate) selected: usize,
+    pub(crate) list_offset: usize,
     /// Index of the highlighted line within the selected file's diff (moved
     /// with Up/Down).
     pub(crate) line: usize,
@@ -103,10 +104,22 @@ pub(crate) struct ReviewChrome<'a> {
 }
 
 impl ReviewState {
+    pub(crate) fn update_list_offset(&mut self, right_body_height: usize) {
+        if self.selected < self.list_offset {
+            self.list_offset = self.selected;
+        } else if self.selected >= self.list_offset + right_body_height {
+            self.list_offset = self
+                .selected
+                .saturating_sub(right_body_height)
+                .saturating_add(1);
+        }
+    }
+
     pub(crate) fn new(launch: ReviewLaunch) -> Self {
         Self {
             files: launch.files,
             selected: 0,
+            list_offset: 0,
             line: 0,
             scroll: 0,
             x_offset: 0,
@@ -134,6 +147,31 @@ impl ReviewState {
 
     pub(crate) fn selected_path(&self) -> Option<&str> {
         self.files.get(self.selected).map(|file| file.path.as_str())
+    }
+
+    fn max_scroll_for_lines(line_count: usize, visible_rows: usize) -> usize {
+        line_count.saturating_sub(visible_rows.max(1))
+    }
+
+    fn apply_scroll_offset(offset: &mut usize, delta: isize, max_scroll: usize) {
+        *offset = offset.saturating_add_signed(delta).min(max_scroll);
+    }
+
+    pub(crate) fn scroll_diff(&mut self, delta: isize, body_height: usize) {
+        let max_scroll = Self::max_scroll_for_lines(self.selected_lines().len(), body_height);
+        Self::apply_scroll_offset(&mut self.scroll, delta, max_scroll);
+        self.line = self.line.min(self.selected_lines().len().saturating_sub(1));
+    }
+
+    pub(crate) fn scroll_feedback(&mut self, delta: isize, body_height: usize) {
+        let Some(feedback) = &mut self.feedback else {
+            return;
+        };
+        let review_rows = body_height
+            .saturating_sub(usize::from(feedback.question.is_some()))
+            .max(1);
+        let max_scroll = Self::max_scroll_for_lines(feedback.lines.len(), review_rows);
+        Self::apply_scroll_offset(&mut feedback.scroll, delta, max_scroll);
     }
 
     /// The existing comment recorded against the highlighted line, if any.
@@ -543,6 +581,7 @@ pub(crate) fn print_review_screen(
     chrome: ReviewChrome<'_>,
     left_status: Option<StatusFragment>,
     ghost: &str,
+    print_screen_fn: &mut impl FnMut(ReviewScreenArgs<'_>),
 ) {
     let feedback = state.feedback.as_ref().map(|feedback| ReviewFeedbackView {
         title: &feedback.title,
@@ -561,32 +600,30 @@ pub(crate) fn print_review_screen(
             cursor: editor.input.cursor(),
         });
     let commented_lines = state.commented_lines();
-    print!("{CLEAR_TERMINAL_SEQUENCE}");
-    print!(
-        "{}",
-        render_review_screen(ReviewScreenArgs {
-            files: &state.files,
-            selected: state.selected,
-            line: state.line,
-            scroll: state.scroll,
-            x_offset: state.x_offset,
-            feedback,
-            comment_editor,
-            commented_lines: &commented_lines,
-            current_model: chrome.current_model,
-            prompt_branch: chrome.prompt_branch,
-            input: input_state.as_str(),
-            cursor: input_state.cursor(),
-            ghost,
-            left_status,
-            pending_count: chrome.pending_count,
-            actual_width: viewport.actual_width,
-            actual_height: viewport.actual_height,
-        })
-    );
+    print_screen_fn(ReviewScreenArgs {
+        files: &state.files,
+        selected: state.selected,
+        list_offset: state.list_offset,
+        line: state.line,
+        scroll: state.scroll,
+        x_offset: state.x_offset,
+        feedback,
+        comment_editor,
+        commented_lines: &commented_lines,
+        current_model: chrome.current_model,
+        prompt_branch: chrome.prompt_branch,
+        input: input_state.as_str(),
+        cursor: input_state.cursor(),
+        ghost,
+        left_status,
+        pending_count: chrome.pending_count,
+        actual_width: viewport.actual_width,
+        actual_height: viewport.actual_height,
+    });
 }
 
 /// Run the review event loop until the user exits or asks for an LLM review.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_review_mode(
     state: &mut ReviewState,
     viewport: &mut ViewportState,
@@ -595,6 +632,7 @@ pub(crate) fn run_review_mode(
     workspace: &Path,
     server_names: &[String],
     available_models: &[String],
+    print_screen_fn: &mut impl FnMut(ReviewScreenArgs<'_>),
 ) -> Result<ReviewSignal> {
     let mut escape_cancel = EscapeCancelState::default();
     loop {
@@ -605,7 +643,7 @@ pub(crate) fn run_review_mode(
             viewport.actual_width,
         );
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
-        let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
+        let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
         state.clamp(body_height, left_width, viewport.actual_width);
         // Preview the file/command Tab would fill in, the same way the main
         // prompt does, so `/open_file ` and `open ` complete project files.
@@ -619,12 +657,79 @@ pub(crate) fn run_review_mode(
             chrome.skills,
         )
         .unwrap_or_default();
-        print_review_screen(state, input_state, viewport, chrome, None, &ghost);
+
+        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let input_lines_count = orangu::tui::screen::wrapped_input_lines(
+            input_state.as_str(),
+            viewport.actual_width,
+            &prefix,
+        )
+        .len();
+        let prompt_frame_height = input_lines_count + 3;
+        // The native layout uses two rows for the mode header, plus the
+        // right pane's one-row top padding and `Files` heading.
+        let right_body_height = viewport
+            .actual_height
+            .saturating_sub(prompt_frame_height)
+            .saturating_sub(4)
+            .max(1);
+        state.update_list_offset(right_body_height);
+
+        print_review_screen(
+            state,
+            input_state,
+            viewport,
+            chrome,
+            None,
+            &ghost,
+            print_screen_fn,
+        );
         std::io::stdout().flush()?;
 
         let (code, modifiers) = match event::read()? {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
+                continue;
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind, column, row, ..
+            }) => {
+                match kind {
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        let scroll_rows = crate::input::wheel_scroll_lines(body_height);
+                        if state.feedback.is_some() {
+                            state.scroll_feedback(-(scroll_rows as isize), body_height);
+                        } else {
+                            state.scroll_diff(-(scroll_rows as isize), body_height);
+                        }
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        let scroll_rows = crate::input::wheel_scroll_lines(body_height);
+                        if state.feedback.is_some() {
+                            state.scroll_feedback(scroll_rows as isize, body_height);
+                        } else {
+                            state.scroll_diff(scroll_rows as isize, body_height);
+                        }
+                    }
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if column as usize >= left_width =>
+                    {
+                        let list_start = state.list_offset;
+                        // Rows 0-1 are the mode header, row 2 is the
+                        // right pane's top padding, and row 3 is its
+                        // heading; file entries start at row 4.
+                        if row >= 4 {
+                            let click_y = (row - 4) as usize;
+                            let file_index = list_start + click_y;
+                            if file_index < state.files.len() {
+                                state.selected = file_index;
+                                state.line = 0;
+                                state.scroll = 0;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             Event::Key(KeyEvent {
@@ -641,16 +746,28 @@ pub(crate) fn run_review_mode(
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         // While the feedback popup is open it is modal: scroll it, or close it.
-        if let Some(feedback) = &mut state.feedback {
+        if state.feedback.is_some() {
             escape_cancel.reset();
             match code {
                 KeyCode::Char('x') | KeyCode::Esc => state.feedback = None,
-                KeyCode::Up => feedback.scroll = feedback.scroll.saturating_sub(1),
-                KeyCode::Down => feedback.scroll = feedback.scroll.saturating_add(1),
-                KeyCode::Left => feedback.x_offset = feedback.x_offset.saturating_sub(1),
-                KeyCode::Right => feedback.x_offset = feedback.x_offset.saturating_add(1),
-                KeyCode::PageUp => feedback.scroll = feedback.scroll.saturating_sub(body_height),
-                KeyCode::PageDown => feedback.scroll = feedback.scroll.saturating_add(body_height),
+                KeyCode::Up => state.scroll_feedback(-1, body_height),
+                KeyCode::Down => state.scroll_feedback(1, body_height),
+                KeyCode::Left => {
+                    let feedback = state.feedback.as_mut().unwrap();
+                    feedback.x_offset = feedback.x_offset.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    let feedback = state.feedback.as_mut().unwrap();
+                    feedback.x_offset = feedback.x_offset.saturating_add(1);
+                }
+                KeyCode::PageUp => state.scroll_feedback(
+                    -(crate::input::page_scroll_lines(body_height) as isize),
+                    body_height,
+                ),
+                KeyCode::PageDown => state.scroll_feedback(
+                    crate::input::page_scroll_lines(body_height) as isize,
+                    body_height,
+                ),
                 _ => {}
             }
             continue;
@@ -770,12 +887,18 @@ pub(crate) fn run_review_mode(
             }
             // Left-pane scrolling (Alt+arrows / PageUp/Down), mirroring the
             // main output window.
-            (KeyCode::Up, true, _) => state.scroll = state.scroll.saturating_sub(1),
-            (KeyCode::Down, true, _) => state.scroll = state.scroll.saturating_add(1),
+            (KeyCode::Up, true, _) => state.scroll_diff(-1, body_height),
+            (KeyCode::Down, true, _) => state.scroll_diff(1, body_height),
             (KeyCode::Left, true, _) => state.x_offset = state.x_offset.saturating_sub(1),
             (KeyCode::Right, true, _) => state.x_offset = state.x_offset.saturating_add(1),
-            (KeyCode::PageUp, _, _) => state.scroll = state.scroll.saturating_sub(body_height),
-            (KeyCode::PageDown, _, _) => state.scroll = state.scroll.saturating_add(body_height),
+            (KeyCode::PageUp, _, _) => state.scroll_diff(
+                -(crate::input::page_scroll_lines(body_height) as isize),
+                body_height,
+            ),
+            (KeyCode::PageDown, _, _) => state.scroll_diff(
+                crate::input::page_scroll_lines(body_height) as isize,
+                body_height,
+            ),
             // Move the highlighted line through the diff, view following.
             (KeyCode::Up, false, _) => state.cursor_up(),
             (KeyCode::Down, false, _) => state.cursor_down(body_height),
@@ -831,9 +954,11 @@ pub(crate) async fn run_review_request(
     input_state: &InputState,
     viewport: &mut ViewportState,
     chrome: ReviewChrome<'_>,
+    print_screen_fn: &mut impl FnMut(ReviewScreenArgs<'_>),
 ) -> Result<ReviewRequestOutcome> {
     let checkpoint = session.checkpoint();
-    let mut future = Box::pin(session.prompt(prompt, profile, tools, |_| {}, |_| {}, |_| {}));
+    let mut future =
+        Box::pin(session.prompt(prompt, profile, tools, |_| {}, |_| {}, |_| {}, |_| {}));
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let started = std::time::Instant::now();
     let mut escape_cancel = EscapeCancelState::default();
@@ -875,7 +1000,7 @@ pub(crate) async fn run_review_request(
                 let frame = (started.elapsed().as_millis()
                     / THINKING_FRAME_INTERVAL.as_millis().max(1)) as usize;
                 let status = render_thinking_status(frame, started.elapsed());
-                print_review_screen(state, input_state, viewport, chrome, Some(status), "");
+                print_review_screen(state, input_state, viewport, chrome, Some(status), "", print_screen_fn);
                 std::io::stdout().flush()?;
             }
         }
@@ -906,6 +1031,7 @@ mod tests {
                 },
             ],
             selected: 0,
+            list_offset: 0,
             line: 0,
             scroll: 7,
             x_offset: 5,
@@ -958,6 +1084,7 @@ mod tests {
                 patch: String::new(),
             }],
             selected: 0,
+            list_offset: 0,
             line: 0,
             scroll: 0,
             x_offset: 0,
@@ -1003,6 +1130,7 @@ mod tests {
         let mut state = ReviewState {
             files: vec![entry("a.txt"), entry("b.txt")],
             selected: 0,
+            list_offset: 0,
             line: 3,
             scroll: 0,
             x_offset: 0,
@@ -1063,9 +1191,8 @@ mod tests {
     #[test]
     fn alt_c_on_commented_line_opens_editor_prefilled_in_the_box() {
         use crate::review::ReviewState;
-        use orangu::tui::{
-            ReviewCommentEditor, ReviewEntry, ReviewScreenArgs, ReviewStatus, render_review_screen,
-        };
+        use orangu::tui::{ReviewCommentEditor, ReviewEntry, ReviewScreenArgs, ReviewStatus};
+        use ratatui::{Terminal, backend::TestBackend};
 
         let mut state = ReviewState {
             files: vec![ReviewEntry {
@@ -1075,6 +1202,7 @@ mod tests {
                 patch: String::new(),
             }],
             selected: 0,
+            list_offset: 0,
             line: 2,
             scroll: 0,
             x_offset: 0,
@@ -1092,11 +1220,12 @@ mod tests {
         state.commit_comment();
         state.open_comment_editor(12);
 
-        // The editor holds the existing comment, and it renders inside the box.
+        // The editor holds the existing comment.
         assert_eq!(
             state.comment_editor.as_ref().unwrap().input.as_str(),
             "needs a guard"
         );
+
         let editor = state
             .comment_editor
             .as_ref()
@@ -1107,28 +1236,46 @@ mod tests {
                 cursor: editor.input.cursor(),
             });
         let commented = state.commented_lines();
-        let rendered = render_review_screen(ReviewScreenArgs {
-            files: &state.files,
-            selected: state.selected,
-            line: state.line,
-            scroll: state.scroll,
-            x_offset: state.x_offset,
-            feedback: None,
-            comment_editor: editor,
-            commented_lines: &commented,
-            current_model: "model",
-            prompt_branch: Some("main"),
-            input: "",
-            cursor: 0,
-            ghost: "",
-            left_status: None,
-            pending_count: 0,
-            actual_width: 60,
-            actual_height: 16,
-        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                orangu::tui::review_native::draw_review_screen(
+                    frame,
+                    ReviewScreenArgs {
+                        files: &state.files,
+                        selected: state.selected,
+                        list_offset: state.list_offset,
+                        line: state.line,
+                        scroll: state.scroll,
+                        x_offset: state.x_offset,
+                        feedback: None,
+                        comment_editor: editor,
+                        commented_lines: &commented,
+                        current_model: "model",
+                        prompt_branch: Some("main"),
+                        input: "",
+                        cursor: 0,
+                        ghost: "",
+                        left_status: None,
+                        pending_count: 0,
+                        actual_width: 80,
+                        actual_height: 20,
+                    },
+                );
+            })
+            .unwrap();
+
+        let mut rendered = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                rendered.push_str(terminal.backend().buffer().cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+
         assert!(
             rendered.contains("needs a guard"),
-            "existing comment not loaded into the box"
+            "existing comment not rendered in native review screen"
         );
     }
 
@@ -1145,6 +1292,7 @@ mod tests {
                 patch: String::new(),
             }],
             selected: 0,
+            list_offset: 0,
             line: 1,
             scroll: 0,
             x_offset: 0,
@@ -1363,6 +1511,7 @@ mod tests {
                 patch: String::new(),
             }],
             selected: 0,
+            list_offset: 0,
             line: 2,
             scroll: 0,
             x_offset: 0,

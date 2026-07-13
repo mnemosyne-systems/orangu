@@ -17,6 +17,7 @@ use crate::*;
 
 pub(crate) const SESSIONS_DIRECTORY: &str = ".orangu/sessions";
 pub(crate) const SESSION_SETTINGS_FILE: &str = "settings";
+pub(crate) const SESSION_THEME_FILE: &str = "theme";
 
 /// Load the server and model pinned to this session, if any.
 /// Returns `(server, model)` — either or both may be `None`.
@@ -56,6 +57,30 @@ pub(crate) fn save_session_settings(session_dir: &Path, server: Option<&str>, mo
         body.push_str(&format!("model = {m}\n"));
     }
     let _ = std::fs::write(session_dir.join(SESSION_SETTINGS_FILE), body);
+}
+
+/// Load the theme override pinned to this session, if any. Stored separately
+/// from `settings` because it is a pure UI concern and the maintainer wants a
+/// dedicated sidecar under `~/.orangu/sessions/<id>/theme`.
+pub(crate) fn load_session_theme(session_dir: &Path) -> Option<String> {
+    let path = session_dir.join(SESSION_THEME_FILE);
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Persist or clear this session's theme override.
+pub(crate) fn save_session_theme(session_dir: &Path, theme: Option<&str>) {
+    let path = session_dir.join(SESSION_THEME_FILE);
+    match theme.map(str::trim).filter(|theme| !theme.is_empty()) {
+        Some(theme) => {
+            let _ = std::fs::write(path, format!("{theme}\n"));
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 /// Scratch directory used by `/restart` to stage a runnable copy of the binary
 /// when the original on-disk path has been replaced (e.g. rebuilt while

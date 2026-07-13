@@ -1,0 +1,14 @@
+success = fg:#73daaa
+error = fg:#f7768e
+ignore = fg:#7da6ff
+deep = fg:#bb9af7
+muted = fg:#565f89
+cursor_line_bg = fg:#c0caf5 bg:#292e42
+selected_file = fg:#c0caf5 bg:#363e5e
+comment_bg = bg:#1e283c
+code_block_bg = bg:#232d41
+highlight = fg:#7dcfc8
+warning = fg:#e0af68
+user_input = fg:#c0caf5 bg:#1e2030
+bg_base = #1a1b26
+text_primary = #c0caf5

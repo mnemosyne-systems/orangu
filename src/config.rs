@@ -44,7 +44,15 @@ pub struct ClientAppConfiguration {
     pub platform: String,
     pub workspaces: WorkspacePlacement,
     pub drop_down: bool,
+    /// Enable mouse capture in the terminal. When `true` (default), the TUI
+    /// handles mouse scroll (for output scrolling) and double-click (to toggle
+    /// collapsibles). Hold **Shift** while clicking/dragging to do native text
+    /// selection and copy. Set to `false` to disable all mouse handling.
+    pub mouse: bool,
     pub semantic_budget_tokens: usize,
+    pub theme: String,
+    pub auto_dark_theme: String,
+    pub auto_light_theme: String,
 }
 
 impl ClientAppConfiguration {
@@ -148,6 +156,18 @@ pub fn default_drop_down() -> bool {
     true
 }
 
+pub fn default_theme() -> String {
+    "classic".to_string()
+}
+
+pub fn default_auto_dark_theme() -> String {
+    "classic".to_string()
+}
+
+pub fn default_auto_light_theme() -> String {
+    "oranguday".to_string()
+}
+
 pub fn default_auto_downsample_lines() -> usize {
     300
 }
@@ -202,6 +222,10 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         .get("drop_down")
         .map(|value| parse_feedback_bool(value))
         .unwrap_or_else(default_drop_down);
+    let mouse = client
+        .get("mouse")
+        .map(|value| parse_feedback_bool(value))
+        .unwrap_or(true);
     let auto_downsample_lines = parse_client_field(
         &client,
         "auto_downsample_lines",
@@ -215,6 +239,16 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         .get("semantic_budget_tokens")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(16384);
+
+    let theme = client.get("theme").cloned().unwrap_or_else(default_theme);
+    let auto_dark_theme = client
+        .get("auto_dark_theme")
+        .cloned()
+        .unwrap_or_else(default_auto_dark_theme);
+    let auto_light_theme = client
+        .get("auto_light_theme")
+        .cloned()
+        .unwrap_or_else(default_auto_light_theme);
 
     // `[orangu].model` is the general default model id; a server section's own
     // `model` takes precedence over it.
@@ -262,6 +296,10 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         platform: client.get("platform").cloned().unwrap_or_default(),
         workspaces,
         drop_down,
+        mouse,
+        theme,
+        auto_dark_theme,
+        auto_light_theme,
     })
 }
 
@@ -271,6 +309,56 @@ pub const DEFAULT_PLATFORM: &str = "github";
 /// when the key is absent. Profile names and values may freely contain `.`
 /// and `:` — unlike a generic INI loader, this parser never treats those as
 /// nested-key separators.
+pub fn set_client_theme(path: &Path, new_theme: &str) -> Result<()> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut lines: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
+
+    let mut in_orangu_section = false;
+    let mut theme_line_index = None;
+    let mut insert_index = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = &trimmed[1..trimmed.len() - 1].trim();
+            if *section == CLIENT_SECTION {
+                in_orangu_section = true;
+                insert_index = Some(i + 1); // After the section header
+            } else if in_orangu_section {
+                // Leaving the section
+                break;
+            }
+        } else if in_orangu_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            insert_index = Some(i + 1); // Track the last active line in the section
+            if let Some(stripped) = trimmed.strip_prefix("theme") {
+                let after_key = &stripped.trim_start();
+                if after_key.starts_with('=') {
+                    theme_line_index = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let new_line = format!("theme = {}", new_theme);
+
+    if let Some(idx) = theme_line_index {
+        lines[idx] = new_line;
+    } else if let Some(idx) = insert_index {
+        lines.insert(idx, new_line);
+    } else {
+        // [orangu] section doesn't exist at all, append it
+        if !lines.is_empty() && !lines.last().unwrap().is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{}]", CLIENT_SECTION));
+        lines.push(new_line);
+    }
+
+    let new_contents = lines.join("\n") + "\n";
+    std::fs::write(path, new_contents)?;
+    Ok(())
+}
+
 fn parse_client_field<T: FromStr>(
     client: &HashMap<String, String>,
     key: &str,
@@ -557,6 +645,24 @@ mod tests {
         assert!(conf.compression);
         // Absent platform defaults to GitHub.
         assert_eq!(conf.platform, "github");
+        // Absent theme keeps the historical dark UI as the named classic theme.
+        assert_eq!(conf.theme, "classic");
+        assert_eq!(conf.auto_dark_theme, "classic");
+        assert_eq!(conf.auto_light_theme, "oranguday");
+    }
+
+    #[test]
+    fn parses_theme_defaults_and_overrides() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = a\ntheme = auto\nauto_dark_theme = tokyonight\nauto_light_theme = oranguday\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.theme, "auto");
+        assert_eq!(conf.auto_dark_theme, "tokyonight");
+        assert_eq!(conf.auto_light_theme, "oranguday");
     }
 
     #[test]

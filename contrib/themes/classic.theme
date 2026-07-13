@@ -1,0 +1,15 @@
+# Current orangu main UI, preserved as the canonical shipped default.
+success = fg:#50c878
+error = fg:#dc5050
+ignore = fg:#64a0e6
+deep = fg:#aa78dc
+muted = fg:#585858
+cursor_line_bg = fg:#fff5e6 bg:#28282d
+selected_file = fg:#ffffff bg:#3b4261
+comment_bg = bg:#1f2335
+code_block_bg = bg:#191923
+highlight = fg:#7aa2f7
+warning = fg:#e6c878
+user_input = fg:#ffffff bg:#2d2314
+bg_base = #181818
+text_primary = #f0f0f0

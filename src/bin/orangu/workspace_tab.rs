@@ -58,6 +58,7 @@ pub(crate) struct WorkspaceTab {
     pub(crate) session_hist_path: PathBuf,
     pub(crate) session_messages_path: PathBuf,
     pub(crate) session_metadata_path: PathBuf,
+    pub(crate) session_theme_override: Option<String>,
     /// Sidecar recording which server/model this tab's saved orangu-server slot
     /// (if any) was captured under — see `session_store::SessionSlotInfo`.
     pub(crate) session_slot_path: PathBuf,
@@ -190,6 +191,7 @@ impl WorkspaceTab {
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");
         let session_metadata_path = session_dir.join("metadata");
+        let session_theme_override = load_session_theme(&session_dir);
         let session_slot_path = session_dir.join(SESSION_SLOT_FILE);
 
         if !is_resumed {
@@ -250,6 +252,7 @@ impl WorkspaceTab {
             session_hist_path,
             session_messages_path,
             session_metadata_path,
+            session_theme_override,
             session_slot_path,
             current_branch,
             last_review_report: None,
@@ -589,6 +592,7 @@ mod tests {
             session_hist_path: PathBuf::from(workspace),
             session_messages_path: PathBuf::from(workspace),
             session_metadata_path: PathBuf::from(workspace),
+            session_theme_override: None,
             session_slot_path: PathBuf::from(workspace),
             current_branch: None,
             last_review_report: None,

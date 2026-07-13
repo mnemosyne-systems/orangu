@@ -26,8 +26,9 @@ use crate::quotes::QUOTE_OPTIONS;
 use anyhow::{Context, Result, anyhow};
 use orangu::{
     config::{
-        CLIENT_SECTION, DEFAULT_PLATFORM, default_code_max_tokens, default_compile_workers,
-        default_drop_down, default_llm_max_tool_rounds, default_review_max_tokens, default_timeout,
+        CLIENT_SECTION, DEFAULT_PLATFORM, default_auto_dark_theme, default_auto_light_theme,
+        default_code_max_tokens, default_compile_workers, default_drop_down,
+        default_llm_max_tool_rounds, default_review_max_tokens, default_theme, default_timeout,
         default_virtual_width,
     },
     llm::normalized_openai_endpoint,
@@ -60,6 +61,19 @@ const PLATFORM_OPTIONS: &[&str] = &["github", "gitlab"];
 /// for completion and validated. Must stay in step with the placements the
 /// loader accepts (see `orangu::workspaces::WorkspacePlacement`).
 const WORKSPACE_OPTIONS: &[&str] = &["top", "bottom", "left", "right"];
+
+/// Theme values shipped with orangu. User theme files can still be selected at
+/// runtime with `/theme` or `--theme`, but the wizard only writes known-good
+/// bundled values.
+const THEME_OPTIONS: &[&str] = &[
+    "classic",
+    "oranguday",
+    "tokyonight",
+    "rosepine-moon",
+    "auto",
+];
+
+const CONCRETE_THEME_OPTIONS: &[&str] = &["classic", "oranguday", "tokyonight", "rosepine-moon"];
 
 /// Bundled skills that will be installed into `~/.orangu/skills/` during `--init`
 /// if they do not already exist.
@@ -117,6 +131,20 @@ pub async fn run_init() -> Result<()> {
     let quotes = prompt_with_options("quotes", "none", QUOTE_OPTIONS)?;
     let width = prompt_number::<usize>("width", default_virtual_width())?;
     let banner = prompt_with_options("banner", "left", BANNER_OPTIONS)?;
+    let default_theme = default_theme();
+    let theme = prompt_with_options("theme", &default_theme, THEME_OPTIONS)?;
+    let default_auto_dark_theme = default_auto_dark_theme();
+    let auto_dark_theme = prompt_with_options(
+        "auto_dark_theme",
+        &default_auto_dark_theme,
+        CONCRETE_THEME_OPTIONS,
+    )?;
+    let default_auto_light_theme = default_auto_light_theme();
+    let auto_light_theme = prompt_with_options(
+        "auto_light_theme",
+        &default_auto_light_theme,
+        CONCRETE_THEME_OPTIONS,
+    )?;
     let workspaces = prompt_with_options("workspaces", "top", WORKSPACE_OPTIONS)?;
     let drop_down = prompt_bool("drop_down", default_drop_down())?;
     let feedback = prompt_bool("feedback", false)?;
@@ -157,6 +185,15 @@ pub async fn run_init() -> Result<()> {
     }
     if banner != "left" {
         client.push(format!("banner = {banner}"));
+    }
+    if theme != default_theme {
+        client.push(format!("theme = {theme}"));
+    }
+    if auto_dark_theme != default_auto_dark_theme {
+        client.push(format!("auto_dark_theme = {auto_dark_theme}"));
+    }
+    if auto_light_theme != default_auto_light_theme {
+        client.push(format!("auto_light_theme = {auto_light_theme}"));
     }
     if workspaces != "top" {
         client.push(format!("workspaces = {workspaces}"));
@@ -539,6 +576,20 @@ impl Completer for OptionCompleter {
 
 impl Hinter for OptionCompleter {
     type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &RlContext<'_>) -> Option<Self::Hint> {
+        if pos != line.len() || line.is_empty() {
+            return None;
+        }
+        let prefix = line.to_lowercase();
+        self.options
+            .iter()
+            .find(|option| {
+                option.to_lowercase().starts_with(&prefix) && !option.eq_ignore_ascii_case(line)
+            })
+            .map(|option| option[line.len()..].to_string())
+            .filter(|suffix| !suffix.is_empty())
+    }
 }
 
 impl Highlighter for OptionCompleter {}
@@ -568,7 +619,9 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WORKSPACE_OPTIONS, pager_executable, tool_status};
+    use super::{
+        CONCRETE_THEME_OPTIONS, THEME_OPTIONS, WORKSPACE_OPTIONS, pager_executable, tool_status,
+    };
 
     #[test]
     fn workspace_options_are_all_valid_placements() {
@@ -583,6 +636,41 @@ mod tests {
                 "wizard offers an invalid workspaces value: {option}"
             );
         }
+    }
+
+    #[test]
+    fn theme_options_are_known_to_runtime_completion() {
+        let available = orangu::tui::Theme::available_theme_names();
+        for option in THEME_OPTIONS {
+            assert!(
+                available.iter().any(|theme| theme == option),
+                "wizard offers an unknown theme value: {option}"
+            );
+        }
+        assert!(
+            !CONCRETE_THEME_OPTIONS.contains(&"auto"),
+            "auto_dark_theme/auto_light_theme must not offer auto"
+        );
+    }
+
+    #[test]
+    fn option_completer_ghosts_matching_suffix() {
+        let completer = super::OptionCompleter {
+            options: THEME_OPTIONS
+                .iter()
+                .map(|option| option.to_string())
+                .collect(),
+        };
+        let history = rustyline::history::DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        assert_eq!(
+            rustyline::hint::Hinter::hint(&completer, "tok", 3, &ctx),
+            Some("yonight".to_string())
+        );
+        assert_eq!(
+            rustyline::hint::Hinter::hint(&completer, "auto", 4, &ctx),
+            None
+        );
     }
 
     #[test]

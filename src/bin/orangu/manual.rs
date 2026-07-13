@@ -27,11 +27,17 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orangu::tui::{
-    PromptFrameArgs, REVIEW_SEPARATOR, StatusFragment, prompt_prefix, render_prompt_frame,
-    render_user_input_line, review_highlight, review_line_highlight, review_pane_body_height,
-    review_pane_cell, visible_line_width,
+    StatusFragment, Theme, prompt_prefix, review_pane_body_height,
+    text::{clip_line, clip_ratatui_line},
+    visible_line_width,
+    widgets::PromptFrameWidget,
 };
-use std::io::Write;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 
 use super::input::{EscapeCancelState, InputState, ViewportState};
 use super::render::{ANSI_FG_CODE, render_markdown_for_console};
@@ -371,175 +377,200 @@ fn manual_right_width(sections: &[ManualSection], actual_width: usize) -> usize 
         .unwrap_or(0);
     let header = format!("Contents ({})", sections.len());
     let desired = longest.max(header.chars().count());
-    // Always leave room for a separator plus a minimally useful left pane.
-    let cap = actual_width.saturating_sub(2).max(1);
+    // Give the content (left pane) priority by capping the TOC (right pane)
+    // at 25% of the screen (or 25 columns on very small terminals).
+    let cap = (actual_width / 4)
+        .max(25)
+        .min(actual_width.saturating_sub(2).max(1));
     desired.clamp(1, cap)
 }
 
 /// Render the Alt+s search window: the query on the user-input background
 /// with a reverse-video caret, padded to `width`.
-fn render_search_bar(query: &str, cursor: usize, width: usize) -> String {
-    let mut content = String::from("Search: ");
+fn render_search_bar<'a>(
+    query: &'a str,
+    cursor: usize,
+    width: usize,
+    theme: &'a Theme,
+) -> Line<'a> {
+    let mut spans = vec![Span::raw("Search: ")];
     let cursor_chars = query[..cursor.min(query.len())].chars().count();
     let chars: Vec<char> = query.chars().collect();
     for (index, ch) in chars.iter().enumerate() {
         if index == cursor_chars {
-            content.push_str("\x1b[7m");
-            content.push(*ch);
-            content.push_str("\x1b[27m");
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
         } else {
-            content.push(*ch);
+            spans.push(Span::raw(ch.to_string()));
         }
     }
     if cursor_chars >= chars.len() {
-        content.push_str("\x1b[7m \x1b[27m");
+        spans.push(Span::styled(
+            " ",
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
     }
-    render_user_input_line(&content, width)
+
+    let line = Line::from(spans);
+    let clipped = clip_ratatui_line(&line, 0, width);
+
+    let w = clipped.width();
+    let pad = " ".repeat(width.saturating_sub(w));
+
+    let mut padded_spans = clipped.spans;
+    padded_spans.push(Span::raw(pad));
+
+    Line::from(padded_spans).style(theme.user_input.bg(Color::Rgb(40, 40, 40)))
 }
 
 /// Rendering inputs for the manual screen.
-struct ManualScreenArgs<'a> {
-    sections: &'a [ManualSection],
-    selected: usize,
-    /// Highlighted line within the selected section's text.
-    line: usize,
-    scroll: usize,
-    x_offset: usize,
-    /// When set, the search window `(query, cursor)` is drawn as the first
-    /// row of the left pane.
-    search: Option<(&'a str, usize)>,
-    /// Transient status-bar message shown on the left of the status line.
-    notice: Option<&'a str>,
-    current_model: &'a str,
-    prompt_branch: Option<&'a str>,
-    pending_count: usize,
-    actual_width: usize,
-    actual_height: usize,
-}
+fn draw_manual_screen(
+    frame: &mut ratatui::Frame,
+    state: &ManualState,
+    viewport: &ViewportState,
+    chrome: ManualChrome<'_>,
+    theme: &Theme,
+) {
+    let width = viewport.actual_width.max(1) as u16;
+    let height = viewport.actual_height.max(1) as u16;
 
-fn render_manual_screen(args: &ManualScreenArgs<'_>) -> String {
-    let width = args.actual_width.max(1);
-    let height = args.actual_height.max(1);
-
-    // Reserve the bottom prompt frame exactly like the review screen. The
-    // input window is always empty in the manual, so the frame is four rows.
-    let prompt_prefix = prompt_prefix(args.prompt_branch);
+    let prompt_prefix = prompt_prefix(chrome.prompt_branch);
     let pane_rows = height.saturating_sub(4).max(1);
 
-    let right_width = manual_right_width(args.sections, width);
+    let right_width = manual_right_width(&state.sections, width as usize) as u16;
     let left_width = width.saturating_sub(right_width + 1).max(1);
-    let body_height = pane_rows.saturating_sub(1);
+    let body_height = pane_rows.saturating_sub(1) as usize;
 
-    // Keep the selected entry visible in the right pane.
-    let list_start = if args.selected >= body_height {
-        args.selected - body_height + 1
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(pane_rows), Constraint::Length(4)])
+        .split(Rect::new(0, 0, width, height));
+
+    let panes_area = layout[0];
+    let prompt_area = layout[1];
+
+    let panes_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_width),
+            Constraint::Length(1),
+            Constraint::Length(right_width),
+        ])
+        .split(panes_area);
+
+    let left_area = panes_layout[0];
+    let sep_area = panes_layout[1];
+    let right_area = panes_layout[2];
+
+    let list_start = if state.selected >= body_height {
+        state.selected - body_height + 1
     } else {
         0
     };
 
     let title = "Manual  Alt+j/k Switch section  Alt+s Search  Alt+x Exit";
-    let right_header = format!("Contents ({})", args.sections.len());
+    let right_header = format!("Contents ({})", state.sections.len());
 
-    // The left pane shows only the selected section's text; the search window
-    // (when open) takes its first row.
-    let selected_lines: &[String] = args
+    let mut left_lines = vec![Line::from(clip_line(title, 0, left_area.width as usize))];
+    let mut right_lines = vec![Line::from(clip_line(
+        &right_header,
+        0,
+        right_area.width as usize,
+    ))];
+    let mut sep_lines = vec![Line::from(Span::styled("│", theme.muted))];
+
+    let selected_lines: &[String] = state
         .sections
-        .get(args.selected)
+        .get(state.selected)
         .map(|section| section.lines.as_slice())
         .unwrap_or(&[]);
-    let search_bar = args
-        .search
-        .map(|(query, cursor)| render_search_bar(query, cursor, left_width));
+
+    let search_bar = state.search.as_ref().map(|editor| {
+        render_search_bar(
+            editor.as_str(),
+            editor.cursor(),
+            left_area.width as usize,
+            theme,
+        )
+    });
     let text_row_offset = usize::from(search_bar.is_some());
 
-    let mut rows: Vec<String> = Vec::with_capacity(pane_rows);
-    rows.push(format!(
-        "{}{}{}",
-        review_pane_cell(title, 0, left_width),
-        REVIEW_SEPARATOR,
-        review_pane_cell(&right_header, 0, right_width),
-    ));
-
     for row in 0..body_height {
-        let left = if row == 0 && search_bar.is_some() {
-            search_bar.clone().unwrap_or_default()
+        sep_lines.push(Line::from(Span::styled("│", theme.muted)));
+
+        if row == 0 && search_bar.is_some() {
+            left_lines.push(search_bar.clone().unwrap());
         } else {
-            let line_index = args.scroll + row - text_row_offset;
+            let line_index = state.scroll + row - text_row_offset;
             match selected_lines.get(line_index) {
                 Some(line) => {
-                    let cell = review_pane_cell(line, args.x_offset, left_width);
-                    if line_index == args.line {
-                        review_line_highlight(&cell)
+                    let clipped = clip_line(line, state.x_offset, left_area.width as usize);
+                    let mut spans = Vec::new();
+                    if let Ok(text) = ansi_to_tui::IntoText::into_text(&clipped) {
+                        if let Some(parsed_line) = text.lines.into_iter().next() {
+                            spans.extend(parsed_line.spans);
+                        }
                     } else {
-                        cell
+                        spans.push(Span::raw(clipped));
                     }
+
+                    let mut line_rat = Line::from(spans);
+                    if line_index == state.line {
+                        line_rat = line_rat.style(theme.cursor_line_bg);
+                    }
+                    left_lines.push(line_rat);
                 }
-                None => review_pane_cell("", 0, left_width),
+                None => left_lines.push(Line::raw("")),
             }
         };
+
         let section_index = list_start + row;
-        let right = match args.sections.get(section_index) {
+        match state.sections.get(section_index) {
             Some(section) => {
-                let cell = review_pane_cell(&section.toc_label(), 0, right_width);
-                if section_index == args.selected {
-                    review_highlight(&cell)
-                } else {
-                    cell
+                let clipped = clip_line(&section.toc_label(), 0, right_area.width as usize);
+                let mut line = Line::from(clipped);
+                if section_index == state.selected {
+                    line = line.style(theme.cursor_line_bg);
                 }
+                right_lines.push(line);
             }
-            None => review_pane_cell("", 0, right_width),
-        };
-        rows.push(format!("{left}{REVIEW_SEPARATOR}{right}"));
+            None => right_lines.push(Line::raw("")),
+        }
     }
 
-    let mut screen = rows.join("\r\n");
-    screen.push_str("\r\n");
-    screen.push_str(&render_prompt_frame(PromptFrameArgs {
-        header_height: pane_rows,
-        current_model: args.current_model,
-        left_status: args
-            .notice
-            .map(|notice| StatusFragment::plain(notice.to_string())),
-        pending_count: args.pending_count,
-        // The Graph status dot is `/auto_review`-only.
-        graph_status: None,
+    frame.render_widget(Paragraph::new(left_lines), left_area);
+    frame.render_widget(Paragraph::new(sep_lines), sep_area);
+    frame.render_widget(Paragraph::new(right_lines), right_area);
+
+    let current_model = orangu::tui::header::display_model_name(false, chrome.current_model);
+    let notice = state
+        .notice
+        .as_ref()
+        .map(|notice| StatusFragment::plain(notice.clone()));
+    let prompt_widget = PromptFrameWidget {
+        current_model,
         prompt_prefix: &prompt_prefix,
         input: "",
         cursor: 0,
         ghost: "",
-        height,
-        actual_width: width,
         valid_command_len: 0,
-    }));
-    screen
-}
-
-fn print_manual_screen(state: &ManualState, viewport: &ViewportState, chrome: ManualChrome<'_>) {
-    print!("{}", super::CLEAR_TERMINAL_SEQUENCE);
-    print!(
-        "{}",
-        render_manual_screen(&ManualScreenArgs {
-            sections: &state.sections,
-            selected: state.selected,
-            line: state.line,
-            scroll: state.scroll,
-            x_offset: state.x_offset,
-            search: state
-                .search
-                .as_ref()
-                .map(|editor| (editor.as_str(), editor.cursor())),
-            notice: state.notice.as_deref(),
-            current_model: chrome.current_model,
-            prompt_branch: chrome.prompt_branch,
-            pending_count: chrome.pending_count,
-            actual_width: viewport.actual_width,
-            actual_height: viewport.actual_height,
-        })
-    );
+        left_status: notice.as_ref(),
+        pending_count: chrome.pending_count,
+        graph_status: None,
+        prompt_branch: None,
+    };
+    frame.render_widget(prompt_widget, prompt_area);
 }
 
 /// Run the manual viewer event loop until the user exits (Alt+x or Esc Esc).
-pub fn run_manual_mode(viewport: &mut ViewportState, chrome: ManualChrome<'_>) -> Result<()> {
+pub fn run_manual_mode(
+    viewport: &mut ViewportState,
+    chrome: ManualChrome<'_>,
+    terminal_guard: &mut super::terminal::TerminalUiGuard,
+) -> Result<()> {
+    let theme = Theme::current();
     let mut state = ManualState::new(manual_sections());
     let mut escape_cancel = EscapeCancelState::default();
     loop {
@@ -556,12 +587,28 @@ pub fn run_manual_mode(viewport: &mut ViewportState, chrome: ManualChrome<'_>) -
         let right_width = manual_right_width(&state.sections, viewport.actual_width);
         let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
         state.clamp(text_height, left_width);
-        print_manual_screen(&state, viewport, chrome);
-        std::io::stdout().flush()?;
+
+        terminal_guard.terminal.draw(|f| {
+            draw_manual_screen(f, &state, viewport, chrome, &theme);
+        })?;
 
         let (code, modifiers) = match event::read()? {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
+                continue;
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                ..
+            }) => {
+                state.scroll = state.scroll.saturating_sub(1);
+                continue;
+            }
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                ..
+            }) => {
+                state.scroll = state.scroll.saturating_add(1);
                 continue;
             }
             Event::Key(KeyEvent {
@@ -648,10 +695,7 @@ pub fn run_manual_mode(viewport: &mut ViewportState, chrome: ManualChrome<'_>) -
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ANSI_FG_CODE, ManualScreenArgs, ManualSection, ManualState, is_code_fence_line,
-        manual_sections, page_heading, render_manual_screen,
-    };
+    use super::{ManualSection, ManualState, is_code_fence_line, manual_sections, page_heading};
     use crate::input::InputState;
     use crate::render::ANSI_FG_LINK;
 
@@ -815,110 +859,18 @@ mod tests {
 
     #[test]
     fn code_fence_lines_are_detected() {
-        assert!(is_code_fence_line(&format!("{ANSI_FG_CODE}```text")));
-        assert!(is_code_fence_line(&format!("{ANSI_FG_CODE}```")));
-        assert!(!is_code_fence_line(&format!("{ANSI_FG_CODE}`inline`")));
+        assert!(is_code_fence_line(&format!(
+            "{}```text",
+            crate::render::ANSI_FG_CODE
+        )));
+        assert!(is_code_fence_line(&format!(
+            "{}```",
+            crate::render::ANSI_FG_CODE
+        )));
+        assert!(!is_code_fence_line(&format!(
+            "{}`inline`",
+            crate::render::ANSI_FG_CODE
+        )));
         assert!(!is_code_fence_line("plain text"));
-    }
-
-    #[test]
-    fn render_manual_screen_shows_selected_text_and_contents() {
-        let sections = vec![
-            section("Alpha", 1, &["alpha line"]),
-            section("Beta", 2, &["beta line"]),
-        ];
-        let rendered = render_manual_screen(&ManualScreenArgs {
-            sections: &sections,
-            selected: 0,
-            line: 0,
-            scroll: 0,
-            x_offset: 0,
-            search: None,
-            notice: None,
-            current_model: "my-model",
-            prompt_branch: None,
-            pending_count: 0,
-            actual_width: 70,
-            actual_height: 12,
-        });
-        assert!(rendered.contains("Manual"));
-        assert!(rendered.contains("Contents (2)"));
-        // Only the selected section's text is shown in the left pane.
-        assert!(rendered.contains("alpha line"));
-        assert!(!rendered.contains("beta line"));
-        // The TOC shows both entries, the level-2 one indented.
-        assert!(rendered.contains("Alpha"));
-        assert!(rendered.contains("  Beta"));
-        // The status bar (model name) is still present.
-        assert!(rendered.contains("my-model"));
-    }
-
-    #[test]
-    fn render_manual_screen_highlights_the_cursor_line() {
-        let sections = vec![section("Alpha", 1, &["line zero", "line one"])];
-        let rendered = render_manual_screen(&ManualScreenArgs {
-            sections: &sections,
-            selected: 0,
-            line: 1,
-            scroll: 0,
-            x_offset: 0,
-            search: None,
-            notice: None,
-            current_model: "model",
-            prompt_branch: None,
-            pending_count: 0,
-            actual_width: 50,
-            actual_height: 10,
-        });
-        assert!(
-            rendered.contains("\u{1b}[48;2;60;60;90mline one"),
-            "cursor line not highlighted"
-        );
-        assert!(!rendered.contains("\u{1b}[48;2;60;60;90mline zero"));
-    }
-
-    #[test]
-    fn render_manual_screen_shows_the_search_window() {
-        let sections = vec![section("Alpha", 1, &["alpha line"])];
-        let rendered = render_manual_screen(&ManualScreenArgs {
-            sections: &sections,
-            selected: 0,
-            line: 0,
-            scroll: 0,
-            x_offset: 0,
-            search: Some(("needle", "needle".len())),
-            notice: None,
-            current_model: "model",
-            prompt_branch: None,
-            pending_count: 0,
-            actual_width: 70,
-            actual_height: 12,
-        });
-        assert!(
-            rendered.contains("Search: needle"),
-            "search window with the query missing"
-        );
-        // The section text is still shown below the search window.
-        assert!(rendered.contains("alpha line"));
-    }
-
-    #[test]
-    fn render_manual_screen_shows_notice_on_status_bar() {
-        let sections = vec![section("Alpha", 1, &["alpha line"])];
-        let rendered = render_manual_screen(&ManualScreenArgs {
-            sections: &sections,
-            selected: 0,
-            line: 0,
-            scroll: 0,
-            x_offset: 0,
-            search: None,
-            notice: Some("No match for 'missing'"),
-            current_model: "model",
-            prompt_branch: None,
-            pending_count: 0,
-            actual_width: 70,
-            actual_height: 12,
-        });
-        assert!(rendered.contains("No match for 'missing'"));
     }
 }

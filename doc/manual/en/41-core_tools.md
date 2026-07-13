@@ -163,6 +163,39 @@ select server local-llama
 
 \newpage
 
+## /theme
+
+Selects the UI theme for the current session.
+
+Built-in themes are shipped inside the binary: `classic`, `oranguday`, `tokyonight`, and `rosepine-moon`. The `auto` selector follows the detected terminal appearance, using the configured `auto_dark_theme` and `auto_light_theme` values from `orangu.conf`.
+
+Custom themes can be placed in:
+
+```text
+~/.orangu/themes/<name>.theme
+```
+
+With a theme name, `/theme` applies it immediately and writes a session override to:
+
+```text
+~/.orangu/sessions/<UUID>/theme
+```
+
+That override is restored when the session is resumed or when you switch back to that workspace tab. Use `/theme default` (or `/theme global`) to remove the session override and return to the global `[orangu].theme` from `orangu.conf`.
+
+Pressing `Tab` after `/theme ` completes `default`, the built-in themes, `auto`, and any user theme files found in `~/.orangu/themes/`.
+
+### Examples
+
+```text
+/theme classic
+/theme tokyonight
+/theme auto
+/theme default
+```
+
+\newpage
+
 ## /information
 
 Reports everything `orangu` can learn about the active server: every OpenAI-compatible endpoint orangu itself talks to (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever native endpoints it exposes. It is handled entirely locally, needs no arguments, and never sends anything to the model.

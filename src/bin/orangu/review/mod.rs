@@ -21,13 +21,29 @@ mod interactive;
 pub(crate) use auto::*;
 pub(crate) use interactive::*;
 
+use std::cell::RefCell;
+
+thread_local! {
+    static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+
 /// Copy `text` to the system clipboard.
 pub(crate) fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = arboard::Clipboard::new().context("failed to access the clipboard")?;
-    clipboard
-        .set_text(text.to_string())
-        .context("failed to write to the clipboard")?;
-    Ok(())
+    CLIPBOARD.with(|cb| {
+        let mut cb_guard = cb.borrow_mut();
+        if cb_guard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => *cb_guard = Some(c),
+                Err(e) => return Err(anyhow::anyhow!("failed to access the clipboard: {}", e)),
+            }
+        }
+        if let Some(clipboard) = cb_guard.as_mut() {
+            clipboard
+                .set_text(text.to_string())
+                .context("failed to write to the clipboard")?;
+        }
+        Ok(())
+    })
 }
 
 /// The human-readable status label for a file in the exit summary.

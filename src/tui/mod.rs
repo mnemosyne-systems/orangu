@@ -14,11 +14,16 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 mod auto_review;
-mod header;
+pub mod auto_review_native;
+pub mod header;
 mod helper;
-mod review;
-mod screen;
-mod text;
+pub mod renderer;
+pub mod review;
+pub mod review_native;
+pub mod screen;
+pub mod text;
+pub mod theme;
+pub mod widgets;
 
 pub use auto_review::*;
 pub use header::*;
@@ -26,18 +31,36 @@ pub use helper::*;
 pub use review::*;
 pub use screen::*;
 pub use text::*;
+pub use theme::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptLine {
     Plain(String),
     UserInput(String),
     Wide(String),
+    CodeBlock {
+        language: Option<String>,
+        ansi_lines: Vec<String>,
+    },
+    Collapsible {
+        id: usize,
+        title: String,
+        content: String,
+        expanded: bool,
+    },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
 }
 
 impl TranscriptLine {
     pub fn as_str(&self) -> &str {
         match self {
             TranscriptLine::Plain(s) | TranscriptLine::UserInput(s) | TranscriptLine::Wide(s) => s,
+            TranscriptLine::CodeBlock { .. } => "",
+            TranscriptLine::Collapsible { content, .. } => content,
+            TranscriptLine::ToolCall { name, .. } => name,
         }
     }
 }
@@ -45,14 +68,7 @@ impl TranscriptLine {
 pub(crate) const STATUS_GREEN: &str = "\x1b[38;2;80;200;120m";
 pub(crate) const STATUS_RED: &str = "\x1b[38;2;220;80;80m";
 pub(crate) const STATUS_WHITE: &str = "\x1b[38;2;230;230;230m";
-/// The Ignore dot in `/auto_review`: a file marked Ignore (Alt+m) is skipped
-/// from the run and shown with this blue dot.
-pub(crate) const STATUS_BLUE: &str = "\x1b[38;2;100;160;230m";
-/// The Deep dot in `/auto_review`: a file marked Deep (Alt+m) is reviewed with
-/// extra passes (no diff compression, cross-file graph context, and a verify
-/// pass on rejected findings) and shown with this purple dot before the run
-/// starts.
-pub(crate) const STATUS_PURPLE: &str = "\x1b[38;2;170;120;220m";
+
 pub(crate) const ANSI_RESET: &str = "\x1b[0m";
 pub const FEEDBACK_OK: &str = "\x1b[38;2;80;200;120m●\x1b[0m";
 pub const FEEDBACK_ERR: &str = "\x1b[38;2;220;80;80m●\x1b[0m";
@@ -84,6 +100,7 @@ pub(crate) mod test_fixtures {
         ReviewScreenArgs {
             files,
             selected,
+            list_offset: 0,
             line: 0,
             scroll,
             x_offset: 0,
@@ -111,6 +128,7 @@ pub(crate) mod test_fixtures {
         AutoReviewScreenArgs {
             files,
             selected: None,
+            list_offset: 0,
             reviewing: None,
             browsing: false,
             prestart: false,
@@ -135,3 +153,6 @@ pub(crate) mod test_fixtures {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

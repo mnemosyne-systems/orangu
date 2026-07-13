@@ -222,6 +222,7 @@ pub fn help_text() -> &'static str {
 /statistics [total]                             Show persistent, cross-session activity history and a daily heatmap for this workspace, or every workspace (total)
 /schedule                                       List the cron-style scheduled jobs from ~/.orangu/schedule with their next run times (UTC)
 /skills                                         List discovered Agent Skills; invoke one with /skill-name
+/theme <name>|default                           Set this session's UI theme, or default to return to orangu.conf
 /clear                                          Clear the current conversation
 /quit                                           Exit the client
 

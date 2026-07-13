@@ -143,7 +143,15 @@ pub fn run_explorer_subagent<'a>(
         config_clone.max_tool_rounds = max_turns;
 
         let response = session
-            .prompt(&prompt, &config_clone, &tools, |_| {}, |_| {}, |_| {})
+            .prompt(
+                &prompt,
+                &config_clone,
+                &tools,
+                |_| {},
+                |_| {},
+                |_| {},
+                |_| {},
+            )
             .await?;
 
         // Try to extract the final answer block

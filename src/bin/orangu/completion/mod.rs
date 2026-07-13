@@ -148,6 +148,43 @@ fn export_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
     Some((token_start, candidates))
 }
 
+/// Tab/ghost completion for `/theme <name>` — and its natural-language `theme
+/// <name>`, `use theme <name>`, `switch theme to <name>`, and `set theme to
+/// <name>` forms — as `(token_start, candidates)`: available session themes
+/// (`default`, `auto`, built-ins, and user theme files).
+fn theme_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
+    let (token_start, value) = prefix
+        .strip_prefix("/theme ")
+        .map(|value| ("/theme ".len(), value))
+        .or_else(|| {
+            prefix
+                .strip_prefix("theme ")
+                .map(|value| ("theme ".len(), value))
+        })
+        .or_else(|| {
+            prefix
+                .strip_prefix("use theme ")
+                .map(|value| ("use theme ".len(), value))
+        })
+        .or_else(|| {
+            prefix
+                .strip_prefix("switch theme to ")
+                .map(|value| ("switch theme to ".len(), value))
+        })
+        .or_else(|| {
+            prefix
+                .strip_prefix("set theme to ")
+                .map(|value| ("set theme to ".len(), value))
+        })?;
+    let lower = value.to_ascii_lowercase();
+    let themes = orangu::tui::Theme::available_session_theme_names();
+    let candidates = themes
+        .into_iter()
+        .filter(|t| t.to_ascii_lowercase().starts_with(&lower))
+        .collect();
+    Some((token_start, candidates))
+}
+
 /// Tab/ghost completion for the `/build [debug|release] [<target>]` argument
 /// as `(token_start, candidates)`: the profile keywords plus the workspace's
 /// discovered build targets (cargo binary names, Makefile rule names — see
@@ -240,6 +277,10 @@ fn structured_completion_candidates(
                 .cloned()
                 .collect(),
         ));
+    }
+
+    if let Some((start, candidates)) = theme_completion_candidates(prefix) {
+        return Some((start, cursor, candidates));
     }
 
     if let Some((start, token)) = pull_completion_prefix(prefix) {
@@ -523,6 +564,40 @@ mod tests {
             auto_review_completion_candidates("/auto_review de", workspace.path())
                 .expect("auto-review argument");
         assert!(candidates.iter().any(|c| c == "deep"), "{candidates:?}");
+    }
+
+    #[test]
+    fn theme_completion_offers_default_and_builtins() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+        for prefix in [
+            "/theme ",
+            "theme ",
+            "use theme ",
+            "switch theme to ",
+            "set theme to ",
+        ] {
+            let (start, _, candidates) =
+                completion_candidates(prefix, prefix.len(), workspace.path(), &[], &[], &skills)
+                    .expect("theme candidates");
+            assert_eq!(start, prefix.len());
+            for expected in ["default", "classic", "auto"] {
+                assert!(
+                    candidates.iter().any(|candidate| candidate == expected),
+                    "missing {expected} for {prefix:?}: {candidates:?}"
+                );
+            }
+        }
+
+        // The inline ghost suffix previews matching theme name
+        assert_eq!(
+            completion_ghost_suffix("/theme c", 8, workspace.path(), &[], &[], &skills),
+            Some("lassic".to_string())
+        );
+        assert_eq!(
+            completion_ghost_suffix("use theme c", 11, workspace.path(), &[], &[], &skills),
+            Some("lassic".to_string())
+        );
     }
 
     #[test]

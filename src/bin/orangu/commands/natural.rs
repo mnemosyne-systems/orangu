@@ -129,6 +129,12 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "switch server to ",
     "set server to ",
     "select server ",
+    // --- theme (select) ---
+    "use theme ",
+    "switch theme to ",
+    "set theme to ",
+    "theme ",
+    "theme",
     // --- model (select) ---
     "use model ",
     "switch model to ",
@@ -559,6 +565,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         if let Some(name) = strip_ascii_prefix(input, prefix) {
             return Some(LocalCommand::SetServer(name.trim()));
         }
+    }
+    for prefix in ["use theme ", "switch theme to ", "set theme to ", "theme "] {
+        if let Some(name) = strip_ascii_prefix(input, prefix) {
+            return Some(LocalCommand::SetTheme(name.trim()));
+        }
+    }
+    if matches_ci(input, &["theme"]) {
+        return Some(LocalCommand::SetTheme(""));
     }
     for prefix in [
         "use model ",

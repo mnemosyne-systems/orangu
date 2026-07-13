@@ -30,18 +30,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::VERSION;
+
 use super::completion::{
     completion_candidates, first_ghost_word, natural_language_ghost_candidates,
     natural_language_ghost_suffix_at,
 };
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const ESC_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CTRL_C_EXIT_MESSAGE: &str = "Press Ctrl+c again to quit";
 pub const IDLE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub const TRANSCRIPT_MAX_LINES: usize = 10_000;
+
+pub(crate) fn wheel_scroll_lines(visible_rows: usize) -> usize {
+    match visible_rows {
+        0..=10 => 1,
+        11..=24 => 2,
+        _ => 3,
+    }
+}
+
+pub(crate) fn page_scroll_lines(visible_rows: usize) -> usize {
+    visible_rows.saturating_sub(2).max(1)
+}
 
 pub struct CompletionState {
     pub start: usize,
@@ -159,15 +171,19 @@ impl ViewportState {
         self.x_offset = self.x_offset.saturating_sub(1);
     }
 
-    pub fn pan_right(&mut self, max_content_width: usize) {
+    pub fn pan_right(&mut self, max_content_width: usize, visible_width: usize) {
         self.x_offset = self.x_offset.saturating_add(1);
-        let effective_right = max_content_width.min(self.virtual_width);
-        let max_offset = effective_right.saturating_sub(self.actual_width);
-        self.x_offset = self.x_offset.min(max_offset);
+        self.clamp_to_content(max_content_width, visible_width);
     }
 
     fn clamp_offset(&mut self) {
         let max_offset = self.virtual_width.saturating_sub(self.actual_width);
+        self.x_offset = self.x_offset.min(max_offset);
+    }
+
+    pub fn clamp_to_content(&mut self, max_content_width: usize, visible_width: usize) {
+        let effective_right = max_content_width.min(self.virtual_width);
+        let max_offset = effective_right.saturating_sub(visible_width.max(1));
         self.x_offset = self.x_offset.min(max_offset);
     }
 }
@@ -175,10 +191,11 @@ impl ViewportState {
 #[derive(Clone)]
 pub struct ScreenState<'a> {
     pub transcript: &'a [TranscriptLine],
+    pub transcript_epoch: usize,
     pub scroll_offset: usize,
     pub left_status: Option<StatusFragment>,
     pub pending_count: usize,
-    pub pending_line: Option<&'a str>,
+    pub pending_lines: &'a [TranscriptLine],
     pub input: &'a str,
     pub cursor: usize,
     pub ghost_index: usize,
@@ -190,6 +207,7 @@ pub struct StreamRenderState {
     pub output: String,
     pub metrics: StreamMetrics,
     pub tool_running_since: Option<std::time::Instant>,
+    pub native_tool_calls: Vec<orangu::llm::ToolCall>,
 }
 
 #[derive(Debug, Default)]
@@ -276,6 +294,7 @@ pub struct WaitContext<'a> {
 #[derive(Default)]
 pub struct OutputState {
     pub transcript: Vec<TranscriptLine>,
+    pub render_epoch: usize,
     pub scroll_offset: usize,
 }
 
@@ -288,9 +307,94 @@ impl OutputState {
         self.scroll_offset
     }
 
+    pub fn render_epoch(&self) -> usize {
+        self.render_epoch
+    }
+
     pub fn clear(&mut self) {
         self.transcript.clear();
+        self.render_epoch = self.render_epoch.wrapping_add(1);
         self.scroll_offset = 0;
+    }
+
+    pub fn toggle_collapse(&mut self, id: usize) -> bool {
+        for line in &mut self.transcript {
+            if let TranscriptLine::Collapsible {
+                id: line_id,
+                expanded,
+                ..
+            } = line
+                && *line_id == id
+            {
+                *expanded = !*expanded;
+                self.render_epoch = self.render_epoch.wrapping_add(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn collapsible_id_at(
+        &self,
+        click_y: usize,
+        available_output_rows: usize,
+        inner_width: usize,
+        has_status_line: bool,
+    ) -> Option<usize> {
+        let mut visual_lines = Vec::new();
+        let mut user_inputs = Vec::new();
+        let theme = orangu::tui::theme::Theme::current();
+        for line in &self.transcript {
+            let start = visual_lines.len();
+            let rendered = orangu::tui::render_transcript_line_multi(line, inner_width, &theme);
+            let id = match line {
+                TranscriptLine::Collapsible { id, .. } => Some(*id),
+                _ => None,
+            };
+            visual_lines.extend(std::iter::repeat_n(id, rendered.len()));
+            if matches!(line, TranscriptLine::UserInput(_)) {
+                user_inputs.push((start, visual_lines[start..].to_vec()));
+            }
+        }
+
+        // Keep this mapping identical to `draw_screen`: while at the bottom,
+        // a status row consumes one transcript row and the latest prior user
+        // prompt is pinned at the top of the visible view.
+        let max_scroll_offset = if has_status_line {
+            visual_lines
+                .len()
+                .saturating_sub(available_output_rows.saturating_sub(1))
+        } else {
+            visual_lines.len().saturating_sub(available_output_rows)
+        };
+        let scroll_offset = self.scroll_offset.min(max_scroll_offset);
+        let text_rows = if has_status_line && scroll_offset == 0 {
+            available_output_rows.saturating_sub(1)
+        } else {
+            available_output_rows
+        };
+        let visible_end = visual_lines.len().saturating_sub(scroll_offset);
+        let visible_start = visible_end.saturating_sub(text_rows);
+        let mut visible_lines = visual_lines[visible_start..visible_end].to_vec();
+
+        if let Some(sticky_idx) = user_inputs
+            .iter()
+            .rposition(|(start, _)| *start < visible_start)
+        {
+            let (_, sticky_lines) = &user_inputs[sticky_idx];
+            let next_start = user_inputs
+                .get(sticky_idx + 1)
+                .map(|(start, _)| *start)
+                .unwrap_or(usize::MAX);
+            let draw_count = sticky_lines
+                .len()
+                .min(next_start.saturating_sub(visible_start))
+                .min(visible_lines.len());
+            visible_lines[..draw_count]
+                .clone_from_slice(&sticky_lines[sticky_lines.len() - draw_count..]);
+        }
+
+        visible_lines.get(click_y).copied().flatten()
     }
 
     pub fn reset_scroll(&mut self) {
@@ -312,10 +416,7 @@ impl OutputState {
     }
 
     pub fn push_input(&mut self, text: &str) {
-        self.push_lines(
-            text.lines()
-                .map(|line| TranscriptLine::UserInput(line.to_owned())),
-        );
+        self.push_lines(std::iter::once(TranscriptLine::UserInput(text.to_owned())));
     }
 
     pub fn push_lines<I>(&mut self, lines: I)
@@ -325,6 +426,9 @@ impl OutputState {
         let collected = lines.collect::<Vec<_>>();
         let added_lines = collected.len();
         self.transcript.extend(collected);
+        if added_lines > 0 {
+            self.render_epoch = self.render_epoch.wrapping_add(1);
+        }
         if self.scroll_offset > 0 {
             self.scroll_offset = self.scroll_offset.saturating_add(added_lines);
         }
@@ -337,7 +441,125 @@ impl OutputState {
     }
 
     pub fn push_markdown(&mut self, text: &str) {
-        self.push_text(&super::render::render_markdown_for_console(text));
+        self.push_parsed(text, false);
+    }
+
+    pub fn push_parsed(&mut self, text: &str, is_streaming: bool) {
+        let mut remaining = text;
+        let mut next_id = self.transcript.len() + 1000;
+
+        while !remaining.is_empty() {
+            let think_pos = remaining.find("<think>");
+            let tool_pos = remaining.find("<tool_call");
+
+            let (tag_type, start_idx) = match (think_pos, tool_pos) {
+                (Some(t1), Some(t2)) if t1 < t2 => ("think", t1),
+                (Some(_t1), Some(t2)) => ("tool_call", t2),
+                (Some(t1), None) => ("think", t1),
+                (None, Some(t2)) => ("tool_call", t2),
+                (None, None) => {
+                    if !remaining.trim().is_empty() {
+                        for chunk in crate::render::parse_markdown_chunks(remaining) {
+                            match chunk {
+                                crate::render::MarkdownChunk::Text(t) => self.push_text(&t),
+                                crate::render::MarkdownChunk::Code { language, content } => {
+                                    let ansi_lines = crate::render::render_syntax_highlighted_code(
+                                        language.as_deref(),
+                                        &content,
+                                    );
+                                    self.push_lines(std::iter::once(
+                                        orangu::tui::TranscriptLine::CodeBlock {
+                                            language,
+                                            ansi_lines,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            };
+
+            let before = &remaining[..start_idx];
+            if !before.trim().is_empty() {
+                for chunk in crate::render::parse_markdown_chunks(before) {
+                    match chunk {
+                        crate::render::MarkdownChunk::Text(t) => self.push_text(&t),
+                        crate::render::MarkdownChunk::Code { language, content } => {
+                            let ansi_lines = crate::render::render_syntax_highlighted_code(
+                                language.as_deref(),
+                                &content,
+                            );
+                            self.push_lines(std::iter::once(
+                                orangu::tui::TranscriptLine::CodeBlock {
+                                    language,
+                                    ansi_lines,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let title: String;
+            let tag_end: usize;
+            let end_tag: &str;
+
+            if tag_type == "think" {
+                title = "Thought".to_string();
+                tag_end = start_idx + "<think>".len();
+                end_tag = "</think>";
+            } else {
+                let tag_str = &remaining[start_idx..];
+                if let Some(close_bracket) = tag_str.find('>') {
+                    let full_open_tag = &tag_str[..=close_bracket];
+                    if let Some(name_start) = full_open_tag.find("name=\"") {
+                        let name_part = &full_open_tag[name_start + 6..];
+                        if let Some(name_end) = name_part.find('"') {
+                            title = format!("Tool Call: {}", &name_part[..name_end]);
+                        } else {
+                            title = "Tool Call".to_string();
+                        }
+                    } else {
+                        title = "Tool Call".to_string();
+                    }
+                    tag_end = start_idx + close_bracket + 1;
+                } else {
+                    tag_end = start_idx + "<tool_call".len();
+                    title = "Tool Call".to_string();
+                }
+                end_tag = "</tool_call>";
+            }
+
+            remaining = &remaining[tag_end..];
+
+            let (content, after) = if let Some(end_idx) = remaining.find(end_tag) {
+                (&remaining[..end_idx], &remaining[end_idx + end_tag.len()..])
+            } else {
+                (remaining, "")
+            };
+
+            // During streaming, keep only the newest thinking/tool block open.
+            // Earlier blocks are complete context and should fold away when the
+            // model starts the next block, matching the transcript behavior of
+            // the finalized response.
+            if is_streaming {
+                for line in &mut self.transcript {
+                    if let TranscriptLine::Collapsible { expanded, .. } = line {
+                        *expanded = false;
+                    }
+                }
+            }
+            self.push_lines(std::iter::once(TranscriptLine::Collapsible {
+                id: next_id,
+                title,
+                content: content.trim().to_string(),
+                expanded: is_streaming,
+            }));
+            next_id += 1;
+            remaining = after;
+        }
     }
 
     pub fn max_content_width(&self) -> usize {
@@ -350,19 +572,27 @@ impl OutputState {
     }
 
     pub fn page_up(&mut self, rows: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(rows.max(1));
+        self.scroll_offset = self.scroll_offset.saturating_add(page_scroll_lines(rows));
     }
 
     pub fn page_down(&mut self, rows: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(page_scroll_lines(rows));
+    }
+
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(rows.max(1));
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows.max(1));
     }
 
     pub fn line_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
+        self.scroll_up(1);
     }
 
     pub fn line_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.scroll_down(1);
     }
 }
 
@@ -370,6 +600,31 @@ impl OutputState {
 pub struct DropdownState {
     pub candidates: Vec<(String, String)>,
     pub selected_index: usize,
+    pub replacement_start: usize,
+}
+
+impl DropdownState {
+    /// Move selection up, wrapping from first item to last.
+    pub fn select_previous(&mut self) {
+        let len = self.candidates.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_index = if self.selected_index == 0 {
+            len - 1
+        } else {
+            self.selected_index - 1
+        };
+    }
+
+    /// Move selection down, wrapping from last item to first.
+    pub fn select_next(&mut self) {
+        let len = self.candidates.len();
+        if len == 0 {
+            return;
+        }
+        self.selected_index = (self.selected_index + 1) % len;
+    }
 }
 
 #[derive(Default)]
@@ -381,6 +636,7 @@ pub struct InputState {
     pub history_index: Option<usize>,
     pub history_draft: String,
     pub dropdown: Option<DropdownState>,
+    pub last_mouse_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 impl InputState {
@@ -564,13 +820,27 @@ impl InputState {
             return;
         }
 
-        if self.buffer.starts_with('/') && !self.buffer.contains(' ') {
-            let candidates =
-                super::completion::slash_command_dropdown_candidates(&self.buffer, skills);
+        let is_theme_arg = self.buffer.starts_with("/theme ");
+        let no_space = !self.buffer.contains(' ');
+
+        if self.buffer.starts_with('/') && (no_space || is_theme_arg) {
+            let candidates = if is_theme_arg {
+                let prefix = &self.buffer["/theme ".len()..];
+                orangu::tui::Theme::available_session_theme_names()
+                    .into_iter()
+                    .filter(|t| t.starts_with(prefix))
+                    .map(|t| (t.to_string(), "".to_string()))
+                    .collect()
+            } else {
+                super::completion::slash_command_dropdown_candidates(&self.buffer, skills)
+            };
+
             if !candidates.is_empty() {
+                let replacement_start = if is_theme_arg { "/theme ".len() } else { 0 };
                 let mut new_dropdown = DropdownState {
                     candidates,
                     selected_index: 0,
+                    replacement_start,
                 };
                 if let Some(old) = &self.dropdown {
                     // Try to preserve selection if the currently selected command is still in the list
@@ -609,7 +879,7 @@ pub fn read_input(
     pending_count: usize,
     viewport: &mut ViewportState,
     input_context: InputContext<'_>,
-    print_screen_fn: impl Fn(RenderContext<'_>, ScreenState<'_>),
+    mut print_screen_fn: impl FnMut(RenderContext<'_>, ScreenState<'_>),
     max_idle: Duration,
 ) -> anyhow::Result<InputResult> {
     use crossterm::event;
@@ -622,13 +892,14 @@ pub fn read_input(
             return Ok(InputResult::Refresh);
         }
 
-        let result = handle_input_event(
+        let result = handle_input_event_with_status(
             event::read()?,
             input_state,
             interrupt_state,
             output_state,
             viewport,
             input_context,
+            pending_count,
         );
 
         if let Some(outcome) = result.outcome {
@@ -651,10 +922,11 @@ pub fn read_input(
                 render,
                 ScreenState {
                     transcript: output_state.lines(),
+                    transcript_epoch: output_state.render_epoch(),
                     scroll_offset: output_state.scroll_offset(),
                     left_status: None,
-                    pending_count,
-                    pending_line: None,
+                    pending_count: 0,
+                    pending_lines: &[],
                     input: input_state.as_str(),
                     cursor: input_state.cursor(),
                     ghost_index: input_state.ghost_index,
@@ -666,6 +938,7 @@ pub fn read_input(
     }
 }
 
+#[cfg(test)]
 pub fn handle_input_event(
     event: Event,
     input_state: &mut InputState,
@@ -674,11 +947,35 @@ pub fn handle_input_event(
     viewport: &mut ViewportState,
     input_context: InputContext<'_>,
 ) -> InputEventResult {
+    handle_input_event_with_status(
+        event,
+        input_state,
+        interrupt_state,
+        output_state,
+        viewport,
+        input_context,
+        0,
+    )
+}
+
+pub fn handle_input_event_with_status(
+    event: Event,
+    input_state: &mut InputState,
+    interrupt_state: &mut InterruptState,
+    output_state: &mut OutputState,
+    viewport: &mut ViewportState,
+    input_context: InputContext<'_>,
+    pending_count: usize,
+) -> InputEventResult {
     let mut redraw = false;
 
     match event {
         Event::Resize(w, h) => {
             viewport.on_resize(usize::from(w), usize::from(h));
+            viewport.clamp_to_content(
+                output_state.max_content_width(),
+                current_output_width(input_context.render, input_state.as_str(), output_state),
+            );
             redraw = true;
         }
         Event::Paste(text) => {
@@ -791,20 +1088,20 @@ pub fn handle_input_event(
                         && dropdown.selected_index < dropdown.candidates.len()
                     {
                         let cmd = &dropdown.candidates[dropdown.selected_index].0;
-                        input_state.buffer = format!("{} ", cmd);
+                        input_state.buffer.truncate(dropdown.replacement_start);
+                        input_state.buffer.push_str(cmd);
+                        input_state.buffer.push(' ');
                         input_state.cursor = input_state.buffer.len();
                         input_state.dropdown = None;
+                        redraw = true;
+                    } else {
+                        let input = input_state.buffer.clone();
+                        input_state.clear();
                         return InputEventResult {
-                            redraw: true,
-                            outcome: None,
+                            redraw: false,
+                            outcome: Some(InputResult::Submitted(input)),
                         };
                     }
-                    let input = input_state.buffer.clone();
-                    input_state.clear();
-                    return InputEventResult {
-                        redraw: false,
-                        outcome: Some(InputResult::Submitted(input)),
-                    };
                 }
                 (KeyCode::Backspace, _) => {
                     interrupt_state.reset();
@@ -827,7 +1124,14 @@ pub fn handle_input_event(
                     if modifiers.contains(KeyModifiers::ALT)
                         && !modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    viewport.pan_right(output_state.max_content_width());
+                    viewport.pan_right(
+                        output_state.max_content_width(),
+                        current_output_width(
+                            input_context.render,
+                            input_state.as_str(),
+                            output_state,
+                        ),
+                    );
                     redraw = true;
                 }
                 (KeyCode::Left, _) => {
@@ -878,7 +1182,7 @@ pub fn handle_input_event(
                 (KeyCode::Up, _) => {
                     interrupt_state.reset();
                     if let Some(dropdown) = &mut input_state.dropdown {
-                        dropdown.selected_index = dropdown.selected_index.saturating_sub(1);
+                        dropdown.select_previous();
                         redraw = true;
                     } else {
                         history_previous(input_state, input_context.history);
@@ -888,9 +1192,7 @@ pub fn handle_input_event(
                 (KeyCode::Down, _) => {
                     interrupt_state.reset();
                     if let Some(dropdown) = &mut input_state.dropdown {
-                        if dropdown.selected_index + 1 < dropdown.candidates.len() {
-                            dropdown.selected_index += 1;
-                        }
+                        dropdown.select_next();
                         redraw = true;
                     } else {
                         history_next(input_state, input_context.history);
@@ -902,7 +1204,9 @@ pub fn handle_input_event(
                     if let Some(dropdown) = &input_state.dropdown {
                         if dropdown.selected_index < dropdown.candidates.len() {
                             let cmd = &dropdown.candidates[dropdown.selected_index].0;
-                            input_state.buffer = format!("{} ", cmd);
+                            input_state.buffer.truncate(dropdown.replacement_start);
+                            input_state.buffer.push_str(cmd);
+                            input_state.buffer.push(' ');
                             input_state.cursor = input_state.buffer.len();
                             input_state.dropdown = None;
                             redraw = true;
@@ -925,32 +1229,30 @@ pub fn handle_input_event(
                 }
                 (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     interrupt_state.reset();
-                    output_state.page_up(orangu::tui::output_view_rows(
-                        VERSION,
-                        input_context.render.current_model,
-                        input_context.render.endpoint,
-                        input_context.render.workspace,
-                        input_context.render.prompt_branch,
-                        input_context.render.header_status,
-                        input_state.as_str(),
+                    let layout = orangu::tui::main_screen_layout(
                         input_context.render.actual_width,
                         input_context.render.actual_height,
-                    ));
+                        input_context.render.prompt_branch,
+                        input_state.as_str(),
+                        input_context.render.tab_bar,
+                        input_context.render.tab_statuses,
+                        true,
+                    );
+                    output_state.page_up(layout.output_area.height as usize);
                     redraw = true;
                 }
                 (KeyCode::PageDown, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     interrupt_state.reset();
-                    output_state.page_down(orangu::tui::output_view_rows(
-                        VERSION,
-                        input_context.render.current_model,
-                        input_context.render.endpoint,
-                        input_context.render.workspace,
-                        input_context.render.prompt_branch,
-                        input_context.render.header_status,
-                        input_state.as_str(),
+                    let layout = orangu::tui::main_screen_layout(
                         input_context.render.actual_width,
                         input_context.render.actual_height,
-                    ));
+                        input_context.render.prompt_branch,
+                        input_state.as_str(),
+                        input_context.render.tab_bar,
+                        input_context.render.tab_statuses,
+                        true,
+                    );
+                    output_state.page_down(layout.output_area.height as usize);
                     redraw = true;
                 }
                 (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
@@ -966,17 +1268,143 @@ pub fn handle_input_event(
                 _ => {}
             }
         }
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            row,
+            ..
+        }) => {
+            let now = std::time::Instant::now();
+            let mut is_double_click = false;
+
+            if let Some((last_time, last_row, _last_col)) = input_state.last_mouse_click {
+                if last_row == row
+                    && now.duration_since(last_time) < std::time::Duration::from_millis(500)
+                {
+                    is_double_click = true;
+                    input_state.last_mouse_click = None;
+                } else {
+                    input_state.last_mouse_click = Some((now, row, 0));
+                }
+            } else {
+                input_state.last_mouse_click = Some((now, row, 0));
+            }
+
+            if is_double_click {
+                let layout = orangu::tui::main_screen_layout(
+                    input_context.render.actual_width,
+                    input_context.render.actual_height,
+                    input_context.render.prompt_branch,
+                    input_state.as_str(),
+                    input_context.render.tab_bar,
+                    input_context.render.tab_statuses,
+                    !output_state.lines().is_empty(),
+                );
+
+                let output_y = usize::from(layout.output_area.y);
+                let output_height = usize::from(layout.output_area.height);
+                if (row as usize) >= output_y && (row as usize) < output_y + output_height {
+                    let click_y = (row as usize) - output_y;
+
+                    if let Some(id) = output_state.collapsible_id_at(
+                        click_y,
+                        output_height,
+                        usize::from(layout.output_area.width),
+                        pending_count > 0,
+                    ) && output_state.toggle_collapse(id)
+                    {
+                        redraw = true;
+                    }
+                }
+            }
+        }
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            ..
+        }) => {
+            let layout = orangu::tui::main_screen_layout(
+                input_context.render.actual_width,
+                input_context.render.actual_height,
+                input_context.render.prompt_branch,
+                input_state.as_str(),
+                input_context.render.tab_bar,
+                input_context.render.tab_statuses,
+                !output_state.lines().is_empty(),
+            );
+            output_state.scroll_up(wheel_scroll_lines(layout.output_area.height as usize));
+            redraw = true;
+        }
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            ..
+        }) => {
+            let layout = orangu::tui::main_screen_layout(
+                input_context.render.actual_width,
+                input_context.render.actual_height,
+                input_context.render.prompt_branch,
+                input_state.as_str(),
+                input_context.render.tab_bar,
+                input_context.render.tab_statuses,
+                !output_state.lines().is_empty(),
+            );
+            output_state.scroll_down(wheel_scroll_lines(layout.output_area.height as usize));
+            redraw = true;
+        }
         _ => {}
     }
 
     if redraw {
         input_state.update_dropdown(input_context.skills, input_context.render.drop_down);
+        sync_theme_preview(input_state);
     }
 
     InputEventResult {
         redraw,
         outcome: None,
     }
+}
+
+/// Live-preview the theme under the `/theme` dropdown (or filled argument).
+/// Preview is temporary until `/theme <name>` is submitted; leaving the command
+/// restores the committed theme.
+fn sync_theme_preview(input_state: &InputState) {
+    if let Some(dropdown) = &input_state.dropdown
+        && input_state.buffer.starts_with("/theme ")
+        && let Some((name, _)) = dropdown.candidates.get(dropdown.selected_index)
+    {
+        let _ = orangu::tui::Theme::preview_named(name);
+        return;
+    }
+
+    if let Some(rest) = input_state.buffer.strip_prefix("/theme ") {
+        let name = rest.trim();
+        if !name.is_empty() {
+            let _ = orangu::tui::Theme::preview_named(name);
+            return;
+        }
+    }
+
+    orangu::tui::Theme::clear_preview();
+}
+
+fn current_output_width(
+    render: RenderContext<'_>,
+    input: &str,
+    output_state: &OutputState,
+) -> usize {
+    orangu::tui::output_view_width(
+        VERSION,
+        render.current_model,
+        render.endpoint,
+        render.workspace,
+        render.prompt_branch,
+        render.header_status,
+        input,
+        render.actual_width,
+        render.actual_height,
+        render.tab_bar,
+        render.tab_statuses,
+        !output_state.lines().is_empty(),
+    )
 }
 
 pub fn history_previous(input_state: &mut InputState, history: &[String]) {
@@ -1175,6 +1603,8 @@ fn readline_word_end(buffer: &str, cursor: usize) -> usize {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use orangu::tui::{TabStatus, WorkspaceTabsView};
+    use orangu::workspaces::WorkspacePlacement;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
@@ -1209,6 +1639,48 @@ mod tests {
         assert!(
             matches!(output_state.lines().get(1), Some(TranscriptLine::Plain(s)) if s == "plain output")
         );
+    }
+
+    #[test]
+    fn streaming_collapses_previous_thinking_or_tool_blocks() {
+        let mut output_state = OutputState::default();
+
+        output_state.push_parsed(
+            "<think>first thought</think>between<tool_call name=\"read\">file</tool_call>",
+            true,
+        );
+
+        let collapsibles = output_state
+            .lines()
+            .iter()
+            .filter_map(|line| match line {
+                TranscriptLine::Collapsible {
+                    title, expanded, ..
+                } => Some((title.as_str(), *expanded)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            collapsibles,
+            vec![("Thought", false), ("Tool Call: read", true)]
+        );
+    }
+
+    #[test]
+    fn finalized_output_starts_collapsed() {
+        let mut output_state = OutputState::default();
+        output_state.push_markdown("<think>done</think><tool_call name=\"read\">file</tool_call>");
+
+        assert!(output_state.lines().iter().all(|line| {
+            matches!(
+                line,
+                TranscriptLine::Collapsible {
+                    expanded: false,
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
@@ -1335,6 +1807,81 @@ mod tests {
     }
 
     #[test]
+    fn transcript_pan_reaches_right_edge_of_narrowed_output_pane() {
+        let visible_width = orangu::tui::output_view_width(
+            VERSION,
+            "default",
+            "http://localhost:11434/v1",
+            std::path::Path::new("/tmp"),
+            None,
+            HeaderStatus {
+                workspace_ok: true,
+                server_ok: orangu::tui::ConnStatus::Ok,
+                model_ok: orangu::tui::ConnStatus::Ok,
+                is_coordinator: false,
+            },
+            "",
+            80,
+            24,
+            Some(WorkspaceTabsView {
+                count: 12,
+                active: 0,
+                placement: WorkspacePlacement::Left,
+            }),
+            &[TabStatus::Valid; 12],
+            true,
+        );
+        let mut viewport = ViewportState::new(160, 80, 24);
+
+        for _ in 0..200 {
+            viewport.pan_right(120, visible_width);
+        }
+
+        assert_eq!(viewport.x_offset, 120usize.saturating_sub(visible_width));
+    }
+
+    #[test]
+    fn resize_clamps_horizontal_pan_to_current_output_width() {
+        let workspace = tempdir().expect("workspace");
+        let mut input_state = InputState::default();
+        let mut interrupt_state = InterruptState::default();
+        let mut output_state = OutputState::default();
+        output_state.push_wide(&"x".repeat(110));
+        let mut viewport = ViewportState::new(160, 80, 24);
+        viewport.x_offset = 120;
+
+        let mut context = test_input_context(workspace.path());
+        context.render.actual_width = 50;
+        context.render.actual_height = 24;
+
+        let result = handle_input_event(
+            Event::Resize(50, 24),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            context,
+        );
+
+        assert!(result.redraw);
+        let visible_width = orangu::tui::output_view_width(
+            VERSION,
+            context.render.current_model,
+            context.render.endpoint,
+            context.render.workspace,
+            context.render.prompt_branch,
+            context.render.header_status,
+            input_state.as_str(),
+            50,
+            24,
+            context.render.tab_bar,
+            context.render.tab_statuses,
+            true,
+        );
+        assert_eq!(viewport.x_offset, 110usize.saturating_sub(visible_width));
+    }
+
+    #[test]
     fn idle_refresh_timeout_hits_zero_at_deadline() {
         let start = Instant::now();
 
@@ -1349,6 +1896,129 @@ mod tests {
             ),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn dropdown_selection_wraps_around() {
+        let mut dropdown = DropdownState {
+            candidates: vec![
+                ("a".into(), "".into()),
+                ("b".into(), "".into()),
+                ("c".into(), "".into()),
+            ],
+            selected_index: 0,
+            replacement_start: 0,
+        };
+
+        dropdown.select_previous();
+        assert_eq!(dropdown.selected_index, 2);
+        dropdown.select_next();
+        assert_eq!(dropdown.selected_index, 0);
+        dropdown.select_next();
+        assert_eq!(dropdown.selected_index, 1);
+        dropdown.selected_index = 2;
+        dropdown.select_next();
+        assert_eq!(dropdown.selected_index, 0);
+    }
+
+    #[test]
+    fn theme_dropdown_up_down_cycles_and_previews() {
+        let workspace = tempdir().expect("workspace");
+        orangu::tui::Theme::apply_named("classic").expect("commit classic");
+
+        let mut input_state = InputState::default();
+        input_state.set_buffer("/theme ".to_string());
+        let mut interrupt_state = InterruptState::default();
+        let mut output_state = OutputState::default();
+        let mut viewport = ViewportState::new(80, 80, 24);
+        let context = test_input_context(workspace.path());
+
+        // Seed dropdown (set_buffer clears it).
+        input_state.update_dropdown(context.skills, true);
+        sync_theme_preview(&input_state);
+        let dropdown = input_state.dropdown.as_ref().expect("theme dropdown");
+        let count = dropdown.candidates.len();
+        assert!(count >= 2);
+        assert_eq!(dropdown.selected_index, 0);
+
+        // Down from first advances; last + Down wraps to first.
+        let result = handle_input_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            context,
+        );
+        assert!(result.redraw);
+        assert_eq!(input_state.dropdown.as_ref().unwrap().selected_index, 1);
+
+        input_state.dropdown.as_mut().unwrap().selected_index = count - 1;
+        let context = test_input_context(workspace.path());
+        handle_input_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            context,
+        );
+        assert_eq!(input_state.dropdown.as_ref().unwrap().selected_index, 0);
+
+        // Up from first wraps to last.
+        let context = test_input_context(workspace.path());
+        handle_input_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            context,
+        );
+        assert_eq!(
+            input_state.dropdown.as_ref().unwrap().selected_index,
+            count - 1
+        );
+
+        // Selecting a real theme (not "default") should live-preview without committing.
+        let selected = input_state.dropdown.as_ref().unwrap().candidates
+            [input_state.dropdown.as_ref().unwrap().selected_index]
+            .0
+            .clone();
+        if selected != "default" {
+            assert!(orangu::tui::Theme::is_previewing());
+            assert_eq!(orangu::tui::Theme::current_theme_name(), "classic");
+        }
+
+        // Leaving `/theme` restores the committed theme.
+        let context = test_input_context(workspace.path());
+        input_state.set_buffer("/help".to_string());
+        handle_input_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            context,
+        );
+        assert!(!orangu::tui::Theme::is_previewing());
+        assert_eq!(orangu::tui::Theme::current_theme_name(), "classic");
     }
 
     #[test]

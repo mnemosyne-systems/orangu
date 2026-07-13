@@ -443,6 +443,7 @@ pub(crate) fn handle_command(
         review_reports,
         skills,
         semantic_budget_tokens,
+        config_path,
     } = context;
 
     match command {
@@ -611,6 +612,39 @@ pub(crate) fn handle_command(
             // server, even when it is the server we were already on.
             *detect_model = true;
             Ok(CommandOutcome::Quiet)
+        }
+        LocalCommand::SetTheme(name) => {
+            if name.is_empty() {
+                return Ok(CommandOutcome::OutputError(format!(
+                    "Usage: /theme <name> (available: {})",
+                    orangu::tui::Theme::available_session_theme_summary()
+                )));
+            }
+            if matches!(name.trim(), "default" | "global") {
+                save_session_theme(session_dir, None);
+                let configured_theme = orangu::config::load_client_configuration(config_path)
+                    .map(|config| config.theme)
+                    .unwrap_or_else(|_| "auto".to_string());
+                match orangu::tui::Theme::apply_named(&configured_theme) {
+                    Ok(_) => {
+                        return Ok(CommandOutcome::Output(format!(
+                            "Theme reset to config default ({})",
+                            configured_theme
+                        )));
+                    }
+                    Err(err) => return Ok(CommandOutcome::OutputError(err.to_string())),
+                }
+            }
+            match orangu::tui::Theme::apply_named(name) {
+                Ok(canonical_name) => {
+                    save_session_theme(session_dir, Some(&canonical_name));
+                    Ok(CommandOutcome::Output(format!(
+                        "Theme set to {}",
+                        canonical_name
+                    )))
+                }
+                Err(err) => Ok(CommandOutcome::OutputError(err.to_string())),
+            }
         }
         LocalCommand::SetVerbosity(verbosity) => {
             let profile = &llms[active_model];
@@ -1594,6 +1628,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1656,6 +1691,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1727,6 +1763,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -1786,6 +1823,7 @@ mod tests {
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
                     semantic_budget_tokens: 16384,
+                    config_path: &here,
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -1873,6 +1911,7 @@ mod tests {
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
                     semantic_budget_tokens: 16384,
+                    config_path: &here,
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -1985,6 +2024,7 @@ mod tests {
                     terminal: "",
                     forge: crate::git::Forge::GitHub,
                     semantic_budget_tokens: 16384,
+                    config_path: workspace.path(),
                     review_reports: crate::git::ReviewReports::default(),
                 },
             )
@@ -2059,6 +2099,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2119,6 +2160,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2181,6 +2223,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2242,6 +2285,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2304,6 +2348,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2371,6 +2416,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2431,6 +2477,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2497,6 +2544,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2551,6 +2599,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2601,6 +2650,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )
@@ -2651,6 +2701,7 @@ mod tests {
                 terminal: "",
                 forge: crate::git::Forge::GitHub,
                 semantic_budget_tokens: 16384,
+                config_path: workspace.path(),
                 review_reports: crate::git::ReviewReports::default(),
             },
         )

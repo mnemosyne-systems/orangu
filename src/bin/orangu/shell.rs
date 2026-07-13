@@ -57,11 +57,16 @@ _orangu() {
             fi
             return 0
             ;;
+        --theme)
+            COMPREPLY=( $(compgen -W "classic oranguday tokyonight rosepine-moon auto" -- "$cur") $(compgen -f -- "$cur") )
+            compopt -o filenames 2>/dev/null
+            return 0
+            ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -w --workspace -r --resume -a --all -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
+            "-c --config --theme -w --workspace -r --resume -a --all -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
         return 0
     fi
 }
@@ -98,9 +103,17 @@ _orangu_workspaces() {
     compadd -a workspaces
 }
 
+_orangu_themes() {
+    local -a themes
+    themes=(classic oranguday tokyonight rosepine-moon auto)
+    compadd -a themes
+    _files -g '*.theme'
+}
+
 _orangu() {
     _arguments -s \
         '(-c --config)'{-c,--config}'[Path to the configuration file (orangu.conf)]:config file:_files' \
+        '(--theme)'--theme'[Override the TUI theme with a name or .theme file]:theme:_orangu_themes' \
         '(-w --workspace)'{-w,--workspace}'[Workspace root for local tools]:workspace:_orangu_workspaces' \
         '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
@@ -137,6 +150,8 @@ function __orangu_workspaces
 end
 
 complete -c orangu -s c -l config           -r                          -d 'Path to the configuration file (orangu.conf)'
+complete -c orangu    -l theme              -r -a 'classic oranguday tokyonight rosepine-moon auto' -d 'Override the TUI theme with a name or .theme file'
+complete -c orangu    -l theme              -r -a '(__fish_complete_path)' -d 'Theme file'
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'

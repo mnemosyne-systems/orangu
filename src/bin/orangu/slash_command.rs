@@ -82,6 +82,7 @@ pub enum SlashCommand {
     Skills,
     Graph,
     Clear,
+    Theme,
     Quit,
 }
 
@@ -158,6 +159,7 @@ impl SlashCommand {
                 "Generates an HTML visualization of the codebase Knowledge Graph"
             }
             SlashCommand::Clear => "Clears the terminal screen",
+            SlashCommand::Theme => "Switches the active TUI theme",
             SlashCommand::Quit => "Exits the application",
         }
     }
