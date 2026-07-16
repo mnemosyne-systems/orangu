@@ -321,7 +321,7 @@ impl EmbeddingIndex {
             module_sketches: HashMap::new(),
             chunks: kept,
         };
-        index.rewrite_cache(&dir);
+        index.rewrite_cache(&dir)?;
 
         // ── Phase 2 (50–100%): upload — embed the parsed chunks concurrently ──
         // The upload to the embedding server is the bottleneck, so keep up to
@@ -375,7 +375,7 @@ impl EmbeddingIndex {
                     let Some(joined) = maybe else { break };
                     let (_rel, _hash, embedded, bytes) = joined??;
                     // The file's hash is already in meta; append its chunks.
-                    append_chunks(&chunks_path, &embedded);
+                    append_chunks(&chunks_path, &embedded)?;
                     index.chunks.extend(embedded);
                     done_bytes = done_bytes.saturating_add(bytes);
                     let permille = (500 + done_bytes.saturating_mul(500) / total_bytes).min(1000);
@@ -414,7 +414,7 @@ impl EmbeddingIndex {
                 .module_sketches
                 .insert(file, super::sketch::EllipsoidSketch::compute(&vectors));
         }
-        index.write_meta(&dir);
+        index.write_meta(&dir)?;
 
         Ok(index)
     }
@@ -422,8 +422,8 @@ impl EmbeddingIndex {
     /// Rewrite `chunks.json` (one chunk per line) and `meta.json` from scratch —
     /// used once at the end of the local phase to seed the cache with the reused
     /// chunks and record every file's hash.
-    fn rewrite_cache(&self, dir: &Path) {
-        let _ = std::fs::create_dir_all(dir);
+    fn rewrite_cache(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
         let mut body = String::new();
         for chunk in &self.chunks {
             if let Ok(line) = serde_json::to_string(chunk) {
@@ -431,21 +431,22 @@ impl EmbeddingIndex {
                 body.push('\n');
             }
         }
-        let _ = std::fs::write(Self::chunks_path(dir), body);
-        self.write_meta(dir);
+        std::fs::write(Self::chunks_path(dir), body)?;
+        self.write_meta(dir)?;
+        Ok(())
     }
 
     /// Write the small `meta.json` sidecar (version + per-file hashes).
-    fn write_meta(&self, dir: &Path) {
+    fn write_meta(&self, dir: &Path) -> Result<()> {
         let meta = Meta {
             version: self.version,
             file_hashes: self.file_hashes.clone(),
             module_sketches: self.module_sketches.clone(),
         };
-        if let Ok(json) = serde_json::to_string(&meta) {
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(Self::meta_path(dir), json);
-        }
+        let json = serde_json::to_string(&meta)?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(Self::meta_path(dir), json)?;
+        Ok(())
     }
 
     /// Hybrid search: rank chunks by cosine similarity to `query_vector`, then,
@@ -658,10 +659,10 @@ fn batches_within_budget(chunks: &[super::chunk::Chunk]) -> Vec<&[super::chunk::
 
 /// Append embedded chunks to `chunks.json`, one JSON object per line. Appending
 /// keeps per-file persistence cheap — the existing vectors are never rewritten.
-fn append_chunks(path: &Path, chunks: &[EmbeddedChunk]) {
+fn append_chunks(path: &Path, chunks: &[EmbeddedChunk]) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
     let mut body = String::new();
     for chunk in chunks {
@@ -670,13 +671,12 @@ fn append_chunks(path: &Path, chunks: &[EmbeddedChunk]) {
             body.push('\n');
         }
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    {
-        let _ = f.write_all(body.as_bytes());
-    }
+        .open(path)?;
+    f.write_all(body.as_bytes())?;
+    Ok(())
 }
 
 /// Append `<unix-timestamp>\t<path>` lines to the processed-files manifest, one
