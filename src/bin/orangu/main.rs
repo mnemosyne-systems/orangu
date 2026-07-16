@@ -1320,11 +1320,24 @@ async fn run() -> Result<()> {
                     pending_tab_action = Some(TabAction::SwitchTo(index));
                     continue;
                 }
-                let _ = save_session_messages(&session_messages_path, session.messages());
-                let _ = update_session_metadata_branch(
+                if let Err(err) = save_session_messages(&session_messages_path, session.messages())
+                {
+                    output_state.push_text(&format!("Failed to save session: {err:#}"));
+                    if config.feedback {
+                        output_state.push_text(FEEDBACK_ERR);
+                    }
+                    output_state.reset_scroll();
+                }
+                if let Err(err) = update_session_metadata_branch(
                     &session_metadata_path,
                     workspace_branch_name(tools.workspace()).as_deref(),
-                );
+                ) {
+                    output_state.push_text(&format!("Failed to save session metadata: {err:#}"));
+                    if config.feedback {
+                        output_state.push_text(FEEDBACK_ERR);
+                    }
+                    output_state.reset_scroll();
+                }
                 match WorkspaceTab::open(
                     dir,
                     None,
@@ -1365,11 +1378,26 @@ async fn run() -> Result<()> {
                 if let Some(index) = ring.position_of(&workspace, &dir) {
                     pending_tab_action = Some(TabAction::SwitchTo(index));
                 } else {
-                    let _ = save_session_messages(&session_messages_path, session.messages());
-                    let _ = update_session_metadata_branch(
+                    if let Err(err) =
+                        save_session_messages(&session_messages_path, session.messages())
+                    {
+                        output_state.push_text(&format!("Failed to save session: {err:#}"));
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_ERR);
+                        }
+                        output_state.reset_scroll();
+                    }
+                    if let Err(err) = update_session_metadata_branch(
                         &session_metadata_path,
                         workspace_branch_name(tools.workspace()).as_deref(),
-                    );
+                    ) {
+                        output_state
+                            .push_text(&format!("Failed to save session metadata: {err:#}"));
+                        if config.feedback {
+                            output_state.push_text(FEEDBACK_ERR);
+                        }
+                        output_state.reset_scroll();
+                    }
                     match WorkspaceTab::open(
                         dir,
                         None,
