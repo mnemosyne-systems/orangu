@@ -186,8 +186,167 @@ pub fn resolve_or_fetch_model(models_dir: &Path, requested: &str) -> Result<Path
         .with_context(|| format!("'{requested}' was not found locally and could not be fetched"))
 }
 
+/// Resolves whatever `delete` was given to a full [`ModelGroup`] — every
+/// shard, not just one file — so a multi-shard model is always deleted
+/// atomically regardless of which shard's path happened to be named.
+/// Unlike [`resolve_show_target`], this always scans and groups first (no
+/// scan-free fast path for a direct file argument): even a plain path needs
+/// the full grouping to know whether it names one shard of a larger group.
+///
+/// Resolution order matches `resolve_show_target`: a direct/relative/
+/// absolute path or a bare name under `models_dir` first (returning that
+/// file's whole group when it belongs to one, or a synthetic single-file
+/// group when it doesn't — e.g. an mmproj sidecar, which `group_models`
+/// deliberately excludes from every real group); then an `NR` from `list`'s
+/// first column; then a `MODEL` name from its second.
+pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<ModelGroup> {
+    let models = scan_models_dir(models_dir)?;
+    let groups = group_models(&models);
+
+    if let Ok(path) = resolve_model_path(models_dir, requested) {
+        if let Some(group) = groups.into_iter().find(|g| g.paths.contains(&path)) {
+            return Ok(group);
+        }
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return Ok(ModelGroup {
+            label: path.display().to_string(),
+            size_bytes,
+            quantization: None,
+            errors: Vec::new(),
+            representative_path: path.clone(),
+            paths: vec![path],
+        });
+    }
+
+    if let Ok(nr) = requested.parse::<usize>() {
+        let count = groups.len();
+        return nr
+            .checked_sub(1)
+            .and_then(|index| groups.into_iter().nth(index))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no model with NR {nr} ({count} model(s) found under {}; run 'orangu-server list' to see them)",
+                    models_dir.display()
+                )
+            });
+    }
+
+    groups
+        .into_iter()
+        .find(|group| group.label == requested)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{requested}' was not found as a file, an NR, or a MODEL name; run 'orangu-server list' to see valid values"
+            )
+        })
+}
+
+/// Deletes every path in `group` from disk. When a path is a Hugging Face
+/// hub-cache symlink (`models--<user>--<model>/snapshots/<rev>/<file>`,
+/// pointing into that same repo's `blobs/`), its target blob is deleted too
+/// — but only when no other snapshot left in that repo still points at it:
+/// a repo's ref can move without a file's content changing, in which case
+/// the cache reuses (symlinks to), rather than re-fetches, the
+/// already-downloaded blob (`scan_models_dir`'s own dedup logic collapses
+/// that pair down to one listed file, so the *other* snapshot's symlink —
+/// not part of `group`, since it was never listed — must not be left
+/// dangling). Empty snapshot/model directories left behind are removed
+/// too, walking up from each deleted path but never past `models_dir`
+/// itself, which is left alone regardless of what remains inside it.
+pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
+    for path in &group.paths {
+        let blob_target = std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_symlink)
+            .and_then(|_| std::fs::canonicalize(path).ok());
+
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to delete {}", path.display()))?;
+
+        if let Some(blob) = blob_target
+            && let Some(repo_root) = hf_repo_root_from_path(path)
+            && blob.starts_with(repo_root.join("blobs"))
+            && !blob_still_referenced(&repo_root, &blob)
+            && std::fs::remove_file(&blob).is_ok()
+        {
+            // `blob` sits under a sibling `blobs/` directory, not under
+            // `path`'s own `snapshots/...` chain, so it needs its own
+            // upward sweep — otherwise a now-empty `blobs/` (and, once
+            // both it and `snapshots/` are gone, the whole repo directory)
+            // would survive even though nothing is left inside it.
+            remove_empty_ancestors(&blob, models_dir);
+        }
+
+        remove_empty_ancestors(path, models_dir);
+    }
+    Ok(())
+}
+
+/// The Hugging Face hub-cache repo root a path lives under
+/// (`models--<user>--<model>`, the directory [`hf_repo_id_from_path`]
+/// decodes the id from), or `None` outside that layout. Checks every
+/// ancestor, not just the immediate parent, for the same reason
+/// `hf_repo_id_from_path` does — a file sits under `snapshots/<rev>/`,
+/// sometimes with a further per-quant subfolder.
+fn hf_repo_root_from_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.parent()?.ancestors() {
+        let name = ancestor.file_name()?.to_str()?;
+        if name.starts_with("models--") {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Whether any symlink still left under `repo_root`'s own `snapshots/`
+/// resolves to `blob` — scoped to just this one repo (blobs are already
+/// repo-scoped by construction, nested under `models--<user>--<model>/
+/// blobs/`, so a blob from one repo can never collide with another's) and
+/// checked *after* the symlink being deleted is already gone, so it
+/// answers "does anything else still need this blob".
+fn blob_still_referenced(repo_root: &Path, blob: &Path) -> bool {
+    let snapshots = repo_root.join("snapshots");
+    if !snapshots.is_dir() {
+        return false;
+    }
+    walkdir::WalkDir::new(&snapshots)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            std::fs::canonicalize(entry.path())
+                .map(|resolved| resolved == blob)
+                .unwrap_or(false)
+        })
+}
+
+/// Removes `path`'s parent directory, and each ancestor above it in turn,
+/// as long as it's empty — stopping the moment one isn't, or at `stop_at`
+/// (never removed itself, whatever's left inside it), so deleting a
+/// model's last shard also cleans up the now-empty `snapshots/<rev>/` (and,
+/// if that was the repo's only snapshot, `models--<user>--<model>/` itself)
+/// rather than leaving empty directories behind.
+fn remove_empty_ancestors(path: &Path, stop_at: &Path) {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == stop_at || !d.starts_with(stop_at) {
+            break;
+        }
+        match std::fs::read_dir(d) {
+            Ok(mut entries) => {
+                if entries.next().is_some() || std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// One row of the `list` output: a model, collapsed from every shard file
 /// that makes it up.
+#[derive(Debug)]
 pub struct ModelGroup {
     pub label: String,
     pub size_bytes: u64,
@@ -198,6 +357,11 @@ pub struct ModelGroup {
     /// The first shard's path — the one `show` opens for this group, since
     /// GGUF metadata for a multi-shard model lives entirely in shard 1.
     pub representative_path: PathBuf,
+    /// Every shard file that makes up this model, in the same sorted order
+    /// `representative_path` (the first of them) was chosen from — what
+    /// `delete_model` actually removes, so a multi-shard model is deleted
+    /// atomically rather than leaving orphaned shards behind.
+    pub paths: Vec<PathBuf>,
 }
 
 /// Collapses a multi-part model's shard files (`name-00001-of-00004.gguf`,
@@ -218,6 +382,7 @@ pub struct ModelGroup {
 pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
     struct Accumulator {
         representative_path: PathBuf,
+        paths: Vec<PathBuf>,
         shard_label: String,
         size_bytes: u64,
         type_totals: HashMap<u32, u128>,
@@ -242,11 +407,13 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
             .entry((parent, shard_label.clone()))
             .or_insert_with(|| Accumulator {
                 representative_path: model.path.clone(),
+                paths: Vec::new(),
                 shard_label,
                 size_bytes: 0,
                 type_totals: HashMap::new(),
                 errors: Vec::new(),
             });
+        acc.paths.push(model.path.clone());
         acc.size_bytes += model.size_bytes;
         match &model.error {
             Some(error) => acc.errors.push(error.clone()),
@@ -278,6 +445,7 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
                     .map(|(ty, _)| ggml_type_name(ty)),
                 errors: acc.errors,
                 representative_path: acc.representative_path,
+                paths: acc.paths,
             }
         })
         .collect();
@@ -690,5 +858,185 @@ mod tests {
         assert_eq!(lines.next().unwrap().split_whitespace().next(), Some("NR"));
         assert!(lines.next().unwrap().trim_start().starts_with("1  "));
         assert!(lines.next().unwrap().trim_start().starts_with("2  "));
+    }
+
+    #[test]
+    fn resolve_delete_target_by_nr_returns_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("model-00001-of-00002.gguf"), "llama", None);
+        write_minimal_gguf(&dir.path().join("model-00002-of-00002.gguf"), "llama", None);
+
+        let group = resolve_delete_target(dir.path(), "1").unwrap();
+        assert_eq!(group.paths.len(), 2);
+    }
+
+    #[test]
+    fn resolve_delete_target_by_model_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        write_minimal_gguf(
+            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+
+        let group =
+            resolve_delete_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M")
+                .unwrap();
+        assert_eq!(group.paths.len(), 1);
+    }
+
+    #[test]
+    fn resolve_delete_target_by_direct_path_returns_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard1 = dir.path().join("model-00001-of-00002.gguf");
+        let shard2 = dir.path().join("model-00002-of-00002.gguf");
+        write_minimal_gguf(&shard1, "llama", None);
+        write_minimal_gguf(&shard2, "llama", None);
+
+        // Naming just one shard's own path should still resolve (and later
+        // delete) the whole group, not that one file alone.
+        let group = resolve_delete_target(dir.path(), &shard2.display().to_string()).unwrap();
+        assert_eq!(group.paths.len(), 2);
+    }
+
+    #[test]
+    fn resolve_delete_target_falls_back_to_a_synthetic_single_file_group_for_an_mmproj_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("mmproj-model.gguf"), "clip", None);
+
+        // mmproj sidecars are excluded from every real group (see
+        // `excludes_clip_projector_sidecars_from_the_scan`), but `delete`
+        // should still be able to name and remove one directly.
+        let group = resolve_delete_target(dir.path(), "mmproj-model.gguf").unwrap();
+        assert_eq!(group.paths, vec![dir.path().join("mmproj-model.gguf")]);
+    }
+
+    #[test]
+    fn resolve_delete_target_rejects_an_out_of_range_nr() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("a.gguf"), "llama", None);
+
+        let err = resolve_delete_target(dir.path(), "5").unwrap_err();
+        assert!(err.to_string().contains("no model with NR 5"), "{err}");
+    }
+
+    #[test]
+    fn resolve_delete_target_rejects_an_unknown_model_label() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("a.gguf"), "llama", None);
+
+        let err = resolve_delete_target(dir.path(), "no/such-model:Q4_K_M").unwrap_err();
+        assert!(err.to_string().contains("was not found"), "{err}");
+    }
+
+    #[test]
+    fn delete_model_removes_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard1 = dir.path().join("model-00001-of-00002.gguf");
+        let shard2 = dir.path().join("model-00002-of-00002.gguf");
+        write_minimal_gguf(&shard1, "llama", None);
+        write_minimal_gguf(&shard2, "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 1);
+
+        delete_model(dir.path(), &groups[0]).unwrap();
+
+        assert!(!shard1.exists());
+        assert!(!shard2.exists());
+    }
+
+    #[test]
+    fn delete_model_removes_now_empty_ancestor_directories_but_not_models_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("sub/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("model.gguf");
+        write_minimal_gguf(&file, "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 1);
+
+        delete_model(dir.path(), &groups[0]).unwrap();
+
+        assert!(!file.exists());
+        assert!(!nested.exists());
+        assert!(!dir.path().join("sub").exists());
+        assert!(dir.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_model_prunes_the_whole_repo_tree_when_it_was_the_only_model_left() {
+        // A blob's own `blobs/` directory sits *beside* the symlink's
+        // `snapshots/<rev>/` chain, not inside it — cleaning up only the
+        // latter would leave a hollowed-out `blobs/` (and the whole repo
+        // directory, since it'd still contain that leftover `blobs/`)
+        // behind even after the blob itself was reclaimed.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--org--solo");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+
+        let blob = repo.join("blobs/only");
+        write_minimal_gguf(&blob, "llama", None);
+        std::os::unix::fs::symlink(&blob, repo.join("snapshots/rev1/model.gguf")).unwrap();
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 1);
+
+        delete_model(dir.path(), &groups[0]).unwrap();
+
+        assert!(!repo.exists(), "the whole repo directory should be gone");
+        assert!(dir.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_model_reclaims_an_unreferenced_blob_but_keeps_one_still_in_use() {
+        // Mirrors a real Hugging Face hub cache: `blob_a` is referenced from
+        // two snapshot revisions (a moved ref reusing already-downloaded
+        // content — `scan_models_dir`'s own dedup collapses that pair down
+        // to one listed file, so only `rev1`'s symlink is ever part of a
+        // group), while `blob_b` has exactly one reference.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--org--model");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev2")).unwrap();
+
+        let blob_a = repo.join("blobs/aaa");
+        let blob_b = repo.join("blobs/bbb");
+        write_minimal_gguf(&blob_a, "llama", None);
+        write_minimal_gguf(&blob_b, "llama", None);
+
+        std::os::unix::fs::symlink(&blob_a, repo.join("snapshots/rev1/model-A.gguf")).unwrap();
+        std::os::unix::fs::symlink(&blob_a, repo.join("snapshots/rev2/model-A.gguf")).unwrap();
+        std::os::unix::fs::symlink(&blob_b, repo.join("snapshots/rev1/model-B.gguf")).unwrap();
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 2);
+
+        for group in &groups {
+            delete_model(dir.path(), group).unwrap();
+        }
+
+        assert!(!repo.join("snapshots/rev1/model-A.gguf").exists());
+        assert!(
+            blob_a.exists(),
+            "blob_a is still referenced from rev2 and must survive"
+        );
+        assert!(
+            !blob_b.exists(),
+            "blob_b had no other reference and should have been reclaimed"
+        );
     }
 }

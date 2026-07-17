@@ -337,6 +337,7 @@ mod tests {
             quantization: None,
             errors: Vec::new(),
             representative_path: PathBuf::new(),
+            paths: Vec::new(),
         }
     }
 

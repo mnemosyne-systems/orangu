@@ -5,20 +5,22 @@
 `orangu-server` (`src/bin/orangu-server/`) is a third binary in the same
 Cargo package as `orangu` and `orangu-coordinator`. Besides serving a GGUF
 model, it's also the machine's GGUF inventory tool (`system`/`suggest`/
-`list`/`show`/`download`) — entirely offline and stateless between runs for
-those five: every invocation re-detects hardware and re-scans the models
-directory from scratch, so there is no cache, config-reload, or background
-process to reason about for them. It does real tensor computation itself
-for serving — GGUF loading, dequantization, the transformer forward pass,
-sampling, and request scheduling are implemented in Rust with no dependency
-on llama.cpp/ggml's own compiled code.
+`list`/`show`/`download`/`delete`) — entirely offline and stateless between
+runs for those six: every invocation re-detects hardware and re-scans the
+models directory from scratch, so there is no cache, config-reload, or
+background process to reason about for them. It does real tensor
+computation itself for serving — GGUF loading, dequantization, the
+transformer forward pass, sampling, and request scheduling are implemented
+in Rust with no dependency on llama.cpp/ggml's own compiled code.
 
 ### Module layout
 
 - `main.rs` — CLI parsing (serving plus the `system`/`suggest`/`list`/
-  `show`/`download` subcommands), model-spec resolution, GPU backend
-  selection (`select_backend`), `format_show`/`DEFAULT_ARRAY_PREVIEW` (for
-  `show`), and process wiring (Ctrl+C/`SIGINT`/`--daemon`).
+  `show`/`download`/`delete` subcommands), model-spec resolution, GPU
+  backend selection (`select_backend`), `format_show`/
+  `DEFAULT_ARRAY_PREVIEW` (for `show`), `select_model_for_deletion`/
+  `confirm` (for `delete`), and process wiring (Ctrl+C/`SIGINT`/
+  `--daemon`).
 - `config.rs`, `init.rs` — `orangu-server.conf` loading and the `--init`
   wizard.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
@@ -191,6 +193,63 @@ opens for a multi-shard model. `resolve_or_fetch_model` builds on top of
 argument: try resolving locally first, and only reach for
 `orangu::model_download::download_model` when nothing local matched — the
 same fallback `main.rs`'s `prepare` and `select_model_interactively` share.
+
+### Deleting a model (`orangu::model_spec`)
+
+`resolve_delete_target` resolves `delete`'s argument to a full
+`ModelGroup`, not just `resolve_show_target`'s single representative
+path — `delete_model` needs every shard to remove a multi-shard model
+atomically, so this always scans and groups first rather than reusing
+`resolve_show_target`'s scan-free fast path for a plain file argument
+(that fast path only ever returns one file, with no way to tell whether it
+belongs to a larger group). Resolution order otherwise matches
+`resolve_show_target`: a direct/bare path first — returning that file's
+whole group when `group_models` placed it in one, or a synthetic
+one-`ModelGroup`-of-one-path when it didn't (an mmproj sidecar, which
+`group_models` deliberately excludes from every real group but `delete`
+should still be able to name directly) — then an `NR`, then a `MODEL`
+label.
+
+`delete_model` removes every path in the resolved group, and, for each one
+that turns out to be a Hugging Face hub-cache symlink
+(`models--<user>--<model>/snapshots/<rev>/<file>`, resolved with
+`std::fs::canonicalize` *before* the symlink itself is unlinked), also
+removes its target blob under that same repo's `blobs/` — but only when
+`blob_still_referenced` finds no other symlink left under
+`<repo>/snapshots/` still pointing at it. This matters for the same reason
+`scan_models_dir`'s own duplicate-file collapsing does: a repo's ref can
+move without a file's content changing, so the cache reuses (symlinks to)
+an already-downloaded blob from a second snapshot revision rather than
+re-fetching it — and `scan_models_dir` only ever lists the first,
+sorted-earliest occurrence of that shared content, so the second
+snapshot's symlink is never part of any group `delete` was asked to
+remove. Scoping the reference check to just `<repo>/snapshots/` (not the
+whole `models` directory) is both cheap and correct: blobs are already
+nested per-repo (`models--<user>--<model>/blobs/`), so cross-repo sharing
+can't happen by construction — no walk of the full, potentially huge
+`models` directory is ever needed just to delete one model.
+
+`remove_empty_ancestors` walks up from a path's parent directory, removing
+it (and its own parent, and so on) as long as it's empty, stopping the
+moment one isn't or at `models_dir` itself (which is never removed,
+whatever's left inside it). `delete_model` calls it twice per shard — once
+from the removed symlink's own `snapshots/<rev>/` chain, and, when a blob
+was also reclaimed, once more from that blob's sibling `blobs/` chain,
+since the two aren't nested inside each other and either could be the one
+left holding the repo directory open. Together, deleting a repo's last
+shard collapses the now-empty `snapshots/<rev>/` and `blobs/`, and, once
+both are gone, `models--<user>--<model>/` itself, rather than leaving a
+hollowed-out shell of empty directories behind.
+
+`main.rs`'s `Command::Delete` arm always confirms before calling
+`delete_model` (`confirm`, a plain stdin Yes/No reader defaulting to *No*
+on an empty entry or closed stdin — the same fail-safe default a
+destructive filesystem action should have) unless `--yes` was passed, and
+resolves an omitted argument through `select_model_for_deletion`: the same
+`format_list` table `list` prints, followed by an `NR` prompt — the
+delete-time counterpart of `main.rs`'s own `select_model_interactively`
+(used to pick a model to *serve*), returning a full `ModelGroup` rather
+than just a path/label pair since that's what `delete_model` needs.
 
 ### Downloading from Hugging Face (`orangu::model_download`)
 
@@ -525,14 +584,14 @@ Mirrors `orangu`'s own `-s`/`--shell-completions` (`src/bin/orangu/
 shell.rs`, `print_shell_completions` in `main.rs`): hand-written bash/zsh/
 fish scripts embedded as `&str` constants, selected by inspecting `$SHELL`,
 rather than clap-generated completions. The positional `model` argument,
-and `show`'s own argument, complete the same way `orangu`'s own scripts
-complete session UUIDs — the shell function shells back out to
+and `show`'s and `delete`'s own arguments, complete the same way `orangu`'s
+own scripts complete session UUIDs — the shell function shells back out to
 `orangu-server list` itself (`2>/dev/null`, so a missing config yields no
 candidates rather than an error) and reads its first two columns with
 `awk`. This keeps the completion logic entirely in the shell script,
 depending on nothing but `orangu-server` itself being on `$PATH` — no
 dynamic-completion protocol or extra binary flag is needed. The bash and
-fish scripts also list the five subcommand names as literal completion
+fish scripts also list the six subcommand names as literal completion
 candidates alongside the dynamic model list at the first argument position;
 the zsh script achieves the same with `_alternative` combining a `_values`
 list (subcommand names) and a `compadd`-based function (model candidates)

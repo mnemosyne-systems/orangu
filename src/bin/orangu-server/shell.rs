@@ -41,7 +41,7 @@ _orangu_server() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     COMPREPLY=()
 
-    if [[ "$prev" == "show" ]]; then
+    if [[ "$prev" == "show" || "$prev" == "delete" ]]; then
         COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
         return 0
     fi
@@ -57,12 +57,12 @@ _orangu_server() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "-c --config -i --init -s --shell-completions -d --daemon \
-             --all --code --review --explorer --embedding -h --help -V --version" -- "$cur") )
+             --all --code --review --explorer --embedding -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete help" -- "$cur") )
         return 0
     fi
 }
@@ -95,6 +95,7 @@ _orangu_server_commands() {
         'list[List every .gguf file under the models directory]' \
         'show[Print a GGUF file'"'"'s full metadata]' \
         'download[Download a GGUF model from Hugging Face]' \
+        'delete[Delete a GGUF model from disk]' \
         'help[Print this message or the help of the given subcommand(s)]'
 }
 
@@ -111,6 +112,7 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding)--review[Code review role]' \
         '(--all --code --review --explorer --embedding)--explorer[Exploration role]' \
         '(--all --code --review --explorer --embedding)--embedding[Embeddings-only role]' \
+        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s confirmation prompt]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
         '1: :->command' \
@@ -124,7 +126,7 @@ _orangu_server() {
                 'commands:command:_orangu_server_commands'
             ;;
         arg)
-            [[ ${line[1]} == show ]] && _orangu_server_models
+            [[ ${line[1]} == show || ${line[1]} == delete ]] && _orangu_server_models
             ;;
     esac
 }
@@ -152,8 +154,10 @@ complete -c orangu-server -n '__fish_use_subcommand' -a suggest  -d 'Suggest a G
 complete -c orangu-server -n '__fish_use_subcommand' -a list     -d 'List every .gguf file under the models directory'
 complete -c orangu-server -n '__fish_use_subcommand' -a show     -d 'Print a GGUF file\'s full metadata'
 complete -c orangu-server -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
+complete -c orangu-server -n '__fish_use_subcommand' -a delete   -d 'Delete a GGUF model from disk'
 complete -c orangu-server -n '__fish_use_subcommand' -a help     -d 'Print this message or the help of the given subcommand(s)'
 complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
 
 complete -c orangu-server -s c -l config              -r -d 'Path to the configuration file (orangu-server.conf)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
@@ -164,6 +168,7 @@ complete -c orangu-server      -l code                    -d 'Coding role'
 complete -c orangu-server      -l review                  -d 'Code review role'
 complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
+complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s confirmation prompt'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
 "#;

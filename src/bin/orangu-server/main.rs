@@ -166,6 +166,19 @@ enum Command {
         /// found.
         repo: String,
     },
+    /// Delete a GGUF model (every shard) from the configured models
+    /// directory, reclaiming its Hugging Face hub-cache blob(s) too when
+    /// nothing else still references them.
+    Delete {
+        /// A path to a .gguf file, a bare name resolved against the
+        /// configured models directory, an NR from `list`'s first column, or
+        /// a MODEL name from its second. Omit it to pick one interactively
+        /// from the same table `list` prints.
+        model: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 impl Args {
@@ -597,7 +610,81 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             println!("Downloaded to {}", path.display());
             Ok(())
         }
+        Command::Delete { model, yes } => {
+            let conf = load_config(config_arg, None, false)?;
+            let group = match model {
+                Some(spec) => orangu::model_spec::resolve_delete_target(&conf.models, &spec)?,
+                None => select_model_for_deletion(&conf.models)?,
+            };
+            let plural = if group.paths.len() == 1 { "" } else { "s" };
+            if !yes {
+                let confirmed = confirm(&format!(
+                    "Delete '{}' ({} file{plural}, {}) from {}? [y/N]: ",
+                    group.label,
+                    group.paths.len(),
+                    orangu::format::format_bytes(group.size_bytes),
+                    conf.models.display(),
+                ))?;
+                if !confirmed {
+                    println!("Aborted. Nothing deleted.");
+                    return Ok(());
+                }
+            }
+            orangu::model_spec::delete_model(&conf.models, &group)?;
+            println!(
+                "Deleted '{}' ({} file{plural}, {})",
+                group.label,
+                group.paths.len(),
+                orangu::format::format_bytes(group.size_bytes),
+            );
+            Ok(())
+        }
     }
+}
+
+/// Lists every `.gguf` model under `models_dir` (the same table `list`
+/// prints) and prompts for an `NR`, for `delete` invoked with no model
+/// argument. Returns the chosen model's full `ModelGroup` — every shard,
+/// not just the representative one — so the caller can delete all of them
+/// atomically.
+fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::ModelGroup> {
+    let models = orangu::model_spec::scan_models_dir(models_dir)
+        .with_context(|| format!("scanning {}", models_dir.display()))?;
+    let groups = orangu::model_spec::group_models(&models);
+    if groups.is_empty() {
+        bail!("no .gguf models found under {}", models_dir.display());
+    }
+    print!("{}", orangu::model_spec::format_list(&models, models_dir));
+
+    print!("\nSelect a model to delete (NR): ");
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("failed to read model selection")?;
+    let nr: usize = input
+        .trim()
+        .parse()
+        .with_context(|| format!("'{}' is not a number", input.trim()))?;
+    let count = groups.len();
+    nr.checked_sub(1)
+        .and_then(|index| groups.into_iter().nth(index))
+        .ok_or_else(|| anyhow!("no model with NR {nr} ({count} model(s) listed)"))
+}
+
+/// Reads a Yes/No confirmation from stdin, defaulting to No on an empty
+/// entry or unrecognized input — `delete` is destructive, so anything but
+/// an explicit "y"/"yes" leaves the model(s) untouched. A closed stdin
+/// (EOF) also reads as an empty line here, so a non-interactive invocation
+/// without `--yes` safely deletes nothing rather than hanging or guessing.
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read confirmation")?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {

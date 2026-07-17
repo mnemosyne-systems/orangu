@@ -15,11 +15,11 @@ scheduling are implemented directly in Rust, with no dependency on
 llama.cpp/ggml's own compiled code.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
-`list`/`show`/`download` subcommands (below) answer the questions that
-matter when *getting* and *choosing* a model to run, before any serving
-starts. Those five read GGUF files directly off disk and query the local
-machine, no model loaded and no HTTP listener bound; only `download` talks
-to the Hugging Face Hub.
+`list`/`show`/`download`/`delete` subcommands (below) answer the questions
+that matter when *getting*, *choosing*, and *cleaning up* a model, before
+or after serving. Those six read (or write) GGUF files directly off disk
+and query the local machine, no model loaded and no HTTP listener bound;
+only `download` talks to the Hugging Face Hub.
 
 ## Quick start
 
@@ -83,9 +83,9 @@ orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 
 
 ## GGUF inventory
 
-Five subcommands cover getting and choosing a model, all sharing the same
-`orangu-server.conf` and its `models` directory (see **Configuration**
-below).
+Six subcommands cover getting, choosing, and cleaning up a model, all
+sharing the same `orangu-server.conf` and its `models` directory (see
+**Configuration** below).
 
 **`download`** fetches a model from Hugging Face into the configured
 `models` directory, laid out **exactly** the way llama.cpp's own
@@ -216,6 +216,30 @@ well over 100,000 entries) is truncated to a short preview by default —
 metadata, and tensor-info table, so `list`/`show` stay fast even against
 multi-gigabyte model files.
 
+**`delete`** removes a model from disk, resolving its argument the same
+way `show` does (or, omitted, the same interactive `list` + `NR` prompt
+bare `orangu-server` uses to pick a model to serve — here picking one to
+remove instead), and always against every shard the model is made of, so a
+multi-shard model is deleted atomically rather than leaving orphans behind:
+
+```sh
+orangu-server delete 3                                     # NR from `list`
+orangu-server delete unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server delete                                        # no argument: interactive
+```
+
+```
+Delete 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB) from /home/you/models? [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)
+```
+
+Asks for confirmation first (`[y/N]`, defaulting to **No**) unless
+`-y`/`--yes` is given. When a file lives under a Hugging Face hub cache,
+its target blob is reclaimed too — but only when no other snapshot left in
+that repo still references it — and any now-empty `snapshots/<rev>/` or
+`models--<user>--<model>/` directory left behind is cleaned up, never
+anything above the configured `models` directory itself.
+
 ## Configuration
 
 `orangu-server.conf`:
@@ -281,10 +305,10 @@ both listeners bound, *before* detaching, so a bad config or a port already
 in use is still reported to the invoking terminal rather than silently lost.
 `-h`/`--help` and `-V`/`--version` are also available. `-s`/
 `--shell-completions` prints a bash/zsh/fish completion script for the
-shell detected from `$SHELL` — covering every flag above, the five
-subcommand names, and both the positional `model` argument and `show`'s own
-argument, the latter two completed by shelling out to `orangu-server list`
-itself.
+shell detected from `$SHELL` — covering every flag above, the six
+subcommand names, and the positional `model` argument plus `show`'s and
+`delete`'s own arguments, the latter three completed by shelling out to
+`orangu-server list` itself.
 
 ## Roles
 

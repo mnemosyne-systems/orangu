@@ -13,11 +13,11 @@ scheduling are implemented directly in Rust, with no dependency on
 llama.cpp/ggml's own compiled code.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
-`list`/`show`/`download` subcommands (below) answer the questions that
-matter when *getting* and *choosing* a model to run, before any serving
-starts. Those five read GGUF files directly off disk and query the local
-machine, no model loaded and no HTTP listener bound; only `download` talks
-to the Hugging Face Hub.
+`list`/`show`/`download`/`delete` subcommands (below) answer the questions
+that matter when *getting*, *choosing*, and *cleaning up* a model, before
+or after serving. Those six read (or write) GGUF files directly off disk
+and query the local machine, no model loaded and no HTTP listener bound;
+only `download` talks to the Hugging Face Hub.
 
 ## Quick start
 
@@ -82,9 +82,9 @@ orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 
 
 ## GGUF inventory
 
-Five subcommands cover getting and choosing a model, all sharing the same
-`orangu-server.conf` and its `models` directory (see **Configuration**
-below):
+Six subcommands cover getting, choosing, and cleaning up a model, all
+sharing the same `orangu-server.conf` and its `models` directory (see
+**Configuration** below):
 
 ### `download`: fetching a model from Hugging Face
 
@@ -378,6 +378,44 @@ well over 100,000 entries) is truncated to a short preview by default —
 metadata, and tensor-info table — `list`/`show` stay fast even against
 multi-gigabyte model files.
 
+### `delete`: removing a model from disk
+
+```sh
+orangu-server delete 3                                     # NR from `list`
+orangu-server delete unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server delete Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `models`
+orangu-server delete                                        # no argument: prints `list`'s table and prompts for an NR
+```
+
+```
+Delete 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB) from /home/you/models? [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)
+```
+
+Resolves its argument exactly the way `show` does — direct/relative/
+absolute path, bare filename under `models`, `NR`, or `MODEL` — but always
+against every shard the model is made of, not just the first: a
+multi-shard model (`name-00001-of-00004.gguf`, ...) is deleted atomically,
+even when only one shard's own path was named. Omit the argument entirely
+and `delete` prints the same table `list` does and prompts for an `NR`,
+the same interaction bare `orangu-server` (no subcommand at all) uses to
+pick a model to *serve* — here picking one to remove instead.
+
+Asks for confirmation before deleting anything (`[y/N]`, defaulting to
+**No** on an empty entry or a closed/non-interactive stdin) — `-y`/`--yes`
+skips the prompt, for scripted use.
+
+When a file lives under a Hugging Face hub cache (`models--<user>--<model>/
+snapshots/<rev>/...`, the layout `download` itself writes), its target blob
+under that repo's own `blobs/` directory is deleted too, reclaiming the
+actual disk space — but only when no other snapshot left in that same repo
+still points at it (a repo's ref can move without a file's content
+changing, in which case the cache reuses rather than re-fetches the blob;
+`delete` won't leave a still-needed one dangling). Empty `snapshots/<rev>/`
+and `models--<user>--<model>/` directories left behind by the last shard
+removed from them are cleaned up too — never anything above the configured
+`models` directory itself.
+
 ## Configuration
 
 `orangu-server.conf`:
@@ -470,10 +508,11 @@ orangu-server -s > ~/.zsh/completions/_orangu-server
 orangu-server -s | source
 ```
 
-Covers every flag above, the five subcommand names, and both the positional
-`model` argument and `show`'s own argument — the latter two completed by
-shelling back out to `orangu-server list` itself and reading its first two
-columns (`NR`/`MODEL`), the same way `orangu`'s own shell completions read
+Covers every flag above, the six subcommand names, and the positional
+`model` argument plus `show`'s and `delete`'s own arguments — the latter
+three completed by shelling back out to `orangu-server list` itself and
+reading its first two columns (`NR`/`MODEL`), the same way `orangu`'s own
+shell completions read
 `~/.orangu/sessions` directly rather than needing any extra plumbing in the
 binary.
 
