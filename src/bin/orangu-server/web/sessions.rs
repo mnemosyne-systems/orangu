@@ -133,6 +133,12 @@ pub fn list_sessions() -> Result<Vec<SessionSummary>> {
         let Ok(session) = serde_json::from_str::<Session>(&contents) else {
             continue;
         };
+        // A session with no messages was created (e.g. by New Chat, or on
+        // first page load) but never actually used — not worth surfacing
+        // in History.
+        if session.messages.is_empty() {
+            continue;
+        }
         summaries.push(SessionSummary {
             id: session.id,
             title: session.title,
@@ -230,6 +236,14 @@ mod tests {
         with_temp_home(|| {
             let mut a = create_session().unwrap();
             let mut b = create_session().unwrap();
+            a.messages.push(SessionMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            });
+            b.messages.push(SessionMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            });
             a.updated_at = 100;
             b.updated_at = 200;
             save_session(&a).unwrap();
@@ -239,6 +253,24 @@ mod tests {
             assert_eq!(summaries.len(), 2);
             assert_eq!(summaries[0].id, b.id);
             assert_eq!(summaries[1].id, a.id);
+        });
+    }
+
+    #[test]
+    fn list_sessions_excludes_sessions_with_no_messages() {
+        with_temp_home(|| {
+            let empty = create_session().unwrap();
+            let mut used = create_session().unwrap();
+            used.messages.push(SessionMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            });
+            save_session(&empty).unwrap();
+            save_session(&used).unwrap();
+
+            let summaries = list_sessions().unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].id, used.id);
         });
     }
 

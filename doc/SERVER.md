@@ -636,10 +636,13 @@ above).
 Set `web` in the config (or at the `web` prompt in `--init`) and visit
 `http://<host>:<web>/` for a small built-in chat UI:
 an input box, a scrolling transcript, a **New Chat** button, and a
-**History** button that lists previous chat sessions. It's a plain
-server-rendered HTML/CSS/JS page (no build step, no WASM) served by the
-same binary — a chat turn calls straight into the model's `Engine` in
-process, never making an HTTP hop to the API's own `port`.
+**History** button that lists previous chat sessions — sessions with no
+messages in them (e.g. one just started with **New Chat** but never sent
+to) are left out, so History only ever shows conversations that actually
+happened. It's a plain server-rendered HTML/CSS/JS page (no build step,
+no WASM) served by the same binary — a chat turn calls straight into the
+model's `Engine` in process, never making an HTTP hop to the API's own
+`port`.
 
 Each assistant reply is rendered from markdown to HTML server-side —
 including syntax-highlighted fenced code blocks — reusing the same
