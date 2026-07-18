@@ -836,18 +836,23 @@ pub fn create_pull_request_output(
 }
 
 pub(crate) fn git_commit_count(repo_root: &Path, range: &str) -> Result<usize> {
-    Ok(String::from_utf8_lossy(
-        &std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .args(["rev-list", "--count", range])
-            .output()
-            .context("failed to run git rev-list")?
-            .stdout,
-    )
-    .trim()
-    .parse()
-    .unwrap_or(0))
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-list", "--count", range])
+        .output()
+        .context("failed to run git rev-list")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "git rev-list --count failed for range '{range}': {stderr}"
+        ));
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .context("git rev-list --count produced unexpected output")?;
+    Ok(count)
 }
 
 /// One reviewer's status on a pull/merge request. `state` is a human-readable
