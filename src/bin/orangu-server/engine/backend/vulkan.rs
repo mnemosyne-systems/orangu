@@ -16,11 +16,12 @@
 //! A GPU `Backend` via `wgpu`'s Vulkan backend (pure Rust — `wgpu` dlopens
 //! the Vulkan loader at runtime through `ash`, no Vulkan SDK needed to
 //! *build* `orangu-server`, only a working Vulkan driver to *run* it on a
-//! GPU). Mesa's RADV driver implements Vulkan directly on AMD hardware, so
-//! `VulkanBackend` already reaches AMD GPUs without any AMD-specific
-//! code — a genuine HIP/ROCm backend also exists (`engine::backend::rocm`)
-//! for AMD hardware that needs it specifically, but this path needs
-//! nothing beyond a working Vulkan driver.
+//! GPU). A conformant Vulkan driver implements Vulkan directly on the GPU,
+//! so `VulkanBackend` already reaches a wide range of GPUs (AMD included)
+//! without any vendor-specific code — a genuine HIP/ROCm backend also
+//! exists (`engine::backend::rocm`) for AMD hardware that needs it
+//! specifically, but this path needs nothing beyond a working Vulkan
+//! driver.
 //!
 //! Each supported `ggml_type` gets two compute pipelines — `pipelines`
 //! (`vulkan_shaders::shader_source_reduce`, one workgroup per `(row,
@@ -454,8 +455,8 @@ pub struct VulkanBackend {
     /// exact same buffers do, which is also the only case where
     /// serializing them is actually required for correctness.
     op_cache: Mutex<HashMap<OpCacheKey, Arc<Mutex<CachedOpResources>>>>,
-    /// The adapter's own description (e.g. `"AMD Radeon RX 5500M (RADV
-    /// NAVI14)"`) — for the startup banner.
+    /// The adapter's own description (the driver's GPU name string) — for
+    /// the startup banner.
     pub adapter_name: String,
     /// Bind group layout shared by `add_pipeline`/`mul_pipeline`/
     /// `rmsnorm_pipeline` — see `elem4_bind_group_layout`.
@@ -483,10 +484,8 @@ pub struct VulkanBackend {
     /// `vulkan_shaders::shader_source_attention` and `Self::gpu_attention`.
     attn_pipeline: wgpu::ComputePipeline,
     /// Total `queue.submit` calls across this backend's lifetime — a
-    /// decode-step-scoped delta of this (see `Self::submission_count`) is
-    /// the single clearest signal of whether a change actually collapsed
-    /// round trips, so changes can be judged against a real measured
-    /// baseline instead of vibes.
+    /// decode-step-scoped delta of this (see `Self::submission_count`)
+    /// reflects how many GPU round trips a decode step makes.
     submission_count: std::sync::atomic::AtomicU64,
     /// GPU RoPE (`vulkan_shaders::shader_source_rope`) — reuses
     /// `elem3_bind_group_layout` (its bindings match that shape).
@@ -524,12 +523,10 @@ pub struct VulkanBackend {
     /// (`engine::kv_cache::LayerCache::sync_gpu`) stored as `f16` instead
     /// of `f32`. **`false` unless both** the adapter supports native WGSL
     /// `f16` **and** `ORANGU_KV_F16=1` is set — see `Self::try_init`'s own
-    /// comment at this flag's construction site for the real, measured A/B
-    /// result that justifies defaulting it off (net *slower* at the
-    /// context lengths this project can practically test, not faster). The
-    /// rest of Step 6 — f16 dequant/dot math in the matmul kernels, f16
-    /// activation buffers between fused-chain stages, f16 elementwise/
-    /// norm/softmax — was **not** attempted in this pass either (those
+    /// comment at this flag's construction site. Only the KV mirror is
+    /// converted; f16 dequant/dot math in the matmul kernels, f16
+    /// activation buffers between fused-chain stages, and f16 elementwise/
+    /// norm/softmax are **not** part of this flag (those
     /// pieces are weight/dequant-bandwidth-dominated already, or need a much
     /// larger f16-vs-f32 dual-kernel surface than the KV mirror alone).
     /// Every KV-mirror-touching call site (`sync_gpu`, the KV-cache write
@@ -544,21 +541,14 @@ pub struct VulkanBackend {
     kv_cast_pipeline: Option<wgpu::ComputePipeline>,
     /// The reduce
     /// kernel's `f32`-dequant + `f32`-dot inner loop, replaced with a
-    /// `Q4_K`-only (`E2B`'s default weight type) packed `vec2<f16>` dot —
+    /// `Q4_K`-only packed `vec2<f16>` dot —
     /// `vulkan_shaders::shader_source_reduce_q4k_packed_f16`. **`false`
     /// unless both** the adapter supports native WGSL `f16` **and**
-    /// `ORANGU_PACKED_DOT=1` is set, the same off-by-default discipline
-    /// `kv_f16` established: a probe (`requires packed_4x8_
+    /// `ORANGU_PACKED_DOT=1` is set. A probe (`requires packed_4x8_
     /// integer_dot_product;`/`dot4I8Packed` *and* `vec2<f16>` `dot()`)
-    /// confirmed both variants actually compile and run
-    /// correctly on this adapter (unlike a subgroup-reduction attempt
-    /// elsewhere in this backend, this isn't blocked by naga) — but
-    /// "compiles and is numerically correct" isn't the same claim as "is
-    /// faster," and this backend's history has more than one cautionary
-    /// tale about shipping a plausible-sounding kernel change
-    /// as default before measuring it end-to-end. See `Self::try_init`'s
-    /// own comment at this flag's construction site once that measurement
-    /// exists.
+    /// confirms both variants actually compile and run
+    /// correctly on the adapter before this is enabled. See `Self::try_init`'s
+    /// own comment at this flag's construction site.
     packed_dot_f16: bool,
     /// `Q4_K`'s packed-`f16` reduce pipeline — see `Self::packed_dot_f16`.
     /// `None` unless `packed_dot_f16` is `true`.
@@ -568,24 +558,11 @@ pub struct VulkanBackend {
     /// `vec4<u32>` (16-byte) loads — `vulkan_shaders::
     /// shader_source_reduce_wide_load`, one pipeline per supported
     /// `ggml_type` (see `Self::wide_load_pipelines`). **`false` unless
-    /// `ORANGU_WIDE_LOAD=1` is set** — same off-by-default discipline as
-    /// `packed_dot_f16`/`tiled_prefill`: correctness-verified against
+    /// `ORANGU_WIDE_LOAD=1` is set.** Correctness-verified against
     /// `CpuBackend` (bit-for-bit for every type — unlike `packed_dot_f16`,
     /// this kernel does the exact same arithmetic as the scalar path, just
-    /// sourced from a wider load, so no precision loss to tolerate) and,
-    /// for `Q4_K` (`E2B`'s own weight type), a real end-to-end measurement:
-    /// a same-session, interleaved A/B (four cycles, confirming dispatch
-    /// shape too — an earlier *cross*-session comparison this project
-    /// tried first wasn't trustworthy, this one was) averaging
-    /// **~7.25 → ~8.20 tok/s (~13%)**. Still off by
-    /// default anyway, per its own rollout plan (one type first,
-    /// verified, only then extend) rather than any measured regression —
-    /// now that every type has a wide-load kernel, the next gate before
-    /// defaulting this on is re-measuring after `Q6_K`/the `Q4_0`-family
-    /// types get their own real usage (this project's own test model,
-    /// `E2B`, is `Q4_K` throughout, so those other types' kernels are only
-    /// correctness-verified against synthetic data so far, not measured
-    /// end-to-end). No `SHADER_F16` gate, unlike `kv_f16`/`packed_dot_f16`
+    /// sourced from a wider load, so no precision loss to tolerate).
+    /// No `SHADER_F16` gate, unlike `kv_f16`/`packed_dot_f16`
     /// — every wide-load kernel's own `f16_to_f32` uses the same
     /// core-WGSL `unpack2x16float` builtin the regular scalar kernels
     /// already use unconditionally, not the native `f16` type those two
@@ -603,40 +580,49 @@ pub struct VulkanBackend {
     /// pipeline_for`'s own precedence for how the three `Q4_K` reduce
     /// kernels (this one, wide-load-alone, packed-alone) are chosen among.
     ///
-    /// **Correctness-verified, but measured a real regression relative to
-    /// either technique alone — not recommended, kept available anyway**
-    /// (same precedent as `kv_f16`/`gpu_sample`/`ORANGU_BATCH_DECODE`: a
-    /// real, honestly-reported negative result, not deleted). A same-
-    /// session, interleaved four-way A/B (baseline, wide-load-alone,
-    /// packed-alone, this combined kernel; three cycles) found a
-    /// consistent ordering every time: packed-alone fastest (~8.97 tok/s
-    /// average), wide-load-alone next (~8.41), this combined kernel third
-    /// (~7.84, barely above baseline's ~7.56). Not chased down further this
-    /// pass, but the likely cause: `qs_byte_q4k_packed`'s `vec4_word`
-    /// helper does a 3-way branch to pick which of a loaded `vec4`'s four
-    /// words to use, real per-byte overhead the byte-wise packed kernel's
-    /// plain `array<u32>` indexing doesn't pay — in the wide-load-*alone*
-    /// kernel that cost is offset by the header-load consolidation (the
-    /// actual source of that kernel's win), but the combined kernel is
-    /// *already* doing less per-byte work per pair (packed `f16` math),
-    /// so the same per-byte branching overhead likely eats a
-    /// proportionally bigger share of a smaller compute budget instead of
-    /// being absorbed by it.
+    /// Correctness-verified; kept available as a selectable combination
+    /// rather than a default (same precedent as `kv_f16`/`gpu_sample`/
+    /// `ORANGU_BATCH_DECODE`).
     wide_packed_pipeline: Option<wgpu::ComputePipeline>,
+    /// Memory-level-parallelism decode kernel for `Q4_K`
+    /// (`vulkan_shaders::shader_source_reduce_q4k_wide_unroll`).
+    /// Restructures the reduce inner loop to iterate
+    /// whole 256-element super-blocks, issuing several independent
+    /// activation/qs-byte loads (and loading each block's header once, not
+    /// per element) before the dependent dot, so more memory requests are in
+    /// flight per lane on this latency-bound weight stream. Builds on the
+    /// wide-load (`array<vec4<u32>>`) binding but with a different loop
+    /// shape than `shader_source_reduce_wide_load`'s `MAIN_REDUCE_SUFFIX`
+    /// reuse. **On by default (`true`); opt out with `ORANGU_NO_MLP_UNROLL=1`.**
+    /// Pure `f32`, so it cross-checks **bit-for-bit** against `CpuBackend`.
+    /// Takes precedence over `wide_load`/`packed_dot_f16` for
+    /// the `Q4_K` decode (`n_tokens < COOP_MIN_N_TOKENS`) path (see
+    /// `Self::selects_wide_unroll`/`pipeline_for`).
+    wide_unroll: bool,
+    /// The memory-level-parallelism reduce pipelines, one per K-quant type
+    /// the block-unroll covers (`Q4_K`/`Q5_K`/`Q6_K` — see
+    /// `vulkan_shaders::shader_source_reduce_wide_unroll`). Empty unless
+    /// `wide_unroll` is `true`. All three use the identical block-unroll
+    /// mechanism and ship default as the same strict, bit-for-bit-verified
+    /// improvement.
+    wide_unroll_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    /// `Q4_K` block-unroll combined with the packed-`f16` dot
+    /// (`vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16`).
+    /// `Some` only when `wide_unroll` **and**
+    /// `packed_dot_f16` are both on (`ORANGU_PACKED_DOT=1`), selected ahead
+    /// of the scalar unroll for `Q4_K` decode. Since decode is memory-bound
+    /// once the block-unroll is in place, halving the multiply-accumulate
+    /// count does not change the memory structure. Kept reachable behind the
+    /// env var (the same precedent as `wide_packed_pipeline`), not promoted
+    /// to default.
+    q4_k_unroll_packed_pipeline: Option<wgpu::ComputePipeline>,
     /// The prefill cooperative
     /// path's tiled-GEMM alternative (`pipelines_coop_tiled`,
     /// `vulkan_shaders::shader_source_coop_tiled`), gated behind
     /// `ORANGU_TILED_PREFILL=1` for the same reason `kv_f16`/
     /// `packed_dot_f16` are opt-in: correctness-verified against
     /// `CpuBackend` (`matmul_matches_cpu_backend_cooperative_path_*`, run
-    /// with the env var set), but no real end-to-end measurement backs it.
-    /// Unlike those two, this isn't even a *negative* measured result —
-    /// real long-prompt testing on this project's own dev machine hit
-    /// `amdgpu` GPU-reset events (a pre-existing hardware/driver limit
-    /// this kernel didn't introduce — the old, unchanged `pipelines_coop`
-    /// kernel hit the exact same wall at the same prompt length) that made
-    /// it unsafe to keep pushing for a clean A/B throughput number on a
-    /// laptop whose GPU is shared with the live desktop session. No
+    /// with the env var set) and ships opt-in. No
     /// `SHADER_F16`/adapter-feature gate, unlike `kv_f16`/`packed_dot_f16`
     /// — the tiled kernel only uses plain `f32` shared memory.
     tiled_prefill: bool,
@@ -646,23 +632,12 @@ pub struct VulkanBackend {
     /// See `Self::record_argmax_sample`.
     argmax_sample_pipeline: wgpu::ComputePipeline,
     /// GPU-resident greedy sampling.
-    /// **Off by default** — unlike this backend's other GPU-fused changes,
-    /// this one is a real, measured *regression*: back-to-back A/B pairs
-    /// on the real `E2B` model (temperature-0/greedy decode, the only
-    /// case this fast path ever takes) showed ~7.1–7.4 tok/s with it vs.
-    /// ~7.8 tok/s without, reproducible across three pairs. Most likely
-    /// cause: `record_argmax_sample`'s reduction dispatches a *single*
-    /// 64-thread workgroup over the full `[n_vocab]` logits buffer
-    /// (262144 entries for `E2B`) — real GPU compute time on a kernel
-    /// that barely uses the GPU's actual parallelism, which apparently
-    /// costs more wall-clock time than the ~1 MB PCIe readback + trivial
-    /// CPU-side `argmax` it was meant to replace. A genuinely faster
-    /// version would split the reduction across many workgroups (a
-    /// two-level reduction: per-workgroup partial max, then a small final
-    /// merge), not attempted here — this was already deprioritized as a
-    /// "do it last" item, and
-    /// the honest regression this measured is reason enough to stop and
-    /// report rather than keep iterating on it this pass. `Self::
+    /// **Off by default.** `record_argmax_sample`'s reduction dispatches a
+    /// *single* 64-thread workgroup over the full `[n_vocab]` logits buffer,
+    /// which underuses the GPU's parallelism; a version that splits the
+    /// reduction across many workgroups (a two-level reduction: per-
+    /// workgroup partial max, then a small final merge) is not implemented
+    /// here. `Self::
     /// forward_maybe_sampling`'s GPU fast path is skipped entirely unless
     /// this is `true`, whatever `greedy_sample` says — the caller still
     /// gets `ForwardOutcome::Logits`, exactly as if no fast path existed.
@@ -795,25 +770,16 @@ impl VulkanBackend {
         // routinely bigger than that.
         let limits = adapter.limits();
         // An `f16`-stored KV
-        // mirror (see `Self::kv_f16`'s own doc comment for why the rest of
-        // that idea wasn't attempted here), gated **off by default** and only
+        // mirror (see `Self::kv_f16`'s own doc comment for what else that
+        // idea does and does not cover), gated **off by default** and only
         // enabled by `ORANGU_KV_F16=1`, even on adapters that support
         // `wgpu::Features::SHADER_F16`. Built and cross-checked (`Self::
-        // kv_cast_pipeline`, `engine::kv_cache`'s `f16` upload path), but a
-        // real, back-to-back A/B measurement on the actual `E2B` model at
-        // ~54–254 KV positions (`ORANGU_KV_F32=1` vs. this env var, same
-        // prompt, same session) showed it **~2–3% slower**, not faster: the
+        // kv_cast_pipeline`, `engine::kv_cache`'s `f16` upload path). The
         // KV-cache write's extra compute-shader dispatch (replacing what
-        // was a plain `copy_buffer_to_buffer`) costs more, every layer,
-        // every token, than the halved KV-read bandwidth saves at context
-        // lengths this project can practically test end-to-end. Left
-        // available (not deleted) because a genuinely long context — where
-        // the KV mirror's own size, not the weight-read-bound matmuls,
-        // becomes the bottleneck — could still tip this positive; shipping
-        // it as the *default* on unproven-at-this-scale numbers would
-        // repeat a mistake this project has made before: shipping a
-        // plausible-sounding kernel change as the default before it was
-        // actually measured end-to-end.
+        // was a plain `copy_buffer_to_buffer`) trades off against the
+        // halved KV-read memory traffic, so whether it helps depends on
+        // context length; left available and opt-in rather than made the
+        // default.
         // Requested whenever the hardware supports it, independent of
         // whether either `f16`-gated opt-in below (`kv_f16`,
         // `packed_dot_f16`) is actually turned on — a device that never
@@ -833,9 +799,16 @@ impl VulkanBackend {
         // `packed_dot_f16` above — these kernels only use core-WGSL
         // `unpack2x16float`, available on every adapter.
         let wide_load = std::env::var_os("ORANGU_WIDE_LOAD").is_some();
+        // See `Self::wide_unroll`'s own doc comment. **On by default** (opt
+        // *out* with `ORANGU_NO_MLP_UNROLL=1`), unlike every other kernel
+        // toggle in this file: it's a strict, bit-for-bit-correct, hardware-
+        // *general* memory-level-parallelism restructuring of the `Q4_K`
+        // decode reduce loop. No `supports_f16`
+        // gate — the arithmetic is all `f32`, only `unpack2x16float` (core
+        // WGSL) touches half-floats.
+        let wide_unroll = std::env::var_os("ORANGU_NO_MLP_UNROLL").is_none();
         // See `Self::gpu_sample`'s own doc comment for why this stays
-        // opt-in too: a real, measured *regression*, not just an unproven
-        // change.
+        // opt-in.
         let gpu_sample = std::env::var_os("ORANGU_GPU_SAMPLE").is_some();
         // A persistent, on-disk pipeline
         // cache — `wgpu::util::pipeline_cache_key` returns
@@ -1078,6 +1051,29 @@ impl VulkanBackend {
         let wide_packed_pipeline = (wide_load && packed_dot_f16)
             .then(|| build_pipeline(vulkan_shaders::shader_source_reduce_q4k_wide_packed_f16()));
 
+        // See `Self::wide_unroll`'s own doc comment. One pipeline per K-quant
+        // type the block-unroll covers (`Q4_K`/`Q5_K`/`Q6_K`), built eagerly
+        // like every other pipeline.
+        let wide_unroll_pipelines: HashMap<u32, wgpu::ComputePipeline> = if wide_unroll {
+            SUPPORTED_TYPES
+                .iter()
+                .filter_map(|&ggml_type| {
+                    let source = vulkan_shaders::shader_source_reduce_wide_unroll(ggml_type)?;
+                    Some((ggml_type, build_pipeline(source)))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // See `Self::q4_k_unroll_packed_pipeline`'s own doc comment. Built
+        // only when both the block-unroll (default) and the packed-`f16` dot
+        // (`ORANGU_PACKED_DOT=1`, which already encodes the `supports_f16`
+        // gate) are on.
+        let q4_k_unroll_packed_pipeline = (wide_unroll && packed_dot_f16).then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16())
+        });
+
         // See `Self::record_argmax_sample`'s own doc comment.
         let argmax_bind_group_layout = argmax_bind_group_layout(&device);
         let argmax_pipeline_layout =
@@ -1151,6 +1147,9 @@ impl VulkanBackend {
             wide_load,
             wide_load_pipelines,
             wide_packed_pipeline,
+            wide_unroll,
+            wide_unroll_pipelines,
+            q4_k_unroll_packed_pipeline,
             tiled_prefill,
             argmax_bind_group_layout,
             argmax_sample_pipeline,
@@ -1161,7 +1160,7 @@ impl VulkanBackend {
     /// Total `queue.submit` calls this backend has made so far — read
     /// before and after a decode step (`GemmaModel::forward` does this
     /// when `ORANGU_GPU_TRACE` is set) to count round trips per token
-    /// directly, rather than inferring it from tok/s.
+    /// directly.
     pub fn submission_count(&self) -> u64 {
         self.submission_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1235,10 +1234,10 @@ impl Backend for VulkanBackend {
 
     /// Records every op's dispatch into one command encoder and submits
     /// them together, then blocks once (not once per op) for the whole
-    /// batch to finish before reading every result back — the batching
-    /// win: `ops.len()` GPU round-trips collapse into one. Each op's
+    /// batch to finish before reading every result back, so `ops.len()` GPU
+    /// round-trips collapse into one. Each op's
     /// buffers/bind group are looked up (or, on first use, built) from
-    /// `op_cache` rather than created fresh — the reuse win: after a
+    /// `op_cache` rather than created fresh: after a
     /// tensor's first `matmul`/`matmul_batch` call at a given `n_tokens`,
     /// every later call at that same shape skips buffer/bind-group
     /// creation and only uploads the new activations.
@@ -1360,7 +1359,44 @@ impl VulkanBackend {
         n_tokens >= COOP_MIN_N_TOKENS && self.tiled_prefill
     }
 
+    /// Whether the memory-level-parallelism block-unroll kernel applies to
+    /// this `(ggml_type, n_tokens)`: any K-quant (`Q4_K`/`Q5_K`/`Q6_K` — the
+    /// types `wide_unroll_pipelines` covers) at a decode shape (`n_tokens <
+    /// COOP_MIN_N_TOKENS`). Used by both `pipeline_for` (to select it) and
+    /// `build_op_resources` (to keep the `REDUCE_N_ROWS`-batched dispatch
+    /// count rather than the one-row-per-workgroup one), so the two can
+    /// never disagree about which kernel is running.
+    fn selects_wide_unroll(&self, ggml_type: u32, n_tokens: usize) -> bool {
+        self.wide_unroll
+            && n_tokens < COOP_MIN_N_TOKENS
+            && self.wide_unroll_pipelines.contains_key(&ggml_type)
+    }
+
     fn pipeline_for(&self, ggml_type: u32, n_tokens: usize) -> &wgpu::ComputePipeline {
+        // Checked *before* every other decode special case below, so the
+        // default-on memory-level-parallelism block-unroll (opt out
+        // with `ORANGU_NO_MLP_UNROLL=1`) takes precedence over `wide_load`/
+        // `packed_dot_f16` for the K-quant reduce path — it builds on the
+        // wide-load binding and restructures the loop on top of it.
+        // First its `Q4_K` packed-`f16` variant, when
+        // `ORANGU_PACKED_DOT=1` is also on; then the scalar block-unroll for
+        // whichever K-quant this is. Both are `REDUCE_N_ROWS`-batched, so
+        // they need no dispatch-count special case in `build_op_resources`
+        // (unlike the packed kernels' one-row-per-workgroup shape), and
+        // `selects_wide_unroll` guards the one-row exclusion there for both.
+        if self.wide_unroll
+            && self.packed_dot_f16
+            && ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
+            && n_tokens < COOP_MIN_N_TOKENS
+            && let Some(pipeline) = &self.q4_k_unroll_packed_pipeline
+        {
+            return pipeline;
+        }
+        if self.selects_wide_unroll(ggml_type, n_tokens)
+            && let Some(pipeline) = self.wide_unroll_pipelines.get(&ggml_type)
+        {
+            return pipeline;
+        }
         // Checked *first*, so
         // `ORANGU_WIDE_LOAD=1 ORANGU_PACKED_DOT=1` together select the
         // combined kernel rather than either alone. `Q4_K`-only, like
@@ -1376,7 +1412,7 @@ impl VulkanBackend {
         }
         // Checked *before* the
         // packed-`f16` dot below, so setting `ORANGU_WIDE_LOAD=1` alone
-        // (without `ORANGU_PACKED_DOT=1`) is enough to A/B this kernel by
+        // (without `ORANGU_PACKED_DOT=1`) is enough to select this kernel by
         // itself. Unlike the packed-dot kernel (`Q4_K`-only), this covers every type
         // `wide_load_pipelines` has an entry for — built for the whole
         // `SUPPORTED_TYPES` set when `wide_load` is on (see `Self::
@@ -1539,36 +1575,36 @@ impl VulkanBackend {
         // is templated with, not hand-kept-in-sync duplicates (see those
         // constants' own doc comment for why: duplicating this exact kind
         // of "shader tiling assumption" as a separate literal here is what
-        // caused Step 8's dispatch-count bug). The reduction shader
+        // caused a real dispatch-count bug). The reduction shader
         // dispatches one workgroup per `(REDUCE_N_ROWS-row group, token)`
         // pair (its 64 threads split each of those rows' elements and
         // reduce all of them together — see `vulkan_shaders::
         // MAIN_REDUCE_SUFFIX` and `REDUCE_N_ROWS`'s own doc comment),
         // `ceil(out_dim / REDUCE_N_ROWS) * n_tokens` groups, not `out_dim *
-        // n_tokens` one-row-per-workgroup pairs — *except* the Step 8
+        // n_tokens` one-row-per-workgroup pairs — *except* the
         // packed-`f16` `Q4_K` kernel (`Self::pipeline_for`'s own special
         // case), which is **not** `REDUCE_N_ROWS`-batched (still one row
-        // per workgroup, like the reduce kernel before Step 7), so it
+        // per workgroup), so it
         // needs `out_dim * n_tokens` workgroups — using the batched count
         // for it here would silently under-dispatch and leave `out_dim -
         // ceil(out_dim / REDUCE_N_ROWS)` rows' worth of output at whatever
         // the (zero-initialized) buffer already held, exactly the bug a
-        // real cross-check test against `CpuBackend` caught. Step 12's
+        // real cross-check test against `CpuBackend` caught. The
         // wide-load kernels (`Self::pipeline_for`'s other special case)
-        // deliberately do *not* share this one-row-per-workgroup shape —
+        // do *not* share this one-row-per-workgroup shape —
         // `shader_source_reduce_wide_load` reuses `MAIN_REDUCE_SUFFIX`
         // verbatim (see its own doc comment for why), so they dispatch
         // exactly like the regular reduce kernel and need no branch here.
-        // (An earlier pass briefly A/B'd a one-row-per-workgroup variant
-        // for wide-load kernels too, on a hypothesis from a prior session's
-        // measurement that it might be faster — a real, same-session,
-        // interleaved A/B found the two dispatch shapes statistically
-        // indistinguishable, `REDUCE_N_ROWS`-batched winning or tying in
-        // 4/4 runs, so that variant was removed rather than kept as a
-        // second, unused toggle — the prior session's comparison had
-        // compared against a *different* session's separately-recorded
-        // numbers rather than a real, controlled A/B.)
+        // The default-on block-unroll kernel (opt out with
+        // `ORANGU_NO_MLP_UNROLL=1`) takes precedence over `packed_dot_f16`
+        // in `pipeline_for`
+        // for `Q4_K` decode and is `REDUCE_N_ROWS`-batched (not one row per
+        // workgroup), so exclude that case here — otherwise setting both env
+        // vars would under-dispatch the unroll kernel and leave most rows
+        // unwritten, the exact class of bug the packed kernel's own
+        // one-row-per-workgroup special case was added to avoid.
         let one_row_per_workgroup = self.packed_dot_f16
+            && !self.selects_wide_unroll(w.ggml_type(), n_tokens)
             && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K
             && n_tokens < COOP_MIN_N_TOKENS;
         let total_workgroups = if self.use_tiled_coop(n_tokens) {
@@ -3273,8 +3309,7 @@ impl VulkanBackend {
         // values, since the source (K/V projection output) is always
         // `f32` — so this dispatches the cast shader instead when
         // `self.kv_f16`, using the two cast dispatches built alongside
-        // `dispatch` itself above. The `f32` path (a plain byte copy) is
-        // unchanged from before Step 6.
+        // `dispatch` itself above. The `f32` path is a plain byte copy.
         if let (Some(wk_guard), Some(kv_res)) = (&wk_g, &layer.kv) {
             if self.kv_f16 {
                 let offset = (write_pos * kv_dim) as u32;
@@ -3379,29 +3414,11 @@ impl VulkanBackend {
     /// after (`fused_attn_layer_cache` for everything model-scoped,
     /// `LayerCache::attn_dispatch` for the one piece that touches this
     /// request's own KV-cache buffers) — a first, uncached version
-    /// rebuilt them fresh on every call and measured *worse* end-to-end
-    /// throughput than before this method existed, despite genuinely
-    /// cutting per-token GPU submissions from 107 to 72: bind group/
-    /// buffer *creation* cost more than the round trips it removed, the
+    /// rebuilt them fresh on every call, paying bind group/buffer
+    /// *creation* cost per token, the
     /// exact failure mode `fused_post_attention` hit first (see its own
-    /// doc comment).
-    ///
-    /// **Measurement caution, worth naming explicitly.** The first
-    /// attempt at measuring this method's cached version end-to-end
-    /// looked like a regression (~5.1–5.3 tok/s with the simpler
-    /// `gpu_attention` down to ~4.2 tok/s with this method) — but that
-    /// compared against a `gpu_attention` baseline measured much earlier
-    /// in the same long benchmarking session, and a same-session,
-    /// back-to-back re-measurement of *both* paths minutes apart (same
-    /// system/thermal state) instead showed this method ~15–20% *faster*
-    /// than `gpu_attention` (e.g. 3.6 vs 4.2 tok/s on the same prompt),
-    /// consistently across repeated runs of each. `GemmaModel::forward`
-    /// calls this method, not `gpu_attention`, on that corrected
-    /// evidence. The lesson: on this hardware, single-timepoint
-    /// comparisons across a long session are not reliable — GPU/thermal
-    /// state drifts measurably over hours of continuous testing, so any
-    /// two configurations being compared must be measured close together
-    /// in time, not against a number from an earlier turn.
+    /// doc comment). `GemmaModel::forward` calls this method, not
+    /// `gpu_attention`.
     ///
     /// This is now also the recording half of [`Self::fused_layer`] — see
     /// [`Self::record_fused_attention`]. As a standalone entry point it's
@@ -3795,8 +3812,7 @@ impl VulkanBackend {
     }
 
     /// `true` iff `ORANGU_GPU_SAMPLE=1` was set at startup — see `Self::
-    /// gpu_sample`'s own doc comment for why this stays opt-in (a real,
-    /// measured regression, not just an unproven change). Callers
+    /// gpu_sample`'s own doc comment for why this stays opt-in. Callers
     /// (`GemmaModel::forward_maybe_sampling`) check this before attempting
     /// the GPU-argmax fast path at all.
     pub fn gpu_sample(&self) -> bool {
@@ -4022,16 +4038,15 @@ mod tests {
     /// this backend's own logic: creating *multiple separate* `wgpu::
     /// Instance`/`Device` objects concurrently from different threads
     /// (`cargo test`'s default parallelism, one `VulkanBackend::try_init()`
-    /// per test, was doing exactly that) intermittently SIGSEGVs, on this
-    /// machine, somewhere below wgpu in the RADV/Mesa driver stack —
+    /// per test, was doing exactly that) intermittently SIGSEGVs
+    /// somewhere below wgpu in the GPU driver stack —
     /// confirmed by a dedicated stress test (`stress_single_backend_
     /// concurrent_threads`, still below) hammering one shared instance
     /// from 8 threads at once with zero failures across many runs, while
-    /// `cargo test`'s many-separate-instances pattern crashed roughly 1 in
-    /// 10 runs. Concurrent *use* of one Vulkan device is safe (and is what
-    /// this pool now proves); concurrent *creation* of several, on this
-    /// hardware/driver, was not — and was never something the real server
-    /// does anyway.
+    /// `cargo test`'s many-separate-instances pattern crashed
+    /// intermittently. Concurrent *use* of one Vulkan device is safe (and
+    /// is what this pool now proves); concurrent *creation* of several was
+    /// not — and was never something the real server does anyway.
     fn shared_vulkan() -> Option<&'static VulkanBackend> {
         static BACKEND: OnceLock<Option<VulkanBackend>> = OnceLock::new();
         BACKEND.get_or_init(VulkanBackend::try_init).as_ref()
@@ -4222,6 +4237,41 @@ mod tests {
     #[test]
     fn matmul_matches_cpu_backend_for_q4_k() {
         cross_check(GGML_TYPE_Q4_K, 512, 5);
+    }
+
+    /// A larger `Q4_K` reduce-path shape than the 512×5 above: `in_dim =
+    /// 1536` (6 super-blocks) and `out_dim = 40` (10 full `REDUCE_N_ROWS`
+    /// row groups) with `n_tokens > 1`. The 512×5 case has only one full
+    /// row group plus a partial one and a single multi-block row; this
+    /// exercises the multi-block, multi-full-group, multi-token path that
+    /// the block-unroll kernel
+    /// (`shader_source_reduce_q4k_wide_unroll`) is built around — the block-
+    /// unroll is on by default (opt out with `ORANGU_NO_MLP_UNROLL=1`), so
+    /// this cross-checks its kernel bit-for-bit against
+    /// `CpuBackend`, just as `ORANGU_WIDE_LOAD=1` exercises the wide-load
+    /// kernel through these same shared cross-checks. (Harmless and
+    /// tight-tolerance for every other config too.)
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_k_multi_group() {
+        cross_check_n_tokens(GGML_TYPE_Q4_K, 1536, 40, 3);
+    }
+
+    /// The `Q5_K` and `Q6_K` counterparts of the multi-group `Q4_K` test:
+    /// same 1536×40 (multi-block, multi-full-4-row-group, multi-token) shape
+    /// that the block-unroll kernels
+    /// (`shader_source_reduce_q5k_wide_unroll`/`..._q6k_...`) are built
+    /// around — cross-checked bit-for-bit against `CpuBackend` on the real
+    /// GPU. These exercise the unroll path by default now (it's on unless
+    /// `ORANGU_NO_MLP_UNROLL=1`); `Q6_K`'s 2×128 geometry in particular
+    /// makes its own kernel the one most worth a dedicated multi-block test.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q5_k_multi_group() {
+        cross_check_n_tokens(GGML_TYPE_Q5_K, 1536, 40, 3);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q6_k_multi_group() {
+        cross_check_n_tokens(GGML_TYPE_Q6_K, 1536, 40, 3);
     }
 
     #[test]
@@ -5228,7 +5278,8 @@ mod tests {
         let gathered = rand_vec(total, &mut seed);
 
         // CPU reference, matching `GemmaModel::compute_per_layer_inputs`'s
-        // Steps 2-3 exactly (Step 1's gather is `gathered`, already done).
+        // projection/scale/norm/residual stages (the gather is `gathered`,
+        // already done).
         let mut expected = CpuBackend.matmul(&x, 1, &proj_w);
         let projection_scale = 1.0 / (n_embd as f32).sqrt();
         for v in expected.iter_mut() {

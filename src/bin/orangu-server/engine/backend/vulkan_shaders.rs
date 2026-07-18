@@ -22,22 +22,14 @@
 //! changing either.
 //!
 //! Two dispatch strategies share those same per-type `dequant_element`
-//! functions (see each `*_COOP_MIDDLE`'s doc comment for why a *third*,
-//! now-removed strategy — one thread computing a whole `(row, token)`
-//! sequentially — was replaced):
+//! functions:
 //!
 //! - **`MAIN_REDUCE_SUFFIX`** (small `n_tokens`, e.g. decode's `n_tokens ==
 //!   1`, `VulkanBackend::COOP_MIN_N_TOKENS`): one workgroup per `(row,
 //!   token)` pair, all 64 threads splitting that *row's own elements*
 //!   (`k`, `k+64`, `k+128`, ...) and reducing their partial dot-product
-//!   sums together. Replaced an earlier one-thread-per-row design once
-//!   real measurements against `unsloth/gemma-4-E2B`'s actual shapes (its
-//!   262144-entry vocabulary in particular — a single lm_head call cost
-//!   ~138ms) showed that design's memory access pattern was badly
-//!   uncoalesced: adjacent threads in the same wavefront, each owning a
-//!   *different row*, read memory `row_bytes` (hundreds of bytes) apart at
-//!   every step, instead of the current design's adjacent threads reading
-//!   *adjacent elements of the same row*.
+//!   sums together. Adjacent threads read *adjacent elements of the same
+//!   row*, so a wavefront's reads over the row are contiguous.
 //! - **`MAIN_COOP_SUFFIX`** (large `n_tokens`, e.g. a long prompt's
 //!   prefill): one workgroup per output row, looping over *all* tokens —
 //!   dequantizes each block once into shared memory and reuses it across
@@ -121,21 +113,17 @@ fn get_scale_min_k4(base: u32, j: u32) -> vec2<u32> {
 /// at each `k` read `x[x_base + k]` *once* and reuse it across all
 /// `REDUCE_N_ROWS` rows' dot products — "multiple output rows per thread."
 /// A standard workgroup tree
-/// reduction (`partial_sums`, now `REDUCE_N_ROWS` independent reductions
+/// reduction (`partial_sums`, `REDUCE_N_ROWS` independent reductions
 /// packed into one flat array, `partial_sums[row * 64 + lane]`) combines
-/// each row's 64 partial sums into that row's final output, same as
-/// before, just `REDUCE_N_ROWS` times per workgroup instead of once.
+/// each row's 64 partial sums into that row's final output, `REDUCE_N_ROWS`
+/// times per workgroup.
 ///
-/// This still fixes the memory access pattern a one-thread-per-row design
-/// has (adjacent threads read adjacent elements of the *same* row at every
-/// step — see the single-row design's own history in this module's
-/// top-of-file doc comment) and additionally: cuts the workgroup dispatch
-/// count `REDUCE_N_ROWS`-fold (`VulkanBackend::build_op_resources` computes
-/// `ceil(out_dim / REDUCE_N_ROWS) * n_tokens` workgroups now, not
-/// `out_dim * n_tokens` — a real reduction for a wide `lm_head`'s
-/// 262144-row output), amortizes each `workgroupBarrier` round over
-/// `REDUCE_N_ROWS` rows' worth of useful reduction instead of one, and
-/// reads each `x[k]` once per workgroup instead of once per row.
+/// Adjacent threads read adjacent elements of the *same* row at every
+/// step, so a wavefront's reads over the row are contiguous.
+/// `VulkanBackend::build_op_resources` dispatches
+/// `ceil(out_dim / REDUCE_N_ROWS) * n_tokens` workgroups, each `x[k]` is
+/// read once per workgroup, and each `workgroupBarrier` round reduces
+/// `REDUCE_N_ROWS` rows at once.
 /// `REDUCE_N_ROWS` rows are handled with plain unrolled indices (0..4),
 /// not a runtime loop over a dynamically-sized array, since it's a fixed
 /// compile-time constant matching `VulkanBackend::REDUCE_N_ROWS` exactly —
@@ -234,7 +222,7 @@ fn main(
 /// dispatch selection) that many tokens genuinely share the same weight
 /// row's blocks. One workgroup per output row (not per `(row, token)`
 /// pair): every thread cooperatively dequantizes its own slice of each
-/// block into `shared_vals` (`var<workgroup>`, real fast on-chip shared
+/// block into `shared_vals` (`var<workgroup>`, on-chip shared
 /// memory — not the per-thread `array<f32, BLOCK_ELEMS>` the
 /// non-cooperative path deliberately avoids, a different physical
 /// resource with none of that spilling risk) via `dequant_element`
@@ -257,22 +245,11 @@ fn main(
 ///
 /// This never reuses activations across output rows — every one of
 /// `out_dim` per-row workgroups independently re-reads the entire
-/// activation matrix from global memory — which is exactly what `Self::
-/// shader_source_coop_tiled` (`ORANGU_TILED_PREFILL=1`) fixes. That kernel is correctness-verified
-/// (`VulkanBackend`'s `matmul_matches_cpu_backend_cooperative_path_*`
-/// tests, run with the env var set) but its real end-to-end prefill
-/// throughput is **unmeasured** — this project's own non-negotiable
-/// verification discipline requires a real, back-to-back measurement on
-/// the actual model before any default-affecting change ships, and that
-/// measurement couldn't be safely completed this session: sending long
-/// prompts (~1500+ tokens) through *either* kernel hit real `amdgpu`
-/// ring-timeout/GPU-reset events on this laptop's shared GPU (also used
-/// by the live desktop compositor) — a pre-existing hardware/driver
-/// limit, confirmed to affect this unchanged kernel too, not something
-/// this tiled kernel introduced, but one that made further large-prompt A/B
-/// testing unsafe to keep pursuing. This kernel stays the default;
-/// `shader_source_coop_tiled` ships opt-in, pending a real measurement
-/// once this can be tested without risking the live desktop session.
+/// activation matrix from global memory — which is what `Self::
+/// shader_source_coop_tiled` (`ORANGU_TILED_PREFILL=1`) addresses. That
+/// kernel is correctness-verified (`VulkanBackend`'s
+/// `matmul_matches_cpu_backend_cooperative_path_*` tests, run with the env
+/// var set) and ships opt-in; this kernel stays the default.
 const MAIN_COOP_SUFFIX: &str = r#"
 @compute @workgroup_size(64)
 fn main(
@@ -324,22 +301,18 @@ fn main(
 "#;
 
 /// Row-tile / token-tile output-tiling dimensions for `MAIN_COOP_TILED_
-/// SUFFIX`'s prefill GEMM (`ORANGU_TILED_PREFILL=1`) — templated into the WGSL text (`%TILE_ROWS%`/
-/// `%TILE_TOKENS%`/`%CHUNK%`, `shader_source_coop_tiled`) rather than
-/// duplicated as separate literals in the shader and in `VulkanBackend::
-/// build_op_resources`'s dispatch-count math. `REDUCE_N_ROWS` (the
-/// multi-row-per-workgroup reduce kernel above) *is*
-/// duplicated that way — a hand-kept-in-sync literal in both places — and
-/// that exact drift is what caused a real dispatch-count bug found while
-/// adding the packed-dot kernel: one formula got updated for a new
-/// kernel, the other didn't. `VulkanBackend` imports these same three
-/// constants for its own dispatch math instead of re-declaring the numbers,
-/// closing off that failure mode structurally rather than just documenting
-/// it. `TILE_TOKENS` (64) matches the old cooperative kernel's own implicit
-/// token-tile size (it looped 64 tokens at a time per weight-block
-/// dequant), so weight-dequant reuse is unchanged from before; `TILE_ROWS`
-/// (16) is new — the old kernel never reused activations across output
-/// rows at all (one workgroup per row, so every row's workgroup re-read
+/// SUFFIX`'s prefill GEMM (`ORANGU_TILED_PREFILL=1`) — templated into the
+/// WGSL text (`%TILE_ROWS%`/`%TILE_TOKENS%`/`%CHUNK%`,
+/// `shader_source_coop_tiled`) rather than duplicated as separate literals
+/// in the shader and in `VulkanBackend::build_op_resources`'s dispatch-
+/// count math. `VulkanBackend` imports these same three constants for its
+/// own dispatch math instead of re-declaring the numbers, so the shader and
+/// the dispatch-count math can't drift out of sync. `TILE_TOKENS` (64)
+/// matches the per-row cooperative kernel's own implicit token-tile size
+/// (it loops 64 tokens at a time per weight-block dequant), so weight-
+/// dequant reuse matches that kernel; `TILE_ROWS` (16) additionally reuses
+/// activations across output rows, which the per-row cooperative kernel
+/// does not (one workgroup per row, so every row's workgroup re-reads
 /// `x` from global memory independently). `CHUNK` (32) is the K-dimension
 /// streaming granularity and is deliberately *smaller* than the K-quant
 /// types' native super-block size (`BLOCK_ELEMS = 256` for `Q4_K`/`Q5_K`/
@@ -795,17 +768,14 @@ pub fn shader_source_reduce(ggml_type: u32) -> Option<String> {
     Some(format!("{PRELUDE}\n{middle}\n{MAIN_REDUCE_SUFFIX}"))
 }
 
-/// `Q4_K` only (`E2B`'s
-/// default weight type — rolled out one type first, deliberately).
+/// `Q4_K` only.
 /// Dequantizes weight elements *in pairs* (`dequant_pair_f16`, a `Q4_K`-
 /// specific restatement of `Q4_K_COOP_MIDDLE`'s `dequant_element` that
 /// also skips the redundant `get_scale_min_k4` lookup a pair's two
 /// elements would otherwise repeat) and accumulates the dot product as
 /// packed `vec2<f16>` instead of two scalar `f32` multiplies — half as
-/// many multiply-accumulate ops in the inner loop, gated behind
-/// `VulkanBackend::packed_dot_f16` (`ORANGU_PACKED_DOT=1`) since, like
-/// Step 6/7, this needs a real end-to-end measurement before it can be
-/// trusted as a win, not just a plausible-sounding one. Not reused by
+/// many multiply-accumulate ops in the inner loop. Opt-in via
+/// `VulkanBackend::packed_dot_f16` (`ORANGU_PACKED_DOT=1`). Not reused by
 /// `shader_source_reduce`/`Q4_K_COOP_MIDDLE`'s own `dequant_element`
 /// (kept as a separate, self-contained kernel) since a per-pair, `f16`-
 /// typed dequant function has a different signature and doesn't compose
@@ -904,7 +874,7 @@ fn main(
 }
 "#;
     // `enable f16;` must precede every global declaration in the whole
-    // module (a WGSL rule, not just naga pedantry) — `PRELUDE` already has
+    // module (a WGSL rule) — `PRELUDE` already has
     // `struct Meta`/global `var<...>` declarations, so this can't sit
     // inside `MIDDLE` the way the rest of `MIDDLE` conceptually belongs
     // there; it has to lead the concatenated string instead.
@@ -928,7 +898,7 @@ fn main(
 /// multiples of 16) compute `vec4_base = byte_offset / 16u` — always exact
 /// for those two types, since every block *and* every row (`row_bytes` is
 /// a multiple of `BLOCK_BYTES`) they ever index starts at a 16-byte
-/// boundary — and get the biggest win: their whole `d`/`dmin`/`scales`
+/// boundary — and their whole `d`/`dmin`/`scales`
 /// header (16 bytes) loads in one `vec4` read instead of up to 9 `read_u8`
 /// calls. The other 7 types' blocks aren't 16-byte multiples (`Q6_K`'s 210
 /// in particular), so their block starts land at unpredictable, *varying*
@@ -936,13 +906,9 @@ fn main(
 /// `read_word_unaligned_v4`/`read_byte_v4` below handle any `byte_offset`
 /// correctly regardless, and each type still consolidates whatever of its
 /// own fields are provably word-safe to combine (worked out per type,
-/// see each `*_WIDE_MIDDLE` constant's own comment) — smaller than the
-/// aligned types' win, but real.
+/// see each `*_WIDE_MIDDLE` constant's own comment).
 ///
-/// Gated behind `VulkanBackend::wide_load` (`ORANGU_WIDE_LOAD=1`), same
-/// off-by-default discipline as every other unproven-until-measured kernel
-/// in this file (Steps 6/8/10/11's GPU sampling and batching) — see that
-/// field's own doc comment for why.
+/// Opt-in via `VulkanBackend::wide_load` (`ORANGU_WIDE_LOAD=1`).
 const PRELUDE_VEC4: &str = r#"
 struct Meta {
     in_dim: u32,
@@ -968,10 +934,8 @@ fn bf16_to_f32(bits: u32) -> f32 {
 
 // WGSL supports a dynamic (non-const) index into a vector via `v[i]`, but
 // this sticks to an explicit branch anyway — `idx` only ever ranges 0..4
-// (or 0..3 for `vec3_word`), so the branch is cheap, and it sidesteps
-// relying on naga lowering `OpVectorExtractDynamic` correctly on a WGSL
-// corner this project hasn't exercised before (see this file's own
-// top-of-file history of real naga gaps — subgroups, still blocked).
+// (or 0..3 for `vec3_word`), so the branch is cheap, and a dynamic vector
+// index is avoided.
 fn vec4_word(v: vec4<u32>, idx: u32) -> u32 {
     if (idx == 0u) { return v.x; }
     if (idx == 1u) { return v.y; }
@@ -1042,8 +1006,7 @@ fn get_scale_min_k4_v4(scales: vec3<u32>, j: u32) -> vec2<u32> {
 
 /// `{ f32 }`, 1 element — the whole block *is* one word, so `dequant_
 /// element` collapses to a single `read_word_v4` call instead of the
-/// byte-wise kernel's 4 separate `read_u8` calls: a clean 4x reduction in
-/// memory-access instruction count for this type specifically.
+/// byte-wise kernel's 4 separate `read_u8` calls.
 const F32_WIDE_MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 4u;
 const BLOCK_ELEMS: u32 = 1u;
@@ -1080,9 +1043,9 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 /// straddles a 4-byte word regardless of the block's own alignment (a
 /// 2-byte field starting at word-offset 0 or 2 always fits inside one
 /// word) — 1 word read replaces the byte-wise kernel's 2 `read_u8` calls
-/// for `d`. `qs` (the actual nibbles) stays per-byte (`read_byte_v4`,
-/// still a real win over `array<u32>`-bound `read_u8`, just not further
-/// consolidated) — mirrors `Q4_0_COOP_MIDDLE`'s math exactly otherwise.
+/// for `d`. `qs` (the actual nibbles) stays per-byte (`read_byte_v4`, just
+/// `vec4`-typed rather than further consolidated) — mirrors
+/// `Q4_0_COOP_MIDDLE`'s math exactly otherwise.
 const Q4_0_WIDE_MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 18u;
 const BLOCK_ELEMS: u32 = 32u;
@@ -1149,8 +1112,7 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 /// loads in **one** `vec4` read (`weights[vec4_base]`) instead of the
 /// byte-wise kernel's up to 9 separate `read_u8` calls (2 for `d`, 2 for
 /// `dmin`, up to 5 across both `get_scale_min_k4` calls one element
-/// needs) — this is where this type's real, measured ~11-13% throughput
-/// win comes from. `qs` (the 128-byte
+/// needs). `qs` (the 128-byte
 /// nibble region) stays one word-extraction per queried byte (`qs_byte`) —
 /// same granularity `read_u8` already had there, just `vec4`-typed.
 /// Otherwise mirrors `Q4_K_COOP_MIDDLE`'s index math line-for-line.
@@ -1327,11 +1289,392 @@ pub fn shader_source_reduce_wide_load(ggml_type: u32) -> Option<String> {
     Some(format!("{PRELUDE_VEC4}\n{middle}\n{MAIN_REDUCE_SUFFIX}"))
 }
 
+/// `Q4_K`-only decode kernel that restructures the reduce inner loop for
+/// **memory-level parallelism** — issuing several independent memory loads
+/// before the dependent dequant-and-dot rather than one outstanding load
+/// per lane at a time. Builds on the
+/// wide-load path (`PRELUDE_VEC4`, `weights` bound as `array<vec4<u32>>`)
+/// but changes *how the loop is shaped*, which the `MAIN_REDUCE_SUFFIX`-
+/// based wide-load kernel (`shader_source_reduce_wide_load`) does not.
+///
+/// The problem it targets: `MAIN_REDUCE_SUFFIX`'s inner loop reads **one**
+/// weight element per lane per iteration (`k += 64u`) and immediately
+/// consumes it in a dependent `dequant_element` + `fma` before looping —
+/// one outstanding memory request per lane at a time, which under-feeds the
+/// memory pipeline on a latency-bound DRAM stream. Wide loads reduce the
+/// *number* of transactions but do not add independent in-flight loads;
+/// this does.
+///
+/// The restructuring, exploiting `Q4_K`'s fixed `256 = 4 × 64` super-block
+/// geometry: one workgroup still handles a `REDUCE_N_ROWS = 4`-row group
+/// (same dispatch shape as `MAIN_REDUCE_SUFFIX`, so
+/// `VulkanBackend::build_op_resources`' workgroup-count math is reused
+/// unchanged), but the loop now iterates whole 256-element super-blocks
+/// rather than striding single elements. Within each block, thread `local`
+/// (0..63) owns in-group position `local` of *all four* 64-groups, so the
+/// body issues its **four activation loads up front** (`x0..x3`, one per
+/// 64-group, reused across all four output rows) and, per row, `q4k_block_
+/// dot` loads that block's header **once** (not once per element, as the
+/// per-element `dequant_element` re-does) and issues its **four qs-byte
+/// loads together** before any dependent scale/min math. That is the
+/// memory-level parallelism: several independent loads outstanding per
+/// lane per block, and 4× less redundant header traffic. Explicit unrolling
+/// to whole blocks makes the header reuse unconditional, which the compiler
+/// could not hoist across the stride-64 element loop.
+///
+/// Pure `f32` arithmetic, identical to the scalar/wide-load path
+/// element-for-element (just reordered loads), so it cross-checks
+/// bit-for-bit against `CpuBackend` at the same tight tolerance the
+/// wide-load kernel uses — no `f16` precision loss to widen for. **On by
+/// default** (`VulkanBackend::wide_unroll`, opt out with
+/// `ORANGU_NO_MLP_UNROLL=1`).
+/// The shared `main` for every block-unroll kernel (`Q4_K`/`Q5_K`/`Q6_K`,
+/// scalar and packed-`f16`). Each type's `*_UNROLL_MIDDLE` supplies its own
+/// `BLOCK_BYTES`/`BLOCK_ELEMS` and a single uniform entry point
+/// `block_dot(byte_offset, local, x0, x1, x2, x3) -> f32` — this thread's
+/// contribution to one output row from one 256-element super-block, given
+/// the block's byte offset, this lane's id, and the four activations for
+/// the four 64-groups (positions `local`, `64+local`, `128+local`,
+/// `192+local`). Because all three types share that 4×64 super-block
+/// geometry (element `g` of this lane always lives at position `g*64 +
+/// local`), the activation gather and the whole `REDUCE_N_ROWS = 4`-batched
+/// loop/reduction are identical across types; only the per-type
+/// dequant-and-dot inside `block_dot` differs. Kept `REDUCE_N_ROWS`-batched
+/// (four output rows per workgroup, four hoisted activations reused across
+/// them) so `VulkanBackend::build_op_resources`' existing dispatch-count
+/// math applies unchanged.
+const UNROLL_SUFFIX: &str = r#"
+var<workgroup> partial_sums: array<f32, 256>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n_row_groups = (params.out_dim + 3u) / 4u;
+    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;
+    if (flat >= n_row_groups * params.n_tokens) {
+        return;
+    }
+    let rg = flat / params.n_tokens;
+    let t = flat % params.n_tokens;
+    let o0 = rg * 4u;
+    let o1 = o0 + 1u;
+    let o2 = o0 + 2u;
+    let o3 = o0 + 3u;
+    let local = lid.x;
+    let x_base = t * params.in_dim;
+
+    var partial0: f32 = 0.0;
+    var partial1: f32 = 0.0;
+    var partial2: f32 = 0.0;
+    var partial3: f32 = 0.0;
+
+    // The K-super-block (256 elements) is the quantization unit, so it always
+    // divides `in_dim` exactly — this loops whole blocks with no partial
+    // tail, unlike `MAIN_REDUCE_SUFFIX`'s element-strided loop.
+    let n_blocks = params.in_dim / BLOCK_ELEMS;
+    var b: u32 = 0u;
+    loop {
+        if (b >= n_blocks) {
+            break;
+        }
+        let block_off = b * BLOCK_BYTES;
+        let x_blk = x_base + b * BLOCK_ELEMS;
+        // Four activation loads issued together (one per 64-group), reused
+        // across all four output rows below.
+        let x0 = x[x_blk + local];
+        let x1 = x[x_blk + 64u + local];
+        let x2 = x[x_blk + 128u + local];
+        let x3 = x[x_blk + 192u + local];
+        partial0 = partial0 + block_dot(o0 * params.row_bytes + block_off, local, x0, x1, x2, x3);
+        if (o1 < params.out_dim) {
+            partial1 = partial1 + block_dot(o1 * params.row_bytes + block_off, local, x0, x1, x2, x3);
+        }
+        if (o2 < params.out_dim) {
+            partial2 = partial2 + block_dot(o2 * params.row_bytes + block_off, local, x0, x1, x2, x3);
+        }
+        if (o3 < params.out_dim) {
+            partial3 = partial3 + block_dot(o3 * params.row_bytes + block_off, local, x0, x1, x2, x3);
+        }
+        b = b + 1u;
+    }
+
+    partial_sums[local] = partial0;
+    partial_sums[64u + local] = partial1;
+    partial_sums[128u + local] = partial2;
+    partial_sums[192u + local] = partial3;
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride) {
+            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
+            partial_sums[64u + local] = partial_sums[64u + local] + partial_sums[64u + local + stride];
+            partial_sums[128u + local] = partial_sums[128u + local] + partial_sums[128u + local + stride];
+            partial_sums[192u + local] = partial_sums[192u + local] + partial_sums[192u + local + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (local == 0u) {
+        y[t * params.out_dim + o0] = partial_sums[0];
+        if (o1 < params.out_dim) {
+            y[t * params.out_dim + o1] = partial_sums[64u];
+        }
+        if (o2 < params.out_dim) {
+            y[t * params.out_dim + o2] = partial_sums[128u];
+        }
+        if (o3 < params.out_dim) {
+            y[t * params.out_dim + o3] = partial_sums[192u];
+        }
+    }
+}
+"#;
+
+/// `Q4_K`'s `block_dot`: header loaded once, all four qs-byte loads (one per
+/// 64-group) issued up front so they're in flight together, then the four
+/// dependent dequant-and-multiply-adds. This lane owns in-group position
+/// `local` of every 64-group — positions 0..31 are low nibbles (qs byte
+/// `local`, scale `g*2`), 32..63 high nibbles (qs byte `local-32`, scale
+/// `g*2+1`). `q4k_elem` mirrors `Q4_K_WIDE_MIDDLE::dequant_element`.
+const Q4K_UNROLL_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 144u;
+const BLOCK_ELEMS: u32 = 256u;
+
+fn qs_byte_q4k(vec4_base: u32, qi: u32) -> u32 {
+    let v4i = vec4_base + 1u + qi / 16u;
+    let word = vec4_word(weights[v4i], (qi % 16u) / 4u);
+    return (word >> (8u * (qi % 4u))) & 0xFFu;
+}
+
+fn q4k_elem(d: f32, dmin: f32, scales: vec3<u32>, g: u32, is_low: bool, byte: u32) -> f32 {
+    let is_idx = g * 2u + select(1u, 0u, is_low);
+    let sm = get_scale_min_k4_v4(scales, is_idx);
+    let dd = d * f32(sm.x);
+    let mm = dmin * f32(sm.y);
+    let nib = select(byte >> 4u, byte & 0xFu, is_low);
+    return dd * f32(nib) - mm;
+}
+
+fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
+    let is_low = local < 32u;
+    let qsi = select(local - 32u, local, is_low);
+    let vec4_base = byte_offset / 16u;
+    let header = weights[vec4_base];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+    let scales = vec3<u32>(header.y, header.z, header.w);
+    let b0 = qs_byte_q4k(vec4_base, qsi);
+    let b1 = qs_byte_q4k(vec4_base, 32u + qsi);
+    let b2 = qs_byte_q4k(vec4_base, 64u + qsi);
+    let b3 = qs_byte_q4k(vec4_base, 96u + qsi);
+    return q4k_elem(d, dmin, scales, 0u, is_low, b0) * x0
+         + q4k_elem(d, dmin, scales, 1u, is_low, b1) * x1
+         + q4k_elem(d, dmin, scales, 2u, is_low, b2) * x2
+         + q4k_elem(d, dmin, scales, 3u, is_low, b3) * x3;
+}
+"#;
+
+/// `Q5_K`'s `block_dot`: same 4×64 geometry and vec4-aligned header as
+/// `Q4_K`, plus the extra high bit each element gets from the block's `qh`
+/// region. One `qh` byte (index `qsi`) is shared across all four 64-groups
+/// — only the bit selected differs (`1<<2g` for the low nibble half,
+/// `2<<2g` for the high) — so it loads once. Mirrors `Q5_K_WIDE_MIDDLE::
+/// dequant_element`.
+const Q5K_UNROLL_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 176u;
+const BLOCK_ELEMS: u32 = 256u;
+
+fn qh_byte_q5k(vec4_base: u32, l: u32) -> u32 {
+    let v4i = vec4_base + 1u + l / 16u;
+    let word = vec4_word(weights[v4i], (l % 16u) / 4u);
+    return (word >> (8u * (l % 4u))) & 0xFFu;
+}
+
+fn qs_byte_q5k(vec4_base: u32, qi: u32) -> u32 {
+    let v4i = vec4_base + 3u + qi / 16u;
+    let word = vec4_word(weights[v4i], (qi % 16u) / 4u);
+    return (word >> (8u * (qi % 4u))) & 0xFFu;
+}
+
+fn q5k_elem(d: f32, dmin: f32, scales: vec3<u32>, g: u32, is_low: bool, byte: u32, qh: u32) -> f32 {
+    let is_idx = g * 2u + select(1u, 0u, is_low);
+    let sm = get_scale_min_k4_v4(scales, is_idx);
+    let dd = d * f32(sm.x);
+    let mm = dmin * f32(sm.y);
+    let bit = select(2u << (2u * g), 1u << (2u * g), is_low);
+    var hi: i32 = 0;
+    if ((qh & bit) != 0u) { hi = 16; }
+    let nib = select(byte >> 4u, byte & 0xFu, is_low);
+    return dd * f32(i32(nib) + hi) - mm;
+}
+
+fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
+    let is_low = local < 32u;
+    let qsi = select(local - 32u, local, is_low);
+    let vec4_base = byte_offset / 16u;
+    let header = weights[vec4_base];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+    let scales = vec3<u32>(header.y, header.z, header.w);
+    let qh = qh_byte_q5k(vec4_base, qsi);
+    let b0 = qs_byte_q5k(vec4_base, qsi);
+    let b1 = qs_byte_q5k(vec4_base, 32u + qsi);
+    let b2 = qs_byte_q5k(vec4_base, 64u + qsi);
+    let b3 = qs_byte_q5k(vec4_base, 96u + qsi);
+    return q5k_elem(d, dmin, scales, 0u, is_low, b0, qh) * x0
+         + q5k_elem(d, dmin, scales, 1u, is_low, b1, qh) * x1
+         + q5k_elem(d, dmin, scales, 2u, is_low, b2, qh) * x2
+         + q5k_elem(d, dmin, scales, 3u, is_low, b3, qh) * x3;
+}
+"#;
+
+/// `Q6_K`'s `block_dot`. `Q6_K`'s 210-byte block isn't 16-byte-aligned and
+/// uses a 2×128 (not 4×64) internal geometry, so this maps this lane's four
+/// positions (`local`, `64+local`, `128+local`, `192+local`) to `Q6_K_WIDE_
+/// MIDDLE`'s `(idx, which_q, l)` scheme: `l = local % 32`, `w_lo = local /
+/// 32` picks which of the two `which_q` pairs, `idx` (0/1) picks the 128-half.
+/// The two positions sharing an `idx` share one `ql`/`qh` byte, so only two
+/// `ql`+two `qh` loads are issued (hoisted), plus `d` once (`scales` stay
+/// per-byte — `Q6_K` has no compact vec4 header to consolidate, so this
+/// hoists loads rather than caching a header). Mirrors `Q6_K_WIDE_MIDDLE`.
+const Q6K_UNROLL_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 210u;
+const BLOCK_ELEMS: u32 = 256u;
+
+// One Q6_K element: `ql` is this (idx,w_lo)'s pre-loaded low-or-high quant
+// byte, `qh` its pre-loaded high-bit byte; `half` (0/1) selects the low or
+// high `which_q` of the pair. `which_q = w_lo + 2*half`, matching
+// `Q6_K_WIDE_MIDDLE`'s four branches.
+fn q6k_elem(d: f32, sc_off: u32, idx: u32, w_lo: u32, half: u32, is: u32, ql: u32, qh: u32) -> f32 {
+    let qh_shift = half * 4u + w_lo * 2u;
+    let sc_idx = is + half * 4u + w_lo * 2u;
+    let nib = select(ql >> 4u, ql & 0xFu, half == 0u);
+    let q = i32(nib | (((qh >> qh_shift) & 3u) << 4u)) - 32;
+    var sc: i32 = i32(read_byte_v4(sc_off + idx * 8u + sc_idx));
+    if (sc >= 128) { sc = sc - 256; }
+    return d * f32(sc) * f32(q);
+}
+
+fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
+    let ql_off = byte_offset;
+    let qh_off = byte_offset + 128u;
+    let sc_off = byte_offset + 192u;
+    let d_offset = byte_offset + 208u;
+    let dword = read_word_v4(d_offset - (d_offset % 4u));
+    let d = f16_to_f32(select(dword & 0xFFFFu, dword >> 16u, (d_offset % 4u) != 0u));
+    let l = local % 32u;
+    let w_lo = local / 32u;
+    let is = l / 16u;
+    let qlA = read_byte_v4(ql_off + l + w_lo * 32u);
+    let qhA = read_byte_v4(qh_off + l);
+    let qlB = read_byte_v4(ql_off + 64u + l + w_lo * 32u);
+    let qhB = read_byte_v4(qh_off + 32u + l);
+    let e0 = q6k_elem(d, sc_off, 0u, w_lo, 0u, is, qlA, qhA);
+    let e1 = q6k_elem(d, sc_off, 0u, w_lo, 1u, is, qlA, qhA);
+    let e2 = q6k_elem(d, sc_off, 1u, w_lo, 0u, is, qlB, qhB);
+    let e3 = q6k_elem(d, sc_off, 1u, w_lo, 1u, is, qlB, qhB);
+    return e0 * x0 + e1 * x1 + e2 * x2 + e3 * x3;
+}
+"#;
+
+pub fn shader_source_reduce_q4k_wide_unroll() -> String {
+    format!("{PRELUDE_VEC4}\n{Q4K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+}
+
+/// See `shader_source_reduce_q4k_wide_unroll` — same memory-level-parallelism
+/// restructuring, for `Q5_K` (`Q5K_UNROLL_MIDDLE`).
+pub fn shader_source_reduce_q5k_wide_unroll() -> String {
+    format!("{PRELUDE_VEC4}\n{Q5K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+}
+
+/// See `shader_source_reduce_q4k_wide_unroll` — same restructuring, for
+/// `Q6_K` (`Q6K_UNROLL_MIDDLE`); it hoists loads rather than caching a
+/// header (`Q6_K` has no vec4-aligned header).
+pub fn shader_source_reduce_q6k_wide_unroll() -> String {
+    format!("{PRELUDE_VEC4}\n{Q6K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+}
+
+/// The complete block-unroll reduce source for `ggml_type`, or `None` if
+/// this type has no unroll kernel (only the three K-quants do — the block-
+/// unroll exploits their 256-element super-block geometry; the smaller
+/// legacy quants and float types keep the wide-load/scalar reduce path).
+pub fn shader_source_reduce_wide_unroll(ggml_type: u32) -> Option<String> {
+    match ggml_type {
+        t if t == GGML_TYPE_Q4_K => Some(shader_source_reduce_q4k_wide_unroll()),
+        t if t == GGML_TYPE_Q5_K => Some(shader_source_reduce_q5k_wide_unroll()),
+        t if t == GGML_TYPE_Q6_K => Some(shader_source_reduce_q6k_wide_unroll()),
+        _ => None,
+    }
+}
+
+/// `Q4_K` block-unroll combined with the packed-`f16` dot: the unroll's
+/// four scalar `f32` multiply-adds replaced with **two** `v_dot2_f32_f16`
+/// packed dots (groups 0/1 and 2/3 paired), halving the multiply-accumulate
+/// count while keeping the unroll's header-once + hoisted-load memory
+/// structure — the packed-dot technique applied to the *unrolled*
+/// structure rather than the byte-wise/`MAIN_REDUCE_SUFFIX` one. Selected
+/// only when both
+/// the block-unroll (default) and `ORANGU_PACKED_DOT=1` are on
+/// (`VulkanBackend::pipeline_for`). `f16` dot loses precision, so its
+/// cross-check uses the same widened tolerance the byte-wise packed kernel
+/// needs. `enable f16;` must lead the whole module (WGSL rule), so it can't
+/// sit inside the shared middle/suffix.
+pub fn shader_source_reduce_q4k_wide_unroll_packed_f16() -> String {
+    const MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 144u;
+const BLOCK_ELEMS: u32 = 256u;
+
+fn qs_byte_q4k(vec4_base: u32, qi: u32) -> u32 {
+    let v4i = vec4_base + 1u + qi / 16u;
+    let word = vec4_word(weights[v4i], (qi % 16u) / 4u);
+    return (word >> (8u * (qi % 4u))) & 0xFFu;
+}
+
+fn q4k_elem(d: f32, dmin: f32, scales: vec3<u32>, g: u32, is_low: bool, byte: u32) -> f32 {
+    let is_idx = g * 2u + select(1u, 0u, is_low);
+    let sm = get_scale_min_k4_v4(scales, is_idx);
+    let dd = d * f32(sm.x);
+    let mm = dmin * f32(sm.y);
+    let nib = select(byte >> 4u, byte & 0xFu, is_low);
+    return dd * f32(nib) - mm;
+}
+
+fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
+    let is_low = local < 32u;
+    let qsi = select(local - 32u, local, is_low);
+    let vec4_base = byte_offset / 16u;
+    let header = weights[vec4_base];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+    let scales = vec3<u32>(header.y, header.z, header.w);
+    let b0 = qs_byte_q4k(vec4_base, qsi);
+    let b1 = qs_byte_q4k(vec4_base, 32u + qsi);
+    let b2 = qs_byte_q4k(vec4_base, 64u + qsi);
+    let b3 = qs_byte_q4k(vec4_base, 96u + qsi);
+    let e0 = q4k_elem(d, dmin, scales, 0u, is_low, b0);
+    let e1 = q4k_elem(d, dmin, scales, 1u, is_low, b1);
+    let e2 = q4k_elem(d, dmin, scales, 2u, is_low, b2);
+    let e3 = q4k_elem(d, dmin, scales, 3u, is_low, b3);
+    let w01 = vec2<f16>(f16(e0), f16(e1));
+    let w23 = vec2<f16>(f16(e2), f16(e3));
+    let x01 = vec2<f16>(f16(x0), f16(x1));
+    let x23 = vec2<f16>(f16(x2), f16(x3));
+    return f32(dot(w01, x01)) + f32(dot(w23, x23));
+}
+"#;
+    format!("enable f16;\n{PRELUDE_VEC4}\n{MIDDLE}\n{UNROLL_SUFFIX}")
+}
+
 /// Wide loads (this file's
 /// `PRELUDE_VEC4`/`Q4_K_WIDE_MIDDLE`) combined with the packed-`f16`
 /// pairwise dot (`shader_source_reduce_q4k_packed_f16`'s own `dequant_
-/// pair_f16`) — the two are complementary in principle (one fixes memory
-/// bandwidth, one fixes ALU throughput). `Q4_K`-only, like the packed-dot
+/// pair_f16`) — one addresses memory access, the other the multiply-
+/// accumulate count. `Q4_K`-only, like the packed-dot
 /// kernel itself (no other type has
 /// a packed-`f16` kernel to combine with). `dequant_pair_f16` below is a
 /// direct transcription of the byte-wise kernel's own — same "`k` must be
@@ -1342,17 +1685,11 @@ pub fn shader_source_reduce_wide_load(ggml_type: u32) -> Option<String> {
 /// (`SUFFIX` below) mirrors the packed-`f16` kernel's own one-row-per-
 /// workgroup shape exactly, just walking `vec4_base` instead of
 /// `byte_offset` — deliberately *not* attempting `REDUCE_N_ROWS` batching
-/// on top of this (a 4-row-batched *and* pair-packed kernel is a much
-/// bigger, more error-prone rewrite for an increment not yet shown to be
-/// worth it — `REDUCE_N_ROWS` batching alone turned out close to a wash
-/// for wide loads, which
-/// argues against assuming it would help here either without measuring).
+/// on top of this, which would be a much bigger, more error-prone rewrite.
 ///
-/// **Correctness-verified, but a real, measured regression relative to
-/// either technique alone** — see `VulkanBackend::wide_packed_pipeline`'s
-/// own doc comment for the numbers and the likely (not chased down
-/// further) cause. Not recommended; kept available (like `kv_f16`/
-/// `gpu_sample`) as an honestly-reported negative result, not deleted.
+/// Correctness-verified; kept available (like `kv_f16`/`gpu_sample`) as a
+/// selectable combination — see `VulkanBackend::wide_packed_pipeline`'s
+/// own doc comment.
 pub fn shader_source_reduce_q4k_wide_packed_f16() -> String {
     const MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 144u;
@@ -1698,7 +2035,7 @@ pub fn shader_source_rmsnorm() -> String {
 /// `probs_scratch`-sized (`[n_head, capacity]`) buffer read or written at
 /// all (that buffer is still allocated and bound at binding 3 for now,
 /// simply unused by this shader — removing it is a separate, smaller
-/// follow-up, not required for this step's win). Barrier count is
+/// follow-up). Barrier count is
 /// `O(n_pos / 64)` (a handful of barriers per tile), not the old design's
 /// fixed `O(log 64)` — more barriers for a very long context, but each one
 /// now amortizes 64 positions' worth of work instead of the whole

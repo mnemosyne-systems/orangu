@@ -769,55 +769,32 @@ write, and the attention kernel itself into one GPU submission;
 GEGLU; `record_fused_layer`/`fused_layer` fold a whole layer (attention +
 FFN) into one command encoder; and `GemmaModel::forward` chains every
 layer plus `output_norm`/`lm_head` into one shared encoder per decode
-step. Together these dropped GPU submissions per decode token from roughly
-107 to 2 on this project's own benchmark hardware (an AMD RX 5500M running
-`gemma-4-E2B`), taking real end-to-end decode throughput from ~1.4 tok/s
-to the ~7–9 tok/s range depending on which of the opt-in kernels below are
-also enabled — still meaningfully behind llama.cpp's own tuned Vulkan
-backend (~36 tok/s on the same hardware/model), a gap now attributed to
-kernel quality (`f32` math throughout, no subgroup reductions, no
-flash-attention) rather than round-trip overhead, since round trips have
-already been mostly eliminated.
+step. Together these collapse the number of GPU submissions per decode
+token from one per matmul/op down to a small constant (as low as one for a
+fully-fused Gemma decode step), removing the per-submission submit/poll/
+readback latency that otherwise dominates a many-layer forward pass. With
+round trips largely eliminated, the remaining cost is per-kernel compute
+and weight-memory bandwidth, which the alternative decode kernels below
+target.
 
-Several further optimizations exist behind environment-variable opt-ins,
-each correctness-verified against `CpuBackend` but left off by default
-because a real, same-session A/B measurement didn't clearly justify making
-it the default:
+#### Vulkan backend environment variables
 
-- **`ORANGU_KV_F16=1`** — stores the KV cache as `f16` instead of `f32`,
-  halving its memory bandwidth at the cost of an extra per-layer cast
-  dispatch. Measured ~2–3% *slower* at the context lengths this project
-  can test end-to-end (KV traffic isn't the bottleneck at that scale); a
-  much longer context could plausibly flip this positive.
-- **`ORANGU_PACKED_DOT=1`** — dequantizes `Q4_K` weight elements in pairs
-  and accumulates the dot product as `vec2<f16>` instead of two scalar
-  `f32` multiplies. The first genuine kernel-quality win found: a real,
-  reproducible ~19% throughput gain. Off by default because the win is
-  only measured on one GPU generation (RDNA1), and packed-`f16` throughput
-  isn't necessarily a universal hardware advantage.
-- **`ORANGU_WIDE_LOAD=1`** — binds the weight buffer as `array<vec4<u32>>`
-  (16-byte reads) instead of `array<u32>` (byte-wise reads), so a `Q4_K`/
-  `Q5_K` block's whole header can load in one 16-byte read instead of
-  several byte reads. Bit-for-bit correctness-verified for all 9 quant
-  types; measured a real, reproducible ~11–13% throughput gain on `Q4_K`.
-  Combining it with `ORANGU_PACKED_DOT` was tried and measured a
-  *regression* relative to either alone, so the two are not meant to be
-  combined.
-- **`ORANGU_TILED_PREFILL=1`** — a `16×64`-output-tile GEMM for prefill
-  (`n_tokens >= 64`) that reuses activations across output rows, unlike
-  the default cooperative kernel (one workgroup per output row, each
-  re-reading the whole activation matrix independently). Correctness-
-  verified but unmeasured end-to-end: long prompts on this project's own
-  dev hardware reliably trigger GPU driver hangs (a pre-existing hardware
-  limit that affects the unchanged default kernel too, not something this
-  change causes), which ruled out a trustworthy A/B.
-- **`ORANGU_GPU_SAMPLE=1`** — runs greedy (temperature-0) argmax sampling
-  on the GPU in the same submission as the forward pass, avoiding a full
-  `[n_vocab]` logits readback. Correctness-verified, but measured ~5–10%
-  *slower* — a single-workgroup reduction over a large vocabulary
-  apparently costs more GPU time than the PCIe readback and CPU-side
-  argmax it replaces. A wider, multi-workgroup reduction could plausibly
-  flip this positive but hasn't been attempted.
+The Vulkan backend reads these environment variables at startup to select
+between alternative compute kernels. Each is read once when the backend
+initializes; changing one takes effect on the next server start. All are
+correctness-verified against `CpuBackend`. Values are checked for presence
+only (set to `1`), except where noted.
+
+| Variable | Default | Effect |
+| :-- | :-- | :-- |
+| `ORANGU_NO_MLP_UNROLL` | unset (block-unroll **on**) | Set to **disable** the block-unroll reduce kernel for K-quant (`Q4_K`/`Q5_K`/`Q6_K`) decode and fall back to the scalar per-element reduce kernel. The block-unroll iterates whole super-blocks, loading each block header once and issuing several weight/activation loads before the dependent dot; it is the default decode path. |
+| `ORANGU_PACKED_DOT` | unset (off) | Dequantizes `Q4_K` weight elements in pairs and accumulates the dot product as `vec2<f16>` instead of two scalar `f32` multiplies. Requires an adapter with WGSL `f16` support. When set together with the block-unroll, selects the combined unroll+packed `Q4_K` decode kernel. |
+| `ORANGU_WIDE_LOAD` | unset (off) | Binds the weight buffer as `array<vec4<u32>>` (16-byte reads) instead of `array<u32>` (byte-wise reads), consolidating each `Q4_K`/`Q5_K` block header into one 16-byte read. Covers all supported quant types. |
+| `ORANGU_KV_F16` | unset (off) | Stores the per-request KV-cache GPU mirror as `f16` instead of `f32`, with a per-write cast. Requires an adapter with WGSL `f16` support. |
+| `ORANGU_TILED_PREFILL` | unset (off) | Uses a `16×64`-output-tile GEMM for prefill (`n_tokens >= 64`) that streams the K dimension through shared memory and reuses activations across output rows, instead of the default cooperative kernel (one workgroup per output row). |
+| `ORANGU_GPU_SAMPLE` | unset (off) | Runs greedy (temperature-0) argmax sampling with repeat penalty on the GPU in the same submission as the forward pass, reading back one token id instead of the full `[n_vocab]` logits vector. |
+| `ORANGU_BATCH_DECODE` | unset (off) | Fuses the matmul steps of concurrent requests that submit a decode step within a short window into one batched call (attention/RoPE/KV-write stay per-sequence). Only takes effect when `slots > 1`. |
+| `ORANGU_GPU_TRACE` | unset (off) | Logs the number of GPU submissions per decode step to stdout — a diagnostic for round-trip counting, no effect on the computation. |
 
 Shader compilation is cached to disk across restarts
 (`~/.orangu/server/<adapter-key>/cache.bin`, keyed by a vendor/device-
@@ -874,6 +851,18 @@ layers sharing one KV cache) are covered by cross-check tests in
 `engine::backend::vulkan::tests`, run on real Vulkan hardware whenever
 it's present and skipped otherwise. The CUDA/OpenCL/ROCm backends follow
 the same skip-if-no-device pattern.
+
+A second set of tests runs a full forward pass against a real downloaded
+model and is marked `#[ignore]` so the normal suite doesn't require one.
+These read the model path from an environment variable, and each panics
+with a clear message if its variable is unset when the test is run
+(`cargo test -- --ignored`):
+
+| Variable | Used by | Points to |
+| :-- | :-- | :-- |
+| `ORANGU_TEST_MODEL` | Gemma/qwen35moe real-model forward-pass tests | A local `.gguf` chat model file |
+| `ORANGU_TEST_EMBEDDING_MODEL` | embedding-model tests | A local `.gguf` embedding model file |
+| `ORANGU_TEST_QWEN3VL_MODEL` | qwen3vl tokenizer/embedding tests | A local qwen3vl `.gguf` file |
 
 ### HTTP layer and web UI
 
