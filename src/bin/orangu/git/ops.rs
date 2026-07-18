@@ -923,6 +923,14 @@ pub fn git_squash(repo_root: &Path) -> Result<String> {
 
     let base_ref = git_find_base_ref(repo_root)?;
 
+    let (dirty_count, _) = count_pending_changes(repo_root)?;
+    if dirty_count > 0 {
+        return Err(anyhow!(
+            "working tree has {dirty_count} uncommitted change(s); \
+             commit or stash them before squashing"
+        ));
+    }
+
     let merge_base_output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
