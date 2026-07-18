@@ -17,9 +17,18 @@
 //! `-s`/`--shell-completions` (`src/bin/orangu/shell.rs`): the positional
 //! `model` argument (and `show`'s own argument) are completed by shelling
 //! back out to `orangu-server list` itself and reading its first two
-//! columns (NR and MODEL) — the same trick `orangu`'s own scripts use to
-//! complete session UUIDs. This only ever depends on `orangu-server` itself
+//! columns (NR and MODEL). This only ever depends on `orangu-server` itself
 //! being on `$PATH` — no clap-generated completion machinery is involved.
+//!
+//! `prune`'s own argument is completed differently: directly against
+//! `~/.orangu/server/sessions/*` (each entry a UUID directory), newest
+//! first, plus the literal `all` — the same trick `orangu`'s own scripts
+//! use to complete its `-r`/`--resume`'s session UUIDs
+//! (`src/bin/orangu/shell.rs`). No process invocation involved (unlike the
+//! model-completion trick above), since `prune` itself may prompt on stdin
+//! when run with no argument — piping its output into a completion
+//! function the way `list`'s is used for models would risk the completion
+//! hanging on that prompt.
 
 pub const BASH: &str = r#"# bash completion for orangu-server
 #
@@ -35,6 +44,17 @@ _orangu_server_models() {
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
 }
 
+# Completes `prune`'s own argument: every session UUID under
+# ~/.orangu/server/sessions, newest first, plus the literal "all".
+_orangu_server_sessions() {
+    local sessions_dir="${HOME}/.orangu/server/sessions"
+    local uuids=""
+    if [[ -d "$sessions_dir" ]]; then
+        uuids=$(command ls -1t "$sessions_dir" 2>/dev/null)
+    fi
+    printf 'all\n%s\n' "$uuids"
+}
+
 _orangu_server() {
     local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -43,6 +63,11 @@ _orangu_server() {
 
     if [[ "$prev" == "show" || "$prev" == "delete" ]]; then
         COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
+        return 0
+    fi
+
+    if [[ "$prev" == "prune" ]]; then
+        COMPREPLY=( $(compgen -W "$(_orangu_server_sessions)" -- "$cur") )
         return 0
     fi
 
@@ -62,7 +87,7 @@ _orangu_server() {
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete prune help" -- "$cur") )
         return 0
     fi
 }
@@ -88,6 +113,16 @@ _orangu_server_models() {
     compadd -a candidates
 }
 
+# Completes `prune`'s own argument: every session UUID under
+# ~/.orangu/server/sessions, newest first, plus the literal "all".
+_orangu_server_sessions() {
+    local sessions_dir="${HOME}/.orangu/server/sessions"
+    local -a uuids
+    [[ -d $sessions_dir ]] && uuids=( $sessions_dir/*(/Nom:t) )
+    compadd all
+    compadd -a uuids
+}
+
 _orangu_server_commands() {
     _values 'command' \
         'system[Detect the machine'"'"'s CPU and GPU(s)]' \
@@ -96,6 +131,7 @@ _orangu_server_commands() {
         'show[Print a GGUF file'"'"'s full metadata]' \
         'download[Download a GGUF model from Hugging Face]' \
         'delete[Delete a GGUF model from disk]' \
+        'prune[Delete chat sessions]' \
         'help[Print this message or the help of the given subcommand(s)]'
 }
 
@@ -127,6 +163,7 @@ _orangu_server() {
             ;;
         arg)
             [[ ${line[1]} == show || ${line[1]} == delete ]] && _orangu_server_models
+            [[ ${line[1]} == prune ]] && _orangu_server_sessions
             ;;
     esac
 }
@@ -148,6 +185,15 @@ function __orangu_server_models
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
 end
 
+# Completes `prune`'s own argument: every session UUID under
+# ~/.orangu/server/sessions, newest first, plus the literal "all".
+function __orangu_server_sessions
+    echo all
+    set -l sessions_dir "$HOME/.orangu/server/sessions"
+    test -d "$sessions_dir"; or return
+    path basename (path sort --reverse --key=mtime $sessions_dir/*/)
+end
+
 complete -c orangu-server -n '__fish_use_subcommand' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_use_subcommand' -a system   -d 'Detect the machine\'s CPU and GPU(s)'
 complete -c orangu-server -n '__fish_use_subcommand' -a suggest  -d 'Suggest a GGUF model size for this machine\'s hardware'
@@ -155,9 +201,11 @@ complete -c orangu-server -n '__fish_use_subcommand' -a list     -d 'List every 
 complete -c orangu-server -n '__fish_use_subcommand' -a show     -d 'Print a GGUF file\'s full metadata'
 complete -c orangu-server -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
 complete -c orangu-server -n '__fish_use_subcommand' -a delete   -d 'Delete a GGUF model from disk'
+complete -c orangu-server -n '__fish_use_subcommand' -a prune    -d 'Delete chat sessions'
 complete -c orangu-server -n '__fish_use_subcommand' -a help     -d 'Print this message or the help of the given subcommand(s)'
 complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from prune' -a '(__orangu_server_sessions)'
 
 complete -c orangu-server -s c -l config              -r -d 'Path to the configuration file (orangu-server.conf)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'

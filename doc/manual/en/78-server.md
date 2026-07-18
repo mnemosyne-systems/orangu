@@ -20,11 +20,14 @@ dependency on llama.cpp/ggml's own compiled code.
 ### Module layout
 
 - `main.rs` — CLI parsing (serving plus the `system`/`suggest`/`list`/
-  `show`/`download`/`delete` subcommands), model-spec resolution, GPU
-  backend selection (`select_backend`), `format_show`/
+  `show`/`download`/`delete`/`prune` subcommands), model-spec resolution,
+  GPU backend selection (`select_backend`), `format_show`/
   `DEFAULT_ARRAY_PREVIEW` (for `show`), `select_model_for_deletion`/
-  `confirm` (for `delete`), and process wiring (Ctrl+C/`SIGINT`/
-  `--daemon`).
+  `confirm` (for `delete`, and reused by `prune`), and process wiring
+  (Ctrl+C/`SIGINT`/`--daemon`).
+- `prune.rs` — `prune`'s own CLI logic (listing, `NR`/id resolution, the
+  `all`/interactive/explicit-identifier flows), built on `web::sessions`'s
+  activity tracking; see below.
 - `config.rs`, `init.rs` — `orangu-server.conf` loading and the `--init`
   wizard.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
@@ -48,7 +51,10 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/scheduler.rs`, `engine/generate.rs`, `engine/batch.rs` — the
   multi-slot request scheduler and continuous-batching machinery.
 - `http/{mod,openai,native}.rs` — the HTTP surface.
-- `web/{mod,render,sessions}.rs` — the built-in chat UI.
+- `web/{mod,render,sessions}.rs` — the built-in chat UI. `sessions.rs` also
+  owns the `session.json` activity marker (`mark_active`/`is_active`) and
+  the prune-facing listing/sweep (`list_sessions_for_prune`/
+  `sweep_empty_sessions`/`delete_session_dir`) `prune.rs` calls into.
 
 The GGUF-inventory subcommands lean on library modules shared with the rest
 of the workspace rather than binary-local ones: `orangu::gguf` (the GGUF
@@ -657,6 +663,18 @@ once `orangu`'s own precedent was found, since introducing a genuinely
 unstable (semver-exempt) dependency wasn't warranted when a small,
 self-contained shell script does the same job with zero new dependencies.
 
+`prune`'s own argument completes differently from `model`/`show`/`delete`
+above: directly against `~/.orangu/server/sessions/*` (each entry a UUID
+directory) plus the literal `all`, with no process invocation at all — this
+time genuinely the same trick `orangu`'s own `-r`/`--resume` completion
+uses (`_orangu_sessions`/`__orangu_sessions` in `src/bin/orangu/shell.rs`),
+not just the same general shape. Shelling out to `orangu-server prune`
+itself the way model completion shells out to `list` isn't an option here:
+`prune` with no argument prints its table and then reads a selection from
+stdin, so piping its output into a completion function would risk the
+completion hanging on that prompt — `list` never reads stdin, which is
+exactly why it's safe to use as a completion source and `prune` isn't.
+
 ### GGUF loading and dequantization
 
 `engine::loader` memory-maps the file and reads hyperparameters using the
@@ -879,3 +897,51 @@ the API so a chat turn never makes an HTTP hop. `web::render` renders
 markdown to HTML (including syntax-highlighted code blocks) with the same
 `markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
+
+### Session activity tracking and `prune` (`web::sessions`, `prune.rs`)
+
+`save_session` (called by both `create_session` and `append_turn`, so both
+creating a session and appending a turn to one trigger it) writes a second
+file alongside `chat.json`: `session.json`, recording this process's own pid
+and — critically — its `sysinfo::Process::start_time()`. Recording pid alone
+would be enough as long as the writing process stays alive, but not once it
+exits: the OS is free to hand that same pid number to an unrelated later
+process, and without a way to tell the two apart, `is_active` would read the
+old session as still active forever. `start_time` is what closes that gap —
+a different process at the same pid almost never has the same start time
+down to the second, so a mismatch (or the pid not running at all) both read
+as "not active," never as an error. `mark_active`'s own write is
+best-effort: a failure doesn't fail the session save itself, since
+`chat.json` — already written by the time `mark_active` runs — is the data
+that actually matters; a session that never got a marker (or whose marker
+write failed) just reads as not active, the same as one from a build
+predating this.
+
+`is_active` is read from an entirely separate process: `orangu-server
+prune` (`prune.rs`), a plain CLI invocation with no connection to whatever
+server process actually owns a session. That separation is the whole point
+— it's what makes "keep track of which sessions are active" correct even
+for a session created long after some other still-running server's own
+startup: `is_active` re-queries the live process table every time `prune`
+runs, rather than consulting anything cached or computed once earlier, so
+the answer is always current relative to *this* invocation, not relative to
+whenever the server happened to start.
+
+`prune` itself needs no config file and loads no model — a pure filesystem
+operation against a fixed path, the same shape as `system`/`suggest`.
+Every invocation first calls `sweep_empty_sessions` (deletes every
+non-active session whose `chat.json` is empty, missing, or fails to parse —
+the last two read as "empty" too, so an interrupted-write leftover doesn't
+linger forever uncleaned), then lists what's left via
+`list_sessions_for_prune` (unlike `list_sessions`, the web UI's History
+source, this includes zero-message sessions too — only ones `is_active`
+protected from the sweep, which `prune` needs to show, not hide) and hands
+off to one of three flows: no argument (prints the table, prompts for an
+`NR` or `all`), `all` (deletes every remaining non-active session,
+`partition`-ing active from inactive first), or a specific `NR`/id
+(resolved against the same listing). `main.rs`'s `confirm` — the same
+Yes/No stdin reader `delete` uses — is reused here rather than duplicated
+(`pub(crate)` in `main.rs`); `prune`'s own relative-time formatter
+(`format_relative`, "2h ago") is hand-rolled rather than pulling in a
+date/time dependency, the same reasoning `web::current_year` already used
+for the copyright year.

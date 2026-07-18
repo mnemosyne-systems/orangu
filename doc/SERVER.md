@@ -661,7 +661,74 @@ reload or revisit it from **History**.
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart. A directory (not a flat `<uuid>.json` file) so a session can grow
-more per-session files later without another layout migration.
+more per-session files later without another layout migration — see
+**Session management** below for cleaning old ones up.
+
+## Session management
+
+Every session directory also gets a `session.json`, alongside its
+`chat.json`, recording which `orangu-server` process most recently touched
+it — written whenever a session is created or a turn is appended to it, read
+by `orangu-server prune` (below) to tell a session a server is still using
+apart from an old, abandoned one. This is internal bookkeeping, not
+something to edit or rely on the shape of directly.
+
+### `prune`: deleting old chat sessions
+
+```sh
+orangu-server prune            # list sessions, pick one (or 'all') interactively
+orangu-server prune all        # delete every non-active session
+orangu-server prune 3          # NR from prune's own listing
+orangu-server prune <uuid>     # a specific session id
+orangu-server prune all -y     # skip the confirmation prompt
+```
+
+Needs no config file and loads no model — like `system`/`suggest`, it's a
+pure filesystem operation against a fixed path
+(`~/.orangu/server/sessions/`).
+
+Every invocation, regardless of its own argument, first removes any
+**non-active** session whose `chat.json` is empty (a **New Chat** click that
+was never sent to, or a leftover from an interrupted write) — routine use of
+`prune` in any form also compacts away this junk as a side effect:
+
+```
+Removed 2 empty sessions.
+```
+
+What's left is then handled by the argument:
+
+- **No argument**: prints every remaining session as a numbered table,
+  newest-updated first, and prompts for an `NR` or `all`:
+
+  ```
+  NR  ID                                    TITLE                MESSAGES  UPDATED
+   1  153ed918-1cde-4ac3-aa3e-fc8eb9d2c462  What is Rust?                4  2m ago  (active)
+   2  f082af10-39c9-465c-b2b1-92e4682bb689  Explain sliding windows      6  1d ago
+
+  Prune (NR or 'all', empty to cancel):
+  ```
+
+- **`all`**: deletes every remaining session **except** active ones,
+  printing which were skipped and asking for confirmation (`-y`/`--yes`
+  skips it, for scripted use — the same flag `delete` uses).
+- **An `NR`** (from `prune`'s own listing above) **or a full session id**:
+  prunes that one session.
+
+A session is **active** when its `session.json` names a process that's
+still running — checked by pid *and* start time, so a pid the OS has since
+reused for an unrelated process doesn't count. This is re-checked live
+against the current process table every time `prune` runs, in a separate
+CLI invocation from whatever server process actually owns the session — not
+a snapshot taken once at some earlier point — so a session started long
+after some other still-running server's own startup is still correctly
+protected, and one whose server has since exited becomes prunable the
+moment that happens, not after some delay. Naming an active session
+explicitly refuses rather than deleting it:
+
+```
+Session '153ed918-1cde-4ac3-aa3e-fc8eb9d2c462' is active (in use by a running orangu-server) — not pruned.
+```
 
 ## Shutting it down
 

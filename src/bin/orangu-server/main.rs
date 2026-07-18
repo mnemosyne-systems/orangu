@@ -25,6 +25,7 @@ mod config;
 mod engine;
 mod http;
 mod init;
+mod prune;
 mod shell;
 mod suggest;
 mod web;
@@ -175,6 +176,19 @@ enum Command {
         /// a MODEL name from its second. Omit it to pick one interactively
         /// from the same table `list` prints.
         model: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Delete chat sessions from ~/.orangu/server/sessions/. Every
+    /// invocation, regardless of its own argument, first removes any
+    /// non-active session with an empty chat history.
+    Prune {
+        /// An NR from this command's own listing, a full session id, or
+        /// "all" for every non-active session. Omit it to list sessions and
+        /// pick one interactively. A session currently in use by a running
+        /// orangu-server is never pruned, even if named explicitly.
+        identifier: Option<String>,
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
@@ -650,6 +664,7 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             );
             Ok(())
         }
+        Command::Prune { identifier, yes } => prune::run(identifier, yes),
     }
 }
 
@@ -687,11 +702,12 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
 }
 
 /// Reads a Yes/No confirmation from stdin, defaulting to No on an empty
-/// entry or unrecognized input — `delete` is destructive, so anything but
-/// an explicit "y"/"yes" leaves the model(s) untouched. A closed stdin
-/// (EOF) also reads as an empty line here, so a non-interactive invocation
-/// without `--yes` safely deletes nothing rather than hanging or guessing.
-fn confirm(prompt: &str) -> Result<bool> {
+/// entry or unrecognized input — `delete` (and `prune`, `crate::prune`) is
+/// destructive, so anything but an explicit "y"/"yes" leaves the model(s)/
+/// session(s) untouched. A closed stdin (EOF) also reads as an empty line
+/// here, so a non-interactive invocation without `--yes` safely deletes
+/// nothing rather than hanging or guessing.
+pub(crate) fn confirm(prompt: &str) -> Result<bool> {
     print!("{prompt}");
     std::io::stdout().flush().ok();
     let mut line = String::new();

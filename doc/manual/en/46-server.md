@@ -425,6 +425,25 @@ Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.
 
+## Session management
+
+```sh
+orangu-server prune            # list sessions, pick one (or 'all') interactively
+orangu-server prune all        # delete every non-active session
+orangu-server prune <uuid>     # a specific session, by NR or full id
+```
+
+`prune` deletes chat sessions from `~/.orangu/server/sessions/`. Needs no
+config file and loads no model. Every invocation, regardless of its own
+argument, first removes any non-active session with an empty chat history
+(a **New Chat** click that was never sent to). With no argument, it lists
+the rest as a numbered table, newest first, and prompts for an `NR` or
+`all`; `all` deletes every remaining session except **active** ones —
+sessions a currently-running `orangu-server` is still using, checked live
+against the process table each time `prune` runs, not a snapshot from
+startup. Naming an active session explicitly refuses rather than deleting
+it. `-y`/`--yes` skips the confirmation prompt, the same flag `delete` uses.
+
 ## Shutting it down
 
 Three equivalent ways: `Ctrl+C`, `SIGINT` (`kill -INT <pid>`), or
