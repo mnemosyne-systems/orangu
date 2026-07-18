@@ -46,6 +46,13 @@ use uuid::Uuid;
 pub struct SessionMessage {
     pub role: String,
     pub content: String,
+    /// Wall-clock time the engine spent generating this message, in
+    /// milliseconds — `None` for user messages and for assistant messages
+    /// persisted before this field existed. `#[serde(default)]` so old
+    /// `chat.json` files on disk (written before this field existed) still
+    /// deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -360,11 +367,14 @@ pub fn delete_session_dir(id: &str) -> Result<()> {
 
 /// Appends `user_message`/`assistant_message` to `session`, deriving its
 /// title from the first user message if it doesn't have one yet, and saves
-/// it to disk.
+/// it to disk. `generation_ms` is however long the engine took to produce
+/// `assistant_message` (`GenerateStats::generate_time`), shown as a light
+/// footer under the message in the web UI.
 pub fn append_turn(
     session: &mut Session,
     user_message: &str,
     assistant_message: &str,
+    generation_ms: Option<u64>,
 ) -> Result<()> {
     if session.title.is_empty() {
         session.title = derive_title(user_message);
@@ -372,10 +382,12 @@ pub fn append_turn(
     session.messages.push(SessionMessage {
         role: "user".to_string(),
         content: user_message.to_string(),
+        generation_ms: None,
     });
     session.messages.push(SessionMessage {
         role: "assistant".to_string(),
         content: assistant_message.to_string(),
+        generation_ms,
     });
     session.updated_at = unix_now();
     save_session(session)
@@ -431,9 +443,21 @@ mod tests {
     fn append_turn_sets_title_from_first_message_only() {
         with_temp_home(|| {
             let mut session = create_session().unwrap();
-            append_turn(&mut session, "What is Rust?", "A systems language.").unwrap();
+            append_turn(
+                &mut session,
+                "What is Rust?",
+                "A systems language.",
+                Some(123),
+            )
+            .unwrap();
             assert_eq!(session.title, "What is Rust?");
-            append_turn(&mut session, "And Go?", "Also a systems-ish language.").unwrap();
+            append_turn(
+                &mut session,
+                "And Go?",
+                "Also a systems-ish language.",
+                Some(456),
+            )
+            .unwrap();
             assert_eq!(session.title, "What is Rust?");
             assert_eq!(session.messages.len(), 4);
         });
@@ -447,10 +471,12 @@ mod tests {
             a.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                generation_ms: None,
             });
             b.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                generation_ms: None,
             });
             a.updated_at = 100;
             b.updated_at = 200;
@@ -472,6 +498,7 @@ mod tests {
             used.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                generation_ms: None,
             });
             save_session(&empty).unwrap();
             save_session(&used).unwrap();
@@ -586,6 +613,7 @@ mod tests {
             used_inactive.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                generation_ms: None,
             });
             save_session(&used_inactive).unwrap();
             let empty_active = create_session().unwrap();
@@ -623,6 +651,7 @@ mod tests {
             used.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                generation_ms: None,
             });
             save_session(&used).unwrap();
 

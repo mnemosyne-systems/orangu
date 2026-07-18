@@ -308,6 +308,14 @@ button:disabled {
   font-style: italic;
 }
 
+.gen-time {
+  margin-top: 0.5em;
+  color: var(--text-dim);
+  font-size: 0.72em;
+  opacity: 0.65;
+  text-align: right;
+}
+
 .message pre {
   overflow-x: auto;
   overflow-y: auto;

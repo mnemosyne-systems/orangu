@@ -181,6 +181,8 @@ struct SessionMessageView {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -209,6 +211,7 @@ async fn get_session(Path(id): Path<String>) -> impl IntoResponse {
                         role: m.role,
                         content: m.content,
                         html,
+                        generation_ms: m.generation_ms,
                     }
                 })
                 .collect(),
@@ -275,17 +278,18 @@ async fn send_message(
                             .data(json!({"type": "token", "html": html}).to_string()),
                     );
                 }
-                StreamEvent::Done { finish_reason, .. } => {
+                StreamEvent::Done { finish_reason, stats } => {
                     let full = state.engine.tokenizer.clean_up_tokenization_spaces(&full);
                     let html = render::render_markdown_to_html(&full);
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, &full) {
+                    let generation_ms = stats.generate_time.as_millis() as u64;
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, &full, Some(generation_ms)) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "truncated": truncated}).to_string()));
+                        .data(json!({"type": "done", "html": html, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
                     break;
                 }
                 StreamEvent::Error(err) => {

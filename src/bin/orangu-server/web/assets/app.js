@@ -68,6 +68,40 @@
     return el;
   }
 
+  // Shortest colon-separated D:H:M:S form that fits — leading all-zero
+  // units are dropped entirely rather than shown as "0:", so a typical
+  // few-second generation reads as "12s", not "0:00:00:12".
+  function formatDuration(ms) {
+    let totalSeconds = Math.round(ms / 1000);
+    const days = Math.floor(totalSeconds / 86400);
+    totalSeconds -= days * 86400;
+    const hours = Math.floor(totalSeconds / 3600);
+    totalSeconds -= hours * 3600;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds - minutes * 60;
+    const pad = (n) => String(n).padStart(2, "0");
+
+    if (days > 0) return `${days}:${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+    if (hours > 0) return `${hours}:${pad(minutes)}:${pad(seconds)}`;
+    if (minutes > 0) return `${minutes}:${pad(seconds)}`;
+    return `${seconds}s`;
+  }
+
+  // Appended once generation finishes (streamed replies only know their
+  // own time at the "done" event; history reloads know it from
+  // `message.generation_ms` right away) — deliberately its own element
+  // rather than baked into the rendered markdown, so it survives
+  // `assistantEl.innerHTML = payload.html` reassignments during streaming
+  // and never gets treated as message content (copy/paste, markdown
+  // re-render, ...).
+  function addTimingFooter(assistantEl, ms) {
+    if (ms == null) return;
+    const footer = document.createElement("div");
+    footer.className = "gen-time";
+    footer.textContent = formatDuration(ms);
+    assistantEl.appendChild(footer);
+  }
+
   // While a code block is still filling up during streaming, keep it
   // scrolled to its latest line (like `tail -f`) instead of leaving it
   // pinned to the top — the horizontal/vertical scrollbars (`.message
@@ -123,7 +157,8 @@
     transcript.innerHTML = "";
     for (const message of session.messages) {
       if (message.role === "assistant") {
-        addRenderedMessage("assistant", message.html || escapeHtml(message.content));
+        const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content));
+        addTimingFooter(el, message.generation_ms);
       } else {
         addMessage(message.role, message.content);
       }
@@ -228,11 +263,14 @@
           if (payload.type === "token" || payload.type === "done") {
             assistantEl.innerHTML = payload.html;
             pinCodeBlocksToLatest(assistantEl);
-            if (payload.type === "done" && payload.truncated) {
-              const notice = document.createElement("p");
-              notice.className = "truncated-notice";
-              notice.textContent = "⚠️ Response was cut off at the token limit.";
-              assistantEl.appendChild(notice);
+            if (payload.type === "done") {
+              if (payload.truncated) {
+                const notice = document.createElement("p");
+                notice.className = "truncated-notice";
+                notice.textContent = "⚠️ Response was cut off at the token limit.";
+                assistantEl.appendChild(notice);
+              }
+              addTimingFooter(assistantEl, payload.generation_ms);
             }
             transcript.scrollTop = transcript.scrollHeight;
           } else if (payload.type === "error") {

@@ -1212,14 +1212,15 @@ impl VulkanBackend {
                 vulkan_shaders::shader_source_attention_split(kv_f16, subgroup_reduce).into(),
             ),
         });
-        let attn_split_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("orangu-server attention split pipeline"),
-            layout: Some(&attn_pipeline_layout),
-            module: &attn_split_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: pipeline_cache.as_ref(),
-        });
+        let attn_split_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server attention split pipeline"),
+                layout: Some(&attn_pipeline_layout),
+                module: &attn_split_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache.as_ref(),
+            });
         // Reduces split-k's `ATTN_SPLIT_K` partial results per head into
         // the final attention output — same binding shape as `add`/`mul`/
         // `rmsnorm`/`fused_norm_rope_pipeline` (`vulkan_shaders::
@@ -3432,12 +3433,9 @@ impl VulkanBackend {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("polling the device for the attention split readback failed");
-        let data = readback_buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect(
-                "attention split readback buffer was not mapped after a successful map_async + poll",
-            );
+        let data = readback_buffer.slice(..).get_mapped_range().expect(
+            "attention split readback buffer was not mapped after a successful map_async + poll",
+        );
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         readback_buffer.unmap();
@@ -3495,12 +3493,8 @@ impl VulkanBackend {
                     input.rope_freq_base,
                     input.eps,
                 );
-                let bg = self.elem4_bind_group(
-                    &k_norm_w,
-                    &k_ff,
-                    &wk_guard.output_buffer,
-                    &meta_buf,
-                );
+                let bg =
+                    self.elem4_bind_group(&k_norm_w, &k_ff, &wk_guard.output_buffer, &meta_buf);
                 KNormRope::Fused {
                     bg,
                     meta_buf,
@@ -3705,7 +3699,9 @@ impl VulkanBackend {
                         }),
                     );
                 }
-                KNormRope::Split { k_rope_meta_buf, .. } => {
+                KNormRope::Split {
+                    k_rope_meta_buf, ..
+                } => {
                     self.queue.write_buffer(
                         k_rope_meta_buf,
                         0,
@@ -4594,9 +4590,10 @@ impl VulkanBackend {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("polling for the timestamp readback failed");
-        let data = t.readback_buffer.slice(..).get_mapped_range().expect(
-            "timestamp readback buffer was not mapped after a successful map_async + poll",
-        );
+        let data =
+            t.readback_buffer.slice(..).get_mapped_range().expect(
+                "timestamp readback buffer was not mapped after a successful map_async + poll",
+            );
         let ticks: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         t.readback_buffer.unmap();
@@ -5140,11 +5137,12 @@ mod tests {
         // to reduce first-touch/driver-side noise across runs.
         let mut samples = Vec::new();
         for _ in 0..20 {
-            let mut encoder = vulkan
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("scratch attention encoder"),
-                });
+            let mut encoder =
+                vulkan
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("scratch attention encoder"),
+                    });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("scratch attention pass"),

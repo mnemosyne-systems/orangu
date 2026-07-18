@@ -28,7 +28,7 @@ home = "0.5.12"
 html2text = "0.17.1"
 ignore = "0.4.30"
 markdown = "1.0.0"
-printpdf = { version = "0.12.0", default-features = false, features = ["text_layout"] }
+printpdf = { version = "0.11.3", default-features = false, features = ["text_layout"] }
 regex = "1.13"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 rust-fontconfig = "4.4.6"
