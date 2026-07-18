@@ -51,6 +51,103 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_CSS: &str = include_str!("assets/app.css");
 const APP_JS: &str = include_str!("assets/app.js");
 
+/// KaTeX (MIT, `assets/katex/LICENSE`) — vendored rather than pulled from a
+/// CDN, matching this whole web UI's "no build step, no network
+/// dependency" shape (see this module's own doc comment): the server has
+/// to keep rendering chat math correctly on a machine with no internet
+/// access at all. `web::render` emits `<span class="katex-source"
+/// data-tex="...">`/`<div class="katex-source katex-display" ...>`
+/// placeholders for `$...$`/`$$...$$` math; `app.js` finds them after each
+/// render and calls `katex.render` client-side. Only the `.woff2` font
+/// variant is bundled (universal in any browser capable of running this
+/// page at all) — `katex.min.css`'s own `@font-face` rules still list
+/// `.woff`/`.ttf` fallbacks, which simply 404 through [`katex_font`] on a
+/// browser that never asks for them.
+const KATEX_JS: &str = include_str!("assets/katex/katex.min.js");
+const KATEX_CSS: &str = include_str!("assets/katex/katex.min.css");
+const KATEX_FONTS: &[(&str, &[u8])] = &[
+    (
+        "KaTeX_AMS-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_AMS-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Caligraphic-Bold.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Caligraphic-Bold.woff2"),
+    ),
+    (
+        "KaTeX_Caligraphic-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Caligraphic-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Fraktur-Bold.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Fraktur-Bold.woff2"),
+    ),
+    (
+        "KaTeX_Fraktur-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Fraktur-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Main-Bold.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Main-Bold.woff2"),
+    ),
+    (
+        "KaTeX_Main-BoldItalic.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Main-BoldItalic.woff2"),
+    ),
+    (
+        "KaTeX_Main-Italic.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Main-Italic.woff2"),
+    ),
+    (
+        "KaTeX_Main-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Main-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Math-BoldItalic.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Math-BoldItalic.woff2"),
+    ),
+    (
+        "KaTeX_Math-Italic.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Math-Italic.woff2"),
+    ),
+    (
+        "KaTeX_SansSerif-Bold.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_SansSerif-Bold.woff2"),
+    ),
+    (
+        "KaTeX_SansSerif-Italic.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_SansSerif-Italic.woff2"),
+    ),
+    (
+        "KaTeX_SansSerif-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_SansSerif-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Script-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Script-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Size1-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Size1-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Size2-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Size2-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Size3-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Size3-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Size4-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Size4-Regular.woff2"),
+    ),
+    (
+        "KaTeX_Typewriter-Regular.woff2",
+        include_bytes!("assets/katex/fonts/KaTeX_Typewriter-Regular.woff2"),
+    ),
+];
+
 /// Response-length cap for a web-UI turn — generous for a chat reply
 /// (a full worked example, e.g. a from-scratch data-structure
 /// implementation, easily runs past 1024 tokens) without risking one
@@ -70,6 +167,9 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/", get(index))
         .route("/static/app.css", get(app_css))
         .route("/static/app.js", get(app_js))
+        .route("/static/katex/katex.min.css", get(katex_css))
+        .route("/static/katex/katex.min.js", get(katex_js))
+        .route("/static/katex/fonts/{name}", get(katex_font))
         .route("/api/asset-version", get(asset_version_handler))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}", get(get_session))
@@ -159,6 +259,53 @@ async fn app_js() -> impl IntoResponse {
         ],
         APP_JS,
     )
+}
+
+// KaTeX is a vendored, version-pinned third-party asset (see `KATEX_JS`'s
+// own doc comment) rather than something this project edits — unlike
+// `app_css`/`app_js` above, it's cached aggressively (`immutable`, a full
+// year) instead of `no-cache`, since it only ever changes when a human
+// bumps the vendored copy in a new `orangu-server` build, not between
+// requests to the same one.
+async fn katex_css() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "text/css; charset=utf-8"),
+            ("Cache-Control", "public, max-age=31536000, immutable"),
+        ],
+        KATEX_CSS,
+    )
+}
+
+async fn katex_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "application/javascript; charset=utf-8"),
+            ("Cache-Control", "public, max-age=31536000, immutable"),
+        ],
+        KATEX_JS,
+    )
+}
+
+/// Serves one embedded KaTeX font by exact filename match against
+/// [`KATEX_FONTS`] — an allowlist lookup, not a filesystem read, so an
+/// unexpected `name` (typo, path-traversal attempt) can only ever produce
+/// a 404, never touch disk.
+async fn katex_font(Path(name): Path<String>) -> impl IntoResponse {
+    match KATEX_FONTS.iter().find(|(font_name, _)| *font_name == name) {
+        Some((_, bytes)) => (
+            StatusCode::OK,
+            [
+                ("Content-Type", "font/woff2"),
+                ("Cache-Control", "public, max-age=31536000, immutable"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn create_session() -> impl IntoResponse {

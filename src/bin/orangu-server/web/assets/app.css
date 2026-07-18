@@ -356,6 +356,22 @@ button:disabled {
   border-radius: 4px;
 }
 
+/* Raw-TeX fallback text (`render.rs`'s `.katex-source` placeholders)
+   before `katex.render()` replaces it, or if it never runs — monospace
+   reads better than proportional text for literal `\to`/`\text{}`
+   source. Once rendered, KaTeX's own generated markup governs font/size
+   for the actual math and this rule becomes moot. */
+.katex-source {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.katex-block {
+  display: block;
+  margin: 0.6em 0;
+  overflow-x: auto;
+  text-align: center;
+}
+
 .message table {
   border-collapse: collapse;
   margin: 0.5em 0;

@@ -149,6 +149,27 @@
     }
   }
 
+  // Typesets every `<span/div class="katex-source" data-tex="...">`
+  // placeholder `render.rs` emits for `$...$`/`$$...$$` math — in place,
+  // via KaTeX's own `render()` (bundled locally, see index.html; no CDN,
+  // this has to work fully offline). `data-tex` round-trips through the
+  // DOM already HTML-entity-decoded, so no unescaping is needed here.
+  // Malformed TeX (`throwOnError: false`) just leaves the element's
+  // existing escaped-source text in place instead of blanking it.
+  function renderMathIn(el) {
+    if (typeof katex === "undefined") return;
+    for (const node of el.querySelectorAll(".katex-source")) {
+      try {
+        katex.render(node.dataset.tex, node, {
+          throwOnError: false,
+          displayMode: node.classList.contains("katex-block"),
+        });
+      } catch (err) {
+        console.error("katex render failed:", err);
+      }
+    }
+  }
+
   // sendBtn stays enabled throughout a request — while idle it submits the
   // form, while busy its click handler (below) cancels the in-flight
   // request instead, so it can't be disabled the way `input` is.
@@ -195,6 +216,7 @@
     for (const message of session.messages) {
       if (message.role === "assistant") {
         const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content));
+        renderMathIn(el);
         addTimingFooter(el, message.generation_ms, message.content);
       } else {
         addMessage(message.role, message.content);
@@ -300,6 +322,7 @@
           if (payload.type === "token" || payload.type === "done") {
             assistantEl.innerHTML = payload.html;
             pinCodeBlocksToLatest(assistantEl);
+            renderMathIn(assistantEl);
             if (payload.type === "done") {
               if (payload.truncated) {
                 const notice = document.createElement("p");

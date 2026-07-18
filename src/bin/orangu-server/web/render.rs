@@ -27,6 +27,18 @@
 //! definition) are not resolved — direct `[text](url)` links and fenced
 //! code, which cover the overwhelming majority of real LLM markdown
 //! output, are what this targets.
+//!
+//! `$...$`/`$$...$$` math is parsed (off by default in the `markdown`
+//! crate's own GFM preset, turned on explicitly in [`parse_options`]) into
+//! `<span class="katex-source" data-tex="...">`/`<div class="katex-source
+//! katex-block" data-tex="...">` placeholders, holding the raw TeX
+//! source both as a `data-tex` attribute and as escaped fallback text.
+//! `app.js` finds these after inserting the HTML and calls `katex.render`
+//! on each in place — actual typesetting is a client-side, JS-only step
+//! (no server-side TeX engine exists in Rust); the escaped fallback text
+//! is what stays visible if that JS step is ever skipped (KaTeX fails to
+//! load, `render()` throws on malformed TeX, ...) rather than an empty
+//! element.
 
 use markdown::{
     ParseOptions,
@@ -60,6 +72,18 @@ fn highlight_assets() -> &'static HighlightAssets {
     })
 }
 
+/// `ParseOptions::gfm()` plus math (`math_text`/`math_flow`), which GFM
+/// itself leaves off — without these, `$...$`/`$$...$$` isn't recognized
+/// as math at all and passes through as plain literal text (backslashes,
+/// braces and all), which is what made LaTeX-heavy replies unreadable
+/// before this.
+fn parse_options() -> ParseOptions {
+    let mut options = ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    options
+}
+
 /// Renders `text` (a chat message's raw content) to an HTML fragment safe
 /// to inject into the transcript. Falls back to escaped plain text wrapped
 /// in a `<p>` if the markdown fails to parse.
@@ -67,7 +91,7 @@ pub fn render_markdown_to_html(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    match to_mdast(text, &ParseOptions::gfm()) {
+    match to_mdast(text, &parse_options()) {
         Ok(tree) => render_node(&tree),
         Err(_) => format!("<p>{}</p>", escape_html(text)),
     }
@@ -120,7 +144,7 @@ fn render_inline_node(node: &Node) -> String {
         Node::Emphasis(emphasis) => format!("<em>{}</em>", render_inline_nodes(&emphasis.children)),
         Node::Delete(delete) => format!("<del>{}</del>", render_inline_nodes(&delete.children)),
         Node::InlineCode(code) => format!("<code>{}</code>", escape_html(&code.value)),
-        Node::InlineMath(math) => format!("<code>{}</code>", escape_html(&math.value)),
+        Node::InlineMath(math) => render_math(&math.value, false),
         Node::Link(link) => format!(
             "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
             escape_attr(&link.url),
@@ -138,9 +162,32 @@ fn render_inline_node(node: &Node) -> String {
         }
         Node::Break(_) => "<br>".to_string(),
         Node::Html(html) => escape_html(&html.value),
-        Node::Math(math) => escape_html(&math.value),
+        Node::Math(math) => render_math(&math.value, true),
         _ => render_node(node),
     }
+}
+
+/// Shared by both math node kinds — `display` picks `$$...$$`'s block
+/// `<div>` (KaTeX's centered, enlarged display mode) vs. `$...$`'s inline
+/// `<span>`. `katex-block`, not `katex-display` — KaTeX's own generated
+/// markup uses `katex-display` internally for display-mode output, and
+/// `katex.render()` inserts that markup as a *child* of this element
+/// rather than replacing it, so reusing the same class name here would
+/// leave two different `.katex-display` elements nested inside each
+/// other. See this module's own doc comment for what `app.js` does with
+/// the `katex-source`/`data-tex` markers this produces.
+fn render_math(tex: &str, display: bool) -> String {
+    let tag = if display { "div" } else { "span" };
+    let class = if display {
+        "katex-source katex-block"
+    } else {
+        "katex-source"
+    };
+    format!(
+        "<{tag} class=\"{class}\" data-tex=\"{}\">{}</{tag}>",
+        escape_attr(tex),
+        escape_html(tex)
+    )
 }
 
 fn render_list(list: &List) -> String {
@@ -292,5 +339,29 @@ mod tests {
         let html = render_markdown_to_html("![alt\"](http://x/\"y)");
         assert!(!html.contains("\"y\""));
         assert!(html.contains("&quot;"));
+    }
+
+    #[test]
+    fn renders_inline_math_as_a_katex_source_span() {
+        let html = render_markdown_to_html(r"The set $A \to B$ is finite.");
+        assert!(html.contains(r#"<span class="katex-source" data-tex="A \to B">"#));
+        // Escaped fallback content too, so the raw TeX is at least legible
+        // if the client-side katex.render() pass never runs.
+        assert!(html.contains(r"A \to B</span>"));
+        assert!(!html.contains("katex-block"));
+    }
+
+    #[test]
+    fn renders_block_math_as_a_katex_block_div() {
+        let html = render_markdown_to_html("$$\n\\sum_{i=0}^n i\n$$");
+        assert!(html.contains(r#"<div class="katex-source katex-block" data-tex="#));
+        assert!(html.contains(r"\sum_{i=0}^n i"));
+    }
+
+    #[test]
+    fn escapes_html_special_characters_inside_math_source() {
+        let html = render_markdown_to_html(r"$a < b \& c > d$");
+        assert!(html.contains("data-tex=\"a &lt; b \\&amp; c &gt; d\""));
+        assert!(!html.contains("$a < b"));
     }
 }
