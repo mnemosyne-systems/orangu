@@ -104,118 +104,216 @@ fn get_scale_min_k4(base: u32, j: u32) -> vec2<u32> {
 }
 "#;
 
-/// The compute entry point for the *reduction* path (small `n_tokens`,
-/// e.g. decode's `n_tokens == 1` — see `VulkanBackend::COOP_MIN_N_TOKENS`
-/// for the crossover into `MAIN_COOP_SUFFIX` instead). One workgroup per
-/// `(output row *group* of `REDUCE_N_ROWS` rows, token)` pair, not one row:
-/// all 64 threads divide up `in_dim` elements the same grid-stride way a
-/// single-row design would (`k = local, local + 64, local + 128, ...`), but
-/// at each `k` read `x[x_base + k]` *once* and reuse it across all
-/// `REDUCE_N_ROWS` rows' dot products — "multiple output rows per thread."
-/// A standard workgroup tree
-/// reduction (`partial_sums`, `REDUCE_N_ROWS` independent reductions
-/// packed into one flat array, `partial_sums[row * 64 + lane]`) combines
-/// each row's 64 partial sums into that row's final output, `REDUCE_N_ROWS`
-/// times per workgroup.
-///
-/// Adjacent threads read adjacent elements of the *same* row at every
-/// step, so a wavefront's reads over the row are contiguous.
-/// `VulkanBackend::build_op_resources` dispatches
-/// `ceil(out_dim / REDUCE_N_ROWS) * n_tokens` workgroups, each `x[k]` is
-/// read once per workgroup, and each `workgroupBarrier` round reduces
-/// `REDUCE_N_ROWS` rows at once.
-/// `REDUCE_N_ROWS` rows are handled with plain unrolled indices (0..4),
-/// not a runtime loop over a dynamically-sized array, since it's a fixed
-/// compile-time constant matching `VulkanBackend::REDUCE_N_ROWS` exactly —
-/// see that constant's own doc comment for why the two must stay in sync.
-/// The last group in a row a `REDUCE_N_ROWS`-imperfect `out_dim` (e.g.
-/// `out_dim = 6` needs 2 groups of 4, the second only half full) simply
-/// skips the out-of-range rows via `o < params.out_dim` bounds checks —
-/// their `partial_sums` entries are computed as `0.0` and never written to
-/// `y`, not read back by anything.
-const MAIN_REDUCE_SUFFIX: &str = r#"
-var<workgroup> partial_sums: array<f32, 256>;
-
-@compute @workgroup_size(64)
-fn main(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-) {
-    let n_row_groups = (params.out_dim + 3u) / 4u;
-    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;
-    if (flat >= n_row_groups * params.n_tokens) {
-        return;
+/// Generates the shared final-combine block both `main_reduce_suffix` and
+/// `unroll_suffix` use: `n_rows` independent 64-wide reductions of
+/// `partial0..partial{n_rows-1}` into `y`, either the classic six-round
+/// `workgroupBarrier` pairwise tree or (`subgroup: true`) the
+/// `subgroupAdd`-based combine. Not hardcoded to a 64-wide subgroup:
+/// `subgroupAdd`/`subgroupMax` first collapse each lane's contribution down
+/// to one partial sum *per subgroup* (broadcast to every lane in that
+/// subgroup), each subgroup's lane 0 writes that partial into
+/// `partial_sums`, one `workgroupBarrier` makes every subgroup's partial
+/// visible, and then (only) `local == 0u` sums the (small, `num_subgroups`-
+/// many, ≤64) partials sequentially before writing `y`. On hardware where
+/// the subgroup spans the whole 64-thread workgroup, `num_subgroups == 1`
+/// and that final loop runs exactly once. On hardware with a narrower
+/// subgroup this degrades gracefully to a couple of barriers and a short
+/// sequential combine instead of silently returning the wrong sum —
+/// deliberately not assuming subgroup size == workgroup size, since getting
+/// that wrong would be a silent correctness bug this project's own
+/// bit-for-bit cross-check discipline doesn't allow. (Measured as a real
+/// end-to-end regression despite fewer barriers — see
+/// `VulkanBackend::try_init` for why it ships opt-in, not default.)
+/// Row count used to be a hardcoded `4` baked separately into the WGSL text
+/// and the Rust-side dispatch-count math (`VulkanBackend::REDUCE_N_ROWS`),
+/// two places that had to be changed together by hand; generating both from
+/// the same `n_rows` here removes that footgun.
+fn reduce_combine_block(n_rows: usize, subgroup: bool) -> String {
+    let mut s = String::new();
+    if subgroup {
+        for i in 0..n_rows {
+            s.push_str(&format!("    let sg{i} = subgroupAdd(partial{i});\n"));
+        }
+        s.push_str("    if (sg_lane == 0u) {\n");
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "        partial_sums[{i}u * 64u + sg_id] = sg{i};\n"
+            ));
+        }
+        s.push_str("    }\n    workgroupBarrier();\n    if (local == 0u) {\n");
+        for i in 0..n_rows {
+            s.push_str(&format!("        var t{i}: f32 = 0.0;\n"));
+        }
+        s.push_str("        var i: u32 = 0u;\n        loop {\n            if (i >= n_sg) {\n                break;\n            }\n");
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "            t{i} = t{i} + partial_sums[{i}u * 64u + i];\n"
+            ));
+        }
+        s.push_str("            i = i + 1u;\n        }\n");
+        s.push_str("        y[t * params.out_dim + o0] = t0;\n");
+        for i in 1..n_rows {
+            s.push_str(&format!(
+                "        if (o{i} < params.out_dim) {{\n            y[t * params.out_dim + o{i}] = t{i};\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
+    } else {
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "    partial_sums[{i}u * 64u + local] = partial{i};\n"
+            ));
+        }
+        s.push_str("    workgroupBarrier();\n    var stride: u32 = 32u;\n    loop {\n        if (stride == 0u) {\n            break;\n        }\n        if (local < stride) {\n");
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "            partial_sums[{i}u * 64u + local] = partial_sums[{i}u * 64u + local] + partial_sums[{i}u * 64u + local + stride];\n"
+            ));
+        }
+        s.push_str(
+            "        }\n        workgroupBarrier();\n        stride = stride / 2u;\n    }\n",
+        );
+        s.push_str("    if (local == 0u) {\n");
+        s.push_str("        y[t * params.out_dim + o0] = partial_sums[0];\n");
+        for i in 1..n_rows {
+            s.push_str(&format!(
+                "        if (o{i} < params.out_dim) {{\n            y[t * params.out_dim + o{i}] = partial_sums[{i}u * 64u];\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
     }
-    let rg = flat / params.n_tokens;
-    let t = flat % params.n_tokens;
-    let o_base = rg * 4u;
-    let o0 = o_base;
-    let o1 = o_base + 1u;
-    let o2 = o_base + 2u;
-    let o3 = o_base + 3u;
-    let local = lid.x;
-    let x_base = t * params.in_dim;
+    s
+}
 
-    var partial0: f32 = 0.0;
-    var partial1: f32 = 0.0;
-    var partial2: f32 = 0.0;
-    var partial3: f32 = 0.0;
-    var k: u32 = local;
-    loop {
-        if (k >= params.in_dim) {
-            break;
-        }
-        let block_idx = k / BLOCK_ELEMS;
-        let local_k = k % BLOCK_ELEMS;
-        let block_off = block_idx * BLOCK_BYTES;
-        let xv = x[x_base + k];
-        partial0 = partial0 + dequant_element(o0 * params.row_bytes + block_off, local_k) * xv;
-        if (o1 < params.out_dim) {
-            partial1 = partial1 + dequant_element(o1 * params.row_bytes + block_off, local_k) * xv;
-        }
-        if (o2 < params.out_dim) {
-            partial2 = partial2 + dequant_element(o2 * params.row_bytes + block_off, local_k) * xv;
-        }
-        if (o3 < params.out_dim) {
-            partial3 = partial3 + dequant_element(o3 * params.row_bytes + block_off, local_k) * xv;
-        }
-        k = k + 64u;
-    }
-
-    partial_sums[local] = partial0;
-    partial_sums[64u + local] = partial1;
-    partial_sums[128u + local] = partial2;
-    partial_sums[192u + local] = partial3;
-    workgroupBarrier();
-    var stride: u32 = 32u;
-    loop {
-        if (stride == 0u) {
-            break;
-        }
-        if (local < stride) {
-            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
-            partial_sums[64u + local] = partial_sums[64u + local] + partial_sums[64u + local + stride];
-            partial_sums[128u + local] = partial_sums[128u + local] + partial_sums[128u + local + stride];
-            partial_sums[192u + local] = partial_sums[192u + local] + partial_sums[192u + local + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if (local == 0u) {
-        y[t * params.out_dim + o0] = partial_sums[0];
-        if (o1 < params.out_dim) {
-            y[t * params.out_dim + o1] = partial_sums[64u];
-        }
-        if (o2 < params.out_dim) {
-            y[t * params.out_dim + o2] = partial_sums[128u];
-        }
-        if (o3 < params.out_dim) {
-            y[t * params.out_dim + o3] = partial_sums[192u];
-        }
+/// The `@compute fn main` entry-point parameter list's subgroup-only
+/// builtins — see `reduce_combine_block`'s own doc comment.
+fn subgroup_entry_params(subgroup: bool) -> &'static str {
+    if subgroup {
+        "\n    @builtin(subgroup_invocation_id) sg_lane: u32,\n    @builtin(subgroup_id) sg_id: u32,\n    @builtin(num_subgroups) n_sg: u32,"
+    } else {
+        ""
     }
 }
-"#;
+
+/// The compute entry point for the *reduction* path (small `n_tokens`,
+/// e.g. decode's `n_tokens == 1` — see `VulkanBackend::COOP_MIN_N_TOKENS`
+/// for the crossover into `MAIN_COOP_SUFFIX` instead), generated for an
+/// arbitrary `n_rows` (rows-per-workgroup) — see [`reduce_combine_block`]'s
+/// own doc comment for the combine step. One workgroup per `(output row
+/// *group* of `n_rows` rows, token)` pair, not one row: all 64 threads
+/// divide up `in_dim` elements the same grid-stride way a single-row design
+/// would (`k = local, local + 64, local + 128, ...`), but at each `k` read
+/// `x[x_base + k]` *once* and reuse it across all `n_rows` rows' dot
+/// products — "multiple output rows per thread." Adjacent threads read
+/// adjacent elements of the *same* row at every step, so a wavefront's
+/// reads over the row are contiguous. The last group in a row an
+/// `n_rows`-imperfect `out_dim` (e.g. `out_dim = 6`, `n_rows = 4` needs 2
+/// groups, the second only half full) simply skips the out-of-range rows
+/// via `o < params.out_dim` bounds checks — their `partial_sums` entries
+/// are computed as `0.0` and never written to `y`, not read back by
+/// anything. `VulkanBackend::build_op_resources` dispatches
+/// `ceil(out_dim / n_rows) * n_tokens` workgroups using this same `n_rows`
+/// value, so the two can no longer drift out of sync the way two separately
+/// hardcoded `4`s used to risk.
+fn main_reduce_suffix(n_rows: usize, subgroup: bool) -> String {
+    let mut s = format!(
+        "var<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    );
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o_base = rg * {n_rows}u;\n"));
+    for i in 0..n_rows {
+        s.push_str(&format!("    let o{i} = o_base + {i}u;\n"));
+    }
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("    var k: u32 = local;\n    loop {\n        if (k >= params.in_dim) {\n            break;\n        }\n");
+    s.push_str("        let block_idx = k / BLOCK_ELEMS;\n        let local_k = k % BLOCK_ELEMS;\n        let block_off = block_idx * BLOCK_BYTES;\n        let xv = x[x_base + k];\n");
+    s.push_str(
+        "        partial0 = partial0 + dequant_element(o0 * params.row_bytes + block_off, local_k) * xv;\n",
+    );
+    for i in 1..n_rows {
+        s.push_str(&format!(
+            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + dequant_element(o{i} * params.row_bytes + block_off, local_k) * xv;\n        }}\n"
+        ));
+    }
+    s.push_str("        k = k + 64u;\n    }\n\n");
+    s.push_str(&reduce_combine_block(n_rows, subgroup));
+    s.push_str("}\n");
+    s
+}
+
+/// The block-unroll `main` shared by every block-unroll kernel (`Q4_K`/
+/// `Q5_K`/`Q6_K`, scalar and packed-`f16`) for an arbitrary `n_rows` — see
+/// [`main_reduce_suffix`]'s own doc comment for the `n_rows` generalization
+/// itself. Each type's `*_UNROLL_MIDDLE` supplies its own `BLOCK_BYTES`/
+/// `BLOCK_ELEMS` and a single uniform entry point `block_dot(byte_offset,
+/// local, x0, x1, x2, x3) -> f32` — this thread's contribution to one
+/// output row from one 256-element super-block, given the block's byte
+/// offset, this lane's id, and the four activations for the four 64-groups
+/// (positions `local`, `64+local`, `128+local`, `192+local`). `block_dot`'s
+/// signature is untouched by `n_rows`: those four `x0..x3` activations come
+/// from the K-quant super-block's fixed 4×64 internal geometry (a different
+/// axis from how many *output rows* share a workgroup — element `g` of this
+/// lane always lives at position `g*64 + local`, the same for every type,
+/// which is why the activation gather here is identical across types; only
+/// `block_dot`'s own dequant-and-dot differs), so generalizing `n_rows`
+/// only changes how many times `block_dot` is called per block (once per
+/// output row this workgroup handles), issuing its **four activation loads
+/// up front** each block, before the dependent dots — the memory-level-
+/// parallelism restructuring this kernel exists for: several independent
+/// loads outstanding per lane per block, instead of the plain reduce path's
+/// one outstanding load at a time.
+fn unroll_suffix(n_rows: usize, subgroup: bool) -> String {
+    let mut s = format!(
+        "var<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    );
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("\n    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = 0u;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
+    s.push_str(
+        "        let block_off = b * BLOCK_BYTES;\n        let x_blk = x_base + b * BLOCK_ELEMS;\n",
+    );
+    s.push_str("        let x0 = x[x_blk + local];\n        let x1 = x[x_blk + 64u + local];\n        let x2 = x[x_blk + 128u + local];\n        let x3 = x[x_blk + 192u + local];\n");
+    s.push_str(
+        "        partial0 = partial0 + block_dot(o0 * params.row_bytes + block_off, local, x0, x1, x2, x3);\n",
+    );
+    for i in 1..n_rows {
+        s.push_str(&format!(
+            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + block_dot(o{i} * params.row_bytes + block_off, local, x0, x1, x2, x3);\n        }}\n"
+        ));
+    }
+    s.push_str("        b = b + 1u;\n    }\n\n");
+    s.push_str(&reduce_combine_block(n_rows, subgroup));
+    s.push_str("}\n");
+    s
+}
 
 /// The compute entry point for the *cooperative* path — used instead of
 /// `MAIN_REDUCE_SUFFIX` when `n_tokens` is large enough (see `VulkanBackend`'s
@@ -752,7 +850,7 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 /// constant `shader_source_coop` does — both dispatch strategies share the
 /// exact same `dequant_element` per type, only `MAIN_REDUCE_SUFFIX` vs.
 /// `MAIN_COOP_SUFFIX` (and so the resulting compute `main`) differs.
-pub fn shader_source_reduce(ggml_type: u32) -> Option<String> {
+pub fn shader_source_reduce(ggml_type: u32, n_rows: usize, subgroup: bool) -> Option<String> {
     let middle = match ggml_type {
         t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
         t if t == GGML_TYPE_F16 => F16_COOP_MIDDLE,
@@ -765,7 +863,8 @@ pub fn shader_source_reduce(ggml_type: u32) -> Option<String> {
         t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
         _ => return None,
     };
-    Some(format!("{PRELUDE}\n{middle}\n{MAIN_REDUCE_SUFFIX}"))
+    let suffix = main_reduce_suffix(n_rows, subgroup);
+    Some(format!("{PRELUDE}\n{middle}\n{suffix}"))
 }
 
 /// `Q4_K` only.
@@ -1273,7 +1372,11 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 /// [`shader_source_reduce`]. Reuses `MAIN_REDUCE_SUFFIX` verbatim (see
 /// `PRELUDE_VEC4`'s own doc comment for why every `*_WIDE_MIDDLE`'s
 /// `dequant_element` keeps the same signature that requires).
-pub fn shader_source_reduce_wide_load(ggml_type: u32) -> Option<String> {
+pub fn shader_source_reduce_wide_load(
+    ggml_type: u32,
+    n_rows: usize,
+    subgroup: bool,
+) -> Option<String> {
     let middle = match ggml_type {
         t if t == GGML_TYPE_F32 => F32_WIDE_MIDDLE,
         t if t == GGML_TYPE_F16 => F16_WIDE_MIDDLE,
@@ -1286,154 +1389,64 @@ pub fn shader_source_reduce_wide_load(ggml_type: u32) -> Option<String> {
         t if t == GGML_TYPE_Q6_K => Q6_K_WIDE_MIDDLE,
         _ => return None,
     };
-    Some(format!("{PRELUDE_VEC4}\n{middle}\n{MAIN_REDUCE_SUFFIX}"))
+    let suffix = main_reduce_suffix(n_rows, subgroup);
+    Some(format!("{PRELUDE_VEC4}\n{middle}\n{suffix}"))
 }
 
-/// `Q4_K`-only decode kernel that restructures the reduce inner loop for
-/// **memory-level parallelism** — issuing several independent memory loads
-/// before the dependent dequant-and-dot rather than one outstanding load
-/// per lane at a time. Builds on the
-/// wide-load path (`PRELUDE_VEC4`, `weights` bound as `array<vec4<u32>>`)
-/// but changes *how the loop is shaped*, which the `MAIN_REDUCE_SUFFIX`-
-/// based wide-load kernel (`shader_source_reduce_wide_load`) does not.
-///
-/// The problem it targets: `MAIN_REDUCE_SUFFIX`'s inner loop reads **one**
-/// weight element per lane per iteration (`k += 64u`) and immediately
-/// consumes it in a dependent `dequant_element` + `fma` before looping —
-/// one outstanding memory request per lane at a time, which under-feeds the
-/// memory pipeline on a latency-bound DRAM stream. Wide loads reduce the
-/// *number* of transactions but do not add independent in-flight loads;
-/// this does.
-///
-/// The restructuring, exploiting `Q4_K`'s fixed `256 = 4 × 64` super-block
-/// geometry: one workgroup still handles a `REDUCE_N_ROWS = 4`-row group
-/// (same dispatch shape as `MAIN_REDUCE_SUFFIX`, so
-/// `VulkanBackend::build_op_resources`' workgroup-count math is reused
-/// unchanged), but the loop now iterates whole 256-element super-blocks
-/// rather than striding single elements. Within each block, thread `local`
-/// (0..63) owns in-group position `local` of *all four* 64-groups, so the
-/// body issues its **four activation loads up front** (`x0..x3`, one per
-/// 64-group, reused across all four output rows) and, per row, `q4k_block_
-/// dot` loads that block's header **once** (not once per element, as the
-/// per-element `dequant_element` re-does) and issues its **four qs-byte
-/// loads together** before any dependent scale/min math. That is the
-/// memory-level parallelism: several independent loads outstanding per
-/// lane per block, and 4× less redundant header traffic. Explicit unrolling
-/// to whole blocks makes the header reuse unconditional, which the compiler
-/// could not hoist across the stride-64 element loop.
-///
-/// Pure `f32` arithmetic, identical to the scalar/wide-load path
-/// element-for-element (just reordered loads), so it cross-checks
-/// bit-for-bit against `CpuBackend` at the same tight tolerance the
-/// wide-load kernel uses — no `f16` precision loss to widen for. **On by
-/// default** (`VulkanBackend::wide_unroll`, opt out with
-/// `ORANGU_NO_MLP_UNROLL=1`).
-/// The shared `main` for every block-unroll kernel (`Q4_K`/`Q5_K`/`Q6_K`,
-/// scalar and packed-`f16`). Each type's `*_UNROLL_MIDDLE` supplies its own
-/// `BLOCK_BYTES`/`BLOCK_ELEMS` and a single uniform entry point
-/// `block_dot(byte_offset, local, x0, x1, x2, x3) -> f32` — this thread's
-/// contribution to one output row from one 256-element super-block, given
-/// the block's byte offset, this lane's id, and the four activations for
-/// the four 64-groups (positions `local`, `64+local`, `128+local`,
-/// `192+local`). Because all three types share that 4×64 super-block
-/// geometry (element `g` of this lane always lives at position `g*64 +
-/// local`), the activation gather and the whole `REDUCE_N_ROWS = 4`-batched
-/// loop/reduction are identical across types; only the per-type
-/// dequant-and-dot inside `block_dot` differs. Kept `REDUCE_N_ROWS`-batched
-/// (four output rows per workgroup, four hoisted activations reused across
-/// them) so `VulkanBackend::build_op_resources`' existing dispatch-count
-/// math applies unchanged.
-const UNROLL_SUFFIX: &str = r#"
-var<workgroup> partial_sums: array<f32, 256>;
-
-@compute @workgroup_size(64)
-fn main(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-) {
-    let n_row_groups = (params.out_dim + 3u) / 4u;
-    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;
-    if (flat >= n_row_groups * params.n_tokens) {
-        return;
-    }
-    let rg = flat / params.n_tokens;
-    let t = flat % params.n_tokens;
-    let o0 = rg * 4u;
-    let o1 = o0 + 1u;
-    let o2 = o0 + 2u;
-    let o3 = o0 + 3u;
-    let local = lid.x;
-    let x_base = t * params.in_dim;
-
-    var partial0: f32 = 0.0;
-    var partial1: f32 = 0.0;
-    var partial2: f32 = 0.0;
-    var partial3: f32 = 0.0;
-
-    // The K-super-block (256 elements) is the quantization unit, so it always
-    // divides `in_dim` exactly — this loops whole blocks with no partial
-    // tail, unlike `MAIN_REDUCE_SUFFIX`'s element-strided loop.
-    let n_blocks = params.in_dim / BLOCK_ELEMS;
-    var b: u32 = 0u;
-    loop {
-        if (b >= n_blocks) {
-            break;
-        }
-        let block_off = b * BLOCK_BYTES;
-        let x_blk = x_base + b * BLOCK_ELEMS;
-        // Four activation loads issued together (one per 64-group), reused
-        // across all four output rows below.
-        let x0 = x[x_blk + local];
-        let x1 = x[x_blk + 64u + local];
-        let x2 = x[x_blk + 128u + local];
-        let x3 = x[x_blk + 192u + local];
-        partial0 = partial0 + block_dot(o0 * params.row_bytes + block_off, local, x0, x1, x2, x3);
-        if (o1 < params.out_dim) {
-            partial1 = partial1 + block_dot(o1 * params.row_bytes + block_off, local, x0, x1, x2, x3);
-        }
-        if (o2 < params.out_dim) {
-            partial2 = partial2 + block_dot(o2 * params.row_bytes + block_off, local, x0, x1, x2, x3);
-        }
-        if (o3 < params.out_dim) {
-            partial3 = partial3 + block_dot(o3 * params.row_bytes + block_off, local, x0, x1, x2, x3);
-        }
-        b = b + 1u;
-    }
-
-    partial_sums[local] = partial0;
-    partial_sums[64u + local] = partial1;
-    partial_sums[128u + local] = partial2;
-    partial_sums[192u + local] = partial3;
-    workgroupBarrier();
-    var stride: u32 = 32u;
-    loop {
-        if (stride == 0u) {
-            break;
-        }
-        if (local < stride) {
-            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
-            partial_sums[64u + local] = partial_sums[64u + local] + partial_sums[64u + local + stride];
-            partial_sums[128u + local] = partial_sums[128u + local] + partial_sums[128u + local + stride];
-            partial_sums[192u + local] = partial_sums[192u + local] + partial_sums[192u + local + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if (local == 0u) {
-        y[t * params.out_dim + o0] = partial_sums[0];
-        if (o1 < params.out_dim) {
-            y[t * params.out_dim + o1] = partial_sums[64u];
-        }
-        if (o2 < params.out_dim) {
-            y[t * params.out_dim + o2] = partial_sums[128u];
-        }
-        if (o3 < params.out_dim) {
-            y[t * params.out_dim + o3] = partial_sums[192u];
-        }
-    }
-}
-"#;
+// `Q4_K`-only decode kernel that restructures the reduce inner loop for
+// **memory-level parallelism** — issuing several independent memory loads
+// before the dependent dequant-and-dot rather than one outstanding load
+// per lane at a time. Builds on the
+// wide-load path (`PRELUDE_VEC4`, `weights` bound as `array<vec4<u32>>`)
+// but changes *how the loop is shaped*, which the `MAIN_REDUCE_SUFFIX`-
+// based wide-load kernel (`shader_source_reduce_wide_load`) does not.
+//
+// The problem it targets: `MAIN_REDUCE_SUFFIX`'s inner loop reads **one**
+// weight element per lane per iteration (`k += 64u`) and immediately
+// consumes it in a dependent `dequant_element` + `fma` before looping —
+// one outstanding memory request per lane at a time, which under-feeds the
+// memory pipeline on a latency-bound DRAM stream. Wide loads reduce the
+// *number* of transactions but do not add independent in-flight loads;
+// this does.
+//
+// The restructuring, exploiting `Q4_K`'s fixed `256 = 4 × 64` super-block
+// geometry: one workgroup still handles a `REDUCE_N_ROWS = 4`-row group
+// (same dispatch shape as `MAIN_REDUCE_SUFFIX`, so
+// `VulkanBackend::build_op_resources`' workgroup-count math is reused
+// unchanged), but the loop now iterates whole 256-element super-blocks
+// rather than striding single elements. Within each block, thread `local`
+// (0..63) owns in-group position `local` of *all four* 64-groups, so the
+// body issues its **four activation loads up front** (`x0..x3`, one per
+// 64-group, reused across all four output rows) and, per row, `q4k_block_
+// dot` loads that block's header **once** (not once per element, as the
+// per-element `dequant_element` re-does) and issues its **four qs-byte
+// loads together** before any dependent scale/min math. That is the
+// memory-level parallelism: several independent loads outstanding per
+// lane per block, and 4× less redundant header traffic. Explicit unrolling
+// to whole blocks makes the header reuse unconditional, which the compiler
+// could not hoist across the stride-64 element loop.
+//
+// Pure `f32` arithmetic, identical to the scalar/wide-load path
+// element-for-element (just reordered loads), so it cross-checks
+// bit-for-bit against `CpuBackend` at the same tight tolerance the
+// wide-load kernel uses — no `f16` precision loss to widen for. **On by
+// default** (`VulkanBackend::wide_unroll`, opt out with
+// `ORANGU_NO_MLP_UNROLL=1`).
+// The shared `main` for every block-unroll kernel (`Q4_K`/`Q5_K`/`Q6_K`,
+// scalar and packed-`f16`). Each type's `*_UNROLL_MIDDLE` supplies its own
+// `BLOCK_BYTES`/`BLOCK_ELEMS` and a single uniform entry point
+// `block_dot(byte_offset, local, x0, x1, x2, x3) -> f32` — this thread's
+// contribution to one output row from one 256-element super-block, given
+// the block's byte offset, this lane's id, and the four activations for
+// the four 64-groups (positions `local`, `64+local`, `128+local`,
+// `192+local`). Because all three types share that 4×64 super-block
+// geometry (element `g` of this lane always lives at position `g*64 +
+// local`), the activation gather and the whole `REDUCE_N_ROWS = 4`-batched
+// loop/reduction are identical across types; only the per-type
+// dequant-and-dot inside `block_dot` differs. Kept `REDUCE_N_ROWS`-batched
+// (four output rows per workgroup, four hoisted activations reused across
+// them) so `VulkanBackend::build_op_resources`' existing dispatch-count
+// math applies unchanged.
 
 /// `Q4_K`'s `block_dot`: header loaded once, all four qs-byte loads (one per
 /// 64-group) issued up front so they're in flight together, then the four
@@ -1582,32 +1595,39 @@ fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -
 }
 "#;
 
-pub fn shader_source_reduce_q4k_wide_unroll() -> String {
-    format!("{PRELUDE_VEC4}\n{Q4K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+pub fn shader_source_reduce_q4k_wide_unroll(n_rows: usize, subgroup: bool) -> String {
+    let suffix = unroll_suffix(n_rows, subgroup);
+    format!("{PRELUDE_VEC4}\n{Q4K_UNROLL_MIDDLE}\n{suffix}")
 }
 
 /// See `shader_source_reduce_q4k_wide_unroll` — same memory-level-parallelism
 /// restructuring, for `Q5_K` (`Q5K_UNROLL_MIDDLE`).
-pub fn shader_source_reduce_q5k_wide_unroll() -> String {
-    format!("{PRELUDE_VEC4}\n{Q5K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+pub fn shader_source_reduce_q5k_wide_unroll(n_rows: usize, subgroup: bool) -> String {
+    let suffix = unroll_suffix(n_rows, subgroup);
+    format!("{PRELUDE_VEC4}\n{Q5K_UNROLL_MIDDLE}\n{suffix}")
 }
 
 /// See `shader_source_reduce_q4k_wide_unroll` — same restructuring, for
 /// `Q6_K` (`Q6K_UNROLL_MIDDLE`); it hoists loads rather than caching a
 /// header (`Q6_K` has no vec4-aligned header).
-pub fn shader_source_reduce_q6k_wide_unroll() -> String {
-    format!("{PRELUDE_VEC4}\n{Q6K_UNROLL_MIDDLE}\n{UNROLL_SUFFIX}")
+pub fn shader_source_reduce_q6k_wide_unroll(n_rows: usize, subgroup: bool) -> String {
+    let suffix = unroll_suffix(n_rows, subgroup);
+    format!("{PRELUDE_VEC4}\n{Q6K_UNROLL_MIDDLE}\n{suffix}")
 }
 
 /// The complete block-unroll reduce source for `ggml_type`, or `None` if
 /// this type has no unroll kernel (only the three K-quants do — the block-
 /// unroll exploits their 256-element super-block geometry; the smaller
 /// legacy quants and float types keep the wide-load/scalar reduce path).
-pub fn shader_source_reduce_wide_unroll(ggml_type: u32) -> Option<String> {
+pub fn shader_source_reduce_wide_unroll(
+    ggml_type: u32,
+    n_rows: usize,
+    subgroup: bool,
+) -> Option<String> {
     match ggml_type {
-        t if t == GGML_TYPE_Q4_K => Some(shader_source_reduce_q4k_wide_unroll()),
-        t if t == GGML_TYPE_Q5_K => Some(shader_source_reduce_q5k_wide_unroll()),
-        t if t == GGML_TYPE_Q6_K => Some(shader_source_reduce_q6k_wide_unroll()),
+        t if t == GGML_TYPE_Q4_K => Some(shader_source_reduce_q4k_wide_unroll(n_rows, subgroup)),
+        t if t == GGML_TYPE_Q5_K => Some(shader_source_reduce_q5k_wide_unroll(n_rows, subgroup)),
+        t if t == GGML_TYPE_Q6_K => Some(shader_source_reduce_q6k_wide_unroll(n_rows, subgroup)),
         _ => None,
     }
 }
@@ -1624,7 +1644,7 @@ pub fn shader_source_reduce_wide_unroll(ggml_type: u32) -> Option<String> {
 /// cross-check uses the same widened tolerance the byte-wise packed kernel
 /// needs. `enable f16;` must lead the whole module (WGSL rule), so it can't
 /// sit inside the shared middle/suffix.
-pub fn shader_source_reduce_q4k_wide_unroll_packed_f16() -> String {
+pub fn shader_source_reduce_q4k_wide_unroll_packed_f16(n_rows: usize, subgroup: bool) -> String {
     const MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 144u;
 const BLOCK_ELEMS: u32 = 256u;
@@ -1667,7 +1687,8 @@ fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -
     return f32(dot(w01, x01)) + f32(dot(w23, x23));
 }
 "#;
-    format!("enable f16;\n{PRELUDE_VEC4}\n{MIDDLE}\n{UNROLL_SUFFIX}")
+    let suffix = unroll_suffix(n_rows, subgroup);
+    format!("enable f16;\n{PRELUDE_VEC4}\n{MIDDLE}\n{suffix}")
 }
 
 /// Wide loads (this file's
@@ -1981,6 +2002,70 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 "#;
 
+/// `RMSNORM_SHADER_BODY` with `subgroupAdd` replacing the 6-round
+/// tree — see `reduce_combine_block`'s doc comment for the general-
+/// subgroup-size rationale. Unlike the reduce kernels above (only lane 0
+/// needs the combined total, to write `y`), every lane here needs the
+/// combined `mean_sq`/`scale` to rescale its own slice of the row — so
+/// instead of a second `if (local == 0u) { combine }` + barrier, every lane
+/// just runs the same tiny (`num_subgroups`-long, ≤64, and 1 on hardware
+/// where the subgroup already spans the whole workgroup) combine loop
+/// itself. That keeps this at exactly one barrier — the one that makes each
+/// subgroup's `subgroupAdd` partial visible workgroup-wide — the same
+/// barrier count the fully-single-subgroup case would need anyway.
+const RMSNORM_SHADER_BODY_SUBGROUP: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(num_subgroups) n_sg: u32,
+) {
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    let sg_sum = subgroupAdd(partial);
+    if (sg_lane == 0u) {
+        partial_sums[sg_id] = sg_sum;
+    }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= n_sg) {
+            break;
+        }
+        total = total + partial_sums[i];
+        i = i + 1u;
+    }
+    let mean_sq = total / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[k] = x[k] * scale * weight[k];
+        k = k + 64u;
+    }
+}
+"#;
+
 pub fn shader_source_add() -> String {
     format!("{ELEM_META}\n{ADD_SHADER_BODY}")
 }
@@ -1997,8 +2082,13 @@ pub fn shader_source_scale() -> String {
     format!("{ELEM_META}\n{SCALE_SHADER_BODY}")
 }
 
-pub fn shader_source_rmsnorm() -> String {
-    format!("{ELEM_META}\n{RMSNORM_SHADER_BODY}")
+pub fn shader_source_rmsnorm(subgroup: bool) -> String {
+    let body = if subgroup {
+        RMSNORM_SHADER_BODY_SUBGROUP
+    } else {
+        RMSNORM_SHADER_BODY
+    };
+    format!("{ELEM_META}\n{body}")
 }
 
 /// GPU-resident causal attention for a *single* query token (decode,
@@ -2091,6 +2181,7 @@ fn score_at(h: u32, kv_head: u32, p: u32) -> f32 {
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
+    %SUBGROUP_PARAMS%
 ) {
     let h = wid.x;
     let local = lid.x;
@@ -2124,42 +2215,14 @@ fn main(
         if (has_pos) {
             my_score = score_at(h, kv_head, p);
         }
-        shared_reduce[local] = my_score;
-        workgroupBarrier();
-        var stride: u32 = 32u;
-        loop {
-            if (stride == 0u) {
-                break;
-            }
-            if (local < stride) {
-                shared_reduce[local] = max(shared_reduce[local], shared_reduce[local + stride]);
-            }
-            workgroupBarrier();
-            stride = stride / 2u;
-        }
-        let tile_max = shared_reduce[0];
-        workgroupBarrier();
+        %MAX_REDUCE_BLOCK%
 
         var my_prob: f32 = 0.0;
         if (has_pos) {
             my_prob = exp(my_score - tile_max);
         }
         tile_probs[local] = my_prob;
-        shared_reduce[local] = my_prob;
-        workgroupBarrier();
-        stride = 32u;
-        loop {
-            if (stride == 0u) {
-                break;
-            }
-            if (local < stride) {
-                shared_reduce[local] = shared_reduce[local] + shared_reduce[local + stride];
-            }
-            workgroupBarrier();
-            stride = stride / 2u;
-        }
-        let tile_sum = shared_reduce[0];
-        workgroupBarrier();
+        %SUM_REDUCE_BLOCK%
 
         let new_m = max(m, tile_max);
         let alpha_old = exp(m - new_m);
@@ -2210,10 +2273,127 @@ fn main(
 /// already `f32`), so the score/softmax/weighted-sum math itself is
 /// identical either way — only the storage type, and hence the KV
 /// mirror's memory traffic, changes.
-pub fn shader_source_attention(kv_f16: bool) -> String {
+/// The subgroup reduction for the attention softmax's per-tile max
+/// and sum, substituted into `ATTENTION_SHADER_TEMPLATE`'s `%MAX_REDUCE_
+/// BLOCK%`/`%SUM_REDUCE_BLOCK%` placeholders when `subgroup` is set — see
+/// `reduce_combine_block`'s doc comment for the general-subgroup-
+/// size rationale applied here too. Unlike the dot-product reduce kernels
+/// (only lane 0 needs the total) or RMSNorm (every lane redundantly
+/// recomputes the tiny combine, no second barrier), `shared_reduce` here is
+/// reused twice more per tile iteration (the sum-phase, then next tile's
+/// max-phase), so each phase keeps the classic design's two-barrier
+/// discipline: one barrier after the subgroup partials are written (makes
+/// them visible workgroup-wide), a second after every lane's own redundant
+/// combine loop (a hazard barrier — protects against a fast lane starting
+/// to overwrite `shared_reduce` for the *next* phase before a slow lane has
+/// finished reading it for *this* one, exactly the reason the classic path
+/// already had a barrier in the same spot). Four barriers per tile instead
+/// of the classic path's sixteen, most of the win coming from the
+/// eliminated pairwise-tree rounds themselves, not just their barriers.
+fn attention_subgroup_blocks() -> (&'static str, &'static str) {
+    let max_block = r#"
+        let sg_max = subgroupMax(my_score);
+        if (subgroup_invocation_id == 0u) {
+            shared_reduce[subgroup_id] = sg_max;
+        }
+        workgroupBarrier();
+        var tile_max: f32 = shared_reduce[0];
+        var mi: u32 = 1u;
+        loop {
+            if (mi >= num_subgroups) {
+                break;
+            }
+            tile_max = max(tile_max, shared_reduce[mi]);
+            mi = mi + 1u;
+        }
+        workgroupBarrier();
+"#;
+    let sum_block = r#"
+        let sg_sum = subgroupAdd(my_prob);
+        if (subgroup_invocation_id == 0u) {
+            shared_reduce[subgroup_id] = sg_sum;
+        }
+        workgroupBarrier();
+        var tile_sum: f32 = shared_reduce[0];
+        var si: u32 = 1u;
+        loop {
+            if (si >= num_subgroups) {
+                break;
+            }
+            tile_sum = tile_sum + shared_reduce[si];
+            si = si + 1u;
+        }
+        workgroupBarrier();
+"#;
+    (max_block, sum_block)
+}
+
+fn attention_classic_blocks() -> (&'static str, &'static str) {
+    let max_block = r#"
+        shared_reduce[local] = my_score;
+        workgroupBarrier();
+        var stride: u32 = 32u;
+        loop {
+            if (stride == 0u) {
+                break;
+            }
+            if (local < stride) {
+                shared_reduce[local] = max(shared_reduce[local], shared_reduce[local + stride]);
+            }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        let tile_max = shared_reduce[0];
+        workgroupBarrier();
+"#;
+    let sum_block = r#"
+        shared_reduce[local] = my_prob;
+        workgroupBarrier();
+        var stride2: u32 = 32u;
+        loop {
+            if (stride2 == 0u) {
+                break;
+            }
+            if (local < stride2) {
+                shared_reduce[local] = shared_reduce[local] + shared_reduce[local + stride2];
+            }
+            workgroupBarrier();
+            stride2 = stride2 / 2u;
+        }
+        let tile_sum = shared_reduce[0];
+        workgroupBarrier();
+"#;
+    (max_block, sum_block)
+}
+
+/// `kv_f16` selects whether `k_cache`/`v_cache` are bound as `array<f16>`
+/// (the KV mirror's storage type when the adapter supports native WGSL
+/// `f16`) or `array<f32>` (the
+/// original, always-available path). Every read of either array already
+/// goes through an `f32(...)` widening cast (a no-op when the array is
+/// already `f32`), so the score/softmax/weighted-sum math itself is
+/// identical either way — only the storage type, and hence the KV
+/// mirror's memory traffic, changes. `subgroup` selects `attention_
+/// subgroup_blocks` over `attention_classic_blocks` for the
+/// per-tile max/sum reductions — see `VulkanBackend::try_init`'s own
+/// comment on its `subgroup_reduce` local for why this is opt-in.
+pub fn shader_source_attention(kv_f16: bool, subgroup: bool) -> String {
+    let (max_block, sum_block) = if subgroup {
+        attention_subgroup_blocks()
+    } else {
+        attention_classic_blocks()
+    };
+    let subgroup_params = if subgroup {
+        "@builtin(subgroup_invocation_id) subgroup_invocation_id: u32,\n    @builtin(subgroup_id) subgroup_id: u32,\n    @builtin(num_subgroups) num_subgroups: u32,"
+    } else {
+        ""
+    };
     ATTENTION_SHADER_TEMPLATE
         .replace("%KV_ENABLE%", if kv_f16 { "enable f16;" } else { "" })
         .replace("%KV_TYPE%", if kv_f16 { "f16" } else { "f32" })
+        .replace("%SUBGROUP_PARAMS%", subgroup_params)
+        .replace("%MAX_REDUCE_BLOCK%", max_block)
+        .replace("%SUM_REDUCE_BLOCK%", sum_block)
 }
 
 /// Casts `cm.len` elements of a freshly RoPE'd/normed `f32` key or value
@@ -2381,8 +2561,79 @@ fn main(
 }
 "#;
 
-pub fn shader_source_perhead_rmsnorm() -> String {
-    PERHEAD_RMSNORM_SHADER.to_string()
+/// Subgroup-reduce variant of `PERHEAD_RMSNORM_SHADER` — see
+/// `RMSNORM_SHADER_BODY_SUBGROUP`'s doc comment for the "every lane
+/// redundantly runs the tiny combine loop, one barrier total" pattern this
+/// reuses.
+const PERHEAD_RMSNORM_SHADER_SUBGROUP: &str = r#"
+struct PerHeadNormMeta {
+    n_head: u32,
+    head_dim: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> pw: array<f32>;
+@group(0) @binding(1) var<storage, read_write> px: array<f32>;
+@group(0) @binding(2) var<uniform> pm: PerHeadNormMeta;
+
+var<workgroup> ph_partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(num_subgroups) n_sg: u32,
+) {
+    let h = wid.x;
+    let local = lid.x;
+    let base = h * pm.head_dim;
+
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= pm.head_dim) {
+            break;
+        }
+        let v = px[base + k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    let sg_sum = subgroupAdd(partial);
+    if (sg_lane == 0u) {
+        ph_partial[sg_id] = sg_sum;
+    }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= n_sg) {
+            break;
+        }
+        total = total + ph_partial[i];
+        i = i + 1u;
+    }
+    let mean_sq = total / f32(pm.head_dim);
+    let scale = 1.0 / sqrt(mean_sq + pm.eps);
+    k = local;
+    loop {
+        if (k >= pm.head_dim) {
+            break;
+        }
+        px[base + k] = px[base + k] * scale * pw[k];
+        k = k + 64u;
+    }
+}
+"#;
+
+pub fn shader_source_perhead_rmsnorm(subgroup: bool) -> String {
+    if subgroup {
+        PERHEAD_RMSNORM_SHADER_SUBGROUP.to_string()
+    } else {
+        PERHEAD_RMSNORM_SHADER.to_string()
+    }
 }
 
 /// Like [`PERHEAD_RMSNORM_SHADER`], but weightless (`ggml_rms_norm`, no
@@ -2448,8 +2699,76 @@ fn main(
 }
 "#;
 
-pub fn shader_source_perhead_rmsnorm_weightless() -> String {
-    PERHEAD_RMSNORM_WEIGHTLESS_SHADER.to_string()
+/// Subgroup-reduce variant of `PERHEAD_RMSNORM_WEIGHTLESS_SHADER` — see
+/// `PERHEAD_RMSNORM_SHADER_SUBGROUP`'s doc comment.
+const PERHEAD_RMSNORM_WEIGHTLESS_SHADER_SUBGROUP: &str = r#"
+struct PerHeadNormMeta {
+    n_head: u32,
+    head_dim: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> px: array<f32>;
+@group(0) @binding(1) var<uniform> pm: PerHeadNormMeta;
+
+var<workgroup> ph_partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(num_subgroups) n_sg: u32,
+) {
+    let h = wid.x;
+    let local = lid.x;
+    let base = h * pm.head_dim;
+
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= pm.head_dim) {
+            break;
+        }
+        let v = px[base + k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    let sg_sum = subgroupAdd(partial);
+    if (sg_lane == 0u) {
+        ph_partial[sg_id] = sg_sum;
+    }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= n_sg) {
+            break;
+        }
+        total = total + ph_partial[i];
+        i = i + 1u;
+    }
+    let mean_sq = total / f32(pm.head_dim);
+    let scale = 1.0 / sqrt(mean_sq + pm.eps);
+    k = local;
+    loop {
+        if (k >= pm.head_dim) {
+            break;
+        }
+        px[base + k] = px[base + k] * scale;
+        k = k + 64u;
+    }
+}
+"#;
+
+pub fn shader_source_perhead_rmsnorm_weightless(subgroup: bool) -> String {
+    if subgroup {
+        PERHEAD_RMSNORM_WEIGHTLESS_SHADER_SUBGROUP.to_string()
+    } else {
+        PERHEAD_RMSNORM_WEIGHTLESS_SHADER.to_string()
+    }
 }
 
 /// Greedy (argmax) decode with repeat penalty, entirely on-GPU, so a

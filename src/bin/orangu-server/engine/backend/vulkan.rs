@@ -716,17 +716,33 @@ struct CachedOpResources {
 /// cooperative path.
 const COOP_MIN_N_TOKENS: usize = 64;
 
-/// How many output rows
-/// [`vulkan_shaders::shader_source_reduce`]'s `MAIN_REDUCE_SUFFIX` kernel
-/// computes per workgroup (reading each `x[k]` once and reusing it across
-/// all `REDUCE_N_ROWS` rows' dot products, rather than one workgroup per
-/// row). **Must match `MAIN_REDUCE_SUFFIX`'s hardcoded `4u`/unrolled
-/// `partial0..partial3` exactly** — that shader isn't parameterized by
-/// this constant (it's baked in as a compile-time-unrolled WGSL literal,
-/// not read from a Rust value), so changing one without the other silently
-/// dispatches the wrong number of workgroups for what the shader actually
-/// computes. Used here only for [`VulkanBackend::build_op_resources`]'s
-/// dispatch-count computation.
+/// How many output rows every reduce/block-unroll kernel
+/// (`vulkan_shaders::shader_source_reduce`/`shader_source_reduce_wide_load`/
+/// `shader_source_reduce_wide_unroll`/`..._q4k_wide_unroll_packed_f16`, plus
+/// their subgroup-reduce variants) computes per workgroup — reading each
+/// `x[k]` once and reusing it across all `REDUCE_N_ROWS` rows' dot products,
+/// rather than one workgroup per row. Passed straight into every one of
+/// those shader-source generators, which unroll their `partial0..partialN`
+/// accumulators and dispatch-relevant index math for exactly this many rows
+/// (`vulkan_shaders::main_reduce_suffix`/`unroll_suffix`), so this single
+/// value now drives both the WGSL row count and
+/// [`VulkanBackend::build_op_resources`]'s dispatch-count computation — no
+/// second hardcoded copy to drift out of sync with this one.
+///
+/// Swept against 2, 8, and 16 with a real same-session A/B (3 rounds,
+/// alternating, warmup + a measured 128-token greedy generation each): `4`
+/// won every round outright, with the same ordering (`4 > 2 > 8 > 16`) in
+/// all three. Larger values add per-workgroup register/shared-memory
+/// pressure and dispatch fewer, larger workgroups for the same output
+/// dimension without buying enough additional memory-level parallelism to
+/// pay for it; smaller values dispatch more workgroups that each reuse
+/// `x[k]` across fewer rows, so the *same* activation elements get re-read
+/// from memory more times in total across the whole dispatch. `4` sits at
+/// the point those two costs balance for this backend's decode-time output
+/// dimensions. Kept correctness-verified at every one of those swept
+/// values too (every existing cross-check test passed under each, not just
+/// the shipped default), confirming the generator in `vulkan_shaders` is
+/// genuinely parameterized rather than only accidentally correct at `4`.
 const REDUCE_N_ROWS: usize = 4;
 
 /// The `ggml_type`s a shader exists for — kept in one place so
@@ -810,6 +826,42 @@ impl VulkanBackend {
         // See `Self::gpu_sample`'s own doc comment for why this stays
         // opt-in.
         let gpu_sample = std::env::var_os("ORANGU_GPU_SAMPLE").is_some();
+        // `subgroupAdd`/`subgroupMax` hardware reductions in place
+        // of the classic 6-round `workgroupBarrier` pairwise-tree
+        // reductions — selects the subgroup-reduce shader source for the
+        // decode reduce/block-unroll kernels, RMSNorm (both variants), and
+        // the attention softmax's per-tile max/sum, all built just below.
+        // Correctness-verified (bit-for-bit-within-tolerance against
+        // `CpuBackend`, same as every other kernel here) and generalized to
+        // *any* subgroup size, not hardcoded to assume the subgroup spans
+        // the whole 64-thread workgroup: `subgroupAdd`/`subgroupMax` first
+        // reduce within each subgroup, then a short sequential combine over
+        // `num_subgroups` (workgroup-uniform, read via the `num_subgroups`/
+        // `subgroup_id` builtins) partials — see `wide_unroll`'s own
+        // comment for why that generality matters here (`wgpu`'s adapter
+        // info only reports subgroup size as a range, not a fixed value).
+        // Despite that, a real same-session A/B (several cycles, alternating
+        // on/off, warmup + a measured multi-token greedy generation each)
+        // measured this a **real, reproducible regression** end-to-end, not
+        // a wash. Barrier count was never actually the decode bottleneck —
+        // `q4_k_unroll_packed_pipeline`'s own A/B (see its doc comment)
+        // already showed decode is memory-bound, not ALU/barrier-bound once
+        // `wide_unroll` is in place, so removing barriers here had nothing
+        // to buy, and the extra per-lane builtin plumbing this adds (four
+        // separate `subgroupAdd` calls per workgroup, one per row) was pure
+        // overhead. **Off by default; opt in with `ORANGU_SUBGROUP=1`** —
+        // kept available as an honest negative result, the same precedent
+        // as `kv_f16`/`gpu_sample`/`ORANGU_BATCH_DECODE`, not deleted, since
+        // a different adapter/driver's `subgroupAdd` lowering could still
+        // make this pay off.
+        // Not stored as a field — every kernel it affects is a straight
+        // shader-source swap at pipeline-build time (same buffer layouts,
+        // same dispatch shapes either way), so unlike `wide_load`/
+        // `packed_dot_f16`/`kv_f16` (which each leave multiple pipeline
+        // variants coexisting, chosen between per-call) there is nothing
+        // left for any call site to branch on afterward.
+        let supports_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
+        let subgroup_reduce = supports_subgroup && std::env::var_os("ORANGU_SUBGROUP").is_some();
         // A persistent, on-disk pipeline
         // cache — `wgpu::util::pipeline_cache_key` returns
         // `Some` only for the Vulkan backend (the only one this project
@@ -827,6 +879,9 @@ impl VulkanBackend {
         };
         if supports_pipeline_cache && pipeline_cache_key.is_some() {
             required_features |= wgpu::Features::PIPELINE_CACHE;
+        }
+        if supports_subgroup {
+            required_features |= wgpu::Features::SUBGROUP;
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("orangu-server"),
@@ -894,7 +949,11 @@ impl VulkanBackend {
         for &ggml_type in SUPPORTED_TYPES {
             pipelines.insert(
                 ggml_type,
-                build_pipeline(vulkan_shaders::shader_source_reduce(ggml_type)?),
+                build_pipeline(vulkan_shaders::shader_source_reduce(
+                    ggml_type,
+                    REDUCE_N_ROWS,
+                    subgroup_reduce,
+                )?),
             );
             pipelines_coop.insert(
                 ggml_type,
@@ -940,7 +999,7 @@ impl VulkanBackend {
             build_elem_pipeline(&elem4_pipeline_layout, vulkan_shaders::shader_source_mul());
         let rmsnorm_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
-            vulkan_shaders::shader_source_rmsnorm(),
+            vulkan_shaders::shader_source_rmsnorm(subgroup_reduce),
         );
         let gelu_pipeline =
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_gelu());
@@ -958,7 +1017,7 @@ impl VulkanBackend {
         let attn_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("orangu-server attention shader"),
             source: wgpu::ShaderSource::Wgsl(
-                vulkan_shaders::shader_source_attention(kv_f16).into(),
+                vulkan_shaders::shader_source_attention(kv_f16, subgroup_reduce).into(),
             ),
         });
         let attn_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -978,7 +1037,7 @@ impl VulkanBackend {
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_rope());
         let perhead_rmsnorm_pipeline = build_elem_pipeline(
             &elem3_pipeline_layout,
-            vulkan_shaders::shader_source_perhead_rmsnorm(),
+            vulkan_shaders::shader_source_perhead_rmsnorm(subgroup_reduce),
         );
 
         let elem2_bind_group_layout = elem2_bind_group_layout(&device);
@@ -990,7 +1049,7 @@ impl VulkanBackend {
             });
         let perhead_rmsnorm_weightless_pipeline = build_elem_pipeline(
             &elem2_pipeline_layout,
-            vulkan_shaders::shader_source_perhead_rmsnorm_weightless(),
+            vulkan_shaders::shader_source_perhead_rmsnorm_weightless(subgroup_reduce),
         );
 
         // Casts a freshly
@@ -1035,7 +1094,11 @@ impl VulkanBackend {
             SUPPORTED_TYPES
                 .iter()
                 .filter_map(|&ggml_type| {
-                    let source = vulkan_shaders::shader_source_reduce_wide_load(ggml_type)?;
+                    let source = vulkan_shaders::shader_source_reduce_wide_load(
+                        ggml_type,
+                        REDUCE_N_ROWS,
+                        subgroup_reduce,
+                    )?;
                     Some((ggml_type, build_pipeline(source)))
                 })
                 .collect()
@@ -1058,7 +1121,11 @@ impl VulkanBackend {
             SUPPORTED_TYPES
                 .iter()
                 .filter_map(|&ggml_type| {
-                    let source = vulkan_shaders::shader_source_reduce_wide_unroll(ggml_type)?;
+                    let source = vulkan_shaders::shader_source_reduce_wide_unroll(
+                        ggml_type,
+                        REDUCE_N_ROWS,
+                        subgroup_reduce,
+                    )?;
                     Some((ggml_type, build_pipeline(source)))
                 })
                 .collect()
@@ -1071,7 +1138,12 @@ impl VulkanBackend {
         // (`ORANGU_PACKED_DOT=1`, which already encodes the `supports_f16`
         // gate) are on.
         let q4_k_unroll_packed_pipeline = (wide_unroll && packed_dot_f16).then(|| {
-            build_pipeline(vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16())
+            build_pipeline(
+                vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16(
+                    REDUCE_N_ROWS,
+                    subgroup_reduce,
+                ),
+            )
         });
 
         // See `Self::record_argmax_sample`'s own doc comment.
