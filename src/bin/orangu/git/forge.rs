@@ -808,6 +808,13 @@ pub fn create_pull_request_output(
             current
         ));
     }
+    let (dirty_count, _) = count_pending_changes(&repo_root)?;
+    if dirty_count > 0 {
+        return Err(anyhow!(
+            "working tree has {dirty_count} uncommitted change(s); \
+             commit or stash them before creating a pull request"
+        ));
+    }
     let base_ref = git_find_base_ref(&repo_root)?;
     let ahead = git_commit_count(&repo_root, &format!("{base_ref}..HEAD"))?;
     if ahead == 0 {
