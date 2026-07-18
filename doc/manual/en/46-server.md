@@ -413,6 +413,12 @@ making an HTTP hop to the API's own `port`.
 Each assistant reply is rendered from markdown to HTML server-side,
 including syntax-highlighted fenced code blocks.
 
+While a reply is streaming in, the **Send** button becomes a **Stop** (✕)
+button; clicking it cancels the request. Whatever text had already
+streamed in stays on screen, marked as stopped, but since the turn never
+reached completion it isn't saved — a stopped reply won't reappear if you
+reload or revisit it from **History**.
+
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.

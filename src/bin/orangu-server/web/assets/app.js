@@ -12,7 +12,12 @@
   const historyList = document.getElementById("history-list");
   const themeToggleBtn = document.getElementById("theme-toggle-btn");
 
-  const state = { sessionId: null, busy: false };
+  const state = { sessionId: null, busy: false, abortController: null };
+
+  // Swapped into #send-btn by setBusy() below — Send while idle, a plain
+  // "X" while a reply is streaming so the same button can cancel it.
+  const SEND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
+  const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
 
   const THEME_KEY = "orangu-theme";
 
@@ -73,10 +78,26 @@
     }
   }
 
+  // sendBtn stays enabled throughout a request — while idle it submits the
+  // form, while busy its click handler (below) cancels the in-flight
+  // request instead, so it can't be disabled the way `input` is.
   function setBusy(busy) {
     state.busy = busy;
     input.disabled = busy;
-    sendBtn.disabled = busy;
+    sendBtn.classList.toggle("stop", busy);
+    sendBtn.innerHTML = busy ? STOP_ICON : SEND_ICON;
+    sendBtn.setAttribute("aria-label", busy ? "Stop" : "Send");
+    sendBtn.setAttribute("title", busy ? "Stop" : "Send");
+  }
+
+  // Aborting the fetch closes the SSE connection, which drops the server's
+  // receiver on the generation channel — the engine notices the next time
+  // it tries to send a token and stops decoding right there (cooperative,
+  // not instant, but no explicit server-side cancel endpoint is needed).
+  function stopGeneration() {
+    if (state.abortController) {
+      state.abortController.abort();
+    }
   }
 
   async function createSession() {
@@ -175,12 +196,15 @@
     const assistantEl = addMessage("assistant", "🤖");
     assistantEl.classList.add("pending");
     setBusy(true);
+    const controller = new AbortController();
+    state.abortController = controller;
 
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: text }),
+        signal: controller.signal,
       });
       if (!res.ok || !res.body) {
         const detail = await res.text().catch(() => "");
@@ -217,11 +241,38 @@
         }
       }
     } catch (err) {
-      showFailure(assistantEl, "orangu-server request failed:", err);
+      if (err.name === "AbortError") {
+        // User-initiated stop, not a failure — leave whatever text already
+        // streamed in place (marked as stopped) instead of showing the
+        // failure bubble. If nothing had arrived yet, drop the placeholder.
+        const hadContent = !assistantEl.classList.contains("pending");
+        assistantEl.classList.remove("pending");
+        if (hadContent) {
+          const notice = document.createElement("p");
+          notice.className = "truncated-notice";
+          notice.textContent = "⏹️ Stopped.";
+          assistantEl.appendChild(notice);
+        } else {
+          assistantEl.remove();
+        }
+      } else {
+        showFailure(assistantEl, "orangu-server request failed:", err);
+      }
     } finally {
       setBusy(false);
+      state.abortController = null;
     }
   }
+
+  // While busy, sendBtn is a Stop button: intercept its click before the
+  // browser's default submit action fires, so it cancels instead of
+  // re-submitting the (disabled, empty) composer.
+  sendBtn.addEventListener("click", (event) => {
+    if (state.busy) {
+      event.preventDefault();
+      stopGeneration();
+    }
+  });
 
   composer.addEventListener("submit", (event) => {
     event.preventDefault();

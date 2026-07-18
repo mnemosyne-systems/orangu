@@ -646,6 +646,15 @@ including syntax-highlighted fenced code blocks — reusing the same
 `markdown`/`syntect` crates `orangu`'s own terminal UI uses for its
 rendering, just pointed at HTML instead of ANSI.
 
+While a reply is streaming in, the **Send** button becomes a **Stop** (✕)
+button; clicking it cancels the request. This closes the connection the
+reply was streaming over, which the engine notices the next time it goes
+to send a token and stops generating right there. Whatever text had
+already streamed in stays on screen, marked as stopped — but since the
+turn never reached completion, it isn't written to the session file, so a
+stopped reply (and the message that triggered it) won't reappear if you
+reload or revisit it from **History**.
+
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart. A directory (not a flat `<uuid>.json` file) so a session can grow

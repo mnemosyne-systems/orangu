@@ -183,6 +183,20 @@ button:disabled {
   border-color: var(--brand-text-dim);
 }
 
+/* While a reply is streaming, #send-btn becomes a Stop button (see
+   setBusy() in app.js) — styled in the error color so it reads as "cancel"
+   rather than a second send action. */
+#send-btn.stop {
+  background: var(--error);
+  color: #ffffff;
+  border-color: var(--error);
+}
+
+#send-btn.stop:hover {
+  border-color: var(--brand-text-dim);
+  opacity: 0.9;
+}
+
 #history-panel {
   position: absolute;
   top: 54px;
