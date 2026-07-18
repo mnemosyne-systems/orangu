@@ -80,6 +80,10 @@ pub enum ArchFamily {
     /// see `engine::arch::qwen35moe`), each with a routed+shared-expert MoE
     /// FFN.
     Qwen35Moe,
+    /// Qwen3.5 dense — the same hybrid full-attention/gated-DeltaNet layer
+    /// shape as [`ArchFamily::Qwen35Moe`], but a plain dense SwiGLU FFN
+    /// instead of MoE routing. See `engine::arch::qwen35`.
+    Qwen35,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -115,6 +119,9 @@ const LLAMA_STYLE_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "mistral
 /// there, not read from GGUF metadata or a runtime flag).
 const GEMMA_ARCHITECTURES: &[&str] = &["gemma", "gemma2", "gemma3", "gemma4", "gemma-embedding"];
 const QWEN35MOE_ARCHITECTURES: &[&str] = &["qwen35moe"];
+/// `qwen35` (e.g. `unsloth/Ornith-1.0-9B-GGUF`) — the dense sibling of
+/// `qwen35moe`; see [`ArchFamily::Qwen35`].
+const QWEN35_ARCHITECTURES: &[&str] = &["qwen35"];
 
 pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LLAMA_STYLE_ARCHITECTURES.contains(&architecture) {
@@ -126,6 +133,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if QWEN35MOE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Qwen35Moe);
     }
+    if QWEN35_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Qwen35);
+    }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
@@ -133,6 +143,7 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .iter()
             .chain(GEMMA_ARCHITECTURES)
             .chain(QWEN35MOE_ARCHITECTURES)
+            .chain(QWEN35_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
@@ -606,6 +617,13 @@ mod tests {
     fn resolve_arch_family_accepts_qwen35moe() {
         for arch in QWEN35MOE_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen35Moe);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_qwen35() {
+        for arch in QWEN35_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen35);
         }
     }
 

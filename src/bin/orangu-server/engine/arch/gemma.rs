@@ -957,13 +957,13 @@ impl ModelForward for GemmaModel {
 
     /// Takes the GPU-argmax fast path only when every one of its
     /// preconditions holds: `tokens.len() == 1` (`Self::record_decode_
-    /// forward` is decode-shaped only), a `Vulkan` backend is in use with
-    /// `ORANGU_GPU_SAMPLE=1` set (`VulkanBackend::gpu_sample` — **off by
-    /// default**, unlike this backend's other GPU-fused changes: this one
-    /// measured a real *regression*, not just an unproven win — see that
-    /// method's own doc comment for the numbers and the likely cause), the
-    /// caller actually wants greedy sampling (`greedy_sample.is_some()`),
-    /// and this model has **no** final-logit softcapping configured.
+    /// forward` is decode-shaped only), a `Vulkan` backend is in use
+    /// without `ORANGU_NO_GPU_SAMPLE=1` set (`VulkanBackend::gpu_sample`
+    /// — **on by default**; correctness-verified and no measured
+    /// end-to-end regression, see that method's own doc comment for the
+    /// numbers), the caller actually wants greedy sampling
+    /// (`greedy_sample.is_some()`), and this model has **no** final-logit
+    /// softcapping configured.
     ///
     /// That last check matters: `tanh`-based softcapping
     /// (`x -> tanh(x / cap) * cap`) is strictly increasing, so it never
@@ -1040,8 +1040,8 @@ impl ModelForward for GemmaModel {
     /// one sequence."
     ///
     /// `items.len() <= 1` falls back to `Self::forward_maybe_sampling`
-    /// (preserving its GPU-argmax fast path, `ORANGU_GPU_SAMPLE=1`, for
-    /// the common single-sequence case) rather than taking this path with
+    /// (preserving its GPU-argmax fast path, on by default, for the
+    /// common single-sequence case) rather than taking this path with
     /// a batch of one — there's nothing to amortize across a batch that
     /// doesn't have at least two members, and this path never attempts
     /// GPU sampling at all (always returns `Logits`, letting the caller —

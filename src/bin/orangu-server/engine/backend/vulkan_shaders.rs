@@ -343,11 +343,14 @@ fn unroll_suffix(n_rows: usize, subgroup: bool) -> String {
 ///
 /// This never reuses activations across output rows — every one of
 /// `out_dim` per-row workgroups independently re-reads the entire
-/// activation matrix from global memory — which is what `Self::
-/// shader_source_coop_tiled` (`ORANGU_TILED_PREFILL=1`) addresses. That
-/// kernel is correctness-verified (`VulkanBackend`'s
-/// `matmul_matches_cpu_backend_cooperative_path_*` tests, run with the env
-/// var set) and ships opt-in; this kernel stays the default.
+/// activation matrix from global memory, *and* its own per-workgroup
+/// `tile_start` loop above runs the *entire* `n_tokens` range
+/// sequentially, with no upper bound on prompt length — which is what
+/// `Self::shader_source_coop_tiled` addresses (bounded, fixed-size tiles
+/// instead, so per-workgroup GPU time no longer grows unboundedly with
+/// prompt length). That kernel is now the default (opt out with
+/// `ORANGU_NO_TILED_PREFILL=1`) — see `VulkanBackend::tiled_prefill`'s
+/// own doc comment for why.
 const MAIN_COOP_SUFFIX: &str = r#"
 @compute @workgroup_size(64)
 fn main(
@@ -399,7 +402,7 @@ fn main(
 "#;
 
 /// Row-tile / token-tile output-tiling dimensions for `MAIN_COOP_TILED_
-/// SUFFIX`'s prefill GEMM (`ORANGU_TILED_PREFILL=1`) — templated into the
+/// SUFFIX`'s prefill GEMM — templated into the
 /// WGSL text (`%TILE_ROWS%`/`%TILE_TOKENS%`/`%CHUNK%`,
 /// `shader_source_coop_tiled`) rather than duplicated as separate literals
 /// in the shader and in `VulkanBackend::build_op_resources`'s dispatch-
@@ -429,8 +432,8 @@ pub const COOP_CHUNK: u32 = 32;
 
 /// The tiled-GEMM alternative to `MAIN_COOP_SUFFIX` — see `Self::
 /// shader_source_coop_tiled` and `MAIN_COOP_SUFFIX`'s own doc comment for
-/// why this ships opt-in (`ORANGU_TILED_PREFILL=1`) rather than as the
-/// default despite being correctness-verified.
+/// why this is now the default (opt out with `ORANGU_NO_TILED_
+/// PREFILL=1`) rather than staying opt-in.
 ///
 /// One workgroup computes a `TILE_ROWS × TILE_TOKENS` output tile,
 /// streaming the K dimension through shared memory in `CHUNK`-sized
@@ -1835,10 +1838,10 @@ pub fn shader_source_coop(ggml_type: u32) -> Option<String> {
     Some(format!("{PRELUDE}\n{middle}\n{MAIN_COOP_SUFFIX}"))
 }
 
-/// The opt-in (`ORANGU_TILED_PREFILL=1`) tiled-GEMM alternative to
-/// [`shader_source_coop`] — see `MAIN_COOP_TILED_SUFFIX`'s own doc comment
-/// for the design, and `MAIN_COOP_SUFFIX`'s for why this isn't the default
-/// yet despite being correctness-verified.
+/// The default (opt out with `ORANGU_NO_TILED_PREFILL=1`) tiled-GEMM
+/// alternative to [`shader_source_coop`] — see `MAIN_COOP_TILED_SUFFIX`'s
+/// own doc comment for the design, and `MAIN_COOP_SUFFIX`'s for why this
+/// is the default now.
 pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
     let middle = match ggml_type {
         t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
@@ -2091,6 +2094,91 @@ pub fn shader_source_rmsnorm(subgroup: bool) -> String {
     format!("{ELEM_META}\n{body}")
 }
 
+/// `RMSNORM_SHADER_BODY_SUBGROUP` at a caller-chosen workgroup width —
+/// tests whether a narrower `workgroup_size` (matching a GPU's native
+/// subgroup/wavefront width) lets each workgroup fit in exactly one
+/// subgroup, the same way llama.cpp's `USE_SUBGROUP_ADD_NO_SHMEM`
+/// specifically skips its cross-subgroup merge/barrier when the workgroup
+/// already fits in one subgroup — unlike the fixed 64-wide `RMSNORM_
+/// SHADER_BODY_SUBGROUP` above, which always needs one whenever a
+/// workgroup spans more than one subgroup. `%WG_SIZE%` substitutes both
+/// the `@workgroup_size` attribute and the
+/// grid-stride loops' stride — the reduction logic itself (per-subgroup
+/// `subgroupAdd`, then every lane redundantly re-summing the `n_sg`-long
+/// `partial_sums` combine) is already general to any subgroup count, not
+/// touched here. `partial_sums` stays fixed at 64 slots regardless — a
+/// safe upper bound (`num_subgroups <= workgroup_size <= 64`) for every
+/// `workgroup_size` this is ever called with.
+#[allow(dead_code)]
+const RMSNORM_SHADER_BODY_SUBGROUP_WG_TEMPLATE: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(%WG_SIZE%)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(num_subgroups) n_sg: u32,
+) {
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[k];
+        partial = partial + v * v;
+        k = k + %WG_SIZE%u;
+    }
+    let sg_sum = subgroupAdd(partial);
+    if (sg_lane == 0u) {
+        partial_sums[sg_id] = sg_sum;
+    }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= n_sg) {
+            break;
+        }
+        total = total + partial_sums[i];
+        i = i + 1u;
+    }
+    let mean_sq = total / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[k] = x[k] * scale * weight[k];
+        k = k + %WG_SIZE%u;
+    }
+}
+"#;
+
+/// Only ever called from the `#[ignore]`d scratch benchmark
+/// (`VulkanBackend::_scratch_measure_rmsnorm_workgroup_size_and_subgroup`)
+/// — **not** wired into `try_init`'s own pipeline set. The RMSNorm
+/// dispatch is a single workgroup (`dispatch_workgroups(1, 1, 1)`)
+/// covering the whole row via a grid-stride loop, so halving
+/// `workgroup_size` halves the thread count doing that loop — twice the
+/// sequential iterations per thread — with no offsetting barrier/merge
+/// cost avoided, since the 64-wide subgroup variant's cross-subgroup
+/// combine is already cheap next to the raw compute either way.
+#[allow(dead_code)]
+pub fn shader_source_rmsnorm_subgroup_wg(workgroup_size: u32) -> String {
+    let body =
+        RMSNORM_SHADER_BODY_SUBGROUP_WG_TEMPLATE.replace("%WG_SIZE%", &workgroup_size.to_string());
+    format!("{ELEM_META}\n{body}")
+}
+
 /// GPU-resident causal attention for a *single* query token (decode,
 /// `n_tokens == 1`) against a GPU-resident KV cache — one workgroup per
 /// query head, 64 threads. Online-softmax, **tiled** over the KV sequence in chunks of 64
@@ -2146,11 +2234,12 @@ struct AttnMeta {
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<%KV_TYPE%>;
-@group(0) @binding(2) var<storage, read> v_cache: array<%KV_TYPE%>;
+%KV_BINDINGS%
 @group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
 @group(0) @binding(4) var<storage, read_write> aout: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnMeta;
+
+%KV_READ_FNS%
 
 // Generous upper bound on `head_dim` — `E2B`'s real full-attention layers
 // use 512; this leaves headroom for other models without costing more
@@ -2171,7 +2260,7 @@ fn score_at(h: u32, kv_head: u32, p: u32) -> f32 {
         if (d >= head_dim) {
             break;
         }
-        s = s + aq[q_base + d] * f32(k_cache[k_base + d]);
+        s = s + aq[q_base + d] * kv_read_k(k_base + d);
         d = d + 1u;
     }
     return s * am.scale;
@@ -2242,7 +2331,7 @@ fn main(
                 }
                 let vp = am.window_start + tile_start + j;
                 let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
-                tile_contribution = tile_contribution + tile_probs[j] * f32(v_cache[v_base + d2]);
+                tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                 j = j + 1u;
             }
             acc[d2] = acc[d2] * alpha_old + alpha_tile * tile_contribution;
@@ -2366,18 +2455,120 @@ fn attention_classic_blocks() -> (&'static str, &'static str) {
     (max_block, sum_block)
 }
 
-/// `kv_f16` selects whether `k_cache`/`v_cache` are bound as `array<f16>`
-/// (the KV mirror's storage type when the adapter supports native WGSL
-/// `f16`) or `array<f32>` (the
-/// original, always-available path). Every read of either array already
-/// goes through an `f32(...)` widening cast (a no-op when the array is
-/// already `f32`), so the score/softmax/weighted-sum math itself is
-/// identical either way — only the storage type, and hence the KV
-/// mirror's memory traffic, changes. `subgroup` selects `attention_
-/// subgroup_blocks` over `attention_classic_blocks` for the
-/// per-tile max/sum reductions — see `VulkanBackend::try_init`'s own
-/// comment on its `subgroup_reduce` local for why this is opt-in.
-pub fn shader_source_attention(kv_f16: bool, subgroup: bool) -> String {
+/// Which of three ways `k_cache`/`v_cache` are stored — one fixed choice
+/// per process (baked into the attention pipelines' WGSL text once at
+/// `VulkanBackend::try_init`, the same way `kv_f16` alone used to be, not
+/// a per-dispatch runtime branch). `attention_kv_bindings_and_reads`
+/// substitutes both the bind-group's array element type (`%KV_BINDINGS%`)
+/// and the `kv_read_k`/`kv_read_v` function bodies every score/weighted-
+/// sum read in [`ATTENTION_SHADER_TEMPLATE`]/[`ATTENTION_SPLIT_SHADER_
+/// TEMPLATE`] now goes through (`%KV_READ_FNS%`), so both templates share
+/// one implementation of "how do I read one KV element" per storage kind
+/// instead of duplicating it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvStorage {
+    F32,
+    F16,
+    /// A KV-cache-internal block quantization — **not** ggml's own
+    /// `block_q8_0` byte layout (34 bytes: `f16` scale + 32 `i8`
+    /// values), because nothing outside this process ever reads these
+    /// bytes (no GGUF round-trip, no cross-process sharing), so there is
+    /// no compatibility reason to match it. Instead: 36 bytes (9 `u32`
+    /// words) per 32-element block — a plain `f32` scale (word 0, via
+    /// `bitcast`, not a packed `f16`) followed by 32 `i8` values packed 4
+    /// per word (words 1..9) — deliberately word-aligned throughout, so
+    /// every read/write is a whole-`u32` load/store, never the
+    /// byte-at-a-time read-modify-write ggml's own tighter 34-byte
+    /// packing would force in WGSL (no byte-addressable storage writes).
+    /// ~1.125 bytes/element — still a real ~44% reduction versus `f16`'s
+    /// 2 bytes/element, just not quite `f16`'s exact halving-again ratio,
+    /// the two extra scale bytes being the only difference from ggml's
+    /// own ~1.0625 bytes/element. Requires `kv_dim % 32 == 0` (every
+    /// GQA-shaped model this engine supports satisfies this in practice —
+    /// `head_dim` is always a multiple of 32 — but `VulkanBackend::
+    /// try_init` still checks rather than assuming it).
+    Q8_0,
+}
+
+impl KvStorage {
+    /// `%KV_ENABLE%` — `enable f16;` must lead the WGSL module when (and
+    /// only when) an `f16`-typed binding is actually declared.
+    fn enable_directive(self) -> &'static str {
+        match self {
+            KvStorage::F16 => "enable f16;",
+            KvStorage::F32 | KvStorage::Q8_0 => "",
+        }
+    }
+
+    /// `%KV_BINDINGS%` (bindings 1/2, `k_cache`/`v_cache`) and
+    /// `%KV_READ_FNS%` (the `kv_read_k`/`kv_read_v` functions every score/
+    /// weighted-sum read in both attention templates calls instead of
+    /// indexing `k_cache`/`v_cache` directly) for this storage kind.
+    fn bindings_and_read_fns(self) -> (String, String) {
+        match self {
+            KvStorage::F32 | KvStorage::F16 => {
+                let ty = if self == KvStorage::F16 { "f16" } else { "f32" };
+                let bindings = format!(
+                    "@group(0) @binding(1) var<storage, read> k_cache: array<{ty}>;\n\
+                     @group(0) @binding(2) var<storage, read> v_cache: array<{ty}>;"
+                );
+                let read_fns = "fn kv_read_k(idx: u32) -> f32 { return f32(k_cache[idx]); }\n\
+                     fn kv_read_v(idx: u32) -> f32 { return f32(v_cache[idx]); }"
+                    .to_string();
+                (bindings, read_fns)
+            }
+            KvStorage::Q8_0 => {
+                let bindings = "@group(0) @binding(1) var<storage, read> k_cache: array<u32>;\n\
+                     @group(0) @binding(2) var<storage, read> v_cache: array<u32>;"
+                    .to_string();
+                // Mirrors `KV_QUANTIZE_Q8_0_SHADER`'s own write layout
+                // exactly — see `KvStorage::Q8_0`'s own doc comment for
+                // the block shape (9 words: 1 `f32` scale + 32 `i8`
+                // values packed 4/word).
+                let read_fns = r#"
+fn kv_dequant_q8_0(word0: u32, word_rest: u32, in_block: u32) -> f32 {
+    let d = bitcast<f32>(word0);
+    let j = in_block % 4u;
+    let byte = (word_rest >> (j * 8u)) & 0xFFu;
+    var q: i32 = i32(byte);
+    if (q >= 128) {
+        q = q - 256;
+    }
+    return f32(q) * d;
+}
+fn kv_read_k(idx: u32) -> f32 {
+    let block = idx / 32u;
+    let in_block = idx % 32u;
+    let word_base = block * 9u;
+    return kv_dequant_q8_0(k_cache[word_base], k_cache[word_base + 1u + in_block / 4u], in_block);
+}
+fn kv_read_v(idx: u32) -> f32 {
+    let block = idx / 32u;
+    let in_block = idx % 32u;
+    let word_base = block * 9u;
+    return kv_dequant_q8_0(v_cache[word_base], v_cache[word_base + 1u + in_block / 4u], in_block);
+}
+"#
+                .trim()
+                .to_string();
+                (bindings, read_fns)
+            }
+        }
+    }
+}
+
+/// `kv_storage` selects whether `k_cache`/`v_cache` are bound as
+/// `array<f16>` (the KV mirror's storage type when the adapter supports
+/// native WGSL `f16`), `array<f32>` (the original, always-available
+/// path), or a block-quantized `array<u32>` (see [`KvStorage::Q8_0`]).
+/// Every read of any of the three already goes through `kv_read_k`/
+/// `kv_read_v` (`f32`-returning either way), so the score/softmax/
+/// weighted-sum math itself is identical regardless — only the storage
+/// type, and hence the KV mirror's memory traffic, changes. `subgroup`
+/// selects `attention_subgroup_blocks` over `attention_classic_blocks`
+/// for the per-tile max/sum reductions — see `VulkanBackend::try_init`'s
+/// own comment on its `subgroup_reduce` local for why this is opt-in.
+pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
     } else {
@@ -2388,15 +2579,17 @@ pub fn shader_source_attention(kv_f16: bool, subgroup: bool) -> String {
     } else {
         ""
     };
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     ATTENTION_SHADER_TEMPLATE
-        .replace("%KV_ENABLE%", if kv_f16 { "enable f16;" } else { "" })
-        .replace("%KV_TYPE%", if kv_f16 { "f16" } else { "f32" })
+        .replace("%KV_ENABLE%", kv_storage.enable_directive())
+        .replace("%KV_BINDINGS%", &kv_bindings)
+        .replace("%KV_READ_FNS%", &kv_read_fns)
         .replace("%SUBGROUP_PARAMS%", subgroup_params)
         .replace("%MAX_REDUCE_BLOCK%", max_block)
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
 }
 
-/// Split-k phase 1 of two — see `doc/SERVER_ROADMAP.md` item 6. Same
+/// Split-k phase 1 of two. Same
 /// per-tile online-softmax algorithm as [`ATTENTION_SHADER_TEMPLATE`]
 /// (`score_at`, the tile loop, the rescale-and-merge update — all
 /// unchanged line for line), but each workgroup now covers one `(head,
@@ -2404,12 +2597,15 @@ pub fn shader_source_attention(kv_f16: bool, subgroup: bool) -> String {
 /// before), `wid.y` selects which of `am.k_num` roughly-equal slices of
 /// `[0, n_pos)` this workgroup's tile loop runs over
 /// (`split_start`/`split_end`, computed from `wid.y` and `am.k_num`).
-/// `n_head=8, n_head_kv=1` (E2B's own, unusually aggressive 8:1 GQA
-/// ratio) means the un-split kernel dispatches only 8 workgroups total,
-/// regardless of context length — measured (`_scratch_measure_attention_
-/// dispatch_cost`, `vulkan.rs`) at ~39% of a decode layer's own GPU time
-/// despite doing very little arithmetic, the signature of an occupancy-
-/// bound dispatch, not a compute-bound one. `am.k_num` workgroups per
+/// A model with a low `n_head_kv` relative to `n_head` (an aggressive GQA
+/// ratio) means the un-split kernel dispatches very few workgroups total
+/// (one per query head), regardless of context length —
+/// `_scratch_measure_attention_dispatch_cost` (`vulkan.rs`) isolates this
+/// dispatch's own GPU time to check whether that's actually a meaningful
+/// share of a decode layer's time before assuming it, the signature of an
+/// occupancy-bound dispatch, not a compute-bound one, being worth
+/// distinguishing from a dispatch that's merely doing little arithmetic.
+/// `am.k_num` workgroups per
 /// head instead of one raises that occupancy `k_num`-fold (`ATTN_SPLIT_K`
 /// in `vulkan.rs`), the same split-k idea `flash_attn_split_k_reduce.comp`
 /// implements in llama.cpp's own Vulkan backend (landed for the identical
@@ -2446,11 +2642,12 @@ struct AttnSplitMeta {
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<%KV_TYPE%>;
-@group(0) @binding(2) var<storage, read> v_cache: array<%KV_TYPE%>;
+%KV_BINDINGS%
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+
+%KV_READ_FNS%
 
 const MAX_HEAD_DIM: u32 = 2048u;
 
@@ -2468,7 +2665,7 @@ fn score_at(h: u32, kv_head: u32, p: u32) -> f32 {
         if (d >= head_dim) {
             break;
         }
-        s = s + aq[q_base + d] * f32(k_cache[k_base + d]);
+        s = s + aq[q_base + d] * kv_read_k(k_base + d);
         d = d + 1u;
     }
     return s * am.scale;
@@ -2545,7 +2742,7 @@ fn main(
                     }
                     let vp = am.window_start + tile_start + j;
                     let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
-                    tile_contribution = tile_contribution + tile_probs[j] * f32(v_cache[v_base + d2]);
+                    tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                     j = j + 1u;
                 }
                 acc[d2] = acc[d2] * alpha_old + alpha_tile * tile_contribution;
@@ -2574,7 +2771,7 @@ fn main(
 }
 "#;
 
-pub fn shader_source_attention_split(kv_f16: bool, subgroup: bool) -> String {
+pub fn shader_source_attention_split(kv_storage: KvStorage, subgroup: bool) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
     } else {
@@ -2585,9 +2782,11 @@ pub fn shader_source_attention_split(kv_f16: bool, subgroup: bool) -> String {
     } else {
         ""
     };
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     ATTENTION_SPLIT_SHADER_TEMPLATE
-        .replace("%KV_ENABLE%", if kv_f16 { "enable f16;" } else { "" })
-        .replace("%KV_TYPE%", if kv_f16 { "f16" } else { "f32" })
+        .replace("%KV_ENABLE%", kv_storage.enable_directive())
+        .replace("%KV_BINDINGS%", &kv_bindings)
+        .replace("%KV_READ_FNS%", &kv_read_fns)
         .replace("%SUBGROUP_PARAMS%", subgroup_params)
         .replace("%MAX_REDUCE_BLOCK%", max_block)
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
@@ -2722,6 +2921,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub fn shader_source_kv_cast() -> String {
     KV_CAST_SHADER.to_string()
+}
+
+/// Quantizes `cm.n_blocks` 32-element blocks of a freshly RoPE'd/normed
+/// `f32` key or value row (`csrc`) into the [`KvStorage::Q8_0`] mirror
+/// (`cdst`, `array<u32>`) at block offset `cm.dst_block_offset` — only
+/// ever built when `VulkanBackend::kv_storage` is `Q8_0`. One thread per
+/// block (`csrc` is `kv_dim`-long, i.e. `kv_dim / 32` blocks — a handful
+/// to a few dozen for any real model, so one block per thread is plenty
+/// parallel without needing a workgroup-level reduction the way a much
+/// wider quantize would). Each thread finds its own block's `amax`
+/// sequentially (32 elements), derives the scale exactly the way
+/// `engine::quant`'s own CPU-side quantizers do (`amax / 127`, `id = 1/d`
+/// guarded against `d == 0`), then writes the word-aligned 9-word block
+/// [`KvStorage::Q8_0`]'s own doc comment describes — see `kv_dequant_q8_0`
+/// (`bindings_and_read_fns`) for the matching read side.
+const KV_QUANTIZE_Q8_0_SHADER: &str = r#"
+struct QuantMeta {
+    n_blocks: u32,
+    dst_block_offset: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> csrc: array<f32>;
+@group(0) @binding(1) var<storage, read_write> cdst: array<u32>;
+@group(0) @binding(2) var<uniform> cm: QuantMeta;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let block = gid.x;
+    if (block >= cm.n_blocks) {
+        return;
+    }
+    let src_base = block * 32u;
+    var amax: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= 32u) {
+            break;
+        }
+        amax = max(amax, abs(csrc[src_base + i]));
+        i = i + 1u;
+    }
+    let d = amax / 127.0;
+    let inv_d = select(0.0, 1.0 / d, d > 0.0);
+    let word_base = (cm.dst_block_offset + block) * 9u;
+    cdst[word_base] = bitcast<u32>(d);
+    var w: u32 = 0u;
+    loop {
+        if (w >= 8u) {
+            break;
+        }
+        var packed: u32 = 0u;
+        var j: u32 = 0u;
+        loop {
+            if (j >= 4u) {
+                break;
+            }
+            let v = csrc[src_base + w * 4u + j];
+            var q: i32 = i32(round(v * inv_d));
+            q = clamp(q, -127, 127);
+            packed = packed | ((u32(q) & 0xFFu) << (j * 8u));
+            j = j + 1u;
+        }
+        cdst[word_base + 1u + w] = packed;
+        w = w + 1u;
+    }
+}
+"#;
+
+pub fn shader_source_kv_quantize_q8_0() -> String {
+    KV_QUANTIZE_Q8_0_SHADER.to_string()
 }
 
 /// Line-for-line port of `engine::tensor::rope_apply_scaled_inplace`
@@ -3214,34 +3485,53 @@ pub fn shader_source_fused_norm_rope() -> String {
 /// back the full `[n_vocab]` logits vector — just the one winning token
 /// id (4 bytes instead of, for `E2B`'s 262144-entry vocabulary, ~1 MB).
 ///
-/// Two phases, one workgroup, 64 threads:
-/// 1. **Repeat penalty**, thread 0 only, strictly sequential over
-///    `recent_tokens` in order — mirrors `engine::sampling::
-///    apply_repeat_penalty`'s own loop exactly, including its behavior on
-///    a repeated token id (penalized once per occurrence, compounding,
-///    since each iteration reads the *already-penalized* value the
-///    previous iteration just wrote). This can't be parallelized without
-///    changing that compounding behavior, but `recent_tokens` is tiny
-///    (`repeat_last_n`, 64 by default) next to `n_vocab`, so a single
-///    thread doing it sequentially before the parallel phase starts costs
+/// Three dispatches, one command encoder (`VulkanBackend::record_argmax_
+/// sample` — wgpu's automatic hazard tracking barriers each read-after-
+/// write dependency between them, the same established pattern
+/// `record_fused_attention`'s split-k phases use):
+///
+/// 1. **Repeat penalty** (`ARGMAX_PENALTY_SHADER`, one workgroup, thread 0
+///    only), strictly sequential over `recent_tokens` in order — mirrors
+///    `engine::sampling::apply_repeat_penalty`'s own loop exactly,
+///    including its behavior on a repeated token id (penalized once per
+///    occurrence, compounding, since each iteration reads the
+///    *already-penalized* value the previous iteration just wrote). This
+///    can't be parallelized without changing that compounding behavior,
+///    but `recent_tokens` is tiny (`repeat_last_n`, 64 by default) next to
+///    `n_vocab`, so a single thread doing it sequentially first costs
 ///    nothing worth optimizing.
-/// 2. **Argmax reduction** over the (now-penalized) logits: each thread
-///    grid-strides its own `n_vocab / 64` share finding its own best
-///    `(value, index)` pair, then a standard workgroup tree reduction
-///    combines the 64 partial results into one. Ties are resolved
-///    arbitrarily (whichever candidate a given comparison happens to keep)
-///    rather than matching `engine::sampling`'s CPU `argmax` exactly
-///    (`Iterator::max_by`'s "last element wins" rule) — two independently
-///    computed `f32` logits landing on the exact same bit pattern doesn't
-///    happen with real model output, so this was never worth the extra
-///    bookkeeping an index-aware tie-break would need across the
-///    grid-strided (non-contiguous) per-thread assignment.
+/// 2. **Split argmax reduction** (`ARGMAX_SPLIT_SHADER`,
+///    `ARGMAX_SPLIT_N` workgroups, 64 threads each — replacing an earlier
+///    single-workgroup version that dispatched only 64 threads total over
+///    the *whole* `[n_vocab]` buffer, drastically underusing the GPU).
+///    Thread `wid.x * 64 + local` finds its own best `(value, index)`
+///    globally strided by `ARGMAX_SPLIT_N * 64`, a workgroup tree
+///    reduction combines each workgroup's 64 threads into one partial
+///    winner, written to `partial_val[wid.x]`/`partial_idx[wid.x]`. A
+///    workgroup with no in-range elements at all (`n_vocab` small enough
+///    that `wid.x * 64 >= n_vocab`) writes the reduction's untouched
+///    sentinel (`-3.4028235e38`, `f32::MIN`) — never a real logit, so
+///    phase 3 correctly never picks it.
+/// 3. **Merge** (`ARGMAX_REDUCE_SHADER`, reusing `elem4_bind_group_
+///    layout`'s exact shape — read, read, read_write, uniform — so no new
+///    bind-group plumbing was needed), one
+///    workgroup, the identical tree-reduction shape as phase 2 but over
+///    the `ARGMAX_SPLIT_N` partial winners instead of `n_vocab` — cheap,
+///    since `ARGMAX_SPLIT_N` is tiny next to any real vocabulary.
+///
+/// Ties (any phase) are resolved arbitrarily (whichever candidate a given
+/// comparison happens to keep) rather than matching `engine::sampling`'s
+/// CPU `argmax` exactly (`Iterator::max_by`'s "last element wins" rule)
+/// — two independently computed `f32` logits landing on the exact same
+/// bit pattern doesn't happen with real model output, so this was never
+/// worth the extra index-aware tie-break bookkeeping, now spread across
+/// two reduction levels instead of one.
 ///
 /// `logits` is mutated in place by phase 1 (the same buffer `record_full_
 /// matmul` just produced) — safe because nothing else reads it afterward
 /// in this submission, and the next decode step's own matmul dispatch
 /// overwrites the whole buffer again before anything reads it.
-const ARGMAX_SAMPLE_SHADER: &str = r#"
+const ARGMAX_PENALTY_SHADER: &str = r#"
 struct SampleMeta {
     n_vocab: u32,
     n_recent: u32,
@@ -3254,44 +3544,120 @@ struct SampleMeta {
 @group(0) @binding(2) var<storage, read_write> out_token: array<u32>;
 @group(0) @binding(3) var<uniform> sample_meta: SampleMeta;
 
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    if (lid.x != 0u) {
+        return;
+    }
+    var i: u32 = 0u;
+    loop {
+        if (i >= sample_meta.n_recent) {
+            break;
+        }
+        let tok = recent_tokens[i];
+        if (tok < sample_meta.n_vocab) {
+            let v = logits[tok];
+            if (v > 0.0) {
+                logits[tok] = v / sample_meta.repeat_penalty;
+            } else {
+                logits[tok] = v * sample_meta.repeat_penalty;
+            }
+        }
+        i = i + 1u;
+    }
+}
+"#;
+
+const ARGMAX_SPLIT_SHADER: &str = r#"
+struct ArgmaxSplitMeta {
+    n_vocab: u32,
+    n_split: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> partial_val: array<f32>;
+@group(0) @binding(2) var<storage, read_write> partial_idx: array<u32>;
+@group(0) @binding(3) var<uniform> am: ArgmaxSplitMeta;
+
 var<workgroup> best_val: array<f32, 64>;
 var<workgroup> best_idx: array<u32, 64>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let local = lid.x;
-
-    if (local == 0u) {
-        var i: u32 = 0u;
-        loop {
-            if (i >= sample_meta.n_recent) {
-                break;
-            }
-            let tok = recent_tokens[i];
-            if (tok < sample_meta.n_vocab) {
-                let v = logits[tok];
-                if (v > 0.0) {
-                    logits[tok] = v / sample_meta.repeat_penalty;
-                } else {
-                    logits[tok] = v * sample_meta.repeat_penalty;
-                }
-            }
-            i = i + 1u;
-        }
-    }
-    workgroupBarrier();
-
     var my_best_val: f32 = -3.4028235e38;
     var my_best_idx: u32 = 0u;
-    var k: u32 = local;
+    var k: u32 = wid.x * 64u + local;
+    let global_stride: u32 = am.n_split * 64u;
     loop {
-        if (k >= sample_meta.n_vocab) {
+        if (k >= am.n_vocab) {
             break;
         }
         let v = logits[k];
         if (v > my_best_val) {
             my_best_val = v;
             my_best_idx = k;
+        }
+        k = k + global_stride;
+    }
+    best_val[local] = my_best_val;
+    best_idx[local] = my_best_idx;
+    workgroupBarrier();
+
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride && best_val[local + stride] > best_val[local]) {
+            best_val[local] = best_val[local + stride];
+            best_idx[local] = best_idx[local + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    if (local == 0u) {
+        partial_val[wid.x] = best_val[0];
+        partial_idx[wid.x] = best_idx[0];
+    }
+}
+"#;
+
+/// Merges `ARGMAX_SPLIT_SHADER`'s `ARGMAX_SPLIT_N` partial winners into
+/// the final token id — reuses `elem4_bind_group_layout`'s exact shape
+/// (two read-only storage inputs, one read_write storage output, one
+/// uniform), so `em.len` (`ElemMeta`, prepended by `shader_source_
+/// argmax_reduce`) is repurposed as the partial count instead of an
+/// elementwise length.
+const ARGMAX_REDUCE_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> partial_val: array<f32>;
+@group(0) @binding(1) var<storage, read> partial_idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out_token: array<u32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+var<workgroup> best_val: array<f32, 64>;
+var<workgroup> best_idx: array<u32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let local = lid.x;
+    var my_best_val: f32 = -3.4028235e38;
+    var my_best_idx: u32 = 0u;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = partial_val[k];
+        if (v > my_best_val) {
+            my_best_val = v;
+            my_best_idx = partial_idx[k];
         }
         k = k + 64u;
     }
@@ -3318,6 +3684,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 "#;
 
-pub fn shader_source_argmax_sample() -> String {
-    ARGMAX_SAMPLE_SHADER.to_string()
+pub fn shader_source_argmax_penalty() -> String {
+    ARGMAX_PENALTY_SHADER.to_string()
+}
+
+pub fn shader_source_argmax_split() -> String {
+    ARGMAX_SPLIT_SHADER.to_string()
+}
+
+pub fn shader_source_argmax_reduce() -> String {
+    format!("{ELEM_META}\n{ARGMAX_REDUCE_SHADER_BODY}")
 }

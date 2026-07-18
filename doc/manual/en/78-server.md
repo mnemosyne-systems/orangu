@@ -39,7 +39,7 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,qwen35moe}.rs` — one `ModelForward`
+- `engine/arch/{mod,llama,gemma,qwen35moe,qwen35}.rs` — one `ModelForward`
   implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,cuda,opencl,rocm}.rs` —
   the `Backend` trait and its five implementors; see below.
@@ -708,6 +708,11 @@ mod`), so adding a family is additive rather than a rewrite:
 - `qwen35moe.rs` — Qwen3.5/3.6-MoE (confirmed against upstream
   `src/models/qwen35moe.cpp`/`delta-net-base.cpp`): a genuinely different
   shape, with mixture-of-experts FFN routing.
+- `qwen35.rs` — Qwen3.5 dense (confirmed against upstream `src/models/
+  qwen35.cpp`), e.g. `unsloth/Ornith-1.0-9B-GGUF`: identical hybrid
+  full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
+  `llm_build_delta_net_base` upstream), but a plain SwiGLU FFN in place of
+  MoE routing.
 
 ### Request scheduling and continuous batching
 
@@ -809,8 +814,8 @@ only (set to `1`), except where noted.
 | `ORANGU_PACKED_DOT` | unset (off) | Dequantizes `Q4_K` weight elements in pairs and accumulates the dot product as `vec2<f16>` instead of two scalar `f32` multiplies. Requires an adapter with WGSL `f16` support. When set together with the block-unroll, selects the combined unroll+packed `Q4_K` decode kernel. |
 | `ORANGU_WIDE_LOAD` | unset (off) | Binds the weight buffer as `array<vec4<u32>>` (16-byte reads) instead of `array<u32>` (byte-wise reads), consolidating each `Q4_K`/`Q5_K` block header into one 16-byte read. Covers all supported quant types. |
 | `ORANGU_NO_KV_F16` | unset (`f16` **on** when the adapter supports it) | Set to **disable** storing the per-request KV-cache GPU mirror as `f16` and fall back to `f32`. `f16` (the default on an adapter with WGSL `f16` support) halves KV-read memory traffic per attention dispatch, with a per-write cast, and matches llama.cpp's own default KV cache type. |
-| `ORANGU_TILED_PREFILL` | unset (off) | Uses a `16×64`-output-tile GEMM for prefill (`n_tokens >= 64`) that streams the K dimension through shared memory and reuses activations across output rows, instead of the default cooperative kernel (one workgroup per output row). |
-| `ORANGU_GPU_SAMPLE` | unset (off) | Runs greedy (temperature-0) argmax sampling with repeat penalty on the GPU in the same submission as the forward pass, reading back one token id instead of the full `[n_vocab]` logits vector. |
+| `ORANGU_NO_TILED_PREFILL` | unset (tiled prefill **on**) | Set to **disable** the `16×64`-output-tile GEMM for prefill (`n_tokens >= 64`) and fall back to the plain cooperative kernel (one workgroup per output row, looping over the whole prompt internally) — measured on real hardware to drive real requests into GPU-driver hangs at ordinary prompt lengths (~170-450 tokens) and, even where both complete, ~10x slower. Not recommended; kept for A/B comparison. |
+| `ORANGU_NO_GPU_SAMPLE` | unset (GPU sampling **on**) | Set to **disable** running greedy (temperature-0) argmax sampling with repeat penalty on the GPU in the same submission as the forward pass (reading back one token id instead of the full `[n_vocab]` logits vector) and fall back to a CPU-side readback + sample. |
 | `ORANGU_BATCH_DECODE` | unset (off) | Fuses the matmul steps of concurrent requests that submit a decode step within a short window into one batched call (attention/RoPE/KV-write stay per-sequence). Only takes effect when `slots > 1`. |
 | `ORANGU_GPU_TRACE` | unset (off) | Logs the number of GPU submissions per decode step to stdout — a diagnostic for round-trip counting, no effect on the computation. |
 | `ORANGU_GPU_TIMESTAMPS` | unset (off) | Logs a per-decode-step GPU timing breakdown to stderr — the per-layer-embedding (PLE) projection, the sum/average/slowest across all model layers, and the output-norm-plus-`lm_head` tail, in milliseconds. Requires an adapter with `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_ENCODERS`; a diagnostic for measuring where a decode step's GPU time actually goes, no effect on the computation. |
@@ -879,7 +884,7 @@ with a clear message if its variable is unset when the test is run
 
 | Variable | Used by | Points to |
 | :-- | :-- | :-- |
-| `ORANGU_TEST_MODEL` | Gemma/qwen35moe real-model forward-pass tests | A local `.gguf` chat model file |
+| `ORANGU_TEST_MODEL` | Gemma/qwen35moe/qwen35 real-model forward-pass tests | A local `.gguf` chat model file |
 | `ORANGU_TEST_EMBEDDING_MODEL` | embedding-model tests | A local `.gguf` embedding model file |
 | `ORANGU_TEST_QWEN3VL_MODEL` | qwen3vl tokenizer/embedding tests | A local qwen3vl `.gguf` file |
 

@@ -471,16 +471,17 @@ the API and (if enabled) the web UI listener stop together.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for three
+Text-in/text-out GGUF chat, completion, and embedding models, for four
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, plus the
-bidirectional-attention, embeddings-only `gemma-embedding`), and
-Qwen3.5/3.6-MoE (`qwen35moe`) — using `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/
-`Q5_0`/`Q4_K`/`Q5_K`/`Q6_K` tensors. Weight matrices and embedding tables
-are read lazily from the memory-mapped file (dequantized one row at a
-time, on demand) rather than eagerly resident, so even large models fit in
-modest RAM.
+bidirectional-attention, embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE
+(`qwen35moe`), and Qwen3.5 dense (`qwen35` — the same hybrid full-attention/
+gated-DeltaNet layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE
+routing) — using `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q4_K`/`Q5_K`/`Q6_K`
+tensors. Weight matrices and embedding tables are read lazily from the
+memory-mapped file (dequantized one row at a time, on demand) rather than
+eagerly resident, so even large models fit in modest RAM.
 
 Not yet built, and out of scope for now: multimodal input, `/infill`,
 `/rerank`, LoRA hot-swap, and slot save/restore.

@@ -31,6 +31,40 @@ fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Converts a slice of `f32` KV values into the
+/// [`crate::engine::backend::vulkan_shaders::KvStorage::Q8_0`] byte
+/// layout, for `LayerCache::sync_gpu`'s CPU-side upload path — the
+/// standalone (non-fused) `gpu_attention`/test entry points; the fused
+/// decode hot path quantizes on the GPU instead
+/// (`KV_QUANTIZE_Q8_0_SHADER`). `data.len()` must be a multiple of 32
+/// (`KvStorage::Q8_0`'s own doc comment covers why this is always true in
+/// practice for real GQA-shaped models). 36 bytes per 32-element block — a
+/// plain little-endian `f32` scale followed by 32 signed-byte quants —
+/// deliberately produces the *exact* same bytes the GPU quantize shader
+/// does (both compute `amax`, `d = amax / 127`, `round(v / d)` identically,
+/// and GPU storage buffers are little-endian on every platform this
+/// backend targets), so a cross-check test can compare either path's
+/// output directly.
+fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
+    debug_assert_eq!(
+        data.len() % 32,
+        0,
+        "q8_0 KV storage requires kv_dim to be a multiple of 32"
+    );
+    let mut out = Vec::with_capacity(data.len() / 32 * 36);
+    for block in data.chunks_exact(32) {
+        let amax = block.iter().fold(0f32, |a, &b| a.max(b.abs()));
+        let d = amax / 127.0;
+        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&d.to_le_bytes());
+        for &v in block {
+            let q = (v * inv_d).round().clamp(-127.0, 127.0) as i8;
+            out.push(q as u8);
+        }
+    }
+    out
+}
+
 pub struct LayerCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -61,12 +95,11 @@ struct GpuLayerCache {
     /// (prefill never touches this mirror at all today; only decode's
     /// fused GPU attention path does).
     synced_len: usize,
-    /// Whether `k_buf`/`v_buf` above are `f16`-typed (half the bytes of
-    /// `kv_dim` per position) rather than `f32` — fixed for this mirror's
-    /// whole lifetime once [`Self::new`] decides it, so
-    /// [`LayerCache::sync_gpu`]'s CPU→GPU upload path can check it without
-    /// needing its own copy of the flag.
-    kv_f16: bool,
+    /// Which of `f32`/`f16`/`q8_0` `k_buf`/`v_buf` above are stored as —
+    /// fixed for this mirror's whole lifetime once [`Self::new`] decides
+    /// it, so [`LayerCache::sync_gpu`]'s CPU→GPU upload path can check it
+    /// without needing its own copy.
+    kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     /// Cached attention-dispatch resources, keyed by the *calling layer's*
     /// `wq` tensor identity (`QuantMatrix::cache_key()`) — see
     /// [`GpuAttnDispatch`]'s doc comment for why one `LayerCache` can need
@@ -107,10 +140,11 @@ pub struct GpuAttnDispatch {
     pub out_buf: wgpu::Buffer,
     pub meta_buf: wgpu::Buffer,
     pub readback_buf: wgpu::Buffer,
-    /// This layer's K-cast dispatch (its `f32` K-projection output →
-    /// this `LayerCache`'s `f16` `k_buf`) — `Some` only when
-    /// [`GpuLayerCache::kv_f16`] is `true`; `None` (and the plain
-    /// `copy_buffer_to_buffer` path used instead) otherwise. Same
+    /// This layer's K-cast/quantize dispatch (its `f32` K-projection
+    /// output → this `LayerCache`'s `f16`- or `q8_0`-stored `k_buf`) —
+    /// `Some` only when [`GpuLayerCache::kv_storage`] isn't `F32`; `None`
+    /// (and the plain `copy_buffer_to_buffer` path used instead)
+    /// otherwise. Same
     /// per-calling-layer keying rationale as this struct's own doc
     /// comment: `k_buf` is per-`LayerCache`, but the cast's *source*
     /// (this layer's own K-projection output buffer) is per-layer, so
@@ -118,9 +152,8 @@ pub struct GpuAttnDispatch {
     pub k_cast: Option<KvCastDispatch>,
     /// Same as `k_cast`, for V.
     pub v_cast: Option<KvCastDispatch>,
-    /// Split-k attention (`doc/SERVER_ROADMAP.md` item 6) — `None` unless
-    /// `VulkanBackend::attn_split` is set. See [`AttnSplitDispatch`]'s
-    /// own doc comment.
+    /// Split-k attention — `None` unless `VulkanBackend::attn_split` is
+    /// set. See [`AttnSplitDispatch`]'s own doc comment.
     pub split: Option<AttnSplitDispatch>,
 }
 
@@ -158,38 +191,55 @@ impl GpuLayerCache {
         capacity: usize,
         kv_dim: usize,
         n_head: usize,
-        kv_f16: bool,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> Self {
-        let make = |label: &str, len_f32: usize, elem_bytes: u64, usage: wgpu::BufferUsages| {
+        // `Q8_0`'s 9-word (36-byte), 32-element blocks aren't expressible
+        // as a fixed per-element byte count the way `f32`/`f16` are — size
+        // by block count directly instead.
+        let kv_bytes: u64 = match kv_storage {
+            crate::engine::backend::vulkan_shaders::KvStorage::F32 => {
+                (capacity * kv_dim * 4) as u64
+            }
+            crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
+                (capacity * kv_dim * 2) as u64
+            }
+            crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
+                debug_assert_eq!(
+                    (capacity * kv_dim) % 32,
+                    0,
+                    "q8_0 KV storage requires capacity * kv_dim to be a multiple of 32"
+                );
+                (capacity * kv_dim / 32 * 36) as u64
+            }
+        }
+        .max(1);
+
+        let make = |label: &str, size: u64, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: (len_f32.max(1) as u64) * elem_bytes,
+                size,
                 usage,
                 mapped_at_creation: false,
             })
         };
-        let kv_elem_bytes = if kv_f16 { 2 } else { 4 };
         Self {
             k_buf: make(
                 "orangu-server kv cache k",
-                capacity * kv_dim,
-                kv_elem_bytes,
+                kv_bytes,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             ),
             v_buf: make(
                 "orangu-server kv cache v",
-                capacity * kv_dim,
-                kv_elem_bytes,
+                kv_bytes,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             ),
             probs_scratch: make(
                 "orangu-server kv cache attention scratch",
-                capacity * n_head,
-                4,
+                ((capacity * n_head).max(1) * 4) as u64,
                 wgpu::BufferUsages::STORAGE,
             ),
             synced_len: 0,
-            kv_f16,
+            kv_storage,
             attn_dispatch: std::collections::HashMap::new(),
         }
     }
@@ -241,38 +291,53 @@ impl LayerCache {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         n_head: usize,
-        kv_f16: bool,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
         let capacity = self.capacity;
         let kv_dim = self.kv_dim;
-        let gpu = self
-            .gpu
-            .get_or_insert_with(|| GpuLayerCache::new(device, capacity, kv_dim, n_head, kv_f16));
+        let gpu = self.gpu.get_or_insert_with(|| {
+            GpuLayerCache::new(device, capacity, kv_dim, n_head, kv_storage)
+        });
         if gpu.synced_len < self.len {
             let start = gpu.synced_len * kv_dim;
             let end = self.len * kv_dim;
-            if gpu.kv_f16 {
-                queue.write_buffer(
-                    &gpu.k_buf,
-                    (start * 2) as u64,
-                    &f32_to_f16_bytes(&self.k[start..end]),
-                );
-                queue.write_buffer(
-                    &gpu.v_buf,
-                    (start * 2) as u64,
-                    &f32_to_f16_bytes(&self.v[start..end]),
-                );
-            } else {
-                queue.write_buffer(
-                    &gpu.k_buf,
-                    (start * 4) as u64,
-                    bytemuck::cast_slice(&self.k[start..end]),
-                );
-                queue.write_buffer(
-                    &gpu.v_buf,
-                    (start * 4) as u64,
-                    bytemuck::cast_slice(&self.v[start..end]),
-                );
+            match gpu.kv_storage {
+                crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
+                    queue.write_buffer(
+                        &gpu.k_buf,
+                        (start * 2) as u64,
+                        &f32_to_f16_bytes(&self.k[start..end]),
+                    );
+                    queue.write_buffer(
+                        &gpu.v_buf,
+                        (start * 2) as u64,
+                        &f32_to_f16_bytes(&self.v[start..end]),
+                    );
+                }
+                crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
+                    queue.write_buffer(
+                        &gpu.k_buf,
+                        (start / 32 * 36) as u64,
+                        &f32_to_q8_0_bytes(&self.k[start..end]),
+                    );
+                    queue.write_buffer(
+                        &gpu.v_buf,
+                        (start / 32 * 36) as u64,
+                        &f32_to_q8_0_bytes(&self.v[start..end]),
+                    );
+                }
+                crate::engine::backend::vulkan_shaders::KvStorage::F32 => {
+                    queue.write_buffer(
+                        &gpu.k_buf,
+                        (start * 4) as u64,
+                        bytemuck::cast_slice(&self.k[start..end]),
+                    );
+                    queue.write_buffer(
+                        &gpu.v_buf,
+                        (start * 4) as u64,
+                        bytemuck::cast_slice(&self.v[start..end]),
+                    );
+                }
             }
             gpu.synced_len = self.len;
         }

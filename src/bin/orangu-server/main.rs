@@ -38,6 +38,7 @@ use config::{
 use engine::arch::ModelForward;
 use engine::arch::gemma::GemmaModel;
 use engine::arch::llama::LlamaModel;
+use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::{Backend, CpuBackend, CudaBackend, VulkanBackend};
 use engine::generate::Engine;
@@ -385,6 +386,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         ArchFamily::Qwen35Moe => Arc::new(
             Qwen35MoeModel::load_with_backend(&loaded, backend.clone())
                 .context("building model")?,
+        ),
+        ArchFamily::Qwen35 => Arc::new(
+            Qwen35Model::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
     };
 
