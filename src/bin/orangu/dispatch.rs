@@ -416,6 +416,12 @@ pub(crate) fn handle_command(
                     model_usage_message().to_string(),
                 ));
             }
+            if !available_models.is_empty() && !available_models.iter().any(|m| m == name) {
+                return Ok(CommandOutcome::OutputError(format!(
+                    "Unknown model '{name}'. Available: {}",
+                    available_models.join(", ")
+                )));
+            }
             *active_model_id = name.to_string();
             save_session_settings(session_dir, Some(active_model), Some(active_model_id));
             Ok(CommandOutcome::Quiet)
@@ -1954,6 +1960,68 @@ mod tests {
         assert_eq!(active_model_id, "some-other-model");
         assert_eq!(active_model, GEMMA);
         assert_eq!(current_endpoint, Some(endpoint));
+    }
+
+    #[test]
+    fn set_model_rejects_unknown_model_name() {
+        const SERVER: &str = "local";
+
+        let llms = HashMap::from([(
+            SERVER.to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+        let mut active_model = SERVER.to_string();
+        let mut active_model_id = "model-a".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+        let available = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
+
+        let outcome = handle_command(
+            "/model unicorn-v99",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                startup_model: SERVER,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: workspace.path(),
+                session_dir: workspace.path(),
+                embeddings_server: "",
+                is_coordinator: false,
+                usage_stats: &super::UsageStats::new(),
+                available_models: &available,
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                compile_workers: 1,
+                compression: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(
+            matches!(&outcome, CommandOutcome::OutputError(msg) if msg.contains("Unknown model")),
+            "expected OutputError with 'Unknown model'"
+        );
+        // The active model ID should remain unchanged.
+        assert_eq!(active_model_id, "model-a");
     }
 
     #[test]
