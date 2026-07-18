@@ -19,7 +19,11 @@ It's also the machine's GGUF inventory tool — the `system`/`suggest`/
 that matter when *getting*, *choosing*, and *cleaning up* a model, before
 or after serving. Those six read (or write) GGUF files directly off disk
 and query the local machine, no model loaded and no HTTP listener bound;
-only `download` talks to the Hugging Face Hub.
+`download` talks to the Hugging Face Hub to fetch a model, and `list` talks
+to it too — before printing its table, to check whether a newer commit
+exists for each Hugging Face-backed model already on disk (see **`list` and
+`show`** below). If the Hub is unreachable, `list` still prints the table;
+it just skips the check silently rather than failing the command.
 
 ## Quick start
 

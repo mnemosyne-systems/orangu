@@ -5,13 +5,17 @@
 `orangu-server` (`src/bin/orangu-server/`) is a third binary in the same
 Cargo package as `orangu` and `orangu-coordinator`. Besides serving a GGUF
 model, it's also the machine's GGUF inventory tool (`system`/`suggest`/
-`list`/`show`/`download`/`delete`) — entirely offline and stateless between
-runs for those six: every invocation re-detects hardware and re-scans the
-models directory from scratch, so there is no cache, config-reload, or
-background process to reason about for them. It does real tensor
-computation itself for serving — GGUF loading, dequantization, the
-transformer forward pass, sampling, and request scheduling are implemented
-in Rust with no dependency on llama.cpp/ggml's own compiled code.
+`list`/`show`/`download`/`delete`) — stateless between runs for those six:
+every invocation re-detects hardware and re-scans the models directory from
+scratch, so there is no cache, config-reload, or background process to
+reason about for them. `system`/`suggest`/`show`/`delete` stay entirely
+offline; `download` always talks to the Hub, and `list` does too, before
+printing its table, to check each Hugging Face-backed model for a newer
+commit (see `latest_commits` below) — swallowing the lookup silently rather
+than failing when the Hub can't be reached. It does real tensor computation
+itself for serving — GGUF loading, dequantization, the transformer forward
+pass, sampling, and request scheduling are implemented in Rust with no
+dependency on llama.cpp/ggml's own compiled code.
 
 ### Module layout
 
@@ -376,6 +380,51 @@ downloads (also a `find_best_sibling` call upstream, with
 `keyword = "mtp-"`), `preset.ini`-based repos (a repo-root manifest naming
 one specific file to fetch regardless of tag matching), and Docker registry
 sources.
+
+### Checking for updates (`list`'s `(Refresh)` marker)
+
+`list` doesn't just read local disk state — it also asks the Hub whether a
+newer commit exists for every model it found under a Hugging Face hub-cache
+directory. Two pieces make this work:
+
+- **The local commit.** `orangu::model_spec::hf_local_commit_from_path`
+  recovers the sha a `ModelGroup` is cached at by walking its
+  representative file's ancestors for the `snapshots` directory and taking
+  the child folder's name directly below it — the same
+  `snapshots/<commit>/...` layout `download_model` itself creates and
+  `hf_repo_id_from_path` (above) already walks to recover the repo id.
+  Stored on `ModelGroup` as `hf_repo`/`local_commit`, alongside `label`.
+- **The remote commit.** `orangu::model_download::latest_commits` takes
+  every *distinct* `hf_repo` id `list` found (deduped, so a repo with
+  several `:quant` rows is still only queried once even when those rows
+  were cached at different commits) and, in parallel via `rayon`'s
+  `par_iter`, calls the very same `resolve_commit` `download` uses to
+  resolve `main` (`GET /api/models/<repo>/refs`) — not a separate code
+  path, so a repo `list` says is stale is guaranteed to actually update if
+  `download`ed again. Its own short-lived `reqwest::Client` (via
+  `build_client`'s optional timeout parameter) carries a 5-second timeout
+  (`download`'s own client passes `None`, since a multi-gigabyte transfer
+  legitimately takes longer), and every per-repo failure — unreachable
+  Hub, DNS failure, rate limit, a repo gone private — is discarded with
+  `.ok()` rather than propagated: `list` must still print its table when
+  offline, just with no `(Refresh)` markers, rather than fail the whole
+  command over one lookup (or over having no network at all). An empty
+  repo list short-circuits before even building a client.
+
+`main.rs`'s `Command::List` arm wires the two together: `group_models` runs
+first, its groups' distinct `hf_repo` ids feed `latest_commits`, which
+returns a `repo -> commit` map — not a "these repos are stale" set — and
+`format_groups` (the renderer `format_list` itself now delegates to)
+compares each row's *own* `local_commit` against that map when deciding
+whether to append `  (Refresh)` after `SIZE`. Comparing per row rather than
+per repo matters: a repo can have two `ModelGroup` rows cached at different
+commits (e.g. `:Q4_K_M` downloaded weeks ago, `:Q8_0` downloaded today), and
+only the one actually behind should be marked — a `HashSet` of "stale
+repos" would incorrectly mark both just because they share a repo id. The
+marker sits deliberately *after* `SIZE` rather than folded into `MODEL`, so
+the shell completion scripts (above), which only ever read `list`'s first
+two whitespace-separated columns, stay unaffected by a row growing a
+trailing marker.
 
 ### CPU/GPU detection (`orangu::hardware`)
 

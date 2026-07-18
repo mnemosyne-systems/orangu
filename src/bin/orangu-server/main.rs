@@ -590,7 +590,18 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
         Command::List => {
             let conf = load_config(config_arg, None, false)?;
             let models = orangu::model_spec::scan_models_dir(&conf.models)?;
-            print!("{}", orangu::model_spec::format_list(&models, &conf.models));
+            let groups = orangu::model_spec::group_models(&models);
+            let repos: Vec<String> = groups
+                .iter()
+                .filter_map(|g| g.hf_repo.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let latest_commits = orangu::model_download::latest_commits(&repos);
+            print!(
+                "{}",
+                orangu::model_spec::format_groups(&groups, &conf.models, &latest_commits)
+            );
             Ok(())
         }
         Command::Show {
@@ -654,7 +665,10 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
     if groups.is_empty() {
         bail!("no .gguf models found under {}", models_dir.display());
     }
-    print!("{}", orangu::model_spec::format_list(&models, models_dir));
+    print!(
+        "{}",
+        orangu::model_spec::format_groups(&groups, models_dir, &Default::default())
+    );
 
     print!("\nSelect a model to delete (NR): ");
     std::io::stdout().flush().ok();

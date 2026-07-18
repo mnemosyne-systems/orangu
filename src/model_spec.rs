@@ -208,6 +208,8 @@ pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<Model
             return Ok(group);
         }
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let hf_repo = hf_repo_id_from_path(&path);
+        let local_commit = hf_local_commit_from_path(&path);
         return Ok(ModelGroup {
             label: path.display().to_string(),
             size_bytes,
@@ -215,6 +217,8 @@ pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<Model
             errors: Vec::new(),
             representative_path: path.clone(),
             paths: vec![path],
+            hf_repo,
+            local_commit,
         });
     }
 
@@ -362,6 +366,17 @@ pub struct ModelGroup {
     /// `delete_model` actually removes, so a multi-shard model is deleted
     /// atomically rather than leaving orphaned shards behind.
     pub paths: Vec<PathBuf>,
+    /// The Hugging Face `user/model` repo id this group was downloaded from,
+    /// when it lives under a hub-cache directory — the same id [`label`]'s
+    /// `:quant` tag is appended to. `None` for a model outside that layout,
+    /// which has no repo to check for updates against.
+    ///
+    /// [`label`]: ModelGroup::label
+    pub hf_repo: Option<String>,
+    /// The commit sha this group was downloaded at — the `snapshots/<sha>/`
+    /// directory name its files sit under. Compared against the Hub's live
+    /// `main` commit to decide whether `list` marks this row `(Refresh)`.
+    pub local_commit: Option<String>,
 }
 
 /// Collapses a multi-part model's shard files (`name-00001-of-00004.gguf`,
@@ -428,13 +443,15 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
     let mut result: Vec<ModelGroup> = groups
         .into_values()
         .map(|acc| {
-            let label = match hf_repo_id_from_path(&acc.representative_path) {
+            let hf_repo = hf_repo_id_from_path(&acc.representative_path);
+            let label = match &hf_repo {
                 Some(repo) => match hf_tag_from_label(&acc.shard_label) {
                     Some(tag) => format!("{repo}:{tag}"),
-                    None => repo,
+                    None => repo.clone(),
                 },
                 None => acc.shard_label,
             };
+            let local_commit = hf_local_commit_from_path(&acc.representative_path);
             ModelGroup {
                 label,
                 size_bytes: acc.size_bytes,
@@ -446,6 +463,8 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
                 errors: acc.errors,
                 representative_path: acc.representative_path,
                 paths: acc.paths,
+                hf_repo,
+                local_commit,
             }
         })
         .collect();
@@ -490,6 +509,26 @@ fn hf_repo_id_from_path(path: &Path) -> Option<String> {
     None
 }
 
+/// The commit sha a Hugging Face hub-cache path was downloaded at: the name
+/// of the `snapshots/<commit>/...` directory a file sits under — the same
+/// sha [`crate::model_download::download_model`] names that directory after
+/// and records in `refs/main`. Checks every ancestor the same way
+/// [`hf_repo_id_from_path`] does, since a file can sit a further per-quant
+/// subfolder below `snapshots/<commit>/`. `None` outside that layout, or for
+/// a path directly under `models--<user>--<model>/` with no `snapshots`
+/// ancestor at all.
+fn hf_local_commit_from_path(path: &Path) -> Option<String> {
+    let mut child: Option<&str> = None;
+    for ancestor in path.parent()?.ancestors() {
+        let name = ancestor.file_name()?.to_str()?;
+        if name == "snapshots" {
+            return child.map(str::to_string);
+        }
+        child = Some(name);
+    }
+    None
+}
+
 /// Extracts the quantization tag llama.cpp's `-hf user/model:TAG` expects,
 /// from a shard-suffix-stripped file stem — the trailing run of
 /// alphanumeric/underscore characters after the *last* `-` or `.` in the
@@ -510,12 +549,34 @@ fn hf_tag_from_label(label: &str) -> Option<String> {
     .then(|| candidate.to_uppercase())
 }
 
+/// The `list` table for every `.gguf` model found, with no Hugging Face
+/// update check — the plain, fully offline rendering used by callers (the
+/// `delete` picker, tests) that don't need one. `list` itself calls
+/// [`format_groups`] directly so it can pass `latest_commits`.
 pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
     if models.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
+    format_groups(&group_models(models), base, &HashMap::new())
+}
 
-    let groups = group_models(models);
+/// Renders the `list` table from already-grouped models. `latest_commits`
+/// maps each [`ModelGroup::hf_repo`] id to the commit sha the Hub's `main`
+/// branch currently resolves to — a row gets a trailing `(Refresh)` marker,
+/// appended after `SIZE`, exactly when its own `local_commit` differs from
+/// that repo's entry (comparing per row, not per repo, so one stale
+/// `:quant` row doesn't mark a sibling row of the same repo that's already
+/// current). The marker sits after `SIZE` rather than inside `MODEL` so a
+/// consumer that reads `list`'s output by column position (e.g. the shell
+/// completion scripts, which only read `NR`/`MODEL`) is unaffected.
+pub fn format_groups(
+    groups: &[ModelGroup],
+    base: &Path,
+    latest_commits: &HashMap<String, String>,
+) -> String {
+    if groups.is_empty() {
+        return format!("No .gguf files found under {}\n", base.display());
+    }
 
     let nr_width = groups.len().to_string().len().max("NR".len());
     let model_width = groups
@@ -546,11 +607,17 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
             ));
             continue;
         }
+        let refresh = group.hf_repo.as_deref().is_some_and(|repo| {
+            latest_commits
+                .get(repo)
+                .is_some_and(|latest| Some(latest.as_str()) != group.local_commit.as_deref())
+        });
         out.push_str(&format!(
-            "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {}\n",
+            "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {}{}\n",
             group.label,
             group.quantization.as_deref().unwrap_or("-"),
-            format_bytes(group.size_bytes)
+            format_bytes(group.size_bytes),
+            if refresh { "  (Refresh)" } else { "" }
         ));
     }
     out
@@ -843,6 +910,116 @@ mod tests {
             groups[0].label,
             "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
         );
+        assert_eq!(
+            groups[0].hf_repo.as_deref(),
+            Some("bartowski/Llama-3.2-3B-Instruct-GGUF")
+        );
+        assert_eq!(groups[0].local_commit.as_deref(), Some("rev1"));
+    }
+
+    #[test]
+    fn group_models_leaves_hf_repo_and_local_commit_none_outside_a_hub_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("plain.gguf"), "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hf_repo, None);
+        assert_eq!(groups[0].local_commit, None);
+    }
+
+    #[test]
+    fn format_groups_marks_a_row_whose_local_commit_is_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        write_minimal_gguf(
+            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+        write_minimal_gguf(&dir.path().join("plain.gguf"), "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let mut latest_commits = HashMap::new();
+        latest_commits.insert(
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            "rev2".to_string(),
+        );
+
+        let output = format_groups(&groups, dir.path(), &latest_commits);
+
+        let mut lines = output.lines().skip(1); // header
+        assert!(lines.next().unwrap().ends_with("(Refresh)"));
+        assert!(!lines.next().unwrap().contains("(Refresh)"));
+    }
+
+    #[test]
+    fn format_groups_does_not_mark_a_row_already_at_the_latest_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        write_minimal_gguf(
+            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let mut latest_commits = HashMap::new();
+        latest_commits.insert(
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            "rev1".to_string(),
+        );
+
+        let output = format_groups(&groups, dir.path(), &latest_commits);
+
+        assert!(!output.lines().nth(1).unwrap().contains("(Refresh)"));
+    }
+
+    #[test]
+    fn format_groups_only_marks_the_row_actually_behind_when_a_repo_has_two_local_commits() {
+        // Two `:quant` rows of the same repo, cached at different commits —
+        // the exact scenario `check_for_updates`/`latest_commits` dedupes by
+        // repo id for (one Hub lookup covers both rows), so this pins that a
+        // stale sibling row doesn't also mark an already-current one.
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_minimal_gguf(&old_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"), "llama", None);
+        let current_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev2");
+        std::fs::create_dir_all(&current_dir).unwrap();
+        write_minimal_gguf(&current_dir.join("Llama-3.2-3B-Instruct-Q8_0.gguf"), "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let mut latest_commits = HashMap::new();
+        latest_commits.insert(
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            "rev2".to_string(),
+        );
+
+        let output = format_groups(&groups, dir.path(), &latest_commits);
+
+        let mut lines = output.lines().skip(1); // header
+        let q4 = lines.next().unwrap(); // Q4_K_M, sorted before Q8_0
+        let q8 = lines.next().unwrap();
+        assert!(q4.contains("Q4_K_M"));
+        assert!(q4.ends_with("(Refresh)"));
+        assert!(q8.contains("Q8_0"));
+        assert!(!q8.contains("(Refresh)"));
     }
 
     #[test]

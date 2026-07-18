@@ -338,6 +338,8 @@ mod tests {
             errors: Vec::new(),
             representative_path: PathBuf::new(),
             paths: Vec::new(),
+            hf_repo: None,
+            local_commit: None,
         }
     }
 

@@ -69,7 +69,7 @@ const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
 /// also needs the resulting path to load).
 pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
     let (repo, tag) = split_repo_tag(spec)?;
-    let client = build_client()?;
+    let client = build_client(None)?;
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
 
     let commit = resolve_commit(&client, &repo, token.as_deref())?;
@@ -139,11 +139,48 @@ pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
     Ok(snapshot_dir.join(primary_path))
 }
 
-fn build_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(concat!("orangu-server/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build HTTP client")
+fn build_client(timeout: Option<std::time::Duration>) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(concat!("orangu-server/", env!("CARGO_PKG_VERSION")));
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().context("failed to build HTTP client")
+}
+
+/// Resolves `main`'s live commit for each of `repos` (every distinct
+/// Hugging Face repo id `list` found under the models directory — deduped
+/// by repo, not by `(repo, commit)`, so a repo with several `:quant` rows
+/// cached at different commits is still only queried once), in parallel,
+/// returning a `repo -> commit` map. `orangu-server list` compares each
+/// row's own `local_commit` against this map when rendering, so only the
+/// rows actually behind get marked `(Refresh)` — a repo with one stale and
+/// one current row doesn't mark both just because they share a repo id.
+///
+/// Every failure — no network, DNS, a rate limit, a repo that's since gone
+/// private — is swallowed per-repo rather than propagated: unlike
+/// `download`, `list` must still print its table when offline, just without
+/// any refresh markers, so one flaky lookup (or no connectivity at all)
+/// can't fail the whole command. Each request is capped with a short
+/// timeout for the same reason — an unreachable Hub shouldn't make `list`
+/// hang.
+pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, String> {
+    if repos.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let client = match build_client(Some(std::time::Duration::from_secs(5))) {
+        Ok(client) => client,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+
+    repos
+        .par_iter()
+        .filter_map(|repo| {
+            let commit = resolve_commit(&client, repo, token.as_deref()).ok()?;
+            Some((repo.clone(), commit))
+        })
+        .collect()
 }
 
 /// Splits a `download` argument into `(repo, tag)`, e.g.

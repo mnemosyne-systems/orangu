@@ -17,7 +17,11 @@ It's also the machine's GGUF inventory tool — the `system`/`suggest`/
 that matter when *getting*, *choosing*, and *cleaning up* a model, before
 or after serving. Those six read (or write) GGUF files directly off disk
 and query the local machine, no model loaded and no HTTP listener bound;
-only `download` talks to the Hugging Face Hub.
+`download` talks to the Hugging Face Hub to fetch a model, and `list` talks
+to it too — before printing its table, to check whether a newer commit
+exists for each Hugging Face-backed model already on disk (see **`list` and
+`show`** below). If the Hub is unreachable, `list` still prints the table;
+it just skips the check silently rather than failing the command.
 
 ## Quick start
 
@@ -356,6 +360,26 @@ tag (read from the filename, not the tensor types) is the one to actually use
 with `-hf`. A file that fails to parse (truncated download, not actually a
 GGUF file) is still listed, with its error in place of `QUANT`/`SIZE` — one
 bad file doesn't abort the scan.
+
+For every row whose `MODEL` names a Hugging Face repo, `list` also checks
+that repo's commit — the `snapshots/<commit>/` directory it's cached
+under — against the Hub's current `main` commit (the same `GET
+/api/models/<repo>/refs` lookup `download` itself uses to resolve `main`),
+in parallel across every distinct repo on the row list. A row whose local
+commit is behind gets a trailing `(Refresh)` marker, after `SIZE`:
+
+```
+NR  MODEL                                                QUANT  SIZE
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M     Q4_K   17.28 GiB  (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                  Q4_K   7.14 GiB
+```
+
+Re-running `orangu-server download` on that repo fetches the newer commit.
+The check needs the Hub to be reachable; if it isn't (no network, a
+timeout, `HF_TOKEN` rejected, ...), `list` still prints the table — the
+lookup for that repo is simply skipped, silently, rather than failing the
+command or leaving a stale marker. A model outside the Hugging Face hub
+cache layout has no repo to check and never gets a marker.
 
 ```sh
 orangu-server show 3                                     # NR from `list`
