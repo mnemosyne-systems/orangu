@@ -310,10 +310,31 @@ button:disabled {
 
 .gen-time {
   margin-top: 0.5em;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   color: var(--text-dim);
   font-size: 0.72em;
   opacity: 0.65;
-  text-align: right;
+}
+
+.save-md-btn {
+  display: inline-flex;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  line-height: 0;
+}
+
+.save-md-btn:hover {
+  color: var(--text);
+}
+
+.save-md-btn svg {
+  width: 12px;
+  height: 12px;
 }
 
 .message pre {

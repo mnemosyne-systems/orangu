@@ -18,6 +18,9 @@
   // "X" while a reply is streaming so the same button can cancel it.
   const SEND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
   const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+  // Shown in each assistant message's footer, next to the generation time
+  // — triggers a raw-Markdown download of that answer.
+  const SAVE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
 
   const THEME_KEY = "orangu-theme";
 
@@ -87,18 +90,52 @@
     return `${seconds}s`;
   }
 
+  // Triggers the browser's native download ("Save As", depending on the
+  // user's download-prompt setting) for `content` as a standalone
+  // `.md` file — a Blob + object URL fed through a throwaway anchor's
+  // `download` attribute, the standard way to save client-side-only
+  // content without a server round trip.
+  function downloadMarkdown(content) {
+    const blob = new Blob([content], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:T]/g, "-")
+      .slice(0, 19);
+    a.href = url;
+    a.download = `orangu-answer-${stamp}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   // Appended once generation finishes (streamed replies only know their
-  // own time at the "done" event; history reloads know it from
-  // `message.generation_ms` right away) — deliberately its own element
+  // own time and raw text at the "done" event; history reloads know both
+  // right away from the loaded session) — deliberately its own element
   // rather than baked into the rendered markdown, so it survives
   // `assistantEl.innerHTML = payload.html` reassignments during streaming
   // and never gets treated as message content (copy/paste, markdown
   // re-render, ...).
-  function addTimingFooter(assistantEl, ms) {
+  function addTimingFooter(assistantEl, ms, rawContent) {
     if (ms == null) return;
     const footer = document.createElement("div");
     footer.className = "gen-time";
-    footer.textContent = formatDuration(ms);
+
+    const time = document.createElement("span");
+    time.textContent = formatDuration(ms);
+    footer.appendChild(time);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "save-md-btn";
+    saveBtn.innerHTML = SAVE_ICON;
+    saveBtn.setAttribute("aria-label", "Save answer as Markdown");
+    saveBtn.setAttribute("title", "Save answer as Markdown");
+    saveBtn.addEventListener("click", () => downloadMarkdown(rawContent ?? ""));
+    footer.appendChild(saveBtn);
+
     assistantEl.appendChild(footer);
   }
 
@@ -158,7 +195,7 @@
     for (const message of session.messages) {
       if (message.role === "assistant") {
         const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content));
-        addTimingFooter(el, message.generation_ms);
+        addTimingFooter(el, message.generation_ms, message.content);
       } else {
         addMessage(message.role, message.content);
       }
@@ -270,7 +307,7 @@
                 notice.textContent = "⚠️ Response was cut off at the token limit.";
                 assistantEl.appendChild(notice);
               }
-              addTimingFooter(assistantEl, payload.generation_ms);
+              addTimingFooter(assistantEl, payload.generation_ms, payload.content);
             }
             transcript.scrollTop = transcript.scrollHeight;
           } else if (payload.type === "error") {

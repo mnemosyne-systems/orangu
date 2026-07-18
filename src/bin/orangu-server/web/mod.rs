@@ -289,7 +289,7 @@ async fn send_message(
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
+                        .data(json!({"type": "done", "html": html, "content": full, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
                     break;
                 }
                 StreamEvent::Error(err) => {
