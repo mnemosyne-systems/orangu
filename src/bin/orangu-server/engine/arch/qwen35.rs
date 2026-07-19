@@ -310,7 +310,13 @@ impl ModelForward for Qwen35Model {
         KvCache::new_mixed(capacity, &kv_dims, &recurrent_specs)
     }
 
-    fn forward(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps;
@@ -692,7 +698,7 @@ mod real_model_tests {
 
         let mut cache = model.new_kv_cache(64);
         let tokens: Vec<u32> = vec![760, 6511, 314, 9338, 369];
-        let logits = model.forward(&mut cache, &tokens, 0).expect("forward");
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
         let (top_id, _) = logits
             .iter()
             .copied()

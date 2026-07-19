@@ -333,7 +333,13 @@ impl ModelForward for LlamaModel {
         KvCache::new(self.config.n_layer, capacity, kv_dim)
     }
 
-    fn forward(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;

@@ -62,6 +62,26 @@ pub struct BatchDecodeItem<'a> {
     pub token: u32,
     pub start_pos: usize,
     pub greedy_sample: Option<GreedySampleParams<'a>>,
+    /// The submitting request's own `engine::scheduler::SlotGuard::id()`
+    /// — **not** this item's position within `items`. `BatchCoordinator`
+    /// can run two *different* batches' own `forward_batch_decode` calls
+    /// genuinely concurrently (its own doc comment: the coordinator's
+    /// lock is released before processing a batch, specifically so a new
+    /// window can start collecting while an older one is still being
+    /// processed) — a GPU-resident implementation that caches per-
+    /// sequence resources by *array index within one call*
+    /// (`GemmaModel::record_batched_decode_forward`'s first, broken
+    /// attempt at this: `1..=items.len()`) would let two unrelated
+    /// sequences from two concurrently-running batches collide on the
+    /// exact same cached buffers — since the array index resets to `0`
+    /// every call, two overlapping batches' own "index 0" always
+    /// coincide, corrupting whichever one loses the race, silently. A
+    /// `SlotGuard`'s own `id()` is unique across every *concurrently
+    /// held* slot for that slot's entire lifetime (`SlotPool::acquire`'s
+    /// own guarantee — capped by the semaphore, one live guard per index
+    /// at a time), which is exactly the uniqueness overlapping batches
+    /// need and a per-call array index doesn't provide.
+    pub slot_id: usize,
 }
 
 pub trait ModelForward: Send + Sync {
@@ -76,7 +96,22 @@ pub trait ModelForward: Send + Sync {
     /// logits (`[n_vocab]`) for the *last* token in `tokens` only — the one
     /// prediction a caller doing either prefill (find where generation
     /// starts) or decode (one token at a time) actually needs.
-    fn forward(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>>;
+    ///
+    /// `slot_id` is the caller's own `engine::scheduler::SlotGuard::id()` —
+    /// see [`BatchDecodeItem::slot_id`]'s doc comment for why a real,
+    /// per-request slot id (not a shared constant) is load-bearing here:
+    /// `GemmaModel`'s Vulkan decode path threads it into the same
+    /// per-sequence GPU resource cache the batched path uses, so two
+    /// `slots > 1` requests decoding concurrently don't collide on the same
+    /// cached buffers. Architectures/backends with no such per-caller cache
+    /// (every non-Vulkan-decode path) simply ignore it.
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<f32>>;
 
     /// Like `forward`, but lets the implementor sample the next token
     /// itself when `greedy_sample` is `Some` — skipping the full
@@ -92,9 +127,10 @@ pub trait ModelForward: Send + Sync {
         tokens: &[u32],
         start_pos: usize,
         greedy_sample: Option<GreedySampleParams<'_>>,
+        slot_id: usize,
     ) -> Result<ForwardOutcome> {
         let _ = greedy_sample;
-        self.forward(cache, tokens, start_pos)
+        self.forward(cache, tokens, start_pos, slot_id)
             .map(ForwardOutcome::Logits)
     }
 
@@ -150,6 +186,7 @@ pub trait ModelForward: Send + Sync {
                     &[item.token],
                     item.start_pos,
                     item.greedy_sample.take(),
+                    item.slot_id,
                 )
             })
             .collect()

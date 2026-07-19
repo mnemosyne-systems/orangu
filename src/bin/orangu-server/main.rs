@@ -411,10 +411,11 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Cross-sequence GEMM batching, off by default: a real, reproducible
     // concurrent-load measurement (`ORANGU_BATCH_DECODE=1` vs. without,
     // same `slots` count, 4 concurrent 100-token generations) showed it
-    // ~60% *slower* (74–78s vs. 48.4–48.5s wall time), not faster — see
-    // `engine::generate::Engine::batch_coordinator`'s own doc comment for
-    // the likely cause. Only built at all when `slots > 1` (nothing to
-    // batch across otherwise) *and* the env var is set.
+    // 25-55% *slower*, not faster, even with the batched path fully
+    // GPU-resident — see `engine::generate::Engine::batch_coordinator`'s
+    // own doc comment for the numbers and the likely cause. Only built at
+    // all when `slots > 1` (nothing to batch across otherwise) *and* the
+    // env var is set.
     let batch_coordinator = (conf.slots > 1 && std::env::var_os("ORANGU_BATCH_DECODE").is_some())
         .then(|| engine::batch::BatchCoordinator::new(slots.clone()));
     // Cross-request KV-cache prefix reuse (`engine::prefix_cache`),

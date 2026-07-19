@@ -94,34 +94,59 @@ pub struct Engine {
     pub slots: Arc<SlotPool>,
     /// The cross-sequence GEMM batching coordinator — `Some` only when
     /// `slots.total() > 1` *and*
-    /// `ORANGU_BATCH_DECODE=1` is set (`main.rs`'s own comment has the
-    /// numbers); a single-slot deployment, or `slots > 1` without the env
-    /// var (the default), keeps calling `ModelForward::forward_maybe_
-    /// sampling` directly, unchanged.
+    /// `ORANGU_BATCH_DECODE=1` is set; a single-slot deployment, or
+    /// `slots > 1` without the env var (the default), keeps calling
+    /// `ModelForward::forward_maybe_sampling` directly, unchanged.
     ///
-    /// **Off by default**, unlike every other Step 9/11 GPU-fused change:
-    /// a real, reproducible concurrent-load A/B (4 concurrent 100-token
-    /// generations, same `slots` count either way) measured this ~60%
-    /// *slower*, not faster (74–78s vs. 48.4–48.5s wall time). Correctness
-    /// isn't in question — `engine::arch::gemma`'s own `forward_batch_
-    /// decode_matches_independent_forward_calls_*` tests, plus a real
-    /// concurrent multi-request run against `E2B` where each request got
-    /// back its own, correctly-attributed answer, both confirm that — but
-    /// `ModelForward::forward_batch_decode`'s batched matmul steps go
-    /// through the generic `Backend::matmul`/`matmul_batch` trait methods,
-    /// which always read results back to the CPU between steps (built for
-    /// the CPU-orchestrated prefill path, not for staying GPU-resident).
-    /// That's roughly six CPU↔GPU round trips per layer for the *whole
-    /// batch* combined, vs. `GemmaModel::record_decode_forward`'s **one**
-    /// round trip for a whole single-sequence forward pass — the exact
-    /// round-trip elimination this project's entire Steps 3–11 effort was
-    /// built around, reintroduced here in exchange for weight-bandwidth
-    /// amortization that apparently doesn't outweigh it at this batch
-    /// size/hardware. A genuinely faster version exists in principle (keep
-    /// the batched matmuls GPU-resident across the whole layer loop, the
-    /// same way the single-sequence path already does) but wasn't
-    /// attempted — this is left available behind the flag, correctness-
-    /// verified, for future work rather than deleted.
+    /// **Off by default**, unlike every other GPU-fused change in this
+    /// project. `GemmaModel::record_batched_decode_forward` *is*
+    /// GPU-resident (every item in a batch chained into one shared
+    /// encoder/submission — the one-round-trip design every single-
+    /// sequence decode step already uses, not the old CPU-orchestrated
+    /// per-layer-round-trip path an earlier version of this comment
+    /// described), and is correctness-verified bit-for-bit against
+    /// independent per-sequence `forward` calls
+    /// (`engine::arch::gemma`'s own `forward_batch_decode_matches_
+    /// independent_forward_calls_*` tests) as well as against itself
+    /// across many autoregressive steps
+    /// (`forward_batch_decode_identical_prompts_stay_identical_over_
+    /// many_steps_vulkan`). It still measures **slower** than not
+    /// batching under real concurrent load, though: a reproducible
+    /// concurrent-load A/B (4 concurrent 100-token generations, `slots =
+    /// 4` either way) measured two runs at 24.1s and 30.1s wall time
+    /// batched vs. 18.9–19.4s not batched — 25–55% slower, not faster.
+    /// Likely cause: fusing *M* sequences' matmuls into shared dispatches
+    /// amortizes weight bandwidth, but this hardware's GPU is fast enough
+    /// per single-sequence step (Step 5's whole point) that the extra
+    /// synchronization needed to chain *M* independent sequences into one
+    /// encoder — and the coordinator's own up-to-`MAX_BATCH_WAIT`
+    /// rendezvous wait before a batch can even start — costs more than
+    /// the amortization saves. Left available behind the flag,
+    /// correctness-verified, for hardware or batch sizes where that
+    /// balance tips the other way, rather than deleted.
+    ///
+    /// Getting a trustworthy measurement here required fixing a real bug
+    /// first: both this batched path *and* the pre-existing single-
+    /// sequence GPU-resident decode path (`GemmaModel::record_decode_
+    /// forward`, since Step 5) used to key their cached per-layer GPU
+    /// buffers by weight shape alone, with no per-caller distinction.
+    /// `BatchCoordinator` deliberately allows two of its own `process_
+    /// batch` calls to run concurrently (see its own doc comment), and
+    /// ordinary `slots > 1` decode is concurrent by construction — so two
+    /// requests decoding at the same time could end up sharing the same
+    /// cached buffer. Because that cache's mutex guard is only held
+    /// during the cheap *recording* step, not across the deferred GPU
+    /// *submission* (`queue.write_buffer` takes effect immediately, not
+    /// in encoder-submission order), one request's write could silently
+    /// corrupt another's not-yet-executed dispatch — no crash, just wrong
+    /// tokens, on *any* `slots > 1` deployment regardless of whether
+    /// `ORANGU_BATCH_DECODE` was ever set. Fixed by threading each
+    /// request's own `SlotGuard::id()` through as `BatchDecodeItem::
+    /// slot_id` (see its own doc comment) into every cache key, so
+    /// concurrent callers never share a buffer. Verified fixed with a
+    /// live reproduction: 4 concurrent identical greedy prompts, which
+    /// diverged after a few tokens before the fix (in *both* the batched
+    /// and non-batched configurations) and are byte-identical after it.
     pub batch_coordinator: Option<Arc<BatchCoordinator>>,
     /// Cross-request KV-cache prefix reuse (`engine::prefix_cache`) —
     /// `None` disables it entirely (same as `Some(PrefixCache::new(0))`,
@@ -255,6 +280,7 @@ fn run(
         cache.as_mut().expect("cache is always Some here"),
         &req.prompt_tokens[reused_len..],
         reused_len,
+        guard.id(),
     ) {
         Ok(l) => l,
         Err(err) => {
@@ -347,6 +373,7 @@ fn run(
                     recent_tokens: history[recent_start..].to_vec(),
                     repeat_penalty: sampler.repeat_penalty(),
                 }),
+                slot_id: guard.id(),
             };
             let response = coordinator.submit(model, request);
             cache = Some(response.cache);
@@ -370,6 +397,7 @@ fn run(
                 &[next],
                 start_pos,
                 greedy_sample,
+                guard.id(),
             ) {
                 Ok(ForwardOutcome::Token(t)) => t,
                 Ok(ForwardOutcome::Logits(l)) => sampler.sample(&l, &history),
@@ -475,6 +503,7 @@ mod tests {
             cache: &mut KvCache,
             tokens: &[u32],
             start_pos: usize,
+            _slot_id: usize,
         ) -> Result<Vec<f32>> {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
@@ -697,6 +726,7 @@ mod tests {
             _cache: &mut KvCache,
             _tokens: &[u32],
             _start_pos: usize,
+            _slot_id: usize,
         ) -> Result<Vec<f32>> {
             panic!("PANICKING_MODEL_DELIBERATE_TEST_PANIC");
         }

@@ -507,19 +507,38 @@ fn save_pipeline_cache(path: &std::path::Path, data: &[u8]) -> std::io::Result<(
 }
 
 /// `(weight cache_key.0, weight cache_key.1, in_dim, out_dim, row_bytes,
-/// n_tokens)`. The shape fields beyond the raw `cache_key()` address pair
-/// are redundant in production — `LoadedModel`'s `mmap` lives for the
-/// whole server process, so a `(ptr, start)` pair is never reused for a
-/// different tensor — but they make a same-address collision impossible
-/// to *silently* misuse even so: a stale entry with a different shape
-/// simply misses the cache and gets rebuilt correctly-sized, rather than
-/// having its (wrong-sized) buffers reused. Address reuse can genuinely
-/// happen for short-lived `QuantMatrix`es backed by a temp-file `mmap`
-/// that gets unmapped and then coincidentally remapped at the same
+/// n_tokens, batch_slot)`. The shape fields beyond the raw `cache_key()`
+/// address pair are redundant in production — `LoadedModel`'s `mmap` lives
+/// for the whole server process, so a `(ptr, start)` pair is never reused
+/// for a different tensor — but they make a same-address collision
+/// impossible to *silently* misuse even so: a stale entry with a different
+/// shape simply misses the cache and gets rebuilt correctly-sized, rather
+/// than having its (wrong-sized) buffers reused. Address reuse can
+/// genuinely happen for short-lived `QuantMatrix`es backed by a temp-file
+/// `mmap` that gets unmapped and then coincidentally remapped at the same
 /// address (exactly what the cross-check tests do, sharing one
 /// `VulkanBackend`/`op_cache` — see `tests::shared_vulkan`) — this was
 /// caught by, not just anticipated for, that exact scenario.
-type OpCacheKey = (usize, usize, u32, usize, usize, usize, usize);
+///
+/// `batch_slot`: always `0` for every ordinary (single-sequence) caller —
+/// `Backend::matmul`/`matmul_batch`'s trait impl, and the fused decode
+/// path's own calls via `op_entry_for`. Only `GemmaModel::record_batched_
+/// decode_forward`'s per-sequence chain inside one batched-decode
+/// submission ever passes a nonzero value (`1..=batch_len`, one per
+/// sequence in the batch) — see that method's own doc comment for why a
+/// batch of independent sequences can't just share slot `0`'s cached
+/// buffers the way ordinary decode-shaped calls already safely do:
+/// `queue.write_buffer` calls for two different sequences' activations
+/// would race to overwrite the *same* cached buffer before either
+/// sequence's own dispatch actually runs (nothing defers a `queue.write_
+/// buffer` to encoder-execution order — it happens the moment it's
+/// called), corrupting whichever sequence's write lost the race, silently
+/// — not something a missing cache key would ever surface as a panic or a
+/// wrong-shape error, just wrong numbers. Reserving slot `0` for the
+/// non-batched path and `1..=batch_len` for the batched one is what keeps
+/// those two callers' cached buffers from ever aliasing in the first
+/// place, even though nothing else about the two call shapes looks related.
+type OpCacheKey = (usize, usize, u32, usize, usize, usize, usize, usize);
 
 /// `(cache_key.0, cache_key.1, ggml_type, raw_bytes().len())`.
 type WeightCacheKey = (usize, usize, u32, usize);
@@ -855,18 +874,22 @@ struct TimestampQueries {
 }
 
 /// `(wq.cache_key().0, wq.cache_key().1, n_head, n_head_kv, head_dim,
-/// has_kv, owns_v)` — the same defensive shape-plus-identity pattern
-/// `FusedCacheKey`/`OpCacheKey` use.
-type FusedAttnLayerCacheKey = (usize, usize, usize, usize, usize, bool, bool);
+/// has_kv, owns_v, batch_slot)` — the same defensive shape-plus-identity
+/// pattern `FusedCacheKey`/`OpCacheKey` use; `batch_slot` follows
+/// `OpCacheKey`'s own doc comment (same reservation: `0` for the ordinary
+/// single-sequence path, `1..=batch_len` for `GemmaModel::record_batched_
+/// decode_forward`'s per-sequence chain).
+type FusedAttnLayerCacheKey = (usize, usize, usize, usize, usize, bool, bool, usize);
 
 /// `(wo.cache_key().0, wo.cache_key().1, ffn_gate.out_dim, PLE's
-/// per_layer_dim (0 if this layer has no PLE), layer_output_scale.is_some())`
-/// — `wo`'s identity alone would be enough in production (see
+/// per_layer_dim (0 if this layer has no PLE), layer_output_scale.is_some(),
+/// batch_slot)` — `wo`'s identity alone would be enough in production (see
 /// `OpCacheKey`'s doc comment for why), but the extra shape/feature fields
 /// make a stale entry miss the cache instead of being silently reused with
 /// the wrong shape or wrong optional stages, the same defensive pattern
-/// `OpCacheKey`/`WeightCacheKey` already use.
-type FusedCacheKey = (usize, usize, usize, usize, bool);
+/// `OpCacheKey`/`WeightCacheKey` already use. `batch_slot` follows
+/// `OpCacheKey`'s own doc comment.
+type FusedCacheKey = (usize, usize, usize, usize, bool, usize);
 
 /// `(wq.cache_key().0, wq.cache_key().1, n_embd, eps.to_bits(),
 /// attn_norm.as_ptr() as usize)` — the same defensive shape-plus-identity
@@ -897,8 +920,9 @@ type FusedCacheKey = (usize, usize, usize, usize, bool);
 /// `wq` itself. `eps` is compared via `to_bits()` since `f32` isn't
 /// `Eq`/`Hash`; bit-identical equality is exactly what "was this cache
 /// entry built for this exact call's `eps`" needs, not a tolerance-based
-/// comparison.
-type FusedLayerCacheKey = (usize, usize, usize, u32, usize);
+/// comparison. `batch_slot` (the trailing field) follows `OpCacheKey`'s
+/// own doc comment.
+type FusedLayerCacheKey = (usize, usize, usize, u32, usize, usize);
 
 /// One op's GPU-side resources, reused across every call that shares its
 /// `(weight, n_tokens)` cache key rather than rebuilt each time. Only
@@ -1820,7 +1844,7 @@ impl VulkanBackend {
         }
 
         let entries: Vec<Arc<Mutex<CachedOpResources>>> =
-            ops.iter().map(|op| self.op_entry(op)).collect();
+            ops.iter().map(|op| self.op_entry(op, 0)).collect();
         let guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
             .iter()
             .map(|entry| entry.lock().expect("op cache entry poisoned"))
@@ -2005,8 +2029,11 @@ impl VulkanBackend {
     }
 
     /// Returns the cached GPU resources for `op`'s `(weight, n_tokens)`
-    /// shape, building (and caching) them first on a cache miss.
-    fn op_entry(&self, op: &MatmulOp<'_>) -> Arc<Mutex<CachedOpResources>> {
+    /// shape at `batch_slot`, building (and caching) them first on a cache
+    /// miss — see [`OpCacheKey`]'s own doc comment for what `batch_slot`
+    /// is and why every caller outside `GemmaModel::record_batched_
+    /// decode_forward` always passes `0`.
+    fn op_entry(&self, op: &MatmulOp<'_>, batch_slot: usize) -> Arc<Mutex<CachedOpResources>> {
         let (ptr, start) = op.w.cache_key();
         let key: OpCacheKey = (
             ptr,
@@ -2016,6 +2043,7 @@ impl VulkanBackend {
             op.w.out_dim,
             op.w.row_bytes(),
             op.n_tokens,
+            batch_slot,
         );
         {
             let cache = self.op_cache.lock().expect("op cache poisoned");
@@ -2284,6 +2312,10 @@ pub struct FusedPostAttentionInput<'a> {
     pub eps: f32,
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
+    /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
+    /// (single-sequence) caller, `1..=batch_len` only from `GemmaModel::
+    /// record_batched_decode_forward`'s per-sequence chain.
+    pub batch_slot: usize,
 }
 
 /// [`VulkanBackend::gpu_attention`]'s parameters, grouped into one struct
@@ -2381,6 +2413,15 @@ pub struct FusedAttnInput<'a> {
     pub window_start: usize,
     pub scale: f32,
     pub cache: &'a mut crate::engine::kv_cache::LayerCache,
+    /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
+    /// (single-sequence) caller, `1..=batch_len` only from `GemmaModel::
+    /// record_batched_decode_forward`'s per-sequence chain. Note this is
+    /// unrelated to `cache`'s own per-request isolation (`GpuAttnDispatch`
+    /// is already keyed per `LayerCache`, batched or not) — `batch_slot`
+    /// exists purely to keep the *model-scoped* caches
+    /// (`fused_attn_layer_cache`/`op_cache`) from aliasing between two
+    /// sequences sharing one batched-decode submission.
+    pub batch_slot: usize,
 }
 
 /// [`VulkanBackend::fused_layer`]'s parameters — the union of
@@ -2421,6 +2462,10 @@ pub struct FusedLayerInput<'a> {
     pub ffn_post_norm: &'a [f32],
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
+    /// See [`FusedAttnInput::batch_slot`]'s own doc comment — threaded
+    /// straight through to both the attention and post-attention halves
+    /// this struct's own `record_fused_layer` chains together.
+    pub batch_slot: usize,
 }
 
 impl VulkanBackend {
@@ -3000,16 +3045,22 @@ impl VulkanBackend {
     /// One matmul's op-cache entry, primed with a correctly-sized (but
     /// content-irrelevant — this call only ever uses the entry's buffers as
     /// a GPU-GPU copy target, never `op.x`'s CPU contents) dummy operand.
-    /// Only used by [`Self::fused_post_attention`], where every matmul
-    /// input is itself GPU-resident data produced earlier in the same
-    /// chain, not CPU data `matmul_batch`'s normal callers would pass.
-    fn op_entry_for(&self, w: &QuantMatrix) -> Arc<Mutex<CachedOpResources>> {
+    /// Only used by the fused decode chain (`record_fused_attention`/
+    /// `record_fused_post_attention`/`record_full_matmul`), where every
+    /// matmul input is itself GPU-resident data produced earlier in the
+    /// same chain, not CPU data `matmul_batch`'s normal callers would
+    /// pass. `batch_slot` — see [`OpCacheKey`]'s own doc comment — is
+    /// threaded straight through, unexamined here.
+    fn op_entry_for(&self, w: &QuantMatrix, batch_slot: usize) -> Arc<Mutex<CachedOpResources>> {
         let dummy = vec![0f32; w.in_dim];
-        self.op_entry(&MatmulOp {
-            x: &dummy,
-            n_tokens: 1,
-            w,
-        })
+        self.op_entry(
+            &MatmulOp {
+                x: &dummy,
+                n_tokens: 1,
+                w,
+            },
+            batch_slot,
+        )
     }
 
     /// Records `w`'s matmul dispatch (`x -> y`, `n_tokens == 1`) into
@@ -3189,6 +3240,7 @@ impl VulkanBackend {
             input.ffn_gate.out_dim,
             per_layer_dim,
             input.layer_output_scale.is_some(),
+            input.batch_slot,
         );
         {
             let cache = self.fused_cache.lock().expect("fused cache poisoned");
@@ -3219,14 +3271,16 @@ impl VulkanBackend {
         debug_assert_eq!(input.ffn_down.in_dim, ffn_len);
         debug_assert_eq!(input.ffn_down.out_dim, n_embd);
 
-        let wo_entry = self.op_entry_for(input.wo);
-        let gate_entry = self.op_entry_for(input.ffn_gate);
-        let up_entry = self.op_entry_for(input.ffn_up);
-        let down_entry = self.op_entry_for(input.ffn_down);
-        let ple_entries = input
-            .ple
-            .as_ref()
-            .map(|ple| (self.op_entry_for(ple.gate_w), self.op_entry_for(ple.proj_w)));
+        let wo_entry = self.op_entry_for(input.wo, input.batch_slot);
+        let gate_entry = self.op_entry_for(input.ffn_gate, input.batch_slot);
+        let up_entry = self.op_entry_for(input.ffn_up, input.batch_slot);
+        let down_entry = self.op_entry_for(input.ffn_down, input.batch_slot);
+        let ple_entries = input.ple.as_ref().map(|ple| {
+            (
+                self.op_entry_for(ple.gate_w, input.batch_slot),
+                self.op_entry_for(ple.proj_w, input.batch_slot),
+            )
+        });
 
         let wo_g = wo_entry.lock().expect("op cache entry poisoned");
         let gate_g = gate_entry.lock().expect("op cache entry poisoned");
@@ -3839,6 +3893,7 @@ impl VulkanBackend {
             input.head_dim,
             input.kv.is_some(),
             input.kv.as_ref().is_some_and(|p| p.wv.is_some()),
+            input.batch_slot,
         );
         {
             let cache = self
@@ -3874,13 +3929,16 @@ impl VulkanBackend {
         let kv_dim = input.n_head_kv * input.head_dim;
         let n_embd = input.wq.in_dim;
 
-        let wq_entry = self.op_entry_for(input.wq);
-        let wk_entry = input.kv.as_ref().map(|p| self.op_entry_for(p.wk));
+        let wq_entry = self.op_entry_for(input.wq, input.batch_slot);
+        let wk_entry = input
+            .kv
+            .as_ref()
+            .map(|p| self.op_entry_for(p.wk, input.batch_slot));
         let wv_entry = input
             .kv
             .as_ref()
             .and_then(|p| p.wv)
-            .map(|w| self.op_entry_for(w));
+            .map(|w| self.op_entry_for(w, input.batch_slot));
 
         let wq_g = wq_entry.lock().expect("op cache entry poisoned");
         let wk_g = wk_entry
@@ -3920,6 +3978,7 @@ impl VulkanBackend {
             window_start,
             scale,
             cache,
+            batch_slot: _,
         } = input;
 
         // `pos` is the one field in these cached meta buffers that
@@ -4516,6 +4575,7 @@ impl VulkanBackend {
         n_embd: usize,
         attn_norm: &[f32],
         eps: f32,
+        batch_slot: usize,
     ) -> Arc<FusedLayerResources> {
         let (ptr, start) = wq.cache_key();
         let key: FusedLayerCacheKey = (
@@ -4524,6 +4584,7 @@ impl VulkanBackend {
             n_embd,
             eps.to_bits(),
             attn_norm.as_ptr() as usize,
+            batch_slot,
         );
         {
             let cache = self
@@ -4567,7 +4628,13 @@ impl VulkanBackend {
         input: FusedLayerInput<'_>,
     ) -> wgpu::Buffer {
         let n_embd = input.wq.in_dim;
-        let layer_res = self.fused_layer_entry_for(input.wq, n_embd, input.attn_norm, input.eps);
+        let layer_res = self.fused_layer_entry_for(
+            input.wq,
+            n_embd,
+            input.attn_norm,
+            input.eps,
+            input.batch_slot,
+        );
 
         let FusedLayerInput {
             x,
@@ -4595,6 +4662,7 @@ impl VulkanBackend {
             ffn_post_norm,
             ple,
             layer_output_scale,
+            batch_slot,
         } = input;
 
         self.upload_or_copy(encoder, &layer_res.x_buf, x, n_embd);
@@ -4627,6 +4695,7 @@ impl VulkanBackend {
                 window_start,
                 scale,
                 cache,
+                batch_slot,
             },
         );
 
@@ -4645,6 +4714,7 @@ impl VulkanBackend {
                 eps,
                 ple,
                 layer_output_scale,
+                batch_slot,
             },
         )
     }
@@ -4729,8 +4799,9 @@ impl VulkanBackend {
         encoder: &mut wgpu::CommandEncoder,
         x: GpuInput<'_>,
         w: &QuantMatrix,
+        batch_slot: usize,
     ) -> wgpu::Buffer {
-        let entry = self.op_entry_for(w);
+        let entry = self.op_entry_for(w, batch_slot);
         let g = entry.lock().expect("op cache entry poisoned");
         self.upload_or_copy(encoder, &g.x_buffer, x, w.in_dim);
         {
@@ -4757,8 +4828,9 @@ impl VulkanBackend {
         &self,
         mut encoder: wgpu::CommandEncoder,
         w: &QuantMatrix,
+        batch_slot: usize,
     ) -> Vec<f32> {
-        let entry = self.op_entry_for(w);
+        let entry = self.op_entry_for(w, batch_slot);
         let g = entry.lock().expect("op cache entry poisoned");
         encoder.copy_buffer_to_buffer(&g.output_buffer, 0, &g.readback_buffer, 0, g.output_len);
         self.queue.submit(Some(encoder.finish()));
@@ -4779,6 +4851,70 @@ impl VulkanBackend {
         drop(data);
         g.readback_buffer.unmap();
         result
+    }
+
+    /// Finishes and submits `encoder` **once**, then reads back every one
+    /// of `sources`' own `(buffer, element count)` pairs — the multi-
+    /// result counterpart to `submit_and_readback`/`submit_and_readback_
+    /// for`'s single-buffer versions, needed by `GemmaModel::record_
+    /// batched_decode_forward` to read back all `M` sequences' own
+    /// `[n_vocab]` logits from **one** shared submission (the entire point
+    /// of that method: one GPU round trip for the whole batch, not one per
+    /// sequence). Allocates a fresh readback buffer per source rather than
+    /// reusing any op-cache-owned one (`submit_and_readback_for`'s own
+    /// approach) — the sources here are `M` different `batch_slot`s' own
+    /// cached output buffers, and copying every one of them into a shared
+    /// pool of *fresh* destinations sidesteps needing this function to
+    /// know anything about which weight/slot each source came from. One
+    /// `map_async` per source, fired before the single shared `poll`
+    /// below — the same "one poll drains every callback" pattern
+    /// `matmul_batch_dispatch` already uses for its own multi-op readback.
+    pub fn submit_and_readback_batch(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        sources: &[(&wgpu::Buffer, usize)],
+    ) -> Vec<Vec<f32>> {
+        let readback_buffers: Vec<wgpu::Buffer> = sources
+            .iter()
+            .map(|&(src, len_f32)| {
+                let byte_len = (len_f32 as u64) * 4;
+                let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("orangu-server batched decode readback"),
+                    size: byte_len,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_buffer_to_buffer(src, 0, &readback, 0, byte_len);
+                readback
+            })
+            .collect();
+
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        for readback in &readback_buffers {
+            readback.slice(..).map_async(wgpu::MapMode::Read, |result| {
+                result.expect("mapping a batched decode readback buffer failed");
+            });
+        }
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("polling for the batched decode readback failed");
+
+        readback_buffers
+            .iter()
+            .map(|readback| {
+                let data = readback.slice(..).get_mapped_range().expect(
+                    "batched decode readback buffer was not mapped after a successful \
+                     map_async + poll",
+                );
+                let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                readback.unmap();
+                result
+            })
+            .collect()
     }
 
     /// Whether `GemmaModel::record_decode_forward` should write per-layer
@@ -4953,6 +5089,7 @@ impl VulkanBackend {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         input: PleProjectionInput<'_>,
+        batch_slot: usize,
     ) -> wgpu::Buffer {
         let PleProjectionInput {
             x,
@@ -4968,7 +5105,7 @@ impl VulkanBackend {
         debug_assert_eq!(proj_norm.len(), per_layer);
         debug_assert_eq!(gathered.len(), total);
 
-        let proj_entry = self.op_entry_for(proj_w);
+        let proj_entry = self.op_entry_for(proj_w, batch_slot);
         let proj_g = proj_entry.lock().expect("op cache entry poisoned");
         self.upload_or_copy(encoder, &proj_g.x_buffer, x, proj_w.in_dim);
 
@@ -7020,6 +7157,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 per_layer_dim: per_layer_slice.len(),
             }),
             layer_output_scale: Some(layer_output_scale),
+            batch_slot: 0,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -7109,6 +7247,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             eps,
             ple: None,
             layer_output_scale: None,
+            batch_slot: 0,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -7240,6 +7379,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                     per_layer_dim: per_layer_slice.len(),
                 }),
                 layer_output_scale: Some(layer_output_scale),
+                batch_slot: 0,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -8092,6 +8232,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 per_layer,
                 eps,
             },
+            0,
         );
         let got = vulkan.submit_and_readback(encoder, &buf, total);
 
@@ -8426,6 +8567,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 window_start,
                 scale,
                 cache: &mut kv_cache.layers[0],
+                batch_slot: 0,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -8584,6 +8726,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 window_start,
                 scale,
                 cache: &mut kv_cache.layers[0],
+                batch_slot: 0,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -8736,6 +8879,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             window_start,
             scale,
             cache: &mut kv_cache.layers[0],
+            batch_slot: 0,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -8899,6 +9043,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             window_start: 0,
             scale,
             cache: &mut kv_cache.layers[0],
+            batch_slot: 0,
         });
         assert_eq!(expected_a.len(), got_a.len());
         for (i, (a, b)) in expected_a.iter().zip(got_a.iter()).enumerate() {
@@ -8937,6 +9082,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             window_start: 0,
             scale,
             cache: &mut kv_cache.layers[0],
+            batch_slot: 0,
         });
         assert_eq!(expected_b.len(), got_b.len());
         for (i, (a, b)) in expected_b.iter().zip(got_b.iter()).enumerate() {
@@ -9156,6 +9302,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                     per_layer_dim: per_layer_slice.len(),
                 }),
                 layer_output_scale: Some(layer_output_scale),
+                batch_slot: 0,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -9431,6 +9578,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 ffn_post_norm: &l0.ffn_post_norm,
                 ple: None,
                 layer_output_scale: None,
+                batch_slot: 0,
             });
             assert_eq!(expected0.len(), got0.len());
             for (i, (a, b)) in expected0.iter().zip(got0.iter()).enumerate() {
@@ -9467,6 +9615,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 ffn_post_norm: &l1.ffn_post_norm,
                 ple: None,
                 layer_output_scale: None,
+                batch_slot: 0,
             });
             assert_eq!(expected1.len(), got1.len());
             for (i, (a, b)) in expected1.iter().zip(got1.iter()).enumerate() {

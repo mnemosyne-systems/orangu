@@ -440,12 +440,8 @@ impl GemmaModel {
         token: u32,
         start_pos: usize,
         x: &[f32],
+        slot_id: usize,
     ) -> Result<(wgpu::CommandEncoder, wgpu::Buffer)> {
-        let n_embd = self.config.n_embd;
-        let eps = self.rms_eps();
-        let per_layer = self.n_embd_per_layer;
-        let has_ple = per_layer > 0;
-
         let mut encoder = vulkan.new_encoder("orangu-server full forward encoder");
 
         // See `VulkanBackend::gpu_timestamps`'s own doc comment for what
@@ -454,7 +450,9 @@ impl GemmaModel {
         // no-op) unless it's set. Fetched once per decode step, not
         // cached across steps, since the query set itself is what's
         // cached (`VulkanBackend::timestamp_query_set` — cheap to clone,
-        // built once for the model's lifetime).
+        // built once for the model's lifetime). Single-sequence-only: see
+        // `record_one_sequence_decode`'s own doc comment for why a batched
+        // decode step's own timing isn't captured this same way (yet).
         let timestamps = vulkan
             .gpu_timestamps()
             .then(|| vulkan.timestamp_query_set(self.layers.len()));
@@ -462,11 +460,70 @@ impl GemmaModel {
             encoder.write_timestamp(t, 0);
         }
 
+        let logits_buf = self.record_one_sequence_decode(
+            vulkan,
+            &mut encoder,
+            cache,
+            token,
+            start_pos,
+            x,
+            slot_id + 1,
+            timestamps.as_ref(),
+        );
+
+        if let Some(t) = &timestamps {
+            encoder.write_timestamp(t, (2 + self.layers.len()) as u32);
+            vulkan.finish_timestamps(&mut encoder);
+        }
+        Ok((encoder, logits_buf))
+    }
+
+    /// One sequence's whole decode step — PLE projection, every layer,
+    /// `output_norm`, `lm_head` — recorded into the caller's own `encoder`
+    /// (does **not** create or submit one) at `batch_slot`, returning the
+    /// GPU buffer holding this sequence's own `[n_vocab]` logits. The
+    /// recording half of [`Self::record_decode_forward`] (`batch_slot ==
+    /// this request's own `SlotGuard::id() + 1` — see [`BatchDecodeItem::
+    /// slot_id`]'s doc comment for why a shared constant here would let two
+    /// `slots > 1` requests decoding concurrently corrupt each other's
+    /// cached GPU buffers) *and* [`Self::record_batched_decode_
+    /// forward`] (`batch_slot` likewise each item's own `slot_id + 1`, one
+    /// call per sequence in the batch, all sharing *one* encoder/submission
+    /// — see that method's own doc comment for why `batch_slot` has to
+    /// differ per sequence at all, not just per caller). `timestamps`, unlike
+    /// `record_decode_forward`'s own copy, is only ever threaded through
+    /// from the single-sequence caller (`Some` there iff `ORANGU_GPU_
+    /// TIMESTAMPS=1`) — `record_batched_decode_forward` always passes
+    /// `None`: `timestamp_query_set`'s own `wgpu::QuerySet` is sized for
+    /// exactly one sequence's `n_layer + 3` boundary points, with no batch
+    /// dimension, and a shared query set written from *M* concurrently-
+    /// recorded sequences' worth of `write_timestamp` calls into the same
+    /// fixed slots would just overwrite each other's timings, not add a
+    /// useful per-sequence
+    /// breakdown — a real per-sequence batched-decode timing breakdown
+    /// would need its own, wider query set, not implemented here.
+    #[allow(clippy::too_many_arguments)]
+    fn record_one_sequence_decode(
+        &self,
+        vulkan: &VulkanBackend,
+        encoder: &mut wgpu::CommandEncoder,
+        cache: &mut KvCache,
+        token: u32,
+        start_pos: usize,
+        x: &[f32],
+        batch_slot: usize,
+        timestamps: Option<&wgpu::QuerySet>,
+    ) -> wgpu::Buffer {
+        let n_embd = self.config.n_embd;
+        let eps = self.rms_eps();
+        let per_layer = self.n_embd_per_layer;
+        let has_ple = per_layer > 0;
+
         let ple_buf = if has_ple {
             let gathered = self.gather_per_layer_tok_embd(&[token], 1);
             Some(
                 vulkan.record_ple_projection(
-                    &mut encoder,
+                    encoder,
                     crate::engine::backend::vulkan::PleProjectionInput {
                         x: GpuInput::Cpu(x),
                         proj_w: self
@@ -482,12 +539,13 @@ impl GemmaModel {
                         per_layer,
                         eps,
                     },
+                    batch_slot,
                 ),
             )
         } else {
             None
         };
-        if let Some(t) = &timestamps {
+        if let Some(t) = timestamps {
             encoder.write_timestamp(t, 1);
         }
 
@@ -549,7 +607,7 @@ impl GemmaModel {
                 None => GpuInput::Cpu(x),
             };
             let out = vulkan.record_fused_layer(
-                &mut encoder,
+                encoder,
                 FusedLayerInput {
                     x: x_input,
                     attn_norm: &layer.attn_norm,
@@ -576,31 +634,28 @@ impl GemmaModel {
                     ffn_post_norm: &layer.ffn_post_norm,
                     ple,
                     layer_output_scale: layer.layer_output_scale,
+                    batch_slot,
                 },
             );
             prev_buf = Some(out);
-            if let Some(t) = &timestamps {
+            if let Some(t) = timestamps {
                 encoder.write_timestamp(t, (2 + il) as u32);
             }
         }
         let last_buf = prev_buf.expect("a gemma4 model always has at least one layer");
         let normed_buf = vulkan.record_output_norm(
-            &mut encoder,
+            encoder,
             GpuInput::Gpu(&last_buf, 0),
             &self.output_norm,
             eps,
             n_embd,
         );
-        let logits_buf = vulkan.record_full_matmul(
-            &mut encoder,
+        vulkan.record_full_matmul(
+            encoder,
             GpuInput::Gpu(&normed_buf, 0),
             &self.output_weight,
-        );
-        if let Some(t) = &timestamps {
-            encoder.write_timestamp(t, (2 + self.layers.len()) as u32);
-            vulkan.finish_timestamps(&mut encoder);
-        }
-        Ok((encoder, logits_buf))
+            batch_slot,
+        )
     }
 
     /// The CPU-orchestrated core of a Gemma forward pass — every layer,
@@ -925,6 +980,82 @@ impl GemmaModel {
             (0, pos)
         }
     }
+
+    /// The GPU-resident batched-decode path: every sequence's own PLE/
+    /// layer-stack/`output_norm`/`lm_head` chain (`Self::record_one_
+    /// sequence_decode`) recorded into **one shared encoder**, at a
+    /// distinct `batch_slot` per sequence (`1..=items.len()` — `0` is
+    /// reserved for the single-sequence path, see `OpCacheKey`'s own doc
+    /// comment for why two sequences, or a batched and an unbatched
+    /// decode, can never safely share a `batch_slot`), submitted
+    /// **once**, with every sequence's own `[n_vocab]` logits read back
+    /// together (`VulkanBackend::submit_and_readback_batch`). This is
+    /// what actually eliminates the CPU↔GPU round trips `Self::forward_
+    /// batch_decode`'s own doc comment describes the plain `Backend::
+    /// matmul`/`matmul_batch`-based path taking on every op of every
+    /// layer: instead of that, this is **one** round trip for the
+    /// *entire* batch's *entire* forward pass — the same one-round-trip
+    /// shape `record_decode_forward` already gives a single sequence,
+    /// just run `items.len()` times into the same encoder before
+    /// submitting, rather than once per sequence with its own
+    /// submission.
+    ///
+    /// Each sequence's own attention/RoPE/per-head-norm work stays
+    /// genuinely per-sequence — recorded once per sequence, not widened
+    /// into a single cross-sequence dispatch the way the plain-matmul
+    /// path's QKV/`wo`/FFN projections already batch across sequences
+    /// (see `Self::forward_batch_decode`'s own doc comment) — only the
+    /// round trips *between* those per-sequence dispatches are
+    /// eliminated here, by sharing one encoder/submission across the
+    /// whole batch instead of one per weight per sequence. Never
+    /// GPU-samples (matches `forward_batch_decode`'s own contract) —
+    /// always returns raw logits, sampled by the caller (`engine::
+    /// batch::BatchCoordinator`) on the CPU.
+    fn record_batched_decode_forward(
+        &self,
+        vulkan: &VulkanBackend,
+        items: &mut [BatchDecodeItem<'_>],
+    ) -> Vec<Vec<f32>> {
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.output_weight.out_dim;
+        let mut encoder = vulkan.new_encoder("orangu-server batched decode encoder");
+
+        let logits_bufs: Vec<wgpu::Buffer> = items
+            .iter_mut()
+            .map(|item| {
+                let mut x = self.tok_embeddings.row(item.token as usize);
+                for v in x.iter_mut() {
+                    *v *= (n_embd as f32).sqrt();
+                }
+                self.record_one_sequence_decode(
+                    vulkan,
+                    &mut encoder,
+                    item.cache,
+                    item.token,
+                    item.start_pos,
+                    &x,
+                    item.slot_id + 1,
+                    None,
+                )
+            })
+            .collect();
+
+        let sources: Vec<(&wgpu::Buffer, usize)> =
+            logits_bufs.iter().map(|buf| (buf, n_vocab)).collect();
+        let mut logits = vulkan.submit_and_readback_batch(encoder, &sources);
+
+        // Matches `forward`'s own tail — softcapping is applied to the
+        // read-back logits there too, never inside the recording chain
+        // itself.
+        if let Some(cap) = self.final_logit_softcapping {
+            for row in &mut logits {
+                for v in row.iter_mut() {
+                    *v = (*v / cap).tanh() * cap;
+                }
+            }
+        }
+        logits
+    }
 }
 
 impl ModelForward for GemmaModel {
@@ -936,7 +1067,13 @@ impl ModelForward for GemmaModel {
         KvCache::new_with_dims(capacity, &self.kv_dims())
     }
 
-    fn forward(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<f32>> {
         anyhow::ensure!(
             self.causal,
             "'{}' is an embeddings-only architecture (bidirectional attention, no causal \
@@ -993,8 +1130,8 @@ impl ModelForward for GemmaModel {
             // > 1`) and the CPU backend still take the fully-CPU-
             // orchestrated `else` branch below.
             let (encoder, _logits_buf) =
-                self.record_decode_forward(vulkan, cache, tokens[0], start_pos, &x)?;
-            let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight);
+                self.record_decode_forward(vulkan, cache, tokens[0], start_pos, &x, slot_id)?;
+            let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
             // `submit_and_readback_for`'s own `poll(wait_indefinitely())`
             // already blocked until this whole submission (timestamp
             // resolve included) finished, so the readback here is never
@@ -1058,6 +1195,7 @@ impl ModelForward for GemmaModel {
         tokens: &[u32],
         start_pos: usize,
         greedy_sample: Option<GreedySampleParams<'_>>,
+        slot_id: usize,
     ) -> Result<ForwardOutcome> {
         if tokens.len() == 1
             && self.final_logit_softcapping.is_none()
@@ -1076,7 +1214,7 @@ impl ModelForward for GemmaModel {
                 *v *= (n_embd as f32).sqrt();
             }
             let (mut encoder, logits_buf) =
-                self.record_decode_forward(vulkan, cache, token, start_pos, &x)?;
+                self.record_decode_forward(vulkan, cache, token, start_pos, &x, slot_id)?;
             let sample_buf = vulkan.record_argmax_sample(
                 &mut encoder,
                 GpuArgmaxSampleInput {
@@ -1089,57 +1227,54 @@ impl ModelForward for GemmaModel {
             let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
             return Ok(ForwardOutcome::Token(next));
         }
-        self.forward(cache, tokens, start_pos)
+        self.forward(cache, tokens, start_pos, slot_id)
             .map(ForwardOutcome::Logits)
     }
 
     /// See [`ModelForward::forward_batch_decode`]'s own doc comment for
-    /// the shape of what this does and why. Structurally
-    /// this mirrors `Self::forward`'s CPU-orchestrated `else` branch
-    /// almost exactly — same per-layer sequence of matmul/norm/RoPE/
-    /// attention/residual steps, same math — except every place that
-    /// branch loops `for t in 0..n_tokens` over *one* sequence's multiple
-    /// positions, this loops over `items` — *N different sequences'* own
-    /// single position each — and every matmul call's `n_tokens` argument
-    /// becomes `items.len()` (the batch width) instead of a prompt's
-    /// length. `Backend::matmul`/`matmul_batch` already handle more than
-    /// one token generically (built for prefill), so no new GPU kernel is
-    /// needed for the batched matmuls themselves — this reuses that
-    /// existing, already-verified machinery with "n_tokens" now meaning
-    /// "N different sequences' single tokens" rather than "N positions of
-    /// one sequence."
+    /// the shape of what this does and why.
     ///
     /// `items.len() <= 1` falls back to `Self::forward_maybe_sampling`
     /// (preserving its GPU-argmax fast path, on by default, for the
-    /// common single-sequence case) rather than taking this path with
-    /// a batch of one — there's nothing to amortize across a batch that
-    /// doesn't have at least two members, and this path never attempts
-    /// GPU sampling at all (always returns `Logits`, letting the caller —
-    /// `engine::batch::BatchCoordinator` — sample on the CPU), so a
-    /// batch-of-one here would be strictly worse than the existing
-    /// single-sequence path for no benefit.
+    /// common single-sequence case) rather than taking either batched
+    /// path with a batch of one — there's nothing to amortize across a
+    /// batch that doesn't have at least two members, and neither batched
+    /// path below ever attempts GPU sampling at all (always returns
+    /// `Logits`, letting the caller — `engine::batch::BatchCoordinator` —
+    /// sample on the CPU), so a batch-of-one here would be strictly worse
+    /// than the existing single-sequence path for no benefit.
     ///
-    /// Correctness-verified (`forward_batch_decode_matches_independent_
-    /// forward_calls_*`, below) but **only reached when a caller opts in**
-    /// (`ORANGU_BATCH_DECODE=1`) — `engine::generate::Engine::
-    /// batch_coordinator`'s own doc comment has the real, measured
-    /// concurrent-load numbers (slower, not faster) and the likely cause:
-    /// unlike `Self::record_decode_forward`'s one-round-trip single-
-    /// sequence pipeline, every matmul call here goes through the generic
-    /// `Backend::matmul`/`matmul_batch` trait methods, which always read
-    /// back to the CPU in between. One more honest observation from that
-    /// same real-model testing, unrelated to the throughput question:
-    /// generating many tokens (~100) through this path can *diverge* from
-    /// what the single-sequence path would have generated for the exact
-    /// same prompt — not a bug (the per-step logits already match within
-    /// the tight tolerance the tests below check), just the expected
-    /// consequence of greedy decoding being sensitive to tiny floating-
-    /// point differences: this path's attention step is a CPU loop even
-    /// when the matmuls around it run on Vulkan (see below), while the
-    /// single-sequence path's attention runs the GPU `gpu_attention`
-    /// kernel — two independently-written, both-correct implementations
-    /// of the same math whose tiny per-step differences can compound, over
-    /// enough autoregressive steps, into an argmax flipping to a different
+    /// For a real batch (`items.len() >= 2`) against the Vulkan backend,
+    /// `Self::record_batched_decode_forward` (that method's own doc
+    /// comment has the details) is used — every sequence's whole decode
+    /// step chained into one shared GPU submission. Every other backend
+    /// (in practice, just `CpuBackend`) falls back to the CPU-orchestrated
+    /// path below: structurally, this mirrors `Self::forward`'s CPU-
+    /// orchestrated `else` branch almost exactly — same per-layer
+    /// sequence of matmul/norm/RoPE/attention/residual steps, same math —
+    /// except every place that branch loops `for t in 0..n_tokens` over
+    /// *one* sequence's multiple positions, this loops over `items` — *N
+    /// different sequences'* own single position each — and every matmul
+    /// call's `n_tokens` argument becomes `items.len()` (the batch width)
+    /// instead of a prompt's length.
+    ///
+    /// Both batched paths are correctness-verified
+    /// (`forward_batch_decode_matches_independent_forward_calls_*`,
+    /// below) against independent per-sequence `forward` calls. One
+    /// honest observation from real-model testing, true of the CPU-
+    /// orchestrated fallback specifically (not the Vulkan path, which
+    /// reuses the exact same `gpu_attention` kernel per sequence the
+    /// single-sequence decode path uses): generating many tokens (~100)
+    /// through it can *diverge* from what the single-sequence path would
+    /// have generated for the exact same prompt — not a bug (the per-step
+    /// logits already match within the tight tolerance the tests below
+    /// check), just the expected consequence of greedy decoding being
+    /// sensitive to tiny floating-point differences: the CPU-orchestrated
+    /// fallback's attention step is its own independently-written CPU
+    /// loop, not the single-sequence path's GPU kernel — two
+    /// independently-written, both-correct implementations of the same
+    /// math whose tiny per-step differences can compound, over enough
+    /// autoregressive steps, into an argmax flipping to a different
     /// (still fluent, still coherent) token somewhere along the way.
     fn forward_batch_decode(
         &self,
@@ -1155,9 +1290,18 @@ impl ModelForward for GemmaModel {
                         &[item.token],
                         item.start_pos,
                         item.greedy_sample.take(),
+                        item.slot_id,
                     )
                 })
                 .collect();
+        }
+
+        if let Some(vulkan) = self.backend.as_vulkan() {
+            return Ok(self
+                .record_batched_decode_forward(vulkan, items)
+                .into_iter()
+                .map(ForwardOutcome::Logits)
+                .collect());
         }
 
         let n_embd = self.config.n_embd;
@@ -1578,7 +1722,7 @@ mod real_model_tests {
 
         let mut cache = model.new_kv_cache(64);
         let tokens: Vec<u32> = vec![2, 818, 5279, 529, 7001, 563];
-        let logits = model.forward(&mut cache, &tokens, 0).expect("forward");
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
         let (top_id, _) = logits
             .iter()
             .copied()
@@ -1687,22 +1831,23 @@ mod real_model_tests {
     /// prefill is fully deterministic here (`forward`'s raw logits,
     /// argmax'd directly, no `Sampler`/RNG involved), so both sets reach
     /// identical starting state regardless. Run against both backends
-    /// this project ships:
-    /// - On `CpuBackend`, expect **bit-for-bit** equality: both paths
-    ///   compute attention via the exact same CPU loop, and `Backend::
-    ///   matmul`/`matmul_batch` compute every `(row, token)` pair via an
-    ///   independent dot product (`CpuBackend::matmul`'s own doc comment),
-    ///   so batching sequences together doesn't change any individual
-    ///   result's arithmetic at all.
-    /// - On `VulkanBackend` (skipped if no adapter is available), expect
-    ///   only a **small tolerance**: `forward`'s single-sequence fused
-    ///   path computes attention via the GPU `gpu_attention` kernel, but
-    ///   `forward_batch_decode`'s attention step is a CPU loop even when
-    ///   the matmul steps around it run on Vulkan (see that method's own
-    ///   doc comment for why) — two independently-written, both-correct
-    ///   floating-point implementations of the same math, not the same
-    ///   code path reordered, so a tiny numerical difference here is
-    ///   expected, not a bug.
+    /// this project ships, expecting **bit-for-bit** equality on both:
+    /// - On `CpuBackend`, both paths compute attention via the exact same
+    ///   CPU loop, and `Backend::matmul`/`matmul_batch` compute every
+    ///   `(row, token)` pair via an independent dot product (`CpuBackend::
+    ///   matmul`'s own doc comment), so batching sequences together
+    ///   doesn't change any individual result's arithmetic at all.
+    /// - On `VulkanBackend` (skipped if no adapter is available),
+    ///   `forward_batch_decode` now takes `GemmaModel::record_batched_
+    ///   decode_forward` for a real batch — the *exact same* per-sequence
+    ///   GPU chain (`record_one_sequence_decode`, including the same
+    ///   `gpu_attention` WGSL kernel) `forward`'s own single-sequence path
+    ///   uses, just recorded once per sequence into one shared submission
+    ///   instead of a separate submission per sequence. Not two
+    ///   independently-written implementations of the same math
+    ///   converging within a tolerance — literally the same dispatches
+    ///   and per-sequence buffers/bind groups, so bit-for-bit equality is
+    ///   the right bar here too, not just a plausible one.
     #[test]
     #[ignore]
     fn forward_batch_decode_matches_independent_forward_calls_cpu() {
@@ -1739,7 +1884,7 @@ mod real_model_tests {
             let mut caches: Vec<KvCache> = prompts.iter().map(|_| model.new_kv_cache(64)).collect();
             let mut next = Vec::new();
             for (cache, prompt) in caches.iter_mut().zip(&prompts) {
-                let logits = model.forward(cache, prompt, 0).expect("prefill");
+                let logits = model.forward(cache, prompt, 0, 0).expect("prefill");
                 let (top, _) = logits
                     .iter()
                     .copied()
@@ -1759,7 +1904,7 @@ mod real_model_tests {
         for (i, cache) in independent_caches.iter_mut().enumerate() {
             let pos = prompts[i].len();
             let logits = model
-                .forward(cache, &[next_tokens[i]], pos)
+                .forward(cache, &[next_tokens[i]], pos, i)
                 .expect("independent decode");
             expected.push(logits);
         }
@@ -1772,6 +1917,7 @@ mod real_model_tests {
                 token: next_tokens[i],
                 start_pos: prompts[i].len(),
                 greedy_sample: None,
+                slot_id: i,
             })
             .collect();
         let outcomes = model
@@ -1788,23 +1934,105 @@ mod real_model_tests {
             };
             assert_eq!(expected[i].len(), got.len());
             for (j, (a, b)) in expected[i].iter().zip(got.iter()).enumerate() {
-                // Bit-for-bit on the CPU backend (both paths use the exact
-                // same CPU attention loop); a small tolerance on Vulkan,
-                // where `expected` comes from `forward`'s fully GPU-
-                // resident fused path (attention via the `gpu_attention`
-                // WGSL kernel) but `got` comes from `forward_batch_decode`,
-                // whose attention step is a CPU loop even when the matmul
-                // steps around it run on the Vulkan backend (see that
-                // method's own doc comment) — two independently-written,
-                // both-correct floating-point implementations of the same
-                // math, not the same code path reordered, so a tiny
-                // numerical difference here is expected, not a bug.
-                let tol = 3e-3 * a.abs().max(1.0);
-                assert!(
-                    (a - b).abs() <= tol,
+                // Bit-for-bit on both backends — see this test function's
+                // own doc comment for why the Vulkan case is no longer
+                // just "close": `record_batched_decode_forward` records
+                // the *same* per-sequence GPU chain `forward` itself uses,
+                // just sharing one submission across the batch.
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
                     "sequence {i}, logit {j}: independent={a} batched={b}"
                 );
             }
+        }
+    }
+
+    /// A cheaper, stronger invariant than comparing against `forward`:
+    /// `n` *identical* prompts, batched together, greedy-decoded for
+    /// several sequential steps — every sequence must produce the exact
+    /// same token trajectory as every other, at every step, trivially
+    /// (same input, same deterministic greedy math, no RNG anywhere in
+    /// this call chain), regardless of what the "correct" trajectory
+    /// even is. Doesn't need a second, independent `forward` call to
+    /// compare against — a single wrong output would still make two
+    /// identical sequences disagree with *each other* — so this is a
+    /// direct test of whether `Self::record_batched_decode_forward`
+    /// keeps sequences correctly isolated across *many* calls (batch
+    /// composition changing turn to turn is the norm in
+    /// `engine::batch::BatchCoordinator`'s real usage, not the
+    /// exception this test's own single-batch-call sibling above never
+    /// exercises).
+    #[test]
+    #[ignore]
+    fn forward_batch_decode_identical_prompts_stay_identical_over_many_steps_vulkan() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let backend: Arc<dyn crate::engine::backend::Backend> = Arc::new(vulkan);
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model = GemmaModel::load_with_backend(&loaded, backend).expect("build model");
+
+        const N: usize = 2;
+        const STEPS: usize = 8;
+        let prompt = vec![2u32, 818, 5279, 529, 7001, 563];
+
+        let mut caches: Vec<KvCache> = (0..N).map(|_| model.new_kv_cache(64)).collect();
+        let mut tokens = Vec::with_capacity(N);
+        for cache in &mut caches {
+            let logits = model.forward(cache, &prompt, 0, 0).expect("prefill");
+            let (top, _) = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            tokens.push(top as u32);
+        }
+        assert!(
+            tokens.iter().all(|&t| t == tokens[0]),
+            "identical prompts must prefill to the identical first token, got {tokens:?}"
+        );
+
+        for step in 0..STEPS {
+            let pos = prompt.len() + step;
+            let mut items: Vec<_> = caches
+                .iter_mut()
+                .enumerate()
+                .map(|(i, cache)| crate::engine::arch::BatchDecodeItem {
+                    cache,
+                    token: tokens[i],
+                    start_pos: pos,
+                    greedy_sample: None,
+                    slot_id: i,
+                })
+                .collect();
+            let outcomes = model
+                .forward_batch_decode(&mut items)
+                .expect("batched decode");
+            assert_eq!(outcomes.len(), N);
+
+            let mut next_tokens = Vec::with_capacity(N);
+            for outcome in outcomes {
+                let crate::engine::arch::ForwardOutcome::Logits(logits) = outcome else {
+                    panic!("expected Logits — the batched path never GPU-samples");
+                };
+                let (top, _) = logits
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .unwrap();
+                next_tokens.push(top as u32);
+            }
+            assert!(
+                next_tokens.iter().all(|&t| t == next_tokens[0]),
+                "step {step}: identical prompts must stay identical, got {next_tokens:?} \
+                 (pos={pos})"
+            );
+            tokens = next_tokens;
         }
     }
 }

@@ -88,6 +88,12 @@ pub struct BatchDecodeRequest {
     pub token: u32,
     pub start_pos: usize,
     pub greedy_sample: Option<OwnedGreedySample>,
+    /// The submitting request's own `engine::scheduler::SlotGuard::id()`
+    /// — threaded straight through into the `BatchDecodeItem` this
+    /// becomes; see that field's own doc comment for why it has to be
+    /// the slot id, not this request's position within whatever batch it
+    /// ends up in.
+    pub slot_id: usize,
 }
 
 /// [`BatchDecodeRequest`]'s result: the same cache, with this step's new
@@ -213,6 +219,7 @@ impl BatchCoordinator {
                         recent_tokens: &g.recent_tokens,
                         repeat_penalty: g.repeat_penalty,
                     }),
+                    slot_id: req.slot_id,
                 })
                 .collect();
             match model.forward_batch_decode(&mut items) {
@@ -268,6 +275,7 @@ mod tests {
             _cache: &mut KvCache,
             _tokens: &[u32],
             _start_pos: usize,
+            _slot_id: usize,
         ) -> anyhow::Result<Vec<f32>> {
             unimplemented!("not exercised by this test")
         }
@@ -322,6 +330,7 @@ mod tests {
                                 token: i,
                                 start_pos: 0,
                                 greedy_sample: None,
+                                slot_id: i as usize,
                             },
                         );
                         match response.outcome {
@@ -365,6 +374,7 @@ mod tests {
                 token: 7,
                 start_pos: 0,
                 greedy_sample: None,
+                slot_id: _guard.id(),
             },
         );
         match response.outcome {
