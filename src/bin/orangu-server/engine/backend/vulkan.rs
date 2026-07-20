@@ -1030,6 +1030,17 @@ pub struct VulkanBackend {
     /// env var (the same precedent as `wide_packed_pipeline`), not promoted
     /// to default.
     q4_k_unroll_packed_pipeline: Option<wgpu::ComputePipeline>,
+    /// The dual-nibble `Q4_K` decode kernel
+    /// (`vulkan_shaders::shader_source_reduce_q4k_dual_nibble`) — reads each
+    /// qs byte once and dequantizes both nibbles in one 32-thread
+    /// (single-subgroup) workgroup, halving the two-wave block-unroll's
+    /// redundant weight streaming (`SERVER_ROADMAP.md` Step 2). `Some` when
+    /// `wide_unroll` is on and neither `ORANGU_NO_DUAL_NIBBLE=1` nor
+    /// `ORANGU_PACKED_DOT=1` is set (**on by default** for `Q4_K` decode);
+    /// selected ahead of every other `Q4_K` reduce kernel in `pipeline_for`.
+    /// Still `REDUCE_N_ROWS`-batched, so `selects_wide_unroll`/
+    /// `build_op_resources`' dispatch count applies unchanged.
+    q4_k_dual_pipeline: Option<wgpu::ComputePipeline>,
     /// The prefill cooperative path's tiled-GEMM alternative
     /// (`pipelines_coop_tiled`, `vulkan_shaders::shader_source_coop_
     /// tiled`) to the plain cooperative kernel (`pipelines_coop`,
@@ -1268,21 +1279,48 @@ const MAX_MATMUL_TOKENS_PER_SUBMISSION: usize = 128;
 /// [`VulkanBackend::build_op_resources`]'s dispatch-count computation — no
 /// second hardcoded copy to drift out of sync with this one.
 ///
-/// Swept against 2, 8, and 16 with a real same-session A/B (3 rounds,
-/// alternating, warmup + a measured 128-token greedy generation each): `4`
-/// won every round outright, with the same ordering (`4 > 2 > 8 > 16`) in
-/// all three. Larger values add per-workgroup register/shared-memory
-/// pressure and dispatch fewer, larger workgroups for the same output
-/// dimension without buying enough additional memory-level parallelism to
-/// pay for it; smaller values dispatch more workgroups that each reuse
-/// `x[k]` across fewer rows, so the *same* activation elements get re-read
-/// from memory more times in total across the whole dispatch. `4` sits at
-/// the point those two costs balance for this backend's decode-time output
-/// dimensions. Kept correctness-verified at every one of those swept
-/// values too (every existing cross-check test passed under each, not just
-/// the shipped default), confirming the generator in `vulkan_shaders` is
-/// genuinely parameterized rather than only accidentally correct at `4`.
-const REDUCE_N_ROWS: usize = 4;
+/// Originally `4`, from a pre-Step-1 A/B (see `SERVER_ROADMAP.md`): larger
+/// values add per-workgroup register/shared-memory pressure and dispatch
+/// fewer, larger workgroups without buying enough memory-level parallelism
+/// to pay for it; smaller values dispatch more workgroups that each reuse
+/// `x[k]` across fewer rows, re-reading the *same* activation elements more
+/// times across the whole dispatch. `4` balanced those two — but that
+/// balance was struck while a decode step's wall clock was dominated by
+/// `queue.submit()`'s per-resource CPU cost (Track A), where *fewer*
+/// workgroups also meant fewer resources to validate, biasing the pick
+/// upward. **Re-swept to `2` after Steps 1 and 2** (`SERVER_ROADMAP.md`):
+/// with Step 1's chunked submission removing that CPU bias and Step 2's
+/// dual-nibble kernel (the default `Q4_K` decode path) doing ~2× the
+/// per-lane work in a 32-thread workgroup, more/smaller workgroups now win
+/// on real GPU occupancy — dual-nibble `total_gpu` measured 34.9ms at `4`
+/// vs **33.2ms at `2`** (+~5%), while the (now non-default) two-wave kernel
+/// was flat between the two (44.5 vs 44.0ms, within noise), so `2` helps
+/// the default path at no measured cost to the fallback. Every cross-check
+/// test passes at each swept value — the generator is genuinely
+/// parameterized, not accidentally correct at one row count.
+const REDUCE_N_ROWS_DEFAULT: usize = 2;
+
+/// Output rows one decode matmul-vec workgroup computes (see
+/// `REDUCE_N_ROWS_DEFAULT`'s own doc comment above). Read once from
+/// `ORANGU_REDUCE_N_ROWS` (default `REDUCE_N_ROWS_DEFAULT`, clamped
+/// `1..=16`), so the same value drives both pipeline creation and the
+/// dispatch-count math (`ceil(out_dim / n)`). Lower values launch *more*
+/// workgroups per matmul — more independent wavefronts in flight per CU to
+/// hide VRAM latency on this bandwidth-bound decode — at the cost of
+/// re-reading each shared activation element in more workgroups; `4` was
+/// the historical balance, re-swept against `total_gpu` in
+/// `SERVER_ROADMAP.md` Step 2 now that Step 1 made GPU execution the
+/// critical path.
+fn reduce_n_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_REDUCE_N_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| (1..=16).contains(&n))
+            .unwrap_or(REDUCE_N_ROWS_DEFAULT)
+    })
+}
 
 /// How many workgroups split-k attention
 /// (`vulkan_shaders::ATTENTION_SPLIT_SHADER_TEMPLATE`) splits each query
@@ -1419,6 +1457,16 @@ impl VulkanBackend {
         // gate — the arithmetic is all `f32`, only `unpack2x16float` (core
         // WGSL) touches half-floats.
         let wide_unroll = std::env::var_os("ORANGU_NO_MLP_UNROLL").is_none();
+        // See `Self::q4_k_dual_pipeline`'s own doc comment. **On by default**
+        // for `Q4_K` decode (opt out with `ORANGU_NO_DUAL_NIBBLE=1`), the
+        // same convention as `wide_unroll`/`tiled_prefill`. Only active when
+        // the block-unroll it replaces is itself on (`wide_unroll`), and
+        // deferred to the explicit `ORANGU_PACKED_DOT=1` kernel when that's
+        // requested (measured slower here, but kept reachable for A/B). It
+        // reorders the per-lane float adds vs. the two-wave kernel, so
+        // unlike `wide_unroll` it cross-checks against `CpuBackend` within a
+        // tolerance, not bit-for-bit (`SERVER_ROADMAP.md` Step 2).
+        let dual_nibble = std::env::var_os("ORANGU_NO_DUAL_NIBBLE").is_none();
         // Split-k attention — **on by
         // default** (opt out with `ORANGU_NO_ATTN_SPLIT=1`), same
         // precedent as `wide_unroll`/`kv_f16`: measured
@@ -1589,7 +1637,7 @@ impl VulkanBackend {
                 ggml_type,
                 build_pipeline(vulkan_shaders::shader_source_reduce(
                     ggml_type,
-                    REDUCE_N_ROWS,
+                    reduce_n_rows(),
                     subgroup_reduce,
                 )?),
             );
@@ -1798,7 +1846,7 @@ impl VulkanBackend {
                 .filter_map(|&ggml_type| {
                     let source = vulkan_shaders::shader_source_reduce_wide_load(
                         ggml_type,
-                        REDUCE_N_ROWS,
+                        reduce_n_rows(),
                         subgroup_reduce,
                     )?;
                     Some((ggml_type, build_pipeline(source)))
@@ -1825,7 +1873,7 @@ impl VulkanBackend {
                 .filter_map(|&ggml_type| {
                     let source = vulkan_shaders::shader_source_reduce_wide_unroll(
                         ggml_type,
-                        REDUCE_N_ROWS,
+                        reduce_n_rows(),
                         subgroup_reduce,
                     )?;
                     Some((ggml_type, build_pipeline(source)))
@@ -1842,10 +1890,25 @@ impl VulkanBackend {
         let q4_k_unroll_packed_pipeline = (wide_unroll && packed_dot_f16).then(|| {
             build_pipeline(
                 vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16(
-                    REDUCE_N_ROWS,
+                    reduce_n_rows(),
                     subgroup_reduce,
                 ),
             )
+        });
+
+        // See `Self::q4_k_dual_pipeline`'s own doc comment. Built when the
+        // block-unroll is on, dual-nibble isn't opted out, and the explicit
+        // packed-`f16` kernel isn't requested (it takes over the `Q4_K`
+        // decode path when set). `supports_subgroup` — not the
+        // `ORANGU_SUBGROUP` opt-in `subgroup_reduce` encodes — drives the
+        // reduction here: a 32-thread workgroup is a single subgroup, so
+        // `subgroupAdd` is an unconditional win (no cross-subgroup barrier
+        // to weigh, unlike the 64-thread kernels `subgroup_reduce` gates).
+        let q4_k_dual_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16).then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q4k_dual_nibble(
+                reduce_n_rows(),
+                supports_subgroup,
+            ))
         });
 
         // See `Self::record_argmax_sample`'s own doc comment — three
@@ -1989,6 +2052,7 @@ impl VulkanBackend {
             wide_unroll,
             wide_unroll_pipelines,
             q4_k_unroll_packed_pipeline,
+            q4_k_dual_pipeline,
             tiled_prefill,
             argmax_bind_group_layout,
             argmax_split_bind_group_layout,
@@ -2316,6 +2380,18 @@ impl VulkanBackend {
     }
 
     fn pipeline_for(&self, ggml_type: u32, n_tokens: usize) -> &wgpu::ComputePipeline {
+        // Dual-nibble `Q4_K` decode kernel — checked *first*, ahead of every
+        // other `Q4_K` reduce variant, so it's the default decode path (see
+        // `Self::q4_k_dual_pipeline`). Same `REDUCE_N_ROWS`-batched dispatch
+        // as the block-unroll, so no `build_op_resources` special case
+        // (`selects_wide_unroll` still returns `true` here — the block-unroll
+        // pipelines are still built — keeping the dispatch count right).
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
+            && n_tokens < COOP_MIN_N_TOKENS
+            && let Some(pipeline) = &self.q4_k_dual_pipeline
+        {
+            return pipeline;
+        }
         // Checked *before* every other decode special case below, so the
         // default-on memory-level-parallelism block-unroll (opt out
         // with `ORANGU_NO_MLP_UNROLL=1`) takes precedence over `wide_load`/
@@ -2579,7 +2655,7 @@ impl VulkanBackend {
         } else if one_row_per_workgroup {
             (out_dim * n_tokens) as u32
         } else {
-            (out_dim.div_ceil(REDUCE_N_ROWS) * n_tokens) as u32
+            (out_dim.div_ceil(reduce_n_rows()) * n_tokens) as u32
         };
         let workgroups = Self::workgroup_dims(total_workgroups);
 

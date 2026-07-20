@@ -1603,6 +1603,178 @@ pub fn shader_source_reduce_q4k_wide_unroll(n_rows: usize, subgroup: bool) -> St
     format!("{PRELUDE_VEC4}\n{Q4K_UNROLL_MIDDLE}\n{suffix}")
 }
 
+/// `Q4_K` decode kernel that reads every qs byte **once** and dequantizes
+/// *both* its nibbles — the fix for `Q4K_UNROLL_MIDDLE`'s 2× redundant
+/// weight streaming (`SERVER_ROADMAP.md` Step 2). The two-wave
+/// `block_dot` above splits a 64-thread workgroup into two wave32s that
+/// *each* load the whole 144-byte block — one taking low nibbles
+/// (`is_low`), one high (`local - 32`) — so every weight byte is fetched
+/// twice. Here one **32-thread** workgroup owns a whole super-block: lane
+/// `local` (0..31) loads the four qs bytes at in-group position `local` of
+/// the four 64-groups and, per group, emits *both* the low-nibble element
+/// (position `g*64 + local`, activation `xl_g`) and the high-nibble element
+/// (position `g*64 + 32 + local`, activation `xh_g`), reusing the identical
+/// `q4k_elem`/`qs_byte_q4k` math so the value stays within the same
+/// float-reorder tolerance the existing kernel variants already have vs.
+/// each other and `CpuBackend` (one lane now sums a low+high pair the two
+/// waves previously summed separately, so the add order differs — not
+/// bit-identical, but within `matmul_matches_cpu_backend_for_q4_k`'s
+/// tolerance). 32 threads == one wave32 subgroup on this hardware, so the
+/// reduction is a single barrier-free `subgroupAdd` when `subgroup` is set
+/// (else a 32-wide barrier tree). `n_rows` output rows share the workgroup
+/// and its hoisted activations, exactly as `unroll_suffix` does.
+pub fn shader_source_reduce_q4k_dual_nibble(n_rows: usize, subgroup: bool) -> String {
+    let suffix = dual_nibble_suffix(n_rows, subgroup);
+    format!("{PRELUDE_VEC4}\n{Q4K_DUAL_MIDDLE}\n{suffix}")
+}
+
+const Q4K_DUAL_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 144u;
+const BLOCK_ELEMS: u32 = 256u;
+
+fn qs_byte_q4k(vec4_base: u32, qi: u32) -> u32 {
+    let v4i = vec4_base + 1u + qi / 16u;
+    let word = vec4_word(weights[v4i], (qi % 16u) / 4u);
+    return (word >> (8u * (qi % 4u))) & 0xFFu;
+}
+
+fn q4k_elem(d: f32, dmin: f32, scales: vec3<u32>, g: u32, is_low: bool, byte: u32) -> f32 {
+    let is_idx = g * 2u + select(1u, 0u, is_low);
+    let sm = get_scale_min_k4_v4(scales, is_idx);
+    let dd = d * f32(sm.x);
+    let mm = dmin * f32(sm.y);
+    let nib = select(byte >> 4u, byte & 0xFu, is_low);
+    return dd * f32(nib) - mm;
+}
+
+// One 256-element super-block for `local` in 0..31. Each of the four qs
+// bytes (one per 64-group, at group-relative position `local`) is loaded
+// exactly once; both of its nibbles are consumed — the low nibble against
+// `xl_g` (position `g*64 + local`), the high nibble against `xh_g`
+// (position `g*64 + 32 + local`). Header + the four byte loads are issued
+// before the dependent dequant-and-multiply-adds, same memory-level-
+// parallelism idiom as the two-wave `block_dot`.
+fn block_dot_dual(byte_offset: u32, local: u32,
+                  xl0: f32, xh0: f32, xl1: f32, xh1: f32,
+                  xl2: f32, xh2: f32, xl3: f32, xh3: f32) -> f32 {
+    let vec4_base = byte_offset / 16u;
+    let header = weights[vec4_base];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+    let scales = vec3<u32>(header.y, header.z, header.w);
+    let b0 = qs_byte_q4k(vec4_base, local);
+    let b1 = qs_byte_q4k(vec4_base, 32u + local);
+    let b2 = qs_byte_q4k(vec4_base, 64u + local);
+    let b3 = qs_byte_q4k(vec4_base, 96u + local);
+    return q4k_elem(d, dmin, scales, 0u, true, b0) * xl0
+         + q4k_elem(d, dmin, scales, 0u, false, b0) * xh0
+         + q4k_elem(d, dmin, scales, 1u, true, b1) * xl1
+         + q4k_elem(d, dmin, scales, 1u, false, b1) * xh1
+         + q4k_elem(d, dmin, scales, 2u, true, b2) * xl2
+         + q4k_elem(d, dmin, scales, 2u, false, b2) * xh2
+         + q4k_elem(d, dmin, scales, 3u, true, b3) * xl3
+         + q4k_elem(d, dmin, scales, 3u, false, b3) * xh3;
+}
+"#;
+
+/// The `@compute fn main` for the dual-nibble kernel — a 32-thread
+/// (one-wave32-subgroup) analogue of [`unroll_suffix`]. Same
+/// `ceil(out_dim / n_rows) * n_tokens` workgroup dispatch (so
+/// `build_op_resources`/`selects_wide_unroll`'s existing count applies
+/// unchanged — only the threads-per-workgroup differs, 32 vs 64), but each
+/// lane gathers **eight** activations per block (a low/high pair per
+/// 64-group) and calls `block_dot_dual` once per output row. The reduction
+/// is `subgroupAdd` (no `workgroupBarrier`, since the whole 32-lane
+/// workgroup is a single subgroup) when `subgroup`, else a 32-wide barrier
+/// tree.
+fn dual_nibble_suffix(n_rows: usize, subgroup: bool) -> String {
+    let mut s = format!(
+        "var<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 32
+    );
+    s.push_str("@compute @workgroup_size(32)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("\n    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = 0u;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
+    s.push_str(
+        "        let block_off = b * BLOCK_BYTES;\n        let x_blk = x_base + b * BLOCK_ELEMS;\n",
+    );
+    s.push_str("        let xl0 = x[x_blk + local];\n        let xh0 = x[x_blk + 32u + local];\n        let xl1 = x[x_blk + 64u + local];\n        let xh1 = x[x_blk + 96u + local];\n        let xl2 = x[x_blk + 128u + local];\n        let xh2 = x[x_blk + 160u + local];\n        let xl3 = x[x_blk + 192u + local];\n        let xh3 = x[x_blk + 224u + local];\n");
+    s.push_str(
+        "        partial0 = partial0 + block_dot_dual(o0 * params.row_bytes + block_off, local, xl0, xh0, xl1, xh1, xl2, xh2, xl3, xh3);\n",
+    );
+    for i in 1..n_rows {
+        s.push_str(&format!(
+            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + block_dot_dual(o{i} * params.row_bytes + block_off, local, xl0, xh0, xl1, xh1, xl2, xh2, xl3, xh3);\n        }}\n"
+        ));
+    }
+    s.push_str("        b = b + 1u;\n    }\n\n");
+    s.push_str(&dual_nibble_reduce(n_rows, subgroup));
+    s.push_str("}\n");
+    s
+}
+
+/// Combine step for [`dual_nibble_suffix`]: reduce each output row's 32
+/// per-lane partials to one value. `subgroup` → a single `subgroupAdd` per
+/// row (the workgroup is exactly one subgroup, so no `workgroupBarrier` and
+/// no cross-subgroup pass is needed, unlike `reduce_combine_block`'s
+/// 64-thread/2-subgroup case); otherwise a 32-wide shared-memory barrier
+/// tree (`stride = 16,8,4,2,1`).
+fn dual_nibble_reduce(n_rows: usize, subgroup: bool) -> String {
+    let mut s = String::new();
+    if subgroup {
+        for i in 0..n_rows {
+            s.push_str(&format!("    let sg{i} = subgroupAdd(partial{i});\n"));
+        }
+        s.push_str("    if (sg_lane == 0u) {\n");
+        s.push_str("        y[t * params.out_dim + o0] = sg0;\n");
+        for i in 1..n_rows {
+            s.push_str(&format!(
+                "        if (o{i} < params.out_dim) {{\n            y[t * params.out_dim + o{i}] = sg{i};\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
+    } else {
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "    partial_sums[{i}u * 32u + local] = partial{i};\n"
+            ));
+        }
+        s.push_str("    workgroupBarrier();\n    var stride: u32 = 16u;\n    loop {\n        if (stride == 0u) {\n            break;\n        }\n        if (local < stride) {\n");
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "            partial_sums[{i}u * 32u + local] = partial_sums[{i}u * 32u + local] + partial_sums[{i}u * 32u + local + stride];\n"
+            ));
+        }
+        s.push_str(
+            "        }\n        workgroupBarrier();\n        stride = stride / 2u;\n    }\n",
+        );
+        s.push_str("    if (local == 0u) {\n");
+        s.push_str("        y[t * params.out_dim + o0] = partial_sums[0];\n");
+        for i in 1..n_rows {
+            s.push_str(&format!(
+                "        if (o{i} < params.out_dim) {{\n            y[t * params.out_dim + o{i}] = partial_sums[{i}u * 32u];\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
+    }
+    s
+}
+
 /// See `shader_source_reduce_q4k_wide_unroll` — same memory-level-parallelism
 /// restructuring, for `Q5_K` (`Q5K_UNROLL_MIDDLE`).
 pub fn shader_source_reduce_q5k_wide_unroll(n_rows: usize, subgroup: bool) -> String {
