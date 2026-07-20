@@ -610,8 +610,8 @@ const WEIGHT_ARENA_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
 /// instead of one `wgpu::Buffer` per tensor (previously 200+ for a
 /// multi-layer model — real, measured `queue.submit()` cost, since
 /// `wgpu-core`'s own per-submission resource validation and automatic
-/// barrier insertion both scale with distinct-resource count, not GPU work;
-/// see `doc/SERVER_ROADMAP.md` items 15/16). Weight tensors are permanent
+/// barrier insertion both scale with distinct-resource count, not GPU
+/// work). Weight tensors are permanent
 /// and read-only after their first upload, so packing many into one chunk
 /// carries none of the write-ordering risk `CachedOpResources`'s own
 /// per-call scratch buffers need `ScratchArena`'s own placement discipline
@@ -811,7 +811,6 @@ pub struct VulkanBackend {
     fused_x1_arena: Mutex<ScratchArena>,
     fused_ffn_normed_arena: Mutex<ScratchArena>,
     fused_gelu_arena: Mutex<ScratchArena>,
-    fused_mulled_arena: Mutex<ScratchArena>,
     fused_x2_arena: Mutex<ScratchArena>,
     fused_ple_per_layer_arena: Mutex<ScratchArena>,
     fused_ple_gelu_arena: Mutex<ScratchArena>,
@@ -868,11 +867,23 @@ pub struct VulkanBackend {
     /// the correctness reference the split path's own tests check
     /// against.
     attn_pipeline: wgpu::ComputePipeline,
-    /// Split-k attention, phase 1 — see `vulkan_shaders::
-    /// ATTENTION_SPLIT_SHADER_TEMPLATE`'s own doc comment and `Self::
-    /// gpu_attention_split`. Reuses `attn_bind_group_layout` (same
-    /// binding shape).
-    attn_split_pipeline: wgpu::ComputePipeline,
+    /// Split-k attention, phase 1 (`vulkan_shaders::
+    /// ATTENTION_SPLIT_SHADER_TEMPLATE`) — the decode hot path. Built
+    /// **lazily per head_dim** (`Self::attn_split_pipeline_for`) so each
+    /// layer's kernel sizes its workgroup-shared `acc` accumulator to that
+    /// layer's real head_dim (from the model) rather than a worst-case
+    /// constant, which keeps occupancy high. Keyed by head_dim; a model
+    /// with mixed head_dims (e.g. SWA vs full-attention) gets one entry
+    /// each. Reuses `attn_bind_group_layout`/`attn_pipeline_layout`.
+    attn_split_pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    /// Pipeline layout shared by `attn_pipeline` and every lazily-built
+    /// `attn_split_pipelines` entry (same binding shape).
+    attn_pipeline_layout: wgpu::PipelineLayout,
+    /// Whether the subgroup-reduce shader variants were selected
+    /// (`supports_subgroup && ORANGU_SUBGROUP`) — needed to rebuild the
+    /// split-attention shader at the right head_dim in
+    /// `attn_split_pipeline_for`.
+    subgroup_reduce: bool,
     /// Split-k attention, phase 2 — see `vulkan_shaders::
     /// ATTENTION_SPLIT_REDUCE_SHADER`'s own doc comment. Reuses
     /// `elem4_bind_group_layout` (same binding shape).
@@ -1034,13 +1045,33 @@ pub struct VulkanBackend {
     /// (`vulkan_shaders::shader_source_reduce_q4k_dual_nibble`) — reads each
     /// qs byte once and dequantizes both nibbles in one 32-thread
     /// (single-subgroup) workgroup, halving the two-wave block-unroll's
-    /// redundant weight streaming (`SERVER_ROADMAP.md` Step 2). `Some` when
+    /// redundant weight streaming. `Some` when
     /// `wide_unroll` is on and neither `ORANGU_NO_DUAL_NIBBLE=1` nor
     /// `ORANGU_PACKED_DOT=1` is set (**on by default** for `Q4_K` decode);
     /// selected ahead of every other `Q4_K` reduce kernel in `pipeline_for`.
     /// Still `REDUCE_N_ROWS`-batched, so `selects_wide_unroll`/
     /// `build_op_resources`' dispatch count applies unchanged.
     q4_k_dual_pipeline: Option<wgpu::ComputePipeline>,
+    /// The contiguous-mapping `Q4_K` decode kernel
+    /// (`vulkan_shaders::shader_source_reduce_q4k_contig`) — each lane loads
+    /// a `u32` of four consecutive qs bytes (all used) plus two `vec4<f32>`
+    /// activations, ~3× fewer VMEM loads than the dual kernel's one-byte-per-
+    /// `vec4` reads. **Opt-in (`ORANGU_Q4K_CONTIG=1`), `None` by default**:
+    /// correctness-verified (byte-identical output) but measured no faster
+    /// than the dual kernel, since this matmul is memory-latency-bound rather
+    /// than load-issue-bound. Selected ahead of `q4_k_dual_pipeline` in
+    /// `pipeline_for` when built. Reads `x` (binding 1) as `array<vec4<f32>>`
+    /// — the shared matmul bind group is unchanged (storage layout is
+    /// element-type-agnostic).
+    q4_k_contig_pipeline: Option<wgpu::ComputePipeline>,
+    /// The dual `Q6_K` decode kernel
+    /// (`vulkan_shaders::shader_source_reduce_q6k_dual`) — loads each `qh`
+    /// byte once in a 32-thread (single-subgroup) workgroup instead of the
+    /// two-wave block-unroll re-reading it per `w_lo` half. `Some`/selected
+    /// on the same conditions as `q4_k_dual_pipeline`, but for `Q6_K`
+    /// (`ffn_down`/`attn_v` on the target model). Still `REDUCE_N_ROWS`-
+    /// batched, so the dispatch count is unchanged.
+    q6_k_dual_pipeline: Option<wgpu::ComputePipeline>,
     /// The prefill cooperative path's tiled-GEMM alternative
     /// (`pipelines_coop_tiled`, `vulkan_shaders::shader_source_coop_
     /// tiled`) to the plain cooperative kernel (`pipelines_coop`,
@@ -1065,6 +1096,29 @@ pub struct VulkanBackend {
     /// `kv_storage`/`packed_dot_f16` — the tiled kernel only uses plain
     /// `f32` shared memory.
     tiled_prefill: bool,
+    /// The token count at or above which a matmul takes the
+    /// weight-amortizing tiled-GEMM path (`pipelines_coop_tiled`) instead of
+    /// the reduce family (`pipelines`/the dual/unroll decode kernels). The
+    /// reduce kernels dispatch `n_row_groups * n_tokens` workgroups keyed on
+    /// `flat % n_tokens`, so **each token re-streams the whole weight matrix**
+    /// — their cost grows linearly with `n_tokens`. The tiled kernel loads a
+    /// `COOP_TILE_ROWS × in_dim` weight tile into shared memory once and
+    /// reuses it across a whole `COOP_TILE_TOKENS`-wide token tile, so its
+    /// cost is ~flat in `n_tokens` up to a tile. Below this threshold the
+    /// per-token re-stream is cheaper (a single-token workgroup keeps far more
+    /// wavefronts in flight to hide weight-load latency, which is the binding
+    /// constraint here, not weight bandwidth); at and above it the tile is
+    /// preferred instead — the per-token re-stream's cost grows without bound
+    /// with the batch, and the untiled cooperative kernel it replaces there can
+    /// drive long batches into the driver's own hang detection. `1` forces
+    /// every matmul onto the tiled path, a value past the longest batch keeps
+    /// everything on the reduce path.
+    /// Set once from `ORANGU_COOP_MIN_TOKENS` (default
+    /// [`COOP_MIN_N_TOKENS`]); the multi-position (speculative / small-chunk
+    /// prefill) forward is the regime this exposes for tuning — its handful of
+    /// query positions sat in the reduce path's linear-in-`n_tokens` cost even
+    /// though the tile would amortize the weight read across them.
+    coop_min_n_tokens: usize,
     /// Bind group layout for `argmax_penalty_pipeline` — see
     /// `argmax_bind_group_layout`.
     argmax_bind_group_layout: wgpu::BindGroupLayout,
@@ -1225,7 +1279,7 @@ struct CachedOpResources {
     /// for`'s one caller (the final `lm_head` op) actually map and read
     /// this — eagerly allocating one for *every* cached op regardless cost
     /// real `queue.submit()` per-resource tracking overhead
-    /// (`SERVER_ROADMAP.md` items 15/16) for buffers the overwhelming
+    /// for buffers the overwhelming
     /// majority of callers never touch. Not itself arena-allocated — it's
     /// only ever used by the CPU-orchestrated paths above, which are not
     /// the ones item 16 found to dominate the per-decode-step distinct-
@@ -1279,38 +1333,19 @@ const MAX_MATMUL_TOKENS_PER_SUBMISSION: usize = 128;
 /// [`VulkanBackend::build_op_resources`]'s dispatch-count computation — no
 /// second hardcoded copy to drift out of sync with this one.
 ///
-/// Originally `4`, from a pre-Step-1 A/B (see `SERVER_ROADMAP.md`): larger
-/// values add per-workgroup register/shared-memory pressure and dispatch
-/// fewer, larger workgroups without buying enough memory-level parallelism
-/// to pay for it; smaller values dispatch more workgroups that each reuse
-/// `x[k]` across fewer rows, re-reading the *same* activation elements more
-/// times across the whole dispatch. `4` balanced those two — but that
-/// balance was struck while a decode step's wall clock was dominated by
-/// `queue.submit()`'s per-resource CPU cost (Track A), where *fewer*
-/// workgroups also meant fewer resources to validate, biasing the pick
-/// upward. **Re-swept to `2` after Steps 1 and 2** (`SERVER_ROADMAP.md`):
-/// with Step 1's chunked submission removing that CPU bias and Step 2's
-/// dual-nibble kernel (the default `Q4_K` decode path) doing ~2× the
-/// per-lane work in a 32-thread workgroup, more/smaller workgroups now win
-/// on real GPU occupancy — dual-nibble `total_gpu` measured 34.9ms at `4`
-/// vs **33.2ms at `2`** (+~5%), while the (now non-default) two-wave kernel
-/// was flat between the two (44.5 vs 44.0ms, within noise), so `2` helps
-/// the default path at no measured cost to the fallback. Every cross-check
-/// test passes at each swept value — the generator is genuinely
-/// parameterized, not accidentally correct at one row count.
+/// Output rows one decode matmul-vec workgroup computes, reused as both the
+/// shader's unroll count and the dispatch-count divisor (`ceil(out_dim /
+/// n)`). Lower values launch more, smaller workgroups per matmul — more
+/// independent wavefronts in flight to hide weight-load latency on this
+/// bandwidth-bound decode — at the cost of re-reading each shared
+/// activation element in more workgroups. Env-tunable via
+/// `ORANGU_REDUCE_N_ROWS`.
 const REDUCE_N_ROWS_DEFAULT: usize = 2;
 
-/// Output rows one decode matmul-vec workgroup computes (see
-/// `REDUCE_N_ROWS_DEFAULT`'s own doc comment above). Read once from
-/// `ORANGU_REDUCE_N_ROWS` (default `REDUCE_N_ROWS_DEFAULT`, clamped
-/// `1..=16`), so the same value drives both pipeline creation and the
-/// dispatch-count math (`ceil(out_dim / n)`). Lower values launch *more*
-/// workgroups per matmul — more independent wavefronts in flight per CU to
-/// hide VRAM latency on this bandwidth-bound decode — at the cost of
-/// re-reading each shared activation element in more workgroups; `4` was
-/// the historical balance, re-swept against `total_gpu` in
-/// `SERVER_ROADMAP.md` Step 2 now that Step 1 made GPU execution the
-/// critical path.
+/// Output rows one decode matmul-vec workgroup computes — see
+/// `REDUCE_N_ROWS_DEFAULT`. Read once from `ORANGU_REDUCE_N_ROWS` (clamped
+/// `1..=16`) so the same value drives both pipeline creation and the
+/// dispatch-count math.
 fn reduce_n_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1323,14 +1358,12 @@ fn reduce_n_rows() -> usize {
 }
 
 /// Workgroup size (thread count) for the default tree-reduce RMSNorm /
-/// RMSNorm+add kernels (`ORANGU_NORM_WG`, default 128; must be a power of
-/// two in `64..=256`). These run one `dispatch_workgroups(1,1,1)` workgroup
-/// over the whole `n_embd` row, so they're occupancy-starved — using more
-/// threads shortens each thread's grid-stride loop and lights up more of
-/// one WGP's SIMDs. Item 8 measured that *halving* to 32 doubled the time
-/// (the kernel is compute/load-bound, not launch-bound), so raising it is
-/// the lever; re-swept against `total_gpu` in `SERVER_ROADMAP.md` Step 3.
-/// A malformed or out-of-range value falls back to the default.
+/// RMSNorm+add kernels (`ORANGU_NORM_WG`, must be a power of two in
+/// `64..=256`). These run one `dispatch_workgroups(1,1,1)` workgroup over
+/// the whole `n_embd` row and are compute/load-bound on that grid-stride
+/// loop, so more threads shortens each thread's loop and keeps more of the
+/// workgroup's SIMDs busy. A malformed or out-of-range value falls back to
+/// the default.
 fn norm_wg() -> usize {
     const NORM_WG_DEFAULT: usize = 128;
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1345,20 +1378,95 @@ fn norm_wg() -> usize {
 
 /// How many workgroups split-k attention
 /// (`vulkan_shaders::ATTENTION_SPLIT_SHADER_TEMPLATE`) splits each query
-/// head's KV-position range across, instead of the un-split kernel's one
-/// workgroup per head. `4` was chosen the same way as the tiled prefill
-/// kernel's own tuning constants: a starting point measured against
-/// `_scratch_measure_attention_dispatch_cost`'s isolated GPU-timestamp
-/// benchmark (`vulkan.rs`'s own test module) rather than picked blind —
-/// `n_head=8 * k_num=4 = 32` workgroups for E2B, up from 8, on hardware
-/// with (per `orangu-server system`) far more than 8 compute units to
-/// fill. A higher value adds more of split-k phase 2's own (cheap, but
-/// not free) reduce work per head without necessarily finding more real
-/// parallelism once workgroups already exceed the GPU's own compute-unit
-/// count; `4` is a reasonable middle point, not asserted to be optimal —
-/// unlike `REDUCE_N_ROWS`, this hasn't been swept across several
-/// candidate values yet.
-const ATTN_SPLIT_K: u32 = 4;
+/// head's KV-position range across — `n_head * k_num` phase-1 workgroups,
+/// up from `n_head`. Each head attends a KV range that grows with context,
+/// so more splits expose more parallelism the longer a generation runs, at
+/// the cost of more phase-2 merge work per head (which dominates when the
+/// KV range is short). Env-tunable via `ORANGU_ATTN_SPLIT_K`.
+const ATTN_SPLIT_K_DEFAULT: u32 = 8;
+
+/// Split-k factor for decode attention (`ORANGU_ATTN_SPLIT_K`; see
+/// `ATTN_SPLIT_K_DEFAULT`). Read once, cached, clamped to a power of two in
+/// `1..=32`. `k_num` is a pure runtime uniform (`AttnSplitMeta.k_num`) plus
+/// a dispatch/scratch-buffer dimension — no shader rebuild — so it drives
+/// phase-1's `(n_head, k_num, 1)` grid, the per-head partial-`(m,l,acc)`
+/// buffer sizes, and phase-2's merge count together.
+fn attn_split_k() -> u32 {
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("ORANGU_ATTN_SPLIT_K")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32))
+            .unwrap_or(ATTN_SPLIT_K_DEFAULT)
+    })
+}
+
+/// Whether the decode-path GPU-readback wait spins (`ORANGU_BUSY_POLL`)
+/// instead of blocking. The blocking wait (`PollType::wait_indefinitely()`)
+/// parks the thread while the GPU runs, so the CPU core it was on can drop
+/// its clock or be migrated off — leaving the next token's CPU-side
+/// recording/submission to start on a cold core. A spin keeps that core at
+/// 100% utilisation (so the frequency governor holds it at its boost clock)
+/// and returns within microseconds of the GPU finishing rather than after a
+/// scheduler wake-up, at the cost of pinning one core busy for the wait.
+/// Off by default — it trades power for latency, worth it only when decode
+/// throughput is the priority.
+fn busy_poll() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("ORANGU_BUSY_POLL").is_some())
+}
+
+/// If `ORANGU_DUMP_SHADERS=<dir>` is set, writes the generated WGSL for the
+/// decode-path kernels into `<dir>` (one `.wgsl` file each) at backend
+/// startup, then continues normally. A profiling aid: the driver's own
+/// `RADV_DEBUG=shaders` dumps these kernels' compiled ISA on this GPU, and
+/// the WGSL can also be handed to an offline analyzer (e.g. Radeon GPU
+/// Analyzer, which targets RDNA3+) for register/occupancy analysis. `head_
+/// dim` for the attention kernels isn't known this early, so they're dumped
+/// at a representative width noted in the filename. Best-effort — any I/O
+/// error is logged and skipped, never fatal.
+fn dump_shaders_if_requested(subgroup: bool, kv_storage: vulkan_shaders::KvStorage) {
+    let Some(dir) = std::env::var_os("ORANGU_DUMP_SHADERS") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("orangu-server: ORANGU_DUMP_SHADERS: {}: {e}", dir.display());
+        return;
+    }
+    let n = reduce_n_rows();
+    let wg = norm_wg();
+    let shaders: Vec<(String, String)> = vec![
+        (
+            "q4k_matmul_dual.wgsl".into(),
+            vulkan_shaders::shader_source_reduce_q4k_dual_nibble(n, subgroup),
+        ),
+        (
+            "q6k_matmul_dual.wgsl".into(),
+            vulkan_shaders::shader_source_reduce_q6k_dual(n, subgroup),
+        ),
+        (
+            "rmsnorm.wgsl".into(),
+            vulkan_shaders::shader_source_rmsnorm(subgroup, wg),
+        ),
+        (
+            "rmsnorm_add.wgsl".into(),
+            vulkan_shaders::shader_source_rmsnorm_add(subgroup, wg),
+        ),
+        (
+            "attention_split_headdim256.wgsl".into(),
+            vulkan_shaders::shader_source_attention_split(kv_storage, subgroup, 256),
+        ),
+    ];
+    for (name, src) in shaders {
+        let path = dir.join(&name);
+        match std::fs::write(&path, src) {
+            Ok(()) => eprintln!("orangu-server: dumped shader {}", path.display()),
+            Err(e) => eprintln!("orangu-server: dumping {}: {e}", path.display()),
+        }
+    }
+}
 
 /// How many workgroups `vulkan_shaders::ARGMAX_SPLIT_SHADER` splits the
 /// `[n_vocab]` greedy-argmax reduction across, instead of the old
@@ -1465,6 +1573,14 @@ impl VulkanBackend {
         // entirely and is measurably faster at prompt lengths where both
         // variants can still complete.
         let tiled_prefill = std::env::var_os("ORANGU_NO_TILED_PREFILL").is_none();
+        // See `Self::coop_min_n_tokens`'s own doc comment. Read once, clamped
+        // to at least 1 (a `0` would divide by zero in the reduce dispatch
+        // math); a malformed value falls back to the compile-time default.
+        let coop_min_n_tokens = std::env::var("ORANGU_COOP_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(COOP_MIN_N_TOKENS);
         // See `Self::wide_load`'s own
         // doc comment. No `supports_f16` gate, unlike `kv_f16`/
         // `packed_dot_f16` above — these kernels only use core-WGSL
@@ -1483,10 +1599,10 @@ impl VulkanBackend {
         // same convention as `wide_unroll`/`tiled_prefill`. Only active when
         // the block-unroll it replaces is itself on (`wide_unroll`), and
         // deferred to the explicit `ORANGU_PACKED_DOT=1` kernel when that's
-        // requested (measured slower here, but kept reachable for A/B). It
-        // reorders the per-lane float adds vs. the two-wave kernel, so
-        // unlike `wide_unroll` it cross-checks against `CpuBackend` within a
-        // tolerance, not bit-for-bit (`SERVER_ROADMAP.md` Step 2).
+        // requested (kept reachable for A/B). It reorders the per-lane float
+        // adds vs. the two-wave kernel, so unlike `wide_unroll` it
+        // cross-checks against `CpuBackend` within a tolerance, not
+        // bit-for-bit.
         let dual_nibble = std::env::var_os("ORANGU_NO_DUAL_NIBBLE").is_none();
         // Split-k attention — **on by
         // default** (opt out with `ORANGU_NO_ATTN_SPLIT=1`), same
@@ -1544,6 +1660,7 @@ impl VulkanBackend {
         // left for any call site to branch on afterward.
         let supports_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         let subgroup_reduce = supports_subgroup && std::env::var_os("ORANGU_SUBGROUP").is_some();
+        dump_shaders_if_requested(subgroup_reduce, kv_storage);
         // Per-layer GPU timestamps for one decode step (`Self::
         // timestamp_query_set`/`finish_timestamps`/`report_timestamps`,
         // written from `GemmaModel::record_decode_forward`). Needs both the
@@ -1732,10 +1849,19 @@ impl VulkanBackend {
             bind_group_layouts: &[Some(&attn_bind_group_layout)],
             immediate_size: 0,
         });
+        // The un-split attention pipeline is only reached by the superseded
+        // `gpu_attention` standalone (tests); it keeps the generous fixed
+        // `acc` size since it isn't on the decode hot path. The split-k
+        // pipeline that *is* on the decode path is built lazily per
+        // head_dim instead (`attn_split_pipeline_for`) so its
+        // workgroup-shared `acc` array is sized to the model's actual
+        // head_dim — read from the model, not a worst-case constant —
+        // keeping occupancy high (a 2048-entry `acc` caps it to ~8
+        // waves/SIMD; the real head_dim is a fraction of that).
         let attn_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("orangu-server attention shader"),
             source: wgpu::ShaderSource::Wgsl(
-                vulkan_shaders::shader_source_attention(kv_storage, subgroup_reduce).into(),
+                vulkan_shaders::shader_source_attention(kv_storage, subgroup_reduce, 2048).into(),
             ),
         });
         let attn_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1746,26 +1872,6 @@ impl VulkanBackend {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: pipeline_cache.as_ref(),
         });
-
-        // Split-k attention — same
-        // binding shape as `attn_pipeline` (`vulkan_shaders::
-        // ATTENTION_SPLIT_SHADER_TEMPLATE`'s own doc comment), so this
-        // reuses `attn_pipeline_layout` rather than needing its own.
-        let attn_split_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("orangu-server attention split shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                vulkan_shaders::shader_source_attention_split(kv_storage, subgroup_reduce).into(),
-            ),
-        });
-        let attn_split_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("orangu-server attention split pipeline"),
-                layout: Some(&attn_pipeline_layout),
-                module: &attn_split_module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: pipeline_cache.as_ref(),
-            });
         // Reduces split-k's `ATTN_SPLIT_K` partial results per head into
         // the final attention output — same binding shape as `add`/`mul`/
         // `rmsnorm`/`fused_norm_rope_pipeline` (`vulkan_shaders::
@@ -1932,6 +2038,35 @@ impl VulkanBackend {
             ))
         });
 
+        // See `Self::q4_k_contig_pipeline`. **Opt-in** (`ORANGU_Q4K_CONTIG=1`):
+        // it cuts VMEM load count ~3× but measured no faster than the dual
+        // kernel — the `Q4_K` matmul is memory-latency-bound here, not
+        // load-issue-bound — so the simpler dual kernel stays the default.
+        // Kept, correctness-verified, for other hardware / further study.
+        // Checked ahead of the dual pipeline in `pipeline_for` when built.
+        let q4k_contig = std::env::var_os("ORANGU_Q4K_CONTIG").is_some();
+        let q4_k_contig_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16 && q4k_contig)
+            .then(|| {
+                build_pipeline(vulkan_shaders::shader_source_reduce_q4k_contig(
+                    reduce_n_rows(),
+                    supports_subgroup,
+                ))
+            });
+
+        // See `Self::q6_k_dual_pipeline`. Same gate as the `Q4_K` dual
+        // kernel minus the `packed_dot_f16` exclusion (that kernel is
+        // `Q4_K`-only, so it never competes for the `Q6_K` decode path),
+        // plus an independent `ORANGU_NO_Q6K_DUAL` opt-out so the `Q6_K`
+        // kernel can be reverted to the two-wave block-unroll while the
+        // `Q4_K` dual kernel stays on (A/B isolation).
+        let q6k_dual = std::env::var_os("ORANGU_NO_Q6K_DUAL").is_none();
+        let q6_k_dual_pipeline = (wide_unroll && dual_nibble && q6k_dual).then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q6k_dual(
+                reduce_n_rows(),
+                supports_subgroup,
+            ))
+        });
+
         // See `Self::record_argmax_sample`'s own doc comment — three
         // phases now, not one.
         let argmax_bind_group_layout = argmax_bind_group_layout(&device);
@@ -2030,7 +2165,6 @@ impl VulkanBackend {
             fused_x1_arena: Mutex::new(ScratchArena::new()),
             fused_ffn_normed_arena: Mutex::new(ScratchArena::new()),
             fused_gelu_arena: Mutex::new(ScratchArena::new()),
-            fused_mulled_arena: Mutex::new(ScratchArena::new()),
             fused_x2_arena: Mutex::new(ScratchArena::new()),
             fused_ple_per_layer_arena: Mutex::new(ScratchArena::new()),
             fused_ple_gelu_arena: Mutex::new(ScratchArena::new()),
@@ -2052,7 +2186,9 @@ impl VulkanBackend {
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
             attn_pipeline,
-            attn_split_pipeline,
+            attn_split_pipelines: Mutex::new(HashMap::new()),
+            attn_pipeline_layout,
+            subgroup_reduce,
             attn_split_reduce_pipeline,
             submission_count: std::sync::atomic::AtomicU64::new(0),
             rope_pipeline,
@@ -2074,7 +2210,10 @@ impl VulkanBackend {
             wide_unroll_pipelines,
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
+            q4_k_contig_pipeline,
+            q6_k_dual_pipeline,
             tiled_prefill,
+            coop_min_n_tokens,
             argmax_bind_group_layout,
             argmax_split_bind_group_layout,
             argmax_penalty_pipeline,
@@ -2384,7 +2523,7 @@ impl VulkanBackend {
     /// caused a real dispatch-count bug found while adding the packed-dot
     /// kernel — one call site's condition changed, the other's didn't.
     fn use_tiled_coop(&self, n_tokens: usize) -> bool {
-        n_tokens >= COOP_MIN_N_TOKENS && self.tiled_prefill
+        n_tokens >= self.coop_min_n_tokens && self.tiled_prefill
     }
 
     /// Whether the memory-level-parallelism block-unroll kernel applies to
@@ -2396,7 +2535,7 @@ impl VulkanBackend {
     /// never disagree about which kernel is running.
     fn selects_wide_unroll(&self, ggml_type: u32, n_tokens: usize) -> bool {
         self.wide_unroll
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
             && self.wide_unroll_pipelines.contains_key(&ggml_type)
     }
 
@@ -2408,8 +2547,20 @@ impl VulkanBackend {
         // (`selects_wide_unroll` still returns `true` here — the block-unroll
         // pipelines are still built — keeping the dispatch count right).
         if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = &self.q4_k_contig_pipeline
+        {
+            return pipeline;
+        }
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
+            && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_dual_pipeline
+        {
+            return pipeline;
+        }
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q6_K
+            && n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = &self.q6_k_dual_pipeline
         {
             return pipeline;
         }
@@ -2427,7 +2578,7 @@ impl VulkanBackend {
         if self.wide_unroll
             && self.packed_dot_f16
             && ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_unroll_packed_pipeline
         {
             return pipeline;
@@ -2445,7 +2596,7 @@ impl VulkanBackend {
         if self.wide_load
             && self.packed_dot_f16
             && ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.wide_packed_pipeline
         {
             return pipeline;
@@ -2458,7 +2609,7 @@ impl VulkanBackend {
         // `SUPPORTED_TYPES` set when `wide_load` is on (see `Self::
         // try_init`).
         if self.wide_load
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = self.wide_load_pipelines.get(&ggml_type)
         {
             return pipeline;
@@ -2470,14 +2621,14 @@ impl VulkanBackend {
         // lookup below unchanged.
         if self.packed_dot_f16
             && ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
-            && n_tokens < COOP_MIN_N_TOKENS
+            && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_packed_f16_pipeline
         {
             return pipeline;
         }
         let map = if self.use_tiled_coop(n_tokens) {
             &self.pipelines_coop_tiled
-        } else if n_tokens >= COOP_MIN_N_TOKENS {
+        } else if n_tokens >= self.coop_min_n_tokens {
             &self.pipelines_coop
         } else {
             &self.pipelines
@@ -2666,12 +2817,12 @@ impl VulkanBackend {
         let one_row_per_workgroup = self.packed_dot_f16
             && !self.selects_wide_unroll(w.ggml_type(), n_tokens)
             && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K
-            && n_tokens < COOP_MIN_N_TOKENS;
+            && n_tokens < self.coop_min_n_tokens;
         let total_workgroups = if self.use_tiled_coop(n_tokens) {
             let row_tiles = out_dim.div_ceil(vulkan_shaders::COOP_TILE_ROWS as usize);
             let token_tiles = n_tokens.div_ceil(vulkan_shaders::COOP_TILE_TOKENS as usize);
             (row_tiles * token_tiles) as u32
-        } else if n_tokens >= COOP_MIN_N_TOKENS {
+        } else if n_tokens >= self.coop_min_n_tokens {
             out_dim as u32
         } else if one_row_per_workgroup {
             (out_dim * n_tokens) as u32
@@ -2924,6 +3075,13 @@ pub struct FusedAttnInput<'a> {
     /// (`fused_attn_layer_cache`/`op_cache`) from aliasing between two
     /// sequences sharing one batched-decode submission.
     pub batch_slot: usize,
+    /// Diagnostic only (`ORANGU_GPU_TIMESTAMPS`): `(query_set, slot)` to
+    /// bracket the attention dispatch — a timestamp is written into `slot`
+    /// right before it and `slot + 1` right after, so `report_timestamps`
+    /// can split each layer into qkv-side / attention / ffn-side. `None`
+    /// everywhere except the single-sequence decode path, and a full no-op
+    /// when `None`.
+    pub attn_ts: Option<(&'a wgpu::QuerySet, u32)>,
 }
 
 /// [`VulkanBackend::fused_layer`]'s parameters — the union of
@@ -2968,6 +3126,9 @@ pub struct FusedLayerInput<'a> {
     /// straight through to both the attention and post-attention halves
     /// this struct's own `record_fused_layer` chains together.
     pub batch_slot: usize,
+    /// See [`FusedAttnInput::attn_ts`] — threaded through to the attention
+    /// half. `None` disables the per-op breakdown.
+    pub attn_ts: Option<(&'a wgpu::QuerySet, u32)>,
 }
 
 impl VulkanBackend {
@@ -3218,6 +3379,28 @@ impl VulkanBackend {
     /// record_argmax_sample`'s output buffer: this is the whole point of
     /// that kernel, reading back 4 bytes instead of the `[n_vocab]` logits
     /// vector `submit_and_readback` would otherwise need.
+    /// Waits for a pending `map_async` whose callback stores `true` into
+    /// `done`. The blocking path issues one `PollType::Wait` (which parks
+    /// the thread until the GPU work behind the map completes); the
+    /// `ORANGU_BUSY_POLL` path spins on non-blocking `PollType::Poll` until
+    /// the callback has run, keeping the calling core hot (see
+    /// [`busy_poll`]). Either way the map is complete on return, so the
+    /// subsequent `get_mapped_range` never races.
+    fn wait_mapped(&self, done: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering;
+        if busy_poll() {
+            while !done.load(Ordering::Acquire) {
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                std::hint::spin_loop();
+            }
+        } else {
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("polling for a GPU readback failed");
+            debug_assert!(done.load(Ordering::Acquire));
+        }
+    }
+
     pub fn submit_and_readback_u32(
         &self,
         mut encoder: wgpu::CommandEncoder,
@@ -3233,14 +3416,15 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_cb = done.clone();
         readback_buffer
             .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
+            .map_async(wgpu::MapMode::Read, move |result| {
                 result.expect("mapping a u32 readback buffer failed");
+                done_cb.store(true, std::sync::atomic::Ordering::Release);
             });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling for a u32 readback failed");
+        self.wait_mapped(&done);
         let data = readback_buffer
             .slice(..)
             .get_mapped_range()
@@ -3812,16 +3996,6 @@ impl VulkanBackend {
                 ffn_bytes,
                 "orangu-server fused gelu arena chunk",
             );
-        let (mulled, mulled_offset) = self
-            .fused_mulled_arena
-            .lock()
-            .expect("fused mulled arena poisoned")
-            .alloc(
-                &self.device,
-                align,
-                ffn_bytes,
-                "orangu-server fused mulled arena chunk",
-            );
         let (x2, x2_offset) = self
             .fused_x2_arena
             .lock()
@@ -3863,10 +4037,18 @@ impl VulkanBackend {
             BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
             &meta_ffn_plain,
         );
+        // The gate*up multiply writes its result **straight into `ffn_down`'s
+        // own cached input buffer** (`down_g.x_buffer`, stable for the
+        // model's lifetime) instead of a private `mulled` scratch buffer
+        // that a `copy_buffer_to_buffer` then had to move into `down.x`.
+        // `ffn_down`'s matmul reads that same slice in the next pass, ordered
+        // by the pass boundary — so the copy (and the scratch buffer) is
+        // gone. Safe because `down.x` has exactly one writer (this mul) and
+        // one reader (the down matmul), in separate dispatches.
         let bg_mul = self.elem4_bind_group(
             BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
             up_g.output_src(),
-            BindSrc::Slice(&mulled, mulled_offset, ffn_bytes),
+            BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
             &meta_ffn_plain,
         );
         // `ffn_down`'s own post-matmul norm+add, same fusion — the residual
@@ -3930,8 +4112,6 @@ impl VulkanBackend {
             ffn_normed,
             ffn_normed_offset,
             gelu_out,
-            mulled,
-            mulled_offset,
             x2,
             x2_offset,
             bg_attn_post_norm_add,
@@ -4103,13 +4283,8 @@ impl VulkanBackend {
             pass.set_bind_group(0, &res.bg_mul, &[]);
             pass.dispatch_workgroups(res.ffn_wg, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &res.mulled,
-            res.mulled_offset,
-            &down_g.x_buffer,
-            down_g.x_offset,
-            (ffn_len as u64) * 4,
-        );
+        // No `mulled -> down.x` copy: `bg_mul` already wrote straight into
+        // `down_g.x_buffer` (see `build_fused_resources`).
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4385,7 +4560,7 @@ impl VulkanBackend {
 
         let q_buf = self.upload_new(q);
         let out_buf = self.scratch_buffer(n_head * head_dim);
-        let k_num = ATTN_SPLIT_K;
+        let k_num = attn_split_k();
         let partial_ml = self.scratch_buffer(n_head * k_num as usize * 2);
         let partial_acc = self.scratch_buffer(n_head * k_num as usize * head_dim);
 
@@ -4461,12 +4636,13 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server attention split encoder"),
             });
+        let split_pipeline = self.attn_split_pipeline_for(head_dim);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server attention split pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.attn_split_pipeline);
+            pass.set_pipeline(&split_pipeline);
             pass.set_bind_group(0, &split_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, k_num, 1);
             pass.set_pipeline(&self.attn_split_reduce_pipeline);
@@ -4660,6 +4836,49 @@ impl VulkanBackend {
         cache.entry(key).or_insert(resources).clone()
     }
 
+    /// The split-k attention phase-1 pipeline for `head_dim`, built lazily
+    /// and cached (see `Self::attn_split_pipelines`). The shader's
+    /// workgroup-shared `acc` accumulator is sized exactly to `head_dim` —
+    /// the model's real value, threaded in from the layer being recorded —
+    /// so a small head_dim doesn't pay the LDS (and hence occupancy) cost
+    /// of a worst-case constant. Returns a clone (a cheap handle) so the
+    /// caller can bind it after dropping the cache lock.
+    fn attn_split_pipeline_for(&self, head_dim: usize) -> wgpu::ComputePipeline {
+        let hd = head_dim as u32;
+        let mut cache = self
+            .attn_split_pipelines
+            .lock()
+            .expect("attn split pipelines poisoned");
+        if let Some(p) = cache.get(&hd) {
+            return p.clone();
+        }
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("orangu-server attention split shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    vulkan_shaders::shader_source_attention_split(
+                        self.kv_storage,
+                        self.subgroup_reduce,
+                        hd,
+                    )
+                    .into(),
+                ),
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server attention split pipeline"),
+                layout: Some(&self.attn_pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        cache.insert(hd, pipeline.clone());
+        pipeline
+    }
+
     /// Records the QKV-projection→Q-norm→Q-RoPE→K-norm→V-norm→K-RoPE→
     /// KV-cache-write→attention chain into `encoder` (does **not**
     /// submit) and returns the GPU buffer holding `attn_out` — the
@@ -4727,6 +4946,7 @@ impl VulkanBackend {
             scale,
             cache,
             batch_slot: _,
+            attn_ts,
         } = input;
 
         // `pos` is the one field in these cached meta buffers that
@@ -4889,13 +5109,13 @@ impl VulkanBackend {
             let split = self.attn_split.then(|| {
                 let partial_ml = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention split partial m/l"),
-                    size: (n_head as u64) * (ATTN_SPLIT_K as u64) * 2 * 4,
+                    size: (n_head as u64) * (attn_split_k() as u64) * 2 * 4,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
                 let partial_acc = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention split partial acc"),
-                    size: (n_head as u64) * (ATTN_SPLIT_K as u64) * (head_dim as u64) * 4,
+                    size: (n_head as u64) * (attn_split_k() as u64) * (head_dim as u64) * 4,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
@@ -4990,7 +5210,7 @@ impl VulkanBackend {
                     head_dim: head_dim as u32,
                     window_start: window_start as u32,
                     n_pos: (pos - window_start + 1) as u32,
-                    k_num: ATTN_SPLIT_K,
+                    k_num: attn_split_k(),
                     scale,
                     _pad: 0,
                 }),
@@ -5000,7 +5220,7 @@ impl VulkanBackend {
                 0,
                 bytemuck::bytes_of(&AttnReduceMeta {
                     head_dim: head_dim as u32,
-                    k_num: ATTN_SPLIT_K,
+                    k_num: attn_split_k(),
                     _pad0: 0,
                     _pad1: 0,
                 }),
@@ -5200,6 +5420,15 @@ impl VulkanBackend {
             }
         }
 
+        // Bracket Pass C for the per-op timestamp breakdown
+        // (`ORANGU_GPU_TIMESTAMPS`): everything recorded above this point in
+        // the layer is qkv-side, Pass C is attention, everything after (the
+        // whole post-attention chain) is ffn-side. No-op when `attn_ts` is
+        // `None`.
+        if let Some((ts, slot)) = attn_ts {
+            encoder.write_timestamp(ts, slot);
+        }
+
         // Pass C: attention, now that the cache includes this token's own
         // key/value. Split-k when
         // `dispatch.split` was built (`Self::attn_split`) — phase 1
@@ -5208,13 +5437,14 @@ impl VulkanBackend {
         // results into the same `out_buf` the un-split path would have
         // written directly.
         if let Some(split) = &dispatch.split {
+            let split_pipeline = self.attn_split_pipeline_for(head_dim);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused attention split pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.attn_split_pipeline);
+            pass.set_pipeline(&split_pipeline);
             pass.set_bind_group(0, &split.split_bind_group, &[]);
-            pass.dispatch_workgroups(n_head as u32, ATTN_SPLIT_K, 1);
+            pass.dispatch_workgroups(n_head as u32, attn_split_k(), 1);
             pass.set_pipeline(&self.attn_split_reduce_pipeline);
             pass.set_bind_group(0, &split.reduce_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
@@ -5226,6 +5456,11 @@ impl VulkanBackend {
             pass.set_pipeline(&self.attn_pipeline);
             pass.set_bind_group(0, &dispatch.bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
+        }
+
+        // End of Pass C (attention) — see the bracket comment above.
+        if let Some((ts, slot)) = attn_ts {
+            encoder.write_timestamp(ts, slot + 1);
         }
 
         let out_buf = dispatch.out_buf.clone();
@@ -5443,6 +5678,7 @@ impl VulkanBackend {
             ple,
             layer_output_scale,
             batch_slot,
+            attn_ts,
         } = input;
 
         self.upload_or_copy(encoder, &layer_res.x_buf, layer_res.x_buf_offset, x, n_embd);
@@ -5479,6 +5715,7 @@ impl VulkanBackend {
                 scale,
                 cache,
                 batch_slot,
+                attn_ts,
             },
         );
 
@@ -5609,17 +5846,16 @@ impl VulkanBackend {
     /// `ORANGU_DECODE_CHUNKS > 1`: submitting the first `K-1` chunks as soon
     /// as they're recorded lets the GPU start executing them while the CPU
     /// is still recording (and paying `wgpu-core`'s per-submission
-    /// validation cost for) the later chunks — overlapping the ~17ms/token
-    /// CPU submission cost `SERVER_ROADMAP.md`'s Track A root-caused with
-    /// GPU execution instead of serialising it in front of a single
-    /// end-of-token `queue.submit()`. Correctness across the chunk boundary
-    /// is Vulkan's own same-queue submission-order guarantee plus `wgpu`'s
-    /// cross-submission hazard tracking (the later chunk's `x` input is the
-    /// earlier chunk's last layer's persistent arena output buffer); the
-    /// final chunk is *not* submitted here — it's returned to the caller
-    /// (`record_decode_forward`) so the existing `submit_and_readback_for`/
-    /// `submit_and_readback_u32`/argmax tail, and its `ORANGU_CPU_TIMESTAMPS`
-    /// instrumentation, is unchanged.
+    /// validation cost for) the later chunks — overlapping the CPU
+    /// submission cost with GPU execution instead of serialising it in front
+    /// of a single end-of-token `queue.submit()`. Correctness across the
+    /// chunk boundary is Vulkan's own same-queue submission-order guarantee
+    /// plus `wgpu`'s cross-submission hazard tracking (the later chunk's `x`
+    /// input is the earlier chunk's last layer's persistent arena output
+    /// buffer); the final chunk is *not* submitted here — it's returned to
+    /// the caller (`record_decode_forward`) so the existing
+    /// `submit_and_readback_for`/`submit_and_readback_u32`/argmax tail, and
+    /// its `ORANGU_CPU_TIMESTAMPS` instrumentation, is unchanged.
     pub fn submit_intermediate(&self, encoder: wgpu::CommandEncoder) {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
@@ -5649,8 +5885,8 @@ impl VulkanBackend {
         // is where the actual wait happens — GPU execution *and* whatever
         // CPU-side driver/`wgpu` scheduling latency sits around it), and
         // the final host-side readback copy — so which of them the
-        // `SERVER_ROADMAP.md` Track A "submit+wait exceeds measured GPU
-        // execution time" gap actually lives in stops being a guess. Same
+        // "submit+wait exceeds measured GPU execution time" gap actually
+        // lives in stops being a guess. Same
         // `OnceLock`-cached env-var-read pattern `ORANGU_CPU_TIMESTAMPS`
         // itself already uses in `gemma.rs`, reusing the very same env var
         // rather than adding a second one — this is strictly a finer-
@@ -5680,17 +5916,18 @@ impl VulkanBackend {
         let submit_elapsed = submit_start.map(|t| t.elapsed());
 
         let map_async_start = fine.then(std::time::Instant::now);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_cb = done.clone();
         readback_buffer
             .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
+            .map_async(wgpu::MapMode::Read, move |result| {
                 result.expect("mapping the cached matmul readback buffer failed");
+                done_cb.store(true, std::sync::atomic::Ordering::Release);
             });
         let map_async_elapsed = map_async_start.map(|t| t.elapsed());
 
         let poll_start = fine.then(std::time::Instant::now);
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling for the cached matmul readback failed");
+        self.wait_mapped(&done);
         let poll_elapsed = poll_start.map(|t| t.elapsed());
 
         let readback_start = fine.then(std::time::Instant::now);
@@ -5716,7 +5953,7 @@ impl VulkanBackend {
                 readback.as_secs_f64() * 1000.0
             );
             // Logged once, not every decode step: `queue.submit()`'s own
-            // measured cost above (`SERVER_ROADMAP.md` Track A) traces
+            // measured cost above traces
             // directly to `wgpu-core`'s `validate_command_buffer` (walks
             // every buffer/texture the submitted command buffer touches,
             // checking `map_state`/destroyed-ness) and `insert_barriers_
@@ -5825,7 +6062,10 @@ impl VulkanBackend {
     /// GPU-side resource.
     pub fn timestamp_query_set(&self, n_layer: usize) -> wgpu::QuerySet {
         let mut guard = self.timestamps.lock().expect("timestamp queries poisoned");
-        let capacity = (n_layer + 3) as u32;
+        // `n_layer + 3` boundary slots (start, post-PLE, one per layer, tail)
+        // plus two per layer bracketing each layer's attention dispatch for
+        // the per-op qkv/attention/ffn breakdown (`report_timestamps`).
+        let capacity = (3 * n_layer + 3) as u32;
         if let Some(existing) = &*guard {
             debug_assert_eq!(
                 existing.capacity, capacity,
@@ -5951,6 +6191,29 @@ impl VulkanBackend {
             layers_ms / n_layer.max(1) as f64,
             slowest.0,
             slowest.1,
+        );
+
+        // Per-op breakdown from the attention brackets (2 slots/layer past
+        // the `n_layer + 3` boundary slots). Each layer splits into qkv-side
+        // (attn_norm + Q/K/V matmul + norm/RoPE + KV write, up to the
+        // attention dispatch), attention itself (split-k phase 1+2), and
+        // ffn-side (the whole post-attention chain: wo/gate/up/down matmuls,
+        // their norms, GELU/mul, PLE, scale, and the staging copies).
+        // `qkv` and `ffn` are matmul-heavy; `attn` is the one clean,
+        // non-matmul, context-growing number Step 9 targets.
+        let (mut qkv_ms, mut attn_ms, mut ffn_ms) = (0.0, 0.0, 0.0);
+        for il in 0..n_layer {
+            let before = 3 + n_layer + 2 * il;
+            let after = before + 1;
+            qkv_ms += ms(1 + il, before);
+            attn_ms += ms(before, after);
+            ffn_ms += ms(after, 2 + il);
+        }
+        eprintln!(
+            "orangu-server: [gpu-op-breakdown] pos {start_pos}: qkv-side={qkv_ms:.3}ms \
+             attention={attn_ms:.3}ms ffn-side={ffn_ms:.3}ms (+ ple={ple_ms:.3}ms \
+             output+lm_head={tail_ms:.3}ms; layers sum {:.3}ms)",
+            qkv_ms + attn_ms + ffn_ms,
         );
     }
 
@@ -6367,9 +6630,6 @@ struct FusedResources {
     /// A `VulkanBackend::fused_gelu_arena` chunk.
     #[allow(dead_code)]
     gelu_out: wgpu::Buffer,
-    /// A `VulkanBackend::fused_mulled_arena` chunk.
-    mulled: wgpu::Buffer,
-    mulled_offset: u64,
     /// A `VulkanBackend::fused_x2_arena` chunk. `ffn_down`'s own
     /// post-matmul norm+add writes straight into `x2`
     /// (`bg_ffn_post_norm_add`) — same fusion as `x1`'s own, no separate
@@ -6844,6 +7104,7 @@ mod tests {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("scratch split-k encoder"),
                     });
+            let split_pipeline = vulkan.attn_split_pipeline_for(head_dim);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("scratch split-k pass"),
@@ -6853,7 +7114,7 @@ mod tests {
                         end_of_pass_write_index: Some(1),
                     }),
                 });
-                pass.set_pipeline(&vulkan.attn_split_pipeline);
+                pass.set_pipeline(&split_pipeline);
                 pass.set_bind_group(0, &split_bind_group, &[]);
                 pass.dispatch_workgroups(n_head as u32, k_num, 1);
                 pass.set_pipeline(&vulkan.attn_split_reduce_pipeline);
@@ -7570,8 +7831,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         // widened, still-bug-catching tolerance the `f16` KV mirror
         // above did. Every other type/shape combination is untouched by that
         // flag and keeps the tight tolerance.
-        let packed =
-            vulkan.packed_dot_f16 && ggml_type == GGML_TYPE_Q4_K && n_tokens < COOP_MIN_N_TOKENS;
+        let packed = vulkan.packed_dot_f16
+            && ggml_type == GGML_TYPE_Q4_K
+            && n_tokens < vulkan.coop_min_n_tokens;
         let tol_factor = if packed { 6e-2 } else { 1e-2 };
 
         assert_eq!(cpu_out.len(), gpu_out.len());
@@ -9487,6 +9749,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 scale,
                 cache: &mut kv_cache.layers[0],
                 batch_slot: 0,
+                attn_ts: None,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -9646,6 +9909,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 scale,
                 cache: &mut kv_cache.layers[0],
                 batch_slot: 0,
+                attn_ts: None,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -9799,6 +10063,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
+            attn_ts: None,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -9963,6 +10228,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
+            attn_ts: None,
         });
         assert_eq!(expected_a.len(), got_a.len());
         for (i, (a, b)) in expected_a.iter().zip(got_a.iter()).enumerate() {
@@ -10002,6 +10268,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
+            attn_ts: None,
         });
         assert_eq!(expected_b.len(), got_b.len());
         for (i, (a, b)) in expected_b.iter().zip(got_b.iter()).enumerate() {
@@ -10222,6 +10489,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 }),
                 layer_output_scale: Some(layer_output_scale),
                 batch_slot: 0,
+                attn_ts: None,
             });
 
             assert_eq!(expected.len(), got.len());
@@ -10498,6 +10766,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 ple: None,
                 layer_output_scale: None,
                 batch_slot: 0,
+                attn_ts: None,
             });
             assert_eq!(expected0.len(), got0.len());
             for (i, (a, b)) in expected0.iter().zip(got0.iter()).enumerate() {
@@ -10535,6 +10804,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 ple: None,
                 layer_output_scale: None,
                 batch_slot: 0,
+                attn_ts: None,
             });
             assert_eq!(expected1.len(), got1.len());
             for (i, (a, b)) in expected1.iter().zip(got1.iter()).enumerate() {

@@ -1,189 +1,71 @@
 \newpage
 
-## OpenAI platform
+## Serving models per role
 
-### llama.cpp
+`orangu-server` is the inference engine `orangu` connects to. It loads a GGUF
+model and serves an OpenAI-compatible API; the *Inference server* chapter covers
+its full command set, host/port/backend configuration, and model-inventory
+subcommands. This chapter lists a good starting model for each role and how to
+serve it.
 
-[**llama.cpp**][llama] is an OpenAI compatible platform.
-
-Please, look at their documentation for further information.
-
-**Building**
-
-Clone the repository
-
-```sh
-git clone https://github.com/ggml-org/llama.cpp.git
-```
-
-```sh
-cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-      -DCMAKE_INSTALL_PREFIX=/usr/local/ -DGGML_VULKAN=1 -B build
-cmake --build build --config Debug -j 12
-
-cd build
-su
-make install
-```
-
-for example for an AMD/Vulkan based platform.
-
-**Running**
+The model argument resolves the same way `orangu-server show`/`download` do: an
+existing local `.gguf` path, an `NR`/`MODEL` label under the configured `models`
+directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first
+use). The role flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`,
+mutually exclusive, `--all` by default) selects how the server presents itself;
+give each running server its own port in `orangu-server.conf` when you run more
+than one at a time.
 
 `role = all`
 
 ```sh
-llama-server -hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
-             --port 8100 \
-             --ctx-size 262144 \
-             -sm layer \
-             -t 4 \
-             --webui-mcp-proxy \
-             --fit on \
-             --tools all \
-             -b 2048 \
-             -ub 2048 \
-             --cache-reuse 256 \
-             --slot-save-path ~/.orangu/llama-slots \
-             -fa on \
-             -ctk q8_0 \
-             -ctv q8_0
+orangu-server --all unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL
 ```
 
 `role = code`
 
 ```sh
-llama-server -hf yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF \
-             --port 8100 \
-             --ctx-size 131072 \
-             -t 4 \
-             --webui-mcp-proxy \
-             --fit on \
-             --image-min-tokens 1024 \
-             --tools all \
-             -b 2048 \
-             -ub 2048 \
-             --cache-reuse 256 \
-             --slot-save-path ~/.orangu/llama-slots \
-             -fa on \
-             -ctk q8_0 \
-             -ctv q8_0
+orangu-server --code yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF
 ```
 
 `role = review`
 
+For the fastest reviews, disable thinking with `--reasoning-budget 0 --reasoning off`:
+
 ```sh
-llama-server -hf unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
-             --port 8100 \
-             --ctx-size 262144 \
-             -np 1 \
-             -fa on \
-             -sm layer \
-             -t 4 \
-             --webui-mcp-proxy \
-             --fit on \
-             --tools all \
-             -b 2048 \
-             -ub 2048 \
-             --cache-reuse 256 \
-             --slot-save-path ~/.orangu/llama-slots \
-             --reasoning-budget 0 \
-             --reasoning off \
-             -ctk q8_0 \
-             -ctv q8_0
+orangu-server --review unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL \
+              --reasoning-budget 0 --reasoning off
 ```
 
 `role = explorer`
 
 ```sh
-llama-server -hf bartowski/gemma-4-12B-it-GGUF \
-             --port 8100 \
-             --ctx-size 131072 \
-             -np 1 \
-             -fa on \
-             -ctk q8_0 \
-             -ctv q8_0 \
-             -b 2048 \
-             -ub 2048 \
-             --cache-reuse 256 \
-             --slot-save-path ~/.orangu/llama-slots \
-             --temp 0.7 \
-             --top-p 0.8 \
-             --top-k 20 \
-             --min-p 0 \
-             --jinja \
-             --fit on
+orangu-server --explorer bartowski/gemma-4-12B-it-GGUF
 ```
 
-`--slot-save-path PATH` turns on llama.cpp's slot save/restore endpoints; `orangu`
-uses them automatically when present to persist a session's KV cache to disk on
-tab park/close/quit and reload it on tab activate/resume, avoiding a full
-re-prefill of the conversation so far. **Create the directory before starting
-the server** — llama-server exits immediately with "not a directory" if `PATH`
-does not already exist:
+Host, port, web-UI port, GPU backend, and the `models` directory are set in the
+`[orangu-server]` section of `orangu-server.conf` (see the *Inference server*
+chapter) rather than as per-run flags. Session KV-cache persistence across tab
+park/close/quit and reload is handled by the server's own default slot behavior —
+no flag to enable, no directory to create in advance.
+
+### Embedding model
+
+Semantic `/search` needs a server serving an embedding model. Start one with the
+`--embedding` role flag:
 
 ```sh
-mkdir -p ~/.orangu/llama-slots
+orangu-server --embedding ggml-org/embeddinggemma-300M-GGUF
 ```
 
-The flag is optional: without it, `orangu` detects the server doesn't support
-slot persistence (one informational notice, not an error) and behaves exactly
-as before. Combined with `--cache-reuse`, above, both layers of `orangu`'s KV
-cache cooperation are then active — in-memory reuse across requests within a
-session, and on-disk persistence across tab switches and restarts.
-
-Embedding model
-
-Semantic `/search` needs a server serving an embedding model. Start one with
-`--embedding` (switches the server to the embeddings endpoint), `--pooling`
-(the pooling strategy the model expects — read its own `pooling_type`
-metadata rather than assuming; embeddinggemma's is `mean`), `-np N` (the
-number of requests the server processes in parallel), `--kv-unified` (a
-single shared KV buffer across all of those parallel slots, since `-np`
-here is set explicitly rather than left on `auto`, which is otherwise when
-llama.cpp enables it by default), and a physical batch size (`-b`/`-ub`)
-large enough for embedding requests that batch several chunks together:
-
-```sh
-llama-server -hf ggml-org/embeddinggemma-300M-GGUF \
-             --port 8100 \
-             --embedding \
-             --pooling mean \
-             --ctx-size 8192 \
-             -np 8 \
-             --kv-unified \
-             -b 2048 \
-             -ub 2048 \
-             --fit on
-```
-
-`8100` matches the port used throughout this chapter's other examples. If you
-are running this alongside one of them (a chat server and the embeddings server
-at the same time), give the embeddings server its own free port instead (e.g.
-`8300`) so the two do not collide.
-
-`-np N` sets how many embedding requests the server handles at the same time.
-`/search` uploads several files at once (up to eight), so matching `-np` to that
-(`-np 8`) lets those requests run truly in parallel and makes the first index
-build markedly faster; with `-np 1` they queue and the upload is effectively
-sequential.
-
-`orangu` keeps each embedding request within a conservative token budget on its
-own side, but that budget is still shared across every one of the `-np` slots
-processing requests at the same moment — so with several requests in flight, the
-server's default physical batch size (`-b`/`--batch-size`, `-ub`/`--ubatch-size`,
-512 tokens) can still be too small. Raising both to `2048`, as above, gives enough
-headroom for `-np 8` requests to run at once without hitting "input is too large
-to process".
-
-Give this server its own section with `role = embeddings` (see the Configuration
-chapter). orangu probes it at startup and enables `/search` when it responds; if
-the probe fails it prints the reason (connection refused, timed out, or an error
-status) so you can tell why, rather than a silent "not detected". `-hf` downloads
-the model from Hugging Face the first time it is used — start `llama-server` and
-wait for its "server is listening" line **before** starting orangu, since a
-server that is still downloading or loading the model will not yet accept
-connections and the probe will report it unreachable.
+Give it its own port if you run it alongside a chat server, and its own config
+section with `role = embeddings` (see the *Configuration* chapter). `orangu`
+probes it at startup and enables `/search` when it responds; if the probe fails
+it prints the reason (connection refused, timed out, or an error status) so you
+can tell why, rather than a silent "not detected". The model is fetched from
+Hugging Face on first use — wait for the server's "listening" line **before**
+starting `orangu`, since a server still downloading or loading the model will not
+yet accept connections and the probe will report it unreachable.
 
 The cached vectors are specific to the embedding model that produced them, and
 are keyed by the endpoint you configured. If you restart the embedding server

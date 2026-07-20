@@ -434,17 +434,14 @@ impl GemmaModel {
     /// embedding gather, which does its own independent lookup into a
     /// *different* embedding table.
     /// How many `queue.submit()` calls one decode step's layer loop is
-    /// split across (`ORANGU_DECODE_CHUNKS`, default 7; see
-    /// `record_one_sequence_decode` and `SERVER_ROADMAP.md` Step 1). Read
-    /// once and cached. Clamped to `1..=n_layers` — `1` is the historical
-    /// single-submit behaviour, and no more than one submit per layer is
-    /// meaningful. A malformed value falls back to the default rather than
-    /// erroring a live decode. The default is the measured elbow on real
-    /// `E2B`/`RX 5500M`: throughput rises steeply from `1` (14.4 tok/s) to
-    /// `7` (18.8 tok/s) and only marginally past it (`35`, one submit per
-    /// layer, 19.4 tok/s), while each extra submit adds a little GPU-side
-    /// barrier overhead — `7` captures ~88% of the win with far fewer
-    /// submissions.
+    /// split across (`ORANGU_DECODE_CHUNKS`; see
+    /// `record_one_sequence_decode`). Read once and cached. Clamped to
+    /// `1..=n_layers` — `1` submits the whole token once, and no more than
+    /// one submit per layer is meaningful. A malformed value falls back to
+    /// the default rather than erroring a live decode. More chunks overlap
+    /// more of the CPU-side submission cost with GPU execution but add a
+    /// little per-submission barrier overhead, so the default sits below one
+    /// submit per layer.
     fn decode_submit_chunks(n_layers: usize) -> usize {
         const DEFAULT_CHUNKS: usize = 7;
         static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -575,15 +572,14 @@ impl GemmaModel {
         }
 
         // Number of `queue.submit()` calls the layer loop is split across
-        // this decode step (`ORANGU_DECODE_CHUNKS`, default 7). `1` restores
-        // the historical single-submit-per-token behaviour; `> 1` submits
-        // the first `chunks - 1` groups of layers as soon as they're
-        // recorded (`VulkanBackend::submit_intermediate`), so the GPU starts
-        // executing early chunks while the CPU is still recording and
-        // paying `wgpu-core`'s per-submission validation cost for the later
-        // ones — overlapping the ~17ms/token CPU submission cost with GPU
+        // this decode step (`ORANGU_DECODE_CHUNKS`). `1` submits the whole
+        // token once; `> 1` submits the first `chunks - 1` groups of layers
+        // as soon as they're recorded (`VulkanBackend::submit_intermediate`),
+        // so the GPU starts executing early chunks while the CPU is still
+        // recording and paying `wgpu-core`'s per-submission validation cost
+        // for the later ones — overlapping the CPU submission cost with GPU
         // execution instead of serialising it in front of one end-of-token
-        // submit. See `SERVER_ROADMAP.md` Step 1 for the measurement.
+        // submit.
         let n_layers = self.layers.len();
         let chunks = Self::decode_submit_chunks(n_layers);
         let layers_per_chunk = n_layers.div_ceil(chunks);
@@ -674,6 +670,11 @@ impl GemmaModel {
                     ple,
                     layer_output_scale: layer.layer_output_scale,
                     batch_slot,
+                    // Per-op timestamp bracket for this layer's attention
+                    // dispatch: two slots per layer past the existing
+                    // `n_layers + 3` per-layer slots (see
+                    // `VulkanBackend::timestamp_query_set`/`report_timestamps`).
+                    attn_ts: timestamps.map(|t| (t, (n_layers + 3 + 2 * il) as u32)),
                 },
             );
             prev_buf = Some(out);
@@ -1252,6 +1253,64 @@ impl ModelForward for GemmaModel {
             );
         }
         Ok(logits)
+    }
+
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            self.causal,
+            "'{}' is an embeddings-only architecture and does not support text generation",
+            self.config.architecture
+        );
+        let n_tokens = tokens.len();
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.config.n_vocab;
+        let eps = self.rms_eps();
+
+        // Same embedding lookup + sqrt(n_embd) scaling as `forward`. This path
+        // is deliberately the CPU-orchestrated one (never the single-token
+        // GPU-fused decode branch): the keys/values it appends stay CPU-side,
+        // so a caller can read them back or roll them off with
+        // `KvCache::truncate`, and one weight stream covers every position.
+        let mut x = vec![0f32; n_tokens * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        for v in x.iter_mut() {
+            *v *= (n_embd as f32).sqrt();
+        }
+
+        // One projection of every position through the output norm + vocab
+        // matrix, batched — the weight-heavy `lm_head` read is amortized across
+        // the whole draft in a single `matmul`, not one per position.
+        let mut h = self.run_layers_cpu(cache, &x, tokens, start_pos)?;
+        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
+        let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
+        anyhow::ensure!(
+            flat.len() == n_tokens * n_vocab,
+            "output projection produced {} logits, expected {}",
+            flat.len(),
+            n_tokens * n_vocab
+        );
+
+        let mut out = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
+            if let Some(cap) = self.final_logit_softcapping {
+                for v in row.iter_mut() {
+                    *v = (*v / cap).tanh() * cap;
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Takes the GPU-argmax fast path only when every one of its

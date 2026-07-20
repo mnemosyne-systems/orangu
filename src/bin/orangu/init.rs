@@ -19,7 +19,8 @@
 //! then walks every `[orangu]` and server option, showing its default. A value
 //! left at its default is omitted from the file, so the generated config stays
 //! minimal; only what the user changed (plus the always-required keys) is
-//! written. The provider is assumed to be `llama.cpp`.
+//! written. The server is always `orangu-server`, so no provider or server-type
+//! selection is asked for.
 
 use crate::quotes::QUOTE_OPTIONS;
 use anyhow::{Context, Result, anyhow};
@@ -180,13 +181,10 @@ pub async fn run_init() -> Result<()> {
         client.push(format!("platform = {platform}"));
     }
 
-    // Build the server section. `provider` and `endpoint` are always written;
-    // the model is inherited from `[orangu].model`, so it is not repeated here.
-    // `api_key` is added only when one was supplied.
-    let mut server = vec![
-        "provider = llama.cpp".to_string(),
-        format!("endpoint = {url}"),
-    ];
+    // Build the server section. `endpoint` is always written; the model is
+    // inherited from `[orangu].model`, so it is not repeated here. `api_key` is
+    // added only when one was supplied.
+    let mut server = vec![format!("endpoint = {url}")];
     if !api_key.is_empty() {
         server.push(format!("api_key = {api_key}"));
     }

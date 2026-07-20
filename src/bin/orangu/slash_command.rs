@@ -96,7 +96,7 @@ impl SlashCommand {
             SlashCommand::Model => "Selects the model used for requests",
             SlashCommand::Server => "Selects the server orangu talks to",
             SlashCommand::Information => {
-                "Reports which OpenAI/llama.cpp server capabilities are available"
+                "Reports which OpenAI/orangu-server capabilities are available"
             }
             SlashCommand::Diff => "Shows git diff",
             SlashCommand::Grep => "Searches using git grep",

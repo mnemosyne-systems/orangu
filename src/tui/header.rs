@@ -68,7 +68,7 @@ pub struct HeaderStatus {
     pub server_ok: ConnStatus,
     pub model_ok: ConnStatus,
     /// Whether the active server identified itself as an orangu-coordinator
-    /// proxy (`GET /v1/coordinator`) rather than llama.cpp or a generic
+    /// proxy (`GET /v1/coordinator`) rather than a direct
     /// OpenAI-compatible server. When set, the header shows "Automatic" for
     /// the model instead of the configured wire model id, since the
     /// coordinator — not the user — decides which model is actually loaded.
@@ -175,7 +175,7 @@ pub fn help_text() -> &'static str {
 /restart                                        Restart orangu, resuming the same workspace and session
 /tools                                          List tools
 /model [name]                                   List the server's models (active green), or switch to a specific one
-/information                                    Report which OpenAI/llama.cpp server capabilities are available and enabled
+/information                                    Report which OpenAI/orangu-server capabilities are available and enabled
 /prune [<uuid>|-w <path>|-o <days>|all]         Remove sessions
 /session [uuid|workspace]                       List/switch sessions, or open a workspace directory (Tab completes UUIDs, workspaces, then filesystem paths)
 /workspace [number|path]                        Show the active workspace, switch to a tab by number, or open a directory (Tab completes workspaces, then filesystem paths)

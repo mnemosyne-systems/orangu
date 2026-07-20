@@ -406,7 +406,7 @@ pub(crate) fn is_leap_year(y: u32) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
-/// Sidecar recording which server/model a session's saved llama.cpp slot (see
+/// Sidecar recording which server/model a session's saved orangu-server slot (see
 /// `orangu::llm::SlotRegistry::save_slot`) was captured under, so a later
 /// restore attempt can be gated on both matching — restoring a KV cache saved
 /// under a different model is unsafe (tensor shapes are model-specific), and

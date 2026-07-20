@@ -6,7 +6,7 @@ This project is a local coding-environment client built around a direct OpenAI-c
 
 - `src/bin/orangu.rs` - terminal loop, commands, history, prompt rendering, and waiting state
 - `src/config.rs` - INI parsing and normalization
-- `src/llm/openai.rs` - OpenAI-compatible llama.cpp client
+- `src/llm/openai.rs` - OpenAI-compatible client for `orangu-server`
 - `src/session.rs` - tool-calling conversation flow
 - `src/tools.rs` - local workspace tools for reading, editing, listing, fetching, and shell commands
 - `src/tui.rs` - banner and prompt frame rendering
@@ -30,7 +30,7 @@ The manual sources live under `doc/manual/en`.
 
 - The client is workspace-scoped by default and uses the current directory unless `--workspace` is supplied.
 - Command history is stored in `~/.orangu/orangu.history`.
-- Local llama.cpp deployments may take significant time to answer tool-calling prompts, so the default timeout is 30 minutes.
+- Local `orangu-server` deployments may take significant time to answer tool-calling prompts, so the default timeout is 30 minutes.
 
 ## Basic git guide
 

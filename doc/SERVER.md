@@ -1,8 +1,8 @@
 # orangu-server
 
-`orangu-server` loads a GGUF model and serves a llama.cpp-compatible HTTP
+`orangu-server` loads a GGUF model and serves a OpenAI-compatible HTTP
 API — both the OpenAI-compatible endpoints (`/v1/chat/completions`,
-`/v1/completions`, `/v1/embeddings`, `/v1/models`) and llama.cpp's own
+`/v1/completions`, `/v1/embeddings`, `/v1/models`) and its own
 native ones (`/health`, `/props`, `/slots`, `/metrics`, `/completion`,
 `/tokenize`, `/detokenize`, `/embedding`, `/apply-template`).
 
@@ -80,7 +80,7 @@ ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `CUDA/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
 was used (see **GPU backend** below).
 
-Every completed request logs a throughput line, llama-server-style:
+Every completed request logs a throughput line, orangu-server-style:
 
 ```
 orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 tokens in 4.31s (29.70 tok/s)
@@ -116,7 +116,7 @@ format: it mirrors llama.cpp's own `common/download.cpp`/
 
 If the repository also ships a multimodal projector (`mmproj-*.gguf`,
 needed for vision/audio input), it's fetched alongside the model too —
-picking the same best-matching one llama-server's own `-hf` would auto-fetch
+picking the same best-matching one orangu-server's own `-hf` would auto-fetch
 on first launch anyway (closest quantization bit-depth to the model's own,
 preferring one in the same directory):
 
@@ -343,7 +343,7 @@ When a file was downloaded by `-hf`/`--hf-repo` (llama.cpp stores those in
 the standard Hugging Face hub cache, `models--<user>--<model>/...`), `MODEL`
 is exactly the string to hand back to `-hf`: `<user>/<model>[:quant]` — e.g.
 `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M` above can be pasted
-straight into `llama-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M`
+straight into `orangu-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M`
 (or `orangu-server unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M` — see
 **Quick start** above). The `:quant` tag is extracted from the filename the
 same way llama.cpp's own `-hf` resolver does (`common/download.cpp`'s
@@ -558,9 +558,9 @@ binary.
 matter for a given deployment. These mirror `orangu`'s conventional
 deployment roles (`all`/`code`/`review`/`explorer`/`embeddings`), but a
 single `orangu-server` process serves whatever model it's given rather than
-picking one — so unlike a real `llama-server` process per role, this only
+picking one — so unlike a real `orangu-server` process per role, this only
 adjusts the handful of things that are actually role-specific in an engine
-that doesn't have `llama-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
+that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
 `-sm`/`--cache-reuse`/`-ctk`/`-ctv` equivalents at all:
 
 - **Default slot count**, when the config doesn't set `slots` explicitly.
@@ -758,15 +758,15 @@ the API and (if enabled) the web UI listener stop together.
 | `GET /props` | model + server metadata |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
-| `POST /completion` | llama.cpp-native, streaming; disabled under `--embedding` |
+| `POST /completion` | native, streaming; disabled under `--embedding` |
 | `POST /tokenize` / `POST /detokenize` | |
-| `POST /embedding` | llama.cpp-native embeddings |
+| `POST /embedding` | native embeddings |
 | `POST /apply-template` | renders the chat template without generating |
-| `POST /v1/shutdown` | not a llama.cpp endpoint — orangu-server's own |
+| `POST /v1/shutdown` | not part of the standard API — orangu-server's own |
 
 The built-in **Web UI** (above) is served on its own `web` port, separate
 from the API's `port`, and exposes a small `/api/...` surface of its own —
-used only by that page's own JavaScript, not part of the llama.cpp-
+used only by that page's own JavaScript, not part of the OpenAI-
 compatible API above, and only reachable at all when `web` is configured:
 
 | Endpoint | |

@@ -541,6 +541,68 @@ fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
 
+/// Best-effort, read-only check for machine power settings that cap
+/// throughput on a latency-critical, bursty decode loop: a scaling CPU
+/// frequency governor (which lets a core drop its clock during the GPU
+/// wait between tokens) and an AMD GPU left in an auto/low power state
+/// (which lets the core clock idle down between submissions). Returns one
+/// advisory line per finding, each including the command to fix it — the
+/// server can't change these itself (they're root-owned `sysfs`), so it
+/// only reports them. Empty when everything is already at maximum, on
+/// non-Linux, or when the files aren't present.
+#[cfg(target_os = "linux")]
+pub fn performance_advisories() -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Ok(gov) =
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    {
+        let gov = gov.trim();
+        if !gov.is_empty() && gov != "performance" {
+            out.push(format!(
+                "CPU frequency governor is '{gov}', not 'performance'. Decode is latency-bound on \
+                 bursty CPU work between GPU submissions; pinning it raises throughput. Fix: \
+                 sudo cpupower frequency-set -g performance"
+            ));
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        let mut cards: Vec<_> = entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
+            })
+            .collect();
+        cards.sort_by_key(|e| e.file_name());
+        for e in cards {
+            let path = e.path().join("device/power_dpm_force_performance_level");
+            if let Ok(level) = std::fs::read_to_string(&path) {
+                let level = level.trim();
+                // "auto"/"low" let the core clock idle down; "high"/"manual"
+                // /"profile_*" hold it up. Only warn on the idling ones.
+                if level == "auto" || level == "low" {
+                    out.push(format!(
+                        "GPU {} power level is '{level}', not 'high'. Its core clock can idle down \
+                         between tokens. Fix: echo high | sudo tee {}",
+                        e.file_name().to_string_lossy(),
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn performance_advisories() -> Vec<String> {
+    Vec::new()
+}
+
 pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
     let mut out = String::new();
     out.push_str("CPU\n");

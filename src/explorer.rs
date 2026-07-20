@@ -173,7 +173,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nprovider = llama.cpp\nendpoint = http://localhost:9111/v1\nmodel = explorer\nrole = explorer\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nendpoint = http://localhost:9111/v1\nmodel = explorer\nrole = explorer\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -188,7 +188,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nprovider = llama.cpp\nendpoint = http://localhost:9111/v1\nmodel = org/qwen\nrole = explorer\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[explorer-server]\nendpoint = http://localhost:9111/v1\nmodel = org/qwen\nrole = explorer\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -203,7 +203,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();

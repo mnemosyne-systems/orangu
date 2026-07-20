@@ -38,7 +38,7 @@ impl ModelsResponse {
     /// for entries that only carry one of those fields.
     ///
     /// `data` and `models` are two different shapes a `/v1/models` response
-    /// might use (plain OpenAI vs. some llama.cpp/Ollama-style servers); most
+    /// might use (plain OpenAI vs. orangu-server); most
     /// servers populate only one, leaving the other empty, but a response
     /// that happens to fill in both would otherwise list every model twice —
     /// once from each field — so entries are deduplicated by their resolved
@@ -65,7 +65,7 @@ impl ModelsResponse {
 }
 
 /// Build a GET request to a server's `/v1/models` endpoint, attaching the
-/// optional bearer token. OpenAI-compatible servers — including a llama.cpp
+/// optional bearer token. OpenAI-compatible servers — including an orangu-server
 /// server started with `--api-key` — require `Authorization: Bearer <key>` on
 /// every `/v1/*` endpoint, not just chat completions.
 pub(crate) fn models_request(
@@ -176,7 +176,7 @@ async fn probe_server_reachability(
 /// What `GET /v1/coordinator` reports.
 struct CoordinatorProbe {
     /// Whether the endpoint answered with `"orangu_coordinator": true` — the
-    /// marker an orangu-coordinator proxy exposes and neither llama.cpp nor a
+    /// marker an orangu-coordinator proxy exposes and neither a direct orangu-server nor a
     /// generic OpenAI-compatible server does.
     is_coordinator: bool,
     /// Every distinct model named in the response's `models` map (the model
@@ -186,7 +186,7 @@ struct CoordinatorProbe {
 }
 
 /// `GET /v1/coordinator`, side-effect-free and safe to call whether or not
-/// any profile's llama.cpp is currently active. Any failure (unreachable,
+/// any profile's orangu-server is currently active. Any failure (unreachable,
 /// non-success status, unexpected body) is treated as "not a coordinator"
 /// rather than an error, since this is just an identity probe alongside the
 /// main status refresh. Thin wrapper over the shared library probe (also
@@ -211,7 +211,7 @@ async fn probe_coordinator(
 
 /// Decide whether an idle refresh should switch the pinned model. When the
 /// server is up and advertising models but no longer serves the one we are
-/// pinned to (e.g. a llama.cpp server swapped the loaded model while we sat
+/// pinned to (e.g. an orangu-server swapped the loaded model while we sat
 /// idle), return the model id to switch to so the header banner can reflect the
 /// change; otherwise `None`. Reuses the model list the header probe already
 /// fetched, so no extra request is made.
@@ -261,8 +261,8 @@ pub(crate) async fn try_startup_model_switch(
 }
 
 /// Whether `active_model`'s connection is confirmed to be an
-/// orangu-coordinator proxy rather than a plain llama.cpp/OpenAI-compatible
-/// server — see [`orangu::llm::probe_coordinator`]. `false` if the model
+/// orangu-coordinator proxy rather than a directly-connected orangu-server
+/// — see [`orangu::llm::probe_coordinator`]. `false` if the model
 /// isn't configured or nothing is currently connected.
 pub(crate) async fn is_active_connection_a_coordinator(
     http_client: &reqwest::Client,
@@ -553,7 +553,7 @@ mod tests {
 
     /// A minimal stub that answers `/v1/models` (and any other path) with a
     /// 200 JSON body naming `model_id`, standing in for a reachable
-    /// llama.cpp/OpenAI-compatible server without needing a real one. Its
+    /// orangu-server without needing a real one. Its
     /// body never sets `"orangu_coordinator": true`, so it's correctly
     /// treated as a plain server, not a coordinator.
     async fn spawn_reachable_stub(model_id: &str) -> String {
@@ -685,7 +685,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[reviewer]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = review\nrole = review\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[reviewer]\nendpoint = http://localhost:9000/v1\nmodel = review\nrole = review\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -711,7 +711,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -741,7 +741,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[reviewer]\nprovider = llama.cpp\nendpoint = http://localhost:9111/v1\nmodel = review\nrole = review\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:9000/v1\nmodel = all\nrole = all\n\n[reviewer]\nendpoint = http://localhost:9111/v1\nmodel = review\nrole = review\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -785,7 +785,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = {unreachable}\nmodel = org/main-model\n\n[alt]\nprovider = llama.cpp\nendpoint = {reachable}\nmodel = org/alt-model\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = {unreachable}\nmodel = org/main-model\n\n[alt]\nendpoint = {reachable}\nmodel = org/alt-model\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -811,7 +811,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = {unreachable_main}\nmodel = org/main-model\n\n[alt]\nprovider = llama.cpp\nendpoint = {unreachable_alt}\nmodel = org/alt-model\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = {unreachable_main}\nmodel = org/main-model\n\n[alt]\nendpoint = {unreachable_alt}\nmodel = org/alt-model\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -834,7 +834,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = {reachable}\nmodel = org/main-model\n\n[alt]\nprovider = llama.cpp\nendpoint = {unreachable}\nmodel = org/alt-model\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = {reachable}\nmodel = org/main-model\n\n[alt]\nendpoint = {unreachable}\nmodel = org/alt-model\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();
@@ -859,7 +859,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\n\n[main]\nprovider = llama.cpp\nendpoint = {reachable}\nmodel = org/configured-but-stale\n"
+            "[orangu]\nserver = main\n\n[main]\nendpoint = {reachable}\nmodel = org/configured-but-stale\n"
         )
         .unwrap();
         let config = load_client_configuration(file.path()).unwrap();

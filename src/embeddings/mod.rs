@@ -115,7 +115,6 @@ mod tests {
 
     fn test_profile(endpoint: String, request_timeout_seconds: u64) -> LlmConfiguration {
         LlmConfiguration {
-            provider: "openai".to_string(),
             endpoint,
             model: "test-model".to_string(),
             role: "embeddings".to_string(),
@@ -133,7 +132,7 @@ mod tests {
     /// Accepts one connection, waits `delay` before answering with a
     /// minimal successful JSON body, then closes — standing in for a slow
     /// cold model load (e.g. an orangu-coordinator swapping the active
-    /// model) without needing a real llama.cpp or coordinator process.
+    /// model) without needing a real orangu-server or coordinator process.
     async fn spawn_slow_responder(delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

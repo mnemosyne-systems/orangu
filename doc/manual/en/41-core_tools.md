@@ -165,11 +165,11 @@ select server local-llama
 
 ## /information
 
-Reports everything `orangu` can learn about the active server: every OpenAI-compatible endpoint orangu itself talks to (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever llama.cpp-native endpoints it exposes. It is handled entirely locally, needs no arguments, and never sends anything to the model.
+Reports everything `orangu` can learn about the active server: every OpenAI-compatible endpoint orangu itself talks to (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), plus whatever native endpoints it exposes. It is handled entirely locally, needs no arguments, and never sends anything to the model.
 
-`/information` probes each capability independently — a plain OpenAI-compatible server (which has no llama.cpp-native endpoints) still gets a full report, just with those rows marked unavailable rather than the whole command failing. The result is a table, one row per capability, with a green dot for a capability that is available and enabled and a red dot for one that is not (shown below as `x`, since this static example cannot render color):
+`/information` probes each capability independently — a plain OpenAI-compatible server (which has no native endpoints) still gets a full report, just with those rows marked unavailable rather than the whole command failing. The result is a table, one row per capability, with a green dot for a capability that is available and enabled and a red dot for one that is not (shown below as `x`, since this static example cannot render color):
 
-Most probes are side-effect-free `GET` requests, so they run unconditionally. `/v1/chat/completions` is the one exception — it only accepts real generation requests — so it is only actually sent on a local llama.cpp server; on a hosted API it is not sent, to avoid a needless (potentially billed) request (see the `/v1/chat/completions` row below).
+Most probes are side-effect-free `GET` requests, so they run unconditionally. `/v1/chat/completions` is the one exception — it only accepts real generation requests — so it is only actually sent on a local orangu-server; on a hosted API it is not sent, to avoid a needless (potentially billed) request (see the `/v1/chat/completions` row below).
 
 ```text
 Server  main-server
@@ -180,10 +180,10 @@ STATUS  API        ENDPOINT              DETAILS
 ●       OpenAI     /v1/models            ggml-org/gemma-4-E4B-it-GGUF
 ●       OpenAI     /v1/chat/completions  Ok
 x       OpenAI     /v1/embeddings        Not available
-●       llama.cpp  /health               Ok
-●       llama.cpp  /props                n_ctx=32768 n_predict=-1 total_slots=1 temperature=0.8 top_k=40 top_p=0.95 model_path=/models/gemma.gguf bos_token=<bos> eos_token=<eos> build=b4200-abc1234 chat_template=yes
-x       llama.cpp  /slots                Not available
-x       llama.cpp  /metrics              Not available
+●       orangu-server  /health               Ok
+●       orangu-server  /props                n_ctx=32768 n_predict=-1 total_slots=1 temperature=0.8 top_k=40 top_p=0.95 model_path=/models/gemma.gguf bos_token=<bos> eos_token=<eos> build=b4200-abc1234 chat_template=yes
+x       orangu-server  /slots                Not available
+x       orangu-server  /metrics              Not available
 ```
 
 The header table's third line, **`Graph`**, is not a probed capability — it is the local workspace's background knowledge-graph scan status (the same one Deep `/auto_review` and `graph_lookup` depend on): `Building` while the scan is still running, `Complete` once it has finished, `None` if the scan task itself failed.
@@ -191,13 +191,13 @@ The header table's third line, **`Graph`**, is not a probed capability — it is
 Each row:
 
 - **`/v1/models`** — the standard OpenAI model listing, the same request `/model` and startup detection use; the details column lists every advertised model id, comma-separated (a single advertised model is shown bare, with no count prefix).
-- **`/v1/chat/completions`** — the endpoint every prompt and tool round-trip actually goes through. On a local llama.cpp server (`provider = llama.cpp`) a real generation costs nothing worth avoiding, so `/information` actually sends one: a minimal, non-streaming request capped at a single response token (`ggml-org/gemma-4-E4B-it-GGUF`'s row above shows this). On any other provider — potentially a hosted, billed API — it is not sent a real request; its availability is instead inferred from `/v1/models`, since any server that speaks the OpenAI protocol well enough to list models is expected to serve chat completions too.
+- **`/v1/chat/completions`** — the endpoint every prompt and tool round-trip actually goes through. On a local orangu-server a real generation costs nothing worth avoiding, so `/information` actually sends one: a minimal, non-streaming request capped at a single response token (`ggml-org/gemma-4-E4B-it-GGUF`'s row above shows this).
 - **`/v1/embeddings`** — likewise never sent a real request; this row reflects whether the active server is the one `orangu` already detected at startup as embeddings-capable (the same detection `/search` relies on — see the `role = embeddings` configuration option).
-- **`/health`** — a llama.cpp health check; the details column shows the server's reported `status` (`Ok`, `Loading model`, …, capitalized) when present.
-- **`/props`** — the closest thing llama.cpp exposes over HTTP to *how the server was started*: the context size (`--ctx-size`), the default max response length (`--n-predict`), the parallel slot count (`--parallel`), the sampling defaults (`--temp`, `--top-k`, `--top-p`), the loaded model's path and tokenizer boundary tokens, the build version, and whether a chat template is configured. The details column reads back whichever of these the server's response actually included (the schema is not identical across llama.cpp versions, so fields it omits are simply left out rather than reported as an error). llama.cpp does not expose hardware-only startup flags — thread count, GPU layer count, batch size — through any HTTP endpoint, so `/information` cannot report those; they only ever appear in the server's own startup log.
-- **`/slots`** and **`/metrics`** — llama.cpp diagnostics endpoints that a server operator can disable at startup; a red dot here usually means the corresponding llama.cpp flag (`--no-slots`, `--metrics`) was not passed, not that something is broken. Their JSON body isn't worth summarizing field by field, so a reachable `/slots` simply reads `Ok` and a reachable `/metrics` reads `reachable`; either one, when unavailable, reads a flat `Not available` regardless of the underlying reason (disabled, not implemented, unreachable, …).
+- **`/health`** — an orangu-server health check; the details column shows the server's reported `status` (`Ok`, `Loading model`, …, capitalized) when present.
+- **`/props`** — the closest thing orangu-server exposes over HTTP to *how the server was started*: the context size (`--ctx-size`), the default max response length (`--n-predict`), the parallel slot count (`--parallel`), the sampling defaults (`--temp`, `--top-k`, `--top-p`), the loaded model's path and tokenizer boundary tokens, the build version, and whether a chat template is configured. The details column reads back whichever of these the server's response actually included (the schema is not identical across server versions, so fields it omits are simply left out rather than reported as an error). orangu-server does not expose hardware-only startup flags — thread count, GPU layer count, batch size — through any HTTP endpoint, so `/information` cannot report those; they only ever appear in the server's own startup log.
+- **`/slots`** and **`/metrics`** — orangu-server diagnostics endpoints that a server operator can disable at startup; a red dot here usually means the corresponding server flag (`--no-slots`, `--metrics`) was not passed, not that something is broken. Their JSON body isn't worth summarizing field by field, so a reachable `/slots` simply reads `Ok` and a reachable `/metrics` reads `reachable`; either one, when unavailable, reads a flat `Not available` regardless of the underlying reason (disabled, not implemented, unreachable, …).
 
-A llama.cpp-native endpoint outside `/slots`/`/metrics` that is unreachable (connection refused, timeout) or answers with an unexpected status is reported the same way as one the server never implemented — `/information` only distinguishes "the server told us it's disabled" (`HTTP 501`) from "the server doesn't know this path" (`HTTP 404`) from any other response, shown as its raw HTTP status.
+A native endpoint outside `/slots`/`/metrics` that is unreachable (connection refused, timeout) or answers with an unexpected status is reported the same way as one the server never implemented — `/information` only distinguishes "the server told us it's disabled" (`HTTP 501`) from "the server doesn't know this path" (`HTTP 404`) from any other response, shown as its raw HTTP status.
 
 ### Examples
 
@@ -879,9 +879,9 @@ After the last file, a final pass reviews the change as a whole: the per-file ve
 
 The report ends with the **Conclusion**, derived from the file statuses rather than from the model: the verdict — `orangu approves this patch` when every file is approved, or `orangu rejects this patch` when any file was rejected or not reviewed — stands alone in bold rather than as a list item; the affected files then follow as a bullet list in bold, grouped by their status (`Rejected: **file**`, `Not reviewed: **file**`). A closing **`Generated by: orangu <version> (<model>)`** line credits the orangu version and the reviewing model, e.g. `Generated by: **orangu 0.7.0** (gemma)`.
 
-Each request runs in its own scratch exchange, **without tool definitions** and with a **capped response length** (`[orangu].review_max_tokens`, default `512`; `0` disables the cap) — a review can neither wander off into tool calls nor generate unbounded output, which keeps single requests fast and bounded even on slow local models. For deeper reviews with a thinking model, raise the cap (e.g. `2048`) so the thinking tokens do not eat the answer; the *Response-token caps* part of the Configuration chapter covers the trade-offs in depth. Every category prompt carries the whole file plus its diff (not just the diff), and — on a llama.cpp server — a file's category requests are all pinned to the same `id_slot`, so its file and diff are prompt-processed once and reused from the server's KV cache across every category instead of being recomputed each time. The reviews are independent of each other and nothing is added to your chat session.
+Each request runs in its own scratch exchange, **without tool definitions** and with a **capped response length** (`[orangu].review_max_tokens`, default `512`; `0` disables the cap) — a review can neither wander off into tool calls nor generate unbounded output, which keeps single requests fast and bounded even on slow local models. For deeper reviews with a thinking model, raise the cap (e.g. `2048`) so the thinking tokens do not eat the answer; the *Response-token caps* part of the Configuration chapter covers the trade-offs in depth. Every category prompt carries the whole file plus its diff (not just the diff), and — on an orangu-server — a file's category requests are all pinned to the same `id_slot`, so its file and diff are prompt-processed once and reused from the server's KV cache across every category instead of being recomputed each time. The reviews are independent of each other and nothing is added to your chat session.
 
-While the model works, the status bar shows `Thinking (...)` until the first token arrives and then the live generation rate (`Working @ X.Y t/s (...)` on llama.cpp), so a stalled server and a slowly generating model are easy to tell apart.
+While the model works, the status bar shows `Thinking (...)` until the first token arrives and then the live generation rate (`Working @ X.Y t/s (...)`), so a stalled server and a slowly generating model are easy to tell apart.
 
 A full-branch auto review can take a while, so when **`feedback` is on** (see the Configuration chapter) orangu surfaces its progress outside the window too: while the run is in progress the **terminal title** reads `orangu ●` (`orangu ◆` while the file currently being reviewed is Deep — a window title cannot carry color, so Deep is shown by shape instead of the purple used in the pane) with the dot blinking once a second, so a backgrounded or unfocused terminal still shows that a review is running. When the run **finishes**, orangu rings the **terminal bell** — the standard desktop notification sound (or a visual flash, depending on your terminal) — and drops the title back to a plain `orangu`. A run that is cancelled (`Esc Esc`) or exited (`Alt+x`) before it finishes does not ring. With `feedback` off, neither the title nor the bell is touched.
 
@@ -1221,9 +1221,9 @@ in parallel — across `compile_workers` threads, or every CPU thread when it is
 the on-disk state lists every file before anything is uploaded. The second half
 (50–100%) uploads: it embeds the parsed chunks, keeping several requests in flight
 at once so the embedding server — the real bottleneck — stays busy rather than
-idling between round-trips (a llama-server started with `-np N` embeds them in
+idling between round-trips (a orangu-server started with `-np N` embeds them in
 parallel). Each request stays within a conservative token budget — chunks are
-grouped so a request comfortably fits under a stock llama.cpp server's default
+grouped so a request comfortably fits under a stock orangu-server's default
 physical batch size (`-b`/`--batch-size 512`), so `/search` works out of the box
 without needing that flag raised. The status bar shows the percentage and an
 estimate of the time remaining that counts down (`Working (57%) (4m10s, ~3m

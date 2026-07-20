@@ -2,7 +2,7 @@
 
 # Quick start
 
-This chapter gets **orangu** running against a local OpenAI-compatible server such as **llama.cpp** with the sample configuration in `doc/etc/orangu.conf`.
+This chapter gets **orangu** running against a local **orangu-server** with the sample configuration in `doc/etc/orangu.conf`.
 
 ## Install orangu
 
@@ -28,25 +28,25 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/mnemosyne-systems/orang
 
 The script installs to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows) and warns if the directory is not in your `PATH`. See [BUILDING.md](../../BUILDING.md) for instructions on building from source.
 
-## Start llama.cpp
+## Start orangu-server
 
-Run `llama-server` with your preferred model, for example:
+Run `orangu-server` with your preferred model — a local `.gguf` path, a model
+already under the configured `models` directory, or a `<user>/<model>[:quant]`
+Hugging Face repo (fetched on first use):
 
 ```sh
-llama-server -hf ggml-org/gemma-4-E4B-it-GGUF \
-             --port 8100 \
-             --ctx-size 65536 \
-             -sm layer \
-             -t 4 \
-             --webui-mcp-proxy \
-             --fit on
+orangu-server --all ggml-org/gemma-4-E4B-it-GGUF
 ```
 
-**orangu** expects an OpenAI-compatible endpoint, such as:
+It serves an OpenAI-compatible endpoint (API port `8100` by default), which is
+what **orangu** connects to:
 
 ```text
 http://localhost:8100/v1
 ```
+
+See the *Inference server* chapter for host/port configuration, GPU backend
+selection, and the model-inventory subcommands.
 
 ## Create a configuration
 

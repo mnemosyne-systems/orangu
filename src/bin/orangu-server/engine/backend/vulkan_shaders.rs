@@ -1605,28 +1605,207 @@ pub fn shader_source_reduce_q4k_wide_unroll(n_rows: usize, subgroup: bool) -> St
 
 /// `Q4_K` decode kernel that reads every qs byte **once** and dequantizes
 /// *both* its nibbles — the fix for `Q4K_UNROLL_MIDDLE`'s 2× redundant
-/// weight streaming (`SERVER_ROADMAP.md` Step 2). The two-wave
-/// `block_dot` above splits a 64-thread workgroup into two wave32s that
-/// *each* load the whole 144-byte block — one taking low nibbles
-/// (`is_low`), one high (`local - 32`) — so every weight byte is fetched
-/// twice. Here one **32-thread** workgroup owns a whole super-block: lane
-/// `local` (0..31) loads the four qs bytes at in-group position `local` of
-/// the four 64-groups and, per group, emits *both* the low-nibble element
-/// (position `g*64 + local`, activation `xl_g`) and the high-nibble element
-/// (position `g*64 + 32 + local`, activation `xh_g`), reusing the identical
-/// `q4k_elem`/`qs_byte_q4k` math so the value stays within the same
-/// float-reorder tolerance the existing kernel variants already have vs.
-/// each other and `CpuBackend` (one lane now sums a low+high pair the two
-/// waves previously summed separately, so the add order differs — not
-/// bit-identical, but within `matmul_matches_cpu_backend_for_q4_k`'s
-/// tolerance). 32 threads == one wave32 subgroup on this hardware, so the
-/// reduction is a single barrier-free `subgroupAdd` when `subgroup` is set
-/// (else a 32-wide barrier tree). `n_rows` output rows share the workgroup
-/// and its hoisted activations, exactly as `unroll_suffix` does.
+/// weight streaming. The two-wave `block_dot` above splits a 64-thread
+/// workgroup into two 32-lane halves that *each* load the whole 144-byte
+/// block — one taking low nibbles (`is_low`), one high (`local - 32`) — so
+/// every weight byte is fetched twice. Here one **32-thread** workgroup
+/// owns a whole super-block: lane `local` (0..31) loads the four qs bytes at
+/// in-group position `local` of the four 64-groups and, per group, emits
+/// *both* the low-nibble element (position `g*64 + local`, activation
+/// `xl_g`) and the high-nibble element (position `g*64 + 32 + local`,
+/// activation `xh_g`), reusing the identical `q4k_elem`/`qs_byte_q4k` math.
+/// One lane now sums a low+high pair the two halves previously summed
+/// separately, so the float add order differs — not bit-identical, but
+/// within the same cross-check tolerance the existing kernel variants
+/// already have vs. each other and `CpuBackend`. A 32-thread workgroup fits
+/// in a single subgroup, so the reduction is a barrier-free `subgroupAdd`
+/// when `subgroup` is set (else a 32-wide barrier tree). `n_rows` output
+/// rows share the workgroup and its hoisted activations, exactly as
+/// `unroll_suffix` does.
 pub fn shader_source_reduce_q4k_dual_nibble(n_rows: usize, subgroup: bool) -> String {
     let suffix = dual_nibble_suffix(n_rows, subgroup);
     format!("{PRELUDE_VEC4}\n{Q4K_DUAL_MIDDLE}\n{suffix}")
 }
+
+/// `Q4_K` decode kernel with a **contiguous** thread→element mapping — a
+/// load-efficiency variant of `shader_source_reduce_q4k_dual_nibble` that
+/// measured *no faster* (this matmul is memory-latency-bound, not
+/// load-issue-bound), kept opt-in. The dual kernel loads a full 16-byte
+/// `vec4` per qs byte and keeps only one
+/// byte (its four `qs_byte_q4k` calls each waste 15/16 of the fetched word)
+/// and issues eight scalar activation loads. Here lane `local` (0..31) owns
+/// the `u32` at qs offset `local*4` — four **consecutive** qs bytes (group
+/// `g = local/8`, in-group base `p = (local%8)*4`), *all four used* — read
+/// in one `read_word_v4`, and the four low/high positions it covers are
+/// contiguous, so their activations are two `vec4<f32>` loads (`x` is bound
+/// as `array<vec4<f32>>` on the same binding — storage layout is
+/// type-agnostic). Per-super-block VMEM loads drop from ~5 weight + 8
+/// activation to ~1 weight + 2 activation per output row. The per-element
+/// arithmetic is `q4k_elem`'s, so it stays within the same cross-check
+/// tolerance; the reduction is the shared `subgroupAdd`/tree over the
+/// 32-lane subgroup. `n_rows` output rows share the two hoisted activation
+/// `vec4`s.
+pub fn shader_source_reduce_q4k_contig(n_rows: usize, subgroup: bool) -> String {
+    // Reuse `PRELUDE_VEC4` verbatim except rebind `x` as a `vec4<f32>` view
+    // (nothing in the prelude's helper bodies references the scalar `x`).
+    let prelude = PRELUDE_VEC4.replace(
+        "@group(0) @binding(1) var<storage, read> x: array<f32>;",
+        "@group(0) @binding(1) var<storage, read> xv4: array<vec4<f32>>;",
+    );
+    let suffix = contig_suffix(n_rows, subgroup);
+    format!("{prelude}\n{Q4K_CONTIG_MIDDLE}\n{suffix}")
+}
+
+const Q4K_CONTIG_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 144u;
+const BLOCK_ELEMS: u32 = 256u;
+
+// One 256-element super-block for lane `local` (0..31). `local` owns the
+// `u32` at qs offset `local*4` — four consecutive qs bytes, all used. Group
+// `g = local/8` picks the low/high scale sub-blocks (loaded once). Each qs
+// byte's low nibble is weight `g*64 + p + c`, its high nibble weight
+// `g*64 + 32 + p + c` (`p = (local%8)*4`, `c` the byte within the u32), so
+// the four low positions are `xl.xyzw` and the four high positions
+// `xh.xyzw`. Reuses `q4k_elem`'s exact per-element math (`d*scale*nib -
+// dmin*min`), just factored out of the loop.
+fn block_dot_contig(byte_offset: u32, local: u32, xl: vec4<f32>, xh: vec4<f32>) -> f32 {
+    let vb = byte_offset / 16u;
+    let header = weights[vb];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+    let scales = vec3<u32>(header.y, header.z, header.w);
+    let g = local / 8u;
+    let w = read_word_v4(byte_offset + 16u + local * 4u);
+    let slo = get_scale_min_k4_v4(scales, g * 2u);
+    let shi = get_scale_min_k4_v4(scales, g * 2u + 1u);
+    let dlo = d * f32(slo.x);
+    let mlo = dmin * f32(slo.y);
+    let dhi = d * f32(shi.x);
+    let mhi = dmin * f32(shi.y);
+    let b0 = w & 0xFFu;
+    let b1 = (w >> 8u) & 0xFFu;
+    let b2 = (w >> 16u) & 0xFFu;
+    let b3 = (w >> 24u) & 0xFFu;
+    return (dlo * f32(b0 & 0xFu) - mlo) * xl.x + (dhi * f32(b0 >> 4u) - mhi) * xh.x
+         + (dlo * f32(b1 & 0xFu) - mlo) * xl.y + (dhi * f32(b1 >> 4u) - mhi) * xh.y
+         + (dlo * f32(b2 & 0xFu) - mlo) * xl.z + (dhi * f32(b2 >> 4u) - mhi) * xh.z
+         + (dlo * f32(b3 & 0xFu) - mlo) * xl.w + (dhi * f32(b3 >> 4u) - mhi) * xh.w;
+}
+"#;
+
+/// The `@compute fn main` for the contiguous kernel — a 32-thread analogue
+/// of [`dual_nibble_suffix`] that gathers **two `vec4<f32>` activations**
+/// per super-block (the four contiguous low positions and the four high
+/// positions lane `local` covers) instead of eight scalars, and calls
+/// `block_dot_contig` once per output row. Same `ceil(out_dim / n_rows) *
+/// n_tokens` workgroup dispatch and the shared `dual_nibble_reduce` combine.
+fn contig_suffix(n_rows: usize, subgroup: bool) -> String {
+    let mut s = format!(
+        "var<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 32
+    );
+    s.push_str("@compute @workgroup_size(32)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n");
+    s.push_str("    let g = local / 8u;\n    let p = (local % 8u) * 4u;\n\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("\n    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = 0u;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
+    s.push_str(
+        "        let block_off = b * BLOCK_BYTES;\n        let x_blk = x_base + b * BLOCK_ELEMS;\n",
+    );
+    s.push_str("        let xl = xv4[(x_blk + g * 64u + p) / 4u];\n        let xh = xv4[(x_blk + g * 64u + 32u + p) / 4u];\n");
+    s.push_str(
+        "        partial0 = partial0 + block_dot_contig(o0 * params.row_bytes + block_off, local, xl, xh);\n",
+    );
+    for i in 1..n_rows {
+        s.push_str(&format!(
+            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + block_dot_contig(o{i} * params.row_bytes + block_off, local, xl, xh);\n        }}\n"
+        ));
+    }
+    s.push_str("        b = b + 1u;\n    }\n\n");
+    s.push_str(&dual_nibble_reduce(n_rows, subgroup));
+    s.push_str("}\n");
+    s
+}
+
+/// `Q6_K` decode kernel that loads each `qh` byte **once**, the analogue of
+/// [`shader_source_reduce_q4k_dual_nibble`] for `Q6_K`. The two-wave
+/// `Q6K_UNROLL_MIDDLE::block_dot` splits a 64-thread workgroup into two
+/// `w_lo` halves that each re-read the same `qh` byte (`qh[l]`, `l =
+/// local % 32`, identical for the two halves) — a redundant high-bit load
+/// on every super-block. Here one 32-thread workgroup owns a whole
+/// super-block: lane `l` (0..31) loads `qh` once and drives *both* `w_lo`
+/// halves' eight elements from it, reusing the identical `q6k_elem` math
+/// (so within the same cross-check tolerance the two-wave kernel already
+/// has), with a barrier-free `subgroupAdd` reduction. Reuses
+/// [`dual_nibble_suffix`]: its eight per-block activations
+/// (`x[l]`,`x[32+l]`,…,`x[224+l]`) are exactly the positions the two merged
+/// `w_lo` lanes covered — `w_lo=0`'s four elements map to `xl0..xl3`,
+/// `w_lo=1`'s to `xh0..xh3`.
+pub fn shader_source_reduce_q6k_dual(n_rows: usize, subgroup: bool) -> String {
+    let suffix = dual_nibble_suffix(n_rows, subgroup);
+    format!("{PRELUDE_VEC4}\n{Q6K_DUAL_MIDDLE}\n{suffix}")
+}
+
+const Q6K_DUAL_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 210u;
+const BLOCK_ELEMS: u32 = 256u;
+
+fn q6k_elem(d: f32, sc_off: u32, idx: u32, w_lo: u32, half: u32, is: u32, ql: u32, qh: u32) -> f32 {
+    let qh_shift = half * 4u + w_lo * 2u;
+    let sc_idx = is + half * 4u + w_lo * 2u;
+    let nib = select(ql >> 4u, ql & 0xFu, half == 0u);
+    let q = i32(nib | (((qh >> qh_shift) & 3u) << 4u)) - 32;
+    var sc: i32 = i32(read_byte_v4(sc_off + idx * 8u + sc_idx));
+    if (sc >= 128) { sc = sc - 256; }
+    return d * f32(sc) * f32(q);
+}
+
+// One 256-element super-block for `local` in 0..31. `qhA`/`qhB` are each
+// loaded once and shared across both `w_lo` halves (the two-wave kernel's
+// redundant read); `ql` still differs per half. The eight elements map to
+// the suffix's eight activations: `w_lo=0` -> `xl0..xl3`, `w_lo=1` ->
+// `xh0..xh3`.
+fn block_dot_dual(byte_offset: u32, local: u32,
+                  xl0: f32, xh0: f32, xl1: f32, xh1: f32,
+                  xl2: f32, xh2: f32, xl3: f32, xh3: f32) -> f32 {
+    let ql_off = byte_offset;
+    let qh_off = byte_offset + 128u;
+    let sc_off = byte_offset + 192u;
+    let d_offset = byte_offset + 208u;
+    let dword = read_word_v4(d_offset - (d_offset % 4u));
+    let d = f16_to_f32(select(dword & 0xFFFFu, dword >> 16u, (d_offset % 4u) != 0u));
+    let l = local;
+    let is = l / 16u;
+    let qhA = read_byte_v4(qh_off + l);
+    let qhB = read_byte_v4(qh_off + 32u + l);
+    let qlA0 = read_byte_v4(ql_off + l);
+    let qlA1 = read_byte_v4(ql_off + 32u + l);
+    let qlB0 = read_byte_v4(ql_off + 64u + l);
+    let qlB1 = read_byte_v4(ql_off + 96u + l);
+    return q6k_elem(d, sc_off, 0u, 0u, 0u, is, qlA0, qhA) * xl0
+         + q6k_elem(d, sc_off, 0u, 0u, 1u, is, qlA0, qhA) * xl1
+         + q6k_elem(d, sc_off, 1u, 0u, 0u, is, qlB0, qhB) * xl2
+         + q6k_elem(d, sc_off, 1u, 0u, 1u, is, qlB0, qhB) * xl3
+         + q6k_elem(d, sc_off, 0u, 1u, 0u, is, qlA1, qhA) * xh0
+         + q6k_elem(d, sc_off, 0u, 1u, 1u, is, qlA1, qhA) * xh1
+         + q6k_elem(d, sc_off, 1u, 1u, 0u, is, qlB1, qhB) * xh2
+         + q6k_elem(d, sc_off, 1u, 1u, 1u, is, qlB1, qhB) * xh3;
+}
+"#;
 
 const Q4K_DUAL_MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 144u;
@@ -2134,9 +2313,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // (thread count / grid-stride) and `%HALF%` (the reduction's initial
 // stride, `%WG% / 2`). A single workgroup grid-strides the whole `em.len`
 // row, so more threads means fewer sequential iterations per thread and
-// more of one WGP's SIMDs busy on this otherwise occupancy-starved
-// `dispatch_workgroups(1,1,1)` norm — see `VulkanBackend::norm_wg` and
-// `SERVER_ROADMAP.md` Step 3. `%WG%` must be a power of two.
+// more SIMDs busy on this otherwise occupancy-starved
+// `dispatch_workgroups(1,1,1)` norm — see `VulkanBackend::norm_wg`. `%WG%`
+// must be a power of two.
 const RMSNORM_SHADER_BODY_TEMPLATE: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
@@ -2387,7 +2566,7 @@ pub fn shader_source_rmsnorm_subgroup_wg(workgroup_size: u32) -> String {
 /// workgroups has finished — that would need collapsing the matmul itself
 /// down to one workgroup, trading its current many-workgroup occupancy for
 /// dispatch-count savings with an unclear (likely negative) net effect;
-/// not attempted, see `doc/SERVER_ROADMAP.md`'s Priority 1 item 1 for why.
+/// not attempted.
 /// Needs its own bind group shape (`elem5_bind_group_layout`): `elem4`'s
 /// four bindings (`x`, `weight`, `y`, `meta`) aren't enough room for the
 /// extra `residual` input.
@@ -2580,9 +2759,12 @@ struct AttnMeta {
 
 %KV_READ_FNS%
 
-// Generous upper bound on `head_dim` — `E2B`'s real full-attention layers
-// use 512; this leaves headroom for other models without costing more
-// than a few KB of workgroup-shared memory (`MAX_HEAD_DIM * 4` bytes).
+// Size of the workgroup-shared `acc` accumulator, `MAX_HEAD_DIM * 4` bytes.
+// The `2048u` here is a placeholder the shader-source builders substitute
+// with the model's actual head_dim (`shader_source_attention`/`_split`'s
+// `max_head_dim` argument) so `acc` isn't oversized — an oversized `acc`
+// costs LDS and caps occupancy. The literal default only applies if a
+// builder passes `2048` (the un-split test kernel does).
 const MAX_HEAD_DIM: u32 = 2048u;
 
 var<workgroup> shared_reduce: array<f32, 64>;
@@ -2907,7 +3089,7 @@ fn kv_read_v(idx: u32) -> f32 {
 /// selects `attention_subgroup_blocks` over `attention_classic_blocks`
 /// for the per-tile max/sum reductions — see `VulkanBackend::try_init`'s
 /// own comment on its `subgroup_reduce` local for why this is opt-in.
-pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool) -> String {
+pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool, max_head_dim: u32) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
     } else {
@@ -2920,6 +3102,10 @@ pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool) -> String 
     };
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     ATTENTION_SHADER_TEMPLATE
+        .replace(
+            "const MAX_HEAD_DIM: u32 = 2048u;",
+            &format!("const MAX_HEAD_DIM: u32 = {max_head_dim}u;"),
+        )
         .replace("%KV_ENABLE%", kv_storage.enable_directive())
         .replace("%KV_BINDINGS%", &kv_bindings)
         .replace("%KV_READ_FNS%", &kv_read_fns)
@@ -3110,7 +3296,11 @@ fn main(
 }
 "#;
 
-pub fn shader_source_attention_split(kv_storage: KvStorage, subgroup: bool) -> String {
+pub fn shader_source_attention_split(
+    kv_storage: KvStorage,
+    subgroup: bool,
+    max_head_dim: u32,
+) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
     } else {
@@ -3123,6 +3313,10 @@ pub fn shader_source_attention_split(kv_storage: KvStorage, subgroup: bool) -> S
     };
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     ATTENTION_SPLIT_SHADER_TEMPLATE
+        .replace(
+            "const MAX_HEAD_DIM: u32 = 2048u;",
+            &format!("const MAX_HEAD_DIM: u32 = {max_head_dim}u;"),
+        )
         .replace("%KV_ENABLE%", kv_storage.enable_directive())
         .replace("%KV_BINDINGS%", &kv_bindings)
         .replace("%KV_READ_FNS%", &kv_read_fns)

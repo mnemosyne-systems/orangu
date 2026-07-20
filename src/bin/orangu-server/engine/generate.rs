@@ -21,6 +21,7 @@
 //! llama-server's own console log does.
 
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use super::arch::{ForwardOutcome, GreedySampleParams, ModelForward};
 use super::batch::{BatchCoordinator, BatchDecodeRequest, OwnedGreedySample};
+use super::kv_cache::KvCache;
 use super::prefix_cache::PrefixCache;
 use super::sampling::{Sampler, SamplingParams};
 use super::scheduler::SlotPool;
@@ -306,6 +308,14 @@ fn run(
     let finish_reason;
     let mut last_report = Instant::now();
     let mut reported = false;
+    // Prompt-lookup speculative decoding (opt-in, greedy-only, single-slot).
+    // `spec_buf` holds tokens a speculative step already verified and committed
+    // to the KV cache, waiting to be emitted before the next forward.
+    let speculative =
+        speculative_config().filter(|_| sampler.is_greedy() && batch_coordinator.is_none());
+    let mut spec_buf: VecDeque<u32> = VecDeque::new();
+    let mut spec_accepted = 0usize;
+    let mut spec_steps = 0usize;
     loop {
         if generated >= req.max_tokens {
             finish_reason = FinishReason::Length;
@@ -358,7 +368,37 @@ fn run(
         let recent_start = history.len().saturating_sub(repeat_last_n);
         let start_pos = history.len() - 1;
 
-        next = if let Some(coordinator) = batch_coordinator {
+        next = if let Some(tok) = spec_buf.pop_front() {
+            // A token an earlier speculative step already verified and
+            // committed to the KV cache — emit it without another forward.
+            tok
+        } else if let Some((ngram, max_draft)) = speculative {
+            // Draft a continuation from the context and verify it in one
+            // multi-position forward; returns the model's own next token (any
+            // further accepted tokens are queued in `spec_buf`).
+            match speculative_next(
+                model,
+                cache
+                    .as_mut()
+                    .expect("cache is always Some between iterations"),
+                &mut sampler,
+                &history,
+                next,
+                start_pos,
+                ngram,
+                max_draft,
+                guard.id(),
+                &mut spec_buf,
+                &mut spec_accepted,
+                &mut spec_steps,
+            ) {
+                Ok(t) => t,
+                Err(err) => {
+                    let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
+                    return Ok(());
+                }
+            }
+        } else if let Some(coordinator) = batch_coordinator {
             // Submit this decode step to the shared coordinator instead of
             // calling `forward_maybe_sampling` directly, so it can be fused
             // with whatever other sequences submit their own next step
@@ -409,6 +449,16 @@ fn run(
         };
     }
     let generate_time = generate_start.elapsed();
+    if spec_steps > 0 {
+        // Draft acceptance: `spec_accepted` drafted tokens confirmed across
+        // `spec_steps` forwards, i.e. this many extra tokens produced beyond the
+        // one each forward always yields — the whole payoff of speculation.
+        eprintln!(
+            "orangu-server: [speculative] {spec_accepted} drafted tokens accepted over \
+             {spec_steps} steps ({:.2} extra tokens/forward)",
+            spec_accepted as f64 / spec_steps as f64
+        );
+    }
 
     // Offer this request's own final (full token sequence, resulting KV
     // cache) to the pool for a later request to reuse — win or not this
@@ -438,6 +488,111 @@ fn run(
         finish_reason,
     });
     Ok(())
+}
+
+/// Prompt-lookup speculative-decode settings, read once at the start of a
+/// request. `None` (the default) leaves decoding exactly as it was. Setting
+/// `ORANGU_SPECULATIVE` turns it on; `ORANGU_SPEC_NGRAM` (default 2) is how
+/// many trailing tokens must match a earlier spot in the context to trigger a
+/// draft, and `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from
+/// there. See `Self::speculative_next`.
+fn speculative_config() -> Option<(usize, usize)> {
+    if std::env::var("ORANGU_SPECULATIVE").is_err() {
+        return None;
+    }
+    let read = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default)
+    };
+    Some((read("ORANGU_SPEC_NGRAM", 2), read("ORANGU_SPEC_DRAFT", 4)))
+}
+
+/// Prompt-lookup draft: find the most recent earlier occurrence of the last
+/// `ngram` tokens of `history`, and return up to `max_draft` tokens that
+/// followed it there — a zero-cost (no model call) guess at what comes next,
+/// which pays off whenever the output echoes the context (code, quotations,
+/// structured/repetitive text). Empty when there's no match.
+fn ngram_draft(history: &[u32], ngram: usize, max_draft: usize) -> Vec<u32> {
+    if history.len() <= ngram {
+        return Vec::new();
+    }
+    let suffix = &history[history.len() - ngram..];
+    // Scan match-start positions newest-first; the most recent occurrence is
+    // the best predictor of what follows now.
+    for start in (0..history.len() - ngram).rev() {
+        if &history[start..start + ngram] == suffix {
+            let from = start + ngram;
+            let to = (from + max_draft).min(history.len());
+            return history[from..to].to_vec();
+        }
+    }
+    Vec::new()
+}
+
+/// One prompt-lookup speculative step. Drafts a continuation of `current` from
+/// the context, verifies the whole draft in a single multi-position forward,
+/// keeps the longest prefix the model would itself have produced greedily, and
+/// rolls the rejected tail off the KV cache. Returns the model's own next
+/// token (identical to what plain greedy decoding produces here) and pushes any
+/// further accepted tokens onto `spec_buf` for the loop to emit before its next
+/// forward. `accepted`/`steps` accumulate acceptance stats for the final log.
+///
+/// Only sound for greedy sampling: a draft token is accepted only when it
+/// equals the sampler's own pick at that position, so the emitted sequence is
+/// byte-for-byte what non-speculative greedy decoding would emit.
+#[allow(clippy::too_many_arguments)]
+fn speculative_next(
+    model: &dyn ModelForward,
+    cache: &mut KvCache,
+    sampler: &mut Sampler,
+    history: &[u32],
+    current: u32,
+    start_pos: usize,
+    ngram: usize,
+    max_draft: usize,
+    slot_id: usize,
+    spec_buf: &mut VecDeque<u32>,
+    accepted: &mut usize,
+    steps: &mut usize,
+) -> Result<u32> {
+    let draft = ngram_draft(history, ngram, max_draft);
+    let mut input = Vec::with_capacity(1 + draft.len());
+    input.push(current);
+    input.extend_from_slice(&draft);
+
+    // Per-position logits for `current` and every drafted token, from one
+    // forward that appends all of them to the cache.
+    let logits = model.forward_all_logits(cache, &input, start_pos, slot_id)?;
+
+    // Verify greedily. `recent` mirrors what `history` would be as accepted
+    // tokens are committed, so the repeat penalty (if any) sees exactly the
+    // context plain decoding would — keeping the output identical.
+    let rl = sampler.repeat_last_n();
+    let mut recent: Vec<u32> = history[history.len().saturating_sub(rl)..].to_vec();
+    let mut chosen = vec![sampler.sample(&logits[0], &recent)];
+    recent.push(chosen[0]);
+    let mut matched = 0usize;
+    while matched < draft.len() && draft[matched] == chosen[matched] {
+        let next = sampler.sample(&logits[matched + 1], &recent);
+        recent.push(next);
+        chosen.push(next);
+        matched += 1;
+    }
+
+    // Keep `current` plus the `matched` accepted drafts; drop the rest. The
+    // last element of `chosen` is the model's own token past the accepted
+    // prefix — its key/value is not committed (it was never an accepted input),
+    // so it becomes the next frontier the loop forwards.
+    cache.truncate(start_pos + chosen.len());
+    *accepted += matched;
+    *steps += 1;
+    for &t in &chosen[1..] {
+        spec_buf.push_back(t);
+    }
+    Ok(chosen[0])
 }
 
 #[cfg(test)]
@@ -793,5 +948,40 @@ mod tests {
             rx.recv().await.is_none(),
             "the channel must close after the one error event, not send anything further"
         );
+    }
+
+    #[test]
+    fn ngram_draft_copies_the_continuation_of_the_latest_matching_context() {
+        // Last two tokens are [1, 2]; their most recent earlier occurrence is
+        // at index 4, followed by [3, 9, 9] — so a 3-token draft is [3, 9, 9].
+        let history = [1u32, 2, 3, 7, 1, 2, 3, 9, 9, 1, 2];
+        assert_eq!(ngram_draft(&history, 2, 3), vec![3, 9, 9]);
+        // max_draft caps the length.
+        assert_eq!(ngram_draft(&history, 2, 1), vec![3]);
+    }
+
+    #[test]
+    fn ngram_draft_is_empty_without_a_match_or_enough_history() {
+        assert!(ngram_draft(&[1, 2], 2, 4).is_empty()); // suffix is the whole history
+        assert!(ngram_draft(&[1, 2, 3, 4, 5], 2, 4).is_empty()); // [4,5] never recurs
+        assert!(ngram_draft(&[], 2, 4).is_empty());
+    }
+
+    #[test]
+    fn kv_cache_truncate_rolls_back_length_and_regrows_cleanly() {
+        // A plain (no-GPU-mirror) cache: push a few positions, roll back, and
+        // confirm the length moves and re-pushing overwrites in place.
+        let mut cache = KvCache::new(2, 8, 4);
+        for i in 0..6u32 {
+            for layer in &mut cache.layers {
+                let v = vec![i as f32; 4];
+                layer.push(&v, &v);
+            }
+        }
+        assert_eq!(cache.layers[0].len, 6);
+        cache.truncate(4);
+        assert_eq!(cache.layers[0].len, 4);
+        cache.truncate(10); // no-op: never grows
+        assert_eq!(cache.layers[0].len, 4);
     }
 }

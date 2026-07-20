@@ -14,7 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Detecting whether an endpoint is an orangu-coordinator proxy rather than a
-//! plain llama.cpp/OpenAI-compatible server — shared by both the `orangu`
+//! plain orangu-server — shared by both the `orangu`
 //! binary (the header status probe, startup embeddings detection, `/server`
 //! re-detection) and library code that needs it without access to any of
 //! that (the explorer subagent, which reloads its own config from disk).
@@ -27,7 +27,7 @@ use serde_json::Value;
 /// distinct model each conventional role (`all`/`code`/`review`/`explorer`/
 /// `embeddings`) currently resolves to, deduplicated; `None` for anything
 /// else — unreachable, a non-success status, an unexpected body, or a plain
-/// llama.cpp/OpenAI-compatible server, neither of which exposes this path.
+/// orangu-server, neither of which exposes this path.
 pub async fn probe_coordinator(
     http_client: &reqwest::Client,
     endpoint: &str,

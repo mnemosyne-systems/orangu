@@ -60,7 +60,7 @@ status indicator.
 
 You can keep typing and submitting commands while a response is pending. Submitted commands are queued and executed in order after the active response finishes.
 
-When a profile uses `provider = llama.cpp`, the footer starts with `Thinking (<CLOCK>)` and switches to llama.cpp's native generation throughput once tokens are streaming, for example `Working @ 42.5 t/s (2s)`.
+The footer starts with `Thinking (<CLOCK>)` and switches to `orangu-server`'s native generation throughput once tokens are streaming, for example `Working @ 42.5 t/s (2s)`.
 
 Press `Esc` twice within 2 seconds during the waiting state to cancel the active request without exiting the client. Queued commands are preserved.
 

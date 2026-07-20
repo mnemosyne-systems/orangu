@@ -1317,7 +1317,7 @@ mod tests {
     fn open_file_failure_returns_output_instead_of_error() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -1380,7 +1380,7 @@ mod tests {
         let skills = orangu::skills::SkillRegistry::discover(workspace.path());
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let tools = ToolExecutor::new(workspace.path());
         let mut active_model = "llama".to_string();
@@ -1446,7 +1446,7 @@ mod tests {
         let skills = orangu::skills::SkillRegistry::discover(workspace.path());
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let tools = ToolExecutor::new(workspace.path());
         let mut active_model = "llama".to_string();
@@ -1511,7 +1511,7 @@ mod tests {
         let run = |input: &str| -> CommandOutcome {
             let llms = HashMap::from([(
                 "llama".to_string(),
-                test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+                test_profile("http://localhost:8100/v1", "gemma"),
             )]);
             let tools = ToolExecutor::new(&here);
             let mut active_model = "llama".to_string();
@@ -1598,7 +1598,7 @@ mod tests {
         let run = |input: &str| -> CommandOutcome {
             let llms = HashMap::from([(
                 "llama".to_string(),
-                test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+                test_profile("http://localhost:8100/v1", "gemma"),
             )]);
             let tools = ToolExecutor::new(&here);
             let mut active_model = "llama".to_string();
@@ -1693,7 +1693,7 @@ mod tests {
     fn missing_required_command_arguments_return_usage_output() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -1762,7 +1762,7 @@ mod tests {
     fn list_files_outputs_filtered_workspace_tree() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         fs::write(workspace.path().join("README.md"), "readme").expect("root file");
@@ -1836,15 +1836,11 @@ mod tests {
         let llms = HashMap::from([
             (
                 GEMMA.to_string(),
-                test_profile(
-                    "llama.cpp",
-                    "http://localhost:8100/v1",
-                    "ggml-org/gemma-4-E4B-it-GGUF",
-                ),
+                test_profile("http://localhost:8100/v1", "ggml-org/gemma-4-E4B-it-GGUF"),
             ),
             (
                 OPENAI.to_string(),
-                test_profile("openai", "https://api.openai.com/v1", "gpt-4.1"),
+                test_profile("https://api.openai.com/v1", "gpt-4.1"),
             ),
         ]);
         let workspace = tempdir().expect("workspace");
@@ -1907,11 +1903,7 @@ mod tests {
 
         let llms = HashMap::from([(
             GEMMA.to_string(),
-            test_profile(
-                "llama.cpp",
-                "http://localhost:8100/v1",
-                "ggml-org/gemma-4-E4B-it-GGUF",
-            ),
+            test_profile("http://localhost:8100/v1", "ggml-org/gemma-4-E4B-it-GGUF"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -1968,7 +1960,7 @@ mod tests {
 
         let llms = HashMap::from([(
             SERVER.to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+            test_profile("http://localhost:8100/v1", "model-a"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -2030,7 +2022,7 @@ mod tests {
 
         let llms = HashMap::from([(
             SERVER.to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+            test_profile("http://localhost:8100/v1", "model-a"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -2093,15 +2085,15 @@ mod tests {
         let llms = HashMap::from([
             (
                 "alpha".to_string(),
-                test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+                test_profile("http://localhost:8100/v1", "model-a"),
             ),
             (
                 "bravo".to_string(),
-                test_profile("llama.cpp", "http://localhost:8200/v1", "model-b"),
+                test_profile("http://localhost:8200/v1", "model-b"),
             ),
             (
                 "charlie".to_string(),
-                test_profile("llama.cpp", "http://localhost:8300/v1", "model-c"),
+                test_profile("http://localhost:8300/v1", "model-c"),
             ),
         ]);
         let workspace = tempdir().expect("workspace");
@@ -2162,7 +2154,7 @@ mod tests {
 
         let llms = HashMap::from([(
             SERVER.to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+            test_profile("http://localhost:8100/v1", "model-a"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -2219,7 +2211,6 @@ mod tests {
         llms.insert(
             "default".to_string(),
             LlmConfiguration {
-                provider: "openai".to_string(),
                 model: "gpt-4.1".to_string(),
                 endpoint: "http://localhost:11434/v1".to_string(),
                 role: "all".to_string(),
@@ -2283,7 +2274,7 @@ mod tests {
     fn pending_list_returns_pending_list_outcome() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -2333,7 +2324,7 @@ mod tests {
     fn pending_delete_with_index_returns_pending_delete_outcome() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
@@ -2383,7 +2374,7 @@ mod tests {
     fn pending_delete_without_index_returns_usage_output() {
         let llms = HashMap::from([(
             "llama".to_string(),
-            test_profile("llama.cpp", "http://localhost:8100/v1", "gemma"),
+            test_profile("http://localhost:8100/v1", "gemma"),
         )]);
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());

@@ -232,7 +232,7 @@ async fn run() -> Result<()> {
     let status_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()?;
-    // Shared llama.cpp `id_slot` assignment across every tab's interactive
+    // Shared orangu-server `id_slot` assignment across every tab's interactive
     // session on this server (see `orangu::llm::SlotRegistry`).
     let slot_registry = orangu::llm::SlotRegistry::default();
 
@@ -303,9 +303,9 @@ async fn run() -> Result<()> {
     if let Some(branch) = load_session_branch(&initial_tab.session_id) {
         initial_tab.current_branch = Some(branch);
     }
-    // Restore this tab's llama.cpp slot from disk, if one was saved for the
+    // Restore this tab's orangu-server slot from disk, if one was saved for the
     // same server+model in a previous run (see `SlotRegistry`) — skips
-    // re-prefilling a prefix llama.cpp already has cached, on both an
+    // re-prefilling a prefix orangu-server already has cached, on both an
     // explicit `--resume` and an automatic workspace+branch resume. A no-op
     // for a brand-new session (nothing was ever saved for it).
     if let Some(profile) = config.llms.get(&initial_tab.active_model)
@@ -551,7 +551,7 @@ async fn run() -> Result<()> {
             current_endpoint = tab.current_endpoint;
         }};
     }
-    // Fire-and-forget save of the about-to-be-parked tab's llama.cpp slot (see
+    // Fire-and-forget save of the about-to-be-parked tab's orangu-server slot (see
     // `SlotRegistry`), so switching tabs doesn't block on a network
     // round-trip. MUST be called before current_tab!()/ring.rotate/open, i.e.
     // while `session` etc. still refer to the tab being left.
@@ -568,9 +568,9 @@ async fn run() -> Result<()> {
             );
         };
     }
-    // Restore the newly active tab's llama.cpp slot from disk, if one was
+    // Restore the newly active tab's orangu-server slot from disk, if one was
     // saved for the same server+model — skips re-prefilling a prefix
-    // llama.cpp already has cached. Awaited (not fire-and-forget): the user
+    // orangu-server already has cached. Awaited (not fire-and-forget): the user
     // has to look at the tab before typing anyway, and the failure mode is
     // parity with today's full-reprocess behavior.
     //
@@ -885,15 +885,9 @@ async fn run() -> Result<()> {
         if let Some(pr) = pending_response.take() {
             let pr_llm_start = pr.llm_start;
             let pr_tool_time_before = pr.tool_time_before;
-            let prompt_profile = config
-                .llms
-                .get(&active_model)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing configured server {}", active_model))?;
             let mut deferred_tab_during_wait: Option<TabAction> = None;
             let pr_result = wait_for_pending_response(
                 &mut session,
-                &prompt_profile,
                 pr,
                 WaitContext {
                     render: RenderContext {

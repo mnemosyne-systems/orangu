@@ -1825,7 +1825,7 @@ pub(crate) fn parse_auto_review_category_response(
 /// `file_content` is given) leads, the diff follows, then the cross-file
 /// graph context (Deep mode, when `graph_context` is given), and the category
 /// instruction comes last, so a file's category requests share their prefix
-/// and — pinned to the same llama.cpp slot (`run_auto_review_mode` attaches
+/// and — pinned to the same orangu-server slot (`run_auto_review_mode` attaches
 /// one `ChatSession` per file to a single `id_slot`) — the server's KV cache
 /// can reuse the processed file and diff across them instead of
 /// reprocessing it for every category.
@@ -2219,7 +2219,7 @@ pub(crate) async fn run_auto_review_mode(
                 auto_review_graph_context(&graph_store, workspace, repo_root.as_deref(), &path)
             })
             .flatten();
-        // One scratch session — and, when the server is llama.cpp, one pinned
+        // One scratch session — and one pinned
         // `id_slot` — per file: every category request for this file goes
         // through it, so the file+diff prefix they share is prompt-processed
         // once by the server and reused from its KV cache instead of being
@@ -2785,13 +2785,12 @@ pub(crate) async fn run_auto_review_request(
                 let frame = (started.elapsed().as_millis()
                     / THINKING_FRAME_INTERVAL.as_millis().max(1)) as usize;
                 // Thinking until the first token, then the live streaming rate
-                // (llama.cpp-native t/s when available).
+                // (native t/s when available).
                 let current_state = streamed_state
                     .lock()
                     .map(|state| state.clone())
                     .unwrap_or_default();
                 let status = render_left_status(
-                    profile,
                     &current_state.output,
                     &current_state.metrics,
                     None,

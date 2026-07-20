@@ -33,7 +33,7 @@ The wizard:
    present. At the moment this includes `debugging`.
 6. Shows the resulting configuration and asks for confirmation before writing.
 
-The provider is assumed to be `llama.cpp`. Only values that differ from their
+The server is `orangu-server`. Only values that differ from their
 default are written, so the generated file stays minimal. It is written to
 `~/.orangu/orangu.conf`, creating `~/.orangu/` if needed and overwriting any
 existing file. Bundled skills are written to `~/.orangu/skills/<skill>/SKILL.md`
@@ -171,8 +171,8 @@ enabled, raise the cap so the answer survives the thinking:
 review_max_tokens = 2048
 ```
 
-Conversely, for the fastest reviews disable thinking on the server (for
-llama.cpp: `--reasoning-budget 0` together with
+Conversely, for the fastest reviews disable thinking on the server
+(`orangu-server --reasoning-budget 0` together with
 `--chat-template-kwargs '{"enable_thinking": false}'`) and keep the default
 `512` — the cap then almost never binds and only guards against runaways.
 
@@ -183,23 +183,21 @@ points to, and it carries the host information for that server:
 
 ```ini
 [main-server]
-provider = llama.cpp
 endpoint = http://localhost:8100/v1
 model = ggml-org/gemma-4-E4B-it-GGUF
 ```
 
 | Key | Required | Description |
 | :-- | :-- | :-- |
-| `provider` | Yes | `llama.cpp` or `openai` |
-| `endpoint` | Yes | OpenAI-compatible API URL |
+| `endpoint` | Yes | `orangu-server` URL (its OpenAI-compatible API) |
 | `model` | No | Model identifier used in chat completion requests. Overrides the general `[orangu].model` when set |
-| `api_key` | No | API key sent as `Authorization: Bearer <key>` on every request to the server. Required when a llama.cpp server runs with `--api-key`, or for any authenticated OpenAI-compatible endpoint |
+| `api_key` | No | API key sent as `Authorization: Bearer <key>` on every request to the server. Required when `orangu-server` runs with `--api-key` |
 | `role` | No | A specific role this server fulfills. Valid roles are: `all` (default), `code`, `review`, `explorer`, and `embeddings`. If a specific subsystem needs a server and one is tagged with its role, it will use that server instead of the default. `embeddings` designates the server that embeds code for semantic `/search`; an `all` server also serves it, and search auto-enables when that endpoint responds at startup. Ignored behind a confirmed orangu-coordinator — it alone decides which model backs each role, so a single server section is enough there |
 
 - At least one of `[orangu].model` or a server's own `model` must be set, so every server resolves to a non-empty model
 - The endpoint may be configured either with or without `/v1`
 - The client normalizes the endpoint internally before calling `/v1/chat/completions`
-- Set `api_key` when the server requires authentication, for example a llama.cpp server started with `llama-server --api-key <key>`. The key is sent as a bearer token on every request, including the `/v1/models` probe
+- Set `api_key` when the server requires authentication, for example `orangu-server --api-key <key>`. The key is sent as a bearer token on every request, including the `/v1/models` probe
 - Each server section must use a unique `endpoint`; `http://x` and `http://x/v1` are treated as the same host
 - Use `/server` to switch between the configured servers at runtime; Tab completion lists every server section
 - Set `feedback = on` in `[orangu]` to show a green or red dot in the output window after each command completes, and to blink an `orangu ●` title and ring the terminal bell while/when a `/auto_review` runs and finishes
@@ -212,4 +210,4 @@ The distributed sample lives at:
 doc/etc/orangu.conf
 ```
 
-It ships with llama.cpp-style servers and a 30-minute timeout suitable for local tool-calling workloads.
+It ships with `orangu-server` sections and a 30-minute timeout suitable for local tool-calling workloads.

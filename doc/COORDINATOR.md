@@ -296,7 +296,6 @@ is enough:
 server = main-server
 
 [main-server]
-provider = llama.cpp
 endpoint = http://localhost:9000/v1
 model = all
 ```

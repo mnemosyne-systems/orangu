@@ -455,14 +455,13 @@ server = main-server
 model = my-code-model-Q4_K_M
 
 [main-server]
-provider = llama.cpp
 endpoint = http://localhost:8100/v1
 model = my-code-model-Q4_K_M
 ```
 
-See [LOCAL_LLM.md](LOCAL_LLM.md) for configuration details and
+See [CONFIGURATION.md](CONFIGURATION.md) for configuration details and
 [SERVER.md](SERVER.md) for `orangu-server`'s own model-inventory tooling
-(and its native, llama.cpp-free serving path).
+and native serving path.
 
 ## Rust toolchain
 

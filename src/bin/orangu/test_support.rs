@@ -18,9 +18,8 @@ use orangu::tui::{Banner, HeaderStatus};
 
 pub(crate) use crate::git::init_git_for_test as init_test_git_repo;
 
-pub(crate) fn test_profile(provider: &str, endpoint: &str, model: &str) -> LlmConfiguration {
+pub(crate) fn test_profile(endpoint: &str, model: &str) -> LlmConfiguration {
     LlmConfiguration {
-        provider: provider.to_string(),
         endpoint: endpoint.to_string(),
         model: model.to_string(),
         role: "all".to_string(),

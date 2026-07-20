@@ -58,7 +58,7 @@ pub(crate) struct WorkspaceTab {
     pub(crate) session_hist_path: PathBuf,
     pub(crate) session_messages_path: PathBuf,
     pub(crate) session_metadata_path: PathBuf,
-    /// Sidecar recording which server/model this tab's saved llama.cpp slot
+    /// Sidecar recording which server/model this tab's saved orangu-server slot
     /// (if any) was captured under — see `session_store::SessionSlotInfo`.
     pub(crate) session_slot_path: PathBuf,
     pub(crate) current_branch: Option<String>,
@@ -268,7 +268,7 @@ impl WorkspaceTab {
     }
 
     /// Persist this tab's conversation and bump its session's last-updated
-    /// timestamp, then (best-effort, blocking) save its assigned llama.cpp
+    /// timestamp, then (best-effort, blocking) save its assigned orangu-server
     /// slot's KV cache to disk — see [`save_session_slot`]. Called when
     /// leaving a tab (close) and on quit, so every tab a run touched is both
     /// resumable and, where the server supports it, resumable without a full
@@ -407,7 +407,7 @@ pub(crate) fn spawn_slot_save(
 /// Resolve a slot for `session` on `profile`'s endpoint and, if a matching
 /// [`SessionSlotInfo`] sidecar was saved for the same server and model,
 /// restore it — so switching a tab back in, or resuming a session at
-/// startup, skips re-prefilling a prefix llama.cpp already has cached on
+/// startup, skips re-prefilling a prefix orangu-server already has cached on
 /// disk. A mismatched or missing sidecar skips the restore silently (normal
 /// full reprocessing, no functional loss).
 ///
@@ -799,14 +799,13 @@ mod tests {
         )
         .expect("write sidecar");
 
-        // No assign_slot listener is set up: a real llama.cpp server would be
+        // No assign_slot listener is set up: a real orangu-server would be
         // needed for `ensure_slot_assigned` to succeed, but the mismatch check
         // (different model) must skip before any restore request is even
         // considered, regardless — this exercises the model-gating path.
         let mut session = orangu::session::ChatSession::new("system")
             .with_slots(orangu::llm::SlotRegistry::default());
         let profile = orangu::config::LlmConfiguration {
-            provider: "llama.cpp".to_string(),
             endpoint: "http://127.0.0.1:9".to_string(),
             model: "new-model".to_string(),
             role: "all".to_string(),

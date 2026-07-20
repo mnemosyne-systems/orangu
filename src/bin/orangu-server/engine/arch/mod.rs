@@ -134,6 +134,29 @@ pub trait ModelForward: Send + Sync {
             .map(ForwardOutcome::Logits)
     }
 
+    /// Like [`Self::forward`], but returns next-token logits for *every* input
+    /// position (`Vec` of `n_tokens` `[n_vocab]` rows), not just the last —
+    /// what speculative decoding's verify step needs to check each drafted
+    /// token against the model's own prediction at that position. Appends all
+    /// `tokens` to `cache` (which a later [`KvCache::truncate`] can roll back
+    /// to the accepted prefix), and runs the multi-token / CPU-orchestrated
+    /// path so one weight stream covers the whole draft at once.
+    ///
+    /// The default errors: an architecture opts in only by overriding this. A
+    /// caller must not reach it for a model whose `forward` uses a KV path this
+    /// can't stay consistent with (e.g. one that leaves keys/values GPU-only) —
+    /// speculative decoding is gated to the plain CPU-KV path for that reason.
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let _ = (cache, tokens, start_pos, slot_id);
+        anyhow::bail!("this architecture does not support multi-position (speculative) decoding")
+    }
+
     /// Every token's final hidden state (`[n_tokens, n_embd]`, before the
     /// output projection to vocab logits) — what an embeddings request
     /// pools over. A one-shot call: no KV cache reuse across calls.

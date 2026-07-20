@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 /// `GET /v1/coordinator` — a fixed, side-effect-free identity marker orangu
 /// (or any other client) can probe to tell an orangu-coordinator proxy apart
-/// from a plain llama.cpp or OpenAI-compatible server, neither of which
+/// from a a plain OpenAI-compatible server, neither of which
 /// exposes this path. Unlike every other request, it is answered directly
 /// and never proxied: it must work even when no profile is active yet.
 ///

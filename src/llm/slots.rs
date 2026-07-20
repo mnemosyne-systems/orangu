@@ -13,13 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Coordinates llama.cpp's per-server `id_slot` assignment across the
+//! Coordinates orangu-server's per-server `id_slot` assignment across the
 //! sessions sharing one endpoint within a single orangu process.
 //!
 //! llama.cpp's `/v1/chat/completions` accepts a top-level `id_slot` field to
 //! pin a request to a specific slot (default: any idle slot), and `GET
 //! /props` reports how many slots (`-np`) the server was started with. Only
-//! llama.cpp servers understand either of these; on any other
+//! orangu-servers understand either of these; on any other
 //! OpenAI-compatible server the `/props` probe simply fails once and every
 //! session on that endpoint falls back to today's behavior (no `id_slot`
 //! sent, the server picks).
@@ -74,7 +74,7 @@ pub enum SaveRestoreOutcome {
 impl SlotRegistry {
     /// Resolve (probing `/props` at most once per endpoint) and hand out the
     /// next slot index for `endpoint`, round-robin. `None` means the probe
-    /// failed (non-llama.cpp server, or `--props` disabled) or the server
+    /// failed (non-orangu-server, or `--props` disabled) or the server
     /// reported zero slots — callers should treat that as "don't pin, let the
     /// server pick," which is today's behavior.
     pub async fn assign_slot(
@@ -290,7 +290,7 @@ mod tests {
         let client = Client::new();
         let registry = SlotRegistry::default();
 
-        // Save from slot 1, restore into slot 0 — llama.cpp allows the
+        // Save from slot 1, restore into slot 0 — orangu-server allows the
         // restore target to differ from the save-time slot.
         assert_eq!(
             registry

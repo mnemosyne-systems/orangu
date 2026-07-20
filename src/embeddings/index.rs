@@ -42,12 +42,12 @@ const INDEX_VERSION: u32 = 1;
 
 /// Approximate character-per-token ratio used to size embedding batches. Coarse
 /// (real tokenizers vary), but conservative enough to leave headroom under a
-/// typical llama.cpp server's default physical batch (`-b`/`--batch-size 512`
+/// typical orangu-server's default physical batch (`-b`/`--batch-size 512`
 /// tokens) without requiring users to raise it.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Target token budget per `/v1/embeddings` request — comfortably under the
-/// llama.cpp default physical batch of 512 tokens, so a batch built from several
+/// orangu-server's default physical batch of 512 tokens, so a batch built from several
 /// chunks does not trip "input is too large to process" on a stock server.
 const EMBED_BATCH_TOKEN_BUDGET: usize = 350;
 const EMBED_BATCH_CHAR_BUDGET: usize = EMBED_BATCH_TOKEN_BUDGET * CHARS_PER_TOKEN_ESTIMATE;
@@ -325,7 +325,7 @@ impl EmbeddingIndex {
 
         // ── Phase 2 (50–100%): upload — embed the parsed chunks concurrently ──
         // The upload to the embedding server is the bottleneck, so keep up to
-        // `EMBED_CONCURRENCY` files in flight — a llama-server started with
+        // `EMBED_CONCURRENCY` files in flight — a orangu-server started with
         // `-np N` runs them in parallel, and even with one slot the next request
         // is ready the moment the server frees up. Files finish out of order and
         // their chunks are appended as they complete, so a cancel or kill keeps
@@ -632,7 +632,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Group `chunks` into request-sized batches that stay under
 /// [`EMBED_BATCH_CHAR_BUDGET`] (and [`EMBED_BATCH_MAX_COUNT`]), so a request
-/// never trips a llama.cpp server's default physical batch size. A single chunk
+/// never trips an orangu-server's default physical batch size. A single chunk
 /// that alone exceeds the budget (should not happen given `MAX_CHUNK_CHARS`, but
 /// guarded regardless) still goes out alone rather than being dropped.
 fn batches_within_budget(chunks: &[super::chunk::Chunk]) -> Vec<&[super::chunk::Chunk]> {

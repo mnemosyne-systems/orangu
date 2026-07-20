@@ -83,7 +83,6 @@ pub(crate) async fn wait_for_response(
             tool_time_before,
             saved_messages,
         },
-        profile,
         wait_context,
     )
     .await
@@ -94,11 +93,10 @@ pub(crate) async fn wait_for_response(
 /// already-running task instead of starting a new one.
 pub(crate) async fn wait_for_pending_response(
     session: &mut ChatSession,
-    profile: &LlmConfiguration,
     pr: PendingResponse,
     wait_context: WaitContext<'_>,
 ) -> Result<WaitResult> {
-    drive_handle(session, pr, profile, wait_context).await
+    drive_handle(session, pr, wait_context).await
 }
 
 /// The shared polling loop used by both [`wait_for_response`] and
@@ -108,7 +106,6 @@ pub(crate) async fn wait_for_pending_response(
 async fn drive_handle(
     session: &mut ChatSession,
     pr: PendingResponse,
-    profile: &LlmConfiguration,
     wait_context: WaitContext<'_>,
 ) -> Result<WaitResult> {
     let PendingResponse {
@@ -337,7 +334,6 @@ async fn drive_handle(
                     last_rendered_metrics = current_stream_metrics;
                     last_tool_was_running = current_tool_running_since.is_some();
                     let left_status = render_left_status(
-                        profile,
                         &last_rendered_output,
                         &last_rendered_metrics,
                         current_tool_running_since,
@@ -621,7 +617,6 @@ fn live_tab_statuses(
 }
 
 pub(crate) fn render_left_status(
-    profile: &LlmConfiguration,
     rendered_output: &str,
     metrics: &StreamMetrics,
     tool_running_since: Option<std::time::Instant>,
@@ -634,18 +629,15 @@ pub(crate) fn render_left_status(
     }
 
     if rendered_output.is_empty() {
-        if profile.provider.eq_ignore_ascii_case("llama.cpp")
-            && let Some(progress) = metrics.prompt_progress.filter(|p| p.total > 0)
-        {
+        if let Some(progress) = metrics.prompt_progress.filter(|p| p.total > 0) {
             return Some(orangu::tui::render_prefill_status(frame, progress, elapsed));
         }
         return Some(render_thinking_status(frame, elapsed));
     }
 
-    if profile.provider.eq_ignore_ascii_case("llama.cpp")
-        && let Some(rate) = metrics
-            .predicted_per_second
-            .filter(|rate| *rate > 0.0 && !rendered_output.is_empty())
+    if let Some(rate) = metrics
+        .predicted_per_second
+        .filter(|rate| *rate > 0.0 && !rendered_output.is_empty())
     {
         return Some(render_working_status(frame, rate, elapsed));
     }
@@ -902,7 +894,6 @@ mod tests {
     #[test]
     fn llama_cpp_left_status_shows_prefill_cache_progress_during_prefill() {
         let profile = LlmConfiguration {
-            provider: "llama.cpp".to_string(),
             model: "model".to_string(),
             endpoint: "http://localhost:8080/v1".to_string(),
             role: "all".to_string(),
@@ -919,7 +910,6 @@ mod tests {
         // Still in prefill (no output yet) with cache progress reported: shows
         // the cache-hit percentage rather than the plain thinking spinner.
         let prefill = render_left_status(
-            &profile,
             "",
             &StreamMetrics {
                 prompt_progress: Some(StreamPromptProgress {
@@ -944,7 +934,6 @@ mod tests {
         // Still in prefill with no progress reported yet (e.g. a non-llama.cpp
         // server, or before the first progress event arrives): plain spinner.
         let thinking = render_left_status(
-            &profile,
             "",
             &StreamMetrics {
                 prompt_progress: None,
@@ -964,7 +953,6 @@ mod tests {
         assert_eq!(thinking.visible_width, "Thinking (2s)".chars().count());
 
         let working = render_left_status(
-            &profile,
             "hello",
             &StreamMetrics {
                 prompt_progress: None,

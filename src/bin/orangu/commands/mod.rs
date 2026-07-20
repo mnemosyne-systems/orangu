@@ -431,7 +431,7 @@ pub enum LocalCommand<'a> {
     SetServer(&'a str),
     /// `/information`: probe the active server for as much information as it
     /// will give up — advertised models over the OpenAI-compatible API, plus
-    /// any llama.cpp-native endpoints (`/health`, `/props`, `/slots`,
+    /// any native endpoints (`/health`, `/props`, `/slots`,
     /// `/metrics`) it exposes — and report which are available and enabled.
     Information,
 

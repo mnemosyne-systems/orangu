@@ -16,16 +16,16 @@
 //! `/information` gathers as much information as possible about the active
 //! server: every OpenAI-compatible endpoint orangu itself talks to
 //! (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`), whatever
-//! llama.cpp-native endpoints (`/health`, `/props`, `/slots`, `/metrics`) it
+//! native endpoints (`/health`, `/props`, `/slots`, `/metrics`) it
 //! exposes, and whether it is actually an orangu-coordinator proxy
-//! (`/v1/coordinator`) rather than llama.cpp or a generic OpenAI-compatible
-//! server. Every capability is probed independently, so a plain
-//! OpenAI-compatible server (which lacks the llama.cpp-native endpoints and
+//! (`/v1/coordinator`) rather than a directly-connected orangu-server.
+//! Every capability is probed independently, so a plain
+//! OpenAI-compatible server (which lacks the native endpoints and
 //! `/v1/coordinator`) still gets a full report — those rows just come back
 //! unavailable rather than failing the whole command.
 //!
 //! `/v1/chat/completions` is the one endpoint where "probe" can mean a real
-//! request rather than a side-effect-free GET: on a local llama.cpp server a
+//! request rather than a side-effect-free GET: on a local orangu-server a
 //! one-token generation costs nothing worth avoiding, so it is actually sent
 //! there; on any other (potentially hosted, potentially billed) provider its
 //! availability is inferred from `/v1/models` instead.
@@ -40,7 +40,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// One row of the `/information` report: an API surface and whether the
 /// connected server currently exposes it.
 pub(crate) struct Capability {
-    /// `OpenAI` for the standard chat/embeddings API, `llama.cpp` for the
+    /// `OpenAI` for the standard chat/embeddings API, `orangu-server` for the
     /// server's native (non-OpenAI) endpoints.
     api: &'static str,
     endpoint: &'static str,
@@ -64,18 +64,12 @@ pub(crate) async fn gather_server_information(
         .timeout(PROBE_TIMEOUT)
         .build()
         .unwrap_or_default();
-    let is_llama_cpp = profile.provider.eq_ignore_ascii_case("llama.cpp");
-
     let models = probe_models(&client, &endpoint, api_key).await;
-    // A real generation costs nothing extra on a local llama.cpp server, so
-    // /v1/chat/completions is actually probed there (capped at one token);
-    // on any other provider — a hosted API, potentially billed per request —
-    // its availability is inferred from /v1/models instead.
-    let chat_completions = if is_llama_cpp {
-        probe_chat_completions(&client, &endpoint, api_key, &profile.model).await
-    } else {
-        chat_completions_capability(&models, &profile.model)
-    };
+    // A real generation costs nothing extra on a local orangu-server, so
+    // /v1/chat/completions is probed directly (capped at one token) rather
+    // than inferred from /v1/models.
+    let chat_completions =
+        probe_chat_completions(&client, &endpoint, api_key, &profile.model).await;
     let embeddings = embeddings_capability(is_embeddings_server);
     let coordinator = simplify_unavailable(
         probe_get(
@@ -97,7 +91,7 @@ pub(crate) async fn gather_server_information(
         probe_get(
             &client,
             &endpoint,
-            "llama.cpp",
+            "orangu-server",
             "/health",
             api_key,
             summarize_health,
@@ -106,7 +100,7 @@ pub(crate) async fn gather_server_information(
         probe_get(
             &client,
             &endpoint,
-            "llama.cpp",
+            "orangu-server",
             "/props",
             api_key,
             summarize_props,
@@ -116,7 +110,7 @@ pub(crate) async fn gather_server_information(
             probe_get(
                 &client,
                 &endpoint,
-                "llama.cpp",
+                "orangu-server",
                 "/slots",
                 api_key,
                 summarize_ok,
@@ -127,7 +121,7 @@ pub(crate) async fn gather_server_information(
             probe_get(
                 &client,
                 &endpoint,
-                "llama.cpp",
+                "orangu-server",
                 "/metrics",
                 api_key,
                 summarize_reachable,
@@ -195,7 +189,7 @@ struct ChatCompletionsProbeMessage<'a> {
 }
 
 /// `POST /v1/chat/completions` with a one-token cap, used only on a local
-/// llama.cpp server (see [`gather_server_information`]) where a real
+/// orangu-server (see [`gather_server_information`]) where a real
 /// generation costs nothing worth avoiding — every other endpoint this module
 /// probes is a side-effect-free GET.
 async fn probe_chat_completions(
@@ -242,7 +236,7 @@ async fn probe_chat_completions(
 }
 
 /// `GET <path>`, applying `summarize` to the parsed JSON body on success. Used
-/// for every llama.cpp-native endpoint: they are all side-effect-free GETs, so
+/// for every native endpoint: they are all side-effect-free GETs, so
 /// probing them costs nothing beyond the request itself.
 async fn probe_get(
     client: &reqwest::Client,
@@ -341,14 +335,14 @@ fn push_str(parts: &mut Vec<String>, label: &str, value: Option<&str>) {
     }
 }
 
-/// Pull as much as possible out of a llama.cpp `/props` response — the
+/// Pull as much as possible out of an orangu-server `/props` response — the
 /// closest thing llama.cpp exposes over HTTP to "how was the server
 /// started": the context size (`--ctx-size`), the parallel slot count
 /// (`--parallel`), the sampling defaults (`--temp`, `--top-k`, `--top-p`),
 /// the loaded model's path and tokenizer boundary tokens, and the build
-/// version. The schema is not guaranteed to be stable across llama.cpp
+/// version. The schema is not guaranteed to be stable across orangu-server
 /// versions, so every field is read defensively and simply omitted when
-/// absent rather than treated as an error. (llama.cpp does not expose
+/// absent rather than treated as an error. (orangu-server does not expose
 /// hardware-only flags such as thread count, GPU layer count, or batch size
 /// through any HTTP endpoint, so those never appear here.)
 fn summarize_props(value: &Value) -> String {
@@ -426,7 +420,7 @@ fn summarize_props(value: &Value) -> String {
 
 /// Summarize `/v1/coordinator`: show the orangu-coordinator version when the
 /// field is present, confirming the connected server actually is an
-/// orangu-coordinator proxy rather than llama.cpp or a generic
+/// orangu-coordinator proxy rather than a direct
 /// OpenAI-compatible server.
 fn summarize_coordinator(value: &Value) -> String {
     match value.get("version").and_then(Value::as_str) {
@@ -435,7 +429,7 @@ fn summarize_coordinator(value: &Value) -> String {
     }
 }
 
-/// Summarize `/health`: show the `status` field llama.cpp reports (`ok`,
+/// Summarize `/health`: show the `status` field orangu-server reports (`ok`,
 /// `loading model`, `error`, …), capitalized, when present, otherwise just
 /// note it responded.
 fn summarize_health(value: &Value) -> String {
@@ -465,26 +459,6 @@ fn summarize_reachable(_value: &Value) -> String {
 /// response is all the report needs to say.
 fn summarize_ok(_value: &Value) -> String {
     "Ok".to_string()
-}
-
-/// Fallback used for `/v1/chat/completions` on a non-llama.cpp (potentially
-/// hosted, potentially billed) provider, where [`probe_chat_completions`] is
-/// not run: its availability is inferred from `/v1/models` instead, since any
-/// server that speaks the OpenAI protocol well enough to list models is
-/// expected to serve chat completions too.
-fn chat_completions_capability(models: &Capability, model_id: &str) -> Capability {
-    Capability {
-        api: "OpenAI",
-        endpoint: "/v1/chat/completions",
-        available: models.available,
-        details: if models.available {
-            format!(
-                "not probed directly (would trigger a real generation); used for every request to {model_id}"
-            )
-        } else {
-            "server unreachable via /v1/models (see that row above)".to_string()
-        },
-    }
 }
 
 /// `/v1/embeddings` is never actively probed (see [`gather_server_information`]);
@@ -664,7 +638,7 @@ mod tests {
     #[test]
     fn simplify_unavailable_flattens_only_unavailable_capabilities() {
         let available = Capability {
-            api: "llama.cpp",
+            api: "orangu-server",
             endpoint: "/slots",
             available: true,
             details: "reachable".to_string(),
@@ -674,7 +648,7 @@ mod tests {
         assert_eq!(capability.details, "reachable");
 
         let unavailable = Capability {
-            api: "llama.cpp",
+            api: "orangu-server",
             endpoint: "/slots",
             available: false,
             details: "disabled by the server (missing startup flag)".to_string(),
@@ -687,7 +661,7 @@ mod tests {
     #[test]
     fn chat_completions_probe_request_caps_the_response_at_one_token() {
         // The probe must stay a minimal, non-streaming, single-token request —
-        // this is a real generation on a local llama.cpp server, so it should
+        // this is a real generation on a local orangu-server, so it should
         // never balloon into something that takes real time or output.
         let body = ChatCompletionsProbeRequest {
             model: "gemma",
@@ -703,28 +677,6 @@ mod tests {
         assert_eq!(encoded["max_tokens"], 1);
         assert_eq!(encoded["stream"], false);
         assert_eq!(encoded["messages"][0]["role"], "user");
-    }
-
-    #[test]
-    fn chat_completions_capability_follows_models_reachability() {
-        let reachable = Capability {
-            api: "OpenAI",
-            endpoint: "/v1/models",
-            available: true,
-            details: String::new(),
-        };
-        let capability = chat_completions_capability(&reachable, "gemma");
-        assert!(capability.available);
-        assert!(capability.details.contains("gemma"));
-
-        let unreachable = Capability {
-            api: "OpenAI",
-            endpoint: "/v1/models",
-            available: false,
-            details: String::new(),
-        };
-        let capability = chat_completions_capability(&unreachable, "gemma");
-        assert!(!capability.available);
     }
 
     #[test]
@@ -745,7 +697,7 @@ mod tests {
                 details: "gemma".to_string(),
             },
             Capability {
-                api: "llama.cpp",
+                api: "orangu-server",
                 endpoint: "/metrics",
                 available: false,
                 details: "disabled by the server (missing startup flag)".to_string(),
@@ -753,10 +705,12 @@ mod tests {
         ];
         let table = format_information_table("main-server", "gemma", "Complete", &capabilities);
         assert!(table.contains("Server  main-server\nModel   gemma      \nGraph   Complete   "));
-        assert!(table.contains("STATUS  API        ENDPOINT    DETAILS"));
-        assert!(table.contains(&format!("{FEEDBACK_OK}       OpenAI     /v1/models  gemma")));
+        assert!(table.contains("STATUS  API            ENDPOINT    DETAILS"));
         assert!(table.contains(&format!(
-            "{FEEDBACK_ERR}       llama.cpp  /metrics    disabled by the server (missing startup flag)"
+            "{FEEDBACK_OK}       OpenAI         /v1/models  gemma"
+        )));
+        assert!(table.contains(&format!(
+            "{FEEDBACK_ERR}       orangu-server  /metrics    disabled by the server (missing startup flag)"
         )));
     }
 

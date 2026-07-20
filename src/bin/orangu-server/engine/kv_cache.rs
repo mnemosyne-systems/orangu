@@ -261,6 +261,25 @@ impl LayerCache {
         self.capacity
     }
 
+    /// Drops every position from `new_len` onward, rolling this layer back to
+    /// exactly `new_len` cached keys/values (a no-op if it already holds
+    /// `new_len` or fewer). The stored `k`/`v` beyond `new_len` are left as-is
+    /// — only [`Self::len`] moves, so the next [`Self::push`] overwrites them
+    /// in place. If a GPU mirror exists, its synced watermark is pulled back to
+    /// at most `new_len` too, so the next [`Self::sync_gpu`] re-uploads any
+    /// positions that get written over the rolled-back range. Used to discard a
+    /// speculative draft's rejected tail after verification keeps only its
+    /// accepted prefix.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        self.len = new_len;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.synced_len = gpu.synced_len.min(new_len);
+        }
+    }
+
     /// A CPU-only snapshot (no GPU mirror) for building an independent
     /// reference in cross-check tests — `engine::backend::vulkan::tests`
     /// needs a plain CPU copy of a cache-in-progress to compute the
@@ -559,6 +578,22 @@ impl KvCache {
         }
         for (dst, src_r) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
             dst.copy_from(src_r);
+        }
+    }
+
+    /// Rolls every attention layer back to `new_len` positions (see
+    /// [`LayerCache::truncate`]). Only valid for a cache with no recurrent
+    /// (SSM / gated-delta-net) layers: those carry a single evolving state with
+    /// no per-position history to roll back, so a partial rollback can't be
+    /// expressed — the caller (speculative decoding) is gated to architectures
+    /// without them, and this asserts that precondition.
+    pub fn truncate(&mut self, new_len: usize) {
+        debug_assert!(
+            self.recurrent.is_empty(),
+            "KvCache::truncate is not valid for architectures with recurrent layers"
+        );
+        for layer in &mut self.layers {
+            layer.truncate(new_len);
         }
     }
 }

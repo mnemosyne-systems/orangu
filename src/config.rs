@@ -96,7 +96,6 @@ impl ClientAppConfiguration {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LlmConfiguration {
-    pub provider: String,
     pub endpoint: String,
     pub model: String,
     pub role: String,
@@ -463,7 +462,6 @@ fn parse_llm_profiles(
             Ok((
                 name,
                 LlmConfiguration {
-                    provider: values.get("provider").cloned().unwrap_or_default(),
                     endpoint: values.get("endpoint").cloned().unwrap_or_default(),
                     model,
                     role,
@@ -482,7 +480,6 @@ fn parse_llm_profiles(
 }
 
 fn normalize_llm_configuration(llm: &mut LlmConfiguration) -> Result<()> {
-    llm.provider = llm.provider.trim().to_string();
     llm.endpoint = llm.endpoint.trim().trim_end_matches('/').to_string();
     llm.model = llm.model.trim().to_string();
     llm.system_prompt = llm.system_prompt.trim().to_string();
@@ -498,9 +495,6 @@ fn normalize_llm_configuration(llm: &mut LlmConfiguration) -> Result<()> {
         }
     }
 
-    if llm.provider.is_empty() {
-        return Err(anyhow!("LLM provider must not be empty"));
-    }
     if llm.endpoint.is_empty() {
         return Err(anyhow!("LLM endpoint must not be empty"));
     }
@@ -508,10 +502,7 @@ fn normalize_llm_configuration(llm: &mut LlmConfiguration) -> Result<()> {
         return Err(anyhow!("LLM model must not be empty"));
     }
 
-    match llm.provider.to_lowercase().as_str() {
-        "llama.cpp" | "openai" => Ok(()),
-        _ => Err(anyhow!("Unsupported LLM provider '{}'", llm.provider)),
-    }
+    Ok(())
 }
 
 pub fn load_agents_instructions(workspace: &std::path::Path) -> String {
@@ -554,14 +545,13 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = gemma\ntimeout = 45\nmax_tool_rounds = 12\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
+            "[orangu]\nserver = gemma\ntimeout = 45\nmax_tool_rounds = 12\n\n[gemma]\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
         )
         .unwrap();
 
         let conf = load_client_configuration(file.path()).unwrap();
         assert_eq!(conf.default_server, "gemma");
         assert_eq!(conf.llms.len(), 2);
-        assert_eq!(conf.llms["gemma"].provider, "llama.cpp");
         assert_eq!(conf.llms["gemma"].request_timeout_seconds, 45);
         assert_eq!(conf.llms["gemma"].max_tool_rounds, 12);
         assert!(conf.compression);
@@ -575,7 +565,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -586,7 +576,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\nreview_max_tokens = 2048\ncode_max_tokens = 4096\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nreview_max_tokens = 2048\ncode_max_tokens = 4096\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -600,7 +590,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -610,7 +600,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\ncompile_workers = 0\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ncompile_workers = 0\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -619,7 +609,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\ncompile_workers = 12\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ncompile_workers = 12\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -631,7 +621,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -640,7 +630,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\ncompression = off\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ncompression = off\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -653,7 +643,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -663,7 +653,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\nworkspaces = Bottom\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nworkspaces = Bottom\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -673,7 +663,7 @@ mod tests {
         let mut bad = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             bad,
-            "[orangu]\nserver = a\nworkspaces = middle\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nworkspaces = middle\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let err = load_client_configuration(bad.path()).unwrap_err();
@@ -688,7 +678,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\nplatform = GitLab\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nplatform = GitLab\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -697,7 +687,7 @@ mod tests {
         let mut bad = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             bad,
-            "[orangu]\nserver = a\nplatform = bitbucket\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\nplatform = bitbucket\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let err = load_client_configuration(bad.path()).unwrap_err();
@@ -712,7 +702,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen_Qwen3.6-35B-A3B-GGUF]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = bartowski/Qwen_Qwen3.6-35B-A3B-GGUF\n"
+            "[orangu]\nserver = Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M]\nendpoint = http://localhost:8100/v1\nmodel = bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M\n\n[Qwen_Qwen3.6-35B-A3B-GGUF]\nendpoint = http://localhost:8101/v1\nmodel = bartowski/Qwen_Qwen3.6-35B-A3B-GGUF\n"
         )
         .unwrap();
 
@@ -735,7 +725,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\ntimeout = soon\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ntimeout = soon\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
 
@@ -762,7 +752,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\n\n[gemma]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
+            "[orangu]\n\n[gemma]\nendpoint = http://localhost:8100/v1\nmodel = ggml-org/gemma-4-E4B-it-GGUF\n\n[qwen]\nendpoint = http://localhost:8101/v1\nmodel = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF\n"
         )
         .unwrap();
 
@@ -775,7 +765,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = main\nmodel = general-default\n\n[main]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = server-specific\n\n[fallback]\nprovider = llama.cpp\nendpoint = http://localhost:8101/v1\n"
+            "[orangu]\nserver = main\nmodel = general-default\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = server-specific\n\n[fallback]\nendpoint = http://localhost:8101/v1\n"
         )
         .unwrap();
 
@@ -793,7 +783,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1\nmodel = one\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://localhost:8100/v1\nmodel = one\n\n[b]\nendpoint = http://localhost:8100/v1\nmodel = one\n"
         )
         .unwrap();
 
@@ -810,7 +800,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:8100\nmodel = one\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:8100/v1/\nmodel = one\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://localhost:8100\nmodel = one\n\n[b]\nendpoint = http://localhost:8100/v1/\nmodel = one\n"
         )
         .unwrap();
 
@@ -829,7 +819,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = one\nrole = all\n\n[b]\nprovider = llama.cpp\nendpoint = http://localhost:9000/v1\nmodel = two\nrole = explorer\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://localhost:9000/v1\nmodel = one\nrole = all\n\n[b]\nendpoint = http://localhost:9000/v1\nmodel = two\nrole = explorer\n"
         )
         .unwrap();
 
@@ -845,7 +835,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = chat\n\n[chat]\nprovider = openai\nendpoint = http://localhost:11434/v1\nmodel = llama3.1\n\n[embed]\nrole = embeddings\nprovider = openai\nendpoint = http://localhost:11434/v1\nmodel = nomic-embed-text\n"
+            "[orangu]\nserver = chat\n\n[chat]\nendpoint = http://localhost:11434/v1\nmodel = llama3.1\n\n[embed]\nrole = embeddings\nendpoint = http://localhost:11434/v1\nmodel = nomic-embed-text\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).expect("shared embeddings endpoint");
@@ -857,7 +847,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\nrole = all\n\n[b]\nprovider = llama.cpp\nendpoint = http://y/v1\nmodel = n\nrole = explorer\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\nrole = all\n\n[b]\nendpoint = http://y/v1\nmodel = n\nrole = explorer\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -878,7 +868,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\nrole = all\n\n[e]\nprovider = llama.cpp\nendpoint = http://z/v1\nmodel = k\nrole = embeddings\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\nrole = all\n\n[e]\nendpoint = http://z/v1\nmodel = k\nrole = embeddings\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
@@ -888,7 +878,7 @@ mod tests {
         let mut file2 = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file2,
-            "[orangu]\nserver = a\n\n[a]\nprovider = llama.cpp\nendpoint = http://x/v1\nmodel = m\nrole = all\n"
+            "[orangu]\nserver = a\n\n[a]\nendpoint = http://x/v1\nmodel = m\nrole = all\n"
         )
         .unwrap();
         let conf2 = load_client_configuration(file2.path()).unwrap();

@@ -1,9 +1,6 @@
 [orangu]: https://github.com/mnemosyne-systems/orangu
-[llama.cpp]: https://github.com/ggml-org/llama.cpp
 [Pandoc]: https://pandoc.org/
 [eisvogel]: https://github.com/Wandmalfarbe/pandoc-latex-template
-
-[llama]: https://github.com/ggml-org/llama.cpp
 
 [git_squash]: https://www.git-tower.com/learn/git/faq/git-squash
 [progit]: https://github.com/progit/progit2/releases

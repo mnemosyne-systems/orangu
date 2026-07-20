@@ -548,6 +548,9 @@ async fn serve(prepared: Prepared) -> Result<()> {
             None => println!("UI     disabled"),
         }
         println!("API    http://{}:{}", conf.host, conf.port);
+        for advisory in orangu::hardware::performance_advisories() {
+            println!("Note   {advisory}");
+        }
     }
 
     if let Some(web_listener) = web_listener {

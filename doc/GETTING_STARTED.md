@@ -1,14 +1,12 @@
 # Getting started
 
-## 1. Start llama.cpp
+## 1. Start orangu-server
 
-Run a local `llama-server` instance with an OpenAI-compatible endpoint.
+Run a local `orangu-server` instance; it serves an OpenAI-compatible endpoint
+(API port `8100` by default).
 
 ```sh
-llama-server \
-  --model /path/to/model.gguf \
-  --port 8100 \
-  --ctx-size 8192
+orangu-server --all /path/to/model.gguf
 ```
 
 ## 2. Create a client configuration

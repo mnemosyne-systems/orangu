@@ -50,7 +50,6 @@ pub struct ChatSession {
 /// Two profiles producing the same key yield an interchangeable client.
 #[derive(PartialEq, Eq)]
 struct ClientKey {
-    provider: String,
     endpoint: String,
     model: String,
     api_key: Option<String>,
@@ -61,7 +60,6 @@ struct ClientKey {
 impl ClientKey {
     fn from_profile(profile: &LlmConfiguration) -> Self {
         Self {
-            provider: profile.provider.clone(),
             endpoint: profile.endpoint.clone(),
             model: profile.model.clone(),
             api_key: profile.api_key.clone(),
@@ -86,7 +84,7 @@ impl ChatSession {
     }
 
     /// Attach a shared [`SlotRegistry`] so this session's requests pin to a
-    /// specific llama.cpp `id_slot`. Only the interactive per-tab session
+    /// specific orangu-server `id_slot`. Only the interactive per-tab session
     /// should call this — see the `slots` field doc.
     pub fn with_slots(mut self, slots: SlotRegistry) -> Self {
         self.slots = Some(slots);
@@ -109,11 +107,6 @@ impl ChatSession {
         client: &reqwest::Client,
     ) -> Option<u32> {
         let slots = self.slots.as_ref()?;
-        if !profile.provider.eq_ignore_ascii_case("llama.cpp") {
-            self.assigned_slot = None;
-            self.assigned_slot_endpoint = None;
-            return None;
-        }
         if self.assigned_slot_endpoint.as_deref() != Some(profile.endpoint.as_str()) {
             self.assigned_slot = slots
                 .assign_slot(client, &profile.endpoint, profile.api_key.as_deref())
@@ -332,7 +325,6 @@ mod tests {
 
     fn test_profile(endpoint: &str) -> LlmConfiguration {
         LlmConfiguration {
-            provider: "llama.cpp".to_string(),
             endpoint: endpoint.to_string(),
             model: "test-model".to_string(),
             role: "all".to_string(),

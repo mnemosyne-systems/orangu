@@ -17,7 +17,7 @@
 //!
 //! Semantic `/search` embeds code chunks and queries with the server that serves
 //! the `embeddings` role. The endpoint is the OpenAI embeddings shape, which
-//! llama.cpp also serves, so the same `LlmConfiguration` profile that drives chat
+//! orangu-server also serves, so the same `LlmConfiguration` profile that drives chat
 //! works here unchanged.
 
 use std::time::Duration;

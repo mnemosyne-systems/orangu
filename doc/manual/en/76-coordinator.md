@@ -146,7 +146,7 @@ every 500ms until it succeeds or `startup_timeout` elapses. Only *then* does
 `proxy` forward the original request — headers (minus hop-by-hop ones),
 method, and body unchanged — and stream the response back.
 
-Unlike the older `llamacpp`-command-line design this replaced, `start`
+Unlike a shell-command-line design, `start`
 never parses a shell command line at all: every argument it passes is
 either a config value validated at load time or a path it generated itself,
 so there's no argv-scraping, no leading-`KEY=VALUE`-environment-assignment

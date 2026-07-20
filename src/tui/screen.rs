@@ -469,7 +469,7 @@ pub fn render_working_status(frame: usize, rate: f64, elapsed: Duration) -> Stat
     }
 }
 
-/// Like [`render_thinking_status`] but for the prefill phase of a llama.cpp
+/// Like [`render_thinking_status`] but for the prefill phase of an orangu-server
 /// request, when the server has reported [`StreamPromptProgress`] — shows how
 /// much of the prompt is being served from its KV cache rather than
 /// reprocessed, e.g. `Thinking (41% cached, 620/1500 tok) (2s)`. This is the

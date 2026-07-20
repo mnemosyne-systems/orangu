@@ -60,7 +60,7 @@ fn slice_lines(content: &str, start: usize, end: usize) -> String {
 }
 
 /// Cap embedded chunk text so a single huge function cannot dominate a request,
-/// and so a single chunk alone never exceeds a typical llama.cpp server's default
+/// and so a single chunk alone never exceeds a typical orangu-server's default
 /// physical batch size (`-b`/`--batch-size 512` tokens). Characters, not tokens —
 /// a coarse ~4 chars/token estimate, not an exact budget — chosen to leave
 /// headroom under that default rather than requiring users to raise it.

@@ -145,7 +145,6 @@ model backs every role — a single, ordinary server section is enough:
 server = main-server
 
 [main-server]
-provider = llama.cpp
 endpoint = http://localhost:9000/
 ```
 

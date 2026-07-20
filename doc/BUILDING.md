@@ -9,8 +9,7 @@ file inventory tool (`orangu-server`, see [doc/SERVER.md](SERVER.md)).
 ## Prerequisites
 
 - Rust toolchain with `cargo`
-- A running llama.cpp server exposing an OpenAI-compatible API (not needed
-  if `orangu.conf` points at `orangu-server` instead — see
+- A running `orangu-server` exposing its OpenAI-compatible API (see
   [doc/SERVER.md](SERVER.md))
 
 ## Build

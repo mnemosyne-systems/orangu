@@ -1,8 +1,10 @@
 # orangu
 
-**orangu** is a local workspace-aware tool-driven coding environment for **OpenAI-compatible** servers - especially **[llama.cpp](https://github.com/ggml-org/llama.cpp)**.
+**orangu** is a local, workspace-aware, tool-driven coding environment.
 
-**orangu** **does not** require an Internet connection after **[llama.cpp](https://github.com/ggml-org/llama.cpp)** and models have been downloaded.
+**orangu** **does not** require an Internet connection after `orangu-server` and models have been downloaded.
+
+**orangu is a complete, self-contained AI coding stack — not just a client.** It ships all three layers, written end to end in Rust: the coding environment (`orangu`), an on-demand model manager (`orangu-coordinator`), and a **native, pure-Rust GGUF inference server** (`orangu-server`) that implements the transformer forward pass itself — **no llama.cpp, no ggml, no Python**. Every layer speaks the OpenAI-compatible API. See [A complete local AI coding stack](#a-complete-local-ai-coding-stack).
 
 **orangu** is named after the [Orangutan](https://en.wikipedia.org/wiki/Orangutan) - the smartest ape.
 
@@ -11,6 +13,7 @@
 ## Table of Contents
 
 - [Why orangu?](#why-orangu)
+- [A complete local AI coding stack](#a-complete-local-ai-coding-stack)
 - [Features](#features)
   - [Code review and auto review](#code-review-and-auto-review)
 - [orangu vs. a cloud coding assistant](#orangu-vs-a-cloud-coding-assistant)
@@ -32,15 +35,44 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 
 - **100% local and private** — zero telemetry; after the model is downloaded no Internet connection is needed, so it runs happily in privacy-sensitive or air-gapped environments. Your code and conversations stay on your machine.
 - **Built-in code review** — an interactive two-pane reviewer (`/review`) *and* a category-by-category LLM auto-reviewer (`/auto_review`). This review story is orangu's standout feature; few tools its size match it.
+- **A complete local stack, all in Rust** — orangu is more than a client. It ships its own native GGUF inference server (`orangu-server`) and an on-demand model coordinator (`orangu-coordinator`), so the whole pipeline — editor, coordinator, and engine — is one pure-Rust toolchain with **no llama.cpp, ggml, or Python dependency**. See [A complete local AI coding stack](#a-complete-local-ai-coding-stack).
 - **A single fast native binary** — written entirely in Rust, with quick startup, no runtime to install, no garbage-collector pauses, and a small download.
 - **The whole Git loop lives in the prompt** — branch, commit, rebase, squash, cherry-pick, stash, bisect, push, and GitHub/GitLab pull requests, comments, and issues, all without leaving the terminal.
-- **Tuned for llama.cpp** — live tokens/second in the footer, and an interactive `--init` wizard that auto-detects the model your server is serving.
+- **Built for orangu-server** — live tokens/second in the footer, and an interactive `--init` wizard that auto-detects the model your server is serving.
 - **Agent Skills & Memory** — discovers reusable `SKILL.md` skills and merges cross-session memory and instructions from global (`~/.orangu/AGENTS.md`) and workspace-level (`./AGENTS.md`) files directly into the LLM context.
 - **Natural to drive** — dozens of slash commands, each with plain-English aliases (`review`, `auto review`, `commit "..."`, `merge feature/foo`, `pull 58`).
 
+## A complete local AI coding stack
+
+Most local-AI setups are a patchwork: one tool for the editor, a separate engine for inference, and glue to manage which model is loaded. **orangu is the whole stack in one project**, three cooperating programs written end to end in Rust:
+
+```
+                 you
+                  │
+        ┌─────────▼──────────┐   orangu — the coding environment: terminal UI,
+        │       orangu       │   local + Git/forge tools, code review, knowledge
+        └─────────┬──────────┘   graph, semantic search, compression
+                  │  OpenAI-compatible HTTP
+        ┌─────────▼──────────┐   orangu-coordinator — optional on-demand model
+        │ orangu-coordinator │   manager: starts/stops the server and swaps the
+        └─────────┬──────────┘   model per role (review, chat, embeddings)
+                  │  OpenAI-compatible HTTP
+        ┌─────────▼──────────┐   orangu-server — native pure-Rust GGUF engine:
+        │    orangu-server   │   loading, tokenization, the transformer forward
+        └─────────┬──────────┘   pass, sampling, scheduling, GGUF inventory
+                  │
+     CPU · Vulkan · CUDA · ROCm · OpenCL
+```
+
+- **`orangu`** — the workspace-aware coding environment you drive: the terminal UI, local and Git/forge tools, `/review` and `/auto_review`, the knowledge graph, semantic `/search`, and the context-compression engine.
+- **`orangu-coordinator`** — an optional companion HTTP proxy that starts and stops `orangu-server` on demand and swaps to whichever model each request needs, so a single-GPU machine can use a different model per role without ever running more than one server. Skip it if you have the VRAM to keep every model resident.
+- **`orangu-server`** — *is* the inference engine. GGUF loading, tokenization, the transformer forward pass, sampling, and request scheduling are implemented directly in Rust with **no dependency on llama.cpp/ggml's compiled code**, running on CPU or GPU (Vulkan, CUDA, ROCm, OpenCL). It exposes an OpenAI-compatible API plus native health/props/slots/metrics endpoints, and doubles as the machine's GGUF inventory (`list`/`show`/`download`/`suggest`/`system`).
+
+Every layer talks to the next over the OpenAI-compatible API, so the pieces stay cleanly separated, yet they ship and run as one: a **fully local, fully private, single-language AI coding stack — no Python, no llama.cpp, no cloud**. The coordinator ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md)) and server ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md)) each have their own chapter.
+
 ## Features
 
-**Fully local and private.** orangu talks to any OpenAI-compatible server — and is tuned for **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — so once the server and models are downloaded, nothing leaves your machine and no Internet connection is required. Your code is never sent to a third-party cloud.
+**Fully local and private.** orangu runs on its own `orangu-server`, so once the server and models are downloaded, nothing leaves your machine and no Internet connection is required. Your code is never sent to a third-party cloud.
 
 **Code review built in.** orangu's standout feature is a pair of in-terminal review workflows — an interactive reviewer and a fully automated, LLM-driven one — covered in [Code review and auto review](#code-review-and-auto-review) below.
 
@@ -63,7 +95,7 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 - Persistent terminal UI with workspace, server, and model status in the header, refreshed every minute while idle
 - Shell-style prompt editing, history, scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches)
 - Natural-language aliases for nearly every command — e.g. `review`, `auto review`, `open README.md`, `list models`, `pull 58`, `commit "[#42] My feature"`, `rebase`, `merge feature/foo`, `get comments for issue 51`, `export review`
-- Streaming responses with live footer status such as `Thinking (...)` and llama.cpp-native `Working @ X.Y t/s (...)`
+- Streaming responses with live footer status such as `Thinking (...)` and native `Working @ X.Y t/s (...)`
 - Queued local commands while a response is in flight, plus double-`Esc` request cancellation
 - Markdown rendering in the console (bold, italic, headings, lists, links, code) with syntax highlighting for fenced code blocks
 
@@ -113,7 +145,7 @@ orangu makes a deliberate trade: a focused, offline-first, Git-centric terminal 
 | --- | --- | --- |
 | **Where your code goes** | Stays on your machine — zero telemetry | Sent to a third-party provider |
 | **Offline use** | First-class; only the initial model download needs a network | Generally requires connectivity |
-| **Models** | Any OpenAI-compatible server — tuned for local llama.cpp (Ollama, LM Studio, …) | Vendor-hosted models, usually behind API keys |
+| **Models** | Any local GGUF model, served by the built-in `orangu-server` | Vendor-hosted models, usually behind API keys |
 | **Cost** | Free to run against models you host | Per-token / subscription billing |
 | **Footprint** | One native Rust binary, fast start, no runtime | Editor/cloud service + account |
 | **Code review** | Built-in interactive **and** LLM auto review in the terminal | Usually delegated to the hosting platform |
@@ -240,8 +272,7 @@ It asks for the **LLM URL**, auto-detects a model the server advertises (and
 pre-fills it as the **Model**), then walks every option showing its default.
 Anything left at its default is omitted from the file, and the result is shown
 for confirmation before being written to `~/.orangu/orangu.conf` (creating the
-directory if needed, and overwriting any existing file). The provider is
-assumed to be [llama.cpp](https://github.com/ggml-org/llama.cpp). The wizard
+directory if needed, and overwriting any existing file). The wizard
 also installs bundled skills into `~/.orangu/skills/` when they are not
 already present; currently this includes `debugging`.
 
@@ -302,7 +333,7 @@ Useful first commands:
 - [Latest manual](https://github.com/mnemosyne-systems/orangu/tree/main/doc/manual/en)
 - [Getting Started](https://github.com/mnemosyne-systems/orangu/blob/main/doc/GETTING_STARTED.md)
 - [orangu-coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/COORDINATOR.md) — auto-start/stop orangu-server for machines that only run one local model at a time
-- [orangu-server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/SERVER.md) — a native, pure-Rust GGUF inference server with a llama.cpp-compatible API, plus CPU/GPU hardware detection and local GGUF model inventory
+- [orangu-server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/SERVER.md) — a native, pure-Rust GGUF inference server with an OpenAI-compatible API, plus CPU/GPU hardware detection and local GGUF model inventory
 - [Quick start](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/03-quickstart.md)
 - [Configuration](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/20-configuration.md)
 - [Workspaces](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/31-workspaces.md)

@@ -29,13 +29,12 @@ pub struct OpenAiClient {
     endpoint: String,
     model: String,
     api_key: Option<String>,
-    llama_cpp: bool,
     /// Response-token cap sent as `max_tokens`; `None` leaves the server's
     /// default in place.
     max_tokens: Option<u32>,
-    /// llama.cpp `id_slot` to pin this request to, from
+    /// `orangu-server` `id_slot` to pin this request to, from
     /// [`crate::llm::SlotRegistry`]; `None` lets the server assign any idle
-    /// slot (today's behavior). Never sent to a non-llama.cpp server.
+    /// slot (today's behavior).
     id_slot: Option<u32>,
 }
 
@@ -134,7 +133,6 @@ impl OpenAiClient {
             endpoint: normalize_openai_endpoint(&profile.endpoint),
             model: profile.model.clone(),
             api_key: profile.api_key.clone(),
-            llama_cpp: profile.provider.eq_ignore_ascii_case("llama.cpp"),
             // Normal chat/tool responses are capped by the configured
             // `code_max_tokens` (0 = no cap).
             max_tokens: (profile.code_max_tokens > 0).then_some(profile.code_max_tokens),
@@ -150,8 +148,8 @@ impl OpenAiClient {
         self
     }
 
-    /// Pin every request from this client to a specific llama.cpp `id_slot`
-    /// (see [`crate::llm::SlotRegistry`]). Ignored on non-llama.cpp servers.
+    /// Pin every request from this client to a specific `orangu-server`
+    /// `id_slot` (see [`crate::llm::SlotRegistry`]).
     pub fn with_id_slot(mut self, id_slot: Option<u32>) -> Self {
         self.id_slot = id_slot;
         self
@@ -175,9 +173,12 @@ impl OpenAiClient {
             stream: true,
             tools: if tools.is_empty() { None } else { Some(tools) },
             max_tokens: self.max_tokens,
-            timings_per_token: self.llama_cpp.then_some(true),
-            return_progress: self.llama_cpp.then_some(true),
-            id_slot: self.llama_cpp.then_some(self.id_slot).flatten(),
+            // orangu-server is the only backend and always speaks the
+            // OpenAI-compatible API, so its native streaming metrics and
+            // slot pinning are always requested.
+            timings_per_token: Some(true),
+            return_progress: Some(true),
+            id_slot: self.id_slot,
         };
 
         let mut builder = self.http_client.post(&url).json(&request);
@@ -472,7 +473,6 @@ mod tests {
     #[test]
     fn max_tokens_follows_the_profile_and_zero_means_no_cap() {
         let mut profile = LlmConfiguration {
-            provider: "llama.cpp".to_string(),
             endpoint: "http://localhost:8100".to_string(),
             model: "model".to_string(),
             role: "all".to_string(),
@@ -547,12 +547,8 @@ mod tests {
     }
 
     #[test]
-    fn with_id_slot_sets_the_field_regardless_of_provider() {
-        // `chat()` itself is what drops `id_slot` for non-llama.cpp providers
-        // (`self.llama_cpp.then_some(self.id_slot).flatten()`); the builder
-        // just records what was requested.
-        let mut profile = LlmConfiguration {
-            provider: "openai".to_string(),
+    fn with_id_slot_records_the_requested_slot() {
+        let profile = LlmConfiguration {
             endpoint: "http://localhost:8100".to_string(),
             model: "model".to_string(),
             role: "all".to_string(),
@@ -568,14 +564,6 @@ mod tests {
         let client = OpenAiClient::from_profile(&profile)
             .expect("client")
             .with_id_slot(Some(3));
-        assert!(!client.llama_cpp);
-        assert_eq!(client.id_slot, Some(3));
-
-        profile.provider = "llama.cpp".to_string();
-        let client = OpenAiClient::from_profile(&profile)
-            .expect("client")
-            .with_id_slot(Some(3));
-        assert!(client.llama_cpp);
         assert_eq!(client.id_slot, Some(3));
     }
 

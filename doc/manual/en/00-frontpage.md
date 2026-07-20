@@ -1,7 +1,7 @@
 ---
 title: "orangu"
 subtitle: "Advanced coding environment"
-keywords: [orangu, llama.cpp, OpenAI-compatible, CLI]
+keywords: [orangu, orangu-server, OpenAI-compatible, CLI]
 lang: "en"
 titlepage: true
 titlepage-color: "8B5A2B"
