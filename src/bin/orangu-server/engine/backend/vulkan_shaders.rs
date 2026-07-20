@@ -2179,6 +2179,148 @@ pub fn shader_source_rmsnorm_subgroup_wg(workgroup_size: u32) -> String {
     format!("{ELEM_META}\n{body}")
 }
 
+/// `RMSNORM_SHADER_BODY_SUBGROUP` with the trailing rescale loop's write
+/// changed to `y[k] = x[k] * scale * weight[k] + residual[k]` — RMSNorm
+/// immediately followed by a residual add, in one dispatch instead of two
+/// (`rmsnorm_pipeline` then `add_pipeline`). Only safe to merge this way
+/// because both steps are single-workgroup, whole-row operations already
+/// (`dispatch_workgroups(1, 1, 1)`, every one of the 64 threads
+/// grid-striding the *entire* row) — the add's own per-thread output slice
+/// exactly matches the norm's own, so no new cross-thread dependency is
+/// introduced by folding the add into the same trailing loop. This is
+/// *not* the same kind of fusion as folding a matmul in: the matmul that
+/// produces `x` here is dispatched across many independent workgroups (one
+/// per `REDUCE_N_ROWS`-row group, for occupancy), and there is no
+/// cross-workgroup barrier in a single dispatch to make that matmul's own
+/// output visible to a fused norm+add before every one of *those*
+/// workgroups has finished — that would need collapsing the matmul itself
+/// down to one workgroup, trading its current many-workgroup occupancy for
+/// dispatch-count savings with an unclear (likely negative) net effect;
+/// not attempted, see `doc/SERVER_ROADMAP.md`'s Priority 1 item 1 for why.
+/// Needs its own bind group shape (`elem5_bind_group_layout`): `elem4`'s
+/// four bindings (`x`, `weight`, `y`, `meta`) aren't enough room for the
+/// extra `residual` input.
+const RMSNORM_ADD_SHADER_BODY_SUBGROUP: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> residual: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(num_subgroups) n_sg: u32,
+) {
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    let sg_sum = subgroupAdd(partial);
+    if (sg_lane == 0u) {
+        partial_sums[sg_id] = sg_sum;
+    }
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i >= n_sg) {
+            break;
+        }
+        total = total + partial_sums[i];
+        i = i + 1u;
+    }
+    let mean_sq = total / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[k] = x[k] * scale * weight[k] + residual[k];
+        k = k + 64u;
+    }
+}
+"#;
+
+/// `RMSNORM_SHADER_BODY`'s shared-memory-tree-reduction fallback, fused
+/// with the residual add the same way `RMSNORM_ADD_SHADER_BODY_SUBGROUP`
+/// is — used when `subgroupAdd` isn't available. See that constant's own
+/// doc comment for why this fusion is safe and what it deliberately
+/// doesn't attempt.
+const RMSNORM_ADD_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> residual: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    partial_sums[local] = partial;
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride) {
+            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let mean_sq = partial_sums[0] / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[k] = x[k] * scale * weight[k] + residual[k];
+        k = k + 64u;
+    }
+}
+"#;
+
+/// See `RMSNORM_ADD_SHADER_BODY_SUBGROUP`'s own doc comment — RMSNorm
+/// fused with the residual add that already always immediately follows it
+/// at both of this codebase's two call sites (`wo`'s and `ffn_down`'s own
+/// post-matmul norm+add, `VulkanBackend::build_fused_resources`), removing
+/// one dispatch (`add_pipeline`'s own) from each.
+pub fn shader_source_rmsnorm_add(subgroup: bool) -> String {
+    let body = if subgroup {
+        RMSNORM_ADD_SHADER_BODY_SUBGROUP
+    } else {
+        RMSNORM_ADD_SHADER_BODY
+    };
+    format!("{ELEM_META}\n{body}")
+}
+
 /// GPU-resident causal attention for a *single* query token (decode,
 /// `n_tokens == 1`) against a GPU-resident KV cache — one workgroup per
 /// query head, 64 threads. Online-softmax, **tiled** over the KV sequence in chunks of 64

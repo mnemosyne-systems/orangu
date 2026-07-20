@@ -292,6 +292,60 @@ fn elem4_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Bind group layout for `rmsnorm_add_pipeline` — RMSNorm fused with an
+/// immediately-following residual add, in one dispatch: `x`/`weight` (both
+/// read-only storage, RMSNorm's own inputs), `residual` (read-only
+/// storage, the value added after normalizing), `y` (read-write storage,
+/// the final post-add output), `meta` (uniform). See `shader_source_
+/// rmsnorm_add`'s own doc comment for why this exists as a fifth binding
+/// rather than reusing `elem4_bind_group_layout`.
+fn elem5_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server elem5 bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(false),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 /// Bind group layout for the unary elementwise shaders (`gelu`, `scale`):
 /// one read-only storage buffer, one read-write storage buffer, one
 /// uniform.
@@ -608,6 +662,14 @@ struct ScratchArena {
 }
 
 impl ScratchArena {
+    fn new() -> Self {
+        ScratchArena {
+            chunks: Vec::new(),
+            current_chunk_capacity: 0,
+            next_offset: 0,
+        }
+    }
+
     /// Places a new `size`-byte region at the next `align`-aligned offset,
     /// growing `chunks` first if the current one doesn't have room —
     /// mirrors `VulkanBackend::weight_buffer`'s own chunk-growth logic.
@@ -710,6 +772,53 @@ pub struct VulkanBackend {
     x_arena: Mutex<ScratchArena>,
     /// Backing store for every `CachedOpResources::output_buffer`.
     output_arena: Mutex<ScratchArena>,
+    /// Backing arenas for `FusedResources`/`FusedLayerResources`/
+    /// `FusedPleResources`/`FusedScaleResources`'s own scratch buffers —
+    /// **one dedicated arena per distinct field**, not one shared pool.
+    /// Two independent hazards rule out sharing, both discovered by a real
+    /// `wgpu` validation failure while implementing this (`fused_arena`
+    /// originally grouped several fields together and broke immediately):
+    /// 1. Any two buffers *bound together in the same dispatch* with
+    ///    different usages (one read-only, one read-write) must not be the
+    ///    same underlying `wgpu::Buffer` — `wgpu-core` rejects this even
+    ///    when the two bound regions are non-overlapping sub-ranges of one
+    ///    buffer ("`BufferUses(STORAGE_READ_WRITE)` is an exclusive usage
+    ///    and cannot be used with any other usages within the usage
+    ///    scope"). E.g. `attn_norm_bg` binds `FusedLayerResources::x_buf`
+    ///    read-only and `normed_buf` read-write in the *same* bind
+    ///    group — those two must never share a chunk.
+    /// 2. The same restriction applies to `copy_buffer_to_buffer`: a
+    ///    layer's own final output (`FusedResources::x2`, or
+    ///    `FusedPleResources::x3`/`FusedScaleResources::scaled` when
+    ///    PLE/`layer_output_scale` are present) is copied directly into
+    ///    the *next* layer's `FusedLayerResources::x_buf` (`GemmaModel::
+    ///    record_one_sequence_decode`'s own `prev_buf` chaining) — that
+    ///    copy's source and destination must not be the same buffer
+    ///    either.
+    ///
+    /// Working out the *minimum* number of arenas that avoids every such
+    /// pair (a graph-coloring problem — which fields are ever bound or
+    /// copied together) is real but easy to get subtly wrong, and a
+    /// mistake here is a silent-corruption risk, not a compile error or a
+    /// crash. One arena per field, mirroring `x_arena`/`output_arena`'s
+    /// own one-per-role precedent, is provably safe by construction —
+    /// two *different* fields are never the same buffer, full stop — at
+    /// the cost of a few more (~14, vs. `weight_cache`/`op_cache`'s own
+    /// tens-of-thousands) chunk buffers than the true minimum.
+    fused_layer_x_arena: Mutex<ScratchArena>,
+    fused_layer_normed_arena: Mutex<ScratchArena>,
+    fused_residual_arena: Mutex<ScratchArena>,
+    fused_x1_arena: Mutex<ScratchArena>,
+    fused_ffn_normed_arena: Mutex<ScratchArena>,
+    fused_gelu_arena: Mutex<ScratchArena>,
+    fused_mulled_arena: Mutex<ScratchArena>,
+    fused_x2_arena: Mutex<ScratchArena>,
+    fused_ple_per_layer_arena: Mutex<ScratchArena>,
+    fused_ple_gelu_arena: Mutex<ScratchArena>,
+    fused_ple_mulled_arena: Mutex<ScratchArena>,
+    fused_ple_normed_arena: Mutex<ScratchArena>,
+    fused_ple_x3_arena: Mutex<ScratchArena>,
+    fused_scale_arena: Mutex<ScratchArena>,
     /// Each entry is individually locked (not the whole map) for the
     /// duration of the op that uses it, so unrelated ops (different weight
     /// tensors, or the same tensor at a different `n_tokens`) never
@@ -731,6 +840,15 @@ pub struct VulkanBackend {
     gelu_pipeline: wgpu::ComputePipeline,
     scale_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
+    /// Bind group layout for `rmsnorm_add_pipeline` — see
+    /// `elem5_bind_group_layout`.
+    elem5_bind_group_layout: wgpu::BindGroupLayout,
+    /// RMSNorm fused with the residual add that immediately follows it —
+    /// see `vulkan_shaders::shader_source_rmsnorm_add`'s own doc comment.
+    /// Used at `wo`'s and `ffn_down`'s own post-matmul norm+add call sites
+    /// (`Self::build_fused_resources`), replacing what were two separate
+    /// dispatches (`rmsnorm_pipeline` then `add_pipeline`) with one.
+    rmsnorm_add_pipeline: wgpu::ComputePipeline,
     /// Every buffer/bind group `fused_post_attention` needs *except* the
     /// three that genuinely change contents every call (`wo`'s own
     /// `x_buffer`, already covered by `op_cache`; the residual snapshot;
@@ -1499,6 +1617,13 @@ impl VulkanBackend {
                 bind_group_layouts: &[Some(&elem3_bind_group_layout)],
                 immediate_size: 0,
             });
+        let elem5_bind_group_layout = elem5_bind_group_layout(&device);
+        let elem5_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server elem5 pipeline layout"),
+                bind_group_layouts: &[Some(&elem5_bind_group_layout)],
+                immediate_size: 0,
+            });
         let build_elem_pipeline = |layout: &wgpu::PipelineLayout, source: String| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("orangu-server elem shader"),
@@ -1520,6 +1645,10 @@ impl VulkanBackend {
         let rmsnorm_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm(subgroup_reduce),
+        );
+        let rmsnorm_add_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add(subgroup_reduce),
         );
         let gelu_pipeline =
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_gelu());
@@ -1811,6 +1940,20 @@ impl VulkanBackend {
                 current_chunk_capacity: 0,
                 next_offset: 0,
             }),
+            fused_layer_x_arena: Mutex::new(ScratchArena::new()),
+            fused_layer_normed_arena: Mutex::new(ScratchArena::new()),
+            fused_residual_arena: Mutex::new(ScratchArena::new()),
+            fused_x1_arena: Mutex::new(ScratchArena::new()),
+            fused_ffn_normed_arena: Mutex::new(ScratchArena::new()),
+            fused_gelu_arena: Mutex::new(ScratchArena::new()),
+            fused_mulled_arena: Mutex::new(ScratchArena::new()),
+            fused_x2_arena: Mutex::new(ScratchArena::new()),
+            fused_ple_per_layer_arena: Mutex::new(ScratchArena::new()),
+            fused_ple_gelu_arena: Mutex::new(ScratchArena::new()),
+            fused_ple_mulled_arena: Mutex::new(ScratchArena::new()),
+            fused_ple_normed_arena: Mutex::new(ScratchArena::new()),
+            fused_ple_x3_arena: Mutex::new(ScratchArena::new()),
+            fused_scale_arena: Mutex::new(ScratchArena::new()),
             op_cache: Mutex::new(HashMap::new()),
             adapter_name,
             elem4_bind_group_layout,
@@ -1820,6 +1963,8 @@ impl VulkanBackend {
             gelu_pipeline,
             scale_pipeline,
             rmsnorm_pipeline,
+            elem5_bind_group_layout,
+            rmsnorm_add_pipeline,
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
             attn_pipeline,
@@ -2830,6 +2975,52 @@ impl VulkanBackend {
         })
     }
 
+    /// See `elem5_bind_group_layout`'s own doc comment — `x`/`weight`
+    /// (RMSNorm's own inputs), `residual` (added after normalizing), `y`
+    /// (the final post-add output), `meta`.
+    fn elem5_bind_group<'a>(
+        &self,
+        x: impl Into<BindSrc<'a>>,
+        weight: impl Into<BindSrc<'a>>,
+        residual: impl Into<BindSrc<'a>>,
+        y: impl Into<BindSrc<'a>>,
+        meta: impl Into<BindSrc<'a>>,
+    ) -> wgpu::BindGroup {
+        let (x, weight, residual, y, meta) = (
+            x.into(),
+            weight.into(),
+            residual.into(),
+            y.into(),
+            meta.into(),
+        );
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server elem5 bind group"),
+            layout: &self.elem5_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: residual.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: y.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: meta.resource(),
+                },
+            ],
+        })
+    }
+
     fn elem3_bind_group<'a>(
         &self,
         x: impl Into<BindSrc<'a>>,
@@ -2894,6 +3085,7 @@ impl VulkanBackend {
         &self,
         mut encoder: wgpu::CommandEncoder,
         src: &wgpu::Buffer,
+        src_offset: u64,
         len_f32: usize,
     ) -> Vec<f32> {
         let byte_len = (len_f32 as u64) * 4;
@@ -2903,7 +3095,7 @@ impl VulkanBackend {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        encoder.copy_buffer_to_buffer(src, 0, &readback_buffer, 0, byte_len);
+        encoder.copy_buffer_to_buffer(src, src_offset, &readback_buffer, 0, byte_len);
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3061,7 +3253,7 @@ impl VulkanBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
         }
-        self.submit_and_readback(encoder, &x_buf, x.len())
+        self.submit_and_readback(encoder, &x_buf, 0, x.len())
     }
 
     /// GPU per-head weighted RMSNorm immediately followed by RoPE, fused
@@ -3126,7 +3318,7 @@ impl VulkanBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
-        self.submit_and_readback(encoder, &x_buf, x.len())
+        self.submit_and_readback(encoder, &x_buf, 0, x.len())
     }
 
     /// GPU per-head weighted RMSNorm (Q-norm/K-norm) — cross-checked
@@ -3176,7 +3368,7 @@ impl VulkanBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
-        self.submit_and_readback(encoder, &x_buf, x.len())
+        self.submit_and_readback(encoder, &x_buf, 0, x.len())
     }
 
     /// GPU per-head weightless RMSNorm (V's norm) — cross-checked against
@@ -3222,7 +3414,7 @@ impl VulkanBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
-        self.submit_and_readback(encoder, &x_buf, x.len())
+        self.submit_and_readback(encoder, &x_buf, 0, x.len())
     }
 
     fn perhead_norm_meta_buffer(&self, n_head: u32, head_dim: u32, eps: f32) -> wgpu::Buffer {
@@ -3356,40 +3548,106 @@ impl VulkanBackend {
         ple: &FusedPle<'_>,
         n_embd: usize,
         meta_embd_eps: &wgpu::Buffer,
-        x2: &wgpu::Buffer,
+        x2: (&wgpu::Buffer, u64),
         ple_gate_g: &CachedOpResources,
         ple_proj_g: &CachedOpResources,
     ) -> FusedPleResources {
+        let (x2, x2_offset) = x2;
         let per_layer_dim = ple.per_layer_dim;
         debug_assert_eq!(ple.gate_w.out_dim, per_layer_dim);
         debug_assert_eq!(ple.proj_w.in_dim, per_layer_dim);
         debug_assert_eq!(ple.proj_w.out_dim, n_embd);
 
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        let per_layer_bytes = (per_layer_dim as u64) * 4;
+        let n_embd_bytes = (n_embd as u64) * 4;
+        let (per_layer_buf, per_layer_buf_offset) = self
+            .fused_ple_per_layer_arena
+            .lock()
+            .expect("fused ple per_layer arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                per_layer_bytes,
+                "orangu-server fused ple per_layer arena chunk",
+            );
+        let (gelu_out, gelu_out_offset) = self
+            .fused_ple_gelu_arena
+            .lock()
+            .expect("fused ple gelu arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                per_layer_bytes,
+                "orangu-server fused ple gelu arena chunk",
+            );
+        let (mulled, mulled_offset) = self
+            .fused_ple_mulled_arena
+            .lock()
+            .expect("fused ple mulled arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                per_layer_bytes,
+                "orangu-server fused ple mulled arena chunk",
+            );
+        let (normed, normed_offset) = self
+            .fused_ple_normed_arena
+            .lock()
+            .expect("fused ple normed arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused ple normed arena chunk",
+            );
+        let (x3, x3_offset) = self
+            .fused_ple_x3_arena
+            .lock()
+            .expect("fused ple x3 arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused ple x3 arena chunk",
+            );
         let post_norm_w = self.upload_new(ple.post_norm);
-        let per_layer_buf = self.scratch_buffer(per_layer_dim);
-        let gelu_out = self.scratch_buffer(per_layer_dim);
-        let mulled = self.scratch_buffer(per_layer_dim);
-        let normed = self.scratch_buffer(n_embd);
-        let x3 = self.scratch_buffer(n_embd);
         let meta_plain = self.elem_meta_buffer(per_layer_dim as u32, 0.0);
         let wg = (per_layer_dim as u32).div_ceil(64);
 
-        let bg_gelu = self.elem3_bind_group(ple_gate_g.output_src(), &gelu_out, &meta_plain);
-        let bg_mul = self.elem4_bind_group(&gelu_out, &per_layer_buf, &mulled, &meta_plain);
+        let bg_gelu = self.elem3_bind_group(
+            ple_gate_g.output_src(),
+            BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
+            &meta_plain,
+        );
+        let bg_mul = self.elem4_bind_group(
+            BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
+            BindSrc::Slice(&per_layer_buf, per_layer_buf_offset, per_layer_bytes),
+            BindSrc::Slice(&mulled, mulled_offset, per_layer_bytes),
+            &meta_plain,
+        );
         let bg_post_norm = self.elem4_bind_group(
             ple_proj_g.output_src(),
             &post_norm_w,
-            &normed,
+            BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
             meta_embd_eps,
         );
-        let bg_add = self.elem4_bind_group(&normed, x2, &x3, meta_embd_eps);
+        let bg_add = self.elem4_bind_group(
+            BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
+            BindSrc::Slice(x2, x2_offset, n_embd_bytes),
+            BindSrc::Slice(&x3, x3_offset, n_embd_bytes),
+            meta_embd_eps,
+        );
 
         FusedPleResources {
             per_layer_buf,
+            per_layer_buf_offset,
             gelu_out,
             mulled,
+            mulled_offset,
             normed,
             x3,
+            x3_offset,
             bg_gelu,
             bg_mul,
             bg_post_norm,
@@ -3414,73 +3672,176 @@ impl VulkanBackend {
         let n_embd = input.wo.out_dim;
         let ffn_len = input.ffn_gate.out_dim;
 
-        let residual_buf = self.scratch_buffer(n_embd);
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        let n_embd_bytes = (n_embd as u64) * 4;
+        let ffn_bytes = (ffn_len as u64) * 4;
+        let (residual_buf, residual_buf_offset) = self
+            .fused_residual_arena
+            .lock()
+            .expect("fused residual arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused residual arena chunk",
+            );
+        let (x1, x1_offset) = self
+            .fused_x1_arena
+            .lock()
+            .expect("fused x1 arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused x1 arena chunk",
+            );
+        let (ffn_normed, ffn_normed_offset) = self
+            .fused_ffn_normed_arena
+            .lock()
+            .expect("fused ffn_normed arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused ffn_normed arena chunk",
+            );
+        let (gelu_out, gelu_out_offset) = self
+            .fused_gelu_arena
+            .lock()
+            .expect("fused gelu arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                ffn_bytes,
+                "orangu-server fused gelu arena chunk",
+            );
+        let (mulled, mulled_offset) = self
+            .fused_mulled_arena
+            .lock()
+            .expect("fused mulled arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                ffn_bytes,
+                "orangu-server fused mulled arena chunk",
+            );
+        let (x2, x2_offset) = self
+            .fused_x2_arena
+            .lock()
+            .expect("fused x2 arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused x2 arena chunk",
+            );
+
         let attn_post_norm_w = self.upload_new(input.attn_post_norm);
         let ffn_norm_w = self.upload_new(input.ffn_norm);
         let ffn_post_norm_w = self.upload_new(input.ffn_post_norm);
-
-        let normed1 = self.scratch_buffer(n_embd);
-        let x1 = self.scratch_buffer(n_embd);
-        let ffn_normed = self.scratch_buffer(n_embd);
-        let gelu_out = self.scratch_buffer(ffn_len);
-        let mulled = self.scratch_buffer(ffn_len);
-        let normed2 = self.scratch_buffer(n_embd);
-        let x2 = self.scratch_buffer(n_embd);
-
         let meta_embd_eps = self.elem_meta_buffer(n_embd as u32, input.eps);
-        let meta_embd_plain = self.elem_meta_buffer(n_embd as u32, 0.0);
         let meta_ffn_plain = self.elem_meta_buffer(ffn_len as u32, 0.0);
 
-        let bg_attn_post_norm = self.elem4_bind_group(
+        // `wo`'s own post-matmul RMSNorm and the residual add that always
+        // immediately follows it, fused into one dispatch — see
+        // `vulkan_shaders::shader_source_rmsnorm_add`'s own doc comment for
+        // why this is safe (both were already single-workgroup, whole-row
+        // operations) and what it deliberately doesn't attempt (folding
+        // the matmul itself in too).
+        let bg_attn_post_norm_add = self.elem5_bind_group(
             wo_g.output_src(),
             &attn_post_norm_w,
-            &normed1,
+            BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
+            BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
             &meta_embd_eps,
         );
-        let bg_add1 = self.elem4_bind_group(&normed1, &residual_buf, &x1, &meta_embd_plain);
-        let bg_ffn_norm = self.elem4_bind_group(&x1, &ffn_norm_w, &ffn_normed, &meta_embd_eps);
-        let bg_gelu = self.elem3_bind_group(gate_g.output_src(), &gelu_out, &meta_ffn_plain);
-        let bg_mul = self.elem4_bind_group(&gelu_out, up_g.output_src(), &mulled, &meta_ffn_plain);
-        let bg_ffn_post_norm = self.elem4_bind_group(
+        let bg_ffn_norm = self.elem4_bind_group(
+            BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+            &ffn_norm_w,
+            BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
+            &meta_embd_eps,
+        );
+        let bg_gelu = self.elem3_bind_group(
+            gate_g.output_src(),
+            BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
+            &meta_ffn_plain,
+        );
+        let bg_mul = self.elem4_bind_group(
+            BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
+            up_g.output_src(),
+            BindSrc::Slice(&mulled, mulled_offset, ffn_bytes),
+            &meta_ffn_plain,
+        );
+        // `ffn_down`'s own post-matmul norm+add, same fusion — the residual
+        // here is `x1` (this sub-layer's own pre-FFN residual stream), not
+        // `residual_buf` (that's `bg_attn_post_norm_add`'s own residual).
+        let bg_ffn_post_norm_add = self.elem5_bind_group(
             down_g.output_src(),
             &ffn_post_norm_w,
-            &normed2,
+            BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+            BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
             &meta_embd_eps,
         );
-        let bg_add2 = self.elem4_bind_group(&normed2, &x1, &x2, &meta_embd_plain);
 
         let ple = if let (Some(ple), Some((ple_gate_g, ple_proj_g))) = (&input.ple, ple_g) {
-            Some(self.build_ple_resources(ple, n_embd, &meta_embd_eps, &x2, ple_gate_g, ple_proj_g))
+            Some(self.build_ple_resources(
+                ple,
+                n_embd,
+                &meta_embd_eps,
+                (&x2, x2_offset),
+                ple_gate_g,
+                ple_proj_g,
+            ))
         } else {
             None
         };
 
         let scale = if let Some(s) = input.layer_output_scale {
-            let scaled = self.scratch_buffer(n_embd);
+            let (scaled, scaled_offset) = self
+                .fused_scale_arena
+                .lock()
+                .expect("fused scale arena poisoned")
+                .alloc(
+                    &self.device,
+                    align,
+                    n_embd_bytes,
+                    "orangu-server fused scale arena chunk",
+                );
             let meta_buf = self.elem_meta_buffer(n_embd as u32, s);
-            let source: &wgpu::Buffer = ple.as_ref().map_or(&x2, |p| &p.x3);
-            let bg = self.elem3_bind_group(source, &scaled, &meta_buf);
-            Some(FusedScaleResources { scaled, bg })
+            let source: BindSrc<'_> = match &ple {
+                Some(p) => BindSrc::Slice(&p.x3, p.x3_offset, n_embd_bytes),
+                None => BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
+            };
+            let bg = self.elem3_bind_group(
+                source,
+                BindSrc::Slice(&scaled, scaled_offset, n_embd_bytes),
+                &meta_buf,
+            );
+            Some(FusedScaleResources {
+                scaled,
+                scaled_offset,
+                bg,
+            })
         } else {
             None
         };
 
         FusedResources {
             residual_buf,
-            normed1,
+            residual_buf_offset,
             x1,
             ffn_normed,
+            ffn_normed_offset,
             gelu_out,
             mulled,
-            normed2,
+            mulled_offset,
             x2,
-            bg_attn_post_norm,
-            bg_add1,
+            x2_offset,
+            bg_attn_post_norm_add,
             bg_ffn_norm,
             bg_gelu,
             bg_mul,
-            bg_ffn_post_norm,
-            bg_add2,
+            bg_ffn_post_norm_add,
             ple,
             scale,
             embd_wg: (n_embd as u32).div_ceil(64),
@@ -3532,7 +3893,7 @@ impl VulkanBackend {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         input: FusedPostAttentionInput<'_>,
-    ) -> wgpu::Buffer {
+    ) -> (wgpu::Buffer, u64) {
         let n_embd = input.wo.out_dim;
         let ffn_len = input.ffn_gate.out_dim;
         debug_assert_eq!(input.ffn_up.out_dim, ffn_len);
@@ -3582,12 +3943,18 @@ impl VulkanBackend {
             input.attn_out,
             input.wo.in_dim,
         );
-        self.upload_or_copy(encoder, &res.residual_buf, 0, input.residual, n_embd);
+        self.upload_or_copy(
+            encoder,
+            &res.residual_buf,
+            res.residual_buf_offset,
+            input.residual,
+            n_embd,
+        );
         if let (Some(ple), Some(pres)) = (&input.ple, &res.ple) {
             self.upload_or_copy(
                 encoder,
                 &pres.per_layer_buf,
-                0,
+                pres.per_layer_buf_offset,
                 ple.per_layer_slice,
                 ple.per_layer_dim,
             );
@@ -3600,13 +3967,9 @@ impl VulkanBackend {
             });
             self.record_matmul(&mut pass, input.wo, &wo_g);
 
-            pass.set_pipeline(&self.rmsnorm_pipeline);
-            pass.set_bind_group(0, &res.bg_attn_post_norm, &[]);
+            pass.set_pipeline(&self.rmsnorm_add_pipeline);
+            pass.set_bind_group(0, &res.bg_attn_post_norm_add, &[]);
             pass.dispatch_workgroups(1, 1, 1);
-
-            pass.set_pipeline(&self.add_pipeline);
-            pass.set_bind_group(0, &res.bg_add1, &[]);
-            pass.dispatch_workgroups(res.embd_wg, 1, 1);
 
             pass.set_pipeline(&self.rmsnorm_pipeline);
             pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
@@ -3614,14 +3977,14 @@ impl VulkanBackend {
         }
         encoder.copy_buffer_to_buffer(
             &res.ffn_normed,
-            0,
+            res.ffn_normed_offset,
             &gate_g.x_buffer,
             gate_g.x_offset,
             (n_embd as u64) * 4,
         );
         encoder.copy_buffer_to_buffer(
             &res.ffn_normed,
-            0,
+            res.ffn_normed_offset,
             &up_g.x_buffer,
             up_g.x_offset,
             (n_embd as u64) * 4,
@@ -3645,7 +4008,7 @@ impl VulkanBackend {
         }
         encoder.copy_buffer_to_buffer(
             &res.mulled,
-            0,
+            res.mulled_offset,
             &down_g.x_buffer,
             down_g.x_offset,
             (ffn_len as u64) * 4,
@@ -3658,22 +4021,18 @@ impl VulkanBackend {
             });
             self.record_matmul(&mut pass, input.ffn_down, &down_g);
 
-            pass.set_pipeline(&self.rmsnorm_pipeline);
-            pass.set_bind_group(0, &res.bg_ffn_post_norm, &[]);
+            pass.set_pipeline(&self.rmsnorm_add_pipeline);
+            pass.set_bind_group(0, &res.bg_ffn_post_norm_add, &[]);
             pass.dispatch_workgroups(1, 1, 1);
-
-            pass.set_pipeline(&self.add_pipeline);
-            pass.set_bind_group(0, &res.bg_add2, &[]);
-            pass.dispatch_workgroups(res.embd_wg, 1, 1);
         }
 
-        let mut final_buf = &res.x2;
+        let mut final_buf: (&wgpu::Buffer, u64) = (&res.x2, res.x2_offset);
         if let (Some(ple_input), Some(pres), Some((ple_gate_g, ple_proj_g))) =
             (&input.ple, &res.ple, &ple_g)
         {
             encoder.copy_buffer_to_buffer(
-                final_buf,
-                0,
+                final_buf.0,
+                final_buf.1,
                 &ple_gate_g.x_buffer,
                 ple_gate_g.x_offset,
                 (n_embd as u64) * 4,
@@ -3697,7 +4056,7 @@ impl VulkanBackend {
             let per_layer_dim = ple_input.per_layer_dim;
             encoder.copy_buffer_to_buffer(
                 &pres.mulled,
-                0,
+                pres.mulled_offset,
                 &ple_proj_g.x_buffer,
                 ple_proj_g.x_offset,
                 (per_layer_dim as u64) * 4,
@@ -3718,7 +4077,7 @@ impl VulkanBackend {
                 pass.set_bind_group(0, &pres.bg_add, &[]);
                 pass.dispatch_workgroups(res.embd_wg, 1, 1);
             }
-            final_buf = &pres.x3;
+            final_buf = (&pres.x3, pres.x3_offset);
         }
 
         if let Some(sres) = &res.scale {
@@ -3731,10 +4090,10 @@ impl VulkanBackend {
                 pass.set_bind_group(0, &sres.bg, &[]);
                 pass.dispatch_workgroups(res.embd_wg, 1, 1);
             }
-            final_buf = &sres.scaled;
+            final_buf = (&sres.scaled, sres.scaled_offset);
         }
 
-        final_buf.clone()
+        (final_buf.0.clone(), final_buf.1)
     }
 
     /// Fuses a gemma4 layer's post-attention chain — `wo`, `attn_post_norm`,
@@ -3770,8 +4129,8 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server fused post-attention (standalone) encoder"),
             });
-        let final_buf = self.record_fused_post_attention(&mut encoder, input);
-        self.submit_and_readback(encoder, &final_buf, n_embd)
+        let (final_buf, final_offset) = self.record_fused_post_attention(&mut encoder, input);
+        self.submit_and_readback(encoder, &final_buf, final_offset, n_embd)
     }
 
     /// GPU-resident causal attention for one decode step (`n_tokens == 1`)
@@ -4835,7 +5194,7 @@ impl VulkanBackend {
                 label: Some("orangu-server fused attention (standalone) encoder"),
             });
         let out_buf = self.record_fused_attention(&mut encoder, input);
-        self.submit_and_readback(encoder, &out_buf, n_head * head_dim)
+        self.submit_and_readback(encoder, &out_buf, 0, n_head * head_dim)
     }
 
     /// Builds (never cached itself — callers cache the whole
@@ -4849,14 +5208,41 @@ impl VulkanBackend {
         attn_norm: &[f32],
         eps: f32,
     ) -> FusedLayerResources {
-        let x_buf = self.scratch_buffer(n_embd);
-        let normed_buf = self.scratch_buffer(n_embd);
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        let n_embd_bytes = (n_embd as u64) * 4;
+        let (x_buf, x_buf_offset) = self
+            .fused_layer_x_arena
+            .lock()
+            .expect("fused layer x arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused layer x arena chunk",
+            );
+        let (normed_buf, normed_buf_offset) = self
+            .fused_layer_normed_arena
+            .lock()
+            .expect("fused layer normed arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                n_embd_bytes,
+                "orangu-server fused layer normed arena chunk",
+            );
         let attn_norm_w = self.upload_new(attn_norm);
         let meta = self.elem_meta_buffer(n_embd as u32, eps);
-        let attn_norm_bg = self.elem4_bind_group(&x_buf, &attn_norm_w, &normed_buf, &meta);
+        let attn_norm_bg = self.elem4_bind_group(
+            BindSrc::Slice(&x_buf, x_buf_offset, n_embd_bytes),
+            &attn_norm_w,
+            BindSrc::Slice(&normed_buf, normed_buf_offset, n_embd_bytes),
+            &meta,
+        );
         FusedLayerResources {
             x_buf,
+            x_buf_offset,
             normed_buf,
+            normed_buf_offset,
             attn_norm_bg,
         }
     }
@@ -4923,7 +5309,7 @@ impl VulkanBackend {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         input: FusedLayerInput<'_>,
-    ) -> wgpu::Buffer {
+    ) -> (wgpu::Buffer, u64) {
         let n_embd = input.wq.in_dim;
         let layer_res = self.fused_layer_entry_for(
             input.wq,
@@ -4962,7 +5348,7 @@ impl VulkanBackend {
             batch_slot,
         } = input;
 
-        self.upload_or_copy(encoder, &layer_res.x_buf, 0, x, n_embd);
+        self.upload_or_copy(encoder, &layer_res.x_buf, layer_res.x_buf_offset, x, n_embd);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4977,7 +5363,10 @@ impl VulkanBackend {
         let attn_out_buf = self.record_fused_attention(
             encoder,
             FusedAttnInput {
-                normed: GpuInput::Gpu(&layer_res.normed_buf, 0),
+                normed: GpuInput::Gpu(
+                    &layer_res.normed_buf,
+                    (layer_res.normed_buf_offset / 4) as usize,
+                ),
                 wq,
                 q_norm,
                 kv,
@@ -5000,7 +5389,7 @@ impl VulkanBackend {
             encoder,
             FusedPostAttentionInput {
                 attn_out: GpuInput::Gpu(&attn_out_buf, 0),
-                residual: GpuInput::Gpu(&layer_res.x_buf, 0),
+                residual: GpuInput::Gpu(&layer_res.x_buf, (layer_res.x_buf_offset / 4) as usize),
                 wo,
                 attn_post_norm,
                 ffn_norm,
@@ -5033,8 +5422,8 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server fused layer (standalone) encoder"),
             });
-        let final_buf = self.record_fused_layer(&mut encoder, input);
-        self.submit_and_readback(encoder, &final_buf, n_embd)
+        let (final_buf, final_offset) = self.record_fused_layer(&mut encoder, input);
+        self.submit_and_readback(encoder, &final_buf, final_offset, n_embd)
     }
 
     /// Starts a fresh, empty command encoder — the one piece of GPU state
@@ -5706,9 +6095,13 @@ impl VulkanBackend {
 /// PLE's own gate/GELU/multiply/proj/RMSNorm/residual-add sub-chain's
 /// cached resources — see `VulkanBackend::build_ple_resources`.
 struct FusedPleResources {
-    /// Rewritten every call (`fused_post_attention`) — everything else
-    /// here is fixed once built.
+    /// A `VulkanBackend::fused_ple_per_layer_arena` chunk (see that
+    /// field's own doc comment on `VulkanBackend` for why each field here
+    /// gets its own dedicated arena rather than sharing one) — rewritten
+    /// every call (`fused_post_attention`) — everything else here is
+    /// fixed once built.
     per_layer_buf: wgpu::Buffer,
+    per_layer_buf_offset: u64,
     /// Only ever read by `bg_mul` (built once, at cache-build time) — kept
     /// as a field purely to keep the underlying GPU buffer alive for as
     /// long as `bg_mul` references it, not because Rust code reads it
@@ -5716,10 +6109,12 @@ struct FusedPleResources {
     #[allow(dead_code)]
     gelu_out: wgpu::Buffer,
     mulled: wgpu::Buffer,
+    mulled_offset: u64,
     /// Same reasoning as `gelu_out` above — read only by `bg_add`.
     #[allow(dead_code)]
     normed: wgpu::Buffer,
     x3: wgpu::Buffer,
+    x3_offset: u64,
     bg_gelu: wgpu::BindGroup,
     bg_mul: wgpu::BindGroup,
     bg_post_norm: wgpu::BindGroup,
@@ -5729,7 +6124,9 @@ struct FusedPleResources {
 
 /// `layer_output_scale`'s single-shader sub-chain's cached resources.
 struct FusedScaleResources {
+    /// A `VulkanBackend::fused_scale_arena` chunk.
     scaled: wgpu::Buffer,
+    scaled_offset: u64,
     bg: wgpu::BindGroup,
 }
 
@@ -5808,8 +6205,14 @@ enum KNormRope {
 /// layer's GPU output — copied in-place with no CPU round trip);
 /// everything else, including the bind group, is fixed once built.
 struct FusedLayerResources {
+    /// A `VulkanBackend::fused_layer_x_arena` chunk — see that field's own
+    /// doc comment (on `VulkanBackend`) for why every field across these
+    /// four structs gets its own dedicated arena.
     x_buf: wgpu::Buffer,
+    x_buf_offset: u64,
+    /// A `VulkanBackend::fused_layer_normed_arena` chunk.
     normed_buf: wgpu::Buffer,
+    normed_buf_offset: u64,
     attn_norm_bg: wgpu::BindGroup,
 }
 
@@ -5821,30 +6224,42 @@ struct FusedLayerResources {
 /// `queue.write_buffer`, same buffer object every time) — everything else,
 /// including every bind group, is fixed for this layer's whole lifetime.
 struct FusedResources {
+    /// A `VulkanBackend::fused_residual_arena` chunk — see that field's
+    /// own doc comment (on `VulkanBackend`) for why every field across
+    /// these four structs gets its own dedicated arena rather than
+    /// sharing one.
     residual_buf: wgpu::Buffer,
-    /// Only ever read by bind groups built once at cache-build time
-    /// (`bg_add1`/`bg_ffn_norm` for `normed1`, `bg_ffn_norm`/`bg_add2` for
-    /// `x1`, `bg_ffn_post_norm` for `normed2`) — kept as fields purely to
-    /// keep the underlying GPU buffers alive for as long as those bind
-    /// groups reference them, not because Rust code reads them again.
-    #[allow(dead_code)]
-    normed1: wgpu::Buffer,
+    residual_buf_offset: u64,
+    /// A `VulkanBackend::fused_x1_arena` chunk. Only ever read by bind
+    /// groups built once at cache-build time (`bg_ffn_norm`/`bg_add2` for
+    /// `x1`) — kept as a field purely to keep the underlying GPU buffer
+    /// alive for as long as those bind groups reference it, not because
+    /// Rust code reads it again. `wo`'s own post-matmul norm+add writes
+    /// straight into `x1` now (`bg_attn_post_norm_add`, see
+    /// `vulkan_shaders::shader_source_rmsnorm_add`) — the separate
+    /// `normed1` intermediate this used to go through no longer exists.
     #[allow(dead_code)]
     x1: wgpu::Buffer,
+    /// A `VulkanBackend::fused_ffn_normed_arena` chunk.
     ffn_normed: wgpu::Buffer,
+    ffn_normed_offset: u64,
+    /// A `VulkanBackend::fused_gelu_arena` chunk.
     #[allow(dead_code)]
     gelu_out: wgpu::Buffer,
+    /// A `VulkanBackend::fused_mulled_arena` chunk.
     mulled: wgpu::Buffer,
-    #[allow(dead_code)]
-    normed2: wgpu::Buffer,
+    mulled_offset: u64,
+    /// A `VulkanBackend::fused_x2_arena` chunk. `ffn_down`'s own
+    /// post-matmul norm+add writes straight into `x2`
+    /// (`bg_ffn_post_norm_add`) — same fusion as `x1`'s own, no separate
+    /// `normed2` intermediate.
     x2: wgpu::Buffer,
-    bg_attn_post_norm: wgpu::BindGroup,
-    bg_add1: wgpu::BindGroup,
+    x2_offset: u64,
+    bg_attn_post_norm_add: wgpu::BindGroup,
     bg_ffn_norm: wgpu::BindGroup,
     bg_gelu: wgpu::BindGroup,
     bg_mul: wgpu::BindGroup,
-    bg_ffn_post_norm: wgpu::BindGroup,
-    bg_add2: wgpu::BindGroup,
+    bg_ffn_post_norm_add: wgpu::BindGroup,
     ple: Option<FusedPleResources>,
     scale: Option<FusedScaleResources>,
     embd_wg: u32,
@@ -8617,7 +9032,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             },
             0,
         );
-        let got = vulkan.submit_and_readback(encoder, &buf, total);
+        let got = vulkan.submit_and_readback(encoder, &buf, 0, total);
 
         assert_eq!(expected.len(), got.len());
         for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {

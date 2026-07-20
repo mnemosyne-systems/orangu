@@ -5,3 +5,4 @@ rpmbuild/
 *.pdf
 /.orangu/
 *-graph.html
+llama.cpp/

@@ -549,7 +549,7 @@ impl GemmaModel {
             encoder.write_timestamp(t, 1);
         }
 
-        let mut prev_buf: Option<wgpu::Buffer> = None;
+        let mut prev_buf: Option<(wgpu::Buffer, u64)> = None;
         for (il, layer) in self.layers.iter().enumerate() {
             let head_dim = layer.head_dim;
             // Proportional RoPE (a learned per-frequency divisor) only
@@ -603,7 +603,7 @@ impl GemmaModel {
             };
 
             let x_input = match &prev_buf {
-                Some(buf) => GpuInput::Gpu(buf, 0),
+                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
                 None => GpuInput::Cpu(x),
             };
             let out = vulkan.record_fused_layer(
@@ -642,10 +642,11 @@ impl GemmaModel {
                 encoder.write_timestamp(t, (2 + il) as u32);
             }
         }
-        let last_buf = prev_buf.expect("a gemma4 model always has at least one layer");
+        let (last_buf, last_offset) =
+            prev_buf.expect("a gemma4 model always has at least one layer");
         let normed_buf = vulkan.record_output_norm(
             encoder,
-            GpuInput::Gpu(&last_buf, 0),
+            GpuInput::Gpu(&last_buf, (last_offset / 4) as usize),
             &self.output_norm,
             eps,
             n_embd,
