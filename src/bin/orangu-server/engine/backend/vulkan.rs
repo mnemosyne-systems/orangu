@@ -543,6 +543,136 @@ type OpCacheKey = (usize, usize, u32, usize, usize, usize, usize, usize);
 /// `(cache_key.0, cache_key.1, ggml_type, raw_bytes().len())`.
 type WeightCacheKey = (usize, usize, u32, usize);
 
+/// Where one weight tensor's bytes live within `WeightArena::chunks` —
+/// `(chunk index, byte offset, byte size)`.
+type WeightSlot = (usize, u64, u64);
+
+/// Default size of one `WeightArena` chunk buffer — grown to fit a single
+/// tensor larger than this (e.g. a wide embedding table) when needed.
+const WEIGHT_ARENA_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Backing store for `VulkanBackend::weight_buffer`: every weight tensor's
+/// quantized bytes, packed by offset into a handful of large chunk buffers
+/// instead of one `wgpu::Buffer` per tensor (previously 200+ for a
+/// multi-layer model — real, measured `queue.submit()` cost, since
+/// `wgpu-core`'s own per-submission resource validation and automatic
+/// barrier insertion both scale with distinct-resource count, not GPU work;
+/// see `doc/SERVER_ROADMAP.md` items 15/16). Weight tensors are permanent
+/// and read-only after their first upload, so packing many into one chunk
+/// carries none of the write-ordering risk `CachedOpResources`'s own
+/// per-call scratch buffers need `ScratchArena`'s own placement discipline
+/// (permanent, non-overlapping per-entry regions — never reused/aliased)
+/// for instead.
+struct WeightArena {
+    chunks: Vec<wgpu::Buffer>,
+    /// Capacity, in bytes, of `chunks`'s last element.
+    current_chunk_capacity: u64,
+    /// Byte offset within `chunks`'s last element where the next tensor
+    /// should be placed; always a multiple of the offset alignment
+    /// `weight_buffer` computes from `Device::limits()`.
+    next_offset: u64,
+    slots: HashMap<WeightCacheKey, WeightSlot>,
+}
+
+/// Default size of one `ScratchArena` chunk — `CachedOpResources`'s own
+/// `x_buffer`/`output_buffer` regions are much smaller than a weight
+/// tensor (just `in_dim`/`out_dim` floats, not a whole quantized matrix),
+/// so this is far smaller than `WEIGHT_ARENA_CHUNK_BYTES`.
+const OP_ARENA_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bump-allocated backing store for `CachedOpResources.x_buffer`/
+/// `output_buffer` — same placement pattern as `WeightArena` (permanent,
+/// non-overlapping per-entry regions within a handful of large chunks,
+/// never reused/aliased once handed out), but with no dedup-by-key `slots`
+/// map: `Self::alloc` is only ever called once per cache entry (`op_cache`'s
+/// own `HashMap` lookup, one level up in `VulkanBackend::op_entry`, already
+/// guarantees `build_op_resources` runs at most once per key), so there is
+/// nothing to look up later — the resulting `(buffer, offset)` is stored
+/// directly on `CachedOpResources` instead.
+///
+/// `VulkanBackend` keeps *two* of these (`x_arena`/`output_arena`) rather
+/// than sharing one pool between x- and output-buffers: this file's fused
+/// decode chain routinely `copy_buffer_to_buffer`s directly from one op's
+/// `output_buffer` into another op's `x_buffer` (chaining GPU-resident
+/// results with no CPU round trip), and keeping the two kinds of region in
+/// disjoint underlying `wgpu::Buffer` objects sidesteps ever needing to
+/// reason about whether a same-buffer, non-overlapping-region copy is safe
+/// — they're simply never the same buffer.
+struct ScratchArena {
+    chunks: Vec<wgpu::Buffer>,
+    /// Capacity, in bytes, of `chunks`'s last element.
+    current_chunk_capacity: u64,
+    /// Byte offset within `chunks`'s last element where the next region
+    /// should be placed; always a multiple of `align`.
+    next_offset: u64,
+}
+
+impl ScratchArena {
+    /// Places a new `size`-byte region at the next `align`-aligned offset,
+    /// growing `chunks` first if the current one doesn't have room —
+    /// mirrors `VulkanBackend::weight_buffer`'s own chunk-growth logic.
+    fn alloc(
+        &mut self,
+        device: &wgpu::Device,
+        align: u64,
+        size: u64,
+        label: &'static str,
+    ) -> (wgpu::Buffer, u64) {
+        let fits_current_chunk = !self.chunks.is_empty()
+            && self.next_offset.next_multiple_of(align) + size <= self.current_chunk_capacity;
+        if !fits_current_chunk {
+            let capacity = OP_ARENA_CHUNK_BYTES.max(size);
+            let chunk = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: capacity,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.chunks.push(chunk);
+            self.current_chunk_capacity = capacity;
+            self.next_offset = 0;
+        }
+        let chunk_index = self.chunks.len() - 1;
+        let offset = self.next_offset.next_multiple_of(align);
+        self.next_offset = offset + size;
+        (self.chunks[chunk_index].clone(), offset)
+    }
+}
+
+/// A `wgpu::BindingResource::Buffer` source for the `Self::elemN_bind_group`
+/// helpers — either a buffer's whole range (`.as_entire_binding()`,
+/// unchanged from before this existed) or a fixed sub-range within a shared
+/// `ScratchArena` chunk (`CachedOpResources::x_src`/`output_src`). The
+/// `From` impl below lets every existing whole-buffer call site keep
+/// passing a bare `&wgpu::Buffer` with no changes.
+enum BindSrc<'a> {
+    Whole(&'a wgpu::Buffer),
+    Slice(&'a wgpu::Buffer, u64, u64),
+}
+
+impl<'a> From<&'a wgpu::Buffer> for BindSrc<'a> {
+    fn from(b: &'a wgpu::Buffer) -> Self {
+        BindSrc::Whole(b)
+    }
+}
+
+impl<'a> BindSrc<'a> {
+    fn resource(&self) -> wgpu::BindingResource<'a> {
+        match *self {
+            BindSrc::Whole(b) => b.as_entire_binding(),
+            BindSrc::Slice(b, offset, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: b,
+                offset,
+                size: Some(
+                    std::num::NonZeroU64::new(size).expect("arena slice size is always > 0"),
+                ),
+            }),
+        }
+    }
+}
+
 pub struct VulkanBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -573,7 +703,13 @@ pub struct VulkanBackend {
     /// are both 2 bytes/element, 1 element/block) while decoding those
     /// bytes completely differently — exactly the pair that first caught
     /// this needing `ggml_type` too, not just a length check.
-    weight_cache: Mutex<HashMap<WeightCacheKey, Arc<wgpu::Buffer>>>,
+    weight_cache: Mutex<WeightArena>,
+    /// Backing store for every `CachedOpResources::x_buffer` — see
+    /// `ScratchArena`'s own doc comment for why this is a separate arena
+    /// from `output_arena` rather than one shared pool.
+    x_arena: Mutex<ScratchArena>,
+    /// Backing store for every `CachedOpResources::output_buffer`.
+    output_arena: Mutex<ScratchArena>,
     /// Each entry is individually locked (not the whole map) for the
     /// duration of the op that uses it, so unrelated ops (different weight
     /// tensors, or the same tensor at a different `n_tokens`) never
@@ -933,11 +1069,47 @@ type FusedLayerCacheKey = (usize, usize, usize, u32, usize, usize);
 /// `row_bytes` are all fixed by it.
 struct CachedOpResources {
     bind_group: wgpu::BindGroup,
+    /// A `VulkanBackend::x_arena` chunk — `x_offset` is this entry's own
+    /// fixed, non-overlapping region's start within it (`build_op_
+    /// resources` already folded the region's size into `bind_group`
+    /// directly; nothing else needs it — every write call site passes its
+    /// own correct length independently). Only the *contents* at that
+    /// region change between reuses (a fresh `write_buffer`/
+    /// `copy_buffer_to_buffer` per call — the activations themselves
+    /// differ every time); the region itself, like every other field here,
+    /// is fixed for the key's whole lifetime.
     x_buffer: wgpu::Buffer,
+    x_offset: u64,
+    /// A `VulkanBackend::output_arena` chunk — `output_len` is this entry's
+    /// own fixed, non-overlapping region's size within it, `output_offset`
+    /// its start.
     output_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
+    output_offset: u64,
+    /// Lazily created (`VulkanBackend::ensure_readback_buffer`), not built
+    /// eagerly alongside the other three buffers — most callers into this
+    /// weight's cached resources (`record_full_matmul`, the GPU-resident
+    /// fused decode chain's own matmul recorder) never read this op's
+    /// result back to the CPU at all; the *next* dispatch just reads
+    /// `output_buffer` directly on the GPU. Only `matmul_batch_dispatch`
+    /// (the CPU-orchestrated prefill path, which needs every intermediate
+    /// result back on the CPU between layers) and `submit_and_readback_
+    /// for`'s one caller (the final `lm_head` op) actually map and read
+    /// this — eagerly allocating one for *every* cached op regardless cost
+    /// real `queue.submit()` per-resource tracking overhead
+    /// (`SERVER_ROADMAP.md` items 15/16) for buffers the overwhelming
+    /// majority of callers never touch. Not itself arena-allocated — it's
+    /// only ever used by the CPU-orchestrated paths above, which are not
+    /// the ones item 16 found to dominate the per-decode-step distinct-
+    /// resource count.
+    readback_buffer: Option<wgpu::Buffer>,
     output_len: u64,
     workgroups: (u32, u32, u32),
+}
+
+impl CachedOpResources {
+    fn output_src(&self) -> BindSrc<'_> {
+        BindSrc::Slice(&self.output_buffer, self.output_offset, self.output_len)
+    }
 }
 
 /// Below this many tokens, the regular per-`(row, token)` dispatch (one
@@ -1623,7 +1795,22 @@ impl VulkanBackend {
             pipelines,
             pipelines_coop,
             pipelines_coop_tiled,
-            weight_cache: Mutex::new(HashMap::new()),
+            weight_cache: Mutex::new(WeightArena {
+                chunks: Vec::new(),
+                current_chunk_capacity: 0,
+                next_offset: 0,
+                slots: HashMap::new(),
+            }),
+            x_arena: Mutex::new(ScratchArena {
+                chunks: Vec::new(),
+                current_chunk_capacity: 0,
+                next_offset: 0,
+            }),
+            output_arena: Mutex::new(ScratchArena {
+                chunks: Vec::new(),
+                current_chunk_capacity: 0,
+                next_offset: 0,
+            }),
             op_cache: Mutex::new(HashMap::new()),
             adapter_name,
             elem4_bind_group_layout,
@@ -1679,16 +1866,20 @@ impl VulkanBackend {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Returns this matrix's raw bytes already uploaded to the GPU,
-    /// uploading (and caching) them first if this is the first `matmul`
-    /// call to ever use this tensor.
-    fn weight_buffer(&self, w: &QuantMatrix) -> Arc<wgpu::Buffer> {
+    /// Returns this matrix's raw bytes already uploaded to the GPU as a
+    /// `(chunk buffer, byte offset, byte size)` triple ready to bind
+    /// directly via `wgpu::BufferBinding`, uploading (and caching) them
+    /// into `Self::weight_cache`'s arena first if this is the first
+    /// `matmul` call to ever use this tensor. See `WeightArena`'s own doc
+    /// comment for why this packs many tensors into few chunk buffers
+    /// instead of allocating one `wgpu::Buffer` per tensor.
+    fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
         let (ptr, start) = w.cache_key();
         let bytes = w.raw_bytes();
         let key = (ptr, start, w.ggml_type(), bytes.len());
-        let mut cache = self.weight_cache.lock().expect("weight cache poisoned");
-        if let Some(buffer) = cache.get(&key) {
-            return buffer.clone();
+        let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
+        if let Some(&(chunk, offset, size)) = arena.slots.get(&key) {
+            return (arena.chunks[chunk].clone(), offset, size);
         }
         // Pad to a multiple of 16: `array<u32>`-bound kernels (the default
         // scalar reduce/coop pipelines) only ever needed a multiple of 4,
@@ -1702,24 +1893,41 @@ impl VulkanBackend {
         // `Q4_0`/`Q5_0`/`Q8_0` depending on `out_dim`, all routinely
         // aren't — only `Q4_K`/`Q5_K`'s 144-/176-byte blocks always are).
         // Padded unconditionally, not just when `Self::wide_load` is on:
-        // this buffer is cached and shared across whichever kernel calls
-        // into it later, and the extra padding (at most 15 bytes per
-        // tensor) is immaterial next to real model tensor sizes. The
-        // padding itself is never addressed by any kernel — every read
-        // stays within the tensor's own real byte range — it only needs
-        // to exist so the buffer's *allocated* size covers both binding
-        // types' alignment requirements.
-        let padded_len = (bytes.len() as u64).next_multiple_of(16);
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server weight"),
-            size: padded_len,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&buffer, 0, bytes);
-        let buffer = Arc::new(buffer);
-        cache.insert(key, buffer.clone());
-        buffer
+        // this range is shared across whichever kernel binds it later, and
+        // the extra padding (at most 15 bytes per tensor) is immaterial
+        // next to real model tensor sizes. The padding itself is never
+        // addressed by any kernel — every read stays within the tensor's
+        // own real byte range — it only needs to exist so the bound
+        // region's *allocated* size covers both binding types' alignment
+        // requirements.
+        let size = (bytes.len() as u64).next_multiple_of(16);
+        // Each tensor's own placement offset also has to respect the
+        // device's storage-buffer offset alignment (typically 256 bytes),
+        // a separate requirement from the 16-byte size padding above.
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
+
+        let fits_current_chunk = !arena.chunks.is_empty()
+            && arena.next_offset.next_multiple_of(align) + size <= arena.current_chunk_capacity;
+        if !fits_current_chunk {
+            let capacity = WEIGHT_ARENA_CHUNK_BYTES.max(size);
+            let chunk = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server weight arena chunk"),
+                size: capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            arena.chunks.push(chunk);
+            arena.current_chunk_capacity = capacity;
+            arena.next_offset = 0;
+        }
+
+        let chunk_index = arena.chunks.len() - 1;
+        let offset = arena.next_offset.next_multiple_of(align);
+        self.queue
+            .write_buffer(&arena.chunks[chunk_index], offset, bytes);
+        arena.next_offset = offset + size;
+        arena.slots.insert(key, (chunk_index, offset, size));
+        (arena.chunks[chunk_index].clone(), offset, size)
     }
 
     /// Splits `total` compute-shader workgroups across up to two dispatch
@@ -1845,14 +2053,14 @@ impl VulkanBackend {
 
         let entries: Vec<Arc<Mutex<CachedOpResources>>> =
             ops.iter().map(|op| self.op_entry(op, 0)).collect();
-        let guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
+        let mut guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
             .iter()
             .map(|entry| entry.lock().expect("op cache entry poisoned"))
             .collect();
 
         for (op, guard) in ops.iter().zip(guards.iter()) {
             self.queue
-                .write_buffer(&guard.x_buffer, 0, bytemuck::cast_slice(op.x));
+                .write_buffer(&guard.x_buffer, guard.x_offset, bytemuck::cast_slice(op.x));
         }
 
         let mut encoder = self
@@ -1872,13 +2080,23 @@ impl VulkanBackend {
                 pass.dispatch_workgroups(wx, wy, wz);
             }
         }
-        for guard in &guards {
+        // Every op in this batch is actually read back (this is the
+        // CPU-orchestrated path — unlike `record_full_matmul`'s GPU-
+        // resident callers, every result here has to reach the CPU), so
+        // `ensure_readback_buffer` allocates one for each; still lazy in
+        // principle (skips it for every *other* caller), just never
+        // skipped here.
+        for guard in guards.iter_mut() {
+            let output_buffer = guard.output_buffer.clone();
+            let output_offset = guard.output_offset;
+            let output_len = guard.output_len;
+            let readback_buffer = self.ensure_readback_buffer(guard).clone();
             encoder.copy_buffer_to_buffer(
-                &guard.output_buffer,
+                &output_buffer,
+                output_offset,
+                &readback_buffer,
                 0,
-                &guard.readback_buffer,
-                0,
-                guard.output_len,
+                output_len,
             );
         }
         self.queue.submit(Some(encoder.finish()));
@@ -1892,6 +2110,8 @@ impl VulkanBackend {
         for guard in &guards {
             guard
                 .readback_buffer
+                .as_ref()
+                .expect("ensured above")
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, |result| {
                     result.expect("mapping a matmul batch readback buffer failed");
@@ -1904,14 +2124,22 @@ impl VulkanBackend {
         guards
             .iter()
             .map(|guard| {
-                let slice = guard.readback_buffer.slice(..);
+                let slice = guard
+                    .readback_buffer
+                    .as_ref()
+                    .expect("ensured above")
+                    .slice(..);
                 let data = slice.get_mapped_range().expect(
                     "matmul batch readback buffer was not mapped after a successful \
                      map_async + poll",
                 );
                 let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
                 drop(data);
-                guard.readback_buffer.unmap();
+                guard
+                    .readback_buffer
+                    .as_ref()
+                    .expect("ensured above")
+                    .unmap();
                 result
             })
             .collect()
@@ -2075,29 +2303,37 @@ impl VulkanBackend {
         let out_dim = w.out_dim;
         debug_assert_eq!(x.len(), n_tokens * in_dim);
 
-        let weight_buffer = self.weight_buffer(w);
+        let (weight_chunk, weight_offset, weight_size) = self.weight_buffer(w);
 
-        let x_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server activations"),
-            size: (x.len() as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // `x_buffer`/`output_buffer` are placed in `Self::x_arena`/
+        // `Self::output_arena` — see `ScratchArena`'s own doc comment for
+        // why two arenas, not one. The same offset alignment
+        // `Self::weight_buffer` already needs (`min_storage_buffer_offset_
+        // alignment`) applies here too; unlike weight tensors, these
+        // regions don't need the extra 16-byte *size* padding (nothing
+        // ever binds `x_buffer`/`output_buffer` through the wide-load
+        // kernels' `array<vec4<u32>>` view — only weight buffers are), so
+        // each region is exactly its real byte length, no larger.
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        let x_len = (x.len() as u64) * 4;
+        let (x_buffer, x_offset) = self.x_arena.lock().expect("x arena poisoned").alloc(
+            &self.device,
+            align,
+            x_len,
+            "orangu-server x arena chunk",
+        );
 
         let output_len = (n_tokens * out_dim) as u64 * 4;
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server matmul output"),
-            size: output_len,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server matmul readback"),
-            size: output_len,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        let (output_buffer, output_offset) = self
+            .output_arena
+            .lock()
+            .expect("output arena poisoned")
+            .alloc(
+                &self.device,
+                align,
+                output_len,
+                "orangu-server output arena chunk",
+            );
         // `in_dim`/`out_dim`/`n_tokens`/`row_bytes` are all fixed for this
         // cache key's whole lifetime, so — unlike `x_buffer` — this never
         // needs writing again after this first (and only) time.
@@ -2122,15 +2358,22 @@ impl VulkanBackend {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: weight_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &weight_chunk,
+                        offset: weight_offset,
+                        size: Some(
+                            std::num::NonZeroU64::new(weight_size)
+                                .expect("weight size is always > 0"),
+                        ),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: x_buffer.as_entire_binding(),
+                    resource: BindSrc::Slice(&x_buffer, x_offset, x_len).resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: BindSrc::Slice(&output_buffer, output_offset, output_len).resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -2198,11 +2441,28 @@ impl VulkanBackend {
         CachedOpResources {
             bind_group,
             x_buffer,
+            x_offset,
             output_buffer,
-            readback_buffer,
+            output_offset,
+            readback_buffer: None,
             output_len,
             workgroups,
         }
+    }
+
+    /// Returns `resources`'s own `readback_buffer`, creating and caching it
+    /// on first use — see the field's own doc comment for why this is
+    /// lazy rather than built alongside the other three buffers.
+    fn ensure_readback_buffer<'a>(&self, resources: &'a mut CachedOpResources) -> &'a wgpu::Buffer {
+        let output_len = resources.output_len;
+        resources.readback_buffer.get_or_insert_with(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server matmul readback"),
+                size: output_len,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
     }
 }
 
@@ -2538,75 +2798,82 @@ impl VulkanBackend {
         buffer
     }
 
-    fn elem4_bind_group(
+    fn elem4_bind_group<'a>(
         &self,
-        a: &wgpu::Buffer,
-        b: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        meta: &wgpu::Buffer,
+        a: impl Into<BindSrc<'a>>,
+        b: impl Into<BindSrc<'a>>,
+        y: impl Into<BindSrc<'a>>,
+        meta: impl Into<BindSrc<'a>>,
     ) -> wgpu::BindGroup {
+        let (a, b, y, meta) = (a.into(), b.into(), y.into(), meta.into());
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server elem4 bind group"),
             layout: &self.elem4_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: a.as_entire_binding(),
+                    resource: a.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: b.as_entire_binding(),
+                    resource: b.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: y.as_entire_binding(),
+                    resource: y.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: meta.as_entire_binding(),
+                    resource: meta.resource(),
                 },
             ],
         })
     }
 
-    fn elem3_bind_group(
+    fn elem3_bind_group<'a>(
         &self,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        meta: &wgpu::Buffer,
+        x: impl Into<BindSrc<'a>>,
+        y: impl Into<BindSrc<'a>>,
+        meta: impl Into<BindSrc<'a>>,
     ) -> wgpu::BindGroup {
+        let (x, y, meta) = (x.into(), y.into(), meta.into());
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server elem3 bind group"),
             layout: &self.elem3_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: x.as_entire_binding(),
+                    resource: x.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: y.as_entire_binding(),
+                    resource: y.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: meta.as_entire_binding(),
+                    resource: meta.resource(),
                 },
             ],
         })
     }
 
-    fn elem2_bind_group(&self, x: &wgpu::Buffer, meta: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn elem2_bind_group<'a>(
+        &self,
+        x: impl Into<BindSrc<'a>>,
+        meta: impl Into<BindSrc<'a>>,
+    ) -> wgpu::BindGroup {
+        let (x, meta) = (x.into(), meta.into());
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server elem2 bind group"),
             layout: &self.elem2_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: x.as_entire_binding(),
+                    resource: x.resource(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: meta.as_entire_binding(),
+                    resource: meta.resource(),
                 },
             ],
         })
@@ -2706,20 +2973,22 @@ impl VulkanBackend {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         dst: &wgpu::Buffer,
+        dst_offset: u64,
         src: GpuInput<'_>,
         len_f32: usize,
     ) {
         match src {
             GpuInput::Cpu(data) => {
                 debug_assert_eq!(data.len(), len_f32);
-                self.queue.write_buffer(dst, 0, bytemuck::cast_slice(data));
+                self.queue
+                    .write_buffer(dst, dst_offset, bytemuck::cast_slice(data));
             }
             GpuInput::Gpu(buf, offset) => {
                 encoder.copy_buffer_to_buffer(
                     buf,
                     (offset as u64) * 4,
                     dst,
-                    0,
+                    dst_offset,
                     (len_f32 as u64) * 4,
                 );
             }
@@ -3105,10 +3374,10 @@ impl VulkanBackend {
         let meta_plain = self.elem_meta_buffer(per_layer_dim as u32, 0.0);
         let wg = (per_layer_dim as u32).div_ceil(64);
 
-        let bg_gelu = self.elem3_bind_group(&ple_gate_g.output_buffer, &gelu_out, &meta_plain);
+        let bg_gelu = self.elem3_bind_group(ple_gate_g.output_src(), &gelu_out, &meta_plain);
         let bg_mul = self.elem4_bind_group(&gelu_out, &per_layer_buf, &mulled, &meta_plain);
         let bg_post_norm = self.elem4_bind_group(
-            &ple_proj_g.output_buffer,
+            ple_proj_g.output_src(),
             &post_norm_w,
             &normed,
             meta_embd_eps,
@@ -3163,18 +3432,17 @@ impl VulkanBackend {
         let meta_ffn_plain = self.elem_meta_buffer(ffn_len as u32, 0.0);
 
         let bg_attn_post_norm = self.elem4_bind_group(
-            &wo_g.output_buffer,
+            wo_g.output_src(),
             &attn_post_norm_w,
             &normed1,
             &meta_embd_eps,
         );
         let bg_add1 = self.elem4_bind_group(&normed1, &residual_buf, &x1, &meta_embd_plain);
         let bg_ffn_norm = self.elem4_bind_group(&x1, &ffn_norm_w, &ffn_normed, &meta_embd_eps);
-        let bg_gelu = self.elem3_bind_group(&gate_g.output_buffer, &gelu_out, &meta_ffn_plain);
-        let bg_mul =
-            self.elem4_bind_group(&gelu_out, &up_g.output_buffer, &mulled, &meta_ffn_plain);
+        let bg_gelu = self.elem3_bind_group(gate_g.output_src(), &gelu_out, &meta_ffn_plain);
+        let bg_mul = self.elem4_bind_group(&gelu_out, up_g.output_src(), &mulled, &meta_ffn_plain);
         let bg_ffn_post_norm = self.elem4_bind_group(
-            &down_g.output_buffer,
+            down_g.output_src(),
             &ffn_post_norm_w,
             &normed2,
             &meta_embd_eps,
@@ -3307,12 +3575,19 @@ impl VulkanBackend {
         // `n_embd` here copied too many bytes out of a too-small source
         // buffer — silently corrupting `wo`'s input immediately after the
         // very first attention call once the two dims genuinely differ.
-        self.upload_or_copy(encoder, &wo_g.x_buffer, input.attn_out, input.wo.in_dim);
-        self.upload_or_copy(encoder, &res.residual_buf, input.residual, n_embd);
+        self.upload_or_copy(
+            encoder,
+            &wo_g.x_buffer,
+            wo_g.x_offset,
+            input.attn_out,
+            input.wo.in_dim,
+        );
+        self.upload_or_copy(encoder, &res.residual_buf, 0, input.residual, n_embd);
         if let (Some(ple), Some(pres)) = (&input.ple, &res.ple) {
             self.upload_or_copy(
                 encoder,
                 &pres.per_layer_buf,
+                0,
                 ple.per_layer_slice,
                 ple.per_layer_dim,
             );
@@ -3337,8 +3612,20 @@ impl VulkanBackend {
             pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&res.ffn_normed, 0, &gate_g.x_buffer, 0, (n_embd as u64) * 4);
-        encoder.copy_buffer_to_buffer(&res.ffn_normed, 0, &up_g.x_buffer, 0, (n_embd as u64) * 4);
+        encoder.copy_buffer_to_buffer(
+            &res.ffn_normed,
+            0,
+            &gate_g.x_buffer,
+            gate_g.x_offset,
+            (n_embd as u64) * 4,
+        );
+        encoder.copy_buffer_to_buffer(
+            &res.ffn_normed,
+            0,
+            &up_g.x_buffer,
+            up_g.x_offset,
+            (n_embd as u64) * 4,
+        );
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3356,7 +3643,13 @@ impl VulkanBackend {
             pass.set_bind_group(0, &res.bg_mul, &[]);
             pass.dispatch_workgroups(res.ffn_wg, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&res.mulled, 0, &down_g.x_buffer, 0, (ffn_len as u64) * 4);
+        encoder.copy_buffer_to_buffer(
+            &res.mulled,
+            0,
+            &down_g.x_buffer,
+            down_g.x_offset,
+            (ffn_len as u64) * 4,
+        );
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3382,7 +3675,7 @@ impl VulkanBackend {
                 final_buf,
                 0,
                 &ple_gate_g.x_buffer,
-                0,
+                ple_gate_g.x_offset,
                 (n_embd as u64) * 4,
             );
 
@@ -3406,7 +3699,7 @@ impl VulkanBackend {
                 &pres.mulled,
                 0,
                 &ple_proj_g.x_buffer,
-                0,
+                ple_proj_g.x_offset,
                 (per_layer_dim as u64) * 4,
             );
 
@@ -3785,7 +4078,7 @@ impl VulkanBackend {
             input.eps,
         );
         let q_norm_rope_bg =
-            self.elem4_bind_group(&q_norm_w, &q_ff, &wq_g.output_buffer, &q_norm_rope_meta_buf);
+            self.elem4_bind_group(&q_norm_w, &q_ff, wq_g.output_src(), &q_norm_rope_meta_buf);
         let q_norm_rope_wg = input.n_head as u32;
 
         let kv = if let (Some(proj), Some(wk_guard)) = (&input.kv, wk_g) {
@@ -3804,8 +4097,7 @@ impl VulkanBackend {
                     input.rope_freq_base,
                     input.eps,
                 );
-                let bg =
-                    self.elem4_bind_group(&k_norm_w, &k_ff, &wk_guard.output_buffer, &meta_buf);
+                let bg = self.elem4_bind_group(&k_norm_w, &k_ff, wk_guard.output_src(), &meta_buf);
                 KNormRope::Fused {
                     bg,
                     meta_buf,
@@ -3819,7 +4111,7 @@ impl VulkanBackend {
                     input.eps,
                 );
                 let k_norm_bg =
-                    self.elem3_bind_group(&k_norm_w, &wk_guard.output_buffer, &k_norm_meta);
+                    self.elem3_bind_group(&k_norm_w, wk_guard.output_src(), &k_norm_meta);
 
                 let k_ff = self.upload_new(ff);
                 let k_rope_meta_buf = self.rope_meta_buffer(
@@ -3830,7 +4122,7 @@ impl VulkanBackend {
                     input.rope_freq_base,
                 );
                 let k_rope_bg =
-                    self.elem3_bind_group(&k_ff, &wk_guard.output_buffer, &k_rope_meta_buf);
+                    self.elem3_bind_group(&k_ff, wk_guard.output_src(), &k_rope_meta_buf);
 
                 KNormRope::Split {
                     k_norm_bg,
@@ -3851,9 +4143,9 @@ impl VulkanBackend {
                 input.head_dim as u32,
                 input.eps,
             );
-            let v_target: &wgpu::Buffer = match wv_g {
-                Some(g) => &g.output_buffer,
-                None => v_scratch.as_ref().unwrap(),
+            let v_target: BindSrc<'_> = match wv_g {
+                Some(g) => g.output_src(),
+                None => v_scratch.as_ref().unwrap().into(),
             };
             let v_norm_bg = self.elem2_bind_group(v_target, &v_norm_meta);
 
@@ -3948,12 +4240,12 @@ impl VulkanBackend {
             .as_ref()
             .map(|e| e.lock().expect("op cache entry poisoned"));
 
-        self.upload_or_copy(encoder, &wq_g.x_buffer, input.normed, n_embd);
+        self.upload_or_copy(encoder, &wq_g.x_buffer, wq_g.x_offset, input.normed, n_embd);
         if let Some(g) = &wk_g {
-            self.upload_or_copy(encoder, &g.x_buffer, input.normed, n_embd);
+            self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
         }
         if let Some(g) = &wv_g {
-            self.upload_or_copy(encoder, &g.x_buffer, input.normed, n_embd);
+            self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
         }
 
         let layer =
@@ -4069,7 +4361,7 @@ impl VulkanBackend {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wq_g.output_buffer.as_entire_binding(),
+                        resource: wq_g.output_src().resource(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -4107,21 +4399,20 @@ impl VulkanBackend {
             // `Some` when `self.kv_storage` matches, so this whole block is
             // a no-op cost-wise when the KV mirror is plain `f32`.
             let kv_needs_dispatch = !matches!(self.kv_storage, vulkan_shaders::KvStorage::F32);
-            let k_cast = if let (true, Some(wk_guard), Some(_)) =
-                (kv_needs_dispatch, &wk_g, &layer.kv)
-            {
-                let meta_buf = self.cast_meta_buffer(kv_dim as u32, 0);
-                Some(crate::engine::kv_cache::KvCastDispatch {
-                    bind_group: self.elem3_bind_group(&wk_guard.output_buffer, &k_buf, &meta_buf),
-                    meta_buf,
-                })
-            } else {
-                None
-            };
+            let k_cast =
+                if let (true, Some(wk_guard), Some(_)) = (kv_needs_dispatch, &wk_g, &layer.kv) {
+                    let meta_buf = self.cast_meta_buffer(kv_dim as u32, 0);
+                    Some(crate::engine::kv_cache::KvCastDispatch {
+                        bind_group: self.elem3_bind_group(wk_guard.output_src(), &k_buf, &meta_buf),
+                        meta_buf,
+                    })
+                } else {
+                    None
+                };
             let v_cast = if let (true, Some(kv_res)) = (kv_needs_dispatch, &layer.kv) {
-                let v_source: Option<&wgpu::Buffer> = match &wv_g {
-                    Some(g) => Some(&g.output_buffer),
-                    None => kv_res.v_scratch.as_ref(),
+                let v_source: Option<BindSrc<'_>> = match &wv_g {
+                    Some(g) => Some(g.output_src()),
+                    None => kv_res.v_scratch.as_ref().map(BindSrc::from),
                 };
                 v_source.map(|src| {
                     let meta_buf = self.cast_meta_buffer(kv_dim as u32, 0);
@@ -4164,7 +4455,7 @@ impl VulkanBackend {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: wq_g.output_buffer.as_entire_binding(),
+                            resource: wq_g.output_src().resource(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -4317,7 +4608,7 @@ impl VulkanBackend {
         {
             encoder.copy_buffer_to_buffer(
                 &wk_guard.output_buffer,
-                0,
+                wk_guard.output_offset,
                 scratch,
                 0,
                 (kv_dim as u64) * 4,
@@ -4433,16 +4724,22 @@ impl VulkanBackend {
                     let byte_len = (kv_dim as u64) * 4;
                     encoder.copy_buffer_to_buffer(
                         &wk_guard.output_buffer,
-                        0,
+                        wk_guard.output_offset,
                         &k_buf,
                         byte_offset,
                         byte_len,
                     );
-                    let v_source: &wgpu::Buffer = match &wv_g {
-                        Some(g) => &g.output_buffer,
-                        None => kv_res.v_scratch.as_ref().unwrap(),
+                    let (v_source, v_source_offset): (&wgpu::Buffer, u64) = match &wv_g {
+                        Some(g) => (&g.output_buffer, g.output_offset),
+                        None => (kv_res.v_scratch.as_ref().unwrap(), 0),
                     };
-                    encoder.copy_buffer_to_buffer(v_source, 0, &v_buf, byte_offset, byte_len);
+                    encoder.copy_buffer_to_buffer(
+                        v_source,
+                        v_source_offset,
+                        &v_buf,
+                        byte_offset,
+                        byte_len,
+                    );
                 }
             }
         }
@@ -4665,7 +4962,7 @@ impl VulkanBackend {
             batch_slot,
         } = input;
 
-        self.upload_or_copy(encoder, &layer_res.x_buf, x, n_embd);
+        self.upload_or_copy(encoder, &layer_res.x_buf, 0, x, n_embd);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4771,7 +5068,7 @@ impl VulkanBackend {
         n_embd: usize,
     ) -> wgpu::Buffer {
         let x_buf = self.scratch_buffer(n_embd);
-        self.upload_or_copy(encoder, &x_buf, x, n_embd);
+        self.upload_or_copy(encoder, &x_buf, 0, x, n_embd);
         let weight_buf = self.upload_new(weight);
         let out_buf = self.scratch_buffer(n_embd);
         let meta = self.elem_meta_buffer(n_embd as u32, eps);
@@ -4790,9 +5087,14 @@ impl VulkanBackend {
     /// Records one full `x -> w` matmul (`n_tokens == 1`) into `encoder`
     /// (does **not** submit), using the same `op_cache`-backed
     /// buffers/bind group every other matmul call reuses, and returns the
-    /// GPU buffer holding the result — the one piece `record_fused_layer`
-    /// doesn't already expose standalone, needed for `lm_head` in a fully
-    /// GPU-resident forward pass.
+    /// GPU buffer holding the result plus its own byte offset within that
+    /// buffer (`Self::output_arena`'s own placement — no longer always `0`
+    /// now that `output_buffer` can be a shared chunk, see `ScratchArena`)
+    /// — the one piece `record_fused_layer` doesn't already expose
+    /// standalone, needed for `lm_head` in a fully GPU-resident forward
+    /// pass. Callers that feed this straight into another `GpuInput::Gpu`
+    /// must use the returned offset, not assume `0` — `wgpu::Buffer` alone
+    /// no longer tells the whole story.
     /// `pub` for the same reason as `submit_and_readback`.
     pub fn record_full_matmul(
         &self,
@@ -4800,10 +5102,10 @@ impl VulkanBackend {
         x: GpuInput<'_>,
         w: &QuantMatrix,
         batch_slot: usize,
-    ) -> wgpu::Buffer {
+    ) -> (wgpu::Buffer, u64) {
         let entry = self.op_entry_for(w, batch_slot);
         let g = entry.lock().expect("op cache entry poisoned");
-        self.upload_or_copy(encoder, &g.x_buffer, x, w.in_dim);
+        self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, x, w.in_dim);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server record_full_matmul pass"),
@@ -4811,7 +5113,7 @@ impl VulkanBackend {
             });
             self.record_matmul(&mut pass, w, &g);
         }
-        g.output_buffer.clone()
+        (g.output_buffer.clone(), g.output_offset)
     }
 
     /// Finishes and submits `encoder`, then reads back `w`'s own
@@ -4830,26 +5132,107 @@ impl VulkanBackend {
         w: &QuantMatrix,
         batch_slot: usize,
     ) -> Vec<f32> {
+        // Splits the coarse "submit+wait" span `engine::arch::gemma`'s own
+        // `ORANGU_CPU_TIMESTAMPS` already measures around this whole call
+        // into its four real phases — `queue.submit()`, `map_async`'s own
+        // (synchronous, callback-registration-only) call, `poll()` (which
+        // is where the actual wait happens — GPU execution *and* whatever
+        // CPU-side driver/`wgpu` scheduling latency sits around it), and
+        // the final host-side readback copy — so which of them the
+        // `SERVER_ROADMAP.md` Track A "submit+wait exceeds measured GPU
+        // execution time" gap actually lives in stops being a guess. Same
+        // `OnceLock`-cached env-var-read pattern `ORANGU_CPU_TIMESTAMPS`
+        // itself already uses in `gemma.rs`, reusing the very same env var
+        // rather than adding a second one — this is strictly a finer-
+        // grained view of the same measurement, not a different one.
+        static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fine = *FINE.get_or_init(|| std::env::var("ORANGU_CPU_TIMESTAMPS").is_ok());
+
         let entry = self.op_entry_for(w, batch_slot);
-        let g = entry.lock().expect("op cache entry poisoned");
-        encoder.copy_buffer_to_buffer(&g.output_buffer, 0, &g.readback_buffer, 0, g.output_len);
+        let mut g = entry.lock().expect("op cache entry poisoned");
+        let output_buffer = g.output_buffer.clone();
+        let output_offset = g.output_offset;
+        let output_len = g.output_len;
+        let readback_buffer = self.ensure_readback_buffer(&mut g).clone();
+        drop(g);
+        encoder.copy_buffer_to_buffer(
+            &output_buffer,
+            output_offset,
+            &readback_buffer,
+            0,
+            output_len,
+        );
+
+        let submit_start = fine.then(std::time::Instant::now);
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        g.readback_buffer
+        let submit_elapsed = submit_start.map(|t| t.elapsed());
+
+        let map_async_start = fine.then(std::time::Instant::now);
+        readback_buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |result| {
                 result.expect("mapping the cached matmul readback buffer failed");
             });
+        let map_async_elapsed = map_async_start.map(|t| t.elapsed());
+
+        let poll_start = fine.then(std::time::Instant::now);
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("polling for the cached matmul readback failed");
-        let data = g.readback_buffer.slice(..).get_mapped_range().expect(
+        let poll_elapsed = poll_start.map(|t| t.elapsed());
+
+        let readback_start = fine.then(std::time::Instant::now);
+        let data = readback_buffer.slice(..).get_mapped_range().expect(
             "cached matmul readback buffer was not mapped after a successful map_async + poll",
         );
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
-        g.readback_buffer.unmap();
+        readback_buffer.unmap();
+        let readback_elapsed = readback_start.map(|t| t.elapsed());
+
+        if let (Some(submit), Some(map_async), Some(poll), Some(readback)) = (
+            submit_elapsed,
+            map_async_elapsed,
+            poll_elapsed,
+            readback_elapsed,
+        ) {
+            eprintln!(
+                "orangu-server: [cpu-trace-fine] submit {:.3}ms, map_async {:.3}ms, poll {:.3}ms, readback {:.3}ms",
+                submit.as_secs_f64() * 1000.0,
+                map_async.as_secs_f64() * 1000.0,
+                poll.as_secs_f64() * 1000.0,
+                readback.as_secs_f64() * 1000.0
+            );
+            // Logged once, not every decode step: `queue.submit()`'s own
+            // measured cost above (`SERVER_ROADMAP.md` Track A) traces
+            // directly to `wgpu-core`'s `validate_command_buffer` (walks
+            // every buffer/texture the submitted command buffer touches,
+            // checking `map_state`/destroyed-ness) and `insert_barriers_
+            // from_device_tracker` (builds a whole extra native "Transit"
+            // pass from tracked per-resource state) — both scale with the
+            // number of *distinct* cached resources one decode step's
+            // encoder references, not with GPU work. These four caches are
+            // exactly that population.
+            static LOGGED_CACHE_SIZES: std::sync::Once = std::sync::Once::new();
+            LOGGED_CACHE_SIZES.call_once(|| {
+                eprintln!(
+                    "orangu-server: [cpu-trace-fine] cached resource groups: op={}, fused={}, fused_attn_layer={}, fused_layer={}",
+                    self.op_cache.lock().expect("op cache poisoned").len(),
+                    self.fused_cache.lock().expect("fused cache poisoned").len(),
+                    self.fused_attn_layer_cache
+                        .lock()
+                        .expect("fused attn layer cache poisoned")
+                        .len(),
+                    self.fused_layer_cache
+                        .lock()
+                        .expect("fused layer cache poisoned")
+                        .len(),
+                );
+            });
+        }
+
         result
     }
 
@@ -4872,11 +5255,11 @@ impl VulkanBackend {
     pub fn submit_and_readback_batch(
         &self,
         mut encoder: wgpu::CommandEncoder,
-        sources: &[(&wgpu::Buffer, usize)],
+        sources: &[(&wgpu::Buffer, u64, usize)],
     ) -> Vec<Vec<f32>> {
         let readback_buffers: Vec<wgpu::Buffer> = sources
             .iter()
-            .map(|&(src, len_f32)| {
+            .map(|&(src, src_offset, len_f32)| {
                 let byte_len = (len_f32 as u64) * 4;
                 let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server batched decode readback"),
@@ -4884,7 +5267,7 @@ impl VulkanBackend {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                encoder.copy_buffer_to_buffer(src, 0, &readback, 0, byte_len);
+                encoder.copy_buffer_to_buffer(src, src_offset, &readback, 0, byte_len);
                 readback
             })
             .collect();
@@ -5107,7 +5490,7 @@ impl VulkanBackend {
 
         let proj_entry = self.op_entry_for(proj_w, batch_slot);
         let proj_g = proj_entry.lock().expect("op cache entry poisoned");
-        self.upload_or_copy(encoder, &proj_g.x_buffer, x, proj_w.in_dim);
+        self.upload_or_copy(encoder, &proj_g.x_buffer, proj_g.x_offset, x, proj_w.in_dim);
 
         let projection_scale = 1.0 / (proj_w.in_dim as f32).sqrt();
         let input_scale = 1.0 / 2f32.sqrt();
@@ -5136,7 +5519,7 @@ impl VulkanBackend {
         let meta_add = self.elem_meta_buffer(total as u32, 0.0);
         let meta_scale2 = self.elem_meta_buffer(total as u32, input_scale);
 
-        let bg_scale1 = self.elem3_bind_group(&proj_g.output_buffer, &scaled, &meta_scale1);
+        let bg_scale1 = self.elem3_bind_group(proj_g.output_src(), &scaled, &meta_scale1);
         // Same (weight, x-in-place, meta) role assignment as
         // `gpu_perhead_rmsnorm`'s own `elem3_bind_group` call — RMSNorm
         // writes back into `scaled` itself.
@@ -5203,7 +5586,7 @@ impl VulkanBackend {
         } = input;
 
         let logits_buf = self.scratch_buffer(n_vocab);
-        self.upload_or_copy(encoder, &logits_buf, logits, n_vocab);
+        self.upload_or_copy(encoder, &logits_buf, 0, logits, n_vocab);
         // A zero-length storage buffer is invalid in WGSL/Vulkan, so
         // always upload at least one element — `meta.n_recent = 0` (set
         // below) means the shader's repeat-penalty loop never reads it in

@@ -441,7 +441,7 @@ impl GemmaModel {
         start_pos: usize,
         x: &[f32],
         slot_id: usize,
-    ) -> Result<(wgpu::CommandEncoder, wgpu::Buffer)> {
+    ) -> Result<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         let mut encoder = vulkan.new_encoder("orangu-server full forward encoder");
 
         // See `VulkanBackend::gpu_timestamps`'s own doc comment for what
@@ -460,7 +460,7 @@ impl GemmaModel {
             encoder.write_timestamp(t, 0);
         }
 
-        let logits_buf = self.record_one_sequence_decode(
+        let (logits_buf, logits_offset) = self.record_one_sequence_decode(
             vulkan,
             &mut encoder,
             cache,
@@ -475,7 +475,7 @@ impl GemmaModel {
             encoder.write_timestamp(t, (2 + self.layers.len()) as u32);
             vulkan.finish_timestamps(&mut encoder);
         }
-        Ok((encoder, logits_buf))
+        Ok((encoder, logits_buf, logits_offset))
     }
 
     /// One sequence's whole decode step — PLE projection, every layer,
@@ -513,7 +513,7 @@ impl GemmaModel {
         x: &[f32],
         batch_slot: usize,
         timestamps: Option<&wgpu::QuerySet>,
-    ) -> wgpu::Buffer {
+    ) -> (wgpu::Buffer, u64) {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let per_layer = self.n_embd_per_layer;
@@ -1020,7 +1020,7 @@ impl GemmaModel {
         let n_vocab = self.output_weight.out_dim;
         let mut encoder = vulkan.new_encoder("orangu-server batched decode encoder");
 
-        let logits_bufs: Vec<wgpu::Buffer> = items
+        let logits_bufs: Vec<(wgpu::Buffer, u64)> = items
             .iter_mut()
             .map(|item| {
                 let mut x = self.tok_embeddings.row(item.token as usize);
@@ -1040,8 +1040,10 @@ impl GemmaModel {
             })
             .collect();
 
-        let sources: Vec<(&wgpu::Buffer, usize)> =
-            logits_bufs.iter().map(|buf| (buf, n_vocab)).collect();
+        let sources: Vec<(&wgpu::Buffer, u64, usize)> = logits_bufs
+            .iter()
+            .map(|(buf, offset)| (buf, *offset, n_vocab))
+            .collect();
         let mut logits = vulkan.submit_and_readback_batch(encoder, &sources);
 
         // Matches `forward`'s own tail — softcapping is applied to the
@@ -1097,6 +1099,28 @@ impl ModelForward for GemmaModel {
             .flatten()
             .map(|v| v.submission_count());
 
+        // Splits a decode step's CPU-side wall-clock time into "recording"
+        // (building the whole-layer-loop `wgpu::CommandEncoder` — every
+        // `set_pipeline`/`set_bind_group`/`dispatch_workgroups` call the
+        // Rust `wgpu` API itself costs, not GPU execution) vs. "submit+wait"
+        // (`queue.submit()` plus `poll(wait_indefinitely())`, which spans
+        // real GPU execution time *and* whatever CPU-side driver/kernel
+        // scheduling latency sits between the CPU handing work off and the
+        // GPU actually finishing it) — set `ORANGU_CPU_TIMESTAMPS=1` to log
+        // it. `ORANGU_GPU_TIMESTAMPS` (ahead of this in the codebase)
+        // already measures GPU *execution* time between layers; this
+        // measures the two halves neither that flag nor `ORANGU_GPU_TRACE`'s
+        // submission count can see at all — specifically, how much of a
+        // decode step's wall clock is CPU-side command-buffer construction,
+        // a cost `wgpu`'s API (unlike raw Vulkan's resubmittable
+        // `VkCommandBuffer`s) requires paying fresh every single token, with
+        // no capture/replay primitive to amortize it across steps that
+        // share the exact same dispatch sequence.
+        static CPU_TIMESTAMPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cpu_timestamps =
+            *CPU_TIMESTAMPS.get_or_init(|| std::env::var("ORANGU_CPU_TIMESTAMPS").is_ok());
+        let record_start = (cpu_timestamps && n_tokens == 1).then(std::time::Instant::now);
+
         // Embedding lookup, scaled by sqrt(n_embd) — every real-token input
         // path (Gemma never leaves this unscaled outside multimodal input).
         let mut x = vec![0f32; n_tokens * n_embd];
@@ -1129,13 +1153,24 @@ impl ModelForward for GemmaModel {
             // PLE fusion folded into the same encoder. Prefill (`n_tokens
             // > 1`) and the CPU backend still take the fully-CPU-
             // orchestrated `else` branch below.
-            let (encoder, _logits_buf) =
+            let (encoder, _logits_buf, _logits_offset) =
                 self.record_decode_forward(vulkan, cache, tokens[0], start_pos, &x, slot_id)?;
+            let record_elapsed = record_start.map(|t| t.elapsed());
+            let submit_start = cpu_timestamps.then(std::time::Instant::now);
             let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
             // `submit_and_readback_for`'s own `poll(wait_indefinitely())`
             // already blocked until this whole submission (timestamp
             // resolve included) finished, so the readback here is never
             // premature.
+            if let (Some(record), Some(submit_start)) = (record_elapsed, submit_start) {
+                let submit = submit_start.elapsed();
+                eprintln!(
+                    "orangu-server: [cpu-trace] pos {start_pos}: record {:.3}ms, submit+wait {:.3}ms, cpu-total {:.3}ms",
+                    record.as_secs_f64() * 1000.0,
+                    submit.as_secs_f64() * 1000.0,
+                    (record + submit).as_secs_f64() * 1000.0
+                );
+            }
             if vulkan.gpu_timestamps() {
                 vulkan.report_timestamps(start_pos, self.layers.len());
             }
@@ -1213,12 +1248,16 @@ impl ModelForward for GemmaModel {
             for v in x.iter_mut() {
                 *v *= (n_embd as f32).sqrt();
             }
-            let (mut encoder, logits_buf) =
+            let (mut encoder, logits_buf, logits_offset) =
                 self.record_decode_forward(vulkan, cache, token, start_pos, &x, slot_id)?;
+            // `GpuInput::Gpu`'s own offset is in elements, not bytes —
+            // `logits_offset` (from `Self::record_full_matmul`'s own
+            // `CachedOpResources::output_offset`) is always a multiple of 4
+            // (the arena's own minimum alignment), so this divides evenly.
             let sample_buf = vulkan.record_argmax_sample(
                 &mut encoder,
                 GpuArgmaxSampleInput {
-                    logits: GpuInput::Gpu(&logits_buf, 0),
+                    logits: GpuInput::Gpu(&logits_buf, (logits_offset / 4) as usize),
                     n_vocab: self.output_weight.out_dim,
                     recent_tokens: params.recent_tokens,
                     repeat_penalty: params.repeat_penalty,
