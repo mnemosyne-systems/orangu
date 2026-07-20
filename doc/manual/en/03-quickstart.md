@@ -6,7 +6,7 @@ This chapter gets **orangu** running against a local **orangu-server** with the 
 
 ## Install orangu
 
-The quickest way to install the latest release binary is the one-liner installer.
+The quickest way to install the latest release is the one-liner installer. It installs the whole stack — `orangu`, `orangu-coordinator`, and `orangu-server`.
 
 **Linux / macOS:**
 

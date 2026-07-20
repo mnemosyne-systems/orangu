@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 690" font-family="'DejaVu Sans', 'Helvetica Neue', Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 712" font-family="'DejaVu Sans', 'Helvetica Neue', Arial, sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#8a7f70"/>
@@ -6,15 +6,15 @@
   </defs>
 
   <!-- card background -->
-  <rect x="8" y="8" width="884" height="674" rx="20" fill="#fdfbf7" stroke="#e7ded0" stroke-width="2"/>
+  <rect x="8" y="8" width="884" height="696" rx="20" fill="#fdfbf7" stroke="#e7ded0" stroke-width="2"/>
 
   <!-- title -->
   <text x="450" y="52" text-anchor="middle" font-size="26" font-weight="bold" fill="#2c2620">The orangu stack</text>
-  <text x="450" y="76" text-anchor="middle" font-size="14" fill="#8a7f70">three cooperating programs, one pure-Rust project</text>
+  <text x="450" y="76" text-anchor="middle" font-size="14" fill="#8a7f70">Three cooperating programs, one Pure-Rust project</text>
 
   <!-- you -->
   <rect x="402" y="98" width="96" height="36" rx="18" fill="#efe8dc" stroke="#d8cdba" stroke-width="1.5"/>
-  <text x="450" y="121" text-anchor="middle" font-size="15" font-weight="bold" fill="#4a4238">you</text>
+  <text x="450" y="121" text-anchor="middle" font-size="15" font-weight="bold" fill="#4a4238">You</text>
 
   <!-- arrow you -> orangu -->
   <line x1="450" y1="134" x2="450" y2="168" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
@@ -47,20 +47,21 @@
   <text x="270" y="544" font-size="13.5" fill="#6b6156">the transformer forward pass, sampling, scheduling.</text>
 
   <!-- arrow server -> backends -->
-  <line x1="450" y1="562" x2="450" y2="596" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="450" y1="562" x2="450" y2="583" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <!-- backends row -->
+  <!-- backends layer -->
+  <rect x="195" y="587" width="510" height="60" rx="16" fill="#faf7f1" stroke="#ddd2c0" stroke-width="1.5"/>
   <g font-size="13.5" font-weight="bold" fill="#5a5248" text-anchor="middle">
-    <rect x="196" y="600" width="82" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="237" y="622">CPU</text>
-    <rect x="288" y="600" width="92" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="334" y="622">Vulkan</text>
-    <rect x="390" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="432" y="622">CUDA</text>
-    <rect x="484" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="526" y="622">ROCm</text>
-    <rect x="578" y="600" width="96" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="626" y="622">OpenCL</text>
+    <rect x="211" y="600" width="82" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="252" y="622">CPU</text>
+    <rect x="303" y="600" width="92" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="349" y="622">Vulkan</text>
+    <rect x="405" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="447" y="622">CUDA</text>
+    <rect x="499" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="541" y="622">ROCm</text>
+    <rect x="593" y="600" width="96" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="641" y="622">OpenCL</text>
   </g>
-  <text x="450" y="660" text-anchor="middle" font-size="12.5" fill="#8a7f70">no llama.cpp · no ggml · no Python · no cloud</text>
+  <text x="450" y="672" text-anchor="middle" font-size="12.5" font-weight="bold" font-style="italic" fill="#8a7f70">One native stack — fully local, fully private, entirely your own</text>
 </svg>

@@ -41,14 +41,15 @@ powershell -NoProfile -NonInteractive -Command ^
 powershell -NoProfile -NonInteractive -Command ^
     "$ErrorActionPreference='Stop'; Expand-Archive -Path '!TMP!\!ASSET!' -DestinationPath '!TMP!\out' -Force" || ^
     (echo error: could not extract archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
-if not exist "!TMP!\out\orangu.exe" (echo error: binary not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
+:: The whole stack: the editor plus the coordinator and inference server.
+for %%b in (orangu orangu-coordinator orangu-server) do if not exist "!TMP!\out\%%b.exe" (echo error: %%b.exe not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 if not exist "!INSTALL_DIR!" mkdir "!INSTALL_DIR!"
-copy /y "!TMP!\out\orangu.exe" "!INSTALL_DIR!\orangu.exe" >nul || ^
-    (echo error: could not write to !INSTALL_DIR! & exit /b 1)
+for %%b in (orangu orangu-coordinator orangu-server) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 rd /s /q "!TMP!" >nul 2>&1
-echo Installed: !INSTALL_DIR!\orangu.exe
+echo Installed the orangu stack to !INSTALL_DIR!:
+echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe
 echo Run "orangu --help" to get started.
 echo Run "orangu -s" and add the output to your PowerShell $PROFILE for completions.
 endlocal

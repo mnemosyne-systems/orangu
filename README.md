@@ -154,7 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/insta
 curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.cmd -o install.cmd && install.cmd
 ```
 
-Both scripts download the latest release binary, install it to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), and warn if the directory is not in your `PATH`.
+Both scripts download the latest release and install the whole stack — `orangu`, `orangu-coordinator`, and `orangu-server` — to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), and warn if the directory is not in your `PATH`.
 
 **Custom install directory:** set `INSTALL_DIR` before running the script:
 
