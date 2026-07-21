@@ -3325,6 +3325,258 @@ pub fn shader_source_attention_split(
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
 }
 
+/// Positions per K-tile the **flash** split kernel
+/// ([`ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE`]) stages into LDS, chosen so the
+/// padded `f16` `k_shmem` (`tile_pos * (head_dim + 1) * 2` bytes) stays within a
+/// conservative ~34 KB LDS budget — leaving room for `acc`/`shared_reduce`/
+/// `tile_probs` and one resident workgroup per SIMD. Clamped to a power of two
+/// in `8..=64`. The workgroup is always 64 threads, so `tile_pos < 64` (only for
+/// large `head_dim`, e.g. gemma's `512` full-attention layers) simply leaves the
+/// high lanes idle during the *score* phase; they still cooperate on the
+/// coalesced staging and the `head_dim`-strided `acc`/V loops.
+fn flash_tile_positions(head_dim: u32) -> u32 {
+    let stride = head_dim + 1;
+    let budget_elems = 17_000u32; // ~34 KB / 2 bytes per f16
+    let max_pos = (budget_elems / stride).max(1);
+    let mut tp = 64u32;
+    while tp > max_pos && tp > 8 {
+        tp /= 2;
+    }
+    tp.clamp(8, 64)
+}
+
+/// **Flash** variant of [`ATTENTION_SPLIT_SHADER_TEMPLATE`] (split-k phase 1).
+/// Byte-for-byte the same online-softmax algorithm, the same 6-binding shape,
+/// the same `AttnSplitMeta` uniform, the same `(head, split)` dispatch, and the
+/// same unnormalized `partial_ml`/`partial_acc` outputs — so it drops straight
+/// into `record_fused_attention`'s Pass C and [`ATTENTION_SPLIT_REDUCE_SHADER`]
+/// merges it unchanged. **One difference, and it is the whole point:** the
+/// un-split/split kernels compute each candidate position's `q·k` by reading
+/// that position's `head_dim`-long K row *directly from global memory* inside
+/// `score_at` — and with one thread per position, adjacent threads read K rows
+/// `n_head_kv * head_dim` elements apart, i.e. **completely uncoalesced** (each
+/// lane touches a different cache line for the same `d`). As the KV range grows
+/// this uncoalesced K traffic comes to dominate the attention dispatch, while
+/// the rest of the decode token is independent of context length.
+///
+/// This kernel instead **cooperatively stages each K tile into shared memory
+/// with coalesced loads** (all 64 lanes stream `tile_len * head_dim` contiguous
+/// f16 values, the classic flash-attention tiling llama.cpp's own WGSL
+/// `flash_attn_tile.wgsl` `load_k_tile_block` does), then each lane computes its
+/// position's score by reading K from LDS. The `k_shmem` row stride is padded to
+/// `head_dim + 1` so the score read `k_shmem[local * KV_STRIDE + d]` lands in a
+/// distinct LDS bank per lane (stride ≡ 1 (mod 32) for `head_dim` a multiple of
+/// 32) instead of a 32-way bank conflict. V is left reading from global: its
+/// existing access (`kv_read_v(v_base + d2)`, adjacent lanes → adjacent `d2`)
+/// is *already* coalesced, so staging it would only add LDS pressure.
+///
+/// **Numerically identical, not merely close, for `f16` KV** (the default): the
+/// staged value is `f16(kv_read_k(g))`, and `kv_read_k` already returns
+/// `f32(k_cache[idx])` from an `f16` mirror, so the round-trip is exact and the
+/// per-`d` accumulation order is unchanged — greedy output is byte-identical to
+/// the split kernel. Only offered for `f16` storage (the generator is only
+/// called for it): `f32` KV would blow the LDS budget at `head_dim = 512`, and
+/// `q8_0` isn't `f16`-representable losslessly.
+const ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE: &str = r#"
+%KV_ENABLE%
+struct AttnSplitMeta {
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    window_start: u32,
+    n_pos: u32,
+    k_num: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> aq: array<f32>;
+%KV_BINDINGS%
+@group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
+@group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
+@group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+
+%KV_READ_FNS%
+
+const MAX_HEAD_DIM: u32 = 2048u;
+// Positions staged per tile, and the padded K-tile row stride (head_dim + 1).
+const TILE_POS: u32 = %TILE_POS%u;
+const KV_STRIDE: u32 = %KV_STRIDE%u;
+
+var<workgroup> shared_reduce: array<f32, 64>;
+var<workgroup> tile_probs: array<f32, 64>;
+var<workgroup> acc: array<f32, MAX_HEAD_DIM>;
+// Coalesced K-tile staging buffer: TILE_POS rows × head_dim, padded to
+// KV_STRIDE so the strided score read is LDS-bank-conflict-free.
+var<workgroup> k_shmem: array<f16, %K_SHMEM_LEN%>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    %SUBGROUP_PARAMS%
+) {
+    let h = wid.x;
+    let split_idx = wid.y;
+    let local = lid.x;
+    let group_size = am.n_head / am.n_head_kv;
+    let kv_head = h / group_size;
+    let head_dim = am.head_dim;
+    let k_num = am.k_num;
+    let q_base = h * head_dim;
+
+    let split_len = (am.n_pos + k_num - 1u) / k_num;
+    let split_start = split_idx * split_len;
+    let split_end = min(split_start + split_len, am.n_pos);
+
+    var zd: u32 = local;
+    loop {
+        if (zd >= head_dim) {
+            break;
+        }
+        acc[zd] = 0.0;
+        zd = zd + 64u;
+    }
+
+    var m: f32 = -1e30;
+    var l: f32 = 0.0;
+
+    if (split_start < split_end) {
+        var tile_start: u32 = split_start;
+        loop {
+            if (tile_start >= split_end) {
+                break;
+            }
+            let tile_len = min(TILE_POS, split_end - tile_start);
+
+            // Cooperatively stage this tile's K rows into LDS. All 64 lanes
+            // stream tile_len*head_dim contiguous f16 values — consecutive
+            // lanes read consecutive global addresses (a coalesced burst),
+            // replacing the un-staged kernel's per-position, stride-head_dim
+            // (uncoalesced) K fetches.
+            var e: u32 = local;
+            loop {
+                if (e >= tile_len * head_dim) {
+                    break;
+                }
+                let row = e / head_dim;
+                let col = e - row * head_dim;
+                let pp = am.window_start + tile_start + row;
+                let g = (pp * am.n_head_kv + kv_head) * head_dim + col;
+                k_shmem[row * KV_STRIDE + col] = f16(kv_read_k(g));
+                e = e + 64u;
+            }
+            workgroupBarrier();
+
+            let has_pos = local < tile_len;
+            var my_score: f32 = -1e30;
+            if (has_pos) {
+                var s: f32 = 0.0;
+                var d: u32 = 0u;
+                loop {
+                    if (d >= head_dim) {
+                        break;
+                    }
+                    s = s + aq[q_base + d] * f32(k_shmem[local * KV_STRIDE + d]);
+                    d = d + 1u;
+                }
+                my_score = s * am.scale;
+            }
+            %MAX_REDUCE_BLOCK%
+
+            var my_prob: f32 = 0.0;
+            if (has_pos) {
+                my_prob = exp(my_score - tile_max);
+            }
+            tile_probs[local] = my_prob;
+            %SUM_REDUCE_BLOCK%
+
+            let new_m = max(m, tile_max);
+            let alpha_old = exp(m - new_m);
+            let alpha_tile = exp(tile_max - new_m);
+            l = l * alpha_old + tile_sum * alpha_tile;
+
+            var d2: u32 = local;
+            loop {
+                if (d2 >= head_dim) {
+                    break;
+                }
+                var tile_contribution: f32 = 0.0;
+                var j: u32 = 0u;
+                loop {
+                    if (j >= tile_len) {
+                        break;
+                    }
+                    let vp = am.window_start + tile_start + j;
+                    let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
+                    tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
+                    j = j + 1u;
+                }
+                acc[d2] = acc[d2] * alpha_old + alpha_tile * tile_contribution;
+                d2 = d2 + 64u;
+            }
+
+            m = new_m;
+            workgroupBarrier();
+            tile_start = tile_start + TILE_POS;
+        }
+    }
+
+    let out_base = h * k_num + split_idx;
+    if (local == 0u) {
+        partial_ml[out_base * 2u] = m;
+        partial_ml[out_base * 2u + 1u] = l;
+    }
+    var d3: u32 = local;
+    loop {
+        if (d3 >= head_dim) {
+            break;
+        }
+        partial_acc[out_base * head_dim + d3] = acc[d3];
+        d3 = d3 + 64u;
+    }
+}
+"#;
+
+/// Builds [`ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE`] for a specific `head_dim`
+/// (which fixes the staged-tile size), the adapter's subgroup capability, and
+/// the KV storage kind. Only meaningful for [`KvStorage::F16`] — see the
+/// template's doc comment.
+pub fn shader_source_attention_split_flash(
+    kv_storage: KvStorage,
+    subgroup: bool,
+    head_dim: u32,
+) -> String {
+    let (max_block, sum_block) = if subgroup {
+        attention_subgroup_blocks()
+    } else {
+        attention_classic_blocks()
+    };
+    let subgroup_params = if subgroup {
+        "@builtin(subgroup_invocation_id) subgroup_invocation_id: u32,\n    @builtin(subgroup_id) subgroup_id: u32,\n    @builtin(num_subgroups) num_subgroups: u32,"
+    } else {
+        ""
+    };
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
+    let tile_pos = flash_tile_positions(head_dim);
+    let stride = head_dim + 1;
+    let shmem_len = tile_pos * stride;
+    ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE
+        .replace(
+            "const MAX_HEAD_DIM: u32 = 2048u;",
+            &format!("const MAX_HEAD_DIM: u32 = {head_dim}u;"),
+        )
+        .replace("%KV_ENABLE%", kv_storage.enable_directive())
+        .replace("%KV_BINDINGS%", &kv_bindings)
+        .replace("%KV_READ_FNS%", &kv_read_fns)
+        .replace("%SUBGROUP_PARAMS%", subgroup_params)
+        .replace("%MAX_REDUCE_BLOCK%", max_block)
+        .replace("%SUM_REDUCE_BLOCK%", sum_block)
+        .replace("%TILE_POS%", &tile_pos.to_string())
+        .replace("%KV_STRIDE%", &stride.to_string())
+        .replace("%K_SHMEM_LEN%", &shmem_len.to_string())
+}
+
 /// Split-k phase 2 of two — merges [`ATTENTION_SPLIT_SHADER_TEMPLATE`]'s
 /// `k_num` partial `(m, l, acc)` triples for one head into the same final
 /// `aout[h * head_dim .. (h+1) * head_dim]` the un-split kernel writes

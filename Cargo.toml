@@ -18,6 +18,13 @@ path = "src/bin/orangu-coordinator/main.rs"
 name = "orangu-server"
 path = "src/bin/orangu-server/main.rs"
 
+# Developer benchmarking tool (not part of the served product). Measures decode
+# tok/s of any OpenAI-compatible server over HTTP — orangu-server or
+# llama-server. Documented in doc/manual/en/79-bench.md.
+[[bin]]
+name = "orangu-bench"
+path = "src/bin/orangu-bench/main.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 arboard = { version = "3.6.1", default-features = false }

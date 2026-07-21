@@ -1161,6 +1161,14 @@ pub struct VulkanBackend {
     /// — see `Self::try_init`'s own construction-site comment for why
     /// this is on by default.
     attn_split: bool,
+    /// Whether `attn_split_pipeline_for` builds the **flash** split-k phase-1
+    /// kernel (coalesced-LDS-staged K — `shader_source_attention_split_flash`)
+    /// instead of the un-staged one. Opt-in (`ORANGU_FLASH_ATTN=1`) and only
+    /// ever true when KV is stored as `f16` (the staging round-trips through
+    /// `f16` losslessly, keeping greedy output byte-identical). Cuts the
+    /// uncoalesced K traffic that otherwise dominates attention as the KV
+    /// range grows — see `Self::try_init`'s construction-site comment.
+    flash_attn: bool,
     /// Whether `GemmaModel::record_decode_forward` should write per-layer
     /// GPU timestamps — see `Self::try_init`'s own construction-site
     /// comment for why this needs both `TIMESTAMP_QUERY` and
@@ -1556,6 +1564,13 @@ impl VulkanBackend {
         } else {
             vulkan_shaders::KvStorage::F32
         };
+        // Flash split-k phase-1 kernel (coalesced-LDS-staged K). **Opt-in**
+        // (`ORANGU_FLASH_ATTN=1`) and only when KV is `f16` — the staging
+        // round-trips through `f16` losslessly (byte-identical greedy output),
+        // and `f32`/`q8_0` KV don't fit the LDS budget / aren't `f16`-exact.
+        // See `attn_split_pipeline_for` and `shader_source_attention_split_flash`.
+        let flash_attn = matches!(kv_storage, vulkan_shaders::KvStorage::F16)
+            && std::env::var_os("ORANGU_FLASH_ATTN").is_some();
         // See `Self::
         // packed_dot_f16`'s own doc comment.
         let packed_dot_f16 = supports_f16 && std::env::var_os("ORANGU_PACKED_DOT").is_some();
@@ -2221,6 +2236,7 @@ impl VulkanBackend {
             argmax_reduce_pipeline,
             gpu_sample,
             attn_split,
+            flash_attn,
             gpu_timestamps,
             timestamps: Mutex::new(None),
         })
@@ -4852,18 +4868,26 @@ impl VulkanBackend {
         if let Some(p) = cache.get(&hd) {
             return p.clone();
         }
+        // The flash variant (coalesced-LDS-staged K) is only well-defined for
+        // f16 KV (`self.flash_attn` already encodes that), and its LDS budget
+        // is sized for head_dim up to ~512 (`flash_tile_positions`); guard the
+        // upper bound here so an unusually large head_dim falls back to the
+        // proven split kernel rather than a tiny, over-split tile.
+        let use_flash = self.flash_attn && hd <= 576;
+        let source = if use_flash {
+            vulkan_shaders::shader_source_attention_split_flash(
+                self.kv_storage,
+                self.subgroup_reduce,
+                hd,
+            )
+        } else {
+            vulkan_shaders::shader_source_attention_split(self.kv_storage, self.subgroup_reduce, hd)
+        };
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("orangu-server attention split shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    vulkan_shaders::shader_source_attention_split(
-                        self.kv_storage,
-                        self.subgroup_reduce,
-                        hd,
-                    )
-                    .into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
         let pipeline = self
             .device
