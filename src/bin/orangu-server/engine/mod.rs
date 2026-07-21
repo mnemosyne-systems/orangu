@@ -24,5 +24,6 @@ pub mod prefix_cache;
 pub mod quant;
 pub mod sampling;
 pub mod scheduler;
+pub mod slot_store;
 pub mod tensor;
 pub mod tokenizer;

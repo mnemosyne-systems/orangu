@@ -130,9 +130,17 @@ impl SlotRegistry {
     }
 
     /// `POST {endpoint}/slots/{id_slot}?action=save` — persists `id_slot`'s
-    /// KV cache to `filename` under the server's `--slot-save-path`
-    /// directory. A no-op (returns `Unsupported` without a request) once this
-    /// endpoint has failed once.
+    /// KV cache to `filename` under the server's slot-persistence directory.
+    /// A no-op (returns `Unsupported` without a request) once this endpoint
+    /// has failed once.
+    ///
+    /// `model` names the session's model so that when `endpoint` is an
+    /// `orangu-coordinator` proxy, the request routes to *that* model's
+    /// backing `orangu-server` (the one holding this slot's cache) rather
+    /// than the coordinator's default — the slots body carries no `model`
+    /// otherwise, so the coordinator would fall back to the default profile
+    /// and could even force a spurious model swap. A plain OpenAI-compatible
+    /// server (or a direct `orangu-server`) simply ignores the extra field.
     pub async fn save_slot(
         &self,
         client: &Client,
@@ -140,14 +148,16 @@ impl SlotRegistry {
         api_key: Option<&str>,
         id_slot: u32,
         filename: &str,
+        model: &str,
     ) -> SaveRestoreOutcome {
-        self.save_or_restore(client, endpoint, api_key, id_slot, filename, "save")
+        self.save_or_restore(client, endpoint, api_key, id_slot, filename, model, "save")
             .await
     }
 
     /// `POST {endpoint}/slots/{id_slot}?action=restore` — loads a
     /// previously-saved `filename` back into `id_slot` (which may differ from
-    /// the slot it was saved from). Same short-circuiting as `save_slot`.
+    /// the slot it was saved from). Same short-circuiting and `model`-routing
+    /// as [`Self::save_slot`].
     pub async fn restore_slot(
         &self,
         client: &Client,
@@ -155,11 +165,15 @@ impl SlotRegistry {
         api_key: Option<&str>,
         id_slot: u32,
         filename: &str,
+        model: &str,
     ) -> SaveRestoreOutcome {
-        self.save_or_restore(client, endpoint, api_key, id_slot, filename, "restore")
-            .await
+        self.save_or_restore(
+            client, endpoint, api_key, id_slot, filename, model, "restore",
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn save_or_restore(
         &self,
         client: &Client,
@@ -167,15 +181,22 @@ impl SlotRegistry {
         api_key: Option<&str>,
         id_slot: u32,
         filename: &str,
+        model: &str,
         action: &str,
     ) -> SaveRestoreOutcome {
         if self.is_save_restore_unsupported(endpoint) {
             return SaveRestoreOutcome::Unsupported;
         }
         let url = format!("{endpoint}/slots/{id_slot}?action={action}");
-        let mut builder = client
-            .post(url)
-            .json(&serde_json::json!({ "filename": filename }));
+        // `model` lets an `orangu-coordinator` proxy route this to the right
+        // backing server; omitted when empty so it never resolves to an
+        // unintended profile. The backend ignores the field either way.
+        let mut payload = serde_json::Map::new();
+        payload.insert("filename".to_string(), filename.into());
+        if !model.is_empty() {
+            payload.insert("model".to_string(), model.into());
+        }
+        let mut builder = client.post(url).json(&serde_json::Value::Object(payload));
         if let Some(api_key) = api_key {
             builder = builder.bearer_auth(api_key);
         }
@@ -294,13 +315,13 @@ mod tests {
         // restore target to differ from the save-time slot.
         assert_eq!(
             registry
-                .save_slot(&client, &endpoint, None, 1, "session.bin")
+                .save_slot(&client, &endpoint, None, 1, "session.bin", "test-model")
                 .await,
             SaveRestoreOutcome::Ok
         );
         assert_eq!(
             registry
-                .restore_slot(&client, &endpoint, None, 0, "session.bin")
+                .restore_slot(&client, &endpoint, None, 0, "session.bin", "test-model")
                 .await,
             SaveRestoreOutcome::Ok
         );
@@ -323,13 +344,13 @@ mod tests {
 
         assert_eq!(
             registry
-                .save_slot(&client, &endpoint, None, 0, "session.bin")
+                .save_slot(&client, &endpoint, None, 0, "session.bin", "test-model")
                 .await,
             SaveRestoreOutcome::Unsupported
         );
         assert_eq!(
             registry
-                .restore_slot(&client, &endpoint, None, 0, "session.bin")
+                .restore_slot(&client, &endpoint, None, 0, "session.bin", "test-model")
                 .await,
             SaveRestoreOutcome::Unsupported
         );

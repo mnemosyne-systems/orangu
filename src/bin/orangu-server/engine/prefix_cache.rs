@@ -38,6 +38,39 @@ pub struct CachedPrefill {
     pub cache: KvCache,
 }
 
+impl CachedPrefill {
+    /// How many leading tokens of `prompt` this entry can serve for free —
+    /// the shared token prefix, capped by how much of the cache is actually
+    /// committed, and forced to all-or-nothing when the cache carries
+    /// recurrent (SSM / gated-delta-net) state. `0` means "no usable reuse."
+    ///
+    /// This is the single source of truth for prefix matching, shared by
+    /// [`PrefixCache::take_best_match`] (the cross-request pool) and
+    /// [`crate::engine::slot_store`] (per-slot persistence), so both honor
+    /// the exact same committed-length and recurrent-state rules — see
+    /// [`PrefixCache::take_best_match`]'s own doc comment for why each cap
+    /// matters.
+    pub fn reusable_prefix_len(&self, prompt: &[u32]) -> usize {
+        let cached_len = self
+            .cache
+            .layers
+            .iter()
+            .map(|l| l.len)
+            .max()
+            .unwrap_or(self.tokens.len());
+        let prefix_len = common_prefix_len(&self.tokens, prompt).min(cached_len);
+        if prefix_len == 0 {
+            return 0;
+        }
+        // Recurrent state has no per-position history to rewind to a shorter
+        // prefix — only a full-length carryover is valid.
+        if !self.cache.recurrent.is_empty() && prefix_len != cached_len {
+            return 0;
+        }
+        prefix_len
+    }
+}
+
 /// Bounded by `max_entries` (a fixed small number — each entry holds a
 /// whole `KvCache`'s worth of `f32` K/V buffers, easily hundreds of MB at
 /// real context lengths, so this is sized to stay well within ordinary
@@ -98,18 +131,8 @@ impl PrefixCache {
         let mut entries = self.entries.lock().unwrap();
         let mut best: Option<(usize, usize)> = None; // (pool index, prefix len)
         for (i, entry) in entries.iter().enumerate() {
-            let cached_len = entry
-                .cache
-                .layers
-                .iter()
-                .map(|l| l.len)
-                .max()
-                .unwrap_or(entry.tokens.len());
-            let prefix_len = common_prefix_len(&entry.tokens, tokens).min(cached_len);
+            let prefix_len = entry.reusable_prefix_len(tokens);
             if prefix_len == 0 {
-                continue;
-            }
-            if !entry.cache.recurrent.is_empty() && prefix_len != cached_len {
                 continue;
             }
             if best.is_none_or(|(_, best_len)| prefix_len > best_len) {

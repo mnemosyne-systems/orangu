@@ -742,6 +742,65 @@ removed, since a genuinely GPU-resident batched-and-fused pipeline could
 plausibly flip this positive on different hardware or at higher
 concurrency.
 
+### Durable slot persistence (`engine::slot_store`)
+
+`orangu-server` implements the `POST /slots/{id_slot}?action=save|restore`
+endpoints — its equivalent of llama.cpp's `--slot-save-path` prompt-cache
+save/restore, and the receiving end of the orangu client's per-session slot
+persistence (`orangu::llm::SlotRegistry`, driven from tab park/activate).
+
+The important structural difference from llama.cpp is that an orangu-server
+slot is a *concurrency permit* (`SlotPool`), not a long-lived owner of one KV
+cache. A completed request's cache otherwise survives only inside the in-RAM
+`engine::prefix_cache` pool (opt-in, bounded, cross-slot). `engine::slot_store`
+adds the durable layer: each slot retains the `(tokens, KvCache)` of the last
+request that ran on it, and
+
+- `save` serializes that snapshot to
+  `~/.orangu/server/<fingerprint>/slots/<filename>` — only the committed KV
+  positions (not the whole allocated context window), written atomically
+  (temp file + rename);
+- `restore` loads it back into the slot's retained cache, so that slot's
+  *next* request reuses the prefix through the same `KvCache::copy_prefix_from`
+  path (and the same `CachedPrefill::reusable_prefix_len` committed-length and
+  recurrent-state rules) as the prefix pool, instead of re-prefilling.
+
+This is what survives the cases the RAM pool cannot: eviction under cache
+pressure, a server restart, and — most relevant behind `orangu-coordinator` —
+a model swap that tears the server down. The client saves a tab's slot
+*before* the coordinator activates the next tab's model, so the save reaches
+the still-active server and lands on disk; the later restore repopulates a
+freshly (re)started server.
+
+`<fingerprint>` is a SHA-256 of the architecture, the model label, and the KV
+structure tag (layer count, per-layer `kv_dim`, recurrent specs). A snapshot
+saved for one model therefore resolves to a different directory than any other
+model's, and every file also carries the fingerprint internally — a mismatched
+or corrupt file is treated as "nothing to restore" (`n_restored: 0`, a normal
+prefill next request), never a hard error, so a stale sidecar never trips the
+client's fallback notice. Client-supplied filenames are validated to a single
+safe path component before touching the filesystem.
+
+The feature is **on by default**; set `ORANGU_NO_SLOT_SAVE` to disable it (it
+also stays off when `$HOME` can't be resolved). While off, the endpoints report
+"not supported" exactly as a llama.cpp server started without `--slot-save-path`
+does — which the orangu client already degrades against, falling back to a full
+reprefill. The opt-out exists for the same reason `ORANGU_PREFIX_CACHE` is
+itself opt-in — a bug in prefix reuse would produce a silently *wrong*
+generation, not merely a slow one — but persistence is only ever exercised when
+a client explicitly saves or restores a slot, so it stays dormant unless used.
+
+Requests routed through `orangu-coordinator` carry the session's `model` in
+the slots request body (the orangu client adds it), so the coordinator proxies
+each save/restore to that model's backing server rather than its default
+profile; a direct orangu-server or plain OpenAI-compatible server ignores the
+extra field.
+
+Saved files accumulate one directory per distinct model. `orangu-server prune`
+sweeps slot files untouched for over 30 days on every run
+(`slot_store::sweep_stale_slot_files`), alongside its empty-session sweep — see
+[Session management](46-server.md).
+
 ### GPU backend architecture
 
 `engine::backend::Backend` (`backend/mod.rs`) is the trait every backend

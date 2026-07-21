@@ -19,7 +19,13 @@
 //! close enough for `orangu`'s `/information` probe and `curl` inspection,
 //! not a byte-for-byte schema match.
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -48,6 +54,97 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 pub async fn slots(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.engine.slots.snapshot())
+}
+
+/// `?action=save|restore` on the slot-action endpoint.
+#[derive(Deserialize)]
+pub struct SlotActionQuery {
+    action: String,
+}
+
+/// `POST /slots/{id_slot}?action=save|restore` with a JSON body naming the
+/// file: persists a slot's KV cache to, or restores it from,
+/// `~/.orangu/server/<fingerprint>/slots/<filename>`. This is orangu-server's
+/// equivalent of llama.cpp's `--slot-save-path` endpoints, and speaks the
+/// same request shape the orangu client (`orangu::llm::SlotRegistry`) already
+/// sends.
+///
+/// When durable slot persistence is disabled (`ORANGU_NO_SLOT_SAVE` set, or no
+/// resolvable home directory), this reports "not supported" exactly as a
+/// llama.cpp server started without `--slot-save-path` does — the orangu
+/// client already degrades gracefully against that, falling back to a full
+/// reprefill. A missing or model-incompatible saved file is *not* an error:
+/// `restore` succeeds with `n_restored: 0` so a stale sidecar never trips the
+/// client's "persistence unavailable" notice.
+pub async fn slot_action(
+    State(state): State<Arc<AppState>>,
+    Path(id_slot): Path<usize>,
+    Query(query): Query<SlotActionQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(store) = state.engine.slot_store.as_deref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "This server does not support slots action (disabled by ORANGU_NO_SLOT_SAVE)\n"
+                .to_string(),
+        )
+            .into_response();
+    };
+
+    if id_slot >= state.engine.slots.total() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "id_slot {id_slot} out of range (server has {} slots)\n",
+                state.engine.slots.total()
+            ),
+        )
+            .into_response();
+    }
+
+    let filename = match serde_json::from_slice::<SlotActionBody>(&body) {
+        Ok(b) if !b.filename.is_empty() => b.filename,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object with a non-empty \"filename\" field\n"
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match query.action.as_str() {
+        "save" => match store.save(id_slot, &filename) {
+            Ok(n_saved) => Json(serde_json::json!({
+                "id_slot": id_slot,
+                "filename": filename,
+                "n_saved": n_saved,
+            }))
+            .into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+        },
+        "restore" => match store.restore(id_slot, &filename) {
+            Ok(n_restored) => Json(serde_json::json!({
+                "id_slot": id_slot,
+                "filename": filename,
+                "n_restored": n_restored,
+            }))
+            .into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+        },
+        other => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown slot action {other:?} (expected \"save\" or \"restore\")\n"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SlotActionBody {
+    #[serde(default)]
+    filename: String,
 }
 
 pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {

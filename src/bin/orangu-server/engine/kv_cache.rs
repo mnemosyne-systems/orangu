@@ -257,6 +257,40 @@ impl LayerCache {
         }
     }
 
+    /// Rebuilds a layer from a slot-persistence snapshot: `k`/`v` hold
+    /// exactly `len * kv_dim` committed floats each, so `capacity` is set to
+    /// `len` — the minimum that keeps this a valid [`Self::copy_prefix_from`]
+    /// *source* (only `len`, `kv_dim`, and the `[0, len)` floats are ever
+    /// read from a source; its `capacity` is never consulted). A restored
+    /// cache is only ever used as a reuse source, never pushed to directly.
+    fn from_parts(kv_dim: usize, len: usize, k: Vec<f32>, v: Vec<f32>) -> Self {
+        debug_assert_eq!(k.len(), len * kv_dim);
+        debug_assert_eq!(v.len(), len * kv_dim);
+        Self {
+            k,
+            v,
+            kv_dim,
+            capacity: len,
+            len,
+            gpu: None,
+        }
+    }
+
+    /// A CPU-only deep copy (no GPU mirror). Used by slot persistence to
+    /// snapshot a completed cache for a slot that is also being deposited
+    /// into the [`crate::engine::prefix_cache`] pool — the one case where a
+    /// single completed cache is needed in two places at once.
+    fn duplicate(&self) -> Self {
+        Self {
+            k: self.k.clone(),
+            v: self.v.clone(),
+            kv_dim: self.kv_dim,
+            capacity: self.capacity,
+            len: self.len,
+            gpu: None,
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -287,14 +321,7 @@ impl LayerCache {
     /// (and its GPU mirror) the test also feeds to `fused_attention`.
     #[cfg(test)]
     pub fn clone_for_test(&self) -> Self {
-        Self {
-            k: self.k.clone(),
-            v: self.v.clone(),
-            kv_dim: self.kv_dim,
-            capacity: self.capacity,
-            len: self.len,
-            gpu: None,
-        }
+        self.duplicate()
     }
 
     /// Lazily builds this layer's GPU-resident mirror (sized once, for the
@@ -596,6 +623,185 @@ impl KvCache {
             layer.truncate(new_len);
         }
     }
+
+    /// How many token positions are actually committed to this cache — the
+    /// maximum `len` across every attention layer, so a permanently-empty
+    /// cross-layer KV-donor slot (`engine::arch::gemma`'s `kv_donor`) never
+    /// drags the count to zero. `0` for a freshly allocated, never-pushed
+    /// cache. This is what a saved slot reports as its reusable token count.
+    pub fn committed_len(&self) -> usize {
+        self.layers.iter().map(|l| l.len).max().unwrap_or(0)
+    }
+
+    /// A CPU-only deep copy (no GPU mirror) of the whole cache — the
+    /// [`crate::engine::slot_store`] uses it to snapshot a slot's completed
+    /// cache when that same cache is also being handed to the
+    /// [`crate::engine::prefix_cache`] pool.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            layers: self.layers.iter().map(LayerCache::duplicate).collect(),
+            recurrent: self
+                .recurrent
+                .iter()
+                .map(RecurrentLayerState::duplicate)
+                .collect(),
+        }
+    }
+
+    /// A structural signature — layer count and each layer's `kv_dim`, plus
+    /// every recurrent layer's `(conv_channels, d_conv, num_heads, head_dim)`
+    /// — with no per-position data or capacity in it. Two caches from the
+    /// same model architecture always agree here; two from different models
+    /// (or different KV shapes) never do. Feeds the on-disk slot fingerprint
+    /// so a snapshot can only ever be restored into a structurally identical
+    /// model. Deterministic across runs (no hashing here — the caller hashes
+    /// it together with the model label).
+    pub fn structure_tag(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, self.layers.len() as u32);
+        for l in &self.layers {
+            push_u32(&mut out, l.kv_dim as u32);
+        }
+        push_u32(&mut out, self.recurrent.len() as u32);
+        for r in &self.recurrent {
+            push_u32(&mut out, r.conv_channels as u32);
+            push_u32(&mut out, r.d_conv as u32);
+            push_u32(&mut out, r.num_heads() as u32);
+            push_u32(&mut out, r.head_dim as u32);
+        }
+        out
+    }
+
+    /// Serializes every committed KV position (and all recurrent state) to a
+    /// self-describing little-endian byte blob — the payload
+    /// [`crate::engine::slot_store`] writes under
+    /// `~/.orangu/server/<fp>/slots/`. Only the `[0, len)` floats of each
+    /// layer are written (never the unused tail of a larger `capacity`), so
+    /// a saved file is sized to the conversation, not the context window.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(KV_CACHE_MAGIC);
+        push_u32(&mut out, self.layers.len() as u32);
+        for l in &self.layers {
+            push_u32(&mut out, l.kv_dim as u32);
+            push_u32(&mut out, l.len as u32);
+            let n = l.len * l.kv_dim;
+            push_f32s(&mut out, &l.k[..n]);
+            push_f32s(&mut out, &l.v[..n]);
+        }
+        push_u32(&mut out, self.recurrent.len() as u32);
+        for r in &self.recurrent {
+            push_u32(&mut out, r.conv_channels as u32);
+            push_u32(&mut out, r.d_conv as u32);
+            push_u32(&mut out, r.num_heads() as u32);
+            push_u32(&mut out, r.head_dim as u32);
+            push_f32s(&mut out, &r.conv_history);
+            push_f32s(&mut out, &r.delta_state);
+        }
+        out
+    }
+
+    /// Inverse of [`Self::to_bytes`]. Every length is validated against the
+    /// remaining input before it is read, so a truncated or corrupt file
+    /// yields an `Err` rather than a panic or an out-of-bounds read — the
+    /// caller ([`crate::engine::slot_store`]) treats any `Err` as "nothing to
+    /// restore" and falls back to a normal prefill.
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let mut cur = ByteReader::new(bytes);
+        if cur.take(KV_CACHE_MAGIC.len())? != KV_CACHE_MAGIC {
+            anyhow::bail!("not an orangu KV-cache blob (bad magic)");
+        }
+        let n_layer = cur.u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layer);
+        for _ in 0..n_layer {
+            let kv_dim = cur.u32()? as usize;
+            let len = cur.u32()? as usize;
+            let n = len
+                .checked_mul(kv_dim)
+                .ok_or_else(|| anyhow::anyhow!("KV layer dimensions overflow"))?;
+            let k = cur.f32s(n)?;
+            let v = cur.f32s(n)?;
+            layers.push(LayerCache::from_parts(kv_dim, len, k, v));
+        }
+        let n_rec = cur.u32()? as usize;
+        let mut recurrent = Vec::with_capacity(n_rec);
+        for _ in 0..n_rec {
+            let conv_channels = cur.u32()? as usize;
+            let d_conv = cur.u32()? as usize;
+            let num_heads = cur.u32()? as usize;
+            let head_dim = cur.u32()? as usize;
+            let conv_history = cur.f32s(conv_channels * d_conv.saturating_sub(1))?;
+            let delta_state = cur.f32s(num_heads * head_dim * head_dim)?;
+            recurrent.push(RecurrentLayerState::from_parts(
+                conv_channels,
+                d_conv,
+                head_dim,
+                conv_history,
+                delta_state,
+            ));
+        }
+        if !cur.is_empty() {
+            anyhow::bail!("trailing bytes after KV-cache blob");
+        }
+        Ok(Self { layers, recurrent })
+    }
+}
+
+const KV_CACHE_MAGIC: &[u8] = b"ORGUKVC1";
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_f32s(out: &mut Vec<u8>, data: &[f32]) {
+    out.reserve(data.len() * 4);
+    for &x in data {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+/// A tiny bounds-checked forward cursor over the slot-persistence byte
+/// format — every read validates it stays within the buffer, so a
+/// malformed file can never panic or read out of bounds.
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("unexpected end of KV-cache blob"))?;
+        let slice = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> anyhow::Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn f32s(&mut self, count: usize) -> anyhow::Result<Vec<f32>> {
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("KV-cache float count overflows"))?;
+        let b = self.take(bytes)?;
+        Ok(b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
 }
 
 /// One recurrent (SSM / gated-delta-net) layer's persistent state: a
@@ -622,6 +828,46 @@ impl RecurrentLayerState {
             d_conv,
             delta_state: vec![0.0; num_heads * head_dim * head_dim],
             head_dim,
+        }
+    }
+
+    /// Rebuilds a recurrent state from a slot-persistence snapshot. `num_heads`
+    /// is recovered from `delta_state`'s length rather than stored separately.
+    fn from_parts(
+        conv_channels: usize,
+        d_conv: usize,
+        head_dim: usize,
+        conv_history: Vec<f32>,
+        delta_state: Vec<f32>,
+    ) -> Self {
+        Self {
+            conv_history,
+            conv_channels,
+            d_conv,
+            delta_state,
+            head_dim,
+        }
+    }
+
+    /// How many delta-net heads this state carries — `delta_state` is a dense
+    /// `[num_heads, head_dim, head_dim]`, so the head count is implied by its
+    /// length. `0` for the degenerate `head_dim == 0` case (never real).
+    fn num_heads(&self) -> usize {
+        self.delta_state
+            .len()
+            .checked_div(self.head_dim * self.head_dim)
+            .unwrap_or(0)
+    }
+
+    /// A deep copy — every field is owned data (`Vec<f32>` plus dimensions),
+    /// so this is a plain clone, used by [`KvCache::duplicate`].
+    fn duplicate(&self) -> Self {
+        Self {
+            conv_history: self.conv_history.clone(),
+            conv_channels: self.conv_channels,
+            d_conv: self.d_conv,
+            delta_state: self.delta_state.clone(),
+            head_dim: self.head_dim,
         }
     }
 

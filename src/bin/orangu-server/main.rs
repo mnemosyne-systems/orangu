@@ -439,6 +439,33 @@ fn prepare(args: Args) -> Result<Prepared> {
         .is_some()
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
 
+    // Durable per-slot KV-cache persistence (`engine::slot_store`), backing
+    // the `POST /slots/{id}?action=save|restore` endpoints. **On by default**;
+    // set `ORANGU_NO_SLOT_SAVE` to disable it. Reuse of a restored prefix goes
+    // through the same `copy_prefix_from` path the (opt-in) `ORANGU_PREFIX_CACHE`
+    // pool uses; the opt-out exists for the same reason that pool is cautious —
+    // a bug in prefix matching would silently produce a *wrong* generation, not
+    // just a slow one — but persistence is only ever exercised when a client
+    // explicitly saves/restores a slot, so it stays dormant unless used. The
+    // `<fingerprint>` directory component ties every saved file to this exact
+    // model architecture, label, and KV structure, so a snapshot can never be
+    // restored into a different model. `None` here (disabled, or `$HOME`
+    // unresolvable) makes the endpoints report "not supported," matching a
+    // llama.cpp server started without `--slot-save-path` — which is exactly
+    // what the orangu client already degrades against.
+    let slot_store = std::env::var_os("ORANGU_NO_SLOT_SAVE")
+        .is_none()
+        .then(|| {
+            let structure_tag = model.new_kv_cache(1).structure_tag();
+            let fingerprint = engine::slot_store::SlotStore::fingerprint(
+                &architecture,
+                &model_label,
+                &structure_tag,
+            );
+            engine::slot_store::SlotStore::new(slots.total(), fingerprint).map(Arc::new)
+        })
+        .flatten();
+
     let engine = Arc::new(Engine {
         model,
         tokenizer,
@@ -446,6 +473,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         slots,
         batch_coordinator,
         prefix_cache,
+        slot_store,
         role,
     });
 

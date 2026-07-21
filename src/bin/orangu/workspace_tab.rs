@@ -356,7 +356,7 @@ pub(crate) async fn save_session_slot(
     };
     let filename = format!("{session_id}.bin");
     let outcome = slots
-        .save_slot(client, endpoint, None, id_slot, &filename)
+        .save_slot(client, endpoint, None, id_slot, &filename, active_model_id)
         .await;
     if outcome == orangu::llm::SaveRestoreOutcome::Ok {
         let info = SessionSlotInfo {
@@ -437,13 +437,14 @@ pub(crate) async fn restore_session_slot(
     let id_slot = session.ensure_slot_assigned(profile, client).await?;
     let filename = format!("{session_id}.bin");
     let outcome = slots
-        .restore_slot(client, endpoint, None, id_slot, &filename)
+        .restore_slot(client, endpoint, None, id_slot, &filename, active_model_id)
         .await;
     if outcome == orangu::llm::SaveRestoreOutcome::Unsupported
         && slots.notify_save_restore_unsupported(endpoint)
     {
         Some(
-            "KV cache persistence unavailable on this server (no --slot-save-path configured); \
+            "KV cache persistence unavailable on this server (disabled here, or a llama.cpp \
+             server started without --slot-save-path); \
              prompts will fully reprocess on tab switch."
                 .to_string(),
         )

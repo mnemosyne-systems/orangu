@@ -440,7 +440,13 @@ orangu-server prune <uuid>     # a specific session, by NR or full id
 `prune` deletes chat sessions from `~/.orangu/server/sessions/`. Needs no
 config file and loads no model. Every invocation, regardless of its own
 argument, first removes any non-active session with an empty chat history
-(a **New Chat** click that was never sent to). With no argument, it lists
+(a **New Chat** click that was never sent to) **and** any persisted slot
+KV-cache file (`~/.orangu/server/<fingerprint>/slots/`, written by the
+`?action=save` endpoint) untouched for over 30 days, reporting the space
+reclaimed. Those slot files are a pure reprefill-avoidance cache, so an
+over-eager sweep only ever costs a one-time prefill; age is used rather than
+session-liveness because a slot file is named by the *client's* session id,
+which the server can't cross-reference. With no argument, it lists
 the rest as a numbered table, newest first, and prompts for an `NR` or
 `all`; `all` deletes every remaining session except **active** ones —
 sessions a currently-running `orangu-server` is still using, checked live

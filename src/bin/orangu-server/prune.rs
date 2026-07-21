@@ -21,8 +21,11 @@
 //! Every invocation, regardless of its own argument, first sweeps away
 //! every non-active session with an empty chat history
 //! (`sessions::sweep_empty_sessions`) — junk from a "New Chat" click that
-//! was never used, or a leftover from an interrupted write — before doing
-//! anything else. What's left is then handled by argument:
+//! was never used, or a leftover from an interrupted write — and every stale
+//! persisted slot KV-cache file (`engine::slot_store::sweep_stale_slot_files`,
+//! the `<fingerprint>/slots/*.bin` snapshots written by
+//! `POST /slots/{id}?action=save`) before doing anything else. What's left is
+//! then handled by argument:
 //!
 //! - No argument: prints the remaining sessions as a numbered table, sorted
 //!   newest-updated-first, and prompts for an `NR` or `all`.
@@ -42,11 +45,30 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Slot KV-cache files untouched for this long are treated as abandoned and
+/// swept on every `prune` run. Conservative because the sweep is unconditional
+/// and a file's client-side session can't be checked (see
+/// `engine::slot_store::sweep_stale_slot_files`) — but these are pure caches,
+/// so the only cost of over-eager deletion is a one-time reprefill.
+const SLOT_FILE_MAX_AGE_DAYS: u64 = 30;
+
 pub fn run(identifier: Option<String>, yes: bool) -> Result<()> {
     let removed_empty = sessions::sweep_empty_sessions()?;
     if removed_empty > 0 {
         let plural = if removed_empty == 1 { "" } else { "s" };
         println!("Removed {removed_empty} empty session{plural}.");
+    }
+
+    let slots = crate::engine::slot_store::sweep_stale_slot_files(std::time::Duration::from_secs(
+        SLOT_FILE_MAX_AGE_DAYS * 24 * 60 * 60,
+    ));
+    if slots.removed > 0 {
+        let plural = if slots.removed == 1 { "" } else { "s" };
+        println!(
+            "Removed {} stale slot cache file{plural} ({}).",
+            slots.removed,
+            format_bytes(slots.bytes),
+        );
     }
 
     let entries = sessions::list_sessions_for_prune()?;
@@ -202,6 +224,22 @@ fn print_table(entries: &[PruneEntry]) {
             entry.message_count,
             format_relative(entry.updated_at),
         );
+    }
+}
+
+/// A short human-readable byte size (`512 B`, `3.4 MB`, `1.2 GB`) for the
+/// reclaimed-space line — binary units, one decimal past `KB`.
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
     }
 }
 

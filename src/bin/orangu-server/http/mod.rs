@@ -46,6 +46,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(native::health))
         .route("/props", get(native::props))
         .route("/slots", get(native::slots))
+        .route("/slots/{id_slot}", post(native::slot_action))
         .route("/metrics", get(native::metrics))
         .route("/tokenize", post(native::tokenize))
         .route("/detokenize", post(native::detokenize))

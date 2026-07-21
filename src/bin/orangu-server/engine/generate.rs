@@ -155,6 +155,13 @@ pub struct Engine {
     /// just without even the pool's own mutex/lookup cost). See that
     /// module's own doc comment for what it does and doesn't cover.
     pub prefix_cache: Option<Arc<PrefixCache>>,
+    /// Durable per-slot KV-cache persistence (`engine::slot_store`) — `Some`
+    /// by default (unless `ORANGU_NO_SLOT_SAVE` is set or the home directory
+    /// can't be resolved). Backs the `POST /slots/{id}?action=save|restore` endpoints
+    /// and, while live, lets a slot's own retained cache serve as a prefix-
+    /// reuse source for the next request on that slot (independent of the
+    /// cross-slot `prefix_cache` pool). See that module's own doc comment.
+    pub slot_store: Option<Arc<super::slot_store::SlotStore>>,
     /// Which of `--all`/`--code`/`--review`/`--explorer`/`--embedding` this
     /// deployment was started with — read by the HTTP layer for default
     /// sampling parameters, generation-endpoint gating, and (`Review`
@@ -173,6 +180,7 @@ impl Engine {
         let slots = self.slots.clone();
         let batch_coordinator = self.batch_coordinator.clone();
         let prefix_cache = self.prefix_cache.clone();
+        let slot_store = self.slot_store.clone();
 
         tokio::spawn(async move {
             let guard = slots.acquire().await;
@@ -194,6 +202,7 @@ impl Engine {
                         tokenizer.as_ref(),
                         batch_coordinator.as_deref(),
                         prefix_cache.as_deref(),
+                        slot_store.as_deref(),
                         &guard,
                         req,
                         task_tx.clone(),
@@ -224,11 +233,13 @@ impl Engine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     model: &dyn ModelForward,
     tokenizer: &Tokenizer,
     batch_coordinator: Option<&BatchCoordinator>,
     prefix_cache: Option<&PrefixCache>,
+    slot_store: Option<&super::slot_store::SlotStore>,
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
     tx: mpsc::UnboundedSender<StreamEvent>,
@@ -266,6 +277,15 @@ fn run(
             new_cache.copy_prefix_from(&entry.cache, matched);
             reused_len = matched;
         }
+    }
+    // The cross-slot pool (above) has first claim; only if it found nothing
+    // does this slot's own durably-retained cache (`engine::slot_store`, the
+    // source a `restore` populated) get consulted — it applies the same
+    // leave-one-token and recurrent-state rules internally.
+    if reused_len == 0
+        && let Some(store) = slot_store
+    {
+        reused_len = store.reuse_into(guard.id(), &req.prompt_tokens, &mut new_cache);
     }
     // `Option` (not a plain `KvCache`) so the decode loop can *move* it
     // into a `BatchDecodeRequest` when a `batch_coordinator` is in use —
@@ -464,9 +484,22 @@ fn run(
     // cache) to the pool for a later request to reuse — win or not this
     // time, it's a candidate prefix for whatever comes next (most
     // obviously the same conversation's following turn, whose prompt will
-    // be exactly `history` plus a short new suffix).
-    if let (Some(pool), Some(final_cache)) = (prefix_cache, cache.take()) {
-        pool.store(std::mem::take(&mut history), final_cache);
+    // be exactly `history` plus a short new suffix). The same completed
+    // cache is also retained as this slot's durable snapshot (`slot_store`)
+    // so a later `save` can persist it; when both features are on, the pool
+    // gets a `duplicate()` and the slot keeps the original, since each needs
+    // to own its copy.
+    if let Some(final_cache) = cache.take() {
+        let history = std::mem::take(&mut history);
+        match (prefix_cache, slot_store) {
+            (Some(pool), Some(store)) => {
+                store.retain(guard.id(), history.clone(), final_cache.duplicate());
+                pool.store(history, final_cache);
+            }
+            (Some(pool), None) => pool.store(history, final_cache),
+            (None, Some(store)) => store.retain(guard.id(), history, final_cache),
+            (None, None) => {}
+        }
     }
 
     let stats = GenerateStats {
@@ -751,7 +784,7 @@ mod tests {
             max_tokens,
             stop_token_ids: vec![],
         };
-        run(model, tokenizer, None, prefix_cache, &guard, req, tx).unwrap();
+        run(model, tokenizer, None, prefix_cache, None, &guard, req, tx).unwrap();
         drain(rx)
     }
 
@@ -916,6 +949,7 @@ mod tests {
             slots: SlotPool::new(1),
             batch_coordinator: None,
             prefix_cache: None,
+            slot_store: None,
             role: crate::config::Role::default(),
         };
 
