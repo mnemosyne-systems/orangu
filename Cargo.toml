@@ -37,6 +37,7 @@ ignore = "0.4.30"
 markdown = "1.0.0"
 printpdf = { version = "0.11.3", default-features = false, features = ["text_layout"] }
 regex = "1.13"
+rustc-hash = "2.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 rust-fontconfig = "4.4.6"
 rustyline = "18.0.1"
@@ -97,6 +98,11 @@ tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
 wgpu = { version = "30.0.0", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl", "std"] }
+# Raw-Vulkan decode-submit path (persistent command-buffer reuse). Pinned to
+# the exact version wgpu-hal links so `ash::vk` handle types unify — a
+# mismatched major would make `Buffer::as_hal`'s `vk::Buffer` a different,
+# incompatible type. See engine/backend/vulkan_replay.rs.
+ash = "0.38"
 pollster = "1.0.1"
 bytemuck = { version = "1.25.1", features = ["derive"] }
 cudarc = { version = "0.19.8", features = ["cuda-12000"] }

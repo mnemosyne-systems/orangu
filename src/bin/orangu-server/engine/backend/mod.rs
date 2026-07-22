@@ -44,6 +44,7 @@ pub mod opencl;
 #[cfg(feature = "rocm")]
 pub mod rocm;
 pub mod vulkan;
+pub mod vulkan_replay;
 pub mod vulkan_shaders;
 
 pub use cpu::CpuBackend;

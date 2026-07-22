@@ -18,6 +18,21 @@
 //! is row-major: an `[n_rows, n_cols]` matrix is `n_rows` contiguous rows
 //! of `n_cols` elements, matching both ggml's own weight layout and how
 //! this project's `engine::loader` returns dequantized tensors.
+//!
+//! The elementwise ops here (`rmsnorm_inplace`, `add_inplace`, `mul_inplace`,
+//! `gelu_inplace`) parallelise across rows/elements with rayon **only above a
+//! work threshold** — the multi-token prefill path (`run_layers_cpu`) exercises
+//! them on `n_tokens × dim` buffers where the speedup is large, while the
+//! single-token decode / CPU-fallback case stays serial so it never pays
+//! rayon's task-dispatch overhead. The parallel and serial forms are
+//! bit-for-bit identical (each row/element is independent).
+
+use rayon::prelude::*;
+
+/// Row count at/above which `rmsnorm_inplace` parallelises across rows.
+const PAR_ROWS_THRESHOLD: usize = 32;
+/// Element count at/above which `add`/`mul`/`gelu`_inplace parallelise.
+const PAR_ELEMS_THRESHOLD: usize = 1 << 15;
 
 /// Dot product of two equal-length `f32` slices, auto-vectorized via
 /// AVX2+FMA where available (`RUSTFLAGS`-independent — checked once per
@@ -73,12 +88,17 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 pub fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], n_tokens: usize, dim: usize, eps: f32) {
     debug_assert_eq!(x.len(), n_tokens * dim);
     debug_assert_eq!(weight.len(), dim);
-    for row in x.chunks_mut(dim) {
+    let norm_row = |row: &mut [f32]| {
         let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
         let scale = 1.0 / (mean_sq + eps).sqrt();
         for (v, w) in row.iter_mut().zip(weight.iter()) {
             *v = *v * scale * w;
         }
+    };
+    if n_tokens >= PAR_ROWS_THRESHOLD {
+        x.par_chunks_mut(dim).for_each(norm_row);
+    } else {
+        x.chunks_mut(dim).for_each(norm_row);
     }
 }
 
@@ -199,16 +219,42 @@ pub fn add_bias_per_row(x: &mut [f32], bias: &[f32], n_rows: usize) {
 /// Elementwise `a[i] += b[i]`.
 pub fn add_inplace(a: &mut [f32], b: &[f32]) {
     debug_assert_eq!(a.len(), b.len());
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x += y;
+    if a.len() >= PAR_ELEMS_THRESHOLD {
+        a.par_iter_mut()
+            .zip(b.par_iter())
+            .for_each(|(x, y)| *x += y);
+    } else {
+        for (x, y) in a.iter_mut().zip(b.iter()) {
+            *x += y;
+        }
     }
 }
 
 /// Elementwise `a[i] *= b[i]`.
 pub fn mul_inplace(a: &mut [f32], b: &[f32]) {
     debug_assert_eq!(a.len(), b.len());
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x *= y;
+    if a.len() >= PAR_ELEMS_THRESHOLD {
+        a.par_iter_mut()
+            .zip(b.par_iter())
+            .for_each(|(x, y)| *x *= y);
+    } else {
+        for (x, y) in a.iter_mut().zip(b.iter()) {
+            *x *= y;
+        }
+    }
+}
+
+/// Elementwise in-place GELU (tanh approximation) — the FFN gate activation.
+/// Parallelised above `PAR_ELEMS_THRESHOLD` (prefill applies it to the whole
+/// `n_tokens × ffn_len` gate buffer, the single largest CPU-elementwise cost
+/// there — each element an independent transcendental).
+pub fn gelu_inplace(x: &mut [f32]) {
+    if x.len() >= PAR_ELEMS_THRESHOLD {
+        x.par_iter_mut().for_each(|v| *v = gelu(*v));
+    } else {
+        for v in x.iter_mut() {
+            *v = gelu(*v);
+        }
     }
 }
 

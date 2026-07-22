@@ -237,6 +237,12 @@ pub struct CompletionsRequest {
     temperature: Option<f32>,
     #[serde(default)]
     stream: bool,
+    /// Keep generating to `max_tokens` even if the model emits EOS (llama.cpp's
+    /// field name). Used by benchmarks (`orangu-bench --depths`, `llama-bench
+    /// -d`) to time a fixed number of decode steps at a given context depth
+    /// regardless of what the model would otherwise stop on.
+    #[serde(default)]
+    ignore_eos: bool,
 }
 
 pub async fn completions(
@@ -259,7 +265,13 @@ pub async fn completions(
         sampling.temperature = v;
     }
     let max_tokens = req.max_tokens.unwrap_or(256);
-    let stop_token_ids = state.engine.tokenizer.eos_token.into_iter().collect();
+    // `ignore_eos` drops the EOS stop token so generation runs the full
+    // `max_tokens` — the "measure decode, not content" contract benchmarks need.
+    let stop_token_ids: Vec<u32> = if req.ignore_eos {
+        Vec::new()
+    } else {
+        state.engine.tokenizer.eos_token.into_iter().collect()
+    };
     let created = unix_now();
     let model = state.model_label.clone();
 

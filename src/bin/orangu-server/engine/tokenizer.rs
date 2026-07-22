@@ -58,7 +58,15 @@
 use anyhow::{Context, Result, anyhow};
 use orangu::gguf::{GgufFile, GgufValue};
 use regex::Regex;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+/// Sentinel id for a BPE symbol whose string isn't a vocab token (byte-fallback
+/// candidate). `u32::MAX` can't collide with a real token id (vocabs are far
+/// smaller), and never appears as a `merge_map` key, so a sentinel never merges.
+const NO_TOKEN: u32 = u32::MAX;
 
 /// GPT-2's own pre-tokenizer split pattern: contractions, then runs of
 /// letters/digits/other-non-space (each optionally preceded by one space,
@@ -78,13 +86,19 @@ const SPM_SPACE: char = '\u{2581}';
 
 pub struct Tokenizer {
     /// Byte-mapped-unicode (`VocabKind::Gpt2Byte`) or raw-UTF-8 (every other
-    /// `VocabKind`) token string -> id.
-    token_to_id: HashMap<String, u32>,
+    /// `VocabKind`) token string -> id. `FxHashMap`: the fixed vocab
+    /// needs no HashDoS resistance, so the stdlib's SipHash default was pure
+    /// overhead in the tokenizer hot loop.
+    token_to_id: FxHashMap<String, u32>,
     id_to_token: Vec<String>,
-    /// `(left, right)` -> merge rank; lower merges first.
-    merge_ranks: HashMap<(String, String), usize>,
+    /// **Interned** merge table: `(left_id, right_id) -> (rank,
+    /// merged_id)`. Keyed by the two operand token *ids*, not their strings, so
+    /// the BPE merge loop looks merges up with an 8-byte integer key and never
+    /// allocates/hashes a `String` — and the merged token id is stored inline,
+    /// so a merge needs no `format!`+lookup either. Lower rank merges first.
+    merge_map: FxHashMap<(u32, u32), (u32, u32)>,
     byte_to_char: [char; 256],
-    char_to_byte: HashMap<char, u8>,
+    char_to_byte: FxHashMap<char, u8>,
     split_re: Regex,
     /// Control/special tokens (`tokenizer.ggml.token_type` == `CONTROL`),
     /// longest-string-first, so a literal occurrence in text (e.g. a chat
@@ -116,7 +130,7 @@ pub struct Tokenizer {
     /// (`tokenizer.ggml.token_type == BYTE`). Only populated for a non-
     /// `Gpt2Byte` vocab — a byte-encoded vocab already represents every
     /// byte through its ordinary byte-to-unicode alphabet instead.
-    byte_fallback: HashMap<u32, u8>,
+    byte_fallback: FxHashMap<u32, u8>,
     /// `tokenizer.ggml.scores` — `VocabKind::SpmUnigram`'s per-token merge
     /// priority (see [`Tokenizer::spm_merge_symbols`]). Empty for every
     /// other vocab kind.
@@ -153,6 +167,81 @@ enum VocabKind {
 const TOKEN_TYPE_CONTROL: i64 = 3;
 const TOKEN_TYPE_BYTE: i64 = 6;
 
+/// Reusable per-thread working set for [`Tokenizer::bpe_merge_word`]:
+/// the symbol linked-list columns and the bigram heap. Held in a thread-local
+/// and `reset` (not reallocated) per word, so a hot tokenize loop mallocs
+/// nothing after the first large word — it only re-`memset`s the reused
+/// capacity. Struct-of-arrays (parallel `Vec`s indexed by node) so each column
+/// stays contiguous.
+/// A heap entry: `Reverse<(rank, left, right, merged_id, size)>`, so a max-heap
+/// pops the lowest `(rank, left)` — lowest merge rank first, leftmost symbol on
+/// ties (matching the old rescan and llama.cpp's comparator). `right`,
+/// `merged_id` and `size` (the combined unit length when the bigram was pushed,
+/// for the staleness check) are payload that never affects ordering, since among
+/// *valid* bigrams `(rank, left)` is already unique.
+type Bigram = Reverse<(u32, u32, u32, u32, u32)>;
+
+#[derive(Default)]
+struct BpeScratch {
+    /// Current token id of node `i` (`NO_TOKEN` = not a vocab token / sentinel).
+    id: Vec<u32>,
+    /// Byte offset + length of node `i`'s span in the word — used only to
+    /// byte-fallback a surviving sentinel (always exactly one initial symbol).
+    span_start: Vec<u32>,
+    span_len: Vec<u32>,
+    /// Node `i`'s length in *initial-symbol units*; `0` marks a merged-away
+    /// (dead) node, for the O(1) staleness check on popped bigrams.
+    units: Vec<u32>,
+    prev: Vec<i32>,
+    next: Vec<i32>,
+    heap: BinaryHeap<Bigram>,
+}
+
+impl BpeScratch {
+    fn reset(&mut self) {
+        self.id.clear();
+        self.span_start.clear();
+        self.span_len.clear();
+        self.units.clear();
+        self.prev.clear();
+        self.next.clear();
+        self.heap.clear();
+    }
+
+    /// Appends one symbol node; `prev`/`next` are set to the adjacent indices
+    /// (the final node's `next` is fixed to `-1` by the caller).
+    fn push_node(&mut self, id: u32, start: u32, len: u32) {
+        let i = self.id.len() as i32;
+        self.id.push(id);
+        self.span_start.push(start);
+        self.span_len.push(len);
+        self.units.push(1);
+        self.prev.push(i - 1);
+        self.next.push(i + 1);
+    }
+
+    fn try_push_bigram(
+        &mut self,
+        merge_map: &FxHashMap<(u32, u32), (u32, u32)>,
+        l: usize,
+        r: usize,
+    ) {
+        let (il, ir) = (self.id[l], self.id[r]);
+        if il == NO_TOKEN || ir == NO_TOKEN {
+            return;
+        }
+        if let Some(&(rank, merged)) = merge_map.get(&(il, ir)) {
+            let size = self.units[l] + self.units[r];
+            self.heap
+                .push(Reverse((rank, l as u32, r as u32, merged, size)));
+        }
+    }
+}
+
+thread_local! {
+    static BPE_SCRATCH: RefCell<BpeScratch> = RefCell::new(BpeScratch::default());
+}
+
 impl Tokenizer {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let tokens = string_array(gguf, "tokenizer.ggml.tokens")
@@ -168,21 +257,38 @@ impl Tokenizer {
         let add_space_prefix =
             metadata_u32(gguf, "tokenizer.ggml.add_space_prefix").is_none_or(|v| v != 0);
 
-        let mut token_to_id = HashMap::with_capacity(tokens.len());
+        let mut token_to_id: FxHashMap<String, u32> =
+            FxHashMap::with_capacity_and_hasher(tokens.len(), Default::default());
         for (id, tok) in tokens.iter().enumerate() {
             token_to_id.insert(tok.clone(), id as u32);
         }
 
-        let mut merge_ranks = HashMap::with_capacity(merges.len());
+        // Intern the merge table to integer keys once, at load time.
+        // Any `String` concatenation here is one-time setup, never the hot loop:
+        // for each merge `(left, right)` at `rank`, resolve both operands and the
+        // merged token `left+right` to ids and store `(l,r) -> (rank, merged)`.
+        // Merges whose operands or result aren't vocab tokens (never true for a
+        // well-formed BPE table) are dropped — they could never fire correctly.
+        let mut merge_map: FxHashMap<(u32, u32), (u32, u32)> =
+            FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
+        let mut merged_buf = String::new();
         for (rank, merge) in merges.iter().enumerate() {
             let Some((left, right)) = split_merge(merge) else {
                 continue;
             };
-            merge_ranks.insert((left.to_string(), right.to_string()), rank);
+            let (Some(&l), Some(&r)) = (token_to_id.get(left), token_to_id.get(right)) else {
+                continue;
+            };
+            merged_buf.clear();
+            merged_buf.push_str(left);
+            merged_buf.push_str(right);
+            if let Some(&m) = token_to_id.get(&merged_buf) {
+                merge_map.insert((l, r), (rank as u32, m));
+            }
         }
 
         let byte_to_char = byte_to_unicode_table();
-        let char_to_byte = byte_to_char
+        let char_to_byte: FxHashMap<char, u8> = byte_to_char
             .iter()
             .enumerate()
             .map(|(b, &c)| (c, b as u8))
@@ -203,7 +309,7 @@ impl Tokenizer {
             .collect();
         special_tokens.sort_by_key(|(tok, _)| std::cmp::Reverse(tok.len()));
 
-        let mut byte_fallback = HashMap::new();
+        let mut byte_fallback: FxHashMap<u32, u8> = FxHashMap::default();
         if vocab_kind != VocabKind::Gpt2Byte {
             for (id, &ty) in token_types.iter().enumerate() {
                 if ty == TOKEN_TYPE_BYTE
@@ -218,7 +324,7 @@ impl Tokenizer {
         Ok(Self {
             token_to_id,
             id_to_token: tokens,
-            merge_ranks,
+            merge_map,
             byte_to_char,
             char_to_byte,
             split_re: Regex::new(SPLIT_PATTERN).context("building tokenizer split regex")?,
@@ -292,23 +398,7 @@ impl Tokenizer {
 
     fn encode_plain_byte(&self, text: &str, ids: &mut Vec<u32>) {
         for word_match in self.split_re.find_iter(text) {
-            let word = word_match.as_str();
-            let symbols = self.bpe_merge_byte(word);
-            for symbol in symbols {
-                match self.token_to_id.get(&symbol) {
-                    Some(&id) => ids.push(id),
-                    // A symbol with no vocab entry (shouldn't happen for a
-                    // byte-level vocab, which always has all 256 single
-                    // bytes) falls back to its individual mapped bytes.
-                    None => {
-                        for ch in symbol.chars() {
-                            if let Some(&id) = self.token_to_id.get(&ch.to_string()) {
-                                ids.push(id);
-                            }
-                        }
-                    }
-                }
-            }
+            self.bpe_merge_word(word_match.as_str(), false, ids);
         }
     }
 
@@ -331,23 +421,7 @@ impl Tokenizer {
                 ids.push(id);
                 continue;
             }
-            let symbols = self.bpe_merge_raw(word);
-            for symbol in symbols {
-                match self.token_to_id.get(&symbol) {
-                    Some(&id) => ids.push(id),
-                    // Non-byte-encoded BPE represents an unmatched symbol's
-                    // raw bytes via `<0xXX>`-format fallback tokens rather
-                    // than a byte-to-unicode alphabet.
-                    None => {
-                        for byte in symbol.bytes() {
-                            if let Some(&id) = self.token_to_id.get(&byte_fallback_token_name(byte))
-                            {
-                                ids.push(id);
-                            }
-                        }
-                    }
-                }
-            }
+            self.bpe_merge_word(word, true, ids);
         }
     }
 
@@ -493,51 +567,114 @@ impl Tokenizer {
         self.id_to_token.get(id as usize).map(String::as_str)
     }
 
-    /// Standard GPT-2 BPE: map `word`'s bytes to the byte-unicode alphabet,
-    /// then run [`Tokenizer::merge_symbols`].
-    fn bpe_merge_byte(&self, word: &str) -> Vec<String> {
-        let symbols: Vec<String> = word
-            .bytes()
-            .map(|b| self.byte_to_char[b as usize].to_string())
-            .collect();
-        self.merge_symbols(symbols)
-    }
+    /// Merge-rank BPE for one pre-tokenizer `word`, appending token ids to
+    /// `out` (the rewrite of the old `merge_symbols`/`bpe_merge_*`).
+    /// `raw` picks the initial alphabet: raw UTF-8 codepoints (`"gemma4"`) vs.
+    /// the byte-to-unicode alphabet (GPT-2). The algorithm is llama.cpp's
+    /// `llm_tokenizer_bpe` — a doubly-linked list of symbols plus a bigram
+    /// min-heap keyed `(rank, left)`, so each merge is O(1) (relink) and each
+    /// next-merge selection is O(log n): **O(n log n)** per word, versus the old
+    /// O(n²) rescan-plus-`Vec::splice`. Every symbol is its token *id* (interned
+    /// via `merge_map`), so the hot loop clones/hashes/`format!`s no `String`
+    /// at all, and all working state lives in a reused thread-local
+    /// [`BpeScratch`] — after the first large word the loop allocates nothing.
+    fn bpe_merge_word(&self, word: &str, raw: bool, out: &mut Vec<u32>) {
+        BPE_SCRATCH.with(|scratch| {
+            let s = &mut *scratch.borrow_mut();
+            s.reset();
+            let bytes = word.as_bytes();
+            let mut utf8 = [0u8; 4];
 
-    /// The `"gemma4"`-vocab BPE variant: `word`'s raw UTF-8 codepoints are
-    /// the initial symbols (no byte-to-unicode alphabet), then run
-    /// [`Tokenizer::merge_symbols`] — the merge algorithm itself is
-    /// identical either way, only the starting alphabet differs.
-    fn bpe_merge_raw(&self, word: &str) -> Vec<String> {
-        let symbols: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-        self.merge_symbols(symbols)
-    }
-
-    /// Repeatedly merges the lowest-rank adjacent pair of `symbols` until
-    /// none of the remaining pairs have a merge rule — the one merge
-    /// algorithm shared by both vocab shapes; only the initial symbol
-    /// alphabet differs between [`Tokenizer::bpe_merge_byte`] and
-    /// [`Tokenizer::bpe_merge_raw`].
-    fn merge_symbols(&self, mut symbols: Vec<String>) -> Vec<String> {
-        if symbols.len() < 2 {
-            return symbols;
-        }
-
-        loop {
-            let mut best: Option<(usize, usize)> = None; // (rank, pair index)
-            for i in 0..symbols.len() - 1 {
-                if let Some(&rank) = self
-                    .merge_ranks
-                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
-                    && best.is_none_or(|(best_rank, _)| rank < best_rank)
-                {
-                    best = Some((rank, i));
+            // 1. Initial symbols → nodes, resolving each to its token id (or
+            //    `NO_TOKEN`) with an allocation-free lookup (a `&str` slice of
+            //    `word` for raw, a stack `encode_utf8` buffer for the byte map).
+            if raw {
+                for (start, ch) in word.char_indices() {
+                    let clen = ch.len_utf8();
+                    let id = self
+                        .token_to_id
+                        .get(&word[start..start + clen])
+                        .copied()
+                        .unwrap_or(NO_TOKEN);
+                    s.push_node(id, start as u32, clen as u32);
+                }
+            } else {
+                for (i, &b) in bytes.iter().enumerate() {
+                    let sub = self.byte_to_char[b as usize].encode_utf8(&mut utf8);
+                    let id = self.token_to_id.get(sub).copied().unwrap_or(NO_TOKEN);
+                    s.push_node(id, i as u32, 1);
                 }
             }
-            let Some((_, i)) = best else { break };
-            let merged = format!("{}{}", symbols[i], symbols[i + 1]);
-            symbols.splice(i..=i + 1, [merged]);
-        }
-        symbols
+            let n = s.id.len();
+            if n == 0 {
+                return;
+            }
+            s.next[n - 1] = -1;
+
+            // 2. Seed the heap with every adjacent bigram present in `merge_map`.
+            for l in 0..n - 1 {
+                s.try_push_bigram(&self.merge_map, l, l + 1);
+            }
+
+            // 3. Pop the lowest (rank, left) valid bigram, merge, push the two
+            //    new neighbouring bigrams. Stale entries (a symbol has since
+            //    merged, so the stored `size` no longer matches) are skipped.
+            while let Some(Reverse((_rank, l, r, merged, size))) = s.heap.pop() {
+                let (l, r) = (l as usize, r as usize);
+                if s.units[l] == 0
+                    || s.units[r] == 0
+                    || s.next[l] != r as i32
+                    || s.units[l] + s.units[r] != size
+                {
+                    continue;
+                }
+                s.id[l] = merged;
+                s.units[l] += s.units[r];
+                s.units[r] = 0;
+                s.next[l] = s.next[r];
+                if s.next[r] >= 0 {
+                    s.prev[s.next[r] as usize] = l as i32;
+                }
+                if s.prev[l] >= 0 {
+                    let p = s.prev[l] as usize;
+                    s.try_push_bigram(&self.merge_map, p, l);
+                }
+                if s.next[l] >= 0 {
+                    let nx = s.next[l] as usize;
+                    s.try_push_bigram(&self.merge_map, l, nx);
+                }
+            }
+
+            // 4. Walk the surviving list (node 0 is always the head — the
+            //    leftmost symbol is never the *right* of any merge) and emit.
+            //    A `NO_TOKEN` symbol never merged, so it's a single initial
+            //    symbol: byte-fallback it exactly as the old code did.
+            let mut cur = 0i32;
+            while cur >= 0 {
+                let c = cur as usize;
+                if s.id[c] != NO_TOKEN {
+                    out.push(s.id[c]);
+                } else {
+                    let st = s.span_start[c] as usize;
+                    let ln = s.span_len[c] as usize;
+                    if raw {
+                        for &b in &bytes[st..st + ln] {
+                            if let Some(&id) =
+                                self.token_to_id.get(byte_fallback_token_name(b).as_str())
+                            {
+                                out.push(id);
+                            }
+                        }
+                    } else {
+                        let sub = self.byte_to_char[bytes[st] as usize].encode_utf8(&mut utf8);
+                        if let Some(&id) = self.token_to_id.get(sub) {
+                            out.push(id);
+                        }
+                    }
+                }
+                cur = s.next[c];
+            }
+        });
     }
 
     /// `VocabKind::SpmUnigram`'s merge algorithm — real upstream
@@ -1298,6 +1435,68 @@ mod tests {
                 5562,
                 tok.eos_token.unwrap()
             ]
+        );
+    }
+
+    /// Isolated tokenizer throughput on the *real* E2B vocab (256K
+    /// tokens, real merge table), timing the `bpe_merge_word` BPE hot loop.
+    /// Prints tokens/s and
+    /// MB/s over 10 samples. `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B-it-Q4_K_M
+    /// .gguf cargo test --profile release-with-debug --bin orangu-server
+    /// bench_tokenizer_encode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_tokenizer_encode_throughput() {
+        let path = std::env::var("ORANGU_TEST_MODEL").unwrap_or_else(|_| {
+            "/mnt/ai/jews/llama.cpp/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/\
+             0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf"
+                .to_string()
+        });
+        let Ok(gguf) = GgufFile::open(std::path::Path::new(&path)) else {
+            eprintln!("skipping: set ORANGU_TEST_MODEL to a gemma4 gguf");
+            return;
+        };
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let para = "The history of computing spans many centuries, from early mechanical \
+            calculators through the invention of the transistor, the integrated circuit, and \
+            the modern microprocessor. Each advance built upon the last, enabling faster and \
+            more capable machines that reshaped science, industry, and daily life. ";
+        // One long paragraph with no newline = one BPE "word", which is the
+        // O(n²)-per-word case the merge loop is pathological on. `repeat(6)` (~1.7K
+        // chars) keeps the current O(n²) baseline tractable; the fix should scale
+        // far better as this grows. Set ORANGU_TEST_REPEAT to sweep the length.
+        let reps: usize = std::env::var("ORANGU_TEST_REPEAT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let text = para.repeat(reps);
+        let bytes = text.len();
+        let ids0 = tok.encode(&text, false);
+        let ntok = ids0.len();
+        // Fingerprint the id sequence so a before/after run proves byte-identical
+        // tokenization across the rewrite.
+        let fp = ids0.iter().fold(1469598103934665603u64, |h, &i| {
+            (h ^ i as u64).wrapping_mul(1099511628211)
+        });
+        eprintln!(
+            "orangu-server: [bench] input: {bytes} bytes, one word, reps={reps}, id-fp={fp:016x}"
+        );
+        let mut samples = Vec::new();
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            let ids = tok.encode(&text, false);
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&ids);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = samples[samples.len() / 2];
+        eprintln!(
+            "orangu-server: [bench] tokenizer encode: {ntok} tokens / {bytes} bytes — \
+             min={:.3}ms median={:.3}ms => {:.1} Ktok/s ({:.1} MB/s)",
+            samples[0],
+            med,
+            ntok as f64 / (med / 1000.0) / 1000.0,
+            bytes as f64 / (med / 1000.0) / 1e6,
         );
     }
 }

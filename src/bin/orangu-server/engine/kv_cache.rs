@@ -88,9 +88,9 @@ struct GpuLayerCache {
     /// One backing buffer holding this layer's key and value regions as
     /// aligned sub-ranges — a single BO instead of two. On a per-token decode
     /// submission the kernel re-validates and VM-maps every referenced BO
-    /// (~25% of decode CPU; see `doc/SERVER_ROADMAP.md` Step 24), so merging
-    /// k+v → 1 BO/layer shrinks that per-submit BO list by ~35 entries across
-    /// a 35-layer model. Bind groups bind the *sub-ranges* (`k`/`v`), which
+    /// (a significant share of per-submit decode CPU), so merging k+v → 1
+    /// BO/layer shrinks that per-submit BO list by one entry per layer. Bind
+    /// groups bind the *sub-ranges* (`k`/`v`), which
     /// makes the attention shader's position index relative to each region's
     /// start — so only explicit copy/`write_buffer` destinations add the
     /// region base offset, never the shader. `probs_scratch` stays a separate
@@ -204,6 +204,12 @@ pub struct AttnSplitDispatch {
     pub split_meta_buf: wgpu::Buffer,
     pub reduce_bind_group: wgpu::BindGroup,
     pub reduce_meta_buf: wgpu::Buffer,
+    /// The phase-1 softmax partials (`partial_ml`, `partial_acc`) — bound by
+    /// both bind groups; exposed as named fields so the raw-Vulkan replay
+    /// capture can enumerate the exact buffers the attention dispatches bind.
+    /// Only read by the replay path.
+    pub partial_ml: wgpu::Buffer,
+    pub partial_acc: wgpu::Buffer,
 }
 
 /// One cached `f32 -> f16` cast dispatch (`VulkanBackend::kv_cast_pipeline`)

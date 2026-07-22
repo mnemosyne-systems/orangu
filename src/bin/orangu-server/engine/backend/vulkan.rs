@@ -46,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::vulkan_replay;
 use super::vulkan_shaders;
 use super::{Backend, MatmulOp};
 use crate::engine::loader::QuantMatrix;
@@ -109,16 +110,19 @@ struct Meta {
 
 /// `ElemMeta` in `vulkan_shaders::ELEM_META` — `#[repr(C)]` so its layout
 /// matches WGSL's `struct ElemMeta { len: u32, _pad0: u32, extra: f32,
-/// _pad1: u32 }` field-for-field. `extra` is `eps` for the RMSNorm pipeline,
-/// the multiplier for the scale pipeline, and unused (left `0.0`) for add/
-/// mul/gelu.
+/// out_scale: f32 }` field-for-field. `extra` is `eps` for the RMSNorm
+/// pipeline, the multiplier for the scale pipeline, and unused (left `0.0`) for
+/// add/mul/gelu. `out_scale` is `layer_output_scale` for the
+/// `rmsnorm_add_scale` pipeline only (see
+/// `vulkan_shaders::shader_source_rmsnorm_add_scale`); left `0.0` and unread by
+/// every other shader.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ElemMeta {
     len: u32,
     _pad0: u32,
     extra: f32,
-    _pad1: u32,
+    out_scale: f32,
 }
 
 /// `AttnMeta` in `vulkan_shaders::ATTENTION_SHADER` — `#[repr(C)]` so its
@@ -896,8 +900,8 @@ pub struct VulkanBackend {
     /// Backing store for every small per-op meta *uniform* buffer — packs
     /// them all offset-wise into one (or a few) large chunks instead of one
     /// BO per meta, so a decode submission's BO list — which the kernel
-    /// re-validates/VM-maps/sorts per submit (~25% of decode CPU, all
-    /// per-buffer work) — is hundreds of BOs shorter. Same bump-placement as
+    /// re-validates/VM-maps/sorts per submit (a large share of decode CPU,
+    /// all per-buffer work) — is hundreds of BOs shorter. Same bump-placement as
     /// `WeightArena`; see `Self::uniform_alloc`.
     uniform_arena: Mutex<ScratchArena>,
     /// The adapter's own description (the driver's GPU name string) — for
@@ -911,6 +915,9 @@ pub struct VulkanBackend {
     elem3_bind_group_layout: wgpu::BindGroupLayout,
     add_pipeline: wgpu::ComputePipeline,
     mul_pipeline: wgpu::ComputePipeline,
+    /// Fused GELU+multiply (`shader_source_gelu_mul`) — one dispatch replacing
+    /// `gelu_pipeline` then `mul_pipeline` on the FFN (and PLE) path.
+    gelu_mul_pipeline: wgpu::ComputePipeline,
     gelu_pipeline: wgpu::ComputePipeline,
     scale_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
@@ -923,6 +930,13 @@ pub struct VulkanBackend {
     /// (`Self::build_fused_resources`), replacing what were two separate
     /// dispatches (`rmsnorm_pipeline` then `add_pipeline`) with one.
     rmsnorm_add_pipeline: wgpu::ComputePipeline,
+    /// `rmsnorm_add_pipeline` with the trailing write multiplied by
+    /// `layer_output_scale` — see
+    /// `vulkan_shaders::shader_source_rmsnorm_add_scale`. Folds the separate
+    /// post-norm `scale_pipeline` dispatch into the norm+add, at the PLE
+    /// post-projection norm (`build_ple_resources`); gated by
+    /// `ORANGU_NO_FUSED_SCALE`.
+    rmsnorm_add_scale_pipeline: wgpu::ComputePipeline,
     /// Every buffer/bind group `fused_post_attention` needs *except* the
     /// three that genuinely change contents every call (`wo`'s own
     /// `x_buffer`, already covered by `op_cache`; the residual snapshot;
@@ -1128,10 +1142,12 @@ pub struct VulkanBackend {
     /// (single-subgroup) workgroup, halving the two-wave block-unroll's
     /// redundant weight streaming. `Some` when
     /// `wide_unroll` is on and neither `ORANGU_NO_DUAL_NIBBLE=1` nor
-    /// `ORANGU_PACKED_DOT=1` is set (**on by default** for `Q4_K` decode);
-    /// selected ahead of every other `Q4_K` reduce kernel in `pipeline_for`.
-    /// Still `REDUCE_N_ROWS`-batched, so `selects_wide_unroll`/
-    /// `build_op_resources`' dispatch count applies unchanged.
+    /// `ORANGU_PACKED_DOT=1` is set. Built by default, but now the **A/B
+    /// fallback** behind `q4_k_light_pipeline`: `pipeline_for` selects the light
+    /// kernel ahead of it, so this is only the live decode kernel when
+    /// `ORANGU_NO_Q4K_LIGHT=1`. Still `REDUCE_N_ROWS`-batched, so
+    /// `selects_wide_unroll`/`build_op_resources`' dispatch count applies
+    /// unchanged.
     q4_k_dual_pipeline: Option<wgpu::ComputePipeline>,
     /// The contiguous-mapping `Q4_K` decode kernel
     /// (`vulkan_shaders::shader_source_reduce_q4k_contig`) — each lane loads
@@ -1150,15 +1166,27 @@ pub struct VulkanBackend {
     /// llama.cpp's `mul_mat_vec_q4_k.comp`: 16 threads per super-block (two per
     /// 32-thread workgroup), each owning 16 nibbles from two packed `u32` `qs`
     /// reads and four `vec4` activation reads, keeping only the `n_rows`
-    /// accumulators live across the block loop. **Opt-in
-    /// (`ORANGU_Q4K_LIGHT=1`), `None` by default.** Aimed at register pressure /
-    /// occupancy (not load count), but measured *heavier* than the dual kernel
-    /// (56 vs 48 VGPRs — see `shader_source_reduce_q4k_light`), so it does not
-    /// help; kept for reference. Selected ahead of every other `Q4_K` reduce
-    /// kernel in `pipeline_for` when built. Reads `x` (binding 1) as
+    /// accumulators live across the block loop. **On by default** (`Some`
+    /// unless `ORANGU_NO_Q4K_LIGHT=1`); it is the default `Q4_K` decode kernel
+    /// and is selected ahead of every other `Q4_K` reduce kernel in
+    /// `pipeline_for` when built. Its mapping is faster than the dual kernel on
+    /// this backend despite a higher VGPR count — the earlier "does not help"
+    /// note was reached with the raw-Vulkan decode replay engaged, which pins
+    /// the dual kernel and masks this one. Reads `x` (binding 1) as
     /// `array<vec4<f32>>` — the shared matmul bind group is unchanged.
     /// Same `REDUCE_N_ROWS`-batched dispatch as the dual kernel.
     q4_k_light_pipeline: Option<wgpu::ComputePipeline>,
+    /// The **glslc-compiled** `Q4_K` decode kernel
+    /// (`backend/shaders/q4k_gemv.comp` → SPIR-V), a line-for-line twin of the
+    /// light WGSL kernel loaded via `create_shader_module_passthrough` so RADV
+    /// gets glslc's SPIR-V directly, bypassing naga's WGSL codegen. Same
+    /// 6-binding matmul layout, `Meta`, 144-byte block layout, dispatch grid and
+    /// 32-wide shared-memory reduction as the light kernel. `Some` only when
+    /// `ORANGU_Q4K_GLSL=1`, the adapter has `PASSTHROUGH_SHADERS`, and
+    /// `reduce_n_rows() == 2` (the shader fixes n_rows = 2). Selected ahead of
+    /// every WGSL `Q4_K` reduce kernel in `pipeline_for` when built. Isolates
+    /// the SPIR-V producer as the variable behind the decode gap vs llama.
+    q4_k_glsl_pipeline: Option<wgpu::ComputePipeline>,
     /// The dual `Q6_K` decode kernel
     /// (`vulkan_shaders::shader_source_reduce_q6k_dual`) — loads each `qh`
     /// byte once in a 32-thread (single-subgroup) workgroup instead of the
@@ -1214,8 +1242,14 @@ pub struct VulkanBackend {
     /// query positions sat in the reduce path's linear-in-`n_tokens` cost even
     /// though the tile would amortize the weight read across them.
     coop_min_n_tokens: usize,
+    /// Adapter subgroup support — the dual-nibble `Q4_K`/`Q6_K` reduce kernels
+    /// are built with `subgroupAdd` whenever this is true (an unconditional win
+    /// for them, unlike the 64-thread kernels `subgroup_reduce` gates). Stored
+    /// so the raw-Vulkan replay capture can rebuild the *same* matmul WGSL
+    /// `pipeline_for` selected.
+    supports_subgroup: bool,
     /// Thin-tile multi-position reduce kernel enabled (`ORANGU_THIN_TILE`) —
-    /// the Step-13 lever: for `2 ≤ n_tokens < coop_min_n_tokens`, serve the
+    /// for `2 ≤ n_tokens < coop_min_n_tokens`, serve the
     /// matmul with `thin_tile_pipelines` (dequant amortized `thin_tile_size`-
     /// way across a token tile while keeping the reduce path's high workgroup
     /// count) instead of the per-token reduce kernel. Opt-in so it's a clean
@@ -1302,6 +1336,25 @@ pub struct VulkanBackend {
     /// per query-head workgroup — byte-identical output, but trades workgroup
     /// count / occupancy for KV-read reuse (measure it).
     attn_gqa: bool,
+    /// Whether `attn_split_pipeline_for` builds the **cooperative-reduction**
+    /// split-k phase-1 kernel (`shader_source_attention_split_coop`): a 32-lane
+    /// subgroup splits each KV position's `head_dim` dot across its lanes
+    /// (coalesced K/V reads, `subgroupAdd` score, no per-tile barrier), instead
+    /// of one thread running the whole serial dot. **Opt-in
+    /// (`ORANGU_ATTN_COOP=1`), needs subgroup support and `head_dim % 32 == 0`.**
+    /// Not byte-identical (subgroup reduces the dot in a different order) —
+    /// An attempt at the long-context attention lever.
+    attn_coop: bool,
+    /// Effective decode-attention split-k factor (phase-1's `(n_head, k_num, 1)`
+    /// grid + the partial-`(m,l,acc)` buffer sizes + phase-2's merge count).
+    /// Resolved once at build time from `ORANGU_ATTN_SPLIT_K` else a coop-aware
+    /// default (32 for coop, `ATTN_SPLIT_K_DEFAULT` otherwise). See
+    /// `ATTN_SPLIT_K_DEFAULT`. This is the *cap*; `adaptive_split_k` may use
+    /// fewer at short KV ranges unless `attn_split_k_pinned`.
+    attn_split_k: u32,
+    /// Whether `ORANGU_ATTN_SPLIT_K` explicitly pinned `attn_split_k` — when so,
+    /// `adaptive_split_k` returns it verbatim (no per-token adaptation).
+    attn_split_k_pinned: bool,
     /// Whether `GemmaModel::record_decode_forward` should write per-layer
     /// GPU timestamps — see `Self::try_init`'s own construction-site
     /// comment for why this needs both `TIMESTAMP_QUERY` and
@@ -1316,6 +1369,23 @@ pub struct VulkanBackend {
     /// model, so the layer count this needs to be sized to never changes
     /// after the first call.
     timestamps: Mutex<Option<TimestampQueries>>,
+}
+
+thread_local! {
+    /// Per-thread capture sink for the raw-Vulkan decode-replay path.
+    /// When `Some`, the fused decode recording pushes a
+    /// [`vulkan_replay::CaptureStep`] for every dispatch/copy it records
+    /// (reading the same buffers it binds), so the replay graph is built from
+    /// orangu's *real* recording rather than a hand-reassembled op-list.
+    ///
+    /// Thread-local, not a backend field: one shared `VulkanBackend` serves
+    /// many concurrently-decoding sequences (and, in tests, many parallel
+    /// cases), so a global sink would interleave unrelated dispatches. Each
+    /// decode thread captures its own forward. `None` (the default) means no
+    /// capture — the check is a cheap thread-local borrow, no lock, so the
+    /// normal wgpu path pays effectively nothing.
+    static DECODE_CAPTURE: std::cell::RefCell<Option<Vec<vulkan_replay::CaptureStep>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The query set + resolve/readback buffers `Self::timestamp_query_set`
@@ -1428,6 +1498,17 @@ struct CachedOpResources {
     readback_buffer: Option<wgpu::Buffer>,
     output_len: u64,
     workgroups: (u32, u32, u32),
+    /// The `Meta` uniform (dims, `row_bytes`) bound at binding 3 — a
+    /// `uniform_arena` sub-range, write-once. Kept as named fields (the bind
+    /// group already holds it alive) so the raw-Vulkan replay capture can
+    /// enumerate the exact uniform this matmul binds. Only read by the replay
+    /// path.
+    #[allow(dead_code)]
+    meta_chunk: wgpu::Buffer,
+    #[allow(dead_code)]
+    meta_offset: u64,
+    #[allow(dead_code)]
+    meta_size: u64,
     /// MMVQ (integer-dot) resources for this op, built when
     /// `VulkanBackend::q4_k_mmvq` is on and the op is a `Q4_K` matmul with
     /// contraction dim ≥ 2048. When present, `record_matmul` runs the
@@ -1510,6 +1591,11 @@ const MAX_MATMUL_TOKENS_PER_SUBMISSION: usize = 128;
 /// `ORANGU_REDUCE_N_ROWS`.
 const REDUCE_N_ROWS_DEFAULT: usize = 2;
 
+/// glslc-compiled SPIR-V for the `Q4_K` GEMV kernel
+/// (`backend/shaders/q4k_gemv.comp`). Regenerate after editing the `.comp`:
+/// `glslc -fshader-stage=comp -O --target-env=vulkan1.1 q4k_gemv.comp -o q4k_gemv.spv`.
+static Q4K_GLSL_GEMV_SPIRV: &[u8] = include_bytes!("shaders/q4k_gemv.spv");
+
 /// Output rows one decode matmul-vec workgroup computes — see
 /// `REDUCE_N_ROWS_DEFAULT`. Read once from `ORANGU_REDUCE_N_ROWS` (clamped
 /// `1..=16`) so the same value drives both pipeline creation and the
@@ -1553,22 +1639,12 @@ fn norm_wg() -> usize {
 /// KV range is short). Env-tunable via `ORANGU_ATTN_SPLIT_K`.
 const ATTN_SPLIT_K_DEFAULT: u32 = 8;
 
-/// Split-k factor for decode attention (`ORANGU_ATTN_SPLIT_K`; see
-/// `ATTN_SPLIT_K_DEFAULT`). Read once, cached, clamped to a power of two in
-/// `1..=32`. `k_num` is a pure runtime uniform (`AttnSplitMeta.k_num`) plus
-/// a dispatch/scratch-buffer dimension — no shader rebuild — so it drives
-/// phase-1's `(n_head, k_num, 1)` grid, the per-head partial-`(m,l,acc)`
-/// buffer sizes, and phase-2's merge count together.
-fn attn_split_k() -> u32 {
-    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        std::env::var("ORANGU_ATTN_SPLIT_K")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32))
-            .unwrap_or(ATTN_SPLIT_K_DEFAULT)
-    })
-}
+// The effective split-k factor is resolved once at build time into
+// `VulkanBackend::attn_split_k` (`ORANGU_ATTN_SPLIT_K` else a coop-aware
+// default) — `k_num` is a pure runtime uniform (`AttnSplitMeta.k_num`) plus a
+// dispatch/scratch-buffer dimension (no shader rebuild), so it drives phase-1's
+// `(n_head, k_num, 1)` grid, the per-head partial-`(m,l,acc)` buffer sizes, and
+// phase-2's merge count together.
 
 /// Whether the decode-path GPU-readback wait spins (`ORANGU_BUSY_POLL`)
 /// instead of blocking. The blocking wait (`PollType::wait_indefinitely()`)
@@ -1590,7 +1666,7 @@ fn busy_poll() -> bool {
 /// startup, then continues normally. A profiling aid: the driver's own
 /// `RADV_DEBUG=shaders` dumps these kernels' compiled ISA on this GPU, and
 /// the WGSL can also be handed to an offline analyzer (e.g. Radeon GPU
-/// Analyzer, which targets RDNA3+) for register/occupancy analysis. `head_
+/// Analyzer) for register/occupancy analysis. `head_
 /// dim` for the attention kernels isn't known this early, so they're dumped
 /// at a representative width noted in the filename. Best-effort — any I/O
 /// error is logged and skipped, never fatal.
@@ -1766,8 +1842,8 @@ impl VulkanBackend {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(COOP_MIN_N_TOKENS);
-        // Thin-tile multi-position reduce kernel (see `Self::thin_tile` /
-        // `doc/SERVER_ROADMAP.md` Step 13). Opt-in; tile width from
+        // Thin-tile multi-position reduce kernel (see `Self::thin_tile`).
+        // Opt-in; tile width from
         // `ORANGU_THIN_TILE_SIZE` (default 8, clamped to `2..=16` so the
         // `n_rows * tile` shared-memory partials and register pressure stay
         // bounded).
@@ -1781,7 +1857,7 @@ impl VulkanBackend {
         // amortizing the (K-quant-expensive) `dequant_element` across the
         // token tile outweighs its tree-reduce combine and lower token-tile
         // workgroup count. Measured on E2B (`n_tokens=15` prefill): a clear
-        // win on `ffn_down` (`in_dim=6144`, −16%) but a loss on the
+        // win on `ffn_down` (`in_dim=6144`) but a loss on the
         // `in_dim ≤ 4096` matmuls (`gate_up`/`qkv`/`wo`). So it is gated on
         // `in_dim >= thin_tile_min_k` (default 5120, between `wo`'s 4096 and
         // `ffn_down`'s 6144); `ORANGU_THIN_TILE_MIN_K` tunes the crossover.
@@ -1868,6 +1944,25 @@ impl VulkanBackend {
         // left for any call site to branch on afterward.
         let supports_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         let subgroup_reduce = supports_subgroup && std::env::var_os("ORANGU_SUBGROUP").is_some();
+        // See `Self::attn_coop`. Cooperative-reduction (subgroup-parallel head_dim)
+        // attention — **on by default** when subgroups are supported (opt out with
+        // `ORANGU_NO_ATTN_COOP`). Falls back to the classic split kernel per-layer
+        // when `head_dim % 32 != 0`. The large long-context decode win.
+        let attn_coop = supports_subgroup && std::env::var_os("ORANGU_NO_ATTN_COOP").is_none();
+        // Effective decode-attention split-k. An explicit `ORANGU_ATTN_SPLIT_K`
+        // always wins; otherwise the cooperative kernel — serial over positions
+        // per split — wants more splits than the classic kernel to shorten that
+        // serial chain (measured sweet spot ~32 at ctx 512–2048), while the
+        // classic kernel stays at its own default.
+        let attn_split_k_override = std::env::var("ORANGU_ATTN_SPLIT_K")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32));
+        // An explicit override pins `k_num` (no per-token adaptation); otherwise
+        // the cap is coop-aware and `adaptive_split_k` tunes down at short KV.
+        let attn_split_k_pinned = attn_split_k_override.is_some();
+        let attn_split_k =
+            attn_split_k_override.unwrap_or(if attn_coop { 32 } else { ATTN_SPLIT_K_DEFAULT });
         dump_shaders_if_requested(subgroup_reduce, kv_storage);
         // Per-layer GPU timestamps for one decode step (`Self::
         // timestamp_query_set`/`finish_timestamps`/`report_timestamps`,
@@ -1900,6 +1995,12 @@ impl VulkanBackend {
         // try_init`'s own comment where the cache is actually created).
         let supports_pipeline_cache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
         let pipeline_cache_key = wgpu::util::pipeline_cache_key(&info);
+        // SPIR-V passthrough for the glslc-compiled Q4_K GEMV kernel —
+        // hands RADV glslc's SPIR-V directly, bypassing naga's WGSL codegen.
+        let supports_passthrough = adapter
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        let q4k_glsl = supports_passthrough && std::env::var_os("ORANGU_Q4K_GLSL").is_some();
         let mut required_features = if supports_f16 {
             wgpu::Features::SHADER_F16
         } else {
@@ -1910,6 +2011,9 @@ impl VulkanBackend {
         }
         if supports_subgroup {
             required_features |= wgpu::Features::SUBGROUP;
+        }
+        if q4k_glsl {
+            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
         if supports_timestamp_query {
             required_features |=
@@ -2047,6 +2151,12 @@ impl VulkanBackend {
             build_elem_pipeline(&elem4_pipeline_layout, vulkan_shaders::shader_source_add());
         let mul_pipeline =
             build_elem_pipeline(&elem4_pipeline_layout, vulkan_shaders::shader_source_mul());
+        // Dispatch fusion: fused GELU+multiply (`elem4`: a=gate, b=up,
+        // y=out, meta) — one dispatch instead of gelu-then-mul.
+        let gelu_mul_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_gelu_mul(),
+        );
         let rmsnorm_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm(subgroup_reduce, norm_wg()),
@@ -2054,6 +2164,10 @@ impl VulkanBackend {
         let rmsnorm_add_pipeline = build_elem_pipeline(
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add(subgroup_reduce, norm_wg()),
+        );
+        let rmsnorm_add_scale_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_scale(subgroup_reduce, norm_wg()),
         );
         let gelu_pipeline =
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_gelu());
@@ -2287,11 +2401,14 @@ impl VulkanBackend {
                 ))
             });
 
-        // See `Self::q4_k_light_pipeline`. **Opt-in** (`ORANGU_Q4K_LIGHT=1`):
-        // llama.cpp's 16-thread-per-super-block mapping, targeting register
-        // pressure / occupancy. Checked ahead of the contig and dual pipelines
-        // in `pipeline_for` when built. Same `REDUCE_N_ROWS` dispatch.
-        let q4k_light = std::env::var_os("ORANGU_Q4K_LIGHT").is_some();
+        // See `Self::q4_k_light_pipeline`. **On by default** (opt out with
+        // `ORANGU_NO_Q4K_LIGHT=1`), same opt-out convention as `wide_unroll`/
+        // `dual_nibble`: llama.cpp's 16-thread-per-super-block mapping is the
+        // default `Q4_K` decode kernel. Checked ahead of the contig and dual
+        // pipelines in `pipeline_for` when built. Same `REDUCE_N_ROWS` dispatch.
+        // The dual pipeline stays built as the A/B fallback for
+        // `ORANGU_NO_Q4K_LIGHT`.
+        let q4k_light = std::env::var_os("ORANGU_NO_Q4K_LIGHT").is_none();
         let q4_k_light_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16 && q4k_light)
             .then(|| {
                 build_pipeline(vulkan_shaders::shader_source_reduce_q4k_light(
@@ -2299,6 +2416,42 @@ impl VulkanBackend {
                     supports_subgroup,
                 ))
             });
+
+        // See `Self::q4_k_glsl_pipeline`. glslc-compiled twin of the
+        // light kernel, handed to RADV via SPIR-V passthrough — same algorithm
+        // and bind group, only the SPIR-V producer differs (glslc vs naga). The
+        // shader fixes n_rows = 2, so gate on the default `reduce_n_rows()`.
+        // Opt-in `ORANGU_Q4K_GLSL` (already AND-ed with `supports_passthrough`).
+        let q4_k_glsl_pipeline = (q4k_glsl && reduce_n_rows() == 2).then(|| {
+            let module = unsafe {
+                device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                    label: Some("orangu-server q4k glsl gemv"),
+                    entry_points: std::borrow::Cow::Borrowed(&[
+                        wgpu::PassthroughShaderEntryPoint {
+                            name: std::borrow::Cow::Borrowed("main"),
+                            workgroup_size: (32, 1, 1),
+                        },
+                    ]),
+                    spirv: Some(wgpu::util::make_spirv_raw(Q4K_GLSL_GEMV_SPIRV)),
+                    ..Default::default()
+                })
+            };
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server q4k glsl pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache.as_ref(),
+            })
+        });
+        if std::env::var_os("ORANGU_Q4K_GLSL").is_some() {
+            eprintln!(
+                "orangu-server: [q4k-glsl] passthrough={supports_passthrough} \
+                 kernel_active={}",
+                q4_k_glsl_pipeline.is_some()
+            );
+        }
 
         // See `Self::q6_k_dual_pipeline`. Same gate as the `Q4_K` dual
         // kernel minus the `packed_dot_f16` exclusion (that kernel is
@@ -2440,11 +2593,13 @@ impl VulkanBackend {
             elem3_bind_group_layout,
             add_pipeline,
             mul_pipeline,
+            gelu_mul_pipeline,
             gelu_pipeline,
             scale_pipeline,
             rmsnorm_pipeline,
             elem5_bind_group_layout,
             rmsnorm_add_pipeline,
+            rmsnorm_add_scale_pipeline,
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
             attn_pipeline,
@@ -2475,10 +2630,12 @@ impl VulkanBackend {
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
             q4_k_light_pipeline,
+            q4_k_glsl_pipeline,
             q4_k_contig_pipeline,
             q6_k_dual_pipeline,
             tiled_prefill,
             coop_min_n_tokens,
+            supports_subgroup,
             thin_tile,
             thin_tile_size,
             thin_tile_min_k,
@@ -2494,6 +2651,9 @@ impl VulkanBackend {
             flash_attn,
             q4_k_mmvq,
             attn_gqa,
+            attn_coop,
+            attn_split_k,
+            attn_split_k_pinned,
             gpu_timestamps,
             timestamps: Mutex::new(None),
         })
@@ -3014,10 +3174,20 @@ impl VulkanBackend {
         {
             return pipeline;
         }
-        // Dual-nibble `Q4_K` decode kernel — checked *first*, ahead of every
-        // other `Q4_K` reduce variant, so it's the default decode path (see
-        // `Self::q4_k_dual_pipeline`). Same `REDUCE_N_ROWS`-batched dispatch
-        // as the block-unroll, so no `build_op_resources` special case
+        // glslc-compiled `Q4_K` decode kernel — checked *first* when
+        // built (`ORANGU_Q4K_GLSL`), ahead of the WGSL light/contig/dual
+        // variants. Same `REDUCE_N_ROWS`-batched dispatch, so no
+        // `build_op_resources` special case.
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
+            && n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = &self.q4_k_glsl_pipeline
+        {
+            return pipeline;
+        }
+        // Light `Q4_K` decode kernel — the default decode path (see
+        // `Self::q4_k_light_pipeline`); the contig and dual variants below are
+        // fallbacks it pre-empts when built. Same `REDUCE_N_ROWS`-batched
+        // dispatch as the block-unroll, so no `build_op_resources` special case
         // (`selects_wide_unroll` still returns `true` here — the block-unroll
         // pipelines are still built — keeping the dispatch count right).
         if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
@@ -3387,6 +3557,9 @@ impl VulkanBackend {
             readback_buffer: None,
             output_len,
             workgroups,
+            meta_chunk,
+            meta_offset,
+            meta_size,
             mmvq,
         }
     }
@@ -3620,6 +3793,11 @@ pub struct FusedAttnInput<'a> {
     pub eps: f32,
     pub pos: usize,
     pub window_start: usize,
+    /// The SWA sliding-window size for this layer (`Some(n_swa)`), or `None`
+    /// for full attention — used by the raw-replay capture to recompute
+    /// `n_pos`/`window_start` each token (`window_start` alone is ambiguous
+    /// when `pos + 1 <= n_swa`). Does not affect the wgpu recording itself.
+    pub window: Option<u32>,
     pub scale: f32,
     pub cache: &'a mut crate::engine::kv_cache::LayerCache,
     /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
@@ -3667,6 +3845,9 @@ pub struct FusedLayerInput<'a> {
     pub eps: f32,
     pub pos: usize,
     pub window_start: usize,
+    /// See [`FusedAttnInput::window`] — threaded to the attention half for the
+    /// raw-replay capture. `Some(n_swa)` on SWA layers, `None` on full ones.
+    pub window: Option<u32>,
     pub scale: f32,
     pub cache: &'a mut crate::engine::kv_cache::LayerCache,
     pub wo: &'a QuantMatrix,
@@ -3754,10 +3935,32 @@ impl VulkanBackend {
             len,
             _pad0: 0,
             extra,
-            _pad1: 0,
+            out_scale: 0.0,
         };
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server elem meta"),
+            size: std::mem::size_of::<ElemMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::bytes_of(&meta));
+        buffer
+    }
+
+    /// Like `elem_meta_buffer` but also sets `out_scale` — for the
+    /// `rmsnorm_add_scale` pipeline, whose trailing write multiplies by it
+    /// (`vulkan_shaders::shader_source_rmsnorm_add_scale`). Every other shader
+    /// leaves `out_scale` at `0.0` (via `elem_meta_buffer`) and never reads it.
+    fn elem_meta_buffer_scaled(&self, len: u32, extra: f32, out_scale: f32) -> wgpu::Buffer {
+        let meta = ElemMeta {
+            len,
+            _pad0: 0,
+            extra,
+            out_scale,
+        };
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server elem meta scaled"),
             size: std::mem::size_of::<ElemMeta>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -3776,7 +3979,7 @@ impl VulkanBackend {
             len,
             _pad0: offset,
             extra: 0.0,
-            _pad1: 0,
+            out_scale: 0.0,
         };
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server kv cast meta"),
@@ -4043,6 +4246,18 @@ impl VulkanBackend {
                 debug_assert_eq!(data.len(), len_f32);
                 self.queue
                     .write_buffer(dst, dst_offset, bytemuck::cast_slice(data));
+                // The only `Cpu` uploads on the decode path are the scaled token
+                // embedding — layer 0's input and (PLE models) the PLE
+                // projection's `x`, both the same `[n_embd]` value. Capture the
+                // destination as a per-token host input so the replay loop
+                // rewrites it each token (the wgpu path re-does this
+                // `write_buffer` every step; the raw path can't record it).
+                self.capture_push(|| vulkan_replay::CaptureStep::HostInput {
+                    tag: vulkan_replay::HostInputTag::EmbeddingX,
+                    buffer: dst.clone(),
+                    offset: dst_offset,
+                    size: (len_f32 as u64) * 4,
+                });
             }
             GpuInput::Gpu(buf, offset) => {
                 encoder.copy_buffer_to_buffer(
@@ -4052,6 +4267,13 @@ impl VulkanBackend {
                     dst_offset,
                     (len_f32 as u64) * 4,
                 );
+                self.capture_push(|| vulkan_replay::CaptureStep::Copy {
+                    src: buf.clone(),
+                    src_offset: (offset as u64) * 4,
+                    dst: dst.clone(),
+                    dst_offset,
+                    size: (len_f32 as u64) * 4,
+                });
             }
         }
     }
@@ -4393,6 +4615,39 @@ impl VulkanBackend {
         )
     }
 
+    /// The exact WGSL `pipeline_for` selects for a single-token decode matmul of
+    /// a `ggml_type` weight, so the raw-Vulkan replay capture compiles a
+    /// byte-identical kernel. Covers the **default** decode config
+    /// (`Q4_K`/`Q6_K` dual-nibble, K-quant wide-unroll, base reduce for the
+    /// rest); the opt-in kernel flags (mmvq/packed/wide-load/thin-tile/
+    /// q4k-light/contig) are not captured — a `begin_decode_capture` caller must
+    /// run the default config, which `capture_push` on the mmvq branch also
+    /// enforces by not emitting.
+    fn capture_matmul_wgsl(&self, ggml_type: u32, n_tokens: usize) -> String {
+        use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+        let n = reduce_n_rows();
+        if ggml_type == GGML_TYPE_Q4_K
+            && n_tokens < self.coop_min_n_tokens
+            && self.q4_k_dual_pipeline.is_some()
+        {
+            return vulkan_shaders::shader_source_reduce_q4k_dual_nibble(n, self.supports_subgroup);
+        }
+        if ggml_type == GGML_TYPE_Q6_K
+            && n_tokens < self.coop_min_n_tokens
+            && self.q6_k_dual_pipeline.is_some()
+        {
+            return vulkan_shaders::shader_source_reduce_q6k_dual(n, self.supports_subgroup);
+        }
+        if self.selects_wide_unroll(ggml_type, n_tokens)
+            && let Some(src) =
+                vulkan_shaders::shader_source_reduce_wide_unroll(ggml_type, n, self.subgroup_reduce)
+        {
+            return src;
+        }
+        vulkan_shaders::shader_source_reduce(ggml_type, n, self.subgroup_reduce)
+            .expect("base reduce kernel exists for every supported type")
+    }
+
     /// Records `w`'s matmul dispatch (`x -> y`, `n_tokens == 1`) into
     /// `pass`, using `entry`'s already-cached bind group/workgroup count.
     fn record_matmul<'p>(
@@ -4419,6 +4674,157 @@ impl VulkanBackend {
         pass.set_bind_group(0, &entry.bind_group, &[]);
         let (wx, wy, wz) = entry.workgroups;
         pass.dispatch_workgroups(wx, wy, wz);
+        self.capture_push(|| {
+            use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
+            let (wchunk, woff, wsize) = self.weight_buffer(w);
+            let in_bytes = (w.in_dim as u64) * 4;
+            CaptureStep::Dispatch {
+                wgsl: self.capture_matmul_wgsl(w.ggml_type(), 1),
+                bindings: vec![
+                    CaptureBinding {
+                        binding: 0,
+                        kind: DescriptorKind::Storage,
+                        buffer: wchunk,
+                        offset: woff,
+                        size: wsize,
+                    },
+                    CaptureBinding {
+                        binding: 1,
+                        kind: DescriptorKind::Storage,
+                        buffer: entry.x_buffer.clone(),
+                        offset: entry.x_offset,
+                        size: in_bytes,
+                    },
+                    CaptureBinding {
+                        binding: 2,
+                        kind: DescriptorKind::Storage,
+                        buffer: entry.output_buffer.clone(),
+                        offset: entry.output_offset,
+                        size: entry.output_len,
+                    },
+                    CaptureBinding {
+                        binding: 3,
+                        kind: DescriptorKind::Uniform,
+                        buffer: entry.meta_chunk.clone(),
+                        offset: entry.meta_offset,
+                        size: entry.meta_size,
+                    },
+                ],
+                per_token: Vec::new(),
+                groups: [wx, wy, wz],
+            }
+        });
+    }
+
+    /// Builds a matmul bind group that reads its activation from an arbitrary
+    /// `input` slice instead of `entry.x_buffer` — lets a fused producer's
+    /// output feed the matmul **directly** (read-only), removing the
+    /// `copy → entry.x_buffer` the cached bind group would otherwise need.
+    /// Weight/output/meta come from `entry`; only binding 1 (the activation)
+    /// differs. Non-MMVQ only (MMVQ reads a q8 buffer, not the raw activation).
+    fn matmul_bind_group_with_input(
+        &self,
+        w: &QuantMatrix,
+        input: &wgpu::Buffer,
+        input_offset: u64,
+        input_len: u64,
+        entry: &CachedOpResources,
+    ) -> wgpu::BindGroup {
+        let (weight_chunk, weight_offset, weight_size) = self.weight_buffer(w);
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server fused shared-input matmul bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &weight_chunk,
+                        offset: weight_offset,
+                        size: Some(
+                            std::num::NonZeroU64::new(weight_size).expect("weight size > 0"),
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: BindSrc::Slice(input, input_offset, input_len).resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: BindSrc::Slice(
+                        &entry.output_buffer,
+                        entry.output_offset,
+                        entry.output_len,
+                    )
+                    .resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: BindSrc::Slice(&entry.meta_chunk, entry.meta_offset, entry.meta_size)
+                        .resource(),
+                },
+            ],
+        })
+    }
+
+    /// Like `record_matmul` but reads its activation from `input_bg` (a
+    /// `matmul_bind_group_with_input` bind group over `input_buf`) instead of
+    /// `entry.bind_group`/`entry.x_buffer`. Pipeline/workgroups still come from
+    /// `entry`; the replay capture references `input_buf` so `ORANGU_REPLAY`
+    /// stays byte-exact. Non-MMVQ only.
+    fn record_matmul_shared_input<'p>(
+        &'p self,
+        pass: &mut wgpu::ComputePass<'p>,
+        w: &QuantMatrix,
+        entry: &'p CachedOpResources,
+        input_bg: &'p wgpu::BindGroup,
+        input_buf: &wgpu::Buffer,
+        input_offset: u64,
+    ) {
+        pass.set_pipeline(self.pipeline_for(w.ggml_type(), w.in_dim, 1));
+        pass.set_bind_group(0, input_bg, &[]);
+        let (wx, wy, wz) = entry.workgroups;
+        pass.dispatch_workgroups(wx, wy, wz);
+        self.capture_push(|| {
+            use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
+            let (wchunk, woff, wsize) = self.weight_buffer(w);
+            let in_bytes = (w.in_dim as u64) * 4;
+            CaptureStep::Dispatch {
+                wgsl: self.capture_matmul_wgsl(w.ggml_type(), 1),
+                bindings: vec![
+                    CaptureBinding {
+                        binding: 0,
+                        kind: DescriptorKind::Storage,
+                        buffer: wchunk,
+                        offset: woff,
+                        size: wsize,
+                    },
+                    CaptureBinding {
+                        binding: 1,
+                        kind: DescriptorKind::Storage,
+                        buffer: input_buf.clone(),
+                        offset: input_offset,
+                        size: in_bytes,
+                    },
+                    CaptureBinding {
+                        binding: 2,
+                        kind: DescriptorKind::Storage,
+                        buffer: entry.output_buffer.clone(),
+                        offset: entry.output_offset,
+                        size: entry.output_len,
+                    },
+                    CaptureBinding {
+                        binding: 3,
+                        kind: DescriptorKind::Uniform,
+                        buffer: entry.meta_chunk.clone(),
+                        offset: entry.meta_offset,
+                        size: entry.meta_size,
+                    },
+                ],
+                per_token: Vec::new(),
+                groups: [wx, wy, wz],
+            }
+        });
     }
 
     /// Dispatches the q8 activation quantize for one MMVQ op (activation in its
@@ -4449,11 +4855,14 @@ impl VulkanBackend {
     /// `per_layer_buf` is the one field here whose *contents* change every
     /// call (like `FusedResources::residual_buf`); everything else is
     /// fixed once this layer's shapes are known.
+    #[allow(clippy::too_many_arguments)]
     fn build_ple_resources(
         &self,
         ple: &FusedPle<'_>,
         n_embd: usize,
+        eps: f32,
         meta_embd_eps: &wgpu::Buffer,
+        fused_out_scale: Option<f32>,
         x2: (&wgpu::Buffer, u64),
         ple_gate_g: &CachedOpResources,
         ple_proj_g: &CachedOpResources,
@@ -4477,36 +4886,6 @@ impl VulkanBackend {
                 per_layer_bytes,
                 "orangu-server fused ple per_layer arena chunk",
             );
-        let (gelu_out, gelu_out_offset) = self
-            .fused_ple_gelu_arena
-            .lock()
-            .expect("fused ple gelu arena poisoned")
-            .alloc(
-                &self.device,
-                align,
-                per_layer_bytes,
-                "orangu-server fused ple gelu arena chunk",
-            );
-        let (mulled, mulled_offset) = self
-            .fused_ple_mulled_arena
-            .lock()
-            .expect("fused ple mulled arena poisoned")
-            .alloc(
-                &self.device,
-                align,
-                per_layer_bytes,
-                "orangu-server fused ple mulled arena chunk",
-            );
-        let (normed, normed_offset) = self
-            .fused_ple_normed_arena
-            .lock()
-            .expect("fused ple normed arena poisoned")
-            .alloc(
-                &self.device,
-                align,
-                n_embd_bytes,
-                "orangu-server fused ple normed arena chunk",
-            );
         let (x3, x3_offset) = self
             .fused_ple_x3_arena
             .lock()
@@ -4521,39 +4900,171 @@ impl VulkanBackend {
         let meta_plain = self.elem_meta_buffer(per_layer_dim as u32, 0.0);
         let wg = (per_layer_dim as u32).div_ceil(64);
 
-        let bg_gelu = self.elem3_bind_group(
-            ple_gate_g.output_src(),
-            BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
-            &meta_plain,
-        );
-        let bg_mul = self.elem4_bind_group(
-            BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
-            BindSrc::Slice(&per_layer_buf, per_layer_buf_offset, per_layer_bytes),
-            BindSrc::Slice(&mulled, mulled_offset, per_layer_bytes),
-            &meta_plain,
-        );
-        let bg_post_norm = self.elem4_bind_group(
-            ple_proj_g.output_src(),
-            &post_norm_w,
-            BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
-            meta_embd_eps,
-        );
-        let bg_add = self.elem4_bind_group(
-            BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
-            BindSrc::Slice(x2, x2_offset, n_embd_bytes),
-            BindSrc::Slice(&x3, x3_offset, n_embd_bytes),
-            meta_embd_eps,
-        );
+        // Which fallback paths are active — their scratch (`gelu_out`/`mulled`
+        // for the split gelu→mul, `normed` for the split rmsnorm→add) and bind
+        // groups are allocated *only* when needed, so the fully-fused path
+        // (the default) allocates no PLE scratch beyond `per_layer_buf`/`x3`.
+        let fused_postnorm = std::env::var_os("ORANGU_NO_FUSED_PLE_POSTNORM").is_none();
+        let fused_gm = !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_GELU_MUL").is_none();
+        let shared_input =
+            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+
+        // Split gelu→mul fallback scratch + bind groups (only when the fused
+        // gelu·mul is off: MMVQ, or `ORANGU_NO_FUSED_GELU_MUL`).
+        let (gelu_out, gelu_out_offset, mulled, mulled_offset, bg_gelu, bg_mul) = if fused_gm {
+            (None, 0, None, 0, None, None)
+        } else {
+            let (gelu_out, gelu_out_offset) = self
+                .fused_ple_gelu_arena
+                .lock()
+                .expect("fused ple gelu arena poisoned")
+                .alloc(
+                    &self.device,
+                    align,
+                    per_layer_bytes,
+                    "orangu-server fused ple gelu arena chunk",
+                );
+            let (mulled, mulled_offset) = self
+                .fused_ple_mulled_arena
+                .lock()
+                .expect("fused ple mulled arena poisoned")
+                .alloc(
+                    &self.device,
+                    align,
+                    per_layer_bytes,
+                    "orangu-server fused ple mulled arena chunk",
+                );
+            let bg_gelu = self.elem3_bind_group(
+                ple_gate_g.output_src(),
+                BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
+                &meta_plain,
+            );
+            let bg_mul = self.elem4_bind_group(
+                BindSrc::Slice(&gelu_out, gelu_out_offset, per_layer_bytes),
+                BindSrc::Slice(&per_layer_buf, per_layer_buf_offset, per_layer_bytes),
+                BindSrc::Slice(&mulled, mulled_offset, per_layer_bytes),
+                &meta_plain,
+            );
+            (
+                Some(gelu_out),
+                gelu_out_offset,
+                Some(mulled),
+                mulled_offset,
+                Some(bg_gelu),
+                Some(bg_mul),
+            )
+        };
+
+        // Split rmsnorm→add fallback scratch + bind groups (only when
+        // `ORANGU_NO_FUSED_PLE_POSTNORM`).
+        let (normed, normed_offset, bg_post_norm, bg_add) = if fused_postnorm {
+            (None, 0, None, None)
+        } else {
+            let (normed, normed_offset) = self
+                .fused_ple_normed_arena
+                .lock()
+                .expect("fused ple normed arena poisoned")
+                .alloc(
+                    &self.device,
+                    align,
+                    n_embd_bytes,
+                    "orangu-server fused ple normed arena chunk",
+                );
+            let bg_post_norm = self.elem4_bind_group(
+                ple_proj_g.output_src(),
+                &post_norm_w,
+                BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
+                meta_embd_eps,
+            );
+            let bg_add = self.elem4_bind_group(
+                BindSrc::Slice(&normed, normed_offset, n_embd_bytes),
+                BindSrc::Slice(x2, x2_offset, n_embd_bytes),
+                BindSrc::Slice(&x3, x3_offset, n_embd_bytes),
+                meta_embd_eps,
+            );
+            (
+                Some(normed),
+                normed_offset,
+                Some(bg_post_norm),
+                Some(bg_add),
+            )
+        };
+        // Fuse PLE's post-projection RMSNorm and its residual add into one
+        // `rmsnorm_add` dispatch — `x3 = rmsnorm(ple_proj)*post_norm_w + x2`,
+        // exactly the pattern `rmsnorm_add` implements (already byte-exact and
+        // used for both attn/ffn post-norms). Drops the separate `add` pass and
+        // the `normed` round-trip. Gated for an A/B; falls back to the split
+        // `bg_post_norm`+`bg_add` path.
+        //
+        // When `fused_out_scale` is `Some` (this layer has `layer_output_scale`
+        // and scale-fusion is on), also fold that trailing multiply in via the
+        // `rmsnorm_add_scale` pipeline — `x3` is written already scaled, so the
+        // caller's separate `scale` dispatch is dropped entirely.
+        let (bg_post_norm_add, meta_post_norm_scaled, post_norm_add_scaled) = if fused_postnorm {
+            match fused_out_scale {
+                Some(s) => {
+                    let meta_scaled = self.elem_meta_buffer_scaled(n_embd as u32, eps, s);
+                    let bg = self.elem5_bind_group(
+                        ple_proj_g.output_src(),
+                        &post_norm_w,
+                        BindSrc::Slice(x2, x2_offset, n_embd_bytes),
+                        BindSrc::Slice(&x3, x3_offset, n_embd_bytes),
+                        &meta_scaled,
+                    );
+                    (Some(bg), Some(meta_scaled), true)
+                }
+                None => {
+                    let bg = self.elem5_bind_group(
+                        ple_proj_g.output_src(),
+                        &post_norm_w,
+                        BindSrc::Slice(x2, x2_offset, n_embd_bytes),
+                        BindSrc::Slice(&x3, x3_offset, n_embd_bytes),
+                        meta_embd_eps,
+                    );
+                    (Some(bg), None, false)
+                }
+            }
+        } else {
+            (None, None, false)
+        };
+
+        // Same treatment as the main FFN: fuse PLE's
+        // gelu+mul into one dispatch writing straight into `ple_proj`'s input
+        // (`ple_proj_g.x_buffer`) — drops the mul→`mulled`→proj copy and the
+        // `mulled` round-trip; and read the `ple_gate` matmul's activation
+        // directly from `x2` (this sub-layer's stable residual buffer) instead
+        // of a copy into `ple_gate.x`. Same A/B knobs as the main FFN; non-MMVQ
+        // only (MMVQ quantizes `x_buffer` in place, so it keeps the copies).
+        let bg_gelu_mul = fused_gm.then(|| {
+            self.elem4_bind_group(
+                ple_gate_g.output_src(),
+                BindSrc::Slice(&per_layer_buf, per_layer_buf_offset, per_layer_bytes),
+                BindSrc::Slice(&ple_proj_g.x_buffer, ple_proj_g.x_offset, per_layer_bytes),
+                &meta_plain,
+            )
+        });
+        let bg_ple_gate_matmul = shared_input.then(|| {
+            self.matmul_bind_group_with_input(ple.gate_w, x2, x2_offset, n_embd_bytes, ple_gate_g)
+        });
 
         FusedPleResources {
+            bg_gelu_mul,
+            bg_ple_gate_matmul,
+            bg_post_norm_add,
+            meta_post_norm_scaled,
+            post_norm_add_scaled,
             per_layer_buf,
             per_layer_buf_offset,
             gelu_out,
+            gelu_out_offset,
             mulled,
             mulled_offset,
             normed,
+            normed_offset,
             x3,
             x3_offset,
+            post_norm_w,
+            meta_plain,
             bg_gelu,
             bg_mul,
             bg_post_norm,
@@ -4657,6 +5168,36 @@ impl VulkanBackend {
             BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
             &meta_embd_eps,
         );
+        // On the non-MMVQ path the FFN norm's output (`ffn_normed`) is
+        // fed to the gate and up matmuls *directly* via these read-only-input
+        // bind groups (both read the one `ffn_normed` slice — read-sharing a
+        // buffer is legal), so `record_fused_post_attention` drops the two
+        // `ffn_normed → gate.x`/`→ up.x` copies. MMVQ keeps the copy path (it
+        // quantizes `x_buffer` in place), so these stay `None` there.
+        // A/B knob: `ORANGU_NO_FUSED_SHARED_INPUT=1` forces the old copy path for
+        // measurement. Default on (non-MMVQ).
+        let shared_input =
+            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+        let (bg_gate_matmul, bg_up_matmul) = if !shared_input {
+            (None, None)
+        } else {
+            (
+                Some(self.matmul_bind_group_with_input(
+                    input.ffn_gate,
+                    &ffn_normed,
+                    ffn_normed_offset,
+                    n_embd_bytes,
+                    gate_g,
+                )),
+                Some(self.matmul_bind_group_with_input(
+                    input.ffn_up,
+                    &ffn_normed,
+                    ffn_normed_offset,
+                    n_embd_bytes,
+                    up_g,
+                )),
+            )
+        };
         let bg_gelu = self.elem3_bind_group(
             gate_g.output_src(),
             BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
@@ -4676,6 +5217,21 @@ impl VulkanBackend {
             BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
             &meta_ffn_plain,
         );
+        // Dispatch fusion: fused GELU+multiply — reads the gate and up
+        // projection outputs, writes `down.x` directly in **one** dispatch
+        // (`gelu_out` never round-trips through VRAM). Replaces the bg_gelu +
+        // bg_mul pair. A/B knob `ORANGU_NO_FUSED_GELU_MUL=1` restores the pair.
+        // Read once per layer here (cached), never per token.
+        let bg_gelu_mul = std::env::var_os("ORANGU_NO_FUSED_GELU_MUL")
+            .is_none()
+            .then(|| {
+                self.elem4_bind_group(
+                    gate_g.output_src(),
+                    up_g.output_src(),
+                    BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
+                    &meta_ffn_plain,
+                )
+            });
         // `ffn_down`'s own post-matmul norm+add, same fusion — the residual
         // here is `x1` (this sub-layer's own pre-FFN residual stream), not
         // `residual_buf` (that's `bg_attn_post_norm_add`'s own residual).
@@ -4687,11 +5243,25 @@ impl VulkanBackend {
             &meta_embd_eps,
         );
 
+        // Fold `layer_output_scale` into the PLE post-projection `rmsnorm_add`
+        // (which writes the layer's final buffer `x3`) when both are present and
+        // PLE-postnorm fusion is active — drops the separate `scale` dispatch.
+        // Only the PLE path is folded (this model is PLE-on-every-layer, so the
+        // scale always follows the PLE norm); the no-PLE path keeps the
+        // standalone `scale` pass below.
+        let fuse_scale_into_ple = input.ple.is_some()
+            && input.layer_output_scale.is_some()
+            && std::env::var_os("ORANGU_NO_FUSED_PLE_POSTNORM").is_none()
+            && std::env::var_os("ORANGU_NO_FUSED_SCALE").is_none();
+        let ple_out_scale = fuse_scale_into_ple.then(|| input.layer_output_scale.unwrap());
+
         let ple = if let (Some(ple), Some((ple_gate_g, ple_proj_g))) = (&input.ple, ple_g) {
             Some(self.build_ple_resources(
                 ple,
                 n_embd,
+                input.eps,
                 &meta_embd_eps,
+                ple_out_scale,
                 (&x2, x2_offset),
                 ple_gate_g,
                 ple_proj_g,
@@ -4700,7 +5270,7 @@ impl VulkanBackend {
             None
         };
 
-        let scale = if let Some(s) = input.layer_output_scale {
+        let scale = if let (Some(s), false) = (input.layer_output_scale, fuse_scale_into_ple) {
             let (scaled, scaled_offset) = self
                 .fused_scale_arena
                 .lock()
@@ -4724,6 +5294,7 @@ impl VulkanBackend {
             Some(FusedScaleResources {
                 scaled,
                 scaled_offset,
+                meta_buf,
                 bg,
             })
         } else {
@@ -4731,6 +5302,8 @@ impl VulkanBackend {
         };
 
         FusedResources {
+            bg_gate_matmul,
+            bg_up_matmul,
             residual_buf,
             residual_buf_offset,
             x1,
@@ -4743,7 +5316,15 @@ impl VulkanBackend {
             bg_ffn_norm,
             bg_gelu,
             bg_mul,
+            bg_gelu_mul,
             bg_ffn_post_norm_add,
+            attn_post_norm_w,
+            ffn_norm_w,
+            ffn_post_norm_w,
+            meta_embd_eps,
+            meta_ffn_plain,
+            x1_offset,
+            gelu_out_offset,
             ple,
             scale,
             embd_wg: (n_embd as u32).div_ceil(64),
@@ -4885,20 +5466,87 @@ impl VulkanBackend {
             pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &res.ffn_normed,
-            res.ffn_normed_offset,
-            &gate_g.x_buffer,
-            gate_g.x_offset,
-            (n_embd as u64) * 4,
-        );
-        encoder.copy_buffer_to_buffer(
-            &res.ffn_normed,
-            res.ffn_normed_offset,
-            &up_g.x_buffer,
-            up_g.x_offset,
-            (n_embd as u64) * 4,
-        );
+        {
+            use vulkan_replay::DescriptorKind::{Storage, Uniform};
+            let nb4 = (n_embd as u64) * 4;
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                    &[
+                        (
+                            0,
+                            Storage,
+                            wo_g.output_buffer.clone(),
+                            wo_g.output_offset,
+                            nb4,
+                        ),
+                        (1, Storage, res.attn_post_norm_w.clone(), 0, nb4),
+                        (
+                            2,
+                            Storage,
+                            res.residual_buf.clone(),
+                            res.residual_buf_offset,
+                            nb4,
+                        ),
+                        (3, Storage, res.x1.clone(), res.x1_offset, nb4),
+                        (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                    ],
+                    [1, 1, 1],
+                )
+            });
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                    &[
+                        (0, Storage, res.x1.clone(), res.x1_offset, nb4),
+                        (1, Storage, res.ffn_norm_w.clone(), 0, nb4),
+                        (
+                            2,
+                            Storage,
+                            res.ffn_normed.clone(),
+                            res.ffn_normed_offset,
+                            nb4,
+                        ),
+                        (3, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                    ],
+                    [1, 1, 1],
+                )
+            });
+        }
+        // On the non-MMVQ path the gate/up matmuls read `ffn_normed`
+        // directly (`res.bg_gate_matmul`/`bg_up_matmul`), so these two copies
+        // are skipped entirely. MMVQ quantizes each op's `x_buffer` in place, so
+        // it still needs `ffn_normed` copied into `gate.x`/`up.x` first.
+        if res.bg_gate_matmul.is_none() {
+            encoder.copy_buffer_to_buffer(
+                &res.ffn_normed,
+                res.ffn_normed_offset,
+                &gate_g.x_buffer,
+                gate_g.x_offset,
+                (n_embd as u64) * 4,
+            );
+            self.capture_push(|| vulkan_replay::CaptureStep::Copy {
+                src: res.ffn_normed.clone(),
+                src_offset: res.ffn_normed_offset,
+                dst: gate_g.x_buffer.clone(),
+                dst_offset: gate_g.x_offset,
+                size: (n_embd as u64) * 4,
+            });
+            encoder.copy_buffer_to_buffer(
+                &res.ffn_normed,
+                res.ffn_normed_offset,
+                &up_g.x_buffer,
+                up_g.x_offset,
+                (n_embd as u64) * 4,
+            );
+            self.capture_push(|| vulkan_replay::CaptureStep::Copy {
+                src: res.ffn_normed.clone(),
+                src_offset: res.ffn_normed_offset,
+                dst: up_g.x_buffer.clone(),
+                dst_offset: up_g.x_offset,
+                size: (n_embd as u64) * 4,
+            });
+        }
 
         if self.q4_k_mmvq {
             let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4914,16 +5562,111 @@ impl VulkanBackend {
                 label: Some("orangu-server fused ffn pass"),
                 timestamp_writes: None,
             });
-            self.record_matmul(&mut pass, input.ffn_gate, &gate_g);
-            self.record_matmul(&mut pass, input.ffn_up, &up_g);
+            match (&res.bg_gate_matmul, &res.bg_up_matmul) {
+                (Some(bg_gate), Some(bg_up)) => {
+                    self.record_matmul_shared_input(
+                        &mut pass,
+                        input.ffn_gate,
+                        &gate_g,
+                        bg_gate,
+                        &res.ffn_normed,
+                        res.ffn_normed_offset,
+                    );
+                    self.record_matmul_shared_input(
+                        &mut pass,
+                        input.ffn_up,
+                        &up_g,
+                        bg_up,
+                        &res.ffn_normed,
+                        res.ffn_normed_offset,
+                    );
+                }
+                _ => {
+                    self.record_matmul(&mut pass, input.ffn_gate, &gate_g);
+                    self.record_matmul(&mut pass, input.ffn_up, &up_g);
+                }
+            }
 
-            pass.set_pipeline(&self.gelu_pipeline);
-            pass.set_bind_group(0, &res.bg_gelu, &[]);
-            pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+            if let Some(bg_gelu_mul) = &res.bg_gelu_mul {
+                pass.set_pipeline(&self.gelu_mul_pipeline);
+                pass.set_bind_group(0, bg_gelu_mul, &[]);
+                pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+            } else {
+                pass.set_pipeline(&self.gelu_pipeline);
+                pass.set_bind_group(0, &res.bg_gelu, &[]);
+                pass.dispatch_workgroups(res.ffn_wg, 1, 1);
 
-            pass.set_pipeline(&self.mul_pipeline);
-            pass.set_bind_group(0, &res.bg_mul, &[]);
-            pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+                pass.set_pipeline(&self.mul_pipeline);
+                pass.set_bind_group(0, &res.bg_mul, &[]);
+                pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+            }
+        }
+        {
+            use vulkan_replay::DescriptorKind::{Storage, Uniform};
+            let fb4 = (ffn_len as u64) * 4;
+            if res.bg_gelu_mul.is_some() {
+                // One fused GELU*mul dispatch: a=gate, b=up, y=down.x.
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_gelu_mul(),
+                        &[
+                            (
+                                0,
+                                Storage,
+                                gate_g.output_buffer.clone(),
+                                gate_g.output_offset,
+                                fb4,
+                            ),
+                            (
+                                1,
+                                Storage,
+                                up_g.output_buffer.clone(),
+                                up_g.output_offset,
+                                fb4,
+                            ),
+                            (2, Storage, down_g.x_buffer.clone(), down_g.x_offset, fb4),
+                            (3, Uniform, res.meta_ffn_plain.clone(), 0, 16),
+                        ],
+                        [res.ffn_wg, 1, 1],
+                    )
+                });
+            } else {
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_gelu(),
+                        &[
+                            (
+                                0,
+                                Storage,
+                                gate_g.output_buffer.clone(),
+                                gate_g.output_offset,
+                                fb4,
+                            ),
+                            (1, Storage, res.gelu_out.clone(), res.gelu_out_offset, fb4),
+                            (2, Uniform, res.meta_ffn_plain.clone(), 0, 16),
+                        ],
+                        [res.ffn_wg, 1, 1],
+                    )
+                });
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_mul(),
+                        &[
+                            (0, Storage, res.gelu_out.clone(), res.gelu_out_offset, fb4),
+                            (
+                                1,
+                                Storage,
+                                up_g.output_buffer.clone(),
+                                up_g.output_offset,
+                                fb4,
+                            ),
+                            (2, Storage, down_g.x_buffer.clone(), down_g.x_offset, fb4),
+                            (3, Uniform, res.meta_ffn_plain.clone(), 0, 16),
+                        ],
+                        [res.ffn_wg, 1, 1],
+                    )
+                });
+            }
         }
         // No `mulled -> down.x` copy: `bg_mul` already wrote straight into
         // `down_g.x_buffer` (see `build_fused_resources`).
@@ -4947,18 +5690,54 @@ impl VulkanBackend {
             pass.set_bind_group(0, &res.bg_ffn_post_norm_add, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
+        {
+            use vulkan_replay::DescriptorKind::{Storage, Uniform};
+            let nb4 = (n_embd as u64) * 4;
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                    &[
+                        (
+                            0,
+                            Storage,
+                            down_g.output_buffer.clone(),
+                            down_g.output_offset,
+                            nb4,
+                        ),
+                        (1, Storage, res.ffn_post_norm_w.clone(), 0, nb4),
+                        (2, Storage, res.x1.clone(), res.x1_offset, nb4),
+                        (3, Storage, res.x2.clone(), res.x2_offset, nb4),
+                        (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                    ],
+                    [1, 1, 1],
+                )
+            });
+        }
 
         let mut final_buf: (&wgpu::Buffer, u64) = (&res.x2, res.x2_offset);
         if let (Some(ple_input), Some(pres), Some((ple_gate_g, ple_proj_g))) =
             (&input.ple, &res.ple, &ple_g)
         {
-            encoder.copy_buffer_to_buffer(
-                final_buf.0,
-                final_buf.1,
-                &ple_gate_g.x_buffer,
-                ple_gate_g.x_offset,
-                (n_embd as u64) * 4,
-            );
+            let per_layer_dim = ple_input.per_layer_dim;
+            let pb4 = (per_layer_dim as u64) * 4;
+            // Skip the `x2 → ple_gate.x` copy when the gate matmul
+            // reads `x2` directly (shared-input). MMVQ keeps it.
+            if pres.bg_ple_gate_matmul.is_none() {
+                encoder.copy_buffer_to_buffer(
+                    final_buf.0,
+                    final_buf.1,
+                    &ple_gate_g.x_buffer,
+                    ple_gate_g.x_offset,
+                    (n_embd as u64) * 4,
+                );
+                self.capture_push(|| vulkan_replay::CaptureStep::Copy {
+                    src: final_buf.0.clone(),
+                    src_offset: final_buf.1,
+                    dst: ple_gate_g.x_buffer.clone(),
+                    dst_offset: ple_gate_g.x_offset,
+                    size: (n_embd as u64) * 4,
+                });
+            }
 
             if self.q4_k_mmvq {
                 let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4973,24 +5752,149 @@ impl VulkanBackend {
                     label: Some("orangu-server fused ple gate pass"),
                     timestamp_writes: None,
                 });
-                self.record_matmul(&mut pass, ple_input.gate_w, ple_gate_g);
-
-                pass.set_pipeline(&self.gelu_pipeline);
-                pass.set_bind_group(0, &pres.bg_gelu, &[]);
-                pass.dispatch_workgroups(pres.wg, 1, 1);
-
-                pass.set_pipeline(&self.mul_pipeline);
-                pass.set_bind_group(0, &pres.bg_mul, &[]);
-                pass.dispatch_workgroups(pres.wg, 1, 1);
+                match &pres.bg_ple_gate_matmul {
+                    Some(bg) => self.record_matmul_shared_input(
+                        &mut pass,
+                        ple_input.gate_w,
+                        ple_gate_g,
+                        bg,
+                        final_buf.0,
+                        final_buf.1,
+                    ),
+                    None => self.record_matmul(&mut pass, ple_input.gate_w, ple_gate_g),
+                }
+                match &pres.bg_gelu_mul {
+                    Some(bg) => {
+                        pass.set_pipeline(&self.gelu_mul_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(pres.wg, 1, 1);
+                    }
+                    None => {
+                        pass.set_pipeline(&self.gelu_pipeline);
+                        pass.set_bind_group(
+                            0,
+                            pres.bg_gelu.as_ref().expect("split gelu bind group"),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(pres.wg, 1, 1);
+                        pass.set_pipeline(&self.mul_pipeline);
+                        pass.set_bind_group(
+                            0,
+                            pres.bg_mul.as_ref().expect("split mul bind group"),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(pres.wg, 1, 1);
+                    }
+                }
             }
-            let per_layer_dim = ple_input.per_layer_dim;
-            encoder.copy_buffer_to_buffer(
-                &pres.mulled,
-                pres.mulled_offset,
-                &ple_proj_g.x_buffer,
-                ple_proj_g.x_offset,
-                (per_layer_dim as u64) * 4,
-            );
+            {
+                use vulkan_replay::DescriptorKind::{Storage, Uniform};
+                if pres.bg_gelu_mul.is_some() {
+                    self.capture_push(|| {
+                        static_capture_step(
+                            vulkan_shaders::shader_source_gelu_mul(),
+                            &[
+                                (
+                                    0,
+                                    Storage,
+                                    ple_gate_g.output_buffer.clone(),
+                                    ple_gate_g.output_offset,
+                                    pb4,
+                                ),
+                                (
+                                    1,
+                                    Storage,
+                                    pres.per_layer_buf.clone(),
+                                    pres.per_layer_buf_offset,
+                                    pb4,
+                                ),
+                                (
+                                    2,
+                                    Storage,
+                                    ple_proj_g.x_buffer.clone(),
+                                    ple_proj_g.x_offset,
+                                    pb4,
+                                ),
+                                (3, Uniform, pres.meta_plain.clone(), 0, 16),
+                            ],
+                            [pres.wg, 1, 1],
+                        )
+                    });
+                } else {
+                    self.capture_push(|| {
+                        static_capture_step(
+                            vulkan_shaders::shader_source_gelu(),
+                            &[
+                                (
+                                    0,
+                                    Storage,
+                                    ple_gate_g.output_buffer.clone(),
+                                    ple_gate_g.output_offset,
+                                    pb4,
+                                ),
+                                (
+                                    1,
+                                    Storage,
+                                    pres.gelu_out.clone().expect("split gelu_out"),
+                                    pres.gelu_out_offset,
+                                    pb4,
+                                ),
+                                (2, Uniform, pres.meta_plain.clone(), 0, 16),
+                            ],
+                            [pres.wg, 1, 1],
+                        )
+                    });
+                    self.capture_push(|| {
+                        static_capture_step(
+                            vulkan_shaders::shader_source_mul(),
+                            &[
+                                (
+                                    0,
+                                    Storage,
+                                    pres.gelu_out.clone().expect("split gelu_out"),
+                                    pres.gelu_out_offset,
+                                    pb4,
+                                ),
+                                (
+                                    1,
+                                    Storage,
+                                    pres.per_layer_buf.clone(),
+                                    pres.per_layer_buf_offset,
+                                    pb4,
+                                ),
+                                (
+                                    2,
+                                    Storage,
+                                    pres.mulled.clone().expect("split mulled"),
+                                    pres.mulled_offset,
+                                    pb4,
+                                ),
+                                (3, Uniform, pres.meta_plain.clone(), 0, 16),
+                            ],
+                            [pres.wg, 1, 1],
+                        )
+                    });
+                }
+            }
+            // The `mulled → ple_proj.x` copy is gone when the fused
+            // gelu·mul wrote `ple_proj.x` directly. MMVQ keeps it.
+            if pres.bg_gelu_mul.is_none() {
+                let mulled = pres.mulled.as_ref().expect("split mulled");
+                encoder.copy_buffer_to_buffer(
+                    mulled,
+                    pres.mulled_offset,
+                    &ple_proj_g.x_buffer,
+                    ple_proj_g.x_offset,
+                    (per_layer_dim as u64) * 4,
+                );
+                self.capture_push(|| vulkan_replay::CaptureStep::Copy {
+                    src: mulled.clone(),
+                    src_offset: pres.mulled_offset,
+                    dst: ple_proj_g.x_buffer.clone(),
+                    dst_offset: ple_proj_g.x_offset,
+                    size: pb4,
+                });
+            }
 
             if self.q4_k_mmvq {
                 let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -5007,13 +5911,118 @@ impl VulkanBackend {
                 });
                 self.record_matmul(&mut pass, ple_input.proj_w, ple_proj_g);
 
-                pass.set_pipeline(&self.rmsnorm_pipeline);
-                pass.set_bind_group(0, &pres.bg_post_norm, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+                match &pres.bg_post_norm_add {
+                    Some(bg) => {
+                        let pipeline = if pres.post_norm_add_scaled {
+                            &self.rmsnorm_add_scale_pipeline
+                        } else {
+                            &self.rmsnorm_add_pipeline
+                        };
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    None => {
+                        pass.set_pipeline(&self.rmsnorm_pipeline);
+                        pass.set_bind_group(
+                            0,
+                            pres.bg_post_norm
+                                .as_ref()
+                                .expect("split post_norm bind group"),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(1, 1, 1);
 
-                pass.set_pipeline(&self.add_pipeline);
-                pass.set_bind_group(0, &pres.bg_add, &[]);
-                pass.dispatch_workgroups(res.embd_wg, 1, 1);
+                        pass.set_pipeline(&self.add_pipeline);
+                        pass.set_bind_group(
+                            0,
+                            pres.bg_add
+                                .as_ref()
+                                .expect("split post_norm add bind group"),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(res.embd_wg, 1, 1);
+                    }
+                }
+            }
+            {
+                use vulkan_replay::DescriptorKind::{Storage, Uniform};
+                let nb4 = (n_embd as u64) * 4;
+                if pres.bg_post_norm_add.is_some() {
+                    // Scaled variant folds `layer_output_scale` in: different
+                    // shader body + a meta carrying `out_scale`.
+                    let (wgsl, meta_buf) = if pres.post_norm_add_scaled {
+                        (
+                            vulkan_shaders::shader_source_rmsnorm_add_scale(
+                                self.subgroup_reduce,
+                                norm_wg(),
+                            ),
+                            pres.meta_post_norm_scaled
+                                .clone()
+                                .expect("post_norm_add_scaled but no scaled meta"),
+                        )
+                    } else {
+                        (
+                            vulkan_shaders::shader_source_rmsnorm_add(
+                                self.subgroup_reduce,
+                                norm_wg(),
+                            ),
+                            res.meta_embd_eps.clone(),
+                        )
+                    };
+                    self.capture_push(|| {
+                        static_capture_step(
+                            wgsl,
+                            &[
+                                (
+                                    0,
+                                    Storage,
+                                    ple_proj_g.output_buffer.clone(),
+                                    ple_proj_g.output_offset,
+                                    nb4,
+                                ),
+                                (1, Storage, pres.post_norm_w.clone(), 0, nb4),
+                                (2, Storage, res.x2.clone(), res.x2_offset, nb4),
+                                (3, Storage, pres.x3.clone(), pres.x3_offset, nb4),
+                                (4, Uniform, meta_buf, 0, 16),
+                            ],
+                            [1, 1, 1],
+                        )
+                    });
+                } else {
+                    let normed = pres.normed.as_ref().expect("split normed").clone();
+                    let normed2 = normed.clone();
+                    self.capture_push(|| {
+                        static_capture_step(
+                            vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                            &[
+                                (
+                                    0,
+                                    Storage,
+                                    ple_proj_g.output_buffer.clone(),
+                                    ple_proj_g.output_offset,
+                                    nb4,
+                                ),
+                                (1, Storage, pres.post_norm_w.clone(), 0, nb4),
+                                (2, Storage, normed, pres.normed_offset, nb4),
+                                (3, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                            ],
+                            [1, 1, 1],
+                        )
+                    });
+                    self.capture_push(|| {
+                        static_capture_step(
+                            vulkan_shaders::shader_source_add(),
+                            &[
+                                (0, Storage, normed2, pres.normed_offset, nb4),
+                                (1, Storage, res.x2.clone(), res.x2_offset, nb4),
+                                (2, Storage, pres.x3.clone(), pres.x3_offset, nb4),
+                                (3, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                            ],
+                            [res.embd_wg, 1, 1],
+                        )
+                    });
+                }
             }
             final_buf = (&pres.x3, pres.x3_offset);
         }
@@ -5027,6 +6036,26 @@ impl VulkanBackend {
                 pass.set_pipeline(&self.scale_pipeline);
                 pass.set_bind_group(0, &sres.bg, &[]);
                 pass.dispatch_workgroups(res.embd_wg, 1, 1);
+            }
+            {
+                use vulkan_replay::DescriptorKind::{Storage, Uniform};
+                let nb4 = (n_embd as u64) * 4;
+                let embd_wg = res.embd_wg;
+                // `scale` reads whatever `final_buf` currently points at (PLE's
+                // `x3` when present, else the second-residual-add `x2`) and
+                // writes `scaled` — the same `source` the bind group binds.
+                let (src_buf, src_off) = (final_buf.0.clone(), final_buf.1);
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_scale(),
+                        &[
+                            (0, Storage, src_buf, src_off, nb4),
+                            (1, Storage, sres.scaled.clone(), sres.scaled_offset, nb4),
+                            (2, Uniform, sres.meta_buf.clone(), 0, 16),
+                        ],
+                        [embd_wg, 1, 1],
+                    )
+                });
             }
             final_buf = (&sres.scaled, sres.scaled_offset);
         }
@@ -5226,7 +6255,7 @@ impl VulkanBackend {
 
         let q_buf = self.upload_new(q);
         let out_buf = self.scratch_buffer(n_head * head_dim);
-        let k_num = attn_split_k();
+        let k_num = self.attn_split_k;
         let partial_ml = self.scratch_buffer(n_head * k_num as usize * 2);
         let partial_acc = self.scratch_buffer(n_head * k_num as usize * head_dim);
 
@@ -5408,6 +6437,8 @@ impl VulkanBackend {
                     bg,
                     meta_buf,
                     wg: input.n_head_kv as u32,
+                    k_norm_w,
+                    k_ff,
                 }
             } else {
                 let k_norm_w = self.upload_new(proj.k_norm);
@@ -5459,16 +6490,52 @@ impl VulkanBackend {
                 k_norm_rope,
                 v_scratch,
                 v_norm_bg,
+                v_norm_meta,
                 v_norm_wg: input.n_head_kv as u32,
             })
         } else {
             None
         };
 
+        // Build shared-input Q/K/V projection matmul bind groups that
+        // read `normed` (the attn-norm output) directly, so the Q/K/V matmuls
+        // skip the `normed → {q,k,v}.x` copy — same trick as the FFN gate/up and
+        // PLE. Only on the non-MMVQ decode path (GPU `normed`); MMVQ quantizes
+        // `x_buffer` in place so it keeps the copy.
+        let shared_input =
+            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+        let (bg_wq_matmul, bg_wk_matmul, bg_wv_matmul) = match (shared_input, input.normed) {
+            (true, GpuInput::Gpu(nb, noff)) => {
+                let noff_b = (noff as u64) * 4;
+                let n_embd_b = (input.wq.in_dim as u64) * 4;
+                let wq_bg =
+                    Some(self.matmul_bind_group_with_input(input.wq, nb, noff_b, n_embd_b, wq_g));
+                let wk_bg = match (input.kv.as_ref(), wk_g) {
+                    (Some(proj), Some(g)) => {
+                        Some(self.matmul_bind_group_with_input(proj.wk, nb, noff_b, n_embd_b, g))
+                    }
+                    _ => None,
+                };
+                let wv_bg = match (input.kv.as_ref().and_then(|p| p.wv), wv_g) {
+                    (Some(w), Some(g)) => {
+                        Some(self.matmul_bind_group_with_input(w, nb, noff_b, n_embd_b, g))
+                    }
+                    _ => None,
+                };
+                (wq_bg, wk_bg, wv_bg)
+            }
+            _ => (None, None, None),
+        };
+
         FusedAttnLayerResources {
+            bg_wq_matmul,
+            bg_wk_matmul,
+            bg_wv_matmul,
             q_norm_rope_bg,
             q_norm_rope_meta_buf,
             q_norm_rope_wg,
+            q_norm_w,
+            q_ff,
             kv,
         }
     }
@@ -5567,7 +6634,12 @@ impl VulkanBackend {
         // design was budgeted. Every other head_dim stays on the proven split
         // kernel.
         let use_flash = self.flash_attn && hd == 512;
-        let source = if use_flash {
+        // The cooperative-reduction kernel needs `head_dim % 32 == 0` (gemma's
+        // 512/256 qualify). It supersedes flash when both are requested.
+        let use_coop = self.attn_coop && hd.is_multiple_of(32);
+        let source = if use_coop {
+            vulkan_shaders::shader_source_attention_split_coop(self.kv_storage, hd)
+        } else if use_flash {
             vulkan_shaders::shader_source_attention_split_flash(
                 self.kv_storage,
                 self.subgroup_reduce,
@@ -5605,6 +6677,53 @@ impl VulkanBackend {
     /// chain in one submission instead of three. See `fused_attention`'s
     /// own doc comment for the full ordering rationale — identical here,
     /// just without the final `queue.submit`/map/read.
+    /// Starts capturing the fused decode recording into a [`CaptureStep`] list
+    /// (raw-Vulkan replay). Until [`Self::take_decode_capture`],
+    /// every dispatch/copy the fused path records is mirrored as a capture step
+    /// reading the same buffers it binds.
+    // Used by the replay cross-checks now; the production decode loop will call
+    // these once the whole forward is captured.
+    #[allow(dead_code)]
+    pub(crate) fn begin_decode_capture(&self) {
+        DECODE_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Ends capture on this thread and returns the accumulated steps (`None` if
+    /// capture was never begun on this thread).
+    #[allow(dead_code)]
+    pub(crate) fn take_decode_capture(&self) -> Option<Vec<vulkan_replay::CaptureStep>> {
+        DECODE_CAPTURE.with(|c| c.borrow_mut().take())
+    }
+
+    /// Appends a capture step, but only while a capture is active on this thread
+    /// — a cheap thread-local borrow on the normal path, and the `CaptureStep`
+    /// (buffer clones + WGSL) is built lazily via `make` only when capturing.
+    fn capture_push(&self, make: impl FnOnce() -> vulkan_replay::CaptureStep) {
+        DECODE_CAPTURE.with(|c| {
+            if let Some(steps) = c.borrow_mut().as_mut() {
+                steps.push(make());
+            }
+        });
+    }
+
+    /// Split-k factor for one decode attention dispatch, adapted to this token's
+    /// KV range `n_pos`. `self.attn_split_k` is the cap (32 for the cooperative
+    /// kernel, `ATTN_SPLIT_K_DEFAULT` classic). At a very short KV range the
+    /// fixed per-split cost — the phase-2 merge over `k_num` partials and the
+    /// `n_head * k_num` workgroup launches — outweighs the trivial phase-1 work,
+    /// so drop to fewer splits below a measured threshold; at `n_pos >= 128` the
+    /// extra splits pay off (coop measures `k32` strictly `>= k8`/`k16` there,
+    /// but slower than `k8` below it). The scratch buffers are always
+    /// sized for the cap, so a smaller `k_num` just leaves their tail unused.
+    /// An explicit `ORANGU_ATTN_SPLIT_K` pins the cap and is honoured as-is.
+    fn adaptive_split_k(&self, n_pos: u32) -> u32 {
+        if self.attn_split_k_pinned || n_pos >= 128 {
+            self.attn_split_k
+        } else {
+            8.min(self.attn_split_k)
+        }
+    }
+
     fn record_fused_attention(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -5632,12 +6751,24 @@ impl VulkanBackend {
             .as_ref()
             .map(|e| e.lock().expect("op cache entry poisoned"));
 
-        self.upload_or_copy(encoder, &wq_g.x_buffer, wq_g.x_offset, input.normed, n_embd);
-        if let Some(g) = &wk_g {
-            self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
-        }
-        if let Some(g) = &wv_g {
-            self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
+        // When the Q/K/V matmuls read `normed` directly (shared-input,
+        // built in the cached layer resources on the non-MMVQ GPU path), skip
+        // the `normed → {q,k,v}.x` copies. Otherwise (MMVQ / CPU input) copy.
+        let attn_shared = !self.q4_k_mmvq
+            && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none()
+            && matches!(input.normed, GpuInput::Gpu(..));
+        let normed_gpu: Option<(&wgpu::Buffer, u64)> = match &input.normed {
+            GpuInput::Gpu(b, o) => Some((*b, (*o as u64) * 4)),
+            GpuInput::Cpu(_) => None,
+        };
+        if !attn_shared {
+            self.upload_or_copy(encoder, &wq_g.x_buffer, wq_g.x_offset, input.normed, n_embd);
+            if let Some(g) = &wk_g {
+                self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
+            }
+            if let Some(g) = &wv_g {
+                self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
+            }
         }
 
         let layer =
@@ -5660,6 +6791,7 @@ impl VulkanBackend {
             eps,
             pos,
             window_start,
+            window,
             scale,
             cache,
             batch_slot: _,
@@ -5837,13 +6969,13 @@ impl VulkanBackend {
             let split = self.attn_split.then(|| {
                 let partial_ml = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention split partial m/l"),
-                    size: (n_head as u64) * (attn_split_k() as u64) * 2 * 4,
+                    size: (n_head as u64) * (self.attn_split_k as u64) * 2 * 4,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
                 let partial_acc = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention split partial acc"),
-                    size: (n_head as u64) * (attn_split_k() as u64) * (head_dim as u64) * 4,
+                    size: (n_head as u64) * (self.attn_split_k as u64) * (head_dim as u64) * 4,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
@@ -5896,6 +7028,8 @@ impl VulkanBackend {
                     split_meta_buf,
                     reduce_bind_group,
                     reduce_meta_buf,
+                    partial_ml,
+                    partial_acc,
                 }
             });
             cache.set_attn_dispatch(
@@ -5929,6 +7063,8 @@ impl VulkanBackend {
             }),
         );
         if let Some(split) = &dispatch.split {
+            let n_pos = (pos - window_start + 1) as u32;
+            let split_k = self.adaptive_split_k(n_pos);
             self.queue.write_buffer(
                 &split.split_meta_buf,
                 0,
@@ -5937,8 +7073,8 @@ impl VulkanBackend {
                     n_head_kv: n_head_kv as u32,
                     head_dim: head_dim as u32,
                     window_start: window_start as u32,
-                    n_pos: (pos - window_start + 1) as u32,
-                    k_num: attn_split_k(),
+                    n_pos,
+                    k_num: split_k,
                     scale,
                     _pad: 0,
                 }),
@@ -5948,7 +7084,7 @@ impl VulkanBackend {
                 0,
                 bytemuck::bytes_of(&AttnReduceMeta {
                     head_dim: head_dim as u32,
-                    k_num: attn_split_k(),
+                    k_num: split_k,
                     _pad0: 0,
                     _pad1: 0,
                 }),
@@ -5980,19 +7116,59 @@ impl VulkanBackend {
                 label: Some("orangu-server fused attention qkv+qnormrope+knormrope pass"),
                 timestamp_writes: None,
             });
-            self.record_matmul(&mut pass, wq, &wq_g);
+            match &layer.bg_wq_matmul {
+                Some(bg) => {
+                    let (nb, no) = normed_gpu.expect("bg_wq_matmul implies GPU normed");
+                    self.record_matmul_shared_input(&mut pass, wq, &wq_g, bg, nb, no);
+                }
+                None => self.record_matmul(&mut pass, wq, &wq_g),
+            }
             if let (Some(proj), Some(wk_guard)) = (&kv, &wk_g) {
-                self.record_matmul(&mut pass, proj.wk, wk_guard);
+                match &layer.bg_wk_matmul {
+                    Some(bg) => {
+                        let (nb, no) = normed_gpu.expect("bg_wk_matmul implies GPU normed");
+                        self.record_matmul_shared_input(&mut pass, proj.wk, wk_guard, bg, nb, no);
+                    }
+                    None => self.record_matmul(&mut pass, proj.wk, wk_guard),
+                }
             }
             if let (Some(proj), Some(wv_guard)) = (&kv, &wv_g)
                 && proj.wv.is_some()
             {
-                self.record_matmul(&mut pass, proj.wv.unwrap(), wv_guard);
+                match &layer.bg_wv_matmul {
+                    Some(bg) => {
+                        let (nb, no) = normed_gpu.expect("bg_wv_matmul implies GPU normed");
+                        self.record_matmul_shared_input(
+                            &mut pass,
+                            proj.wv.unwrap(),
+                            wv_guard,
+                            bg,
+                            nb,
+                            no,
+                        );
+                    }
+                    None => self.record_matmul(&mut pass, proj.wv.unwrap(), wv_guard),
+                }
             }
 
             pass.set_pipeline(&self.fused_norm_rope_pipeline);
             pass.set_bind_group(0, &layer.q_norm_rope_bg, &[]);
             pass.dispatch_workgroups(layer.q_norm_rope_wg, 1, 1);
+            self.capture_push(|| {
+                fused_norm_rope_capture_step(
+                    &layer.q_norm_w,
+                    &layer.q_ff,
+                    &wq_g.output_buffer,
+                    wq_g.output_offset,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    pos,
+                    rope_freq_base,
+                    eps,
+                    layer.q_norm_rope_wg,
+                )
+            });
 
             // K's own norm(+RoPE, when fused — `KNormRope::Fused` is only
             // reachable when this layer owns its own V projection, so
@@ -6001,10 +7177,33 @@ impl VulkanBackend {
             // RoPE waits for pass B below, same as before this fusion.
             if let Some(kv_res) = &layer.kv {
                 match &kv_res.k_norm_rope {
-                    KNormRope::Fused { bg, wg, .. } => {
+                    KNormRope::Fused {
+                        bg,
+                        wg,
+                        k_norm_w,
+                        k_ff,
+                        meta_buf: _,
+                    } => {
                         pass.set_pipeline(&self.fused_norm_rope_pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(*wg, 1, 1);
+                        if let Some(wk_guard) = &wk_g {
+                            self.capture_push(|| {
+                                fused_norm_rope_capture_step(
+                                    k_norm_w,
+                                    k_ff,
+                                    &wk_guard.output_buffer,
+                                    wk_guard.output_offset,
+                                    n_head_kv,
+                                    head_dim,
+                                    rope_dim,
+                                    pos,
+                                    rope_freq_base,
+                                    eps,
+                                    *wg,
+                                )
+                            });
+                        }
                     }
                     KNormRope::Split {
                         k_norm_bg,
@@ -6047,6 +7246,37 @@ impl VulkanBackend {
             pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
             pass.set_bind_group(0, &kv_res.v_norm_bg, &[]);
             pass.dispatch_workgroups(kv_res.v_norm_wg, 1, 1);
+            self.capture_push(|| {
+                use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
+                // elem2: b0 = V projection (in-place), b1 = PerHeadNormMeta.
+                let (v_buf, v_off) = match &wv_g {
+                    Some(g) => (g.output_buffer.clone(), g.output_offset),
+                    None => (kv_res.v_scratch.as_ref().unwrap().clone(), 0),
+                };
+                CaptureStep::Dispatch {
+                    wgsl: vulkan_shaders::shader_source_perhead_rmsnorm_weightless(
+                        self.subgroup_reduce,
+                    ),
+                    bindings: vec![
+                        CaptureBinding {
+                            binding: 0,
+                            kind: DescriptorKind::Storage,
+                            buffer: v_buf,
+                            offset: v_off,
+                            size: (kv_dim as u64) * 4,
+                        },
+                        CaptureBinding {
+                            binding: 1,
+                            kind: DescriptorKind::Uniform,
+                            buffer: kv_res.v_norm_meta.clone(),
+                            offset: 0,
+                            size: std::mem::size_of::<PerHeadNormMeta>() as u64,
+                        },
+                    ],
+                    per_token: Vec::new(),
+                    groups: [kv_res.v_norm_wg, 1, 1],
+                }
+            });
 
             if let KNormRope::Split {
                 k_rope_bg,
@@ -6076,7 +7306,7 @@ impl VulkanBackend {
                         len: kv_dim as u32,
                         _pad0: offset,
                         extra: 0.0,
-                        _pad1: 0,
+                        out_scale: 0.0,
                     };
                     let k_cast = dispatch
                         .k_cast
@@ -6104,6 +7334,27 @@ impl VulkanBackend {
                     pass.dispatch_workgroups(wg, 1, 1);
                     pass.set_bind_group(0, &v_cast.bind_group, &[]);
                     pass.dispatch_workgroups(wg, 1, 1);
+                    self.capture_push(|| {
+                        kv_cast_capture_step(
+                            &wk_guard.output_buffer,
+                            wk_guard.output_offset,
+                            &k_buf,
+                            k_off,
+                            k_size,
+                            kv_dim,
+                            write_pos,
+                            wg,
+                        )
+                    });
+                    let (v_src, v_src_off) = match &wv_g {
+                        Some(g) => (g.output_buffer.clone(), g.output_offset),
+                        None => (kv_res.v_scratch.as_ref().unwrap().clone(), 0),
+                    };
+                    self.capture_push(|| {
+                        kv_cast_capture_step(
+                            &v_src, v_src_off, &v_buf, v_off, v_size, kv_dim, write_pos, wg,
+                        )
+                    });
                 }
                 vulkan_shaders::KvStorage::Q8_0 => {
                     let n_blocks = (kv_dim as u32) / 32;
@@ -6112,7 +7363,7 @@ impl VulkanBackend {
                         len: n_blocks,
                         _pad0: dst_block_offset,
                         extra: 0.0,
-                        _pad1: 0,
+                        out_scale: 0.0,
                     };
                     let k_cast = dispatch
                         .k_cast
@@ -6202,10 +7453,60 @@ impl VulkanBackend {
             });
             pass.set_pipeline(&split_pipeline);
             pass.set_bind_group(0, &split.split_bind_group, &[]);
-            pass.dispatch_workgroups(phase1_x, attn_split_k(), 1);
+            // Must match the `k_num` written into the split/reduce metas above.
+            let split_k = self.adaptive_split_k((pos - window_start + 1) as u32);
+            pass.dispatch_workgroups(phase1_x, split_k, 1);
             pass.set_pipeline(&self.attn_split_reduce_pipeline);
             pass.set_bind_group(0, &split.reduce_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
+            // Capture the split or coop kernel (flash needs head_dim 512; GQA
+            // rewrites the kernel/grid — both excluded, they're opt-in). Coop is
+            // the default when it applies, so the capture must match it.
+            let use_flash = self.flash_attn && head_dim == 512;
+            let use_gqa = self.attn_gqa && group > 1;
+            let use_coop = self.attn_coop && head_dim.is_multiple_of(32) && !use_flash && !use_gqa;
+            if !use_flash && !use_gqa {
+                let k_num = self.attn_split_k;
+                self.capture_push(|| {
+                    attn_split_capture_step(
+                        &wq_g.output_buffer,
+                        wq_g.output_offset,
+                        &k_buf,
+                        k_off,
+                        k_size,
+                        &v_buf,
+                        v_off,
+                        v_size,
+                        &split.partial_ml,
+                        &split.partial_acc,
+                        self.kv_storage,
+                        self.subgroup_reduce,
+                        use_coop,
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        window_start,
+                        pos,
+                        k_num,
+                        scale,
+                        phase1_x,
+                        // `Some(n_swa)` on SWA layers (recompute the sliding
+                        // window's `n_pos`/`window_start` each token), `None` on
+                        // full-attention layers — threaded from the decode loop.
+                        window,
+                    )
+                });
+                self.capture_push(|| {
+                    attn_reduce_capture_step(
+                        &split.partial_ml,
+                        &split.partial_acc,
+                        &dispatch.out_buf,
+                        n_head,
+                        head_dim,
+                        k_num,
+                    )
+                });
+            }
         } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused attention pass"),
@@ -6334,6 +7635,8 @@ impl VulkanBackend {
             normed_buf,
             normed_buf_offset,
             attn_norm_bg,
+            attn_norm_w,
+            attn_norm_meta: meta,
         }
     }
 
@@ -6424,6 +7727,7 @@ impl VulkanBackend {
             eps,
             pos,
             window_start,
+            window,
             scale,
             cache,
             wo,
@@ -6450,6 +7754,45 @@ impl VulkanBackend {
             pass.set_bind_group(0, &layer_res.attn_norm_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
+        self.capture_push(|| {
+            use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
+            let nb = (n_embd as u64) * 4;
+            CaptureStep::Dispatch {
+                wgsl: vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                bindings: vec![
+                    CaptureBinding {
+                        binding: 0,
+                        kind: DescriptorKind::Storage,
+                        buffer: layer_res.x_buf.clone(),
+                        offset: layer_res.x_buf_offset,
+                        size: nb,
+                    },
+                    CaptureBinding {
+                        binding: 1,
+                        kind: DescriptorKind::Storage,
+                        buffer: layer_res.attn_norm_w.clone(),
+                        offset: 0,
+                        size: nb,
+                    },
+                    CaptureBinding {
+                        binding: 2,
+                        kind: DescriptorKind::Storage,
+                        buffer: layer_res.normed_buf.clone(),
+                        offset: layer_res.normed_buf_offset,
+                        size: nb,
+                    },
+                    CaptureBinding {
+                        binding: 3,
+                        kind: DescriptorKind::Uniform,
+                        buffer: layer_res.attn_norm_meta.clone(),
+                        offset: 0,
+                        size: std::mem::size_of::<ElemMeta>() as u64,
+                    },
+                ],
+                per_token: Vec::new(),
+                groups: [1, 1, 1],
+            }
+        });
 
         let attn_out_buf = self.record_fused_attention(
             encoder,
@@ -6470,6 +7813,7 @@ impl VulkanBackend {
                 eps,
                 pos,
                 window_start,
+                window,
                 scale,
                 cache,
                 batch_slot,
@@ -6562,6 +7906,20 @@ impl VulkanBackend {
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
+        self.capture_push(|| {
+            use vulkan_replay::DescriptorKind::{Storage, Uniform};
+            let nb4 = (n_embd as u64) * 4;
+            static_capture_step(
+                vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                &[
+                    (0, Storage, x_buf.clone(), 0, nb4),
+                    (1, Storage, weight_buf.clone(), 0, nb4),
+                    (2, Storage, out_buf.clone(), 0, nb4),
+                    (3, Uniform, meta.clone(), 0, 16),
+                ],
+                [1, 1, 1],
+            )
+        });
         out_buf
     }
 
@@ -6965,7 +8323,7 @@ impl VulkanBackend {
         // ffn-side (the whole post-attention chain: wo/gate/up/down matmuls,
         // their norms, GELU/mul, PLE, scale, and the staging copies).
         // `qkv` and `ffn` are matmul-heavy; `attn` is the one clean,
-        // non-matmul, context-growing number Step 9 targets.
+        // non-matmul, context-growing number.
         let (mut qkv_ms, mut attn_ms, mut ffn_ms) = (0.0, 0.0, 0.0);
         for il in 0..n_layer {
             let before = 3 + n_layer + 2 * il;
@@ -7095,6 +8453,75 @@ impl VulkanBackend {
             pass.set_pipeline(&self.scale_pipeline);
             pass.set_bind_group(0, &bg_scale2, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
+        }
+        // Raw-Vulkan replay capture: the proj matmul self-captures
+        // (`record_matmul`); mirror the four elementwise/norm dispatches here in
+        // execution order, and register `gathered` as this token's second host
+        // input (the `x` upload above was captured as `EmbeddingX` by
+        // `upload_or_copy`). `scaled`/`summed`/`final_buf`/`norm_w`/the metas are
+        // fresh per call but kept alive by the capture's buffer clones.
+        {
+            use vulkan_replay::DescriptorKind::{Storage, Uniform};
+            let tb4 = (total as u64) * 4;
+            let pb4 = (per_layer as u64) * 4;
+            let out_bytes = proj_g.output_len;
+            self.capture_push(|| vulkan_replay::CaptureStep::HostInput {
+                tag: vulkan_replay::HostInputTag::Gathered,
+                buffer: gathered_buf.clone(),
+                offset: 0,
+                size: tb4,
+            });
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_scale(),
+                    &[
+                        (
+                            0,
+                            Storage,
+                            proj_g.output_buffer.clone(),
+                            proj_g.output_offset,
+                            out_bytes,
+                        ),
+                        (1, Storage, scaled.clone(), 0, tb4),
+                        (2, Uniform, meta_scale1.clone(), 0, 16),
+                    ],
+                    [wg, 1, 1],
+                )
+            });
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_perhead_rmsnorm(self.subgroup_reduce),
+                    &[
+                        (0, Storage, norm_w.clone(), 0, pb4),
+                        (1, Storage, scaled.clone(), 0, tb4),
+                        (2, Uniform, norm_meta_buf.clone(), 0, 16),
+                    ],
+                    [n_layer as u32, 1, 1],
+                )
+            });
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_add(),
+                    &[
+                        (0, Storage, scaled.clone(), 0, tb4),
+                        (1, Storage, gathered_buf.clone(), 0, tb4),
+                        (2, Storage, summed.clone(), 0, tb4),
+                        (3, Uniform, meta_add.clone(), 0, 16),
+                    ],
+                    [wg, 1, 1],
+                )
+            });
+            self.capture_push(|| {
+                static_capture_step(
+                    vulkan_shaders::shader_source_scale(),
+                    &[
+                        (0, Storage, summed.clone(), 0, tb4),
+                        (1, Storage, final_buf.clone(), 0, tb4),
+                        (2, Uniform, meta_scale2.clone(), 0, 16),
+                    ],
+                    [wg, 1, 1],
+                )
+            });
         }
         final_buf
     }
@@ -7351,23 +8778,54 @@ struct FusedPleResources {
     /// fixed once built.
     per_layer_buf: wgpu::Buffer,
     per_layer_buf_offset: u64,
-    /// Only ever read by `bg_mul` (built once, at cache-build time) — kept
-    /// as a field purely to keep the underlying GPU buffer alive for as
-    /// long as `bg_mul` references it, not because Rust code reads it
-    /// again later.
-    #[allow(dead_code)]
-    gelu_out: wgpu::Buffer,
-    mulled: wgpu::Buffer,
+    /// Split gelu→mul fallback scratch — allocated (`Some`) only when the
+    /// fused gelu·mul is off (MMVQ / `ORANGU_NO_FUSED_GELU_MUL`); `None` on the
+    /// default fused path, which writes `ple_proj.x` directly. Read only by
+    /// `bg_gelu`/`bg_mul`, kept to hold the buffers alive and name them at
+    /// capture time.
+    gelu_out: Option<wgpu::Buffer>,
+    gelu_out_offset: u64,
+    mulled: Option<wgpu::Buffer>,
     mulled_offset: u64,
-    /// Same reasoning as `gelu_out` above — read only by `bg_add`.
-    #[allow(dead_code)]
-    normed: wgpu::Buffer,
+    /// Split rmsnorm→add fallback scratch — allocated (`Some`) only when
+    /// `ORANGU_NO_FUSED_PLE_POSTNORM`; `None` on the default fused path, which
+    /// writes `x3` directly via `rmsnorm_add`. Read only by `bg_post_norm`/
+    /// `bg_add`.
+    normed: Option<wgpu::Buffer>,
+    normed_offset: u64,
     x3: wgpu::Buffer,
     x3_offset: u64,
-    bg_gelu: wgpu::BindGroup,
-    bg_mul: wgpu::BindGroup,
-    bg_post_norm: wgpu::BindGroup,
-    bg_add: wgpu::BindGroup,
+    /// PLE's own `post_norm` RMSNorm weight and the plain (`extra = 0`)
+    /// elementwise meta — owned by the bind groups above, but also cloned into
+    /// the raw-replay capture, so kept as fields to hold their buffers alive and
+    /// to name them at capture time.
+    post_norm_w: wgpu::Buffer,
+    meta_plain: wgpu::Buffer,
+    /// Split gelu→mul fallback bind groups — `Some` iff `gelu_out`/`mulled` are
+    /// (i.e. the fused gelu·mul is off).
+    bg_gelu: Option<wgpu::BindGroup>,
+    bg_mul: Option<wgpu::BindGroup>,
+    /// Fused PLE gelu·mul (writes `ple_proj.x` directly) + shared-input
+    /// `ple_gate` matmul (reads `x2` directly). `Some` on the non-MMVQ path;
+    /// when set, the record path skips the two PLE copies + the separate mul.
+    bg_gelu_mul: Option<wgpu::BindGroup>,
+    bg_ple_gate_matmul: Option<wgpu::BindGroup>,
+    /// Fused PLE post-projection RMSNorm+residual-add (`rmsnorm_add`,
+    /// `x3 = rmsnorm(ple_proj)*post_norm_w + x2`). `Some` unless
+    /// `ORANGU_NO_FUSED_PLE_POSTNORM`; when set, the record path replaces the
+    /// separate `bg_post_norm` RMSNorm + `bg_add` with one dispatch.
+    bg_post_norm_add: Option<wgpu::BindGroup>,
+    /// The `out_scale`-carrying meta for `bg_post_norm_add` when this layer
+    /// also folds `layer_output_scale` in (`post_norm_add_scaled`). Owned here
+    /// to hold the buffer alive and to name it at capture time.
+    meta_post_norm_scaled: Option<wgpu::Buffer>,
+    /// `true` when `bg_post_norm_add` uses the `rmsnorm_add_scale` pipeline
+    /// (folds `layer_output_scale`) instead of plain `rmsnorm_add`.
+    post_norm_add_scaled: bool,
+    /// Split rmsnorm→add fallback bind groups — `Some` iff `normed` is (i.e.
+    /// `ORANGU_NO_FUSED_PLE_POSTNORM`).
+    bg_post_norm: Option<wgpu::BindGroup>,
+    bg_add: Option<wgpu::BindGroup>,
     wg: u32,
 }
 
@@ -7376,7 +8834,282 @@ struct FusedScaleResources {
     /// A `VulkanBackend::fused_scale_arena` chunk.
     scaled: wgpu::Buffer,
     scaled_offset: u64,
+    /// The `ElemMeta` holding `layer_output_scale` — owned by `bg`, kept as a
+    /// field so the raw-replay capture can bind it.
+    meta_buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
+}
+
+/// Builds the raw-Vulkan replay [`CaptureStep`] for a fused per-head
+/// norm+RoPE dispatch (Q or K). elem4 layout: b0 = norm weight, b1 =
+/// freq-factors, b2 = the projection buffer (RoPE'd in place), b3 = a per-token
+/// `FusedNormRopeMeta` whose only per-token field is `pos` (byte 12). `n_head`
+/// is this dispatch's head count (`n_head` for Q, `n_head_kv` for K).
+#[allow(clippy::too_many_arguments)]
+fn fused_norm_rope_capture_step(
+    norm_w: &wgpu::Buffer,
+    freq_factors: &wgpu::Buffer,
+    proj: &wgpu::Buffer,
+    proj_offset: u64,
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    eps: f32,
+    wg: u32,
+) -> vulkan_replay::CaptureStep {
+    use vulkan_replay::{
+        CaptureBinding, CaptureStep, DescriptorKind, PerTokenBinding, PerTokenField,
+    };
+    // FusedNormRopeMeta { n_head, head_dim, rope_dim, pos, freq_base, eps, _, _ }.
+    let mut meta = [0u8; 32];
+    meta[0..4].copy_from_slice(&(n_head as u32).to_ne_bytes());
+    meta[4..8].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+    meta[8..12].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+    meta[12..16].copy_from_slice(&(pos as u32).to_ne_bytes());
+    meta[16..20].copy_from_slice(&freq_base.to_ne_bytes());
+    meta[20..24].copy_from_slice(&eps.to_ne_bytes());
+    CaptureStep::Dispatch {
+        wgsl: vulkan_shaders::shader_source_fused_norm_rope(),
+        bindings: vec![
+            CaptureBinding {
+                binding: 0,
+                kind: DescriptorKind::Storage,
+                buffer: norm_w.clone(),
+                offset: 0,
+                size: (head_dim as u64) * 4,
+            },
+            CaptureBinding {
+                binding: 1,
+                kind: DescriptorKind::Storage,
+                buffer: freq_factors.clone(),
+                offset: 0,
+                size: ((rope_dim / 2) as u64) * 4,
+            },
+            CaptureBinding {
+                binding: 2,
+                kind: DescriptorKind::Storage,
+                buffer: proj.clone(),
+                offset: proj_offset,
+                size: (n_head * head_dim) as u64 * 4,
+            },
+        ],
+        per_token: vec![PerTokenBinding {
+            binding: 3,
+            init_bytes: meta.to_vec(),
+            fields: vec![PerTokenField::Pos { byte_offset: 12 }],
+        }],
+        groups: [wg, 1, 1],
+    }
+}
+
+/// Builds the raw-Vulkan replay [`CaptureStep`] for an F16 KV-cast dispatch
+/// (K or V). elem3 layout: b0 = the f32 projection source, b1 = the KV buffer's
+/// K/V region (the cast writes this token's f16 K/V into it), b2 = a per-token
+/// `ElemMeta` whose `_pad0` (byte 4) is the element write offset `write_pos *
+/// kv_dim`.
+#[allow(clippy::too_many_arguments)]
+fn kv_cast_capture_step(
+    source: &wgpu::Buffer,
+    source_offset: u64,
+    dest: &wgpu::Buffer,
+    dest_offset: u64,
+    dest_size: u64,
+    kv_dim: usize,
+    write_pos: usize,
+    wg: u32,
+) -> vulkan_replay::CaptureStep {
+    use vulkan_replay::{
+        CaptureBinding, CaptureStep, DescriptorKind, PerTokenBinding, PerTokenField,
+    };
+    // ElemMeta { len = kv_dim, _pad0 = write_pos * kv_dim, extra, _pad1 }.
+    let mut meta = [0u8; 16];
+    meta[0..4].copy_from_slice(&(kv_dim as u32).to_ne_bytes());
+    meta[4..8].copy_from_slice(&((write_pos * kv_dim) as u32).to_ne_bytes());
+    CaptureStep::Dispatch {
+        wgsl: vulkan_shaders::shader_source_kv_cast(),
+        bindings: vec![
+            CaptureBinding {
+                binding: 0,
+                kind: DescriptorKind::Storage,
+                buffer: source.clone(),
+                offset: source_offset,
+                size: (kv_dim as u64) * 4,
+            },
+            CaptureBinding {
+                binding: 1,
+                kind: DescriptorKind::Storage,
+                buffer: dest.clone(),
+                offset: dest_offset,
+                size: dest_size,
+            },
+        ],
+        per_token: vec![PerTokenBinding {
+            binding: 2,
+            init_bytes: meta.to_vec(),
+            fields: vec![PerTokenField::KvWriteOffset {
+                byte_offset: 4,
+                kv_dim: kv_dim as u32,
+            }],
+        }],
+        groups: [wg, 1, 1],
+    }
+}
+
+/// Builds a raw-Vulkan replay [`CaptureStep`] for a dispatch with only static
+/// uniforms (post-attention norm+add / gelu / mul). `bindings` is
+/// `(binding, kind, buffer, offset, size)` in binding order.
+fn static_capture_step(
+    wgsl: String,
+    bindings: &[(u32, vulkan_replay::DescriptorKind, wgpu::Buffer, u64, u64)],
+    groups: [u32; 3],
+) -> vulkan_replay::CaptureStep {
+    use vulkan_replay::{CaptureBinding, CaptureStep};
+    CaptureStep::Dispatch {
+        wgsl,
+        bindings: bindings
+            .iter()
+            .map(|(b, k, buf, off, sz)| CaptureBinding {
+                binding: *b,
+                kind: *k,
+                buffer: buf.clone(),
+                offset: *off,
+                size: *sz,
+            })
+            .collect(),
+        per_token: Vec::new(),
+        groups,
+    }
+}
+
+/// Builds the raw-Vulkan replay [`CaptureStep`] for split-k attention phase 1.
+/// 6-binding layout: b0 = Q (RoPE'd), b1 = K region, b2 = V region, b3/b4 =
+/// softmax partials, b5 = a per-token `AttnSplitMeta` whose `n_pos` (byte 16)
+/// and `window_start` (byte 12) change each token.
+#[allow(clippy::too_many_arguments)]
+fn attn_split_capture_step(
+    q: &wgpu::Buffer,
+    q_offset: u64,
+    k: &wgpu::Buffer,
+    k_offset: u64,
+    k_size: u64,
+    v: &wgpu::Buffer,
+    v_offset: u64,
+    v_size: u64,
+    partial_ml: &wgpu::Buffer,
+    partial_acc: &wgpu::Buffer,
+    kv_storage: vulkan_shaders::KvStorage,
+    subgroup: bool,
+    coop: bool,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    window_start: usize,
+    pos: usize,
+    k_num: u32,
+    scale: f32,
+    phase1_x: u32,
+    window: Option<u32>,
+) -> vulkan_replay::CaptureStep {
+    use vulkan_replay::{
+        CaptureBinding, CaptureStep, DescriptorKind, PerTokenBinding, PerTokenField,
+    };
+    let s = DescriptorKind::Storage;
+    let ml_size = (n_head as u64) * (k_num as u64) * 2 * 4;
+    let acc_size = (n_head as u64) * (k_num as u64) * (head_dim as u64) * 4;
+    let q_size = (n_head * head_dim) as u64 * 4;
+    // AttnSplitMeta { n_head, n_head_kv, head_dim, window_start, n_pos, k_num,
+    // scale, _pad }.
+    let mut meta = [0u8; 32];
+    meta[0..4].copy_from_slice(&(n_head as u32).to_ne_bytes());
+    meta[4..8].copy_from_slice(&(n_head_kv as u32).to_ne_bytes());
+    meta[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+    meta[12..16].copy_from_slice(&(window_start as u32).to_ne_bytes());
+    meta[16..20].copy_from_slice(&((pos - window_start + 1) as u32).to_ne_bytes());
+    meta[20..24].copy_from_slice(&k_num.to_ne_bytes());
+    meta[24..28].copy_from_slice(&scale.to_ne_bytes());
+    let cb = |binding, buffer: &wgpu::Buffer, offset, size| CaptureBinding {
+        binding,
+        kind: s,
+        buffer: buffer.clone(),
+        offset,
+        size,
+    };
+    CaptureStep::Dispatch {
+        wgsl: if coop {
+            vulkan_shaders::shader_source_attention_split_coop(kv_storage, head_dim as u32)
+        } else {
+            vulkan_shaders::shader_source_attention_split(kv_storage, subgroup, head_dim as u32)
+        },
+        bindings: vec![
+            cb(0, q, q_offset, q_size),
+            cb(1, k, k_offset, k_size),
+            cb(2, v, v_offset, v_size),
+            cb(3, partial_ml, 0, ml_size),
+            cb(4, partial_acc, 0, acc_size),
+        ],
+        per_token: vec![PerTokenBinding {
+            binding: 5,
+            init_bytes: meta.to_vec(),
+            fields: vec![
+                PerTokenField::NPos {
+                    byte_offset: 16,
+                    window,
+                },
+                PerTokenField::WindowStart {
+                    byte_offset: 12,
+                    window,
+                },
+            ],
+        }],
+        groups: [phase1_x, k_num, 1],
+    }
+}
+
+/// Builds the raw-Vulkan replay [`CaptureStep`] for split-k attention phase 2
+/// (reduce). elem4 layout: b0/b1 = partials, b2 = attention output, b3 = a
+/// static `AttnReduceMeta` (`head_dim`, `k_num`).
+fn attn_reduce_capture_step(
+    partial_ml: &wgpu::Buffer,
+    partial_acc: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    n_head: usize,
+    head_dim: usize,
+    k_num: u32,
+) -> vulkan_replay::CaptureStep {
+    use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind, PerTokenBinding};
+    let s = DescriptorKind::Storage;
+    let ml_size = (n_head as u64) * (k_num as u64) * 2 * 4;
+    let acc_size = (n_head as u64) * (k_num as u64) * (head_dim as u64) * 4;
+    let out_size = (n_head * head_dim) as u64 * 4;
+    // AttnReduceMeta { head_dim, k_num, _pad0, _pad1 } — static, no per-token
+    // fields, but carried as a per-token binding so `from_capture` owns a
+    // host-visible copy (no dependency on orangu's meta-buffer contents).
+    let mut meta = [0u8; 16];
+    meta[0..4].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+    meta[4..8].copy_from_slice(&k_num.to_ne_bytes());
+    let cb = |binding, buffer: &wgpu::Buffer, size| CaptureBinding {
+        binding,
+        kind: s,
+        buffer: buffer.clone(),
+        offset: 0,
+        size,
+    };
+    CaptureStep::Dispatch {
+        wgsl: vulkan_shaders::shader_source_attention_split_reduce(),
+        bindings: vec![
+            cb(0, partial_ml, ml_size),
+            cb(1, partial_acc, acc_size),
+            cb(2, out, out_size),
+        ],
+        per_token: vec![PerTokenBinding {
+            binding: 3,
+            init_bytes: meta.to_vec(),
+            fields: Vec::new(),
+        }],
+        groups: [n_head as u32, 1, 1],
+    }
 }
 
 /// One gemma4 layer's cached `fused_attention` resources that *don't*
@@ -7394,7 +9127,21 @@ struct FusedAttnLayerResources {
     q_norm_rope_bg: wgpu::BindGroup,
     q_norm_rope_meta_buf: wgpu::Buffer,
     q_norm_rope_wg: u32,
+    /// The static Q-norm weight and freq-factor buffers bound by
+    /// `q_norm_rope_bg` — exposed for the raw-Vulkan replay capture (the bind
+    /// group already keeps them alive). Only read by the replay path.
+    #[allow(dead_code)]
+    q_norm_w: wgpu::Buffer,
+    #[allow(dead_code)]
+    q_ff: wgpu::Buffer,
     kv: Option<FusedAttnKvLayerResources>,
+    /// Shared-input Q/K/V projection matmul bind groups that read the
+    /// attn-norm output (`normed_buf`) directly, dropping the up-to-3
+    /// `normed → {q,k,v}.x` copies. `Some` on the non-MMVQ path with a GPU
+    /// `normed` input (the decode path); `None` otherwise (falls back to copy).
+    bg_wq_matmul: Option<wgpu::BindGroup>,
+    bg_wk_matmul: Option<wgpu::BindGroup>,
+    bg_wv_matmul: Option<wgpu::BindGroup>,
 }
 
 /// [`FusedAttnLayerResources::kv`] — only present for layers that own
@@ -7409,6 +9156,11 @@ struct FusedAttnKvLayerResources {
     /// separate dispatches.
     v_scratch: Option<wgpu::Buffer>,
     v_norm_bg: wgpu::BindGroup,
+    /// The static `PerHeadNormMeta` uniform bound by `v_norm_bg` — exposed for
+    /// the raw-Vulkan replay capture; the bind group already keeps
+    /// it alive. Only read by the replay path.
+    #[allow(dead_code)]
+    v_norm_meta: wgpu::Buffer,
     v_norm_wg: u32,
 }
 
@@ -7436,6 +9188,12 @@ enum KNormRope {
         bg: wgpu::BindGroup,
         meta_buf: wgpu::Buffer,
         wg: u32,
+        /// Static K-norm weight + freq-factor buffers bound by `bg` — exposed
+        /// for the raw-Vulkan replay capture. Only read by the replay path.
+        #[allow(dead_code)]
+        k_norm_w: wgpu::Buffer,
+        #[allow(dead_code)]
+        k_ff: wgpu::Buffer,
     },
     Split {
         k_norm_bg: wgpu::BindGroup,
@@ -7463,6 +9221,16 @@ struct FusedLayerResources {
     normed_buf: wgpu::Buffer,
     normed_buf_offset: u64,
     attn_norm_bg: wgpu::BindGroup,
+    /// The `attn_norm` weight and `ElemMeta` uniform bound by `attn_norm_bg`.
+    /// The bind group already keeps them alive; they are kept as named fields
+    /// too so the raw-Vulkan replay path can enumerate the exact buffers this
+    /// dispatch binds (`vulkan_replay`) — the capture step. No
+    /// extra allocation: same buffer objects the bind group already holds.
+    /// Only read by the replay cross-check tests.
+    #[allow(dead_code)]
+    attn_norm_w: wgpu::Buffer,
+    #[allow(dead_code)]
+    attn_norm_meta: wgpu::Buffer,
 }
 
 /// One gemma4 layer's cached `fused_post_attention` resources — built once
@@ -7503,13 +9271,160 @@ struct FusedResources {
     x2_offset: u64,
     bg_attn_post_norm_add: wgpu::BindGroup,
     bg_ffn_norm: wgpu::BindGroup,
+    /// Copy elimination: shared-input matmul bind groups for the FFN
+    /// gate/up projections that read `ffn_normed` **directly** (read-only)
+    /// instead of a private `x_buffer` a copy had to fill. `Some` only on the
+    /// non-MMVQ path (MMVQ quantizes its `x_buffer` in place, so it keeps the
+    /// copy). When `Some`, `record_fused_post_attention` skips the
+    /// `ffn_normed → gate.x`/`→ up.x` copies entirely.
+    bg_gate_matmul: Option<wgpu::BindGroup>,
+    bg_up_matmul: Option<wgpu::BindGroup>,
     bg_gelu: wgpu::BindGroup,
     bg_mul: wgpu::BindGroup,
+    /// Fused GELU+multiply for the main FFN (`gelu_mul_pipeline`) —
+    /// `Some` unless `ORANGU_NO_FUSED_GELU_MUL=1`; when `Some`,
+    /// `record_fused_post_attention` runs one dispatch instead of `bg_gelu` then
+    /// `bg_mul`.
+    bg_gelu_mul: Option<wgpu::BindGroup>,
     bg_ffn_post_norm_add: wgpu::BindGroup,
+    /// Static weights / meta uniforms + arena offsets bound by the five
+    /// post-attention dispatches — exposed so the raw-Vulkan replay capture can
+    /// enumerate the exact buffers they bind (the bind groups already keep them
+    /// alive). Read only by the capture path.
+    attn_post_norm_w: wgpu::Buffer,
+    ffn_norm_w: wgpu::Buffer,
+    ffn_post_norm_w: wgpu::Buffer,
+    meta_embd_eps: wgpu::Buffer,
+    meta_ffn_plain: wgpu::Buffer,
+    x1_offset: u64,
+    gelu_out_offset: u64,
     ple: Option<FusedPleResources>,
     scale: Option<FusedScaleResources>,
     embd_wg: u32,
     ffn_wg: u32,
+}
+
+/// A single process-wide `VulkanBackend` for the whole test binary — shared by
+/// both this module's tests and `vulkan_replay`'s cross-checks, so the entire
+/// test run creates exactly one `wgpu::Instance`/`Device`. Multiple concurrent
+/// instances intermittently SIGSEGV below wgpu (see `tests::shared_vulkan`), so
+/// the replay tests must reuse this device rather than boot their own.
+#[cfg(test)]
+pub(crate) fn shared_test_backend() -> Option<&'static VulkanBackend> {
+    static BACKEND: std::sync::OnceLock<Option<VulkanBackend>> = std::sync::OnceLock::new();
+    BACKEND.get_or_init(VulkanBackend::try_init).as_ref()
+}
+
+impl VulkanBackend {
+    /// The underlying `wgpu::Device` — used by the raw-Vulkan replay path
+    /// (`ReplayContext::from_wgpu`) and, in tests, so the cross-checks bind the
+    /// same device the rest of the GPU tests use.
+    pub(crate) fn wgpu_device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The underlying `wgpu::Queue` — paired with [`Self::wgpu_device`].
+    pub(crate) fn wgpu_queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+}
+
+#[cfg(test)]
+impl VulkanBackend {
+    /// Test-only: build a layer's cached pre-attention resources so the replay
+    /// cross-checks can enumerate the exact buffers the `attn_norm` dispatch
+    /// binds. Returns `(x_buf, x_off, normed_buf, normed_off, weight, meta,
+    /// n_embd_bytes)` — the elem4 rmsnorm layout the raw path reproduces.
+    pub(crate) fn test_attn_norm_buffers(
+        &self,
+        n_embd: usize,
+        attn_norm: &[f32],
+        eps: f32,
+    ) -> AttnNormCaptureBuffers {
+        let res = self.build_fused_layer_resources(n_embd, attn_norm, eps);
+        AttnNormCaptureBuffers {
+            n_embd_bytes: (n_embd as u64) * 4,
+            x_off: res.x_buf_offset,
+            x_buf: res.x_buf,
+            normed_buf: res.normed_buf,
+            normed_off: res.normed_buf_offset,
+            weight: res.attn_norm_w,
+            meta: res.attn_norm_meta,
+        }
+    }
+
+    /// Test-only: place `w`'s bytes into the real [`WeightArena`] and return the
+    /// chunk buffer + offset + bound size — the exact `(buffer, offset, size)`
+    /// the matmul dispatch binds at binding 0. Lets the replay cross-check bind
+    /// orangu's genuine weight buffer (the one that dominates the BO list).
+    pub(crate) fn test_weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
+        self.weight_buffer(w)
+    }
+
+    /// Test-only: build `w`'s real decode (`n_tokens = 1`) matmul op resources
+    /// (`op_entry_for` → `CachedOpResources`) and return the genuine arena
+    /// activation input/output buffers + offsets + dispatch grid the fused path
+    /// binds — so the replay can chain a real `attn_norm → copy → projection`
+    /// through orangu's own arena buffers.
+    pub(crate) fn test_op_buffers(&self, w: &QuantMatrix) -> OpCaptureBuffers {
+        let entry = self.op_entry_for(w, 0);
+        let g = entry.lock().expect("op cache entry poisoned");
+        OpCaptureBuffers {
+            x_buffer: g.x_buffer.clone(),
+            x_offset: g.x_offset,
+            output_buffer: g.output_buffer.clone(),
+            output_offset: g.output_offset,
+            output_len: g.output_len,
+            workgroups: g.workgroups,
+        }
+    }
+
+    /// Test-only: `(reduce_n_rows, subgroup_reduce)` so the replay can compile
+    /// the *same* base reduce kernel and dispatch geometry orangu's default
+    /// `pipelines` map is built with.
+    pub(crate) fn test_reduce_config(&self) -> (usize, bool) {
+        (reduce_n_rows(), self.subgroup_reduce)
+    }
+
+    /// Test-only: split-k attention config `(kv_storage, subgroup_reduce,
+    /// attn_gqa, flash_attn, split_k)` so the replay compiles the same
+    /// `shader_source_attention_split` kernel and dispatch grid orangu uses.
+    pub(crate) fn test_attn_config(&self) -> (vulkan_shaders::KvStorage, bool, bool, bool, u32) {
+        (
+            self.kv_storage,
+            self.subgroup_reduce,
+            self.attn_gqa,
+            self.flash_attn,
+            self.attn_split_k,
+        )
+    }
+}
+
+/// The buffers backing one layer's `attn_norm` dispatch, handed to the
+/// raw-Vulkan replay cross-check. Test-only.
+#[cfg(test)]
+pub(crate) struct AttnNormCaptureBuffers {
+    pub n_embd_bytes: u64,
+    pub x_buf: wgpu::Buffer,
+    pub x_off: u64,
+    pub normed_buf: wgpu::Buffer,
+    pub normed_off: u64,
+    pub weight: wgpu::Buffer,
+    pub meta: wgpu::Buffer,
+}
+
+/// The genuine arena activation buffers + dispatch grid of one matmul op, for
+/// the replay cross-check. Test-only. The weight comes from
+/// [`VulkanBackend::test_weight_buffer`]; the `Meta` uniform the replay rebuilds
+/// host-side (its values are all known constants).
+#[cfg(test)]
+pub(crate) struct OpCaptureBuffers {
+    pub x_buffer: wgpu::Buffer,
+    pub x_offset: u64,
+    pub output_buffer: wgpu::Buffer,
+    pub output_offset: u64,
+    pub output_len: u64,
+    pub workgroups: (u32, u32, u32),
 }
 
 #[cfg(test)]
@@ -7521,7 +9436,6 @@ mod tests {
         GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K,
         GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
-    use std::sync::OnceLock;
 
     /// One `VulkanBackend` shared by every test in this module, rather
     /// than each test creating (and racing to create) its own. This
@@ -7542,8 +9456,10 @@ mod tests {
     /// is what this pool now proves); concurrent *creation* of several was
     /// not — and was never something the real server does anyway.
     fn shared_vulkan() -> Option<&'static VulkanBackend> {
-        static BACKEND: OnceLock<Option<VulkanBackend>> = OnceLock::new();
-        BACKEND.get_or_init(VulkanBackend::try_init).as_ref()
+        // Delegates to the module-level single shared backend so this module's
+        // tests and `vulkan_replay`'s share one `wgpu::Device` across the whole
+        // test binary (one instance, never several concurrently).
+        super::shared_test_backend()
     }
 
     /// Scratch measurement — NOT a correctness test, deleted once the
@@ -8039,7 +9955,7 @@ mod tests {
     /// variants: the default 6-round `workgroupBarrier` tree reduction, the
     /// existing 64-wide `subgroupAdd` reduction (the one an earlier
     /// same-session A/B measured as a real regression end-to-end), and a
-    /// new 32-wide `subgroupAdd` variant matching a common wave32
+    /// new 32-wide `subgroupAdd` variant matching a common 32-lane
     /// subgroup width, which (if the adapter's actual subgroup size is
     /// 32) lets each workgroup fit in exactly one subgroup, skipping the
     /// cross-subgroup merge the 64-wide variant always pays.
@@ -10665,6 +12581,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eps,
                 pos,
                 window_start,
+                window: None,
                 scale,
                 cache: &mut kv_cache.layers[0],
                 batch_slot: 0,
@@ -10825,6 +12742,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eps,
                 pos,
                 window_start,
+                window: None,
                 scale,
                 cache: &mut kv_cache.layers[0],
                 batch_slot: 0,
@@ -10979,6 +12897,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             eps,
             pos,
             window_start,
+            window: None,
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
@@ -11144,6 +13063,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             eps,
             pos: 0,
             window_start: 0,
+            window: None,
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
@@ -11184,6 +13104,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             eps,
             pos: 0,
             window_start: 0,
+            window: None,
             scale,
             cache: &mut kv_cache.layers[0],
             batch_slot: 0,
@@ -11390,6 +13311,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eps,
                 pos,
                 window_start,
+                window: None,
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &wo,
@@ -11673,6 +13595,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eps,
                 pos,
                 window_start: 0,
+                window: None,
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &l0.wo,
@@ -11711,6 +13634,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eps,
                 pos,
                 window_start: 0,
+                window: None,
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &l1.wo,

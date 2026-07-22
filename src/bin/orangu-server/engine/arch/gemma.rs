@@ -54,10 +54,54 @@ use super::{BatchDecodeItem, ForwardOutcome, GreedySampleParams, ModelForward};
 use crate::engine::backend::vulkan::{
     FusedAttnProjection, FusedLayerInput, FusedPle, GpuArgmaxSampleInput, GpuInput, VulkanBackend,
 };
+use crate::engine::backend::vulkan_replay::{
+    CaptureStep, ComputeProgram, ReplayContext, ReplayGraph,
+};
 use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
+use rayon::prelude::*;
+
+/// State for the opt-in raw-Vulkan decode replay path (`ORANGU_REPLAY`):
+/// the persistent command buffer captured from the first token's real
+/// recording, replayed every subsequent token with no `wgpu` submit on the
+/// forward itself. Built lazily on the first single-token decode.
+struct DecodeReplay {
+    ctx: ReplayContext,
+    graph: ReplayGraph,
+    /// Kept alive for the graph's lifetime (the persistent command buffer
+    /// references their pipelines/descriptor sets).
+    _programs: Vec<ComputeProgram>,
+    /// The captured op-list — kept alive because it holds `wgpu::Buffer` clones
+    /// of every buffer the graph's descriptor sets reference by raw handle.
+    /// Some (e.g. `output_norm`'s scratch buffers) live *only* here, not in
+    /// orangu's caches, so dropping this would free `VkBuffer`s still bound.
+    _captured_steps: Vec<CaptureStep>,
+    /// Every buffer the wgpu path fills from the scaled token embedding via a
+    /// `GpuInput::Cpu` upload (layer-0 input, and the PLE projection input for
+    /// PLE models) — this token's embedding is written to all of them each step.
+    /// Uncaptured as GPU ops (see [`vulkan_replay::HostInputTag`]).
+    embd_inputs: Vec<(wgpu::Buffer, u64)>,
+    /// PLE models only: the PLE projection's gathered per-layer-embedding input,
+    /// re-gathered and re-uploaded each token. Empty for non-PLE models.
+    gathered_inputs: Vec<(wgpu::Buffer, u64)>,
+    /// The `lm_head` output — read back after each `run_token` for sampling.
+    logits_buf: wgpu::Buffer,
+    logits_off: u64,
+    n_vocab: usize,
+    /// Identity of the `(KvCache, slot)` this graph was captured against — the
+    /// graph binds that request's KV-cache and op-cache buffers by raw handle,
+    /// so a different request (new cache object or slot) needs a fresh capture.
+    cache_ptr: usize,
+    slot_id: usize,
+    /// The position the next replayed token must be at (`start_pos` increments by
+    /// one per decode token within a sequence). A call whose `start_pos` isn't
+    /// this — a *new* request that reused the same pooled `(KvCache, slot)`, so
+    /// `cache_ptr` alone can't tell it apart — means the graph would replay at
+    /// positions it wasn't built for, so it's rebuilt. Updated each token.
+    expected_pos: usize,
+}
 
 struct GemmaLayer {
     attn_norm: Vec<f32>,
@@ -119,6 +163,9 @@ pub struct GemmaModel {
     per_layer_model_proj: Option<QuantMatrix>,
     per_layer_proj_norm: Option<Vec<f32>>,
     layers: Vec<GemmaLayer>,
+    /// Opt-in raw-Vulkan decode replay (`ORANGU_REPLAY`), built lazily on the
+    /// first single-token decode. `None` until then / when disabled.
+    decode_replay: std::sync::Mutex<Option<DecodeReplay>>,
 }
 
 impl GemmaModel {
@@ -388,6 +435,7 @@ impl GemmaModel {
             per_layer_model_proj,
             per_layer_proj_norm,
             layers,
+            decode_replay: std::sync::Mutex::new(None),
         })
         .inspect(|_: &Self| {
             let _ = rms_eps; // used inline below via self.config.rms_eps override per layer call sites
@@ -443,14 +491,13 @@ impl GemmaModel {
     /// little per-submission barrier overhead, so the default sits below one
     /// submit per layer.
     fn decode_submit_chunks(n_layers: usize) -> usize {
-        // The CPU↔GPU submission overlap this buys saturates early: a pinned-
-        // 1700 MHz `orangu-bench --curve` sweep on E2B (Q4_K_M) measured
-        // chunks 1→2→3→7 at ~23.5 → 28.4 → 30.3 → 29.9 tok/s — flat from 3
+        // The CPU↔GPU submission overlap this buys saturates early:
+        // throughput climbs as chunks go from 1 to 3 and is flat from 3
         // upward. `3` sits at that knee, so it keeps the full overlap while
         // paying only 3 `queue.submit()` calls (and allocating only 3 command
-        // encoders) per token instead of 7 — cutting the per-token
-        // `vkQueueSubmit` *and* `radv_BeginCommandBuffer`-`memset` cost, both
-        // of which scale with the submitted-command-buffer count, by ~57%.
+        // encoders) per token — cutting the per-token `vkQueueSubmit` *and*
+        // `radv_BeginCommandBuffer`-`memset` cost, both of which scale with
+        // the submitted-command-buffer count.
         const DEFAULT_CHUNKS: usize = 3;
         static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let requested = *CHUNKS.get_or_init(|| {
@@ -547,7 +594,12 @@ impl GemmaModel {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let per_layer = self.n_embd_per_layer;
-        let has_ple = per_layer > 0;
+        // `ORANGU_SKIP_PLE=1` is a **reduce-work diagnostic** (WRONG output —
+        // gemma-3n needs PLE): skips the per-token PLE projection *and* every
+        // layer's PLE sub-chain (ple_gate matmul + gelu + mul + ple_proj matmul
+        // + norm), so the throughput delta vs default isolates PLE's
+        // recoverable cost. Not a correctness knob.
+        let has_ple = per_layer > 0 && std::env::var_os("ORANGU_SKIP_PLE").is_none();
 
         let ple_buf = if has_ple {
             let gathered = self.gather_per_layer_tok_embd(&[token], 1);
@@ -608,6 +660,10 @@ impl GemmaModel {
             } else {
                 0
             };
+            // Raw-replay capture: SWA layers carry their window size so the
+            // replay recomputes `n_pos`/`window_start` each token (see
+            // `FusedAttnInput::window`); full-attention layers pass `None`.
+            let window = (layer.is_swa && self.n_swa > 0).then_some(self.n_swa as u32);
             let kv = layer.has_kv.then(|| FusedAttnProjection {
                 wk: layer
                     .wk
@@ -666,6 +722,7 @@ impl GemmaModel {
                     eps,
                     pos,
                     window_start,
+                    window,
                     scale: self.attention_scale,
                     cache: &mut cache.layers[cache_index],
                     wo: &layer.wo,
@@ -750,6 +807,15 @@ impl GemmaModel {
         let eps = self.rms_eps();
         let mut x = x0.to_vec();
 
+        // Hoisted scratch, refilled (clear + extend/resize) each layer
+        // rather than freshly allocated — the prefill's dominant CPU cost was
+        // allocating and first-touching several ~n_tokens×n_embd clones per
+        // layer (malloc + page-fault memset). After the first layer these
+        // allocate nothing.
+        let mut normed: Vec<f32> = Vec::with_capacity(x.len());
+        let mut ffn_normed: Vec<f32> = Vec::with_capacity(x.len());
+        let mut attn_out: Vec<f32> = Vec::new();
+
         let per_layer = self.n_embd_per_layer;
         let has_ple = per_layer > 0;
         let inp_per_layer = if has_ple {
@@ -779,7 +845,8 @@ impl GemmaModel {
             let cache_index = layer.kv_donor;
             let group_size = self.n_head / self.n_head_kv;
 
-            let mut normed = x.clone();
+            normed.clear();
+            normed.extend_from_slice(&x);
             tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
 
             let wk = layer.has_kv.then(|| {
@@ -882,34 +949,50 @@ impl GemmaModel {
             // range before this loop starts reading), so a non-causal
             // model's attention window can freely include positions *after*
             // `pos`, not just up to it — see `Self::attention_window`.
-            let mut attn_out = vec![0f32; n_tokens * self.n_head * head_dim];
+            attn_out.clear();
+            attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
             let t0 = Instant::now();
-            for t in 0..n_tokens {
-                let pos = start_pos + t;
-                let (window_start, window_end) = self.attention_window(layer.is_swa, pos, n_tokens);
-                for h in 0..self.n_head {
-                    let kv_head = h / group_size;
-                    let qh = &q[t * self.n_head * head_dim + h * head_dim
-                        ..t * self.n_head * head_dim + (h + 1) * head_dim];
+            // Prefill attention is O(n_tokens²) and single-threaded was the
+            // second-largest prefill cost (after the GPU matmuls) and the one
+            // that grows quadratically with prompt length. Each query token's
+            // attention is independent — reads the (now fully-populated,
+            // read-only) KV cache + `q`, writes only its own `attn_out` slice —
+            // so parallelise across tokens with rayon (byte-exact: no cross-token
+            // dependency, per-token accumulation order unchanged). Every thread
+            // keeps its own `scores` scratch.
+            let n_head = self.n_head;
+            let attention_scale = self.attention_scale;
+            let is_swa = layer.is_swa;
+            let cache_layer = &cache.layers[cache_index];
+            attn_out
+                .par_chunks_mut(n_head * head_dim)
+                .enumerate()
+                .for_each(|(t, out_t)| {
+                    let pos = start_pos + t;
+                    let (window_start, window_end) = self.attention_window(is_swa, pos, n_tokens);
+                    let mut scores: Vec<f32> = Vec::new();
+                    for h in 0..n_head {
+                        let kv_head = h / group_size;
+                        let qh = &q[t * n_head * head_dim + h * head_dim
+                            ..t * n_head * head_dim + (h + 1) * head_dim];
 
-                    let mut scores = Vec::with_capacity(window_end + 1 - window_start);
-                    for p in window_start..=window_end {
-                        let kh = cache.layers[cache_index].key_at(p, kv_head, head_dim);
-                        scores.push(tensor::dot(qh, kh) * self.attention_scale);
-                    }
-                    tensor::softmax_inplace(&mut scores);
+                        scores.clear();
+                        for p in window_start..=window_end {
+                            let kh = cache_layer.key_at(p, kv_head, head_dim);
+                            scores.push(tensor::dot(qh, kh) * attention_scale);
+                        }
+                        tensor::softmax_inplace(&mut scores);
 
-                    let out = &mut attn_out[t * self.n_head * head_dim + h * head_dim
-                        ..t * self.n_head * head_dim + (h + 1) * head_dim];
-                    for (offset, &weight) in scores.iter().enumerate() {
-                        let p = window_start + offset;
-                        let vh = cache.layers[cache_index].value_at(p, kv_head, head_dim);
-                        for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                            *o += weight * vi;
+                        let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
+                        for (offset, &weight) in scores.iter().enumerate() {
+                            let p = window_start + offset;
+                            let vh = cache_layer.value_at(p, kv_head, head_dim);
+                            for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                                *o += weight * vi;
+                            }
                         }
                     }
-                }
-            }
+                });
             if prefill_trace {
                 eprintln!(
                     "orangu-server: [prefill-trace] layer {il} cpu_attention \
@@ -929,9 +1012,15 @@ impl GemmaModel {
             }
             tensor::rmsnorm_inplace(&mut attn_proj, &layer.attn_post_norm, n_tokens, n_embd, eps);
             tensor::add_inplace(&mut x, &attn_proj);
-            let attn_out_residual = x.clone();
 
-            let mut ffn_normed = x.clone();
+            // `x` is the post-attention residual and is *not* mutated
+            // again until the FFN residual add below (the norm runs on the
+            // `ffn_normed` copy, not `x`), so the old `attn_out_residual =
+            // x.clone(); …; x = attn_out_residual` round-trip was a redundant
+            // ~n_tokens×n_embd clone per layer — dropped. `ffn_normed` reuses a
+            // hoisted scratch buffer instead of allocating a fresh clone.
+            ffn_normed.clear();
+            ffn_normed.extend_from_slice(&x);
             tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
             let t0 = Instant::now();
             let mut gate_up = self.backend.matmul_batch(&[
@@ -955,9 +1044,7 @@ impl GemmaModel {
             }
             let up = gate_up.pop().unwrap();
             let mut gate = gate_up.pop().unwrap();
-            for g in gate.iter_mut() {
-                *g = tensor::gelu(*g);
-            }
+            tensor::gelu_inplace(&mut gate);
             tensor::mul_inplace(&mut gate, &up);
             let t0 = Instant::now();
             let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
@@ -969,7 +1056,6 @@ impl GemmaModel {
                 );
             }
             tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
-            x = attn_out_residual;
             tensor::add_inplace(&mut x, &ffn_out);
 
             if let (Some(inp_per_layer), Some(gate_w), Some(proj_w), Some(post_norm)) = (
@@ -978,7 +1064,10 @@ impl GemmaModel {
                 &layer.per_layer_proj,
                 &layer.per_layer_post_norm,
             ) {
-                let pe_in = x.clone();
+                // Same redundant-clone removal as the FFN residual
+                // above — `x` (the post-FFN residual) is read by the PLE
+                // matmuls below but never mutated until the `+= proj` add, so
+                // the `pe_in = x.clone(); …; x = pe_in` round-trip was dropped.
                 let t0 = Instant::now();
                 let mut g = self.backend.matmul(&x, n_tokens, gate_w);
                 if prefill_trace {
@@ -988,9 +1077,7 @@ impl GemmaModel {
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                for v in g.iter_mut() {
-                    *v = tensor::gelu(*v);
-                }
+                tensor::gelu_inplace(&mut g);
                 for t in 0..n_tokens {
                     let slice = &inp_per_layer[(t * self.layers.len() + il) * per_layer
                         ..(t * self.layers.len() + il + 1) * per_layer];
@@ -1006,7 +1093,6 @@ impl GemmaModel {
                     );
                 }
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n_tokens, n_embd, eps);
-                x = pe_in;
                 tensor::add_inplace(&mut x, &proj);
             }
 
@@ -1126,6 +1212,257 @@ impl GemmaModel {
     }
 }
 
+/// Reads `len` f32s back from a device-local wgpu buffer (the replay logits) —
+/// a small transfer submit that references only the logits + readback, no
+/// weights, so it doesn't reintroduce the per-token weight-VM cost.
+fn read_gpu_f32(vulkan: &VulkanBackend, buf: &wgpu::Buffer, offset: u64, len: usize) -> Vec<f32> {
+    let device = vulkan.wgpu_device();
+    let queue = vulkan.wgpu_queue();
+    let rb = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("orangu-server replay logits readback"),
+        size: (len * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("orangu-server replay logits readback enc"),
+    });
+    enc.copy_buffer_to_buffer(buf, offset, &rb, 0, (len * 4) as u64);
+    queue.submit(Some(enc.finish()));
+    rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let out = {
+        let view = rb
+            .slice(..)
+            .get_mapped_range()
+            .expect("map logits readback");
+        bytemuck::cast_slice::<u8, f32>(&view).to_vec()
+    };
+    rb.unmap();
+    out
+}
+
+impl GemmaModel {
+    /// The raw-Vulkan decode replay path (`ORANGU_REPLAY`). On the first
+    /// single-token decode it captures orangu's real recording of the whole
+    /// forward and builds a persistent command buffer; every subsequent token it
+    /// writes this token's embedding into the captured first-layer buffer,
+    /// patches the per-token uniforms (`pos`), resubmits the same command buffer
+    /// (no `wgpu` submit on the forward), and reads the logits back. Returns the
+    /// `[n_vocab]` logits for the caller to sample.
+    fn decode_forward_replay(
+        &self,
+        vulkan: &VulkanBackend,
+        cache: &mut KvCache,
+        token: u32,
+        start_pos: usize,
+        greedy_sample: Option<&GreedySampleParams<'_>>,
+        slot_id: usize,
+    ) -> Result<ForwardOutcome> {
+        let n_embd = self.config.n_embd;
+        anyhow::ensure!(
+            (token as usize) < self.config.n_vocab,
+            "token id {token} out of vocab range"
+        );
+        let mut x = self.tok_embeddings.row(token as usize).to_vec();
+        for v in x.iter_mut() {
+            *v *= (n_embd as f32).sqrt();
+        }
+
+        let cache_ptr = std::ptr::from_ref::<KvCache>(cache) as usize;
+        let mut guard = self.decode_replay.lock().expect("decode_replay poisoned");
+        // Rebuild whenever this is a different request than the one captured: the
+        // graph binds the captured request's KV-cache + op-cache buffers by raw
+        // handle, so reusing it for another `(cache, slot)` would replay over the
+        // wrong (or freed) memory. A fresh request re-captures on its first token.
+        let stale = guard.as_ref().is_some_and(|r| {
+            r.cache_ptr != cache_ptr || r.slot_id != slot_id || r.expected_pos != start_pos
+        });
+        if stale && let Some(old) = guard.take() {
+            // Free the previous request's raw-Vulkan objects (fence, command/
+            // descriptor pools, pipelines, per-token buffers) before rebuilding —
+            // `ReplayContext` only clones wgpu's shared device/instance, so it
+            // owns nothing to destroy.
+            unsafe {
+                old.graph.destroy(&old.ctx);
+                for p in old._programs {
+                    p.destroy(&old.ctx);
+                }
+            }
+        }
+        if guard.is_none() {
+            // First token: record + submit the real wgpu forward while capturing
+            // it, then build the replay graph from the captured op-list.
+            vulkan.begin_decode_capture();
+            let (encoder, logits_buf, logits_off) =
+                self.record_decode_forward(vulkan, cache, token, start_pos, &x, slot_id)?;
+            let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
+            let steps = vulkan
+                .take_decode_capture()
+                .context("ORANGU_REPLAY: no decode capture produced")?;
+            anyhow::ensure!(!steps.is_empty(), "ORANGU_REPLAY: empty capture");
+            use crate::engine::backend::vulkan_replay::HostInputTag;
+            let host = crate::engine::backend::vulkan_replay::host_inputs(&steps);
+            let embd_inputs: Vec<(wgpu::Buffer, u64)> = host
+                .iter()
+                .filter(|(t, ..)| *t == HostInputTag::EmbeddingX)
+                .map(|(_, b, o, _)| (b.clone(), *o))
+                .collect();
+            let gathered_inputs: Vec<(wgpu::Buffer, u64)> = host
+                .iter()
+                .filter(|(t, ..)| *t == HostInputTag::Gathered)
+                .map(|(_, b, o, _)| (b.clone(), *o))
+                .collect();
+            anyhow::ensure!(
+                !embd_inputs.is_empty(),
+                "ORANGU_REPLAY: capture has no per-token embedding input"
+            );
+            let ctx = unsafe { ReplayContext::from_wgpu(vulkan.wgpu_device()) }
+                .context("ORANGU_REPLAY: device is not the Vulkan backend")?;
+            let (graph, programs) = unsafe { ReplayGraph::from_capture(&ctx, &steps) }
+                .map_err(|e| anyhow::anyhow!("ORANGU_REPLAY: build graph: {e}"))?;
+            {
+                use crate::engine::backend::vulkan_replay::CaptureStep;
+                let n_dispatch = steps
+                    .iter()
+                    .filter(|s| matches!(s, CaptureStep::Dispatch { .. }))
+                    .count();
+                let n_copy = steps
+                    .iter()
+                    .filter(|s| matches!(s, CaptureStep::Copy { .. }))
+                    .count();
+                let n_host = steps
+                    .iter()
+                    .filter(|s| matches!(s, CaptureStep::HostInput { .. }))
+                    .count();
+                eprintln!(
+                    "orangu-server: [replay] decode graph — {} steps/token = {} dispatch + {} copy + {} host ({} layers ⇒ {:.1} dispatch/layer, {:.1} copy/layer)",
+                    steps.len(),
+                    n_dispatch,
+                    n_copy,
+                    n_host,
+                    self.layers.len(),
+                    n_dispatch as f64 / self.layers.len() as f64,
+                    n_copy as f64 / self.layers.len() as f64,
+                );
+                if std::env::var_os("ORANGU_REPLAY_HISTO").is_some() {
+                    use std::collections::BTreeMap;
+                    let mut histo: BTreeMap<String, u32> = BTreeMap::new();
+                    for s in steps.iter() {
+                        if let CaptureStep::Dispatch { wgsl, .. } = s {
+                            let compact: String =
+                                wgsl.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let n = compact.len();
+                            let sig = compact[n.saturating_sub(70)..].to_string();
+                            *histo.entry(sig).or_insert(0) += 1;
+                        }
+                    }
+                    let mut rows: Vec<(&String, &u32)> = histo.iter().collect();
+                    rows.sort_by(|a, b| b.1.cmp(a.1));
+                    eprintln!(
+                        "orangu-server: [replay] dispatch histogram (by shader-body signature):"
+                    );
+                    for (sig, cnt) in rows {
+                        eprintln!("  {:>4}x  …{}", cnt, sig);
+                    }
+                }
+            }
+            eprintln!(
+                "orangu-server: [replay] built persistent decode graph — {} steps ({} embd + {} gathered host inputs)",
+                steps.len(),
+                embd_inputs.len(),
+                gathered_inputs.len()
+            );
+            *guard = Some(DecodeReplay {
+                ctx,
+                graph,
+                _programs: programs,
+                _captured_steps: steps,
+                embd_inputs,
+                gathered_inputs,
+                logits_buf,
+                logits_off,
+                n_vocab: self.output_weight.out_dim,
+                cache_ptr,
+                slot_id,
+                // Captured at this token's position; the next replayed token of
+                // this sequence must be at `start_pos + 1`.
+                expected_pos: start_pos + 1,
+            });
+            // First token of a request runs the full wgpu forward; hand its
+            // logits back for the caller to sample (once per request — the hot
+            // path is the replayed tokens below).
+            return Ok(ForwardOutcome::Logits(logits));
+        }
+
+        let r = guard.as_mut().expect("just checked Some");
+        // This sequence's next replayed token must land at `start_pos + 1`.
+        r.expected_pos = start_pos + 1;
+        for (buf, off) in &r.embd_inputs {
+            vulkan
+                .wgpu_queue()
+                .write_buffer(buf, *off, bytemuck::cast_slice(&x));
+        }
+        if !r.gathered_inputs.is_empty() {
+            let gathered = self.gather_per_layer_tok_embd(&[token], 1);
+            for (buf, off) in &r.gathered_inputs {
+                vulkan
+                    .wgpu_queue()
+                    .write_buffer(buf, *off, bytemuck::cast_slice(&gathered));
+            }
+        }
+        // Flush the per-token embedding/gathered `write_buffer`s to the shared
+        // `VkQueue` — but do NOT block on it. `run_token`'s raw submit
+        // goes to the same queue right after, so submission order + the command
+        // buffer's entry barrier (`TRANSFER` → `SHADER_READ`) already make the
+        // transfer visible to the first dispatch; the old `poll(wait)` here just
+        // idled the CPU (and the GPU) between tokens for no correctness benefit.
+        vulkan.wgpu_queue().submit(std::iter::empty());
+        unsafe {
+            r.graph.update_per_token(start_pos as u32);
+            r.graph
+                .run_token(&r.ctx)
+                .map_err(|e| anyhow::anyhow!("ORANGU_REPLAY: run_token: {e}"))?;
+        }
+        // Argmax tail on the GPU: reclaims the per-token `[n_vocab]` logits
+        // readback + the CPU argmax (`total_cmp`/`max_by`, a measurable slice
+        // of decode CPU in the replay profile). Runs the same sample kernel the non-replay
+        // GPU-sample path uses, reading the replay's `logits_buf` (visible after
+        // `run_token`'s final barrier) and reading back only the winning token id.
+        // Falls back to the full logits readback when the caller isn't greedy
+        // sampling or GPU sampling is disabled.
+        if let Some(params) = greedy_sample
+            && vulkan.gpu_sample()
+        {
+            let mut encoder =
+                vulkan
+                    .wgpu_device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("orangu-server replay argmax tail"),
+                    });
+            let sample_buf = vulkan.record_argmax_sample(
+                &mut encoder,
+                GpuArgmaxSampleInput {
+                    logits: GpuInput::Gpu(&r.logits_buf, (r.logits_off / 4) as usize),
+                    n_vocab: r.n_vocab,
+                    recent_tokens: params.recent_tokens,
+                    repeat_penalty: params.repeat_penalty,
+                    logit_softcap: self.final_logit_softcapping,
+                },
+                slot_id + 1,
+            );
+            let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
+            return Ok(ForwardOutcome::Token(next));
+        }
+        Ok(ForwardOutcome::Logits(read_gpu_f32(
+            vulkan,
+            &r.logits_buf,
+            r.logits_off,
+            r.n_vocab,
+        )))
+    }
+}
+
 impl ModelForward for GemmaModel {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -1153,8 +1490,8 @@ impl ModelForward for GemmaModel {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
 
-        // Counts GPU submissions per token rather than inferring
-        // round-trip count from tok/s — set `ORANGU_GPU_TRACE=1` to log
+        // Counts GPU submissions per token directly rather than inferring
+        // the round-trip count indirectly — set `ORANGU_GPU_TRACE=1` to log
         // it. Only reads an env var (via a
         // cached `OnceLock`, not a fresh lookup every call) and an atomic
         // load/subtract when a Vulkan backend is in use; free otherwise.
@@ -1356,6 +1693,41 @@ impl ModelForward for GemmaModel {
         greedy_sample: Option<GreedySampleParams<'_>>,
         slot_id: usize,
     ) -> Result<ForwardOutcome> {
+        // Raw-Vulkan decode replay (`ORANGU_REPLAY`): capture the
+        // forward once, then resubmit the persistent command buffer every token
+        // with no `wgpu` submit on the forward — returns logits for the caller
+        // to sample (bypasses the GPU-argmax fast path).
+        //
+        // The capture now covers the *whole* gemma4 forward — the per-layer-
+        // embedding (PLE) projection + sub-chain and the `layer_output_scale`
+        // dispatch included, with PLE's gathered per-layer
+        // embeddings re-uploaded each token as a second host input — so
+        // `ORANGU_REPLAY` engages for every gemma variant this backend records,
+        // gemma4-E2B (PLE + `layer_output_scale`) included.
+        let replay_supported = true;
+        // Opt-in (`ORANGU_REPLAY`). The replay path removes the per-token wgpu
+        // record/submit, but single-token decode is bound by the `Q4_K`
+        // matmul-vec kernel — not by CPU submit — so removing the submit is not
+        // the bottleneck. It also pins the captured decode kernel, which
+        // suppresses the faster kernel `pipeline_for` would otherwise select, so
+        // it is off by default and kept for capture/replay study.
+        // `ORANGU_REPLAY_FORCE` still bypasses the support check for debugging
+        // incomplete captures.
+        let force = std::env::var_os("ORANGU_REPLAY_FORCE").is_some();
+        let replay_on = std::env::var_os("ORANGU_REPLAY").is_some();
+        if tokens.len() == 1
+            && (force || (replay_supported && replay_on))
+            && let Some(vulkan) = self.backend.as_vulkan()
+        {
+            return self.decode_forward_replay(
+                vulkan,
+                cache,
+                tokens[0],
+                start_pos,
+                greedy_sample.as_ref(),
+                slot_id,
+            );
+        }
         // A `final_logit_softcapping` model no longer forces the slow CPU
         // path here: the softcap is `cap * tanh(v / cap)`, monotonic, so it
         // can't change the greedy token, and the GPU sample kernel applies it
@@ -1481,7 +1853,7 @@ impl ModelForward for GemmaModel {
         let eps = self.rms_eps();
         let group_size = self.n_head / self.n_head_kv;
 
-        // Step 1: N embedding lookups, stacked into one `[n, n_embd]`
+        // N embedding lookups, stacked into one `[n, n_embd]`
         // buffer — the same "n_tokens" shape `Self::forward`'s CPU path
         // builds for a multi-position prompt, just one row per *sequence*
         // instead of one row per *position*.
@@ -1499,7 +1871,7 @@ impl ModelForward for GemmaModel {
             *v *= (n_embd as f32).sqrt();
         }
 
-        // Step 2: per-layer-embedding input, per sequence — `per_layer_
+        // Per-layer-embedding input, per sequence — `per_layer_
         // model_proj`/`per_layer_proj_norm` are small next to the main
         // attention/FFN weights, so batching this too wasn't worth the
         // extra bookkeeping; `compute_per_layer_inputs` is already
@@ -1678,9 +2050,7 @@ impl ModelForward for GemmaModel {
             ]);
             let up = gate_up.pop().unwrap();
             let mut gate = gate_up.pop().unwrap();
-            for g in gate.iter_mut() {
-                *g = tensor::gelu(*g);
-            }
+            tensor::gelu_inplace(&mut gate);
             tensor::mul_inplace(&mut gate, &up);
             let mut ffn_out = self.backend.matmul(&gate, n, &layer.ffn_down);
             tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
@@ -1694,9 +2064,7 @@ impl ModelForward for GemmaModel {
             ) {
                 let pe_in = x.clone();
                 let mut g = self.backend.matmul(&x, n, gate_w);
-                for v in g.iter_mut() {
-                    *v = tensor::gelu(*v);
-                }
+                tensor::gelu_inplace(&mut g);
                 for (i, per_layer_input) in inp_per_layer.iter().enumerate() {
                     let slice = &per_layer_input[il * per_layer..(il + 1) * per_layer];
                     tensor::mul_inplace(&mut g[i * per_layer..(i + 1) * per_layer], slice);
@@ -1775,13 +2143,13 @@ impl GemmaModel {
     /// layer (`project_per_layer_inputs` + `build_inp_per_layer` in the
     /// reference graph), flattened as `[n_tokens, n_layer, n_embd_per_layer]`
     /// row-major.
-    /// `compute_per_layer_inputs`'s "Step 1": gathers each token's
+    /// The first phase of `compute_per_layer_inputs`: gathers each token's
     /// per-layer embedding row, scaled by `sqrt(per_layer)` —
     /// `[n_tokens, n_layer, per_layer]` row-major, same shape and content
     /// `compute_per_layer_inputs` itself would produce this piece of. Split
     /// out so the decode (`n_tokens == 1`) GPU-fused path
     /// (`VulkanBackend::record_ple_projection`) can reuse it too, without
-    /// also running Steps 2 and 3 on the CPU (those move to the GPU there
+    /// also running the remaining phases on the CPU (those move to the GPU there
     /// instead) — it's a
     /// tiny embedding-table lookup, cheap enough to stay a plain CPU
     /// gather + upload rather than needing its own GPU kernel.
@@ -1825,10 +2193,10 @@ impl GemmaModel {
             .as_ref()
             .expect("checked by caller");
 
-        // Step 1: gather each token's per-layer embedding row, scaled.
+        // First, gather each token's per-layer embedding row, scaled.
         let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
 
-        // Step 2: project the (already sqrt(n_embd)-scaled) hidden state.
+        // Then project the (already sqrt(n_embd)-scaled) hidden state.
         let mut proj = self
             .backend
             .matmul(x_scaled_embd, n_tokens, per_layer_model_proj);
@@ -1843,7 +2211,7 @@ impl GemmaModel {
             self.rms_eps(),
         );
 
-        // Step 3: combine and scale.
+        // Finally, combine and scale.
         tensor::add_inplace(&mut proj, &gathered);
         for v in proj.iter_mut() {
             *v *= per_layer_input_scale;

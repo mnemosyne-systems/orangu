@@ -161,6 +161,12 @@ fn run_once(
         "temperature": 0,
         "stream": true,
         "cache_prompt": false,
+        // Generate exactly `n_gen` tokens regardless of content — without this a
+        // greedy model handed a depth-padded (repetitive) prompt emits EOS on
+        // the first token, so the non-zero-depth rows timed **0** tokens. This
+        // is the same "measure decode, not content" contract `llama-bench -d`
+        // uses.
+        "ignore_eos": true,
     });
     if let Some(m) = model {
         body["model"] = serde_json::Value::String(m.clone());

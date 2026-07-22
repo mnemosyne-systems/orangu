@@ -115,11 +115,10 @@ pub struct Engine {
     /// many_steps_vulkan`). It still measures **slower** than not
     /// batching under real concurrent load, though: a reproducible
     /// concurrent-load A/B (4 concurrent 100-token generations, `slots =
-    /// 4` either way) measured two runs at 24.1s and 30.1s wall time
-    /// batched vs. 18.9–19.4s not batched — 25–55% slower, not faster.
+    /// 4` either way) measured it consistently slower batched than not.
     /// Likely cause: fusing *M* sequences' matmuls into shared dispatches
-    /// amortizes weight bandwidth, but this hardware's GPU is fast enough
-    /// per single-sequence step (Step 5's whole point) that the extra
+    /// amortizes weight bandwidth, but the GPU is fast enough per
+    /// single-sequence step that the extra
     /// synchronization needed to chain *M* independent sequences into one
     /// encoder — and the coordinator's own up-to-`MAX_BATCH_WAIT`
     /// rendezvous wait before a batch can even start — costs more than
@@ -130,7 +129,7 @@ pub struct Engine {
     /// Getting a trustworthy measurement here required fixing a real bug
     /// first: both this batched path *and* the pre-existing single-
     /// sequence GPU-resident decode path (`GemmaModel::record_decode_
-    /// forward`, since Step 5) used to key their cached per-layer GPU
+    /// forward`) used to key their cached per-layer GPU
     /// buffers by weight shape alone, with no per-caller distinction.
     /// `BatchCoordinator` deliberately allows two of its own `process_
     /// batch` calls to run concurrently (see its own doc comment), and
@@ -319,8 +318,7 @@ fn run(
     let prompt_time = prompt_start.elapsed();
     // Prefill is never decode-shaped (`n_tokens > 1`), so it never takes a
     // GPU-fused sampling fast path either way — this first sample always
-    // runs the plain CPU chain, same as before Step 11's GPU-sampling
-    // follow-up existed.
+    // runs the plain CPU chain.
     let mut next = sampler.sample(&logits, &history);
 
     let generate_start = Instant::now();

@@ -872,8 +872,8 @@ pub fn shader_source_reduce(ggml_type: u32, n_rows: usize, subgroup: bool) -> Op
 
 /// The **thin-tile reduce** entry point (`fn main`) for an arbitrary
 /// `(n_rows, tile)` — the multi-position (speculative / small-chunk-prefill)
-/// matmul kernel that `doc/SERVER_ROADMAP.md` Step 13 named as the missing
-/// lever. It keeps the reduce path's occupancy (one workgroup per
+/// matmul kernel named as the missing lever. It keeps the reduce path's
+/// occupancy (one workgroup per
 /// `(n_rows-row group, tile-token group)`, so `ceil(out_dim / n_rows) *
 /// ceil(n_tokens / tile)` workgroups — still many small groups, unlike the
 /// tiled GEMM's few large ones) **and** amortizes each weight dequant across
@@ -1811,7 +1811,7 @@ pub fn shader_source_reduce_q4k_wide_unroll(n_rows: usize, subgroup: bool) -> St
 /// HW `v_dot4_i32_i8`): four int8×int8 into one `int32` per instruction,
 /// rescaled to `f32` at the end. This attacks both prior dead ends at once —
 /// 4 MACs/instruction (ALU) and int8 operands / int32 accumulator (register
-/// pressure, Steps 11/16). Correct because ggml's Q4_K dequant is
+/// pressure). Correct because ggml's Q4_K dequant is
 /// **contiguous per sub-block** (`y[32g..32g+32]` all share scale/min `g`), so a
 /// natural 32-element activation block aligns with one Q4_K sub-block, letting
 /// the per-sub-block integer dot factor the scale out. Each of 32 lanes strides
@@ -1918,15 +1918,6 @@ struct Meta {{
 fn f16_to_f32(bits: u32) -> f32 {{
     return unpack2x16float(bits & 0xFFFFu).x;
 }}
-fn vec4_word(v: vec4<u32>, i: u32) -> u32 {{
-    if (i == 0u) {{ return v.x; }}
-    if (i == 1u) {{ return v.y; }}
-    if (i == 2u) {{ return v.z; }}
-    return v.w;
-}}
-fn read_word_v4(byte_offset: u32) -> u32 {{
-    return vec4_word(weights[byte_offset / 16u], (byte_offset % 16u) / 4u);
-}}
 fn vec3_word(v: vec3<u32>, i: u32) -> u32 {{
     if (i == 0u) {{ return v.x; }}
     if (i == 1u) {{ return v.y; }}
@@ -1992,17 +1983,28 @@ fn main(
         let d_b = bitcast<f32>(q8x[q8base]);
         let sumq = bitcast<i32>(q8x[q8base + 1u]);
 
+        // The sub-block's 32 nibbles are 8 contiguous `u32` = two `vec4<u32>`.
+        // `qbyte` is 16-byte aligned (`row_bytes`, 144-byte super-blocks, the
+        // +16 header and 32*(b/2) qs offset are all multiples of 16), so read
+        // them as two direct vec4 loads and mask both nibble halves branchlessly
+        // — no per-word divide/modulo/select indexing.
+        let vidx = qbyte / 16u;
+        let m4 = vec4<u32>(0x0F0F0F0Fu);
+        let f4 = vec4<u32>(4u);
+        let w0 = weights[vidx];
+        let w1 = weights[vidx + 1u];
+        let wv0 = select(w0 & m4, (w0 >> f4) & m4, is_high);
+        let wv1 = select(w1 & m4, (w1 >> f4) & m4, is_high);
+
         var idot: i32 = 0;
-        var i: u32 = 0u;
-        loop {{
-            if (i >= 8u) {{
-                break;
-            }}
-            let wraw = read_word_v4(qbyte + i * 4u);
-            let wword = select(wraw & 0x0F0F0F0Fu, (wraw >> 4u) & 0x0F0F0F0Fu, is_high);
-            idot = idot + dot4I8Packed(wword, q8x[q8base + 2u + i]);
-            i = i + 1u;
-        }}
+        idot = idot + dot4I8Packed(wv0.x, q8x[q8base + 2u]);
+        idot = idot + dot4I8Packed(wv0.y, q8x[q8base + 3u]);
+        idot = idot + dot4I8Packed(wv0.z, q8x[q8base + 4u]);
+        idot = idot + dot4I8Packed(wv0.w, q8x[q8base + 5u]);
+        idot = idot + dot4I8Packed(wv1.x, q8x[q8base + 6u]);
+        idot = idot + dot4I8Packed(wv1.y, q8x[q8base + 7u]);
+        idot = idot + dot4I8Packed(wv1.z, q8x[q8base + 8u]);
+        idot = idot + dot4I8Packed(wv1.w, q8x[q8base + 9u]);
 
         partial = partial + d * scale * d_b * f32(idot) - dmin * mn * d_b * f32(sumq);
         sb = sb + 32u;
@@ -2035,16 +2037,16 @@ fn f16_to_f32(bits: u32) -> f32 {
     return unpack2x16float(bits & 0xFFFFu).x;
 }
 
+// Dynamic vector index — naga lowers `v[i]` to a branchless select, unlike the
+// old 3-`if` chain that diverged across a subgroup's lanes (each owns a
+// different component).
 fn vec4_word(v: vec4<u32>, i: u32) -> u32 {
-    if (i == 0u) { return v.x; }
-    if (i == 1u) { return v.y; }
-    if (i == 2u) { return v.z; }
-    return v.w;
+    return v[i];
 }
 
 // 4-byte-aligned u32 read from the vec4<u32>-bound weight buffer.
 fn read_word_v4(byte_offset: u32) -> u32 {
-    return vec4_word(weights[byte_offset / 16u], (byte_offset % 16u) / 4u);
+    return weights[byte_offset / 16u][(byte_offset % 16u) / 4u];
 }
 
 // Unpack the four bytes of a u32 into a vec4<f32>.
@@ -2128,8 +2130,8 @@ fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im
 
 /// The **light** `Q4_K` decode matmul-vec kernel (`ORANGU_Q4K_LIGHT`): a WGSL
 /// port of llama.cpp's `mul_mat_vec_q4_k.comp`, targeting register pressure /
-/// occupancy rather than load count (which Steps 7/13 showed is a null on this
-/// GPU). Where the default dual-nibble kernel gives one 32-thread workgroup a
+/// occupancy rather than load count (which earlier experiments showed is a null
+/// on this GPU). Where the default dual-nibble kernel gives one 32-thread workgroup a
 /// whole super-block and keeps eight activations plus `n_rows` accumulators
 /// live, this gives **16 threads** each a super-block (two run in parallel in
 /// the 32-thread workgroup, `it_size = 2`), each thread owning 16 weight
@@ -2139,12 +2141,11 @@ fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im
 /// token, via `selects_wide_unroll`), and 144-byte block layout as the dual
 /// kernel, so it drops into `pipeline_for` with no dispatch/bind-group change.
 /// Not bit-identical (it reorders the float adds vs. `CpuBackend`), but
-/// cross-checks within tolerance. Opt-in and default-off. Measured via
-/// `RADV_DEBUG=shaderstats`, it compiles to **56 VGPRs / 1720 B (0 spills)** on
-/// gfx1012 — *higher* register pressure than the dual kernel's 48 VGPRs
-/// (holding 16 nibbles + four `vec4` activations + eight scalar scales live per
-/// super-block costs more registers than it saves in code), so it lowers rather
-/// than raises occupancy. Source-level register-minimizing (accumulating each
+/// cross-checks within tolerance. Opt-in and default-off. As measured via
+/// `RADV_DEBUG=shaderstats`, it compiles to *higher* register pressure than the
+/// dual kernel (holding 16 nibbles + four `vec4` activations + eight scalar
+/// scales live per super-block costs more registers than it saves in code), so
+/// it lowers rather than raises occupancy. Source-level register-minimizing (accumulating each
 /// `vec4` group in turn instead of hoisting all four) did not move the count —
 /// the allocation is compiler-determined. It is therefore *not* the occupancy
 /// lever it was meant to be; kept for reference / other GPUs.
@@ -2188,7 +2189,7 @@ pub fn shader_source_reduce_q4k_light(n_rows: usize, subgroup: bool) -> String {
 }
 
 /// Reduction for [`shader_source_reduce_q4k_light`] — sums each row's `acc`
-/// across all 32 lanes (a single wave32 subgroup, so `subgroupAdd` when
+/// across all 32 lanes (a single 32-lane subgroup, so `subgroupAdd` when
 /// available, else a 32-wide shared-memory tree) and lane 0 writes it out.
 fn light_reduce(n_rows: usize, subgroup: bool) -> String {
     let mut s = String::new();
@@ -2464,7 +2465,7 @@ fn block_dot_dual(byte_offset: u32, local: u32,
 "#;
 
 /// The `@compute fn main` for the dual-nibble kernel — a 32-thread
-/// (one-wave32-subgroup) analogue of [`unroll_suffix`]. Same
+/// (single-subgroup) analogue of [`unroll_suffix`]. Same
 /// `ceil(out_dim / n_rows) * n_tokens` workgroup dispatch (so
 /// `build_op_resources`/`selects_wide_unroll`'s existing count applies
 /// unchanged — only the threads-per-workgroup differs, 32 vs 64), but each
@@ -2835,7 +2836,7 @@ struct ElemMeta {
     len: u32,
     _pad0: u32,
     extra: f32,
-    _pad1: u32,
+    out_scale: f32,
 }
 "#;
 
@@ -2873,8 +2874,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Line-for-line port of `engine::tensor::gelu` (the tanh approximation,
-/// not the exact erf form).
+/// Line-for-line port of `engine::tensor::gelu` (the tanh approximation, not the
+/// exact erf form). WGSL `tanh` lowers to the SPIR-V `GLSLstd450 Tanh` ExtInst —
+/// the hardware SFU, no `exp` polyfill (verified: naga `back/spv/block.rs` maps
+/// `Mf::Tanh` straight to it). A `vec4` (4-elements-per-thread) rewrite of this
+/// and `MUL_SHADER_BODY` was also tried; it measured *slower* because
+/// this decode-shaped dispatch is launch/occupancy-bound, not compute-bound —
+/// quartering the thread count underfills the GPU. Kept scalar; see
+/// `_scratch_measure_ffn_elementwise_dispatch_cost`.
 const GELU_SHADER_BODY: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -2890,6 +2897,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sqrt_2_over_pi = 0.7978846;
     let coef_a = 0.044715;
     y[i] = 0.5 * v * (1.0 + tanh(sqrt_2_over_pi * v * (1.0 + coef_a * v * v)));
+}
+"#;
+
+/// Fused GELU+multiply (dispatch fusion): `y[i] = gelu(a[i]) * b[i]` in
+/// one dispatch instead of a separate GELU pass (writing a `gelu_out` scratch)
+/// then a MUL pass. `a` = the gate projection, `b` = the up projection; byte-
+/// identical to running `GELU_SHADER_BODY` then `MUL_SHADER_BODY` (same tanh
+/// gelu, same multiply order) — the only difference is the intermediate stays in
+/// a register rather than a round-trip through VRAM. Same `elem4` binding shape
+/// as `MUL_SHADER_BODY`, so it reuses `elem4_bind_group`.
+const GELU_MUL_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= em.len) {
+        return;
+    }
+    let v = a[i];
+    let sqrt_2_over_pi = 0.7978846;
+    let coef_a = 0.044715;
+    let g = 0.5 * v * (1.0 + tanh(sqrt_2_over_pi * v * (1.0 + coef_a * v * v)));
+    y[i] = g * b[i];
 }
 "#;
 
@@ -3052,6 +3086,10 @@ pub fn shader_source_mul() -> String {
 
 pub fn shader_source_gelu() -> String {
     format!("{ELEM_META}\n{GELU_SHADER_BODY}")
+}
+
+pub fn shader_source_gelu_mul() -> String {
+    format!("{ELEM_META}\n{GELU_MUL_SHADER_BODY}")
 }
 
 pub fn shader_source_scale() -> String {
@@ -3302,6 +3340,21 @@ pub fn shader_source_rmsnorm_add(subgroup: bool, wg: usize) -> String {
             norm_body_for_wg(RMSNORM_ADD_SHADER_BODY_TEMPLATE, wg)
         )
     }
+}
+
+/// `shader_source_rmsnorm_add` with the trailing write multiplied by
+/// `em.out_scale` (gemma4's per-layer `layer_output_scale`) — folds the
+/// separate post-`rmsnorm_add` `scale` dispatch into the norm+add's own final
+/// loop. The `(norm*w + residual) * out_scale` intermediate is computed in the
+/// same f32 as the split `add`-then-`scale` path (the `add`'s f32 result then
+/// `* out_scale`), so the fusion is byte-exact. `em.out_scale` reuses
+/// `ElemMeta`'s former `_pad1` slot; every other elementwise shader leaves it
+/// `0.0` and never reads it, so no other shader's output changes.
+pub fn shader_source_rmsnorm_add_scale(subgroup: bool, wg: usize) -> String {
+    shader_source_rmsnorm_add(subgroup, wg).replace(
+        "y[k] = x[k] * scale * weight[k] + residual[k];",
+        "y[k] = (x[k] * scale * weight[k] + residual[k]) * em.out_scale;",
+    )
 }
 
 /// GPU-resident causal attention for a *single* query token (decode,
@@ -3932,6 +3985,130 @@ pub fn shader_source_attention_split(
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
 }
 
+/// **Cooperative-reduction** split-k phase 1 (`ORANGU_ATTN_COOP=1`). A
+/// from-scratch rewrite that targets the real bottleneck — the default
+/// split kernel's *serial* per-thread `head_dim` dot product (one thread does
+/// all `head_dim` MACs for one KV position, with the wave's 32 lanes reading K
+/// at a `head_dim`-strided address each — badly uncoalesced) and its per-tile
+/// `workgroupBarrier`s.
+///
+/// Here a **32-lane subgroup owns one KV position at a time, split across the
+/// head dim**: lane `L` owns dims `{L, L+32, …}`, so consecutive lanes read
+/// consecutive K/V elements — **fully coalesced** — and the score is a
+/// barrier-free `subgroupAdd` of each lane's partial dot instead of a
+/// 512-deep serial chain. `q`/`acc` live in registers (sized `HEAD_DIM/32`,
+/// baked per-pipeline so the owned loops unroll to a compile-time trip count
+/// and never spill to scratch). No workgroup shared memory, no
+/// `workgroupBarrier`. Output layout (`partial_ml`/`partial_acc`) is identical
+/// to [`ATTENTION_SPLIT_SHADER_TEMPLATE`], so the same phase-2
+/// [`ATTENTION_SPLIT_REDUCE_SHADER`] merges it unchanged.
+///
+/// Subgroup-only and assumes a subgroup width `>= 32` (the 32 workgroup
+/// threads always fall in one subgroup). `head_dim` must be a
+/// multiple of 32 (gemma's 512/256 are). Not byte-identical to the serial
+/// kernel (the `subgroupAdd` reduces the dot in a different order) — validated
+/// by greedy-output match, like the flash/GQA variants.
+const ATTENTION_SPLIT_COOP_SHADER_TEMPLATE: &str = r#"
+%KV_ENABLE%
+struct AttnSplitMeta {
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    window_start: u32,
+    n_pos: u32,
+    k_num: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> aq: array<f32>;
+%KV_BINDINGS%
+@group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
+@group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
+@group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+
+%KV_READ_FNS%
+
+const HEAD_DIM: u32 = %HEAD_DIM%u;
+const OWNED: u32 = %OWNED%u;
+
+@compute @workgroup_size(32)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let h = wid.x;
+    let split_idx = wid.y;
+    let lane = lid.x;
+    let group_size = am.n_head / am.n_head_kv;
+    let kv_head = h / group_size;
+    let k_num = am.k_num;
+    let q_base = h * HEAD_DIM;
+
+    // Each lane owns dims { lane, lane+32, … } — HEAD_DIM/32 of them. Stage the
+    // owned query elements into registers and zero the owned accumulators.
+    var q_reg: array<f32, OWNED>;
+    var acc_reg: array<f32, OWNED>;
+    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+        q_reg[i] = aq[q_base + lane + i * 32u];
+        acc_reg[i] = 0.0;
+    }
+
+    let split_len = (am.n_pos + k_num - 1u) / k_num;
+    let split_start = split_idx * split_len;
+    let split_end = min(split_start + split_len, am.n_pos);
+
+    var m: f32 = -1e30;
+    var l: f32 = 0.0;
+
+    var pos: u32 = split_start;
+    loop {
+        if (pos >= split_end) {
+            break;
+        }
+        let p = am.window_start + pos;
+        let k_base = (p * am.n_head_kv + kv_head) * HEAD_DIM;
+        var partial: f32 = 0.0;
+        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+            partial = partial + q_reg[i] * kv_read_k(k_base + lane + i * 32u);
+        }
+        let score = subgroupAdd(partial) * am.scale;
+        let new_m = max(m, score);
+        let alpha = exp(m - new_m);
+        let pw = exp(score - new_m);
+        l = l * alpha + pw;
+        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+            acc_reg[i] = acc_reg[i] * alpha + pw * kv_read_v(k_base + lane + i * 32u);
+        }
+        m = new_m;
+        pos = pos + 1u;
+    }
+
+    let out_base = h * k_num + split_idx;
+    if (lane == 0u) {
+        partial_ml[out_base * 2u] = m;
+        partial_ml[out_base * 2u + 1u] = l;
+    }
+    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+        partial_acc[out_base * HEAD_DIM + lane + i * 32u] = acc_reg[i];
+    }
+}
+"#;
+
+/// Builds the cooperative-reduction phase-1 kernel for a specific `head_dim`
+/// (baked in, so the owned loops unroll). See
+/// [`ATTENTION_SPLIT_COOP_SHADER_TEMPLATE`]. Requires `head_dim % 32 == 0`.
+pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) -> String {
+    debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
+    ATTENTION_SPLIT_COOP_SHADER_TEMPLATE
+        .replace("%HEAD_DIM%", &head_dim.to_string())
+        .replace("%OWNED%", &(head_dim / 32).to_string())
+        .replace("%KV_ENABLE%", kv_storage.enable_directive())
+        .replace("%KV_BINDINGS%", &kv_bindings)
+        .replace("%KV_READ_FNS%", &kv_read_fns)
+}
+
 /// Positions per K-tile the **flash** split kernel
 /// ([`ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE`]) stages into LDS, chosen so the
 /// padded `f16` `k_shmem` (`tile_pos * (head_dim + 1) * 2` bytes) stays within a
@@ -3943,7 +4120,14 @@ pub fn shader_source_attention_split(
 /// coalesced staging and the `head_dim`-strided `acc`/V loops.
 fn flash_tile_positions(head_dim: u32) -> u32 {
     let stride = head_dim + 1;
-    let budget_elems = 17_000u32; // ~34 KB / 2 bytes per f16
+    // ~34 KB / 2 bytes per f16 by default; `ORANGU_FLASH_LDS_KB` overrides the
+    // k_shmem budget to trade tile size for occupancy (34 KB → 1 workgroup/SIMD;
+    // ~8 KB → ~7). A smaller tile means more tiles/barriers but higher occupancy.
+    let budget_elems = std::env::var("ORANGU_FLASH_LDS_KB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|kb| kb * 512)
+        .unwrap_or(17_000u32);
     let max_pos = (budget_elems / stride).max(1);
     let mut tp = 64u32;
     while tp > max_pos && tp > 8 {

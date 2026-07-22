@@ -92,6 +92,12 @@ impl Role {
     pub fn default_slots(&self) -> usize {
         match self {
             Role::Embedding => 8,
+            // orangu is a local, single-user AI, so generation defaults to one
+            // slot. Concurrent decode is GPU/weight-bandwidth-bound — extra
+            // slots don't raise throughput
+            // (each token already streams the whole weight set), they only add
+            // KV-cache memory. A multi-user deployment can still set `slots` in
+            // the config file.
             Role::All | Role::Code | Role::Review | Role::Explorer => 1,
         }
     }
@@ -327,6 +333,7 @@ mod tests {
         assert_eq!(conf.models, PathBuf::from("/srv/models"));
         assert_eq!(conf.host, "127.0.0.1");
         assert_eq!(conf.port, 8100);
+        // orangu is local/single-user: generation defaults to one slot.
         assert_eq!(conf.slots, 1);
         assert_eq!(conf.web, 0);
         assert_eq!(conf.model, None);
