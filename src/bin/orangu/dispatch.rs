@@ -844,7 +844,32 @@ pub(crate) fn handle_command(
             ))
         }
         LocalCommand::Log(count) => match log_output(workspace, count) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                let (context, stats) =
+                    orangu::compression::prepare_llm_diff_context_with_stats(
+                        &output,
+                        compression,
+                        tools.diff_file_cap(),
+                        Some(&*tools.compression_store),
+                    );
+                if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                    metrics.record(&stats);
+                }
+                let count_part = count.map(|c| format!(" {c}")).unwrap_or_default();
+                let mut llm_msg =
+                    format!("The user executed `/log{count_part}`. Output:\n\n");
+                if let Some(note) = context.note {
+                    llm_msg.push_str(&note);
+                    llm_msg.push_str("\n\n");
+                }
+                llm_msg.push_str("```\n");
+                llm_msg.push_str(&context.content);
+                llm_msg.push_str("\n```");
+                Ok(CommandOutcome::OutputWithLlmContext {
+                    display: output,
+                    llm_context: llm_msg,
+                })
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Show(commit) => match show_output(workspace, commit.as_deref()) {
@@ -881,7 +906,35 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Fetch(remote) => match fetch_output(workspace, remote.as_deref(), forge) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                let (context, stats) =
+                    orangu::compression::prepare_llm_diff_context_with_stats(
+                        &output,
+                        compression,
+                        tools.diff_file_cap(),
+                        Some(&*tools.compression_store),
+                    );
+                if let Ok(mut metrics) = tools.compression_metrics.lock() {
+                    metrics.record(&stats);
+                }
+                let remote_part = remote
+                    .as_deref()
+                    .map(|r| format!(" {r}"))
+                    .unwrap_or_default();
+                let mut llm_msg =
+                    format!("The user executed `/fetch{remote_part}`. Output:\n\n");
+                if let Some(note) = context.note {
+                    llm_msg.push_str(&note);
+                    llm_msg.push_str("\n\n");
+                }
+                llm_msg.push_str("```\n");
+                llm_msg.push_str(&context.content);
+                llm_msg.push_str("\n```");
+                Ok(CommandOutcome::OutputWithLlmContext {
+                    display: output,
+                    llm_context: llm_msg,
+                })
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Pull(None) => Ok(CommandOutcome::OutputError(
@@ -2660,5 +2713,161 @@ mod tests {
             outcome,
             CommandOutcome::Output(ref msg) if msg.contains("Usage")
         ));
+    }
+
+    #[test]
+    fn log_command_wraps_output_in_llm_context() {
+        const SERVER: &str = "local";
+
+        let here_dir = tempdir().expect("workspace");
+        let here = crate::normalize_path(here_dir.path());
+
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&here)
+            .output()
+            .expect("git init");
+        assert!(git_init.status.success());
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&here)
+            .output()
+            .expect("git config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&here)
+            .output()
+            .expect("git config name");
+        std::fs::write(here_dir.path().join("readme.md"), b"hello")
+            .expect("write file");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&here)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial commit"])
+            .current_dir(&here)
+            .output()
+            .expect("git commit");
+
+        let llms = HashMap::from([(
+            SERVER.to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+        )]);
+        let tools = ToolExecutor::new(&here);
+        let mut active_model = SERVER.to_string();
+        let mut active_model_id = "model-a".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/log",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                startup_model: SERVER,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: &here,
+                session_dir: &here,
+                embeddings_server: "",
+                is_coordinator: false,
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                compile_workers: 1,
+                compression: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        let CommandOutcome::OutputWithLlmContext {
+            display,
+            llm_context,
+        } = outcome
+        else {
+            panic!("expected OutputWithLlmContext");
+        };
+        assert!(
+            llm_context.contains("/log"),
+            "llm_context should reference /log: {llm_context}"
+        );
+        assert!(
+            llm_context.contains("initial commit"),
+            "llm_context should include commit message: {llm_context}"
+        );
+        assert!(!display.is_empty(), "display should contain the raw log output");
+    }
+
+    #[test]
+    fn log_without_git_repo_returns_error() {
+        const SERVER: &str = "local";
+
+        let here_dir = tempdir().expect("workspace");
+        let here = crate::normalize_path(here_dir.path());
+
+        let llms = HashMap::from([(
+            SERVER.to_string(),
+            test_profile("llama.cpp", "http://localhost:8100/v1", "model-a"),
+        )]);
+        let tools = ToolExecutor::new(&here);
+        let mut active_model = SERVER.to_string();
+        let mut active_model_id = "model-a".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        let outcome = handle_command(
+            "/log",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                startup_model: SERVER,
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools: &tools,
+                workspace: &here,
+                session_dir: &here,
+                embeddings_server: "",
+                is_coordinator: false,
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                compile_workers: 1,
+                compression: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command");
+
+        assert!(
+            matches!(&outcome, CommandOutcome::OutputError(msg) if msg.contains("only available inside")),
+            "expected OutputError about git repo"
+        );
+        assert_eq!(active_model_id, "model-a");
     }
 }
