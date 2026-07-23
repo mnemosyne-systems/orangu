@@ -630,10 +630,28 @@ fn download_all(
         .try_for_each(|(slot, task)| download_with_resume(client, task, token, slot, &board))
 }
 
+/// How many times a single file's download is retried after a transient
+/// failure (a dropped connection, a rate limit, a truncated stream) before
+/// giving up, and how long to wait between attempts. A large multi-shard
+/// model streams for long enough that at least one shard hitting a blip is
+/// the norm, not the exception; each retry resumes from the `.part` file via
+/// a `Range` request rather than restarting, so a blip near the end costs
+/// only the tail, not the whole file.
+const DOWNLOAD_RETRIES: u32 = 5;
+const DOWNLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Downloads `task.url` into `task.blob_path`, resuming from a `.part` file
 /// left over from an interrupted attempt (via an HTTP `Range` request), and
 /// reporting percentage progress against `task.size` into `board`'s `slot`
 /// line as it goes.
+///
+/// A failed attempt is retried quietly up to [`DOWNLOAD_RETRIES`] times with
+/// [`DOWNLOAD_RETRY_DELAY`] between tries — each retry picks up where the
+/// last left off, since the partial bytes are already on disk. The retry
+/// status shows in place on this file's own progress line rather than
+/// scrolling new output, so a stall stays visible without becoming noise.
+/// Only once every retry is exhausted does the error propagate and fail the
+/// whole command.
 fn download_with_resume(
     client: &reqwest::blocking::Client,
     task: &DownloadTask,
@@ -643,21 +661,71 @@ fn download_with_resume(
 ) -> Result<()> {
     let DownloadTask {
         label,
-        url,
         blob_path: dest,
-        size: expected_size,
         position: (index, total),
+        ..
     } = task;
-    let expected_size = *expected_size;
     // Blob filenames are bare content hashes with no extension of their own
     // for `Path::with_extension` to replace, so just append directly.
     let part_path = PathBuf::from(format!("{}.part", dest.display()));
-    let mut resume_from = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+
+    let mut attempt = 0;
+    loop {
+        match download_attempt(client, task, token, slot, board, &part_path) {
+            Ok(()) => break,
+            Err(_) if attempt < DOWNLOAD_RETRIES => {
+                attempt += 1;
+                let secs = DOWNLOAD_RETRY_DELAY.as_secs();
+                board.lock().unwrap().update(
+                    slot,
+                    format!(
+                        "Retrying {label} in {secs}s (attempt {attempt}/{DOWNLOAD_RETRIES}) [{index}/{total}]"
+                    ),
+                );
+                std::thread::sleep(DOWNLOAD_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    board
+        .lock()
+        .unwrap()
+        .update(slot, format!("Downloaded {label}: 100% [{index}/{total}]"));
+
+    fs::rename(&part_path, dest)
+        .with_context(|| format!("failed to finalize {}", dest.display()))?;
+    Ok(())
+}
+
+/// One attempt at fetching `task` into `part_path` — sends the request
+/// (resuming from any existing partial bytes), streams the body to disk, and
+/// verifies the finished `.part` is the expected size. Returns an error on
+/// any network, HTTP, I/O, or short-read failure so [`download_with_resume`]
+/// can retry it; the partial bytes it leaves behind are what the next
+/// attempt resumes from.
+fn download_attempt(
+    client: &reqwest::blocking::Client,
+    task: &DownloadTask,
+    token: Option<&str>,
+    slot: usize,
+    board: &Mutex<ProgressBoard>,
+    part_path: &Path,
+) -> Result<()> {
+    let DownloadTask {
+        label,
+        url,
+        size: expected_size,
+        position: (index, total),
+        ..
+    } = task;
+    let expected_size = *expected_size;
+    let mut resume_from = fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
     if resume_from >= expected_size && expected_size > 0 {
         // A stale/complete .part from an interrupted run that never got
         // renamed; nothing left to fetch.
         resume_from = 0;
-        fs::remove_file(&part_path).ok();
+        fs::remove_file(part_path).ok();
     }
 
     let mut request = authed_get(client, url, token);
@@ -671,7 +739,7 @@ fn download_with_resume(
     if resume_from > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         // Server ignored the Range request; restart from scratch.
         resume_from = 0;
-        fs::remove_file(&part_path).ok();
+        fs::remove_file(part_path).ok();
         response = authed_get(client, url, token)
             .send()
             .with_context(|| format!("failed to download {label}"))?;
@@ -683,7 +751,7 @@ fn download_with_resume(
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&part_path)
+        .open(part_path)
         .with_context(|| format!("failed to open {}", part_path.display()))?;
 
     let mut downloaded = resume_from;
@@ -713,13 +781,16 @@ fn download_with_resume(
             last_printed = Some(percent);
         }
     }
-    board
-        .lock()
-        .unwrap()
-        .update(slot, format!("Downloaded {label}: 100% [{index}/{total}]"));
 
-    fs::rename(&part_path, dest)
-        .with_context(|| format!("failed to finalize {}", dest.display()))?;
+    // A connection that drops mid-stream often ends with a clean `read == 0`
+    // rather than an error, leaving a truncated `.part`. Treat a short file
+    // as a failure so it's retried (and resumed) rather than finalized as if
+    // it were complete.
+    if expected_size > 0 && downloaded != expected_size {
+        bail!(
+            "download of {label} ended early ({downloaded} of {expected_size} bytes) — will retry"
+        );
+    }
     Ok(())
 }
 
