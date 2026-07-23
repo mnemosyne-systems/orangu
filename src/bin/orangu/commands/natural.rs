@@ -806,10 +806,10 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         }
     }
     for prefix in ["create directory ", "new directory ", "mkdir "] {
-        if let Some(rest) = strip_ascii_prefix(input, prefix) {
-            if let Some(parsed) = parse_path_with_mode(rest) {
-                return Some(LocalCommand::CreateDirectory(Some(parsed)));
-            }
+        if let Some(rest) = strip_ascii_prefix(input, prefix)
+            && let Some(parsed) = parse_path_with_mode(rest)
+        {
+            return Some(LocalCommand::CreateDirectory(Some(parsed)));
         }
     }
     for prefix in ["move directory ", "rename directory "] {

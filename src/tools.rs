@@ -601,7 +601,7 @@ impl ToolExecutor {
                 content: updated.clone(),
                 // A brand-new file gets 0644, matching what this tool has
                 // always created; an existing one keeps its own bits.
-                mode: created.then(|| crate::files::Mode::Bits(0o644)),
+                mode: created.then_some(crate::files::Mode::Bits(0o644)),
                 overwrite: true,
                 parents: true,
                 git: args.git.unwrap_or_else(crate::files::git_default),
