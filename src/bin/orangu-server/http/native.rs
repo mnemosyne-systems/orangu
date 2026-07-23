@@ -48,6 +48,7 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "n_embd": cfg.n_embd,
         "total_slots": state.engine.slots.total(),
         "chat_template": state.engine.chat_template_source,
+        "workspace": state.workspace.display().to_string(),
         "uptime_seconds": state.started_at.elapsed().as_secs(),
     }))
 }

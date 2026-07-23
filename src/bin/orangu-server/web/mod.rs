@@ -39,6 +39,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     convert::Infallible,
     hash::{Hash, Hasher},
+    path::PathBuf,
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -166,6 +167,11 @@ pub struct WebState {
     /// available to the web UI at all.
     pub architecture: String,
     pub backend_label: String,
+    /// The root directory this server operates in (`-w`/`--workspace`, or
+    /// the current working directory) — echoed into the same debug report as
+    /// `architecture`/`backend_label`, so a saved report says which tree the
+    /// server was rooted at.
+    pub workspace: PathBuf,
     pub version: &'static str,
 }
 
@@ -238,8 +244,12 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
     let cpu = orangu::hardware::detect_cpu();
     let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
     let mut report = format!(
-        "orangu-server {}\nModel        {}\nArchitecture {}\nBackend      {}\n\n",
-        state.version, state.model_label, state.architecture, state.backend_label,
+        "orangu-server {}\nModel        {}\nArchitecture {}\nBackend      {}\nWorkspace    {}\n\n",
+        state.version,
+        state.model_label,
+        state.architecture,
+        state.backend_label,
+        state.workspace.display(),
     );
     report.push_str(&orangu::hardware::format_report(&cpu, &gpus));
     (

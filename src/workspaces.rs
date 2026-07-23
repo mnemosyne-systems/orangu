@@ -13,7 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Workspace tabs.
+//! Workspaces: resolving the root directory a binary operates in
+//! ([`resolve_workspace_root`], behind `-w`/`--workspace` in both `orangu`
+//! and `orangu-server`), and the workspace tabs `orangu` keeps open on top
+//! of it.
 //!
 //! A *workspace* is a directory orangu is open on. The [`WorkspaceManager`]
 //! holds the ordered list of open workspaces and tracks which one is active, so
@@ -32,9 +35,48 @@
 //! * Closing a tab renumbers the ones after it: tab numbers are just positions
 //!   in the list (1-based for the user), so removing one shifts the rest down.
 
+use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+
+/// Resolve a `-w`/`--workspace` argument to the absolute, normalized directory
+/// a binary operates in. `None` means "the current working directory", so an
+/// invocation without the flag is rooted where it was launched; a relative path
+/// is taken against that same directory.
+///
+/// Shared by every binary that takes the flag (`orangu`, `orangu-server`), so
+/// they all resolve it identically. The path is normalized lexically (`.` and
+/// `..` segments are folded away, symlinks are left alone) but not required to
+/// exist — the same contract `orangu` has always had.
+pub fn resolve_workspace_root(workspace: Option<PathBuf>) -> Result<PathBuf> {
+    let current_dir = std::env::current_dir().context("failed to resolve current directory")?;
+    let workspace = workspace.unwrap_or_else(|| current_dir.clone());
+    let absolute = if workspace.is_absolute() {
+        workspace
+    } else {
+        current_dir.join(workspace)
+    };
+    Ok(normalize_path(&absolute))
+}
+
+/// Fold `.` and `..` segments away lexically, without touching the filesystem
+/// (so a symlinked parent is not resolved to its target).
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => result.push(prefix.as_os_str()),
+            Component::RootDir => result.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(part) => result.push(part),
+        }
+    }
+    result
+}
 
 /// Where the workspace tab bar is drawn, set by `workspaces` in the `[orangu]`
 /// section of `orangu.conf`. Parsing is case-insensitive; an unset value
@@ -257,8 +299,38 @@ impl<W: WorkspacePath> WorkspaceManager<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Workspace, WorkspaceManager, WorkspacePath, WorkspacePlacement};
+    use super::{
+        Workspace, WorkspaceManager, WorkspacePath, WorkspacePlacement, resolve_workspace_root,
+    };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_workspace_root_defaults_to_the_current_directory() {
+        let current_dir = std::env::current_dir().expect("current directory");
+
+        assert_eq!(
+            resolve_workspace_root(None).expect("workspace"),
+            current_dir
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_makes_relative_paths_absolute() {
+        let current_dir = std::env::current_dir().expect("current directory");
+        let resolved = resolve_workspace_root(Some(PathBuf::from("."))).expect("workspace");
+
+        assert_eq!(resolved, current_dir);
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_workspace_root_normalizes_parent_segments() {
+        let current_dir = std::env::current_dir().expect("current directory");
+        let resolved =
+            resolve_workspace_root(Some(PathBuf::from("src/../tests"))).expect("workspace");
+
+        assert_eq!(resolved, current_dir.join("tests"));
+    }
 
     fn ws(path: &str) -> Workspace {
         Workspace::new(PathBuf::from(path))

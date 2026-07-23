@@ -77,11 +77,16 @@ _orangu_server() {
             compopt -o filenames 2>/dev/null
             return 0
             ;;
+        -w|--workspace)
+            COMPREPLY=( $(compgen -d -- "$cur") )
+            compopt -o filenames 2>/dev/null
+            return 0
+            ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -i --init -s --shell-completions -d --daemon \
+            "-c --config -w --workspace -i --init -s --shell-completions -d --daemon \
              --all --code --review --explorer --embedding -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
@@ -140,6 +145,7 @@ _orangu_server() {
 
     _arguments -C \
         '(-c --config)'{-c,--config}'[Path to the configuration file (orangu-server.conf)]:config file:_files' \
+        '(-w --workspace)'{-w,--workspace}'[Root directory the server operates in (default: the current directory)]:workspace:_files -/' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-d --daemon)'{-d,--daemon}'[Run in the background, detached from the terminal]' \
@@ -208,6 +214,7 @@ complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_
 complete -c orangu-server -n '__fish_seen_subcommand_from prune' -a '(__orangu_server_sessions)'
 
 complete -c orangu-server -s c -l config              -r -d 'Path to the configuration file (orangu-server.conf)'
+complete -c orangu-server -s w -l workspace -x -a '(__fish_complete_directories)' -d 'Root directory the server operates in (default: the current directory)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
 complete -c orangu-server -s s -l shell-completions       -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-server -s d -l daemon                  -d 'Run in the background, detached from the terminal'

@@ -68,12 +68,13 @@ use orangu::{
         render_review_screen, render_screen, render_thinking_status, render_tool_running_status,
         render_working_status, review_pane_body_height, terminal_height, terminal_width,
     },
+    workspaces::{normalize_path, resolve_workspace_root},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::Write,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
 };
@@ -2320,33 +2321,6 @@ fn llm_prompt_block_reason(
     None
 }
 
-fn resolve_workspace_root(workspace: Option<PathBuf>) -> Result<PathBuf> {
-    let current_dir = std::env::current_dir().context("failed to resolve current directory")?;
-    let workspace = workspace.unwrap_or_else(|| current_dir.clone());
-    let absolute = if workspace.is_absolute() {
-        workspace
-    } else {
-        current_dir.join(workspace)
-    };
-    Ok(normalize_path(&absolute))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => result.push(prefix.as_os_str()),
-            Component::RootDir => result.push(Path::new("/")),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            Component::Normal(part) => result.push(part),
-        }
-    }
-    result
-}
-
 /// Resolve a `/session <path>` argument to an existing workspace directory,
 /// expanding a leading `~`/`~/` and normalizing the result. Relative paths are
 /// taken against the current directory. Returns `None` when the argument does
@@ -2440,29 +2414,9 @@ pub fn process_env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
 
-    use super::{llm_prompt_block_reason, resolve_workspace_root};
+    use super::llm_prompt_block_reason;
 
     use orangu::tui::{ConnStatus, HeaderStatus};
-
-    use std::path::PathBuf;
-
-    #[test]
-    fn resolve_workspace_root_makes_relative_paths_absolute() {
-        let current_dir = std::env::current_dir().expect("current directory");
-        let resolved = resolve_workspace_root(Some(PathBuf::from("."))).expect("workspace");
-
-        assert_eq!(resolved, current_dir);
-        assert!(resolved.is_absolute());
-    }
-
-    #[test]
-    fn resolve_workspace_root_normalizes_parent_segments() {
-        let current_dir = std::env::current_dir().expect("current directory");
-        let resolved =
-            resolve_workspace_root(Some(PathBuf::from("src/../tests"))).expect("workspace");
-
-        assert_eq!(resolved, current_dir.join("tests"));
-    }
 
     #[test]
     fn llm_prompt_block_reason_requires_model_connection() {

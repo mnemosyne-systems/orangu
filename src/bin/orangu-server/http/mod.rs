@@ -28,7 +28,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
 pub struct AppState {
@@ -37,6 +37,10 @@ pub struct AppState {
     /// "id" in `/v1/models` and `/props` — not necessarily a real file path,
     /// so a client can display it directly.
     pub model_label: String,
+    /// The root directory this server operates in (`-w`/`--workspace`, or
+    /// the current working directory). Reported by `/props` so a client can
+    /// see which tree it is talking to.
+    pub workspace: PathBuf,
     pub started_at: Instant,
     pub shutdown_tx: mpsc::Sender<()>,
 }

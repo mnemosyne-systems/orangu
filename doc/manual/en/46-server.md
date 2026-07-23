@@ -60,7 +60,7 @@ role [all]:
 ```
 
 On startup, `orangu-server` prints the same CPU/GPU report `system` does,
-followed by the model/UI/API summary:
+followed by the model/UI/API/workspace summary:
 
 ```
 CPU
@@ -71,15 +71,17 @@ GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
       ...
 
-Model  unsloth/gemma-4-E2B-it-GGUF (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
-UI     disabled
-API    http://127.0.0.1:8100
+Model      unsloth/gemma-4-E2B-it-GGUF (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
+UI         disabled
+API        http://127.0.0.1:8100
+Workspace  /home/user/src/orangu
 ```
 
 The model line's second field names the backend the forward pass actually
 ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `CUDA/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
-was used (see **GPU backend** below).
+was used (see **GPU backend** below). The workspace line is the directory
+tree this server operates in (see **Workspace** below).
 
 Every completed request logs a throughput line, orangu-server-style:
 
@@ -317,7 +319,33 @@ in use is still reported to the invoking terminal rather than silently lost.
 shell detected from `$SHELL` — covering every flag above, the six
 subcommand names, and the positional `model` argument plus `show`'s and
 `delete`'s own arguments, the latter three completed by shelling out to
-`orangu-server list` itself.
+`orangu-server list` itself. `-w`/`--workspace` completes directories
+(only), and `-c`/`--config` any file, in all three shells.
+
+## Workspace
+
+`-w`/`--workspace` sets the root directory `orangu-server` operates in —
+the same concept, spelled the same way, as `orangu`'s own `-w`/`--workspace`
+(see the Workspaces chapter):
+
+```sh
+orangu-server -w ~/src/orangu unsloth/gemma-4-E2B-it-GGUF
+orangu-server --workspace ~/src/orangu unsloth/gemma-4-E2B-it-GGUF
+```
+
+It is a run-time parameter only — there is no `orangu-server.conf` key for
+it. Without the argument the current working directory is used. Either way
+the path is made absolute against the directory the server was started in
+and normalized (`.` and `..` segments folded away, symlinks left alone),
+then checked to be an existing directory — a typo fails at startup, while
+there's still a terminal to report it on, rather than at first use. With
+`--daemon` this all happens *before* detaching, so a relative path still
+means what it meant in the launching shell.
+
+The resolved path is printed on the startup banner, reported as
+`workspace` by `GET /props`, and included in the web UI's saved debug
+report. Nothing restricts the server to that tree yet — it is the root the
+workspace-scoped features being built on top of it will operate in.
 
 ## Roles
 

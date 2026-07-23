@@ -23,7 +23,10 @@ dependency on llama.cpp/ggml's own compiled code.
   `show`/`download`/`delete`/`prune` subcommands), model-spec resolution,
   GPU backend selection (`select_backend`), `format_show`/
   `DEFAULT_ARRAY_PREVIEW` (for `show`), `select_model_for_deletion`/
-  `confirm` (for `delete`, and reused by `prune`), and process wiring
+  `confirm` (for `delete`, and reused by `prune`), workspace-root
+  resolution (`resolve_workspace`, over the shared
+  `orangu::workspaces::resolve_workspace_root` that `orangu`'s own
+  `-w`/`--workspace` uses), and process wiring
   (Ctrl+C/`SIGINT`/`--daemon`).
 - `prune.rs` — `prune`'s own CLI logic (listing, `NR`/id resolution, the
   `all`/interactive/explicit-identifier flows), built on `web::sessions`'s
@@ -964,7 +967,7 @@ with a clear message if its variable is unset when the test is run
 ### HTTP layer and web UI
 
 `http::mod` assembles the router and shared `AppState` (model, scheduler
-handle, config, start time); `http::openai` and `http::native` hold the
+handle, config, workspace root, start time); `http::openai` and `http::native` hold the
 OpenAI-compatible and native handlers respectively; `/v1/shutdown`
 lives in `http::mod` itself since it's neither. Ctrl+C, `SIGINT`, and
 `POST /v1/shutdown` all converge on the same shutdown path via

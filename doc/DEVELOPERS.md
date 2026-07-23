@@ -28,7 +28,7 @@ The manual sources live under `doc/manual/en`.
 
 ## Notes
 
-- The client is workspace-scoped by default and uses the current directory unless `--workspace` is supplied.
+- The client is workspace-scoped by default and uses the current directory unless `--workspace` is supplied. `orangu-server` takes the same `-w`/`--workspace` for the root it operates in, with the same default.
 - Command history is stored in `~/.orangu/orangu.history`.
 - Local `orangu-server` deployments may take significant time to answer tool-calling prompts, so the default timeout is 30 minutes.
 

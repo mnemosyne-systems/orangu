@@ -21,6 +21,14 @@
 //! there's one tool, one config file, and one shell-completion script to
 //! keep in sync with the models directory convention both jobs share).
 
+// The `Send`/`Sync` proof for the web UI's SSE stream walks the whole wgpu
+// type graph the Vulkan backend pulls in, which sits right at the default
+// 128-step auto-trait recursion limit — deep enough that adding a single
+// field to `web::WebState` overflows it (in the test build only, where the
+// stream type is monomorphized again). Raising it is rustc's own suggested
+// remedy and costs nothing but a deeper proof search.
+#![recursion_limit = "256"]
+
 mod config;
 mod engine;
 mod http;
@@ -101,6 +109,10 @@ struct Args {
     /// ~/.orangu/orangu-server.conf.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Root directory this server is allowed to operate in. Defaults to the
+    /// current working directory.
+    #[arg(short, long)]
+    workspace: Option<PathBuf>,
     /// Interactively create ~/.orangu/orangu-server.conf.
     #[arg(short, long)]
     init: bool,
@@ -325,6 +337,12 @@ struct Prepared {
     model_label: String,
     architecture: String,
     backend_label: String,
+    /// Absolute, normalized root directory the server operates in — from
+    /// `-w`/`--workspace`, else the current working directory. Resolved in
+    /// [`prepare`], i.e. *before* `--daemon` detaches (daemonizing moves the
+    /// process to `/`), so a relative value still means what it meant in the
+    /// launching shell.
+    workspace: PathBuf,
     conf: ServerConfiguration,
     api_listener: std::net::TcpListener,
     web_listener: Option<std::net::TcpListener>,
@@ -342,6 +360,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     let cli_role = args.role();
     let conf = load_config(args.config, cli_role, args.daemon)?;
     let mut role = conf.role;
+    let workspace = resolve_workspace(args.workspace.clone())?;
 
     let (path, model_label) = if args.daemon {
         let spec = conf.model.clone().ok_or_else(|| {
@@ -505,11 +524,35 @@ fn prepare(args: Args) -> Result<Prepared> {
         model_label,
         architecture,
         backend_label,
+        workspace,
         conf,
         api_listener,
         web_listener,
         daemon: args.daemon,
     })
+}
+
+/// The root directory the server operates in: the `-w`/`--workspace`
+/// argument, or (`None`) the current working directory — the same default
+/// `orangu`'s own `--workspace` has, resolved by the same shared
+/// [`orangu::workspaces::resolve_workspace_root`]: made absolute against the
+/// current directory and normalized.
+///
+/// Unlike `orangu` — which resolves a workspace it is about to open a session
+/// on, and would report a bad path at its first tool call anyway — a server
+/// hands its root to requests it hasn't received yet, so a typo would only
+/// surface much later, in whatever feature happens to use it first. Hence the
+/// directory check here, at startup, while there's still a terminal to report
+/// it on.
+fn resolve_workspace(cli: Option<PathBuf>) -> Result<PathBuf> {
+    let workspace = orangu::workspaces::resolve_workspace_root(cli)?;
+    if !workspace.is_dir() {
+        bail!(
+            "workspace {} does not exist or is not a directory",
+            workspace.display()
+        );
+    }
+    Ok(workspace)
 }
 
 /// Detach from the controlling terminal and continue running in the
@@ -534,6 +577,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         model_label,
         architecture,
         backend_label,
+        workspace,
         conf,
         api_listener,
         web_listener,
@@ -556,6 +600,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
         model_label: model_label.clone(),
+        workspace: workspace.clone(),
         started_at: std::time::Instant::now(),
         shutdown_tx,
     });
@@ -567,17 +612,18 @@ async fn serve(prepared: Prepared) -> Result<()> {
         print!("{}", orangu::hardware::format_report(&cpu, &gpus));
         println!();
         println!(
-            "Model  {model_label} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
+            "Model      {model_label} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
             engine.model.config().n_layer,
             engine.model.config().n_ctx_train,
         );
         match &web_listener {
-            Some(l) => println!("UI     http://{}", l.local_addr()?),
-            None => println!("UI     disabled"),
+            Some(l) => println!("UI         http://{}", l.local_addr()?),
+            None => println!("UI         disabled"),
         }
-        println!("API    http://{}:{}", conf.host, conf.port);
+        println!("API        http://{}:{}", conf.host, conf.port);
+        println!("Workspace  {}", workspace.display());
         for advisory in orangu::hardware::performance_advisories() {
-            println!("Note   {advisory}");
+            println!("Note       {advisory}");
         }
     }
 
@@ -587,6 +633,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             model_label,
             architecture,
             backend_label,
+            workspace,
             version: VERSION,
         });
         let web_app = web::build_router(web_state);
@@ -1129,5 +1176,49 @@ fn is_x86_feature_detected() -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace;
+
+    #[test]
+    fn workspace_defaults_to_the_current_directory() {
+        let current_dir = std::env::current_dir().expect("current directory");
+
+        assert_eq!(resolve_workspace(None).expect("workspace"), current_dir);
+    }
+
+    /// The argument is resolved the same way `orangu`'s own is: made
+    /// absolute against the current directory and normalized.
+    #[test]
+    fn the_argument_is_normalized() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let with_detour = dir.path().join("sub").join("..");
+
+        let resolved = resolve_workspace(Some(with_detour)).expect("workspace");
+
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn a_workspace_that_is_not_a_directory_is_rejected() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let file = dir.path().join("orangu-server.conf");
+        std::fs::write(&file, "[orangu-server]\n").expect("write file");
+
+        let err = resolve_workspace(Some(file)).expect_err("not a directory");
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err:#}"
+        );
+
+        let err =
+            resolve_workspace(Some(dir.path().join("missing"))).expect_err("missing directory");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err:#}"
+        );
     }
 }
