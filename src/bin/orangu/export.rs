@@ -3571,6 +3571,28 @@ mod tests {
         assert!(bytes.starts_with(b"%PDF"));
     }
 
+    /// A `%PDF` header only proves a file was written. This reads the
+    /// exported document back with the same extractor the server uses for
+    /// PDF attachments, so a PDF-writer upgrade that produced structurally
+    /// valid but unreadable output would be caught.
+    #[test]
+    fn an_exported_pdf_can_be_read_back() {
+        let workspace = tempdir().expect("workspace");
+        let path = export_review(
+            workspace.path(),
+            "# Findings\n\nThe quick brown fox.",
+            "gemma",
+            &[],
+        )
+        .expect("export");
+
+        let bytes = std::fs::read(&path).expect("read pdf");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract text");
+
+        assert!(text.contains("Findings"), "extracted: {text:?}");
+        assert!(text.contains("quick brown fox"), "extracted: {text:?}");
+    }
+
     #[test]
     fn export_review_renders_markdown() {
         let workspace = tempdir().expect("workspace");
