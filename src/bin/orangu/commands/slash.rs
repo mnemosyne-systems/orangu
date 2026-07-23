@@ -69,7 +69,10 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
         "/build" => Some(LocalCommand::Build(crate::build::BuildRequest::default())),
         "/shell" => Some(LocalCommand::Shell(None)),
-        "/add_file" => Some(LocalCommand::AddFile(None)),
+        "/create_file" => Some(LocalCommand::CreateFile(None)),
+        "/create_directory" => Some(LocalCommand::CreateDirectory(None)),
+        "/move_directory" => Some(LocalCommand::MoveDirectory(None)),
+        "/delete_directory" => Some(LocalCommand::DeleteDirectory(None)),
         "/amend" => Some(LocalCommand::Amend(None)),
         "/branch" => Some(LocalCommand::Branch(BranchSubcommand::List)),
         "/cherry_pick" => Some(LocalCommand::CherryPick(None)),
@@ -101,7 +104,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/export" => Some(LocalCommand::Export(ExportTarget::Console)),
         "/push" => Some(LocalCommand::Push(false)),
         "/rebase" => Some(LocalCommand::Rebase(None)),
-        "/remove_file" => Some(LocalCommand::RemoveFile(None)),
+        "/delete_file" => Some(LocalCommand::DeleteFile(None)),
         "/squash" => Some(LocalCommand::Squash),
         "/stash" => Some(LocalCommand::Stash(StashSubcommand::Push)),
         "/bisect" => Some(LocalCommand::Bisect(BisectSubcommand::Status)),
@@ -263,21 +266,37 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     )));
                 }
             }
-            if let Some(args) = input.strip_prefix("/add_file ") {
+            if let Some(args) = input.strip_prefix("/create_file ") {
+                return Some(LocalCommand::CreateFile(parse_create_file_args(args)));
+            }
+            if let Some(args) = input.strip_prefix("/delete_file ") {
                 let path = args.trim();
-                return Some(LocalCommand::AddFile(if path.is_empty() {
+                return Some(LocalCommand::DeleteFile(if path.is_empty() {
                     None
                 } else {
                     Some(Cow::Borrowed(path))
                 }));
             }
-            if let Some(args) = input.strip_prefix("/remove_file ") {
+            if let Some(args) = input.strip_prefix("/create_directory ") {
+                return Some(LocalCommand::CreateDirectory(parse_path_with_mode(args)));
+            }
+            if let Some(args) = input.strip_prefix("/delete_directory ") {
                 let path = args.trim();
-                return Some(LocalCommand::RemoveFile(if path.is_empty() {
+                return Some(LocalCommand::DeleteDirectory(if path.is_empty() {
                     None
                 } else {
                     Some(Cow::Borrowed(path))
                 }));
+            }
+            if let Some(args) = input.strip_prefix("/move_directory ") {
+                let args = args.trim();
+                return Some(match shell_words(args) {
+                    Ok(words) if words.len() >= 2 => LocalCommand::MoveDirectory(Some((
+                        Cow::Owned(words[0].clone()),
+                        Cow::Owned(words[1].clone()),
+                    ))),
+                    _ => LocalCommand::MoveDirectory(None),
+                });
             }
             if let Some(args) = input.strip_prefix("/move_file ") {
                 let args = args.trim();
@@ -442,4 +461,45 @@ pub(super) fn parse_bisect_subcommand(sub: &str) -> BisectSubcommand<'_> {
         "log" => BisectSubcommand::Log,
         _ => BisectSubcommand::Status,
     }
+}
+
+/// `<path> [with <mode>]` — the shape both `/create_file` and
+/// `/create_directory` take, and what the natural-language forms ("create
+/// myfile.txt with 0644") parse down to. The mode is kept as typed; it is
+/// `orangu::files` that validates it, so one octal parser covers every
+/// surface.
+pub(crate) fn parse_path_with_mode(args: &str) -> Option<(Cow<'_, str>, Option<Cow<'_, str>>)> {
+    let parsed = parse_create_file_args(args)?;
+    Some((parsed.path, parsed.mode))
+}
+
+/// `<path> [with <mode>] [containing <text>]` — what `/create_file` and its
+/// natural-language forms ("create myfile.txt with 0644 containing hello")
+/// take. `containing` is everything to the end of the line, so content needs
+/// no quoting; the mode is kept as typed, since it is `orangu::files` that
+/// validates it, one octal parser for every surface.
+pub(crate) fn parse_create_file_args(args: &str) -> Option<CreateFileArgs<'_>> {
+    let args = args.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let (head, content) = match args.split_once(" containing ") {
+        Some((head, content)) => (head.trim(), Some(content)),
+        None => (args, None),
+    };
+    let (path, mode) = match head.split_once(" with ") {
+        Some((path, mode)) => (path.trim(), Some(mode.trim())),
+        None => (head, None),
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some(CreateFileArgs {
+        path: Cow::Borrowed(path),
+        mode: mode.filter(|mode| !mode.is_empty()).map(Cow::Borrowed),
+        content: content
+            .map(str::trim_end)
+            .filter(|content| !content.is_empty())
+            .map(Cow::Borrowed),
+    })
 }

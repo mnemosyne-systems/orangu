@@ -100,7 +100,7 @@ Then start with:
 /debugging reproduce the failing request path
 /build
 /shell ls -la
-/add_file README.md
+/create_file README.md
 /auto_review
 /amend "[#42] My feature"
 /branch main
@@ -126,7 +126,7 @@ Then start with:
 /push
 /push --force
 /rebase
-/remove_file README.md
+/delete_file README.md
 /review
 /squash
 /status

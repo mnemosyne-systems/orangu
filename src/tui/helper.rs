@@ -59,7 +59,7 @@ impl OranguHelper {
                 "/branch".to_string(),
                 "/restore".to_string(),
                 "/add_file".to_string(),
-                "/remove_file".to_string(),
+                "/delete_file".to_string(),
                 "/move_file".to_string(),
                 "/cherry_pick".to_string(),
                 "/commit".to_string(),

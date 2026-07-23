@@ -155,49 +155,94 @@ git grep TODO
 
 \newpage
 
-## /add_file
+## /create_file
 
-Stages a file or directory with `git add`.
+Creates a file in the workspace, with optional content and permissions, and — in a Git repository — stages it with `git add`. Nothing is committed.
 
-Tab completion after `/add_file ` offers untracked directories first, then untracked files; already-tracked content is excluded.
+`/add_file` is obsolete: creating a file *is* writing content and staging it, so it was folded into this command. Its phrasing (`add …`, `add file …`, `git add …`) still works and reaches here.
+
+A path that already exists is **overwritten**. That is the same on every surface — this command, the model's `create_file` tool, and `orangu-server`'s `/v1/create_file` endpoint all share one implementation, where creating a file that is already there is an override.
+
+Tab completion after `/create_file ` offers untracked directories first, then untracked files; already-tracked content is excluded.
 
 ### Examples
 
 ```text
-/add_file README.md
-/add_file src/
+/create_file notes.md
+/create_file src/main.rs with 0644
+/create_file notes.md containing Some text to start with
+/create_file README.md containing Fresh start    # already there: overwritten
 ```
+
+`with <mode>` takes octal permissions; `containing <text>` runs to the end of the line, so content needs no quoting.
 
 Natural-language forms:
 
 ```text
+create myfile.txt with 0644
+create file src/main.rs
+new file notes.md
 add README.md
-add file src/
+add file src/main.rs
 git add README.md
 ```
 
 \newpage
 
-## /remove_file
+## /delete_file
 
-Removes a file or directory from Git tracking with `git rm` (using `-r` for directories).
+Deletes a file from the workspace. A tracked file is deleted with `git rm`, so the deletion is staged; an untracked one is simply removed. Nothing is committed. A directory is refused — use `/delete_directory`, which takes only an empty one.
 
-Tab completion after `/remove_file ` offers tracked directories first, then tracked files; untracked content is excluded.
+This command was `/remove_file` before the file-lifecycle commands were unified; the natural-language `remove ...` forms still work, and now reach `/delete_file`.
+
+Tab completion after `/delete_file ` offers tracked directories first, then tracked files; untracked content is excluded.
 
 ### Examples
 
 ```text
-/remove_file old.rs
-/remove_file legacy/
+/delete_file old.rs
 ```
 
 Natural-language forms:
 
 ```text
+delete file old.rs
 remove old.rs
-remove file legacy/
+remove file old.rs
 git rm old.rs
 ```
+
+\newpage
+
+## /create_file, /create_directory, /move_directory, /delete_directory
+
+The rest of the file life cycle, as typed commands. Each is workspace-confined and, in a Git repository, performs its change with the matching Git command — `git add` for a new file, `git mv` for a move, `git rm` for a delete. Nothing is committed.
+
+```text
+/create_file notes.md
+/create_file src/main.rs with 0644
+/create_directory src/engine with 0750
+/move_directory src lib/src
+/delete_directory build
+```
+
+`with <mode>` is optional and takes octal permissions. `/delete_directory` only removes an empty directory.
+
+Natural-language forms:
+
+```text
+create myfile.txt with 0644
+create file src/main.rs
+new file notes.md
+create directory src/engine
+mkdir build
+move directory src lib/src
+delete directory build
+remove directory build
+rmdir build
+```
+
+These are the same operations the model's own `create_file`/`move_directory`/… tools call, and the same ones `orangu-server` serves over HTTP — one implementation behind all three (see the Tools chapter, and the Inference server internals chapter's **File-lifecycle API**).
 
 \newpage
 

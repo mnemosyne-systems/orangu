@@ -63,7 +63,10 @@ behind the same startup sequence.
 Every OpenAI-compatible path orangu talks to, and every one of
 `orangu-server`'s own native endpoints, is supported: `/v1/models`,
 `/v1/chat/completions`, `/v1/embeddings`, `/health`, `/props`, `/slots`,
-`/metrics`, plus the coordinator's own `/v1/coordinator`. All but the last
+`/metrics`, the file-lifecycle endpoints (`/v1/create_file`,
+`/v1/modify_file`, `/v1/move_file`, `/v1/delete_file`, `/v1/show_file`,
+`/v1/create_directory`, `/v1/move_directory`, `/v1/delete_directory`), plus
+the coordinator's own `/v1/coordinator`. All but the last
 are **pass-through**: the coordinator picks a target profile, then forwards
 the request's method, path+query, headers (minus hop-by-hop ones like
 `Connection`/`Host`/`Content-Length`), and body to that profile's
@@ -83,6 +86,7 @@ dynamically per the routing order in [How it works](#how-it-works):
 | `GET /props` | *(none)* | Same as above |
 | `GET /slots` | *(none)* | Same as above |
 | `GET /metrics` | *(none)* | Same as above |
+| `POST /v1/create_file`, `/v1/modify_file`, `/v1/move_file`, `/v1/delete_file`, `/v1/show_file`, `/v1/create_directory`, `/v1/move_directory`, `/v1/delete_directory` | *(none)* | Same as above — pass-through like everything else. See **File-lifecycle endpoints** below |
 | `GET /v1/coordinator` | *(none — special)* | **Not pass-through.** Answered directly by the coordinator itself; see below |
 | `POST /v1/coordinator/activate` | Whatever `model` names | **Not pass-through.** A pre-warming hint, answered directly; see below |
 | `GET /v1/coordinator/shutdown` | *(none — special)* | **Not pass-through.** Cleanly terminates the proxy process and unloads the active model. Disabled unless `shutdown_token` is configured; requires `?token=<secret>` and a loopback source IP |
@@ -91,6 +95,30 @@ The "currently active" fallback for the model-less rows matters in practice:
 without it, something like `/information` probing a server's `/health` would
 itself force a swap back to `all`, killing whatever role a real request had
 just switched to.
+
+### File-lifecycle endpoints
+
+`orangu-server`'s eight file endpoints (see its own documentation, and the
+manual's **File-lifecycle API** section) pass straight through the
+coordinator like any other request: it picks a profile, forwards the method,
+path, headers and body untouched, and streams the reply back.
+
+Two consequences worth being explicit about, since the coordinator is an
+HTTP proxy and nothing more:
+
+- **The workspace is the backend's.** The coordinator has no workspace of its
+  own and no `-w`/`--workspace` flag. A file operation happens in the
+  workspace of whichever `orangu-server` the request reached — which, for a
+  server the coordinator started, is the directory the coordinator itself was
+  started in (the child inherits it), unless that profile's own configuration
+  says otherwise. Point the coordinator at the tree you want operated on.
+- **They resolve like any model-less request**, so they go to the currently
+  active profile, then `all`. If nothing is running yet, the first file
+  request starts a backend — the same cold start any other request pays.
+
+Everything else about them is unchanged by the hop: workspace confinement,
+Git staging (`git add`/`git mv`/`git rm`, never a commit), the response
+shapes, and the error codes are all the server's, byte-for-byte.
 
 ### Self-identification: `GET /v1/coordinator`
 

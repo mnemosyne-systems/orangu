@@ -417,6 +417,14 @@ pub enum BranchSubcommand<'a> {
     Delete(Cow<'a, str>),
 }
 
+/// `/create_file`'s parsed arguments: where, with what permissions, and
+/// with what content.
+pub struct CreateFileArgs<'a> {
+    pub path: Cow<'a, str>,
+    pub mode: Option<Cow<'a, str>>,
+    pub content: Option<Cow<'a, str>>,
+}
+
 pub enum LocalCommand<'a> {
     Help,
     Disconnect,
@@ -472,9 +480,17 @@ pub enum LocalCommand<'a> {
     Merge(Option<Cow<'a, str>>),
     Branch(BranchSubcommand<'a>),
     Restore(Option<Cow<'a, str>>),
-    AddFile(Option<Cow<'a, str>>),
-    RemoveFile(Option<Cow<'a, str>>),
+    /// `/create_file <path> [with <mode>] [containing <text>]`. Also what
+    /// `/add_file` used to be: creating a file *is* writing content and
+    /// staging it, so a path that already exists and is given no content is
+    /// simply staged rather than refused.
+    CreateFile(Option<CreateFileArgs<'a>>),
+    DeleteFile(Option<Cow<'a, str>>),
     MoveFile(Option<(Cow<'a, str>, Cow<'a, str>)>),
+    /// `/create_directory <path> [with <mode>]`.
+    CreateDirectory(Option<(Cow<'a, str>, Option<Cow<'a, str>>)>),
+    MoveDirectory(Option<(Cow<'a, str>, Cow<'a, str>)>),
+    DeleteDirectory(Option<Cow<'a, str>>),
     CherryPick(Option<Cow<'a, str>>),
     Commit(Option<Cow<'a, str>>),
     Amend(Option<Cow<'a, str>>),

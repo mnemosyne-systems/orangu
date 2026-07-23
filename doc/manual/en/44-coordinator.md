@@ -170,6 +170,24 @@ If a role you're using has no dedicated profile in
 instead, so nothing errors out; it just means that role doesn't get its own
 specialized model.
 
+## File operations through the coordinator
+
+`orangu-server`'s file-lifecycle endpoints (`/v1/create_file`,
+`/v1/modify_file`, `/v1/move_file`, `/v1/delete_file`, `/v1/show_file`,
+`/v1/create_directory`, `/v1/move_directory`, `/v1/delete_directory`) work
+through the coordinator like everything else, because the coordinator is an
+HTTP proxy: it forwards the request untouched and streams the reply back.
+
+The coordinator has no workspace of its own and no `-w`/`--workspace` flag —
+the file operation happens in the workspace of the `orangu-server` that
+receives it. For a backend the coordinator started, that is the directory
+the coordinator itself was started in, since the child inherits it. So start
+the coordinator in the tree you want operated on.
+
+These requests carry no `model`, so they resolve like any model-less
+request: the currently active profile, then `all`. If nothing is running,
+the first one pays the same cold start as any other request.
+
 ## Things to know while using it
 
 - The first request after a swap waits for the new model to finish loading —

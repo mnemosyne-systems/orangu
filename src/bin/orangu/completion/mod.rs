@@ -306,11 +306,11 @@ fn structured_completion_candidates(
         return Some((start, cursor, candidates));
     }
 
-    if let Some((start, candidates)) = add_file_completion_candidates(prefix, workspace) {
+    if let Some((start, candidates)) = create_file_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
 
-    if let Some((start, candidates)) = remove_file_completion_candidates(prefix, workspace) {
+    if let Some((start, candidates)) = delete_file_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
 

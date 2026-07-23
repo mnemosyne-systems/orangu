@@ -551,116 +551,18 @@ pub fn git_checkout(repo_root: &Path, target: &str) -> Result<String> {
     Ok(format!("Switched to '{target}'"))
 }
 
-pub fn add_file_output(workspace: &Path, path: &str) -> Result<String> {
-    let repo_root = discover_git_root(workspace)
-        .ok_or_else(|| anyhow!("add_file is only available inside a Git repository"))?;
-    if let Some(output) = try_gh_add_file(&repo_root, path)? {
-        return Ok(output);
-    }
-    git_add_file(&repo_root, path)
-}
+// `/add_file` used to run `git add` from here. It is now `/create_file`
+// without content — creating a file is writing it and staging it, and an
+// already-existing path is staged rather than refused (see
+// `dispatch::create_file_command`), so the staging goes through
+// `orangu::git_index` with every other file operation.
 
-pub fn try_gh_add_file(_repo_root: &Path, _path: &str) -> Result<Option<String>> {
-    Ok(None)
-}
-
-pub fn git_add_file(repo_root: &Path, path: &str) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["add", path])
-        .output()
-        .context("failed to run git add")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "git add failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        ));
-    }
-    Ok(format!("Staged '{path}'"))
-}
-
-pub fn remove_file_output(workspace: &Path, path: &str) -> Result<String> {
-    let repo_root = discover_git_root(workspace)
-        .ok_or_else(|| anyhow!("remove_file is only available inside a Git repository"))?;
-    if let Some(output) = try_gh_remove_file(&repo_root, path)? {
-        return Ok(output);
-    }
-    git_remove_file(&repo_root, path)
-}
-
-pub fn try_gh_remove_file(_repo_root: &Path, _path: &str) -> Result<Option<String>> {
-    Ok(None)
-}
-
-pub fn git_remove_file(repo_root: &Path, path: &str) -> Result<String> {
-    let mut args = vec!["rm"];
-    if repo_root.join(path.trim_end_matches('/')).is_dir() {
-        args.push("-r");
-    }
-    args.push(path);
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(&args)
-        .output()
-        .context("failed to run git rm")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "git rm failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        ));
-    }
-    Ok(format!("Removed '{path}'"))
-}
-
-pub fn move_file_output(workspace: &Path, source: &str, destination: &str) -> Result<String> {
-    let repo_root = discover_git_root(workspace)
-        .ok_or_else(|| anyhow!("move_file is only available inside a Git repository"))?;
-    if let Some(output) = try_gh_move_file(&repo_root, source, destination)? {
-        return Ok(output);
-    }
-    git_move_file(&repo_root, source, destination)
-}
-
-pub fn try_gh_move_file(
-    _repo_root: &Path,
-    _source: &str,
-    _destination: &str,
-) -> Result<Option<String>> {
-    Ok(None)
-}
-
-pub fn git_move_file(repo_root: &Path, source: &str, destination: &str) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["mv", source, destination])
-        .output()
-        .context("failed to run git mv")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "git mv failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        ));
-    }
-    Ok(format!("Moved '{source}' to '{destination}'"))
-}
+// `delete_file`/`move_file` used to run their own `git rm`/`git mv` here.
+// Both now go through `orangu::files`, the one implementation `orangu`'s
+// tools, its typed commands, and `orangu-server`'s endpoints all share — so
+// they are workspace-confined and staged the same way everywhere. `git add`
+// stays below: staging an already-existing file is not a file-lifecycle
+// operation and has no endpoint of its own.
 
 pub fn cherry_pick_output(workspace: &Path, commit: &str) -> Result<String> {
     let repo_root = discover_git_root(workspace)

@@ -1234,81 +1234,82 @@ fn parses_branch_commands() {
 }
 
 #[test]
-fn parses_add_file_commands() {
-    assert!(matches!(
-        parse_local_command("/add_file"),
-        Some(LocalCommand::AddFile(None))
-    ));
-    assert!(matches!(
-        parse_local_command("/add_file "),
-        Some(LocalCommand::AddFile(None))
-    ));
-    assert!(matches!(
-        parse_local_command("add"),
-        Some(LocalCommand::AddFile(None))
-    ));
-    assert!(matches!(
-        parse_local_command("Add"),
-        Some(LocalCommand::AddFile(None))
-    ));
-    match parse_local_command("/add_file README.md") {
-        Some(LocalCommand::AddFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
-        _ => panic!("expected add_file with path"),
+fn add_phrases_now_reach_create_file() {
+    // `/add_file` was `/create_file` without content: creating a file is
+    // writing it and staging it. Its phrasing still works and lands there.
+    for input in [
+        "add README.md",
+        "Add README.md",
+        "add file README.md",
+        "git add README.md",
+    ] {
+        match parse_local_command(input) {
+            Some(LocalCommand::CreateFile(Some(args))) => {
+                assert_eq!(args.path.as_ref(), "README.md", "{input}");
+                assert!(args.content.is_none(), "{input}");
+            }
+            _ => panic!("expected create_file for {input:?}"),
+        }
     }
-    match parse_local_command("add README.md") {
-        Some(LocalCommand::AddFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
-        _ => panic!("expected natural add with path"),
+    assert!(parse_local_command("/add_file").is_none());
+}
+
+#[test]
+fn parses_create_file_content() {
+    match parse_local_command("create notes.md with 0644 containing hello world") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "notes.md");
+            assert_eq!(args.mode.as_deref(), Some("0644"));
+            assert_eq!(args.content.as_deref(), Some("hello world"));
+        }
+        _ => panic!("expected create_file with content"),
     }
-    match parse_local_command("Add src/") {
-        Some(LocalCommand::AddFile(Some(path))) => assert_eq!(path.as_ref(), "src/"),
-        _ => panic!("expected case-insensitive add with directory"),
-    }
-    match parse_local_command("add file README.md") {
-        Some(LocalCommand::AddFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
-        _ => panic!("expected add file prefix"),
-    }
-    match parse_local_command("git add README.md") {
-        Some(LocalCommand::AddFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
-        _ => panic!("expected git add natural language"),
+    match parse_local_command("/create_file src/main.rs containing fn main() {}") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "src/main.rs");
+            assert!(args.mode.is_none());
+            assert_eq!(args.content.as_deref(), Some("fn main() {}"));
+        }
+        _ => panic!("expected slash create_file with content"),
     }
 }
 
 #[test]
-fn parses_remove_file_commands() {
+fn parses_delete_file_commands() {
     assert!(matches!(
-        parse_local_command("/remove_file"),
-        Some(LocalCommand::RemoveFile(None))
+        parse_local_command("/delete_file"),
+        Some(LocalCommand::DeleteFile(None))
     ));
     assert!(matches!(
-        parse_local_command("/remove_file "),
-        Some(LocalCommand::RemoveFile(None))
+        parse_local_command("/delete_file "),
+        Some(LocalCommand::DeleteFile(None))
     ));
     assert!(matches!(
         parse_local_command("remove"),
-        Some(LocalCommand::RemoveFile(None))
+        Some(LocalCommand::DeleteFile(None))
     ));
     assert!(matches!(
         parse_local_command("Remove"),
-        Some(LocalCommand::RemoveFile(None))
+        Some(LocalCommand::DeleteFile(None))
     ));
-    match parse_local_command("/remove_file README.md") {
-        Some(LocalCommand::RemoveFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
-        _ => panic!("expected remove_file with path"),
+    match parse_local_command("/delete_file README.md") {
+        Some(LocalCommand::DeleteFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
+        _ => panic!("expected delete_file with path"),
     }
     match parse_local_command("remove README.md") {
-        Some(LocalCommand::RemoveFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
+        Some(LocalCommand::DeleteFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
         _ => panic!("expected natural remove with path"),
     }
     match parse_local_command("Remove src/") {
-        Some(LocalCommand::RemoveFile(Some(path))) => assert_eq!(path.as_ref(), "src/"),
+        Some(LocalCommand::DeleteFile(Some(path))) => assert_eq!(path.as_ref(), "src/"),
         _ => panic!("expected case-insensitive remove with directory"),
     }
     match parse_local_command("remove file README.md") {
-        Some(LocalCommand::RemoveFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
+        Some(LocalCommand::DeleteFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
         _ => panic!("expected remove file prefix"),
     }
     match parse_local_command("git rm README.md") {
-        Some(LocalCommand::RemoveFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
+        Some(LocalCommand::DeleteFile(Some(path))) => assert_eq!(path.as_ref(), "README.md"),
         _ => panic!("expected git rm natural language"),
     }
 }
@@ -1873,5 +1874,94 @@ fn parses_bisect_commands() {
     assert!(matches!(
         parse_local_command("git bisect"),
         Some(LocalCommand::Bisect(BisectSubcommand::Status))
+    ));
+}
+
+/// "Create myfile.txt with 0644" and the rest of the file-lifecycle
+/// phrasing, all landing on the same commands the tools and the server's
+/// endpoints use.
+#[test]
+fn parses_create_file_commands_with_an_optional_mode() {
+    match parse_local_command("create myfile.txt with 0644") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "myfile.txt");
+            assert_eq!(args.mode.as_deref(), Some("0644"));
+        }
+        _ => panic!("expected create_file with mode"),
+    }
+    match parse_local_command("create file src/main.rs") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "src/main.rs");
+            assert!(args.mode.is_none());
+        }
+        _ => panic!("expected create_file"),
+    }
+    match parse_local_command("/create_file notes.md with 0600") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "notes.md");
+            assert_eq!(args.mode.as_deref(), Some("0600"));
+        }
+        _ => panic!("expected slash create_file"),
+    }
+    assert!(matches!(
+        parse_local_command("/create_file"),
+        Some(LocalCommand::CreateFile(None))
+    ));
+}
+
+/// The bare "create " form must not swallow the other things orangu
+/// creates — each keeps its own command.
+#[test]
+fn create_does_not_shadow_the_other_create_commands() {
+    assert!(matches!(
+        parse_local_command("create workspace ~/project"),
+        Some(LocalCommand::CreateWorkspace(_))
+    ));
+    assert!(matches!(
+        parse_local_command("create branch feature"),
+        Some(LocalCommand::Branch(_))
+    ));
+    assert!(matches!(
+        parse_local_command("create pull request"),
+        Some(LocalCommand::CreatePullRequest)
+    ));
+    assert!(matches!(
+        parse_local_command("create directory src/engine"),
+        Some(LocalCommand::CreateDirectory(_))
+    ));
+}
+
+#[test]
+fn parses_the_directory_commands() {
+    match parse_local_command("create directory src/engine with 0750") {
+        Some(LocalCommand::CreateDirectory(Some((path, mode)))) => {
+            assert_eq!(path.as_ref(), "src/engine");
+            assert_eq!(mode.as_deref(), Some("0750"));
+        }
+        _ => panic!("expected create_directory"),
+    }
+    match parse_local_command("mkdir build") {
+        Some(LocalCommand::CreateDirectory(Some((path, _)))) => assert_eq!(path.as_ref(), "build"),
+        _ => panic!("expected mkdir"),
+    }
+    match parse_local_command("move directory src lib/src") {
+        Some(LocalCommand::MoveDirectory(Some((from, to)))) => {
+            assert_eq!(from.as_ref(), "src");
+            assert_eq!(to.as_ref(), "lib/src");
+        }
+        _ => panic!("expected move_directory"),
+    }
+    match parse_local_command("delete directory build") {
+        Some(LocalCommand::DeleteDirectory(Some(path))) => assert_eq!(path.as_ref(), "build"),
+        _ => panic!("expected delete_directory"),
+    }
+    match parse_local_command("rmdir build") {
+        Some(LocalCommand::DeleteDirectory(Some(path))) => assert_eq!(path.as_ref(), "build"),
+        _ => panic!("expected rmdir"),
+    }
+    // "remove directory" must reach delete_directory, not delete_file.
+    assert!(matches!(
+        parse_local_command("remove directory build"),
+        Some(LocalCommand::DeleteDirectory(_))
     ));
 }

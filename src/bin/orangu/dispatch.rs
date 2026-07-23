@@ -24,6 +24,126 @@ pub(crate) fn local_command_error(err: Error) -> CommandOutcome {
     }
 }
 
+/// `/create_file <path> [with <mode>] [containing <text>]`.
+///
+/// A path that already exists is overwritten — the same on every surface
+/// (`orangu::files::overwrite_default`), so the endpoint, the tool and this
+/// command agree. The file is written and staged with `git add`; nothing is
+/// committed.
+fn create_file_command(
+    workspace: &std::path::Path,
+    args: crate::commands::CreateFileArgs<'_>,
+) -> Result<CommandOutcome> {
+    file_command(
+        orangu::files::create,
+        workspace,
+        orangu::files::CreateFileRequest {
+            path: args.path.to_string(),
+            content: args
+                .content
+                .map(|content| {
+                    let mut content = content.to_string();
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content
+                })
+                .unwrap_or_default(),
+            mode: args
+                .mode
+                .map(|mode| orangu::files::Mode::Text(mode.to_string())),
+            overwrite: orangu::files::overwrite_default(),
+            parents: true,
+            git: orangu::files::git_default(),
+        },
+    )
+}
+
+/// Run one `orangu::files` operation for a typed command, reporting what it
+/// did in one line. These are the same functions the `create_file`/
+/// `modify_file`/… tools call and `orangu-server` serves over HTTP, so a
+/// typed `/create_file`, a model's tool call, and an API request all land on
+/// identical behaviour — workspace-confined, and staged with `git add`/`git
+/// mv`/`git rm` in a repository.
+fn file_command<Q, R: FileOperationSummary>(
+    operation: fn(&std::path::Path, Q) -> orangu::files::FileResult<R>,
+    workspace: &std::path::Path,
+    request: Q,
+) -> Result<CommandOutcome> {
+    match operation(workspace, request) {
+        Ok(response) => Ok(CommandOutcome::Output(response.summary())),
+        Err(err) => Ok(CommandOutcome::OutputError(format!("Error: {err}"))),
+    }
+}
+
+/// The one line a file command prints on success — what happened, and
+/// whether it reached the Git index.
+trait FileOperationSummary {
+    fn summary(&self) -> String;
+}
+
+/// `Staged.` / `Not staged (ignored).` / nothing at all outside a
+/// repository — the Git half of a command's one-line report.
+fn git_suffix(git: &Option<orangu::git_index::GitOutcome>) -> String {
+    match git {
+        Some(outcome) if outcome.staged => " (staged)".to_string(),
+        Some(outcome) => match (&outcome.skipped, &outcome.error) {
+            (Some(reason), _) => format!(" (not staged: {reason})"),
+            (None, Some(error)) => format!(" (not staged: {error})"),
+            _ => String::new(),
+        },
+        None => String::new(),
+    }
+}
+
+impl FileOperationSummary for orangu::files::CreateFileResponse {
+    fn summary(&self) -> String {
+        let mode = self.mode.as_deref().unwrap_or("-");
+        format!("Created {} ({mode}){}", self.path, git_suffix(&self.git))
+    }
+}
+
+impl FileOperationSummary for orangu::files::DeleteFileResponse {
+    fn summary(&self) -> String {
+        format!("Deleted {}{}", self.path, git_suffix(&self.git))
+    }
+}
+
+impl FileOperationSummary for orangu::files::MoveFileResponse {
+    fn summary(&self) -> String {
+        format!(
+            "Moved {} -> {}{}",
+            self.from,
+            self.to,
+            git_suffix(&self.git)
+        )
+    }
+}
+
+impl FileOperationSummary for orangu::files::CreateDirectoryResponse {
+    fn summary(&self) -> String {
+        let mode = self.mode.as_deref().unwrap_or("-");
+        format!("Created directory {} ({mode})", self.path)
+    }
+}
+
+impl FileOperationSummary for orangu::files::MoveDirectoryResponse {
+    fn summary(&self) -> String {
+        format!(
+            "Moved directory {} -> {}{}",
+            self.from,
+            self.to,
+            git_suffix(&self.git)
+        )
+    }
+}
+
+impl FileOperationSummary for orangu::files::DeleteDirectoryResponse {
+    fn summary(&self) -> String {
+        format!("Deleted directory {}", self.path)
+    }
+}
+
 /// Refuse the review when the branch is behind main/master: it would run
 /// against stale code, so point at `/rebase` instead. Returns the error outcome
 /// to surface, or `None` when the branch is up to date.
@@ -878,27 +998,74 @@ pub(crate) fn handle_command(
                 Err(err) => Ok(local_command_error(err)),
             }
         }
-        LocalCommand::AddFile(None) => Ok(CommandOutcome::OutputError(
-            add_file_usage_message().to_string(),
+        LocalCommand::CreateFile(None) => Ok(CommandOutcome::OutputError(
+            create_file_usage_message().to_string(),
         )),
-        LocalCommand::AddFile(Some(path)) => match add_file_output(workspace, &path) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
-            Err(err) => Ok(local_command_error(err)),
-        },
-        LocalCommand::RemoveFile(None) => Ok(CommandOutcome::OutputError(
-            remove_file_usage_message().to_string(),
+        LocalCommand::CreateFile(Some(args)) => create_file_command(workspace, args),
+        LocalCommand::DeleteFile(None) => Ok(CommandOutcome::OutputError(
+            delete_file_usage_message().to_string(),
         )),
-        LocalCommand::RemoveFile(Some(path)) => match remove_file_output(workspace, &path) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
-            Err(err) => Ok(local_command_error(err)),
-        },
+        LocalCommand::DeleteFile(Some(path)) => file_command(
+            orangu::files::delete,
+            workspace,
+            orangu::files::DeleteFileRequest {
+                path: path.to_string(),
+                git: orangu::files::git_default(),
+            },
+        ),
         LocalCommand::MoveFile(None) => Ok(CommandOutcome::OutputError(
             move_file_usage_message().to_string(),
         )),
-        LocalCommand::MoveFile(Some((src, dst))) => match move_file_output(workspace, &src, &dst) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
-            Err(err) => Ok(local_command_error(err)),
-        },
+        LocalCommand::MoveFile(Some((src, dst))) => file_command(
+            orangu::files::move_,
+            workspace,
+            orangu::files::MoveFileRequest {
+                from: src.to_string(),
+                to: dst.to_string(),
+                mode: None,
+                overwrite: false,
+                parents: true,
+                git: orangu::files::git_default(),
+            },
+        ),
+        LocalCommand::CreateDirectory(None) => Ok(CommandOutcome::OutputError(
+            "Usage: /create_directory <path> [with <mode>]".to_string(),
+        )),
+        LocalCommand::CreateDirectory(Some((path, mode))) => file_command(
+            orangu::files::create_dir,
+            workspace,
+            orangu::files::CreateDirectoryRequest {
+                path: path.to_string(),
+                mode: mode.map(|mode| orangu::files::Mode::Text(mode.to_string())),
+                parents: true,
+                git: orangu::files::git_default(),
+            },
+        ),
+        LocalCommand::MoveDirectory(None) => Ok(CommandOutcome::OutputError(
+            "Usage: /move_directory <from> <to>".to_string(),
+        )),
+        LocalCommand::MoveDirectory(Some((src, dst))) => file_command(
+            orangu::files::move_dir,
+            workspace,
+            orangu::files::MoveDirectoryRequest {
+                from: src.to_string(),
+                to: dst.to_string(),
+                mode: None,
+                parents: true,
+                git: orangu::files::git_default(),
+            },
+        ),
+        LocalCommand::DeleteDirectory(None) => Ok(CommandOutcome::OutputError(
+            "Usage: /delete_directory <path>".to_string(),
+        )),
+        LocalCommand::DeleteDirectory(Some(path)) => file_command(
+            orangu::files::delete_dir,
+            workspace,
+            orangu::files::DeleteDirectoryRequest {
+                path: path.to_string(),
+                git: orangu::files::git_default(),
+            },
+        ),
         LocalCommand::CherryPick(None) => Ok(CommandOutcome::OutputError(
             cherry_pick_usage_message().to_string(),
         )),
@@ -1177,6 +1344,78 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    /// The typed commands run the same `orangu::files` operations the tools
+    /// and the server's endpoints do, and report what reached the index.
+    #[test]
+    fn file_commands_run_the_shared_operations_and_report_staging() {
+        let workspace = tempdir().expect("workspace");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(args)
+                .output()
+                .expect("git setup");
+        }
+        let create = |path: &str, content: Option<&str>| {
+            create_file_command(
+                workspace.path(),
+                crate::commands::CreateFileArgs {
+                    path: std::borrow::Cow::Borrowed(path),
+                    mode: Some(std::borrow::Cow::Borrowed("0644")),
+                    content: content.map(std::borrow::Cow::Borrowed),
+                },
+            )
+            .expect("create")
+        };
+
+        match create("notes.md", Some("first")) {
+            CommandOutcome::Output(message) => {
+                assert!(message.starts_with("Created notes.md (0644)"), "{message}");
+                assert!(message.contains("(staged)"), "{message}");
+            }
+            _ => panic!("expected an output line"),
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.md")).unwrap(),
+            "first\n"
+        );
+
+        // A path that already exists is overwritten: the typed command is an
+        // override, unlike the endpoint and the tool.
+        create("notes.md", Some("second"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.md")).unwrap(),
+            "second\n"
+        );
+
+        // Outside the workspace is refused here exactly as it is everywhere
+        // else, and reports the failure rather than the change.
+        match file_command(
+            orangu::files::create,
+            workspace.path(),
+            orangu::files::CreateFileRequest {
+                path: "../escaped.md".to_string(),
+                content: String::new(),
+                mode: None,
+                overwrite: false,
+                parents: true,
+                git: orangu::files::git_default(),
+            },
+        )
+        .expect("call")
+        {
+            CommandOutcome::OutputError(message) => {
+                assert!(message.contains("workspace"), "{message}");
+            }
+            _ => panic!("expected an error outcome"),
+        }
+    }
 
     #[test]
     fn review_path_matches_accepts_exact_paths_and_bare_names() {

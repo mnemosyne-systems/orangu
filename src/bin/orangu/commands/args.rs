@@ -389,11 +389,11 @@ pub fn prune_usage_message() -> &'static str {
     "Usage: /prune <uuid> | /prune --workspace <path> | /prune --older-than <days>. Use /help to see available commands."
 }
 
-pub fn add_file_usage_message() -> &'static str {
-    "Usage: /add_file <path>. Use /help to see available commands."
+pub fn create_file_usage_message() -> &'static str {
+    "Usage: /create_file <path> [with <mode>] [containing <text>]. Use /help to see available commands."
 }
 
-pub fn remove_file_usage_message() -> &'static str {
+pub fn delete_file_usage_message() -> &'static str {
     "Usage: /remove_file <path>. Use /help to see available commands."
 }
 

@@ -51,7 +51,7 @@ uncompressed output directly to the user, they now automatically compress their
 payload when injecting it into the model's context. This lets the LLM follow along
 with your local investigation without flooding its context window.
 
-### `read_file`
+### `show_file`
 
 When the model asks for the same whole file again, and the file is unchanged,
 orangu may return a cache stub instead of resending the full file content.
@@ -60,7 +60,7 @@ This context cache is **per session**, so you do not waste tokens re-reading unm
 This applies only to repeated whole-file reads. Line-range reads still return
 the requested lines normally.
 
-Additionally, `read_file` supports **structural read modes** to grab a high-level
+Additionally, `show_file` supports **structural read modes** to grab a high-level
 understanding of large files without reading their full bodies:
 - `signatures`: Extracts only the public interfaces (functions, structs) while stripping private bodies.
 - `map`: Extracts top-level item declarations for an overview.
@@ -120,7 +120,7 @@ The current implementation is a v1.
 
 It provides:
 
-- Repeated unchanged whole-file `read_file` suppression
+- Repeated unchanged whole-file `show_file` suppression
 - Per-session file caching
 - Structural read modes (`signatures` and `map`)
 - Shell output compression for common noisy commands

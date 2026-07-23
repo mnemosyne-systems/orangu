@@ -417,6 +417,10 @@ impl Coordinator {
         let role_flag = role_server_flag(&entry.role)
             .ok_or_else(|| anyhow!("[{}] has an unknown role '{}'", entry.name, entry.role))?;
 
+        // No `--workspace` here: the backend takes its own, which without
+        // the flag is the directory it is started in — the coordinator's own
+        // working directory, inherited by the child. The coordinator has no
+        // workspace of its own; it is a pass-through.
         let mut child = Command::new(&program)
             .arg("--config")
             .arg(&server_config_path)

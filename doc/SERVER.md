@@ -576,8 +576,10 @@ means what it meant in the launching shell.
 
 The resolved path is printed on the startup banner, reported as
 `workspace` by `GET /props`, and included in the web UI's saved debug
-report. Nothing restricts the server to that tree yet — it is the root the
-workspace-scoped features being built on top of it will operate in.
+report. It is the root every workspace-scoped feature operates in: the
+file-lifecycle API (the five `*_file` and three `*_directory` endpoints —
+see **Endpoint reference** below) refuses any path that resolves outside it,
+and the features built on top of it later will do the same.
 
 ## Roles
 
@@ -790,7 +792,30 @@ the API and (if enabled) the web UI listener stop together.
 | `POST /tokenize` / `POST /detokenize` | |
 | `POST /embedding` | native embeddings |
 | `POST /apply-template` | renders the chat template without generating |
+| `POST /v1/create_file` | file lifecycle: write a new file, with optional permissions |
+| `POST /v1/modify_file` | file lifecycle: replace named line ranges, returning a diff |
+| `POST /v1/move_file` | file lifecycle: rename a file, optionally re-setting permissions |
+| `POST /v1/delete_file` | file lifecycle: delete a file |
+| `POST /v1/show_file` | file lifecycle: return a file's entire content |
+| `POST /v1/create_directory` | file lifecycle: create one directory, with optional permissions |
+| `POST /v1/move_directory` | file lifecycle: move an entire directory tree |
+| `POST /v1/delete_directory` | file lifecycle: delete an empty directory |
 | `POST /v1/shutdown` | not part of the standard API — orangu-server's own |
+
+Those eight are orangu-server's own JSON API for the whole life cycle of a
+file and the directories it lives in, and are confined to the workspace (see
+**Workspace** above): a path outside it is refused before anything is
+touched. `delete_directory` only removes an empty directory, and nothing in
+the API deletes a tree.
+
+When the workspace is a **Git repository**, they are Git operations: a file
+is created, modified, moved and deleted with `git add`, `git mv` and
+`git rm`, so the change is staged, and each reply reports what reached the
+index (including the forge, when `gh` or `glab` is installed). **Nothing is
+ever committed** — that stays the user's own decision. A request can pass
+`"git": false` for a plain filesystem change. They are documented field by field in the Inference
+server internals chapter of the manual (`doc/manual/en/78-server.md`), under
+**File-lifecycle API**.
 
 The built-in **Web UI** (above) is served on its own `web` port, separate
 from the API's `port`, and exposes a small `/api/...` surface of its own —

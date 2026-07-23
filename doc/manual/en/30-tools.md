@@ -8,12 +8,40 @@
 
 | Tool | Purpose | Key arguments |
 | :-- | :-- | :-- |
-| `read_file` | Read a text file from the workspace | `path`, optional `start_line`, optional `end_line`, optional `mode` |
-| `edit_file` | Edit a workspace file by replacing text (creates it if missing) | `path`, `old_text`, `new_text`, optional `replace_all` |
+| `show_file` | Show a text file from the workspace | `path`, optional `start_line`, optional `end_line`, optional `mode` |
+| `create_file` | Create a file with content, optionally with its permissions | `path`, optional `content`, `mode`, `overwrite`, `parents`, `git` |
+| `modify_file` | Modify a file, by text replacement or by line ranges | `path`, either `old_text`/`new_text` (+ `replace_all`) or `edits`, optional `git` |
+| `move_file` | Move or rename a file | `from`, `to`, optional `mode`, `overwrite`, `parents`, `git` |
+| `delete_file` | Delete a file | `path`, optional `git` |
+| `create_directory` | Create one directory | `path`, optional `mode`, `parents` |
+| `move_directory` | Move a directory and everything under it | `from`, `to`, optional `mode`, `parents` |
+| `delete_directory` | Delete an empty directory | `path` |
 | `list_directory` | List files and directories below the workspace | optional `path`, optional `max_depth` |
 | `fetch_url` | Fetch an external URL and return readable text | `url`, optional `max_chars` |
 | `run_shell_command` | Run a shell command inside the workspace | `command`, optional `cwd`, optional `timeout_seconds` |
 | `expand_context` | Retrieve previously compressed/truncated output using its hash ID | `id` |
+
+The eight file-lifecycle tools are the same operations `orangu-server`
+serves over HTTP as `/v1/create_file`, `/v1/modify_file` and so on — one
+shared implementation (`orangu::files`), so a tool call, a typed command and
+an API request behave identically. Their full field-by-field schemas are in
+the Inference server internals chapter, under **File-lifecycle API**.
+
+They replace the earlier `read_file` and `edit_file`: `read_file` is now
+`show_file` with the same arguments, and `edit_file` is now `modify_file`,
+which still takes `old_text`/`new_text` and additionally accepts the
+server's `edits` line ranges. The typed `/add_file` is obsolete for the same
+reason — it was `/create_file` without content (see the Git commands
+chapter). An existing path is overwritten on every
+surface — tool, typed command and HTTP endpoint alike; pass
+`"overwrite": false` for create-if-absent.
+
+**Git.** In a Git repository these tools make their change *with* the Git
+command — `create_file`/`modify_file` stage with `git add`, `move_file`
+moves with `git mv`, `delete_file` deletes with `git rm` — so work is
+staged as it happens. **Nothing is ever committed**; that stays your
+decision (`/commit`). Pass `"git": false` on a call for a plain filesystem
+change.
 
 ## Workspace restrictions
 
@@ -23,9 +51,9 @@ Paths that attempt to escape the workspace are rejected.
 
 Absolute paths are allowed only when they still resolve inside the workspace after normalization.
 
-## `read_file`
+## `show_file`
 
-`read_file` returns text content with line numbers:
+`show_file` returns text content with line numbers:
 
 ```json
 {
@@ -46,9 +74,9 @@ Behavior:
 - Repeated unchanged whole-file reads in the same conversation may return a cache stub instead of resending the entire file
 - The cache stub means the model should reuse the earlier full content already in context; use `start_line` and `end_line` to request a fresh focused excerpt when needed
 
-## `edit_file`
+## `modify_file`
 
-`edit_file` performs a targeted replacement inside a workspace file:
+`modify_file` performs a targeted replacement inside a workspace file:
 
 ```json
 {
@@ -68,7 +96,9 @@ Important details:
 - If the file does not exist, it is created (mode `0644`) with `new_text` as its contents
 - If `old_text` is empty, the file content is replaced with `new_text`
 - If `old_text` is not found in an existing file, the tool returns an error
-- Successful edits return JSON with `path`, `created`, `updated`, `original_bytes`, and `new_bytes`
+- Successful edits return JSON with `path`, `created`, `updated`, `original_bytes`, `new_bytes`, `mode`, and `git`
+- Instead of `old_text`/`new_text`, `edits` may be given — an array of `{start_line, end_line, replacement}` line ranges, exactly as `orangu-server`'s `/v1/modify_file` takes them. `edits` wins if both are supplied
+- In a Git repository the change is staged with `git add`; pass `"git": false` to leave the index alone
 
 ## `list_directory`
 

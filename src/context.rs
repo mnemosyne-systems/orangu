@@ -124,7 +124,7 @@ impl ContextCache {
 
 pub fn format_cache_stub(path: &str, size: u64, fingerprint: &str) -> String {
     format!(
-        "[cached] {path} is unchanged from its previous full read in this conversation ({} bytes, sha256:{fingerprint}). Reuse the earlier content already in context; call read_file with start_line/end_line if you need a fresh focused excerpt.",
+        "[cached] {path} is unchanged from its previous full read in this conversation ({} bytes, sha256:{fingerprint}). Reuse the earlier content already in context; call show_file with start_line/end_line if you need a fresh focused excerpt.",
         size
     )
 }

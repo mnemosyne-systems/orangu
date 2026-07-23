@@ -866,7 +866,7 @@ fn ghost_previews_first_structured_completion() {
 }
 
 #[test]
-fn completes_add_file_untracked() {
+fn completes_create_file_untracked() {
     let workspace = tempdir().expect("workspace");
     init_test_git_repo(workspace.path());
     fs::write(workspace.path().join("tracked.rs"), "").expect("tracked file");
@@ -892,15 +892,15 @@ fn completes_add_file_untracked() {
 
     // "n" matches directory "newdir/" before file "newfile.txt"
     let (start, _, candidates) = completion_candidates(
-        "/add_file n",
-        "/add_file n".len(),
+        "/create_file n",
+        "/create_file n".len(),
         workspace.path(),
         &[],
         &[],
         &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
-    .expect("add_file completion");
-    assert_eq!(start, "/add_file ".len());
+    .expect("create_file completion");
+    assert_eq!(start, "/create_file ".len());
     assert_eq!(candidates[0], "newdir/");
     assert!(candidates.contains(&"newfile.txt".to_string()));
     // tracked file not included
@@ -915,13 +915,13 @@ fn completes_add_file_untracked() {
         &[],
         &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
-    .expect("natural add_file completion");
+    .expect("natural create_file completion");
     assert_eq!(start, "add ".len());
     assert_eq!(nat_candidates[0], "newdir/");
 }
 
 #[test]
-fn completes_remove_file_tracked() {
+fn completes_delete_file_tracked() {
     let workspace = tempdir().expect("workspace");
     init_test_git_repo(workspace.path());
     fs::create_dir(workspace.path().join("src")).expect("src dir");
@@ -947,15 +947,15 @@ fn completes_remove_file_tracked() {
 
     // "s" matches directory "src/" before file "schema.sql"
     let (start, _, candidates) = completion_candidates(
-        "/remove_file s",
-        "/remove_file s".len(),
+        "/delete_file s",
+        "/delete_file s".len(),
         workspace.path(),
         &[],
         &[],
         &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
     )
-    .expect("remove_file completion");
-    assert_eq!(start, "/remove_file ".len());
+    .expect("delete_file completion");
+    assert_eq!(start, "/delete_file ".len());
     assert_eq!(candidates[0], "src/");
     assert!(candidates.contains(&"schema.sql".to_string()));
     // untracked file not included

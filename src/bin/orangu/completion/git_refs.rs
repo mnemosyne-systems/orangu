@@ -213,12 +213,12 @@ pub fn git_modified_candidates(repo_root: &Path, token: &str, staged: bool) -> V
     files
 }
 
-pub fn add_file_completion_candidates(
+pub fn create_file_completion_candidates(
     prefix: &str,
     workspace: &Path,
 ) -> Option<(usize, Vec<String>)> {
-    let (start, token) = if let Some(rest) = prefix.strip_prefix("/add_file ") {
-        ("/add_file ".len(), rest)
+    let (start, token) = if let Some(rest) = prefix.strip_prefix("/create_file ") {
+        ("/create_file ".len(), rest)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "git add ") {
         (prefix.len() - rest.len(), rest)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "add file ") {
@@ -235,13 +235,15 @@ pub fn add_file_completion_candidates(
     Some((start, candidates))
 }
 
-pub fn remove_file_completion_candidates(
+pub fn delete_file_completion_candidates(
     prefix: &str,
     workspace: &Path,
 ) -> Option<(usize, Vec<String>)> {
-    let (start, token) = if let Some(rest) = prefix.strip_prefix("/remove_file ") {
-        ("/remove_file ".len(), rest)
+    let (start, token) = if let Some(rest) = prefix.strip_prefix("/delete_file ") {
+        ("/delete_file ".len(), rest)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "git rm ") {
+        (prefix.len() - rest.len(), rest)
+    } else if let Some(rest) = strip_ascii_prefix(prefix, "delete file ") {
         (prefix.len() - rest.len(), rest)
     } else if let Some(rest) = strip_ascii_prefix(prefix, "remove file ") {
         (prefix.len() - rest.len(), rest)

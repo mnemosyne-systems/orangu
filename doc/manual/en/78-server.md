@@ -968,7 +968,8 @@ with a clear message if its variable is unset when the test is run
 
 `http::mod` assembles the router and shared `AppState` (model, scheduler
 handle, config, workspace root, start time); `http::openai` and `http::native` hold the
-OpenAI-compatible and native handlers respectively; `/v1/shutdown`
+OpenAI-compatible and native handlers respectively; `http::files` holds the
+file-lifecycle API (see the next section); `/v1/shutdown`
 lives in `http::mod` itself since it's neither. Ctrl+C, `SIGINT`, and
 `POST /v1/shutdown` all converge on the same shutdown path via
 `tokio::select!`, mirroring `orangu-coordinator`'s own pattern.
@@ -979,6 +980,486 @@ the API so a chat turn never makes an HTTP hop. `web::render` renders
 markdown to HTML (including syntax-highlighted code blocks) with the same
 `markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
+
+### File-lifecycle API (`http::files`)
+
+Served on the **API port**, alongside the OpenAI-compatible and native
+endpoints, eight dedicated endpoints cover the whole life cycle of a file,
+plus the directories it lives in:
+
+| Endpoint | |
+| :-- | :-- |
+| `POST /v1/create_file` | write a new file, with optional permissions |
+| `POST /v1/modify_file` | replace named line ranges, returning a diff |
+| `POST /v1/move_file` | rename a file, optionally re-setting permissions |
+| `POST /v1/delete_file` | delete a file |
+| `POST /v1/show_file` | return a file's entire content |
+| `POST /v1/create_directory` | create one directory, with optional permissions |
+| `POST /v1/move_directory` | move an entire directory tree |
+| `POST /v1/delete_directory` | delete an empty directory |
+
+Every one is `POST` with a JSON body and a JSON reply, including
+`show_file` — one request shape across the whole API is worth more than
+matching HTTP verbs to intent for a single read.
+
+Nothing here is recursive except `move_directory`, which moves a tree
+because a rename inherently does. Everything else touches exactly one file
+or one directory, so a mistyped path costs one entry.
+
+**In a Git repository, these are Git operations** — a file is created,
+modified, moved and deleted with `git add`, `git mv` and `git rm`, so the
+change is staged rather than only written to disk. **Nothing is ever
+committed**; see **Git integration** below.
+
+The implementation lives in `orangu::files`, shared with `orangu`'s own
+local tools and typed commands of the same names (`create_file`,
+`modify_file`, `/delete_file`, "create myfile.txt with 0644", …), so a tool
+call, a typed command and an API request are the same operation with the
+same fields, defaults and errors. This chapter is where those fields are
+documented for all three.
+
+**Everything is confined to the workspace.** Each path in a request is
+resolved against the server's workspace root (`-w`/`--workspace`, default
+the current working directory — see the Workspace section of the Inference
+server chapter) and refused if it lands outside it. A path may be given
+relative to the workspace (`src/main.rs`) or as an absolute path that is
+itself inside it; anything else — a `..` that climbs out, an absolute path
+elsewhere on the machine, or a symlink inside the tree pointing out of it —
+is a `403 outside_workspace` before any file is touched. Two checks back
+that up: the lexical one (`orangu::tools::resolve_workspace_path`, the same
+resolution `orangu`'s own file tools use, which folds `..` away before
+comparing) and a physical one that canonicalizes the nearest *existing*
+ancestor of the target — the nearest existing one, so it works for
+`create_file`, whose target does not exist yet by definition.
+
+Paths come back in replies relative to the workspace, in the same shape a
+client sent them, never as the server's absolute layout.
+
+Three types recur across the endpoints below:
+
+| Type | |
+| :-- | :-- |
+| *path* | a string, either relative to the workspace (`src/main.rs`) or an absolute path inside it. Never empty |
+| *mode* | in a **request**: an octal string (`"0644"`, `"644"`, `"0o644"`) or the number `chmod` takes (`420`); at most `0o7777`. In a **response**: always the four-digit octal string (`"0644"`), or `null` on a non-Unix platform |
+| *git* | the object described under **Git integration** below, or `null` when the workspace is not a repository or the request passed `"git": false` |
+
+Unknown fields in a request body are rejected by neither serde nor these
+handlers — they are ignored. A missing required field, a wrong type, or
+malformed JSON is a `400 bad_request` carrying serde's own message.
+
+#### `POST /v1/create_file`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | file to write |
+| `content` | optional, default `""` | the file's full content |
+| `mode` | optional | permission bits, as an octal string (`"0644"`) or the number `chmod` takes (`420`) |
+| `overwrite` | optional, default `true` | replace the file if it already exists; `false` for create-if-absent |
+| `parents` | optional, default `false` | create missing parent directories |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/create_file \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "src/hello.py", "content": "print(1)\n", "mode": "0640", "parents": true}'
+```
+
+```json
+{"path":"src/hello.py","bytes_written":9,"mode":"0640","overwritten":false,
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":true,
+        "command":"git add src/hello.py","skipped":null,"error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the file written, relative to the workspace |
+| `bytes_written` | integer | byte length of `content` as written |
+| `mode` | *mode* | the file's permission bits after the write |
+| `overwritten` | boolean | `true` when an existing file was replaced (only possible with `overwrite`) |
+| `git` | *git* | what Git did |
+
+An existing path is **overwritten** — creating a file that is already there
+is an override, and the same is true of `orangu`'s own `create_file` tool
+and its typed `/create_file`, which share this implementation. Pass
+`"overwrite": false` for create-if-absent, which turns an existing path into
+a `409 already_exists`. Without `parents`, a missing parent directory is a
+`404 not_found` rather than a quietly-created tree. `mode` is parsed and
+validated *before* anything is written, so a bad mode never leaves a file
+behind with the wrong permissions. Leaving `mode` out lets the process
+umask decide, exactly as an ordinary `create` would.
+
+#### `POST /v1/modify_file`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | file to edit |
+| `edits` | required, non-empty | the changes, each naming the lines it replaces |
+| `edits[].start_line` | required | first line replaced, 1-based |
+| `edits[].end_line` | required | last line replaced, inclusive |
+| `edits[].replacement` | optional, default `""` | the lines to put in their place |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+Every range refers to the file **as it was read**, not to the numbering
+left behind by an earlier edit in the same request — edits are applied
+last-first internally so a caller never has to re-number around its own
+changes. Ranges must not overlap, and must address real lines; the one
+exception is an insert at `start_line = <line count> + 1`, which appends.
+
+- `end_line = start_line - 1` inserts before `start_line` without replacing
+  anything.
+- `"replacement": ""` deletes the range.
+- The file's trailing-newline state is preserved — a file that ended
+  without a newline still does afterwards.
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/modify_file \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "a.txt",
+       "edits": [{"start_line": 2, "end_line": 2, "replacement": "TWO\n"},
+                 {"start_line": 4, "end_line": 3, "replacement": "four\n"}]}'
+```
+
+```json
+{"path":"a.txt","lines_before":3,"lines_after":4,"edits_applied":2,
+ "diff":"--- a/a.txt\n+++ b/a.txt\n@@ -2,1 +2,1 @@\n-two\n+TWO\n@@ -3,0 +4,1 @@\n+four\n",
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":true,
+        "command":"git add a.txt","skipped":null,"error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the file edited |
+| `lines_before` | integer | line count before the edits |
+| `lines_after` | integer | line count after them |
+| `edits_applied` | integer | how many entries of `edits` were applied — always all of them, since any invalid range rejects the whole request |
+| `diff` | string | a zero-context unified diff of exactly what changed (see below) |
+| `git` | *git* | what Git did |
+
+The `diff` is a **zero-context unified diff** — what `diff -U0` prints. No
+diff algorithm is involved: the caller said exactly which lines it was
+replacing, so each edit is one exact hunk, and adjacent edits never end up
+with two hunks fighting over the same context lines. The `+++` side's line
+numbers carry the running length change from the hunks before them, the
+same way real unified diff output does.
+
+A file that isn't valid UTF-8 has no line structure to edit, so it is a
+`400 not_utf8` rather than a mangled write.
+
+#### `POST /v1/move_file`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `from` | required | file to move |
+| `to` | required | its new path |
+| `mode` | optional | permission bits to set at the destination; unset keeps what the file already had |
+| `overwrite` | optional, default `false` | replace the destination if it exists |
+| `parents` | optional, default `false` | create missing parent directories of the destination |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/move_file \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "a.txt", "to": "docs/b.txt", "mode": "0600", "parents": true}'
+```
+
+```json
+{"from":"a.txt","to":"docs/b.txt","mode":"0600","overwritten":false,
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":true,
+        "command":"git mv a.txt docs/b.txt","skipped":null,"error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `from` | *path* | where the file was |
+| `to` | *path* | where it now is |
+| `mode` | *mode* | its permission bits at the destination |
+| `overwritten` | boolean | `true` when an existing destination was replaced |
+| `git` | *git* | what Git did |
+
+Both paths are workspace-checked, so a move can neither read from nor write
+to anything outside the tree.
+
+#### `POST /v1/delete_file`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | file to delete |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/delete_file \
+  -H 'Content-Type: application/json' -d '{"path": "src/hello.py"}'
+```
+
+```json
+{"path":"src/hello.py","deleted":true,
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":true,
+        "command":"git rm -f src/hello.py","skipped":null,"error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the file deleted |
+| `deleted` | boolean | always `true` — a failure is an error response, not `false` |
+| `git` | *git* | what Git did |
+
+Only regular files: a directory is a `400 not_a_file`. This API is a
+*file's* life cycle, and a recursive delete behind one JSON field is a much
+bigger gun than anything else here hands out.
+
+#### `POST /v1/show_file`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | file to read |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/show_file \
+  -H 'Content-Type: application/json' -d '{"path": "a.txt"}'
+```
+
+```json
+{"path":"a.txt","content":"one\nTWO\nthree\nfour\n","bytes":19,"lines":4,"mode":"0644"}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the file read |
+| `content` | string | the whole file, verbatim |
+| `bytes` | integer | its byte length |
+| `lines` | integer | its line count — a trailing newline does not add an empty last line |
+| `mode` | *mode* | its current permission bits |
+
+The only endpoint that changes nothing, so it has no `git` field and takes
+no `git` flag. A file that isn't valid UTF-8 has no JSON representation
+here, so it is a `400 not_utf8` rather than a lossy conversion.
+
+#### `POST /v1/create_directory`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | directory to create |
+| `mode` | optional | permission bits, as an octal string (`"0755"`) or the number `chmod` takes (`493`) |
+| `parents` | optional, default `false` | create missing parent directories too |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/create_directory \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "src/engine/backend", "mode": "0750", "parents": true}'
+```
+
+```json
+{"path":"src/engine/backend","mode":"0750",
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":false,
+        "command":null,"skipped":"nothing_to_stage","error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the directory created |
+| `mode` | *mode* | its permission bits |
+| `git` | *git* | always `skipped: "nothing_to_stage"` in a repository — Git tracks no directories |
+
+`mode` applies to the directory named by `path`; parents created along the
+way keep the umask's own permissions, the same way `mkdir -p -m` behaves.
+Leaving `mode` out lets the umask decide for all of them, exactly as an
+ordinary `mkdir` would. Like `create_file`, the mode is parsed and validated
+before anything is created.
+
+An existing path — file or directory — is a `409 already_exists`. There is
+deliberately no `overwrite` counterpart: replacing a directory that is
+already there would mean deleting whatever it holds, which is precisely
+what `delete_directory` refuses to do.
+
+#### `POST /v1/move_directory`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `from` | required | directory to move |
+| `to` | required | its new path |
+| `mode` | optional | permission bits to set on the moved directory; unset keeps what it had |
+| `parents` | optional, default `false` | create missing parent directories of the destination |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/move_directory \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "src", "to": "lib/src", "parents": true}'
+```
+
+```json
+{"from":"src","to":"lib/src","mode":"0755",
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":true,
+        "command":"git mv src lib/src","skipped":null,"error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `from` | *path* | where the directory was |
+| `to` | *path* | where it now is |
+| `mode` | *mode* | its permission bits at the destination |
+| `git` | *git* | one `git mv` covering every tracked file in the subtree — or `skipped: "untracked"` when the directory holds nothing Git tracks |
+
+The whole subtree moves — everything under `from` comes along — in a single
+`rename`, so it is atomic, and a move that would cross filesystems fails
+outright (`EXDEV`, reported as `io_error`) rather than half-copying a tree.
+`mode` applies to the moved directory itself, never to anything inside it.
+
+The destination must not exist (`409 already_exists`): there is no
+`overwrite` here, for the same reason `create_directory` has none. Moving a
+directory into itself (`{"from": "src", "to": "src/nested"}`) is a
+`400 bad_request` rather than the kernel's bare "Invalid argument", and the
+workspace root itself cannot be moved.
+
+#### `POST /v1/delete_directory`
+
+| Field | | |
+| :-- | :-- | :-- |
+| `path` | required | directory to delete |
+| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/delete_directory \
+  -H 'Content-Type: application/json' -d '{"path": "src/engine/backend"}'
+```
+
+```json
+{"path":"src/engine/backend","deleted":true,
+ "git":{"repo_root":"/home/user/src/demo","forge":"github","staged":false,
+        "command":null,"skipped":"nothing_to_stage","error":null}}
+```
+
+| Response field | Type | |
+| :-- | :-- | :-- |
+| `path` | *path* | the directory deleted |
+| `deleted` | boolean | always `true` — a failure is an error response, not `false` |
+| `git` | *git* | always `skipped: "nothing_to_stage"` in a repository — an empty directory holds nothing Git tracks |
+
+**The directory has to be empty.** Anything still in it — files or
+subdirectories — is a `409 not_empty`, and nothing is removed. Emptiness is
+checked explicitly rather than left to `remove_dir`'s own errno, so the
+refusal is one stable code on every platform. A path that isn't a directory
+is a `400 not_a_directory`, and the workspace root itself cannot be deleted:
+every later request resolves against it.
+
+There is no recursive form. Deleting a tree is the caller's to do, one
+`delete_file`/`delete_directory` at a time, which keeps the blast radius of
+a single mistyped path to a single directory.
+
+#### Git integration (`git.rs`)
+
+When the workspace sits inside a Git repository, every endpoint above
+performs its change **with the matching Git command**, so the result is
+staged rather than merely written:
+
+| Endpoint | Git command |
+| :-- | :-- |
+| `create_file`, `modify_file` | `git add <path>` — after the write, so the staged content is what is now on disk |
+| `move_file`, `move_directory` | `git mv <from> <to>` — Git performs the move itself, so the index records a **rename** rather than a delete plus an add |
+| `delete_file` | `git rm -f <path>` — Git deletes the file and stages the deletion in one step |
+| `create_directory`, `delete_directory` | none — Git tracks files, not directories |
+
+**Nothing is ever committed.** Every operation stops at the index; what to
+commit, when, and with what message is the user's decision, and this API
+gives no way to make it for them. `git rm` is forced (`-f`) because the
+endpoint's contract is that the file goes away — without it Git refuses
+whenever the working copy differs from the index, which is exactly when a
+deletion is most likely to be wanted. `git mv` is forced only when the
+request itself passed `"overwrite": true`.
+
+Each reply carries a `git` object saying what happened, or `null` when the
+workspace isn't a repository:
+
+```json
+{"from":"a.txt","to":"sub/b.txt","mode":"0644","overwritten":false,
+ "git":{"repo_root":"/home/user/src/orangu","forge":"github","staged":true,
+        "command":"git mv a.txt sub/b.txt","skipped":null,"error":null}}
+```
+
+| Field | Type | |
+| :-- | :-- | :-- |
+| `repo_root` | string | absolute path of the repository the workspace resolved to |
+| `forge` | string or `null` | `"github"`/`"gitlab"`, and only when that forge's CLI (`gh`/`glab`) is installed |
+| `staged` | boolean | whether the change reached the index |
+| `command` | string or `null` | the Git command that ran, verbatim; `null` when none was run |
+| `skipped` | string or `null` | why nothing was staged: `"untracked"`, `"ignored"`, or `"nothing_to_stage"` |
+| `error` | string or `null` | Git's own stderr, when its command failed |
+
+Exactly one of `staged: true`, `skipped`, or `error` describes the outcome:
+a staged change has both others `null`, a skip carries no `error`, and a
+failure carries no `skipped`.
+
+Three cases are skipped rather than treated as failures:
+
+- **`untracked`** — Git has no record of the path, so there is nothing for
+  `git mv`/`git rm` to rewrite; the move or delete is a plain filesystem
+  operation and the file stays untracked.
+- **`ignored`** — `.gitignore` covers the path. `git add` refuses an ignored
+  path outright, so writing into e.g. `build/` succeeds and simply isn't
+  staged.
+- **`nothing_to_stage`** — the directory endpoints. Git tracks no
+  directories of its own; a new one becomes visible to Git with the first
+  file created inside it.
+
+Where the Git command *performs* the change (`git mv`, `git rm`), a failure
+means nothing happened, and the endpoint returns an `io_error`. Where it
+only stages an already-written change (`git add`), the file operation has
+already succeeded, so the reply is a normal `200` with `staged: false` and
+Git's message in `git.error` — the response tells the truth about what
+happened rather than implying the write was rolled back.
+
+To bypass Git entirely for one request, pass `"git": false`:
+
+```sh
+curl -s -X POST http://127.0.0.1:8100/v1/delete_file \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "scratch.txt", "git": false}'
+```
+
+The file is removed from disk and the index is left alone. Outside a
+repository this is what every request does anyway, and `git` comes back
+`null`.
+
+`gh`/`glab` are detected (by `origin`'s URL, and only when the matching CLI
+is on `PATH`) and reported as `forge`, so a client knows which platform it
+is working against. Neither CLI can touch the index — there is no `gh add`
+— so the staging itself always runs through plain `git`.
+
+#### Errors
+
+Every failure — including a malformed request body — comes back with the
+same shape and a stable `code` a client can branch on, rather than message
+text:
+
+```json
+{"error":{"code":"outside_workspace","message":"\"../secret.txt\": path escapes the configured workspace"}}
+```
+
+The body is always a single `error` object and nothing else:
+
+| Field | Type | |
+| :-- | :-- | :-- |
+| `error.code` | string | one of the stable codes below |
+| `error.message` | string | a human-readable explanation, naming the path it concerns. Wording is not part of the contract — branch on `code` |
+
+| `code` | HTTP | |
+| :-- | :-- | :-- |
+| `outside_workspace` | 403 | the path resolves outside the workspace root |
+| `not_found` | 404 | no such file, or a missing parent directory without `parents` |
+| `already_exists` | 409 | the target exists: `create_file` with `"overwrite": false`, `move_file` without `overwrite`, or `create_directory`/`move_directory`, which have no overwrite at all |
+| `not_a_file` | 400 | the path exists but isn't a regular file |
+| `not_a_directory` | 400 | a directory endpoint was given a path that isn't a directory |
+| `not_empty` | 409 | `delete_directory` was given a directory that still has something in it |
+| `bad_request` | 400 | unparsable body, empty path, bad mode, an invalid/overlapping line range, a move into itself, or an attempt on the workspace root |
+| `not_utf8` | 400 | the file isn't valid UTF-8 |
+| `io_error` | 500 | the filesystem refused the operation |
+
+#### Permissions on non-Unix platforms
+
+Permission bits are a Unix concept. Elsewhere `mode` is reported as `null`
+in every reply, and a request that tries to *set* one is refused with
+`bad_request` rather than silently ignored.
 
 ### Session activity tracking and `prune` (`web::sessions`, `prune.rs`)
 

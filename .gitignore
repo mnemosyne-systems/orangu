@@ -3,6 +3,7 @@ target/
 .idea/
 rpmbuild/
 *.pdf
-/.orangu/
-*-graph.html
+*.html
+*.svg
+*.txt
 llama.cpp/

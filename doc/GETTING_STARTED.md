@@ -70,7 +70,7 @@ orangu --config ./orangu.conf
 - `/debugging reproduce the failing request path`
 - `/build`
 - `/shell ls -la`
-- `/add_file README.md`
+- `/create_file README.md`
 - `/auto_review`
 - `/amend <message>`
 - `/branch main`
@@ -99,7 +99,7 @@ orangu --config ./orangu.conf
 - `/rebase`
 - `/rebase develop`
 - `/rebase origin/main`
-- `/remove_file README.md`
+- `/delete_file README.md`
 - `/review`
 - `/squash`
 - `/status`

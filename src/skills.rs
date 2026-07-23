@@ -239,7 +239,7 @@ impl SkillRegistry {
         }
 
         let mut out = String::from(
-            "<skills>\nThe following skills provide specialized instructions for specific tasks.\nWhen a task matches a skill's description, load the SKILL.md at the listed location with the read_file tool before proceeding.\nWhen a skill references relative paths, resolve them against the skill directory, which is the parent directory of SKILL.md.\nUsers can also invoke a skill directly with /skill-name.\n\n<available_skills>\n",
+            "<skills>\nThe following skills provide specialized instructions for specific tasks.\nWhen a task matches a skill's description, load the SKILL.md at the listed location with the show_file tool before proceeding.\nWhen a skill references relative paths, resolve them against the skill directory, which is the parent directory of SKILL.md.\nUsers can also invoke a skill directly with /skill-name.\n\n<available_skills>\n",
         );
         for skill in &self.skills {
             out.push_str(&format!(

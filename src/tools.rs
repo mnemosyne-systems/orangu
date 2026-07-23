@@ -20,8 +20,6 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -74,6 +72,10 @@ struct EditFileRequest {
     old_text: String,
     new_text: String,
     replace_all: Option<bool>,
+    /// Stage the change with `git add` when the workspace is a repository;
+    /// `false` writes the file and leaves the index alone. Defaults to on,
+    /// exactly as the `edits` form (and every other file tool) does.
+    git: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -152,10 +154,11 @@ impl ToolExecutor {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = vec![tool(
-            "read_file",
-            "Read a text file from disk, optionally returning only a line range. \
-                 When investigating unfamiliar code, leave `start_line` and `end_line` empty \
-                 to read the entire file. Use `mode` to get structural overviews.",
+            "show_file",
+            "Show a text file from the workspace — its entire content by default, \
+                 or only a line range. When investigating unfamiliar code, leave \
+                 `start_line` and `end_line` empty to read the whole file. Use `mode` \
+                 to get structural overviews.",
             json!({
                 "type": "object",
                 "properties": {
@@ -173,17 +176,134 @@ impl ToolExecutor {
 
         if !self.read_only {
             defs.push(tool(
-                "edit_file",
-                "Edit a file on disk in the current workspace by replacing old_text with new_text. If the file does not exist it is created (mode 0644) with new_text as its contents.",
+                "create_file",
+                "Create a file in the workspace with the given content, and optionally \
+                     its permissions (\"0644\"). An existing path is overwritten; pass \
+                     `overwrite: false` for create-if-absent. A missing parent directory \
+                     fails unless `parents` is set. In a Git repository the new file is \
+                     staged with `git add`; nothing is ever committed.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0644\""},
+                        "overwrite": {"type": "boolean", "description": "replace an existing file (default true)"},
+                        "parents": {"type": "boolean"},
+                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                    },
+                    "required": ["path"]
+                }),
+            ));
+            defs.push(tool(
+                "modify_file",
+                "Modify an existing file in the workspace, either by replacing `old_text` \
+                     with `new_text` (use this when you know the text but not the line \
+                     numbers) or by giving `edits`, each replacing the inclusive 1-based \
+                     line range `start_line`..`end_line` with `replacement`. Ranges refer \
+                     to the file as it is now, must not overlap, and `end_line = \
+                     start_line - 1` inserts without replacing. In a Git repository the \
+                     change is staged with `git add`; nothing is ever committed.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
                         "old_text": {"type": "string"},
                         "new_text": {"type": "string"},
-                        "replace_all": {"type": "boolean"}
+                        "replace_all": {"type": "boolean"},
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start_line": {"type": "integer"},
+                                    "end_line": {"type": "integer"},
+                                    "replacement": {"type": "string"}
+                                },
+                                "required": ["start_line", "end_line"]
+                            }
+                        },
+                        "git": {"type": "boolean", "description": "stage the change (default true)"}
                     },
-                    "required": ["path", "old_text", "new_text"]
+                    "required": ["path"]
+                }),
+            ));
+            defs.push(tool(
+                "move_file",
+                "Move or rename a file inside the workspace, optionally setting its \
+                     permissions at the destination. In a Git repository a tracked file \
+                     is moved with `git mv`, so the rename is staged as a rename.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0644\""},
+                        "overwrite": {"type": "boolean"},
+                        "parents": {"type": "boolean"},
+                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                    },
+                    "required": ["from", "to"]
+                }),
+            ));
+            defs.push(tool(
+                "delete_file",
+                "Delete a file from the workspace. Refuses a directory — use \
+                     delete_directory. In a Git repository a tracked file is deleted with \
+                     `git rm`, so the deletion is staged.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                    },
+                    "required": ["path"]
+                }),
+            ));
+            defs.push(tool(
+                "create_directory",
+                "Create one directory in the workspace, optionally with its permissions \
+                     (\"0755\") and any missing parents. Fails if the path already exists.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0755\""},
+                        "parents": {"type": "boolean"},
+                        "git": {"type": "boolean"}
+                    },
+                    "required": ["path"]
+                }),
+            ));
+            defs.push(tool(
+                "move_directory",
+                "Move a directory and everything under it to a new path inside the \
+                     workspace. The destination must not already exist. In a Git \
+                     repository a tracked tree is moved with `git mv`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0755\""},
+                        "parents": {"type": "boolean"},
+                        "git": {"type": "boolean"}
+                    },
+                    "required": ["from", "to"]
+                }),
+            ));
+            defs.push(tool(
+                "delete_directory",
+                "Delete an empty directory from the workspace. A directory that still \
+                     holds anything is refused — delete its contents first. There is no \
+                     recursive form.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "git": {"type": "boolean"}
+                    },
+                    "required": ["path"]
                 }),
             ));
             defs.push(tool(
@@ -279,13 +399,19 @@ impl ToolExecutor {
     pub async fn execute(&self, name: &str, arguments: &Map<String, Value>) -> Result<String> {
         let start = std::time::Instant::now();
         let result = match name {
-            "read_file" => self.read_file(arguments).await,
-            "edit_file" => {
-                if self.read_only {
-                    Err(anyhow::anyhow!("tool not available in read-only mode"))
-                } else {
-                    self.edit_file(arguments).await
-                }
+            "show_file" => self.show_file(arguments).await,
+            "modify_file" => self.mutating(|| self.modify_file(arguments)),
+            "create_file" => self.mutating(|| self.file_operation(crate::files::create, arguments)),
+            "move_file" => self.mutating(|| self.file_operation(crate::files::move_, arguments)),
+            "delete_file" => self.mutating(|| self.file_operation(crate::files::delete, arguments)),
+            "create_directory" => {
+                self.mutating(|| self.file_operation(crate::files::create_dir, arguments))
+            }
+            "move_directory" => {
+                self.mutating(|| self.file_operation(crate::files::move_dir, arguments))
+            }
+            "delete_directory" => {
+                self.mutating(|| self.file_operation(crate::files::delete_dir, arguments))
             }
             "explore_repository" => {
                 if self.read_only {
@@ -359,7 +485,49 @@ impl ToolExecutor {
         }
     }
 
-    async fn read_file(&self, arguments: &Map<String, Value>) -> Result<String> {
+    /// Guard for every tool that changes the workspace: refused outright in
+    /// read-only mode (`/review`, the explorer subagent), the same rule the
+    /// old `edit_file` had before these tools replaced it.
+    fn mutating<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.read_only {
+            return Err(anyhow!("tool not available in read-only mode"));
+        }
+        operation()
+    }
+
+    /// Run one [`crate::files`] operation: the same function, request shape
+    /// and JSON result `orangu-server`'s endpoint of the same name serves,
+    /// against this executor's own workspace. Keeping the two on one
+    /// implementation is what stops "create a file" meaning two different
+    /// things depending on which surface asked.
+    fn file_operation<Q, R>(
+        &self,
+        operation: fn(&Path, Q) -> crate::files::FileResult<R>,
+        arguments: &Map<String, Value>,
+    ) -> Result<String>
+    where
+        Q: serde::de::DeserializeOwned,
+        R: Serialize,
+    {
+        let request: Q = serde_json::from_value(Value::Object(arguments.clone()))
+            .map_err(|err| anyhow!("{err}"))?;
+        let response = operation(&self.workspace, request).map_err(|err| anyhow!("{err}"))?;
+        Ok(serde_json::to_string(&response)?)
+    }
+
+    /// `modify_file` takes either shape: `edits` (the line ranges
+    /// `orangu-server`'s own `/v1/modify_file` takes) or the
+    /// `old_text`/`new_text` replacement this tool has always accepted,
+    /// which stays because it is what a model reaches for when it knows the
+    /// text but not the line numbers. `edits` wins if both are given.
+    fn modify_file(&self, arguments: &Map<String, Value>) -> Result<String> {
+        if arguments.contains_key("edits") {
+            return self.file_operation(crate::files::modify, arguments);
+        }
+        self.replace_text(arguments)
+    }
+
+    async fn show_file(&self, arguments: &Map<String, Value>) -> Result<String> {
         let args: ReadFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
         let mut content = fs::read_to_string(&path)?;
@@ -405,7 +573,11 @@ impl ToolExecutor {
         })
     }
 
-    async fn edit_file(&self, arguments: &Map<String, Value>) -> Result<String> {
+    /// `modify_file`'s `old_text`/`new_text` form: compute the new content
+    /// here, then write it through [`crate::files::create`] so the write
+    /// itself is the same one every other surface performs — same workspace
+    /// confinement, same `git add`, same reported shape.
+    fn replace_text(&self, arguments: &Map<String, Value>) -> Result<String> {
         let args: EditFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
         let (original, created) = match fs::read_to_string(&path) {
@@ -422,21 +594,29 @@ impl ToolExecutor {
             created,
         )?;
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, &updated)?;
-        if created {
-            #[cfg(unix)]
-            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
-        }
+        let response = crate::files::create(
+            &self.workspace,
+            crate::files::CreateFileRequest {
+                path: args.path.clone(),
+                content: updated.clone(),
+                // A brand-new file gets 0644, matching what this tool has
+                // always created; an existing one keeps its own bits.
+                mode: created.then(|| crate::files::Mode::Bits(0o644)),
+                overwrite: true,
+                parents: true,
+                git: args.git.unwrap_or_else(crate::files::git_default),
+            },
+        )
+        .map_err(|err| anyhow!("{err}"))?;
 
         Ok(json!({
-            "path": path,
+            "path": response.path,
             "created": created,
             "updated": true,
             "original_bytes": original.len(),
-            "new_bytes": updated.len()
+            "new_bytes": updated.len(),
+            "mode": response.mode,
+            "git": response.git,
         })
         .to_string())
     }
@@ -840,6 +1020,8 @@ fn redact_secrets(content: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn apply_single_edit() {
@@ -854,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_creates_missing_file_with_0644() {
+    async fn modify_file_creates_missing_file_with_0644() {
         let workspace = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(workspace.path());
 
@@ -862,7 +1044,7 @@ mod tests {
         args.insert("path".into(), json!("sub/new.txt"));
         args.insert("old_text".into(), json!(""));
         args.insert("new_text".into(), json!("hello orangu"));
-        executor.edit_file(&args).await.unwrap();
+        executor.replace_text(&args).unwrap();
 
         let created = workspace.path().join("sub/new.txt");
         assert_eq!(fs::read_to_string(&created).unwrap(), "hello orangu");
@@ -884,7 +1066,7 @@ mod tests {
         args.insert("path".into(), json!("existing.txt"));
         args.insert("old_text".into(), json!("world"));
         args.insert("new_text".into(), json!("orangu"));
-        executor.edit_file(&args).await.unwrap();
+        executor.replace_text(&args).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello orangu");
     }
@@ -899,11 +1081,11 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), json!("README.md"));
 
-        let first = executor.read_file(&args).await.unwrap();
+        let first = executor.show_file(&args).await.unwrap();
         assert!(first.contains("1. one"));
         assert!(first.contains("2. two"));
 
-        let second = executor.read_file(&args).await.unwrap();
+        let second = executor.show_file(&args).await.unwrap();
         assert!(second.starts_with("[cached] README.md is unchanged"));
         assert!(second.contains("start_line/end_line"));
     }
@@ -918,12 +1100,12 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), json!("README.md"));
 
-        let _ = executor.read_file(&args).await.unwrap();
-        let _ = executor.read_file(&args).await.unwrap();
+        let _ = executor.show_file(&args).await.unwrap();
+        let _ = executor.show_file(&args).await.unwrap();
 
         fs::write(&path, "one\ntwo\nthree\n").unwrap();
 
-        let changed = executor.read_file(&args).await.unwrap();
+        let changed = executor.show_file(&args).await.unwrap();
         assert!(changed.contains("1. one"));
         assert!(changed.contains("2. two"));
         assert!(changed.contains("3. three"));
@@ -986,8 +1168,8 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), json!("README.md"));
 
-        let first = executor.read_file(&args).await.unwrap();
-        let second = executor.read_file(&args).await.unwrap();
+        let first = executor.show_file(&args).await.unwrap();
+        let second = executor.show_file(&args).await.unwrap();
 
         assert_eq!(first, second);
         assert!(!second.starts_with("[cached]"));
@@ -1107,5 +1289,208 @@ pub fn standalone() {}
         let note = ctx.note.unwrap();
         assert!(note.contains("50 matches found"), "should mention counts");
         assert!(note.contains("first 40"), "should mention counts");
+    }
+}
+
+#[cfg(test)]
+mod file_lifecycle_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    /// Every file-lifecycle endpoint is a tool of the same name, taking the
+    /// same fields.
+    #[test]
+    fn the_endpoints_are_all_offered_as_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let names: Vec<String> = ToolExecutor::new(workspace.path())
+            .definitions()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect();
+
+        for name in [
+            "create_file",
+            "modify_file",
+            "move_file",
+            "delete_file",
+            "show_file",
+            "create_directory",
+            "move_directory",
+            "delete_directory",
+        ] {
+            assert!(names.contains(&name.to_string()), "missing tool: {name}");
+        }
+        // Migrated away from, not kept alongside.
+        assert!(!names.contains(&"read_file".to_string()));
+        assert!(!names.contains(&"edit_file".to_string()));
+    }
+
+    /// A read-only executor (`/review`, the explorer subagent) offers the
+    /// read but none of the mutating operations, and refuses them if called
+    /// anyway.
+    #[tokio::test]
+    async fn read_only_mode_offers_show_file_but_no_mutations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new_read_only(workspace.path());
+        let names: Vec<String> = executor
+            .definitions()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect();
+
+        assert!(names.contains(&"show_file".to_string()));
+        for name in ["create_file", "modify_file", "delete_file", "move_file"] {
+            assert!(!names.contains(&name.to_string()), "offered: {name}");
+        }
+
+        let err = executor
+            .execute(
+                "create_file",
+                &args(&[("path", json!("a.txt")), ("content", json!("x\n"))]),
+            )
+            .await
+            .expect_err("read-only");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    /// The whole life cycle through the tool interface, on the same library
+    /// functions `orangu-server` serves.
+    #[tokio::test]
+    async fn a_file_can_be_created_shown_moved_and_deleted_through_the_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+
+        executor
+            .execute(
+                "create_file",
+                &args(&[
+                    ("path", json!("src/a.txt")),
+                    ("content", json!("one\ntwo\n")),
+                    ("mode", json!("0640")),
+                    ("parents", json!(true)),
+                ]),
+            )
+            .await
+            .expect("create_file");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+
+        let shown = executor
+            .execute("show_file", &args(&[("path", json!("src/a.txt"))]))
+            .await
+            .expect("show_file");
+        assert!(shown.contains("two"), "{shown}");
+
+        executor
+            .execute(
+                "modify_file",
+                &args(&[
+                    ("path", json!("src/a.txt")),
+                    (
+                        "edits",
+                        json!([{"start_line": 1, "end_line": 1, "replacement": "ONE\n"}]),
+                    ),
+                ]),
+            )
+            .await
+            .expect("modify_file with edits");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/a.txt")).unwrap(),
+            "ONE\ntwo\n"
+        );
+
+        executor
+            .execute(
+                "modify_file",
+                &args(&[
+                    ("path", json!("src/a.txt")),
+                    ("old_text", json!("two")),
+                    ("new_text", json!("TWO")),
+                ]),
+            )
+            .await
+            .expect("modify_file with old_text");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/a.txt")).unwrap(),
+            "ONE\nTWO\n"
+        );
+
+        executor
+            .execute(
+                "move_file",
+                &args(&[("from", json!("src/a.txt")), ("to", json!("src/b.txt"))]),
+            )
+            .await
+            .expect("move_file");
+        assert!(workspace.path().join("src/b.txt").exists());
+
+        executor
+            .execute("delete_file", &args(&[("path", json!("src/b.txt"))]))
+            .await
+            .expect("delete_file");
+        assert!(!workspace.path().join("src/b.txt").exists());
+
+        executor
+            .execute("create_directory", &args(&[("path", json!("src/deep"))]))
+            .await
+            .expect("create_directory");
+        executor
+            .execute(
+                "move_directory",
+                &args(&[("from", json!("src/deep")), ("to", json!("src/deeper"))]),
+            )
+            .await
+            .expect("move_directory");
+        executor
+            .execute("delete_directory", &args(&[("path", json!("src/deeper"))]))
+            .await
+            .expect("delete_directory");
+        assert!(!workspace.path().join("src/deeper").exists());
+    }
+
+    /// The tools are confined to the workspace exactly as the endpoints are.
+    #[tokio::test]
+    async fn tools_refuse_paths_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        let escape = outside.path().join("secret.txt").display().to_string();
+
+        for (tool, arguments) in [
+            (
+                "create_file",
+                args(&[("path", json!("../escaped.txt")), ("content", json!("x"))]),
+            ),
+            ("show_file", args(&[("path", json!(escape.clone()))])),
+            ("delete_file", args(&[("path", json!(escape.clone()))])),
+            (
+                "move_file",
+                args(&[("from", json!(escape.clone())), ("to", json!("here.txt"))]),
+            ),
+            ("create_directory", args(&[("path", json!("../escaped"))])),
+        ] {
+            let err = executor
+                .execute(tool, &arguments)
+                .await
+                .expect_err("outside the workspace");
+            assert!(
+                err.to_string().contains("workspace"),
+                "{tool}: unexpected error: {err}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret\n"
+        );
     }
 }

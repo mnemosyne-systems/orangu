@@ -238,13 +238,18 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     // --- restore ---
     "restore ",
     "git restore ",
-    // --- add ---
+    // --- add (folded into create file: creating a file is writing it and
+    // staging it, so these reach /create_file) ---
     "git add ",
     "add file ",
     "add ",
-    "add",
-    // --- remove ---
+    // --- create file ---
+    "create file ",
+    "new file ",
+    "create ",
+    // --- delete file ---
     "git rm ",
+    "delete file ",
     "remove file ",
     "remove ",
     "remove",
@@ -253,6 +258,17 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "move file ",
     "move ",
     "move",
+    // --- create directory ---
+    "create directory ",
+    "mkdir ",
+    "new directory ",
+    // --- move directory ---
+    "move directory ",
+    "rename directory ",
+    // --- delete directory ---
+    "delete directory ",
+    "remove directory ",
+    "rmdir ",
     // --- cherry-pick ---
     "git cherry-pick ",
     "cherry-pick ",
@@ -789,27 +805,77 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             }
         }
     }
-    for prefix in ["git add ", "add file ", "add "] {
-        if let Some(path) = strip_ascii_prefix(input, prefix) {
-            let path = path.trim();
-            if !path.is_empty() {
-                return Some(LocalCommand::AddFile(Some(Cow::Borrowed(path))));
+    for prefix in ["create directory ", "new directory ", "mkdir "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            if let Some(parsed) = parse_path_with_mode(rest) {
+                return Some(LocalCommand::CreateDirectory(Some(parsed)));
             }
         }
     }
-    if matches_ci(input, &["add"]) {
-        return Some(LocalCommand::AddFile(None));
+    for prefix in ["move directory ", "rename directory "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix)
+            && let Ok(words) = shell_words(rest.trim())
+            && words.len() >= 2
+        {
+            return Some(LocalCommand::MoveDirectory(Some((
+                Cow::Owned(words[0].clone()),
+                Cow::Owned(words[1].clone()),
+            ))));
+        }
     }
-    for prefix in ["git rm ", "remove file ", "remove "] {
+    for prefix in ["delete directory ", "remove directory ", "rmdir "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            let path = rest.trim();
+            if !path.is_empty() {
+                return Some(LocalCommand::DeleteDirectory(Some(Cow::Borrowed(path))));
+            }
+        }
+    }
+    // "Create myfile.txt with 0644" — the mode is optional, and the bare
+    // "create " form comes last so it never shadows "create branch"/"create
+    // workspace"/"create pull request" above.
+    for prefix in [
+        "create file ",
+        "new file ",
+        "git add ",
+        "add file ",
+        "create ",
+        "add ",
+    ] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            // The bare "create " form must never swallow the other things
+            // orangu creates — those have their own commands, parsed above.
+            let reserved = [
+                "workspace",
+                "branch",
+                "pull request",
+                "pr",
+                "issue",
+                "directory",
+                "dir",
+                "folder",
+            ];
+            if reserved
+                .iter()
+                .any(|noun| rest.trim_start().to_lowercase().starts_with(noun))
+            {
+                break;
+            }
+            if let Some(parsed) = parse_create_file_args(rest) {
+                return Some(LocalCommand::CreateFile(Some(parsed)));
+            }
+        }
+    }
+    for prefix in ["git rm ", "delete file ", "remove file ", "remove "] {
         if let Some(path) = strip_ascii_prefix(input, prefix) {
             let path = path.trim();
             if !path.is_empty() {
-                return Some(LocalCommand::RemoveFile(Some(Cow::Borrowed(path))));
+                return Some(LocalCommand::DeleteFile(Some(Cow::Borrowed(path))));
             }
         }
     }
     if matches_ci(input, &["remove"]) {
-        return Some(LocalCommand::RemoveFile(None));
+        return Some(LocalCommand::DeleteFile(None));
     }
     for prefix in ["git mv ", "move file ", "move "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {

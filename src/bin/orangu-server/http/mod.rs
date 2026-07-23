@@ -31,6 +31,12 @@ use axum::{
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
+impl orangu::files_http::WorkspaceState for AppState {
+    fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+}
+
 pub struct AppState {
     pub engine: Arc<Engine>,
     /// What `general.name`/the resolved model spec reports as the model's
@@ -62,6 +68,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(openai::completions))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/shutdown", post(shutdown))
+        // The file-lifecycle API, mounted from the shared router
+        // `orangu-coordinator` mounts too, so both front doors serve the
+        // same eight endpoints over the same implementation.
+        .merge(orangu::files_http::router::<AppState>())
         .with_state(state)
 }
 

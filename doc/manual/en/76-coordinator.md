@@ -48,6 +48,21 @@ that one process safe and (mostly) transparent.
   falls back to `Coordinator::resolve_server_binary`'s sibling-binary/`PATH`
   search.
 
+### File-lifecycle endpoints
+
+Nothing in the coordinator handles these: `orangu-server` mounts them
+(`orangu::files_http::router`, over the shared `orangu::files`
+implementation), and the coordinator forwards them through `proxy::proxy`
+like any other path. `implied_role_for_path` returns `None` for them — only
+`/v1/embeddings` has a role baked into its path — so they resolve to the
+currently active profile, then `all`.
+
+Deliberately not handled locally, even though the operations are available
+to the coordinator as a library: it has no workspace to act in. Giving it
+one would mean two workspaces in one deployment (the coordinator's and each
+backend's) and a client unable to tell which one a request reached. The
+proxy stays a proxy.
+
 ### `GET /v1/coordinator`
 
 A fixed, side-effect-free identity marker (`proxy::coordinator_info`),
