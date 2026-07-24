@@ -485,7 +485,7 @@ async fn send_message(
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     };
     let tokens = state.engine.tokenizer.encode(&prompt, false);
-    let stop_token_ids = state.engine.tokenizer.eos_token.into_iter().collect();
+    let stop_token_ids = state.engine.tokenizer.stop_token_ids();
 
     let mut rx = state
         .engine

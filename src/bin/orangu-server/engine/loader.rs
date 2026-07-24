@@ -72,7 +72,9 @@ pub enum ArchFamily {
     LlamaStyle,
     /// Gemma/Gemma2/Gemma3/Gemma4 — QK-norm, per-layer-varying SWA/full
     /// attention, cross-layer KV sharing, per-layer embeddings, GEGLU FFN,
-    /// final logit softcapping. See `engine::arch::gemma`.
+    /// final logit softcapping, and (`gemma-4-26B-A4B`) optional per-layer
+    /// routed-expert MoE alongside a dense shared MLP. See
+    /// `engine::arch::gemma`.
     Gemma,
     /// Qwen3.5/3.6-MoE — layers alternate between full attention (joint
     /// query+gate projection, partial rotary) and gated-DeltaNet linear
@@ -157,11 +159,10 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
 /// the architecture *string*: a model whose architecture is recognised can
 /// still carry tensors this build rejects when it goes to build the model,
 /// so a bare `resolve_arch_family` "yes" would promise a load that then
-/// fails. The one such case today is a gemma checkpoint carrying per-layer
-/// MoE expert tensors (`ffn_gate_inp`) — [`super::arch::gemma`] is
-/// dense-only and bails on it at build time — which is reported unsupported
-/// under a refined `<arch>-moe` label (e.g. `gemma4` → `gemma4-moe`) so the
-/// column names the actual blocker rather than the bare architecture.
+/// fails. There is no such case for the recognised architectures today —
+/// gemma MoE checkpoints (`gemma-4-26B-A4B`, `ffn_gate_inp` present) load via
+/// [`super::arch::gemma`]'s routed-expert path — so this mirrors
+/// [`resolve_arch_family`].
 ///
 /// Returns `(architecture, supported)`: `architecture` is `None` only when
 /// the file has no `general.architecture` at all.
@@ -170,21 +171,8 @@ pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, bool) {
     let Some(arch) = architecture.as_deref() else {
         return (None, false);
     };
-    let Ok(family) = resolve_arch_family(arch) else {
-        return (architecture, false);
-    };
-    if matches!(family, ArchFamily::Gemma) && has_moe_expert_tensors(gguf) {
-        return (Some(format!("{arch}-moe")), false);
-    }
-    (architecture, true)
-}
-
-/// Whether any layer carries a routed-MoE gate (`blk.{i}.ffn_gate_inp.weight`)
-/// — the same tensor `arch::gemma`'s per-layer build guard checks for.
-fn has_moe_expert_tensors(gguf: &GgufFile) -> bool {
-    gguf.tensors
-        .iter()
-        .any(|t| t.name.starts_with("blk.") && t.name.ends_with(".ffn_gate_inp.weight"))
+    let supported = resolve_arch_family(arch).is_ok();
+    (architecture, supported)
 }
 
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
@@ -702,20 +690,18 @@ mod tests {
     }
 
     #[test]
-    fn model_load_support_rejects_a_moe_gemma_model_as_gemma4_moe() {
-        // A gemma checkpoint with per-layer MoE expert tensors — recognised
-        // architecture, but `arch::gemma` bails on `ffn_gate_inp` at build
-        // time, so it must be reported unsupported up front, under `-moe`.
+    fn model_load_support_accepts_a_moe_gemma_model() {
+        // A gemma checkpoint with per-layer MoE expert tensors
+        // (`gemma-4-26B-A4B`) — `arch::gemma` now loads the routed-expert
+        // path, so it's reported supported under the plain architecture.
         let (arch, supported) =
             model_load_support(&header_only("gemma4", &["blk.0.ffn_gate_inp.weight"]));
-        assert_eq!(arch.as_deref(), Some("gemma4-moe"));
-        assert!(!supported);
+        assert_eq!(arch.as_deref(), Some("gemma4"));
+        assert!(supported);
     }
 
     #[test]
-    fn model_load_support_does_not_moe_flag_a_non_gemma_arch() {
-        // `qwen35moe` genuinely supports `ffn_gate_inp`, so the MoE guard
-        // must not fire for it — only gemma is dense-only here.
+    fn model_load_support_accepts_a_moe_qwen_model() {
         let (arch, supported) =
             model_load_support(&header_only("qwen35moe", &["blk.0.ffn_gate_inp.weight"]));
         assert_eq!(arch.as_deref(), Some("qwen35moe"));

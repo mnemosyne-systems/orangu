@@ -140,7 +140,7 @@ pub async fn chat_completions(
         sampling.seed = v;
     }
     let max_tokens = req.max_tokens.unwrap_or(512);
-    let stop_token_ids = state.engine.tokenizer.eos_token.into_iter().collect();
+    let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let created = unix_now();
     let model = state.model_label.clone();
 
@@ -270,7 +270,7 @@ pub async fn completions(
     let stop_token_ids: Vec<u32> = if req.ignore_eos {
         Vec::new()
     } else {
-        state.engine.tokenizer.eos_token.into_iter().collect()
+        state.engine.tokenizer.stop_token_ids()
     };
     let created = unix_now();
     let model = state.model_label.clone();

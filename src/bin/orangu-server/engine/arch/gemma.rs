@@ -40,11 +40,34 @@
 //!   mechanism with no equivalent anywhere else in this engine.
 //! - **GEGLU FFN** (GELU, not SiLU) and **final logit softcapping**
 //!   (`tanh`-based).
+//! - **MoE FFN** (`gemma-4-26B-A4B`): a MoE layer (`ffn_gate_inp` present)
+//!   runs *two* parallel FFN branches off the post-attention residual and
+//!   sums them — a dense GEGLU "shared" MLP (this layer's always-present
+//!   `ffn_gate`/`ffn_up`/`ffn_down`, its own `post_ffw_norm_1`) plus a
+//!   routed-expert branch (`pre_ffw_norm_2` input norm, softmax top-k
+//!   routing over `ffn_gate_*_exps`, renormalized, GELU experts, its own
+//!   `post_ffw_norm_2`). The router logits are computed the way gemma4.cpp
+//!   does — a *weightless* RMSNorm of the residual, `1/sqrt(n_embd)`-scaled
+//!   and multiplied by the learned per-dim `ffn_gate_inp.scale`, then
+//!   projected through `ffn_gate_inp` — reading the residual directly, not
+//!   the expert branch's own pre-normed input. See [`GemmaModel::
+//!   moe_ffn_result`].
 //!
-//! **Not implemented**: MoE gemma4 layers (`ffn_gate_inp` present) — this
-//! module loads the always-present dense FFN branch only, and refuses to
-//! load a model whose layers also have MoE tensors, rather than silently
-//! ignoring the routed-expert path.
+//! The gate+up experts come either fused (`ffn_gate_up_exps`, as in the QAT
+//! checkpoint) or separate (`ffn_{gate,up}_exps`), each optionally carrying
+//! a per-expert `.scale` companion (a QAT scalar folded in per
+//! `build_lora_mm_id`); the `gemma-4-26B-A4B` QAT GGUF ships fused Q4_0
+//! experts plus a per-expert `ffn_down_exps.scale`. Its `head_count_kv` also
+//! varies per layer (full-attention layers use fewer KV heads than SWA
+//! layers), read per [`GemmaLayer::n_head_kv`].
+//!
+//! A model with any MoE layer runs entirely through the CPU-orchestrated
+//! forward paths ([`GemmaModel::run_layers_cpu`] and the CPU branch of
+//! [`ModelForward::forward_batch_decode`]) — the matmuls still dispatch to
+//! the GPU backend, but the fully-fused single-submission decode/replay/
+//! batched Vulkan paths ([`GemmaModel::record_one_sequence_decode`] etc.)
+//! are dense-FFN-only and are skipped when [`GemmaModel::is_moe`], the same
+//! way [`super::qwen35moe`] (also MoE) is wholly CPU-orchestrated.
 
 use anyhow::{Context, Result, bail};
 use std::sync::Arc;
@@ -59,7 +82,7 @@ use crate::engine::backend::vulkan_replay::{
 };
 use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::KvCache;
-use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
+use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
 use rayon::prelude::*;
 
@@ -103,6 +126,54 @@ struct DecodeReplay {
     expected_pos: usize,
 }
 
+/// The routed experts' gate+up projection. `gemma-4-26B-A4B` ships a
+/// **fused** `ffn_gate_up_exps` (`[n_embd, 2*n_ff_exp, n_expert]`), whose
+/// output rows `[0, n_ff_exp)` are the gate and `[n_ff_exp, 2*n_ff_exp)` the
+/// up (matching gemma4.cpp's `ggml_view` split); the plain gemma4.cpp path
+/// instead has separate `ffn_gate_exps`/`ffn_up_exps`. Both carry an
+/// optional per-expert `.scale` companion (`[n_expert]`), a QAT scalar
+/// multiplied into that expert's output *before* the GELU (per
+/// `build_lora_mm_id`) — `None` when absent (the Q4_0 gate/up experts here
+/// have inline scales and ship no companion).
+enum GemmaExpertGateUp {
+    Fused {
+        gate_up: ExpertQuantMatrix,
+        scale: Option<Vec<f32>>,
+    },
+    Separate {
+        gate: ExpertQuantMatrix,
+        up: ExpertQuantMatrix,
+        gate_scale: Option<Vec<f32>>,
+        up_scale: Option<Vec<f32>>,
+    },
+}
+
+/// A gemma4 MoE layer's routed-expert branch (`gemma-4-26B-A4B`). The
+/// dense "shared" MLP branch reuses the layer's always-present
+/// `ffn_norm`/`ffn_gate`/`ffn_up`/`ffn_down`, so only the routed-expert-
+/// specific tensors live here. See [`GemmaModel::moe_ffn_result`].
+struct GemmaMoe {
+    /// Router projection, `[n_embd, n_expert]`.
+    gate_inp: QuantMatrix,
+    /// `ffn_gate_inp.scale`, `[n_embd]` — a learned per-dim scale applied to
+    /// the (weightless-RMSNormed, `1/sqrt(n_embd)`-scaled) router input
+    /// before the `gate_inp` projection, per gemma4.cpp's custom router.
+    gate_inp_scale: Vec<f32>,
+    /// `pre_ffw_norm_2` — RMSNorm on the residual feeding the *experts*
+    /// (distinct from the shared MLP's `ffn_norm`).
+    pre_norm_2: Vec<f32>,
+    /// `post_ffw_norm_1` — RMSNorm applied to the shared MLP branch's output.
+    post_norm_1: Vec<f32>,
+    /// `post_ffw_norm_2` — RMSNorm applied to the routed-expert branch's output.
+    post_norm_2: Vec<f32>,
+    gate_up: GemmaExpertGateUp,
+    down_exps: ExpertQuantMatrix,
+    /// `ffn_down_exps.scale`, `[n_expert]` — a per-expert QAT scalar
+    /// multiplied into that expert's whole down-projection output (per
+    /// `build_lora_mm_id`'s `w_s`). `None` when absent.
+    down_scale: Option<Vec<f32>>,
+}
+
 struct GemmaLayer {
     attn_norm: Vec<f32>,
     wq: QuantMatrix,
@@ -117,6 +188,10 @@ struct GemmaLayer {
     ffn_up: QuantMatrix,
     ffn_down: QuantMatrix,
     ffn_post_norm: Vec<f32>,
+    /// `Some` only for MoE layers (`gemma-4-26B-A4B`) — the routed-expert
+    /// branch that runs alongside the dense FFN above. `None` (dense-only)
+    /// for every other Gemma variant.
+    moe: Option<GemmaMoe>,
     layer_output_scale: Option<f32>,
     per_layer_inp_gate: Option<QuantMatrix>,
     per_layer_proj: Option<QuantMatrix>,
@@ -124,6 +199,12 @@ struct GemmaLayer {
 
     is_swa: bool,
     head_dim: usize,
+    /// KV heads for *this* layer. Gemma4 can vary this per layer
+    /// (`attention.head_count_kv` is an array — e.g. `gemma-4-26B-A4B`'s
+    /// full-attention layers use 2, its SWA layers 8); a scalar (or absent)
+    /// `head_count_kv` is broadcast to every layer. `n_head / n_head_kv`
+    /// (this layer's GQA group size) must divide evenly.
+    n_head_kv: usize,
     rope_dim: usize,
     rope_freq_base: f32,
     has_kv: bool,
@@ -138,8 +219,15 @@ pub struct GemmaModel {
     output_norm: Vec<f32>,
     output_weight: QuantMatrix,
     n_head: usize,
-    n_head_kv: usize,
     n_swa: usize,
+    /// Routed experts evaluated per token (`expert_used_count`) — `0` for
+    /// dense models. Only read on the MoE path.
+    n_expert_used: usize,
+    /// `true` iff any layer carries a routed-expert branch
+    /// ([`GemmaLayer::moe`]). Gates *off* the fully-fused single-submission
+    /// Vulkan decode/replay/batched paths (dense-FFN-only), routing MoE
+    /// models through the CPU-orchestrated forward instead.
+    is_moe: bool,
     attention_scale: f32,
     final_logit_softcapping: Option<f32>,
     /// `false` only for `gemma-embedding` — every other Gemma family member
@@ -176,13 +264,22 @@ impl GemmaModel {
         let n_head = loaded
             .metadata_u64("attention.head_count")
             .context("missing attention.head_count")? as usize;
-        let n_head_kv = loaded
+        // `attention.head_count_kv` is a *scalar* for most Gemma variants but
+        // a per-layer *array* for `gemma-4-26B-A4B` (full-attention layers use
+        // fewer KV heads than SWA layers). Read both: the array wins per layer
+        // when present, else the scalar (defaulting to `n_head`) is broadcast.
+        let n_head_kv_default = loaded
             .metadata_u64("attention.head_count_kv")
             .unwrap_or(n_head as u64) as usize;
+        let n_head_kv_per_layer = loaded.metadata_array_u64("attention.head_count_kv");
         let rms_eps = loaded
             .metadata_f32("attention.layer_norm_rms_epsilon")
             .unwrap_or(1e-6);
         let n_swa = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) as usize;
+        // `expert_used_count` — how many routed experts each token evaluates
+        // (`gemma-4-26B-A4B`). `0`/absent for dense Gemma variants; a MoE
+        // layer with this still `0` is rejected after the layer loop below.
+        let n_expert_used = loaded.metadata_u64("expert_used_count").unwrap_or(0) as usize;
         let final_logit_softcapping = loaded.metadata_f32("final_logit_softcapping");
         let n_embd_per_layer = loaded
             .metadata_u64("embedding_length_per_layer_input")
@@ -325,12 +422,60 @@ impl GemmaModel {
                         .with_context(|| format!("loading {name}"))?,
                 ))
             };
+            let get_expert_matrix = |suffix: &str| -> Result<ExpertQuantMatrix> {
+                let name = format!("blk.{i}.{suffix}");
+                loaded
+                    .expert_matrix(&name)
+                    .with_context(|| format!("loading {name}"))
+            };
+            // An optional `[n_expert]` (etc.) F32 companion scale tensor.
+            let get_optional_vec = |suffix: &str| -> Result<Option<Vec<f32>>> {
+                let name = format!("blk.{i}.{suffix}");
+                if !loaded.has_tensor(&name) {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    loaded
+                        .tensor(&name)
+                        .with_context(|| format!("loading {name}"))?
+                        .0,
+                ))
+            };
 
-            if loaded.has_tensor(&format!("blk.{i}.ffn_gate_inp.weight")) {
-                bail!(
-                    "blk.{i} has MoE expert tensors (ffn_gate_inp) — MoE gemma layers are not yet supported by orangu-server"
-                );
-            }
+            // MoE layer (`gemma-4-26B-A4B`): the presence of the router
+            // (`ffn_gate_inp`) marks this layer as running the routed-expert
+            // branch alongside the always-present dense FFN. See
+            // [`GemmaModel::moe_ffn_result`] for the graph. The gate+up
+            // experts are either fused (`ffn_gate_up_exps`, as in the QAT
+            // checkpoint) or separate (`ffn_{gate,up}_exps`), each with an
+            // optional per-expert `.scale` companion.
+            let moe = if loaded.has_tensor(&format!("blk.{i}.ffn_gate_inp.weight")) {
+                let gate_up = if loaded.has_tensor(&format!("blk.{i}.ffn_gate_up_exps.weight")) {
+                    GemmaExpertGateUp::Fused {
+                        gate_up: get_expert_matrix("ffn_gate_up_exps.weight")?,
+                        scale: get_optional_vec("ffn_gate_up_exps.scale")?,
+                    }
+                } else {
+                    GemmaExpertGateUp::Separate {
+                        gate: get_expert_matrix("ffn_gate_exps.weight")?,
+                        up: get_expert_matrix("ffn_up_exps.weight")?,
+                        gate_scale: get_optional_vec("ffn_gate_exps.scale")?,
+                        up_scale: get_optional_vec("ffn_up_exps.scale")?,
+                    }
+                };
+                Some(GemmaMoe {
+                    gate_inp: get_matrix("ffn_gate_inp.weight")?,
+                    gate_inp_scale: get("ffn_gate_inp.scale")?,
+                    pre_norm_2: get("pre_ffw_norm_2.weight")?,
+                    post_norm_1: get("post_ffw_norm_1.weight")?,
+                    post_norm_2: get("post_ffw_norm_2.weight")?,
+                    gate_up,
+                    down_exps: get_expert_matrix("ffn_down_exps.weight")?,
+                    down_scale: get_optional_vec("ffn_down_exps.scale")?,
+                })
+            } else {
+                None
+            };
 
             let swa = is_swa.get(i).copied().unwrap_or(false);
             let has_kv = i < n_layer_kv_from_start;
@@ -376,6 +521,7 @@ impl GemmaModel {
                 ffn_up: get_matrix("ffn_up.weight")?,
                 ffn_down: get_matrix("ffn_down.weight")?,
                 ffn_post_norm: get("post_ffw_norm.weight")?,
+                moe,
                 layer_output_scale: get_optional("layer_output_scale.weight")?.map(|v| v[0]),
                 per_layer_inp_gate: if n_embd_per_layer > 0 {
                     Some(get_matrix("inp_gate.weight")?)
@@ -394,6 +540,11 @@ impl GemmaModel {
                 },
                 is_swa: swa,
                 head_dim: if swa { head_dim_swa } else { head_dim_full },
+                n_head_kv: n_head_kv_per_layer
+                    .as_ref()
+                    .and_then(|a| a.get(i).copied())
+                    .map(|v| v as usize)
+                    .unwrap_or(n_head_kv_default),
                 rope_dim: if swa { rope_dim_swa } else { rope_dim_full },
                 rope_freq_base: if swa {
                     rope_freq_base_swa
@@ -405,6 +556,15 @@ impl GemmaModel {
             });
         }
 
+        let is_moe = layers.iter().any(|l| l.moe.is_some());
+        if is_moe && n_expert_used == 0 {
+            bail!(
+                "MoE gemma model (layers carry ffn_gate_inp) is missing \
+                 {}.expert_used_count",
+                config.architecture
+            );
+        }
+
         Ok(Self {
             config,
             backend,
@@ -412,8 +572,9 @@ impl GemmaModel {
             output_norm,
             output_weight,
             n_head,
-            n_head_kv,
             n_swa,
+            n_expert_used,
+            is_moe,
             // Gemma4 uses self.scaling = 1.0 (no 1/sqrt(head_dim) scaling).
             // `gemma-embedding` is the one exception: `hparams.
             // f_attention_scale = 1/sqrt(n_embd_head_k)`, applied via an
@@ -451,7 +612,7 @@ impl GemmaModel {
     fn kv_dims(&self) -> Vec<usize> {
         self.layers
             .iter()
-            .map(|l| self.n_head_kv * l.head_dim)
+            .map(|l| l.n_head_kv * l.head_dim)
             .collect()
     }
 
@@ -714,7 +875,7 @@ impl GemmaModel {
                     q_norm: &layer.attn_q_norm,
                     kv,
                     n_head: self.n_head,
-                    n_head_kv: self.n_head_kv,
+                    n_head_kv: layer.n_head_kv,
                     head_dim,
                     rope_dim: layer.rope_dim,
                     rope_freq_base: layer.rope_freq_base,
@@ -843,7 +1004,7 @@ impl GemmaModel {
                 .then_some(self.rope_freqs.as_deref())
                 .flatten();
             let cache_index = layer.kv_donor;
-            let group_size = self.n_head / self.n_head_kv;
+            let group_size = self.n_head / layer.n_head_kv;
 
             normed.clear();
             normed.extend_from_slice(&x);
@@ -908,7 +1069,7 @@ impl GemmaModel {
             }
 
             if layer.has_kv {
-                let kv_dim = self.n_head_kv * head_dim;
+                let kv_dim = layer.n_head_kv * head_dim;
                 let mut k = results.next().unwrap();
                 tensor::rmsnorm_inplace(
                     &mut k,
@@ -916,7 +1077,7 @@ impl GemmaModel {
                         .attn_k_norm
                         .as_ref()
                         .context("layer has_kv but no attn_k_norm")?,
-                    n_tokens * self.n_head_kv,
+                    n_tokens * layer.n_head_kv,
                     head_dim,
                     eps,
                 );
@@ -925,13 +1086,13 @@ impl GemmaModel {
                 } else {
                     k.clone()
                 };
-                rmsnorm_weightless_inplace(&mut v, n_tokens * self.n_head_kv, head_dim, eps);
+                rmsnorm_weightless_inplace(&mut v, n_tokens * layer.n_head_kv, head_dim, eps);
 
                 for t in 0..n_tokens {
                     let pos = start_pos + t;
                     tensor::rope_apply_scaled_inplace(
                         &mut k[t * kv_dim..(t + 1) * kv_dim],
-                        self.n_head_kv,
+                        layer.n_head_kv,
                         head_dim,
                         layer.rope_dim,
                         pos,
@@ -1013,50 +1174,60 @@ impl GemmaModel {
             tensor::rmsnorm_inplace(&mut attn_proj, &layer.attn_post_norm, n_tokens, n_embd, eps);
             tensor::add_inplace(&mut x, &attn_proj);
 
-            // `x` is the post-attention residual and is *not* mutated
-            // again until the FFN residual add below (the norm runs on the
-            // `ffn_normed` copy, not `x`), so the old `attn_out_residual =
-            // x.clone(); …; x = attn_out_residual` round-trip was a redundant
-            // ~n_tokens×n_embd clone per layer — dropped. `ffn_normed` reuses a
-            // hoisted scratch buffer instead of allocating a fresh clone.
-            ffn_normed.clear();
-            ffn_normed.extend_from_slice(&x);
-            tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-            let t0 = Instant::now();
-            let mut gate_up = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens,
-                    w: &layer.ffn_gate,
-                },
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens,
-                    w: &layer.ffn_up,
-                },
-            ]);
-            if prefill_trace {
-                eprintln!(
-                    "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
-                     n_tokens={n_tokens}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
+            // FFN. Dense (GEGLU) for most Gemma variants; a MoE layer
+            // (`gemma-4-26B-A4B`) instead runs a dense shared MLP plus routed
+            // experts and sums them (`moe_ffn_result`). Either way the shared
+            // `ffn_post_norm` and the residual add follow.
+            if let Some(moe) = &layer.moe {
+                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens);
+                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
+                tensor::add_inplace(&mut x, &ffn_out);
+            } else {
+                // `x` is the post-attention residual and is *not* mutated
+                // again until the FFN residual add below (the norm runs on the
+                // `ffn_normed` copy, not `x`), so the old `attn_out_residual =
+                // x.clone(); …; x = attn_out_residual` round-trip was a redundant
+                // ~n_tokens×n_embd clone per layer — dropped. `ffn_normed` reuses a
+                // hoisted scratch buffer instead of allocating a fresh clone.
+                ffn_normed.clear();
+                ffn_normed.extend_from_slice(&x);
+                tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
+                let t0 = Instant::now();
+                let mut gate_up = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &ffn_normed,
+                        n_tokens,
+                        w: &layer.ffn_gate,
+                    },
+                    MatmulOp {
+                        x: &ffn_normed,
+                        n_tokens,
+                        w: &layer.ffn_up,
+                    },
+                ]);
+                if prefill_trace {
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
+                         n_tokens={n_tokens}: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                let up = gate_up.pop().unwrap();
+                let mut gate = gate_up.pop().unwrap();
+                tensor::gelu_inplace(&mut gate);
+                tensor::mul_inplace(&mut gate, &up);
+                let t0 = Instant::now();
+                let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
+                if prefill_trace {
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
+                         n_tokens={n_tokens}: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
+                tensor::add_inplace(&mut x, &ffn_out);
             }
-            let up = gate_up.pop().unwrap();
-            let mut gate = gate_up.pop().unwrap();
-            tensor::gelu_inplace(&mut gate);
-            tensor::mul_inplace(&mut gate, &up);
-            let t0 = Instant::now();
-            let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
-            if prefill_trace {
-                eprintln!(
-                    "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
-                     n_tokens={n_tokens}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
-            tensor::add_inplace(&mut x, &ffn_out);
 
             if let (Some(inp_per_layer), Some(gate_w), Some(proj_w), Some(post_norm)) = (
                 &inp_per_layer,
@@ -1548,6 +1719,7 @@ impl ModelForward for GemmaModel {
         // run_layers_cpu` (used by the CPU-orchestrated `else` branch below,
         // and by `Self::forward_hidden_states`) still does internally.
         let mut logits = if n_tokens == 1
+            && !self.is_moe
             && let Some(vulkan) = self.backend.as_vulkan()
         {
             // See `Self::record_decode_forward`'s own doc comment for
@@ -1715,7 +1887,11 @@ impl ModelForward for GemmaModel {
         // incomplete captures.
         let force = std::env::var_os("ORANGU_REPLAY_FORCE").is_some();
         let replay_on = std::env::var_os("ORANGU_REPLAY").is_some();
+        // MoE models never take the fully-fused Vulkan paths (the fused
+        // record path is dense-FFN-only) — they run CPU-orchestrated via
+        // `Self::forward`'s `else` branch, so short-circuit to it here.
         if tokens.len() == 1
+            && !self.is_moe
             && (force || (replay_supported && replay_on))
             && let Some(vulkan) = self.backend.as_vulkan()
         {
@@ -1735,6 +1911,7 @@ impl ModelForward for GemmaModel {
         // model keeps the single-`u32` readback instead of transferring the
         // whole `[n_vocab]` logits vector to `tanh` it on the CPU every token.
         if tokens.len() == 1
+            && !self.is_moe
             && let Some(params) = &greedy_sample
             && let Some(vulkan) = self.backend.as_vulkan()
             && vulkan.gpu_sample()
@@ -1841,7 +2018,9 @@ impl ModelForward for GemmaModel {
                 .collect();
         }
 
-        if let Some(vulkan) = self.backend.as_vulkan() {
+        if !self.is_moe
+            && let Some(vulkan) = self.backend.as_vulkan()
+        {
             return Ok(self
                 .record_batched_decode_forward(vulkan, items)
                 .into_iter()
@@ -1851,7 +2030,6 @@ impl ModelForward for GemmaModel {
 
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
-        let group_size = self.n_head / self.n_head_kv;
 
         // N embedding lookups, stacked into one `[n, n_embd]`
         // buffer — the same "n_tokens" shape `Self::forward`'s CPU path
@@ -1901,6 +2079,7 @@ impl ModelForward for GemmaModel {
                 .then_some(self.rope_freqs.as_deref())
                 .flatten();
             let cache_index = layer.kv_donor;
+            let group_size = self.n_head / layer.n_head_kv;
 
             let mut normed = x.clone();
             tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n, n_embd, eps);
@@ -1954,7 +2133,7 @@ impl ModelForward for GemmaModel {
             }
 
             if layer.has_kv {
-                let kv_dim = self.n_head_kv * head_dim;
+                let kv_dim = layer.n_head_kv * head_dim;
                 let mut k = results.next().unwrap();
                 tensor::rmsnorm_inplace(
                     &mut k,
@@ -1962,7 +2141,7 @@ impl ModelForward for GemmaModel {
                         .attn_k_norm
                         .as_ref()
                         .context("layer has_kv but no attn_k_norm")?,
-                    n * self.n_head_kv,
+                    n * layer.n_head_kv,
                     head_dim,
                     eps,
                 );
@@ -1971,7 +2150,7 @@ impl ModelForward for GemmaModel {
                 } else {
                     k.clone()
                 };
-                rmsnorm_weightless_inplace(&mut v, n * self.n_head_kv, head_dim, eps);
+                rmsnorm_weightless_inplace(&mut v, n * layer.n_head_kv, head_dim, eps);
 
                 // RoPE + KV-cache write: per-sequence, each into its *own*
                 // cache — there is no shared cache to batch across here.
@@ -1979,7 +2158,7 @@ impl ModelForward for GemmaModel {
                     let pos = item.start_pos;
                     tensor::rope_apply_scaled_inplace(
                         &mut k[i * kv_dim..(i + 1) * kv_dim],
-                        self.n_head_kv,
+                        layer.n_head_kv,
                         head_dim,
                         layer.rope_dim,
                         pos,
@@ -2032,30 +2211,39 @@ impl ModelForward for GemmaModel {
             let mut attn_proj = self.backend.matmul(&attn_out, n, &layer.wo);
             tensor::rmsnorm_inplace(&mut attn_proj, &layer.attn_post_norm, n, n_embd, eps);
             tensor::add_inplace(&mut x, &attn_proj);
-            let attn_out_residual = x.clone();
 
-            let mut ffn_normed = x.clone();
-            tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n, n_embd, eps);
-            let mut gate_up = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens: n,
-                    w: &layer.ffn_gate,
-                },
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens: n,
-                    w: &layer.ffn_up,
-                },
-            ]);
-            let up = gate_up.pop().unwrap();
-            let mut gate = gate_up.pop().unwrap();
-            tensor::gelu_inplace(&mut gate);
-            tensor::mul_inplace(&mut gate, &up);
-            let mut ffn_out = self.backend.matmul(&gate, n, &layer.ffn_down);
-            tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
-            x = attn_out_residual;
-            tensor::add_inplace(&mut x, &ffn_out);
+            // FFN — same dense/MoE split as `run_layers_cpu`, here batched
+            // across the `n` sequences instead of a prompt's positions. `x`
+            // is the post-attention residual at this point.
+            if let Some(moe) = &layer.moe {
+                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n);
+                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
+                tensor::add_inplace(&mut x, &ffn_out);
+            } else {
+                let attn_out_residual = x.clone();
+                let mut ffn_normed = x.clone();
+                tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n, n_embd, eps);
+                let mut gate_up = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &ffn_normed,
+                        n_tokens: n,
+                        w: &layer.ffn_gate,
+                    },
+                    MatmulOp {
+                        x: &ffn_normed,
+                        n_tokens: n,
+                        w: &layer.ffn_up,
+                    },
+                ]);
+                let up = gate_up.pop().unwrap();
+                let mut gate = gate_up.pop().unwrap();
+                tensor::gelu_inplace(&mut gate);
+                tensor::mul_inplace(&mut gate, &up);
+                let mut ffn_out = self.backend.matmul(&gate, n, &layer.ffn_down);
+                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
+                x = attn_out_residual;
+                tensor::add_inplace(&mut x, &ffn_out);
+            }
 
             if let (Some(gate_w), Some(proj_w), Some(post_norm)) = (
                 &layer.per_layer_inp_gate,
@@ -2218,6 +2406,194 @@ impl GemmaModel {
         }
         proj
     }
+
+    /// A MoE gemma4 layer's router logits (`[n_tokens, n_expert]`
+    /// row-major), computed the way gemma4.cpp does — deliberately reading
+    /// the post-attention residual `attn_out` (`[n_tokens, n_embd]`), *not*
+    /// the expert branch's own pre-normed input: a **weightless** RMSNorm,
+    /// scaled by `1/sqrt(n_embd)` and multiplied elementwise by the learned
+    /// per-dim `ffn_gate_inp.scale`, then projected through the router
+    /// (`ffn_gate_inp`).
+    fn moe_router_logits(&self, moe: &GemmaMoe, attn_out: &[f32], n_tokens: usize) -> Vec<f32> {
+        let n_embd = self.config.n_embd;
+        let eps = self.rms_eps();
+        let scale = 1.0 / (n_embd as f32).sqrt();
+
+        let mut tmp = attn_out.to_vec();
+        rmsnorm_weightless_inplace(&mut tmp, n_tokens, n_embd, eps);
+        for row in tmp.chunks_mut(n_embd) {
+            for (v, s) in row.iter_mut().zip(moe.gate_inp_scale.iter()) {
+                *v *= scale * s;
+            }
+        }
+        // `[n_tokens, n_expert]` — one router score per expert per token.
+        self.backend.matmul(&tmp, n_tokens, &moe.gate_inp)
+    }
+
+    /// A MoE gemma4 layer's FFN contribution *before* the shared
+    /// `ffn_post_norm` (which the caller applies, exactly as it does for a
+    /// dense layer): the elementwise sum of two branches computed off the
+    /// same post-attention residual `attn_out` (`[n_tokens, n_embd]`), per
+    /// gemma4.cpp's `is_moe_layer` graph:
+    /// - a **dense GEGLU "shared" MLP** — this layer's always-present
+    ///   `ffn_norm`/`ffn_gate`/`ffn_up`/`ffn_down` (identical to a dense
+    ///   layer's FFN), then its own `post_ffw_norm_1`;
+    /// - a **routed-expert branch** — `pre_ffw_norm_2` input norm, softmax
+    ///   top-`n_expert_used` routing (renormalized over the selected experts,
+    ///   the same `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`/`norm_w=true` path
+    ///   [`super::qwen35moe`] implements), GELU experts, then its own
+    ///   `post_ffw_norm_2`. The routing weights come from
+    ///   [`Self::moe_router_logits`] (which reads `attn_out`, not this
+    ///   branch's `pre_ffw_norm_2`-normed input).
+    fn moe_ffn_result(
+        &self,
+        layer: &GemmaLayer,
+        moe: &GemmaMoe,
+        attn_out: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
+        let n_embd = self.config.n_embd;
+        let eps = self.rms_eps();
+
+        // Dense shared-MLP branch (GEGLU) — the exact dense-FFN computation,
+        // using this layer's ffn_norm/ffn_gate/ffn_up/ffn_down.
+        let mut mlp_normed = attn_out.to_vec();
+        tensor::rmsnorm_inplace(&mut mlp_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
+        let mut gate_up = self.backend.matmul_batch(&[
+            MatmulOp {
+                x: &mlp_normed,
+                n_tokens,
+                w: &layer.ffn_gate,
+            },
+            MatmulOp {
+                x: &mlp_normed,
+                n_tokens,
+                w: &layer.ffn_up,
+            },
+        ]);
+        let up = gate_up.pop().unwrap();
+        let mut gate = gate_up.pop().unwrap();
+        tensor::gelu_inplace(&mut gate);
+        tensor::mul_inplace(&mut gate, &up);
+        let mut result = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
+        tensor::rmsnorm_inplace(&mut result, &moe.post_norm_1, n_tokens, n_embd, eps);
+
+        // Routed-expert branch. Expert input is its own `pre_ffw_norm_2`-normed
+        // residual; the routing weights come from the (differently-normed)
+        // `attn_out` — see `moe_router_logits`.
+        let mut expert_in = attn_out.to_vec();
+        tensor::rmsnorm_inplace(&mut expert_in, &moe.pre_norm_2, n_tokens, n_embd, eps);
+        let logits = self.moe_router_logits(moe, attn_out, n_tokens);
+        let n_expert = moe.gate_inp.out_dim;
+
+        // Route every token first (cheap, sequential): softmax its logits,
+        // take the top `n_expert_used`, renormalize their weights over the
+        // selection (clamped like the reference's `ggml_clamp` against a zero
+        // denominator). Flatten into a `(token, expert, weight)` work list.
+        let mut work: Vec<(usize, usize, f32)> = Vec::with_capacity(n_tokens * self.n_expert_used);
+        for t in 0..n_tokens {
+            let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
+            tensor::softmax_inplace(&mut probs);
+            let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.truncate(self.n_expert_used);
+            let weight_sum: f32 = indexed
+                .iter()
+                .map(|(_, w)| w)
+                .sum::<f32>()
+                .max(6.103_515_6e-5);
+            for (expert, weight) in indexed {
+                work.push((t, expert, weight / weight_sum));
+            }
+        }
+
+        // Evaluate each selected expert in parallel — this is the routed
+        // FFN's dominant cost and the only part of the MoE forward still on
+        // the CPU (per-row `Q*_0` dequant + dot; the shared MLP, attention,
+        // and router all dispatch to the GPU backend). Each `(token, expert)`
+        // pair is independent (reads shared weights + its own token's input,
+        // writes its own contribution vector), so they fan out across every
+        // core; the tiny weighted sum back into `moe_out` stays sequential.
+        let contribs: Vec<(usize, Vec<f32>)> = work
+            .par_iter()
+            .map(|&(t, expert, weight)| {
+                let x_t = &expert_in[t * n_embd..(t + 1) * n_embd];
+
+                // gate/up projection (fused or separate). A per-expert
+                // `.scale`, if present, multiplies that expert's raw gate/up
+                // output *before* the GELU (matches `build_lora_mm_id`).
+                let (mut gate, up) = match &moe.gate_up {
+                    GemmaExpertGateUp::Fused { gate_up, scale } => {
+                        let n_ff = gate_up.out_dim / 2;
+                        let mut gate: Vec<f32> = (0..n_ff)
+                            .map(|o| tensor::dot(x_t, &gate_up.row(expert, o)))
+                            .collect();
+                        let mut up: Vec<f32> = (0..n_ff)
+                            .map(|o| tensor::dot(x_t, &gate_up.row(expert, n_ff + o)))
+                            .collect();
+                        if let Some(s) = scale {
+                            let se = s[expert];
+                            gate.iter_mut().for_each(|v| *v *= se);
+                            up.iter_mut().for_each(|v| *v *= se);
+                        }
+                        (gate, up)
+                    }
+                    GemmaExpertGateUp::Separate {
+                        gate,
+                        up,
+                        gate_scale,
+                        up_scale,
+                    } => {
+                        let mut g: Vec<f32> = (0..gate.out_dim)
+                            .map(|o| tensor::dot(x_t, &gate.row(expert, o)))
+                            .collect();
+                        let mut u: Vec<f32> = (0..up.out_dim)
+                            .map(|o| tensor::dot(x_t, &up.row(expert, o)))
+                            .collect();
+                        if let Some(s) = gate_scale {
+                            let se = s[expert];
+                            g.iter_mut().for_each(|v| *v *= se);
+                        }
+                        if let Some(s) = up_scale {
+                            let se = s[expert];
+                            u.iter_mut().for_each(|v| *v *= se);
+                        }
+                        (g, u)
+                    }
+                };
+                tensor::gelu_inplace(&mut gate);
+                tensor::mul_inplace(&mut gate, &up);
+                let h = gate;
+
+                // Down projection, then the per-expert down `.scale` (if any)
+                // and the routing weight — both scalars, folded into one.
+                // Row-parallel *within* the expert as well: decode routes only
+                // `n_expert_used` (8) tokens' worth of work, too few to fill
+                // every core from the outer fan-out alone, so the down
+                // projection's `n_embd` rows fan out too (rayon's work-stealing
+                // keeps this from oversubscribing when the outer list is
+                // already wide, e.g. during prefill).
+                let dscale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]) * weight;
+                let contrib: Vec<f32> = (0..moe.down_exps.out_dim)
+                    .into_par_iter()
+                    .map(|o| dscale * tensor::dot(&h, &moe.down_exps.row(expert, o)))
+                    .collect();
+                (t, contrib)
+            })
+            .collect();
+
+        let mut moe_out = vec![0f32; n_tokens * n_embd];
+        for (t, contrib) in &contribs {
+            let dst = &mut moe_out[t * n_embd..(t + 1) * n_embd];
+            for (d, v) in dst.iter_mut().zip(contrib) {
+                *d += v;
+            }
+        }
+        tensor::rmsnorm_inplace(&mut moe_out, &moe.post_norm_2, n_tokens, n_embd, eps);
+
+        tensor::add_inplace(&mut result, &moe_out);
+        result
+    }
 }
 
 /// A plain (unweighted) RMSNorm — Gemma4's `Vcur` normalization
@@ -2271,6 +2647,118 @@ mod real_model_tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(top_id, 9079, "expected ' Paris' (9079) as top prediction");
+    }
+
+    /// Regression guard for **dense gemma-4 with a per-layer
+    /// `attention.head_count_kv` array** — `gemma-4-12B` and `gemma-4-31B`,
+    /// whose full-attention layers use far fewer KV heads than their SWA
+    /// layers (12B: 1 vs 8; 31B: 4 vs 16). If [`GemmaLayer::n_head_kv`] ever
+    /// regresses to the scalar `head_count` fallback, every full-attention
+    /// layer's GQA grouping is wrong and the logits collapse to a flat,
+    /// near-tie mush (observed top-gap ~0.05, with reserved/whitespace ids
+    /// winning) instead of a confident prediction.
+    ///
+    /// Rather than a specific argmax (these instruct models pick different
+    /// raw-completion tokens — 12B ` a`, 31B ` France`), the invariant is
+    /// *confidence*: fed "Paris is the capital of"
+    /// (`[2, 50429, 563, 506, 5279, 529]`, same Gemma tokenizer, ids fed
+    /// directly), a correctly-wired forward puts its top token well clear of
+    /// the runner-up. Verified against real `llama-server` `/completion`,
+    /// which is likewise confident here (12B ` a` at logprob -0.08, gap ~4;
+    /// 31B/`E4B` ` France`, gap 8+). The bar (top − second ≥ 2.0 raw logits)
+    /// sits far above a broken run's flat spread and far below every healthy
+    /// model's margin. Run with `ORANGU_TEST_PLKV_MODEL=/path/to/
+    /// gemma-4-{12B,31B}.gguf cargo test --release --bin orangu-server
+    /// real_model_tests -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gemma4_per_layer_kv_dense_is_confident() {
+        let path = std::env::var("ORANGU_TEST_PLKV_MODEL").expect("set ORANGU_TEST_PLKV_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        assert!(
+            !model.is_moe,
+            "ORANGU_TEST_PLKV_MODEL should be a dense per-layer-KV model (12B/31B)"
+        );
+        assert!(
+            model.layers.iter().any(|l| l.n_head_kv != model.n_head),
+            "expected a per-layer head_count_kv array (some layer with n_head_kv != n_head)"
+        );
+
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = vec![2, 50429, 563, 506, 5279, 529];
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
+        let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let gap = ranked[0].1 - ranked[1].1;
+        assert!(
+            gap >= 2.0,
+            "expected a confident prediction (top {} ahead by >=2.0), got gap {gap:.3}; \
+             ranked[..5]={:?} — a flat top usually means per-layer head_count_kv regressed",
+            ranked[0].0,
+            &ranked[..5]
+        );
+    }
+
+    /// The MoE sibling of the test above, for `gemma-4-26B-A4B`
+    /// (`unsloth/gemma-4-26B-A4B-it-qat-GGUF`): exercises the routed-expert
+    /// FFN path (dense shared MLP + softmax top-k experts, fused
+    /// `ffn_gate_up_exps` + per-expert down `.scale`, `moe_ffn_result`)
+    /// against real llama.cpp. The 26B-A4B uses the same Gemma tokenizer, so
+    /// "The capital of France is" tokenizes to the identical ids (BOS=2
+    /// prepended) as the dense test's; ids are fed directly to sidestep the
+    /// tokenizer. Also asserts the model actually took the MoE path
+    /// (`is_moe`), so a checkpoint that silently loaded dense-only wouldn't
+    /// pass by accident.
+    ///
+    /// The bar is the **top-2 token set**, not the single argmax, because on
+    /// this exact prompt the top two are a genuine near-tie that real
+    /// llama.cpp resolves the *other* way — verified directly against
+    /// `llama-server`'s `/completion` (`n_probs`) on this same GGUF: it
+    /// returns ` Paris` (9079) at logprob -1.1775 then ` the` (506) at
+    /// -1.2291 (Paris ahead by 0.05), with `.`/`\n`/` a` next. orangu
+    /// produces the *identical ranking* except ` the` and ` Paris` swap at
+    /// the very top (` the` ahead by ~0.07) — the two straddle a ~0.05-0.07
+    /// gap, and orangu lands on the far side of it because llama.cpp's CPU
+    /// `ggml_gelu` rounds through an f16 lookup table while this engine keeps
+    /// GELU in full f32 (harmless everywhere the top logit isn't a tie — the
+    /// dense test above, not a tie, matches llama.cpp's argmax exactly). So
+    /// asserting a single argmax here would be asserting an f16-rounding
+    /// artifact; the meaningful, stable invariant is that the forward puts
+    /// exactly `{9079, 506}` on top, clear of the rest. Run with
+    /// `ORANGU_TEST_MOE_MODEL=/path/to/gemma-4-26B-A4B.gguf cargo test
+    /// --release --bin orangu-server real_model_tests -- --ignored` (a
+    /// 26B-param model — expect several minutes on this engine's scalar
+    /// per-row dequant).
+    #[test]
+    #[ignore]
+    fn gemma4_moe_ranks_paris_and_the_after_capital_of_france() {
+        let path = std::env::var("ORANGU_TEST_MOE_MODEL").expect("set ORANGU_TEST_MOE_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        assert!(
+            model.is_moe,
+            "ORANGU_TEST_MOE_MODEL should be a MoE (A4B) checkpoint, but no layer had \
+             ffn_gate_inp"
+        );
+
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = vec![2, 818, 5279, 529, 7001, 563];
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
+        let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top2: std::collections::HashSet<usize> = ranked[..2].iter().map(|&(i, _)| i).collect();
+        assert_eq!(
+            top2,
+            std::collections::HashSet::from([9079usize, 506usize]),
+            "expected the top-2 next tokens to be {{' Paris' 9079, ' the' 506}} (matching real \
+             llama.cpp's top-2), got ranked[..5]={:?}",
+            &ranked[..5]
+        );
     }
 
     /// Cross-check against real llama.cpp (build 9959, `ggml-org/

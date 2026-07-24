@@ -58,7 +58,7 @@
 use anyhow::{Context, Result, anyhow};
 use orangu::gguf::{GgufFile, GgufValue};
 use regex::Regex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -105,8 +105,20 @@ pub struct Tokenizer {
     /// template's `<|start_header_id|>`) is recognized as one atomic token
     /// instead of being run through BPE like ordinary text.
     special_tokens: Vec<(String, u32)>,
+    /// Ids of every CONTROL / USER_DEFINED token (BOS/EOS/pad plus a chat
+    /// format's structural markers — gemma-4's `<|turn>`/`<turn|>`/
+    /// `<|channel>`/`<channel|>`/`<|tool_call>` etc.). Rendered literally by
+    /// [`Tokenizer::decode`], so callers streaming to a human suppress them
+    /// via [`Tokenizer::is_special`] (`skip_special_tokens`) rather than
+    /// showing raw `<turn|>`-style tokens.
+    special_ids: FxHashSet<u32>,
     pub bos_token: Option<u32>,
     pub eos_token: Option<u32>,
+    /// `tokenizer.ggml.eot_token_id` — the "end of turn" token, which for a
+    /// chat format can be a *different* id from `eos_token` (gemma-4 ends an
+    /// assistant turn with `<turn|>` = 106, while `<eos>` = 1). Generation
+    /// must stop on it too; see [`Tokenizer::stop_token_ids`].
+    pub eot_token: Option<u32>,
     /// `tokenizer.ggml.add_eos_token` — sentence-embedding models (e.g.
     /// `gemma-embedding`) set this to mark a trailing sentence-boundary
     /// token; causal decoder models generally don't. Only consulted by
@@ -165,6 +177,7 @@ enum VocabKind {
 /// llama.cpp's `LLAMA_TOKEN_TYPE_CONTROL`/`_BYTE` (`enum llama_token_type`
 /// in `llama.h`).
 const TOKEN_TYPE_CONTROL: i64 = 3;
+const TOKEN_TYPE_USER_DEFINED: i64 = 4;
 const TOKEN_TYPE_BYTE: i64 = 6;
 
 /// Reusable per-thread working set for [`Tokenizer::bpe_merge_word`]:
@@ -296,6 +309,7 @@ impl Tokenizer {
 
         let bos_token = metadata_u32(gguf, "tokenizer.ggml.bos_token_id");
         let eos_token = metadata_u32(gguf, "tokenizer.ggml.eos_token_id");
+        let eot_token = metadata_u32(gguf, "tokenizer.ggml.eot_token_id");
         let add_eos_token = metadata_u32(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(0) != 0;
         let add_bos_token =
             metadata_u32(gguf, "tokenizer.ggml.add_bos_token").is_none_or(|v| v != 0);
@@ -308,6 +322,15 @@ impl Tokenizer {
             .filter_map(|(id, _)| tokens.get(id).map(|tok| (tok.clone(), id as u32)))
             .collect();
         special_tokens.sort_by_key(|(tok, _)| std::cmp::Reverse(tok.len()));
+
+        // Every structural (CONTROL or USER_DEFINED) token id, for
+        // `skip_special_tokens`-style suppression of streamed output.
+        let special_ids: FxHashSet<u32> = token_types
+            .iter()
+            .enumerate()
+            .filter(|&(_, &ty)| ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED)
+            .map(|(id, _)| id as u32)
+            .collect();
 
         let mut byte_fallback: FxHashMap<u32, u8> = FxHashMap::default();
         if vocab_kind != VocabKind::Gpt2Byte {
@@ -329,8 +352,10 @@ impl Tokenizer {
             char_to_byte,
             split_re: Regex::new(SPLIT_PATTERN).context("building tokenizer split regex")?,
             special_tokens,
+            special_ids,
             bos_token,
             eos_token,
+            eot_token,
             add_eos_token,
             add_bos_token,
             vocab_kind,
@@ -510,6 +535,35 @@ impl Tokenizer {
     /// known, exactly mirroring real llama.cpp's own split between a per-
     /// token `token_to_piece` (no cleanup) and a whole-sequence
     /// `detokenize` (cleanup applied once at the end).
+    /// The token ids whose generation ends a reply: `eos_token`, plus
+    /// `eot_token` (end-of-turn) when the model defines a distinct one. A
+    /// chat format can terminate an assistant turn on a token that is *not*
+    /// `<eos>` — gemma-4 ends on `<turn|>` (`eot_token_id` = 106, distinct
+    /// from `<eos>` = 1) — so stopping on EOS alone lets the model run past
+    /// the end of its reply, spilling raw turn/channel control tokens into
+    /// the output. Callers that must ignore EOS (raw benchmark decode) skip
+    /// this and pass their own empty set instead.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(2);
+        ids.extend(self.eos_token);
+        if let Some(eot) = self.eot_token
+            && Some(eot) != self.eos_token
+        {
+            ids.push(eot);
+        }
+        ids
+    }
+
+    /// Whether `id` is a structural CONTROL / USER_DEFINED token (BOS/EOS/
+    /// pad, and a chat format's turn/channel/tool markers) that should be
+    /// suppressed from human-visible output rather than rendered as its
+    /// literal `<…>` string — the `skip_special_tokens` behavior every chat
+    /// UI wants. [`Tokenizer::decode`] itself stays faithful (renders
+    /// everything); the streaming caller filters via this.
+    pub fn is_special(&self, id: u32) -> bool {
+        self.special_ids.contains(&id)
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {

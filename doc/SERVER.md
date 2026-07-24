@@ -372,11 +372,11 @@ bad file doesn't abort the scan.
 It's stricter than just recognising the architecture *string*: a model whose
 architecture is known can still carry tensors the loader rejects when it goes
 to build the model, and reporting `Yes` for one would promise a load that
-then fails. The case today is a **gemma checkpoint with MoE expert tensors**
-(`ffn_gate_inp` present) — `orangu-server`'s gemma path is dense-only and
-bails on it — which is reported `No (gemma4-moe)` (a refined `<arch>-moe`
-label) rather than a bare `No (gemma4)`, so the column names the real
-blocker. A `No` row is printed *greyed*, not hidden: you can still select
+then fails. No recognised architecture hits that today — gemma MoE
+checkpoints (`gemma-4-26B-A4B`, `ffn_gate_inp` present, fused or separate
+gate/up experts with optional per-expert `.scale` companions) load via the
+gemma routed-expert path, so they report `Yes (gemma4)`. A `No`
+row is printed *greyed*, not hidden: you can still select
 it, but loading fails with a clear "not yet supported" error — the column
 just surfaces that before you commit. The greying is emitted only to a
 terminal; piped or redirected output stays plain text, so the shell
@@ -853,12 +853,13 @@ compatible API above, and only reachable at all when `web` is configured:
 Text-in/text-out GGUF chat, completion, and embedding models, for four
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
-*text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, plus the
-bidirectional-attention, embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE
-(`qwen35moe`), and Qwen3.5 dense (`qwen35` — the same hybrid full-attention/
-gated-DeltaNet layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE
-routing) — using `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q4_K`/`Q5_K`/`Q6_K`
-tensors. Weight matrices and embedding tables are read lazily from the
+*text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
+the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
+top-k experts per MoE layer — plus the bidirectional-attention,
+embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`), and
+Qwen3.5 dense (`qwen35` — the same hybrid full-attention/gated-DeltaNet layer
+shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing) — using
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q4_K`/`Q5_K`/`Q6_K` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. Runs on CPU or,
 via `backend = vulkan`/`cuda`/`opencl`/`rocm`/`auto`

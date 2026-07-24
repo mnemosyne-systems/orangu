@@ -247,7 +247,7 @@ pub async fn completion(
     }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
     let sampling = sampling_from(&req, state.engine.role);
-    let stop_token_ids = state.engine.tokenizer.eos_token.into_iter().collect();
+    let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let mut rx = state
         .engine
         .generate(GenerateRequest {

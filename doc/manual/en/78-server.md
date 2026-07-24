@@ -451,19 +451,15 @@ supported }` per group before handing the slice to `format_groups`. An empty
 slice omits the column entirely, which is what `format_list` (lib-side
 tests) and any caller without the loader pass.
 
-`model_load_support` is deliberately *stricter* than
+`model_load_support` is deliberately allowed to be *stricter* than
 `resolve_arch_family` (whose family tables are the single source of truth
 for the architecture *string*): a model whose architecture is recognised can
 still carry tensors the arch module rejects at build time, so a bare
-`resolve_arch_family` "yes" would promise a load that then fails. The case
-today is a gemma checkpoint with per-layer MoE expert tensors
-(`blk.{i}.ffn_gate_inp.weight`) — `arch::gemma` is dense-only and bails on
-it (the same tensor its own build guard checks for). `model_load_support`
-spots that from the header's tensor directory and reports it unsupported
-under a refined `<arch>-moe` label (`gemma4` → `gemma4-moe`), so the column
-names the actual blocker instead of a bare `No (gemma4)`. The MoE check is
-gemma-specific: `qwen35moe` genuinely supports `ffn_gate_inp`, so the guard
-only fires for the gemma family.
+`resolve_arch_family` "yes" could promise a load that then fails. No
+recognised architecture hits that today, though — gemma MoE checkpoints
+(`gemma-4-26B-A4B`, `blk.{i}.ffn_gate_inp.weight` present) load via
+`arch::gemma`'s routed-expert path and report `Yes (gemma4)`, so
+`model_load_support` just mirrors `resolve_arch_family`.
 
 A `No` row is *greyed* (dim ANSI SGR), not hidden: a user can still pick it
 and will hit the same clear "not yet supported" error `prepare` gives for

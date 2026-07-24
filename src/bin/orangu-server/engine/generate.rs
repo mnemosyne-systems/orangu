@@ -343,13 +343,20 @@ fn run(
             finish_reason = FinishReason::Stop;
             break;
         }
-        let text = tokenizer.decode(&[next]);
         history.push(next);
         generated += 1;
         guard.set_generated_tokens(generated);
-        if tx.send(StreamEvent::Token(text)).is_err() {
-            // Receiver dropped (client disconnected) — stop generating.
-            return Ok(());
+        // Structural tokens (a chat format's turn/channel/tool markers, and
+        // any stray BOS/EOS) still go into `history` so the KV cache and any
+        // continued generation stay correct, but are not rendered to the
+        // user — otherwise a gemma-4 reply spills literal `<turn|>`/
+        // `<channel|>` tokens into the stream (`skip_special_tokens`).
+        if !tokenizer.is_special(next) {
+            let text = tokenizer.decode(&[next]);
+            if tx.send(StreamEvent::Token(text)).is_err() {
+                // Receiver dropped (client disconnected) — stop generating.
+                return Ok(());
+            }
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             let partial = GenerateStats {

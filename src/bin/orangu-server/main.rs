@@ -703,9 +703,10 @@ fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
 /// `groups` (aligned by index) — judged from each group's representative
 /// file's own header (cheap: metadata + tensor directory, no tensor data),
 /// for the `SUPPORTED` column of the `list` table and the model pickers.
-/// `engine::loader::model_load_support` owns the actual judgement — it can
-/// spot header-detectable blockers like MoE gemma, not just the architecture
-/// string — and this only maps its result onto the lib-side `ModelSupport`
+/// `engine::loader::model_load_support` owns the actual judgement — which
+/// can be stricter than the architecture string alone when a header-
+/// detectable blocker exists — and this only maps its result onto the
+/// lib-side `ModelSupport`
 /// that `format_groups` renders. A file that can't even be opened is reported
 /// unsupported with no architecture.
 fn model_support(
