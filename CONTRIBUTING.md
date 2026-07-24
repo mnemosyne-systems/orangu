@@ -24,10 +24,19 @@ All contributions to orangu are licensed under the [GNU General Public License v
 
 ## Reporting an issue
 
-This project uses GitHub issues to manage the issues. Open an issue directly in GitHub.
+This project uses GitHub issues to manage the issues. Open an issue directly in GitHub — preferably with the *Bug report* or *Feature request* template, although a blank issue is fine too.
 
 If you believe you found a bug, and it's likely possible, please indicate a way to reproduce it, what you are seeing and what you would expect to see.
 Don't forget to indicate your orangu version.
+
+Bug reports also ask for the model you are running and your machine specs, since inference behaviour depends on both:
+
+```
+orangu-server list      # the MODEL and QUANT of the GGUF in use
+orangu-server system    # CPU, memory, and GPU inventory
+```
+
+Questions and feature ideas are best raised in the [forum](https://github.com/mnemosyne-systems/orangu/discussions) first.
 
 ## Setup your build environment
 

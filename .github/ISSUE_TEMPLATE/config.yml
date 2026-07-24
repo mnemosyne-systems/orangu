@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/mnemosyne-systems/orangu/discussions
+    about: Ask a question or discuss a feature before opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/mnemosyne-systems/orangu/blob/main/SECURITY.md
+    about: Do not open a public issue — follow the security policy instead.

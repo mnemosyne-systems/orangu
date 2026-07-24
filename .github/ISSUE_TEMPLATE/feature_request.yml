@@ -1,0 +1,71 @@
+name: Feature request
+description: Suggest an enhancement or a new capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Larger features are best discussed first in the
+        [forum](https://github.com/mnemosyne-systems/orangu/discussions) — see
+        [CONTRIBUTING.md](https://github.com/mnemosyne-systems/orangu/blob/main/CONTRIBUTING.md#discuss-a-feature).
+        Once there is agreement on a plan, open an issue here so the pull
+        request has something to reference.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched the [existing issues](https://github.com/mnemosyne-systems/orangu/issues) and this is not a duplicate
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the stack would this land in? Select all that apply.
+      multiple: true
+      options:
+        - orangu (coding environment / TUI)
+        - orangu-server (inference engine)
+        - orangu-coordinator (model proxy)
+        - orangu-bench
+        - Documentation
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do today, and where does orangu get in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should orangu do instead? Sketch the command, flag, config key, or UI if you have one in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, or how you work around this today.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: |
+        Anything else that matters — the model and machine specs
+        (`orangu-server system`) if this is about inference behaviour or
+        performance, links to prior discussion, or references to other tools.
+    validations:
+      required: false
