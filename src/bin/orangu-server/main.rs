@@ -1147,7 +1147,10 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
                 let label = format!("CUDA/{}", backend.device_name);
                 return Ok((Arc::new(backend), label));
             }
-            if let Some(backend) = engine::backend::OpenClBackend::try_init() {
+            // Apple's OpenCL driver segfaults on the first matmul call.
+            if !cfg!(target_vendor = "apple")
+                && let Some(backend) = engine::backend::OpenClBackend::try_init()
+            {
                 let label = format!("OpenCL/{}", backend.device_name);
                 return Ok((Arc::new(backend), label));
             }

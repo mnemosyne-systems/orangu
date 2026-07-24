@@ -439,6 +439,9 @@ Four GPU backends are available, chosen via `backend` in the config (or
   own hardware. ROCm additionally requires building with the `rocm`
   Cargo feature, since it's off by default in a plain build.
 
+On macOS, `backend = auto` automatically detects the machine and runs on
+CPU, no configuration needed.
+
 Naming a `backend` explicitly fails to start rather than silently falling
 back to the CPU, for when GPU inference was asked for specifically.
 Startup prints which backend actually ran the model (see **Quick start**

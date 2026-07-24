@@ -13,6 +13,7 @@ Tejas Singh Bhati <tejassinghbhati077@gmail.com>
 Shashank Singh <shashanksgh3@gmail.com>
 Nishant raj Jha <nishantrajx924@gmail.com>
 Adesh Deshmukh <adeshkd123@gmail.com>
+Bassam Adnan <mailbassam@gmail.com>
 ```
 
 ## Committers
