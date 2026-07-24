@@ -63,6 +63,7 @@ use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
+use rayon::prelude::*;
 
 /// Shared by both layer kinds: routed top-k softmax experts (renormalized)
 /// plus one always-on, separately-gated shared expert.
@@ -720,22 +721,35 @@ impl Qwen35MoeModel {
                 .sum::<f32>()
                 .max(6.103_515_6e-5);
 
+            // Routed experts — the CPU-scalar (per-row dequant + dot)
+            // bottleneck of MoE decode. Evaluate the selected experts across
+            // every core (each is independent; the router and shared expert
+            // already dispatch to the GPU backend), then sum their
+            // contributions back in the fixed selection order. The down
+            // projection's rows fan out too, so decode's handful of experts
+            // still fill all cores.
+            let contribs: Vec<Vec<f32>> = indexed
+                .par_iter()
+                .map(|&(expert, weight)| {
+                    let weight = weight / weight_sum;
+                    let gate: Vec<f32> = (0..ffn.gate_exps.out_dim)
+                        .map(|o| tensor::dot(x_t, &ffn.gate_exps.row(expert, o)))
+                        .collect();
+                    let up: Vec<f32> = (0..ffn.up_exps.out_dim)
+                        .map(|o| tensor::dot(x_t, &ffn.up_exps.row(expert, o)))
+                        .collect();
+                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                    tensor::mul_inplace(&mut h, &up);
+                    (0..ffn.down_exps.out_dim)
+                        .into_par_iter()
+                        .map(|o| weight * tensor::dot(&h, &ffn.down_exps.row(expert, o)))
+                        .collect()
+                })
+                .collect();
             let mut moe_out = vec![0f32; n_embd];
-            for &(expert, weight) in &indexed {
-                let weight = weight / weight_sum;
-                let gate: Vec<f32> = (0..ffn.gate_exps.out_dim)
-                    .map(|o| tensor::dot(x_t, &ffn.gate_exps.row(expert, o)))
-                    .collect();
-                let up: Vec<f32> = (0..ffn.up_exps.out_dim)
-                    .map(|o| tensor::dot(x_t, &ffn.up_exps.row(expert, o)))
-                    .collect();
-                let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                tensor::mul_inplace(&mut h, &up);
-                let down: Vec<f32> = (0..ffn.down_exps.out_dim)
-                    .map(|o| tensor::dot(&h, &ffn.down_exps.row(expert, o)))
-                    .collect();
-                for (o, d) in moe_out.iter_mut().zip(down.iter()) {
-                    *o += weight * d;
+            for contrib in &contribs {
+                for (o, d) in moe_out.iter_mut().zip(contrib.iter()) {
+                    *o += d;
                 }
             }
 

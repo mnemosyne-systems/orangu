@@ -574,5 +574,25 @@ fn render_prompt(
         .and_then(|id| state.engine.tokenizer.token_text(id))
         .unwrap_or("");
 
-    ChatTemplate::new(template_source.to_string()).render(&messages, true, bos, eos, None)
+    // Reasoning is governed by the server's *role* (a CLI choice on
+    // `orangu-server`), not by the web console — so this mirrors
+    // `http::openai::chat_completions` exactly: pass the role's
+    // `enable_thinking` to the template, and for a reasoning-suppressing
+    // role (`Role::Review`) also pre-fill an empty, already-closed think
+    // block for templates that don't honor the flag. A reasoning-enabled
+    // role still thinks; the raw `<think>`/`</think>` framing tokens never
+    // reach the stream regardless (the generate loop drops special tokens),
+    // so a suppressing role gives a direct answer and a thinking role shows
+    // its reasoning prose without the literal tags.
+    let mut prompt = ChatTemplate::new(template_source.to_string()).render(
+        &messages,
+        true,
+        bos,
+        eos,
+        state.engine.role.enable_thinking(),
+    )?;
+    if state.engine.role.suppresses_reasoning() {
+        prompt.push_str(crate::http::openai::EMPTY_THINK_BLOCK);
+    }
+    Ok(prompt)
 }
