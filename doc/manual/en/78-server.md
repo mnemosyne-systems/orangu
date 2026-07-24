@@ -435,6 +435,48 @@ the shell completion scripts (above), which only ever read `list`'s first
 two whitespace-separated columns, stay unaffected by a row growing a
 trailing marker.
 
+### The `SUPPORTED` column
+
+`list` prints a `SUPPORTED` column reading `Yes (<arch>)` or `No (<arch>)`
+per row — so a user sees which models this build can actually load *before*
+selecting one, rather than only discovering it can't once it's loaded.
+`model_spec::format_groups` renders the column (and `format_list`'s
+signature carries the `support`/`colorize` parameters through), but the lib
+deliberately doesn't decide *what* is supported: that judgement lives in
+`orangu-server`, in `engine::loader::model_load_support`. So `main.rs`'s
+`model_support` opens each group's representative file (header only — no
+tensor data, the same cheap read `show` does), calls `model_load_support`,
+and stores the result as one `model_spec::ModelSupport { architecture,
+supported }` per group before handing the slice to `format_groups`. An empty
+slice omits the column entirely, which is what `format_list` (lib-side
+tests) and any caller without the loader pass.
+
+`model_load_support` is deliberately *stricter* than
+`resolve_arch_family` (whose family tables are the single source of truth
+for the architecture *string*): a model whose architecture is recognised can
+still carry tensors the arch module rejects at build time, so a bare
+`resolve_arch_family` "yes" would promise a load that then fails. The case
+today is a gemma checkpoint with per-layer MoE expert tensors
+(`blk.{i}.ffn_gate_inp.weight`) — `arch::gemma` is dense-only and bails on
+it (the same tensor its own build guard checks for). `model_load_support`
+spots that from the header's tensor directory and reports it unsupported
+under a refined `<arch>-moe` label (`gemma4` → `gemma4-moe`), so the column
+names the actual blocker instead of a bare `No (gemma4)`. The MoE check is
+gemma-specific: `qwen35moe` genuinely supports `ffn_gate_inp`, so the guard
+only fires for the gemma family.
+
+A `No` row is *greyed* (dim ANSI SGR), not hidden: a user can still pick it
+and will hit the same clear "not yet supported" error `prepare` gives for
+any other unsupported model — the greying just deprioritizes it visually.
+Crucially, the escapes are only emitted when `format_groups`' `colorize`
+flag is set, which every call site derives from
+`std::io::stdout().is_terminal()`. Piped or redirected output — including
+what the shell completion scripts parse with `awk '{print $1; print $2}'` —
+stays escape-free, so an ANSI prefix can never corrupt the `NR`/`MODEL`
+columns those scripts read. This is the same renderer the interactive
+serve-time picker (`select_model_interactively`) and the `show`/`delete`
+pickers use, so all four tables carry the column consistently.
+
 ### CPU/GPU detection (`orangu::hardware`)
 
 CPU statistics (brand, vendor, architecture, physical/logical core counts,

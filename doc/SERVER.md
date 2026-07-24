@@ -49,9 +49,9 @@ orangu-server
 ```
 
 ```
-NR  MODEL                                    QUANT   SIZE
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M    Q5_0    468.64 MiB
- 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M        Q5_K    2.89 GiB
+NR  MODEL                                   QUANT  SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+ 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M      Q5_K   2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
 role [all]: 
@@ -304,10 +304,11 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                                QUANT  SIZE
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M     Q4_K   17.28 GiB
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M   Q4_K   270.14 GiB
- 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                  Q4_K   7.14 GiB
+NR  MODEL                                               QUANT  SIZE        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M    Q4_K   17.28 GiB   Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M  Q4_K   270.14 GiB  Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                 Q4_K   7.14 GiB    Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF:Q4_K_M                         Q4_K   433.83 GiB  No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order (alphabetically by `MODEL`), starting
@@ -365,6 +366,22 @@ with `-hf`. A file that fails to parse (truncated download, not actually a
 GGUF file) is still listed, with its error in place of `QUANT`/`SIZE` — one
 bad file doesn't abort the scan.
 
+`SUPPORTED` says whether this build can actually load the model —
+`Yes (<arch>)` or `No (<arch>)`, judged from the file's header alone
+(`general.architecture` plus the tensor directory — cheap: no tensor data).
+It's stricter than just recognising the architecture *string*: a model whose
+architecture is known can still carry tensors the loader rejects when it goes
+to build the model, and reporting `Yes` for one would promise a load that
+then fails. The case today is a **gemma checkpoint with MoE expert tensors**
+(`ffn_gate_inp` present) — `orangu-server`'s gemma path is dense-only and
+bails on it — which is reported `No (gemma4-moe)` (a refined `<arch>-moe`
+label) rather than a bare `No (gemma4)`, so the column names the real
+blocker. A `No` row is printed *greyed*, not hidden: you can still select
+it, but loading fails with a clear "not yet supported" error — the column
+just surfaces that before you commit. The greying is emitted only to a
+terminal; piped or redirected output stays plain text, so the shell
+completions that read `list` by column (below) are unaffected by it.
+
 For every row whose `MODEL` names a Hugging Face repo, `list` also checks
 that repo's commit — the `snapshots/<commit>/` directory it's cached
 under — against the Hub's current `main` commit (the same `GET
@@ -373,9 +390,9 @@ in parallel across every distinct repo on the row list. A row whose local
 commit is behind gets a trailing `(Refresh)` marker, after `SIZE`:
 
 ```
-NR  MODEL                                                QUANT  SIZE
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M     Q4_K   17.28 GiB  (Refresh)
- 2  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                  Q4_K   7.14 GiB
+NR  MODEL                                             QUANT  SIZE       SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M  Q4_K   17.28 GiB  Yes (qwen3)  (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M               Q4_K   7.14 GiB   Yes (gemma4)
 ```
 
 Re-running `orangu-server download` on that repo fetches the newer commit.
@@ -688,7 +705,7 @@ including syntax-highlighted fenced code blocks — reusing the same
 `markdown`/`syntect` crates `orangu`'s own terminal UI uses for its
 rendering, just pointed at HTML instead of ANSI.
 
-While a reply is streaming in, the **Send** button becomes a **Stop** (✕)
+While a reply is streaming in, the **Send** button becomes a **Stop** (×)
 button; clicking it cancels the request. This closes the connection the
 reply was streaming over, which the engine notices the next time it goes
 to send a token and stops generating right there. Whatever text had

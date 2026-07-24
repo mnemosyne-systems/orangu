@@ -51,9 +51,9 @@ orangu-server
 ```
 
 ```
-NR  MODEL                                    QUANT   SIZE
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M    Q5_0    468.64 MiB
- 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M        Q5_K    2.89 GiB
+NR  MODEL                                   QUANT  SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+ 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M      Q5_K   2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
 role [all]: 
@@ -194,10 +194,11 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                                QUANT  SIZE
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M     Q4_K   17.28 GiB
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M   Q4_K   270.14 GiB
- 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                  Q4_K   7.14 GiB
+NR  MODEL                                               QUANT  SIZE        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M    Q4_K   17.28 GiB   Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M  Q4_K   270.14 GiB  Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                 Q4_K   7.14 GiB    Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF:Q4_K_M                         Q4_K   433.83 GiB  No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order, starting from 1 — a shorthand for
@@ -206,6 +207,15 @@ downloaded by `-hf`/`--hf-repo`, `MODEL` is exactly the string to hand back
 to `-hf`: `<user>/<model>[:quant]`. A multimodal projector ("mmproj")
 sidecar file doesn't count as its own model — it's meant to be loaded
 *alongside* a base model, not to stand in as one.
+
+`SUPPORTED` says whether this build can actually load the model's
+architecture — `Yes (<arch>)` or `No (<arch>)`, where `<arch>` is the GGUF
+`general.architecture` (e.g. `qwen3`, `gemma4`, `glm-dsa`). A `No` row (like
+the `glm-dsa` one above) is printed greyed rather than hidden: you can still
+select it, but loading it will fail with a clear "not yet supported" error,
+so the column tells you that up front. The greying is only emitted to a
+terminal — piped or redirected output stays plain text, so the shell
+completion scripts that read `list` by column keep working.
 
 **`show`** prints a GGUF file's full metadata — every key/value pair in the
 file, not just the well-known keys. Omit the argument entirely to pick one
@@ -449,7 +459,7 @@ API's own `port`.
 Each assistant reply is rendered from markdown to HTML server-side,
 including syntax-highlighted fenced code blocks.
 
-While a reply is streaming in, the **Send** button becomes a **Stop** (✕)
+While a reply is streaming in, the **Send** button becomes a **Stop** (×)
 button; clicking it cancels the request. Whatever text had already
 streamed in stays on screen, marked as stopped, but since the turn never
 reached completion it isn't saved — a stopped reply won't reappear if you

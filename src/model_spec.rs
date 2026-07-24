@@ -549,15 +549,50 @@ fn hf_tag_from_label(label: &str) -> Option<String> {
     .then(|| candidate.to_uppercase())
 }
 
+/// Whether this build can load a model's architecture, plus the
+/// architecture id it was read from — one entry per [`ModelGroup`], aligned
+/// by index, for the `SUPPORTED` column [`format_groups`] renders. It's
+/// populated by `orangu-server` (which owns the architecture resolver), not
+/// here, so the lib stays free of the engine's arch tables.
+#[derive(Debug, Clone, Default)]
+pub struct ModelSupport {
+    /// `general.architecture` read from the group's representative file, or
+    /// `None` if that file couldn't be opened or lacks the key.
+    pub architecture: Option<String>,
+    /// Whether this build recognises (and can load) that architecture.
+    pub supported: bool,
+}
+
+impl ModelSupport {
+    /// The `SUPPORTED` cell text, e.g. `Yes (llama)` or `No (glm-dsa)`.
+    fn cell(&self) -> String {
+        let arch = self.architecture.as_deref().unwrap_or("unknown");
+        if self.supported {
+            format!("Yes ({arch})")
+        } else {
+            format!("No ({arch})")
+        }
+    }
+}
+
+/// Dim/grey ANSI SGR codes, used to visually deprioritize a row for a model
+/// whose architecture this build can't load — visible but greyed, not
+/// hidden. Only emitted when the caller asks to colorize (a terminal), so
+/// the plain `list` output that the shell-completion scripts parse by column
+/// stays escape-free.
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_RESET: &str = "\x1b[0m";
+
 /// The `list` table for every `.gguf` model found, with no Hugging Face
-/// update check — the plain, fully offline rendering used by callers (the
-/// `delete` picker, tests) that don't need one. `list` itself calls
-/// [`format_groups`] directly so it can pass `latest_commits`.
+/// update check and no `SUPPORTED` column — the plain, fully offline
+/// rendering used by callers (tests) that don't need either. `list` itself
+/// calls [`format_groups`] directly so it can pass `latest_commits` and the
+/// per-group [`ModelSupport`].
 pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
     if models.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
-    format_groups(&group_models(models), base, &HashMap::new())
+    format_groups(&group_models(models), base, &HashMap::new(), &[], false)
 }
 
 /// Renders the `list` table from already-grouped models. `latest_commits`
@@ -569,14 +604,25 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
 /// current). The marker sits after `SIZE` rather than inside `MODEL` so a
 /// consumer that reads `list`'s output by column position (e.g. the shell
 /// completion scripts, which only read `NR`/`MODEL`) is unaffected.
+///
+/// `support`, when non-empty, adds a trailing `SUPPORTED` column reading
+/// `Yes (<arch>)`/`No (<arch>)` per row (aligned to `groups` by index — see
+/// [`ModelSupport`]); an empty slice omits the column entirely. When
+/// `colorize` is set, rows for architectures this build can't load are
+/// greyed. Callers pass `colorize` only when writing to a terminal, so piped
+/// output (what the completion scripts parse) never carries ANSI escapes.
 pub fn format_groups(
     groups: &[ModelGroup],
     base: &Path,
     latest_commits: &HashMap<String, String>,
+    support: &[ModelSupport],
+    colorize: bool,
 ) -> String {
     if groups.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
+
+    let show_support = !support.is_empty();
 
     let nr_width = groups.len().to_string().len().max("NR".len());
     let model_width = groups
@@ -591,12 +637,33 @@ pub fn format_groups(
         .max()
         .unwrap_or(0)
         .max("QUANT".len());
+    // SIZE is the last column unless a SUPPORTED column follows it, in which
+    // case it needs a fixed width so SUPPORTED lines up. Error rows carry no
+    // size, so they don't factor into the width.
+    let size_width = if show_support {
+        groups
+            .iter()
+            .filter(|g| g.errors.is_empty())
+            .map(|g| format_bytes(g.size_bytes).len())
+            .max()
+            .unwrap_or(0)
+            .max("SIZE".len())
+    } else {
+        0
+    };
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  SIZE\n",
-        "NR", "MODEL", "QUANT"
-    ));
+    if show_support {
+        out.push_str(&format!(
+            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  SUPPORTED\n",
+            "NR", "MODEL", "QUANT", "SIZE"
+        ));
+    } else {
+        out.push_str(&format!(
+            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  SIZE\n",
+            "NR", "MODEL", "QUANT"
+        ));
+    }
     for (index, group) in groups.iter().enumerate() {
         let nr = index + 1;
         if !group.errors.is_empty() {
@@ -612,13 +679,30 @@ pub fn format_groups(
                 .get(repo)
                 .is_some_and(|latest| Some(latest.as_str()) != group.local_commit.as_deref())
         });
-        out.push_str(&format!(
-            "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {}{}\n",
-            group.label,
-            group.quantization.as_deref().unwrap_or("-"),
-            format_bytes(group.size_bytes),
-            if refresh { "  (Refresh)" } else { "" }
-        ));
+        let refresh_suffix = if refresh { "  (Refresh)" } else { "" };
+        let row = if show_support {
+            format!(
+                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {}{refresh_suffix}",
+                group.label,
+                group.quantization.as_deref().unwrap_or("-"),
+                format_bytes(group.size_bytes),
+                support[index].cell(),
+            )
+        } else {
+            format!(
+                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {}{refresh_suffix}",
+                group.label,
+                group.quantization.as_deref().unwrap_or("-"),
+                format_bytes(group.size_bytes),
+            )
+        };
+        let unsupported = show_support && !support[index].supported;
+        if unsupported && colorize {
+            out.push_str(&format!("{ANSI_DIM}{row}{ANSI_RESET}\n"));
+        } else {
+            out.push_str(&row);
+            out.push('\n');
+        }
     }
     out
 }
@@ -952,7 +1036,7 @@ mod tests {
             "rev2".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
 
         let mut lines = output.lines().skip(1); // header
         assert!(lines.next().unwrap().ends_with("(Refresh)"));
@@ -980,7 +1064,7 @@ mod tests {
             "rev1".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
 
         assert!(!output.lines().nth(1).unwrap().contains("(Refresh)"));
     }
@@ -1019,7 +1103,7 @@ mod tests {
             "rev2".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
 
         let mut lines = output.lines().skip(1); // header
         let q4 = lines.next().unwrap(); // Q4_K_M, sorted before Q8_0

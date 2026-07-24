@@ -150,6 +150,43 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     );
 }
 
+/// The architecture label and whether this build can actually load a model,
+/// judged from its GGUF header alone (metadata + tensor directory — no
+/// tensor data), for `list`'s `SUPPORTED` column and the interactive
+/// pickers. This is stricter than [`resolve_arch_family`], which only knows
+/// the architecture *string*: a model whose architecture is recognised can
+/// still carry tensors this build rejects when it goes to build the model,
+/// so a bare `resolve_arch_family` "yes" would promise a load that then
+/// fails. The one such case today is a gemma checkpoint carrying per-layer
+/// MoE expert tensors (`ffn_gate_inp`) — [`super::arch::gemma`] is
+/// dense-only and bails on it at build time — which is reported unsupported
+/// under a refined `<arch>-moe` label (e.g. `gemma4` → `gemma4-moe`) so the
+/// column names the actual blocker rather than the bare architecture.
+///
+/// Returns `(architecture, supported)`: `architecture` is `None` only when
+/// the file has no `general.architecture` at all.
+pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, bool) {
+    let architecture = metadata_string(gguf, "general.architecture");
+    let Some(arch) = architecture.as_deref() else {
+        return (None, false);
+    };
+    let Ok(family) = resolve_arch_family(arch) else {
+        return (architecture, false);
+    };
+    if matches!(family, ArchFamily::Gemma) && has_moe_expert_tensors(gguf) {
+        return (Some(format!("{arch}-moe")), false);
+    }
+    (architecture, true)
+}
+
+/// Whether any layer carries a routed-MoE gate (`blk.{i}.ffn_gate_inp.weight`)
+/// — the same tensor `arch::gemma`'s per-layer build guard checks for.
+fn has_moe_expert_tensors(gguf: &GgufFile) -> bool {
+    gguf.tensors
+        .iter()
+        .any(|t| t.name.starts_with("blk.") && t.name.ends_with(".ffn_gate_inp.weight"))
+}
+
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
 #[derive(Debug, Clone)]
 struct TensorLocation {
@@ -631,5 +668,64 @@ mod tests {
     fn resolve_arch_family_rejects_unknown_architectures() {
         let err = resolve_arch_family("bert").unwrap_err();
         assert!(err.to_string().contains("not yet supported"), "{err}");
+    }
+
+    /// A header-only `GgufFile` (no tensor data) carrying one architecture
+    /// key and the given tensor names — enough to exercise `model_load_support`.
+    fn header_only(architecture: &str, tensor_names: &[&str]) -> GgufFile {
+        GgufFile {
+            version: 3,
+            metadata: vec![(
+                "general.architecture".to_string(),
+                GgufValue::String(architecture.to_string()),
+            )],
+            tensors: tensor_names
+                .iter()
+                .map(|name| orangu::gguf::TensorInfo {
+                    name: name.to_string(),
+                    dims: vec![1],
+                    ggml_type: 0,
+                    offset: 0,
+                })
+                .collect(),
+            alignment: 32,
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn model_load_support_accepts_a_dense_gemma_model() {
+        let (arch, supported) =
+            model_load_support(&header_only("gemma4", &["blk.0.ffn_gate.weight"]));
+        assert_eq!(arch.as_deref(), Some("gemma4"));
+        assert!(supported);
+    }
+
+    #[test]
+    fn model_load_support_rejects_a_moe_gemma_model_as_gemma4_moe() {
+        // A gemma checkpoint with per-layer MoE expert tensors — recognised
+        // architecture, but `arch::gemma` bails on `ffn_gate_inp` at build
+        // time, so it must be reported unsupported up front, under `-moe`.
+        let (arch, supported) =
+            model_load_support(&header_only("gemma4", &["blk.0.ffn_gate_inp.weight"]));
+        assert_eq!(arch.as_deref(), Some("gemma4-moe"));
+        assert!(!supported);
+    }
+
+    #[test]
+    fn model_load_support_does_not_moe_flag_a_non_gemma_arch() {
+        // `qwen35moe` genuinely supports `ffn_gate_inp`, so the MoE guard
+        // must not fire for it — only gemma is dense-only here.
+        let (arch, supported) =
+            model_load_support(&header_only("qwen35moe", &["blk.0.ffn_gate_inp.weight"]));
+        assert_eq!(arch.as_deref(), Some("qwen35moe"));
+        assert!(supported);
+    }
+
+    #[test]
+    fn model_load_support_reports_an_unknown_arch_unsupported() {
+        let (arch, supported) = model_load_support(&header_only("glm-dsa", &[]));
+        assert_eq!(arch.as_deref(), Some("glm-dsa"));
+        assert!(!supported);
     }
 }

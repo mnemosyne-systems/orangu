@@ -57,7 +57,7 @@ use engine::scheduler::SlotPool;
 use engine::tokenizer::Tokenizer;
 use orangu::gguf::{GgufFile, GgufValue, ggml_type_name};
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -699,6 +699,33 @@ fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
     })
 }
 
+/// The architecture, and whether this build can load it, for each group in
+/// `groups` (aligned by index) — judged from each group's representative
+/// file's own header (cheap: metadata + tensor directory, no tensor data),
+/// for the `SUPPORTED` column of the `list` table and the model pickers.
+/// `engine::loader::model_load_support` owns the actual judgement — it can
+/// spot header-detectable blockers like MoE gemma, not just the architecture
+/// string — and this only maps its result onto the lib-side `ModelSupport`
+/// that `format_groups` renders. A file that can't even be opened is reported
+/// unsupported with no architecture.
+fn model_support(
+    groups: &[orangu::model_spec::ModelGroup],
+) -> Vec<orangu::model_spec::ModelSupport> {
+    groups
+        .iter()
+        .map(|group| {
+            let (architecture, supported) = GgufFile::open(&group.representative_path)
+                .ok()
+                .map(|gguf| engine::loader::model_load_support(&gguf))
+                .unwrap_or((None, false));
+            orangu::model_spec::ModelSupport {
+                architecture,
+                supported,
+            }
+        })
+        .collect()
+}
+
 /// Runs one of the GGUF-inventory subcommands (`system`/`suggest`/`list`/
 /// `show`/`download`) to completion and returns — none of these load a
 /// model or bind a listener, so there's no `tokio` runtime involved, unlike
@@ -733,9 +760,16 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
                 .into_iter()
                 .collect();
             let latest_commits = orangu::model_download::latest_commits(&repos);
+            let support = model_support(&groups);
             print!(
                 "{}",
-                orangu::model_spec::format_groups(&groups, &conf.models, &latest_commits)
+                orangu::model_spec::format_groups(
+                    &groups,
+                    &conf.models,
+                    &latest_commits,
+                    &support,
+                    std::io::stdout().is_terminal(),
+                )
             );
             Ok(())
         }
@@ -807,7 +841,13 @@ fn select_model_for_show(models_dir: &Path) -> Result<PathBuf> {
     }
     print!(
         "{}",
-        orangu::model_spec::format_groups(&groups, models_dir, &Default::default())
+        orangu::model_spec::format_groups(
+            &groups,
+            models_dir,
+            &Default::default(),
+            &model_support(&groups),
+            std::io::stdout().is_terminal(),
+        )
     );
 
     print!("\nSelect a model (NR): ");
@@ -841,7 +881,13 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
     }
     print!(
         "{}",
-        orangu::model_spec::format_groups(&groups, models_dir, &Default::default())
+        orangu::model_spec::format_groups(
+            &groups,
+            models_dir,
+            &Default::default(),
+            &model_support(&groups),
+            std::io::stdout().is_terminal(),
+        )
     );
 
     print!("\nSelect a model to delete (NR): ");
@@ -927,17 +973,13 @@ fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {
     out
 }
 
-/// Dim/grey ANSI SGR codes, used to mark a model whose architecture this
-/// build can't load — visible but visually deprioritized, not hidden: a
-/// user can still pick one (they'll hit the same clear "not yet supported"
-/// error `prepare` would give for any other unsupported model).
-const ANSI_DIM: &str = "\x1b[2m";
-const ANSI_RESET: &str = "\x1b[0m";
-
-/// Lists every `.gguf` model under `models_dir` (the same columns
-/// `orangu-server list` prints, plus which ones this build can actually
-/// load) and prompts for an `NR`, for `orangu-server` invoked with no model
-/// argument. Returns the chosen model's file path and its display label.
+/// Lists every `.gguf` model under `models_dir` (the same table
+/// `orangu-server list` prints, `SUPPORTED` column and all — models this
+/// build can't load are shown greyed rather than hidden: a user can still
+/// pick one and will hit the same clear "not yet supported" error `prepare`
+/// gives for any other unsupported model) and prompts for an `NR`, for
+/// `orangu-server` invoked with no model argument. Returns the chosen
+/// model's file path and its display label.
 fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
@@ -949,66 +991,16 @@ fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
         );
     }
 
-    // Each group's architecture, read from its representative file's own
-    // header (cheap — metadata only, no tensor data) so unsupported models
-    // can be dimmed rather than only failing once fully selected and loaded.
-    let architectures: Vec<Option<String>> = groups
-        .iter()
-        .map(|group| {
-            GgufFile::open(&group.representative_path)
-                .ok()
-                .and_then(|gguf| metadata_string(&gguf, "general.architecture"))
-        })
-        .collect();
-    let supported: Vec<bool> = architectures
-        .iter()
-        .map(|arch| {
-            arch.as_deref()
-                .is_some_and(|arch| engine::loader::resolve_arch_family(arch).is_ok())
-        })
-        .collect();
-
-    let nr_width = groups.len().to_string().len().max("NR".len());
-    let model_width = groups
-        .iter()
-        .map(|g| g.label.len())
-        .max()
-        .unwrap_or(0)
-        .max("MODEL".len());
-    let quant_width = groups
-        .iter()
-        .map(|g| g.quantization.as_deref().unwrap_or("-").len())
-        .max()
-        .unwrap_or(0)
-        .max("QUANT".len());
-
-    println!(
-        "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  SIZE",
-        "NR", "MODEL", "QUANT"
+    print!(
+        "{}",
+        orangu::model_spec::format_groups(
+            &groups,
+            models_dir,
+            &Default::default(),
+            &model_support(&groups),
+            std::io::stdout().is_terminal(),
+        )
     );
-    for (index, group) in groups.iter().enumerate() {
-        let nr = index + 1;
-        if !group.errors.is_empty() {
-            println!(
-                "{nr:>nr_width$}  {:<model_width$}  error: {}",
-                group.label,
-                group.errors.join("; ")
-            );
-            continue;
-        }
-        let row = format!(
-            "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {}",
-            group.label,
-            group.quantization.as_deref().unwrap_or("-"),
-            orangu::format::format_bytes(group.size_bytes),
-        );
-        if supported[index] {
-            println!("{row}");
-        } else {
-            let arch = architectures[index].as_deref().unwrap_or("unknown");
-            println!("{ANSI_DIM}{row}  (unsupported: architecture '{arch}'){ANSI_RESET}");
-        }
-    }
 
     print!("\nSelect a model (NR): ");
     std::io::stdout().flush().ok();
