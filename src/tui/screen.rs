@@ -307,7 +307,6 @@ fn tab_gutter_cell<'a>(
 pub fn main_screen_layout(
     actual_width: usize,
     actual_height: usize,
-    prompt_branch: Option<&str>,
     input: &str,
     tab_bar: Option<WorkspaceTabsView>,
     tab_statuses: &[TabStatus],
@@ -345,14 +344,20 @@ pub fn main_screen_layout(
         _ => (None, area),
     };
 
-    let prompt_prefix = prompt_prefix(prompt_branch);
-    let input_lines = wrapped_input_lines(input, actual_width.max(1), &prompt_prefix);
+    let prompt_prefix = prompt_prefix();
+    let input_lines =
+        wrapped_input_lines(input, input_wrap_width(actual_width.max(1)), &prompt_prefix);
     let prompt_frame_height = (input_lines.len() + 3) as u16;
+    // The classic frame packs the screen edge to edge — banner at the top, the
+    // prompt separator directly under the output; the modern frame breathes
+    // with a blank row above the content and above the input box.
+    let classic = crate::tui::Theme::chrome().is_classic();
+    let gap_rows = u16::from(!classic);
     let main_chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
             ratatui::layout::Constraint::Min(0),
-            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(gap_rows),
             ratatui::layout::Constraint::Length(prompt_frame_height),
         ])
         .split(main_area);
@@ -362,7 +367,7 @@ pub fn main_screen_layout(
     let above_prompt_chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(gap_rows),
             ratatui::layout::Constraint::Min(0),
         ])
         .split(above_prompt_area);
@@ -396,8 +401,22 @@ pub fn main_screen_layout(
         _ => (None, above_prompt_content_area),
     };
 
-    let is_landing_mode = !has_output_content && input.is_empty();
-    let (header_area, output_area) = if is_landing_mode {
+    let is_landing_mode = !classic && !has_output_content && input.is_empty();
+    let (header_area, output_area) = if classic {
+        // The banner is always on screen, pinned to the top with a single blank
+        // row separating it from a full-width output window.
+        let banner_rows = (crate::tui::widgets::CLASSIC_BANNER_HEIGHT as u16)
+            .min(central_area.height.saturating_sub(1));
+        let chunks = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                ratatui::layout::Constraint::Length(banner_rows),
+                ratatui::layout::Constraint::Length(u16::from(banner_rows > 0)),
+                ratatui::layout::Constraint::Min(0),
+            ])
+            .split(central_area);
+        (chunks[0], chunks[2])
+    } else if is_landing_mode {
         let v_chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -430,11 +449,17 @@ pub fn main_screen_layout(
         (ratatui::layout::Rect::default(), output_area)
     };
 
-    let padded_prompt_area = ratatui::layout::Rect {
-        x: prompt_area.x + 2,
-        y: prompt_area.y,
-        width: prompt_area.width.saturating_sub(4),
-        height: prompt_area.height,
+    // The classic prompt frame runs edge to edge; the modern one is inset to
+    // line its rounded box up with the output window.
+    let padded_prompt_area = if classic {
+        prompt_area
+    } else {
+        ratatui::layout::Rect {
+            x: prompt_area.x + 2,
+            y: prompt_area.y,
+            width: prompt_area.width.saturating_sub(4),
+            height: prompt_area.height,
+        }
     };
 
     MainScreenLayout {
@@ -462,11 +487,10 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
     );
     let actual_width = args.actual_width.max(1);
     let placement = args.tab_bar.map(|view| view.placement);
-    let prompt_prefix = prompt_prefix(args.prompt_branch);
+    let prompt_prefix = prompt_prefix();
     let layout = main_screen_layout(
         actual_width,
         args.actual_height,
-        args.prompt_branch,
         args.input,
         args.tab_bar,
         args.tab_statuses,
@@ -646,17 +670,19 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         );
     }
 
-    // Set cursor position using Ratatui
+    // Set cursor position using Ratatui. Both frames start the input on the
+    // row below their top edge (the classic separator, the modern border); only
+    // the modern frame costs a column for its left border.
     let (cr_offset, cc_offset) = cursor_position(
         args.input,
         args.cursor,
-        layout.padded_prompt_area.width.saturating_sub(4) as usize,
+        input_wrap_width(layout.padded_prompt_area.width as usize),
         &prompt_prefix,
     );
     let pf_input_start = layout.padded_prompt_area.y + 1;
     let pf_prompt_width = prompt_prefix.chars().count();
     let cr = pf_input_start as usize + cr_offset;
-    let cc = (1 + pf_prompt_width + cc_offset).max(1);
+    let cc = input_left_inset() + pf_prompt_width + cc_offset;
     frame.set_cursor_position((layout.padded_prompt_area.x + cc as u16, cr as u16));
 }
 
@@ -672,18 +698,17 @@ pub fn output_view_rows(
     actual_width: usize,
     actual_height: usize,
 ) -> usize {
-    let _ = (version, current_model, endpoint, workspace, status);
-    main_screen_layout(
-        actual_width,
-        actual_height,
+    let _ = (
+        version,
+        current_model,
+        endpoint,
+        workspace,
+        status,
         prompt_branch,
-        input,
-        None,
-        &[],
-        true,
-    )
-    .output_area
-    .height as usize
+    );
+    main_screen_layout(actual_width, actual_height, input, None, &[], true)
+        .output_area
+        .height as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,11 +726,17 @@ pub fn output_view_width(
     tab_statuses: &[TabStatus],
     has_output_content: bool,
 ) -> usize {
-    let _ = (version, current_model, endpoint, workspace, status);
+    let _ = (
+        version,
+        current_model,
+        endpoint,
+        workspace,
+        status,
+        prompt_branch,
+    );
     main_screen_layout(
         actual_width,
         actual_height,
-        prompt_branch,
         input,
         tab_bar,
         tab_statuses,
@@ -962,6 +993,20 @@ pub fn render_transcript_line_multi(
             language,
             ansi_lines,
         } => {
+            // The classic frame prints highlighted code straight into the
+            // output window, with no box and no forced background.
+            if theme.chrome.is_classic() {
+                return ansi_lines
+                    .iter()
+                    .map(|ansi_line| {
+                        ansi_line
+                            .into_text()
+                            .map(|text| text.lines.into_iter().next().unwrap_or_default())
+                            .unwrap_or_else(|_| Line::from(ansi_line.clone()))
+                    })
+                    .collect();
+            }
+
             let mut lines = Vec::new();
 
             // First, find the maximum line width in the code block
@@ -1078,6 +1123,17 @@ pub fn render_transcript_line_multi(
             lines
         }
         TranscriptLine::UserInput(content) => {
+            // The classic frame echoes the submitted prompt as a single
+            // full-width band, verbatim including its `> ` prefix.
+            if theme.chrome.is_classic() {
+                let clipped = crate::tui::text::clip_line(content, 0, width);
+                let padding = width.saturating_sub(crate::tui::text::visible_line_width(&clipped));
+                return vec![Line::from(vec![
+                    Span::styled(clipped, theme.user_input),
+                    Span::styled(" ".repeat(padding), theme.user_input),
+                ])];
+            }
+
             let mut lines = Vec::new();
             let content = content.trim_start_matches("> ");
 
@@ -1151,9 +1207,33 @@ pub(crate) fn cursor_position(
     (prefix_chars / input_width, prefix_chars % input_width)
 }
 
-/// The input-window prompt prefix: always `❯ ` (branch name is shown in top bar).
-pub fn prompt_prefix(_prompt_branch: Option<&str>) -> String {
-    "❯ ".to_string()
+/// The input-window prompt marker, the same in every theme. The branch is no
+/// longer part of it — that lives on the left of the status line — so this is
+/// a bare `> ` in front of the cursor.
+pub fn prompt_prefix() -> String {
+    "> ".to_string()
+}
+
+/// Columns between the left edge of the prompt frame and the first input
+/// character: none on the classic frame, which runs edge to edge, and two on
+/// the modern one for its rounded border and the padding inside it.
+pub fn input_left_inset() -> usize {
+    if crate::tui::Theme::chrome().is_classic() {
+        0
+    } else {
+        2
+    }
+}
+
+/// Columns the input window has for wrapping inside `width`: the classic
+/// frame spans the full width, while the modern frame loses the rounded
+/// border and its one-column padding on each side.
+pub fn input_wrap_width(width: usize) -> usize {
+    if crate::tui::Theme::chrome().is_classic() {
+        width
+    } else {
+        width.saturating_sub(4)
+    }
 }
 
 /// Center `text` (which may carry ANSI color codes — its width is measured
@@ -1261,6 +1341,11 @@ fn render_dropdown_popup(
 
     let top_row = bottom_row.saturating_sub(display_candidates.len());
     let max_width = actual_width.saturating_sub(x_offset).min(100);
+    // The classic popup sits flush against the left edge with no highlight
+    // band behind the selected row; the modern one is inset by a space on each
+    // side and shades the selection.
+    let classic = crate::tui::Theme::chrome().is_classic();
+    let inset = usize::from(!classic);
 
     let mut lines = Vec::new();
 
@@ -1272,10 +1357,13 @@ fn render_dropdown_popup(
             cmd_padded.push_str(&" ".repeat(32 - cmd_padded.chars().count()));
         }
 
-        // Subtract extra for the internal padding (1 space left, 1 space between, 1 space right)
-        let desc_truncated = truncate_to_width(desc, max_width.saturating_sub(36));
+        // The description gets what's left after the command column, the space
+        // between them, and the modern frame's two padding columns.
+        let desc_truncated = truncate_to_width(desc, max_width.saturating_sub(34 + inset * 2));
         let visible_len = cmd_padded.chars().count() + 1 + desc_truncated.chars().count();
-        let padding = max_width.saturating_sub(visible_len).saturating_sub(2);
+        let padding = max_width
+            .saturating_sub(visible_len)
+            .saturating_sub(inset * 2);
 
         let cmd_style = if is_selected {
             Style::default()
@@ -1286,16 +1374,17 @@ fn render_dropdown_popup(
         };
 
         let desc_style = Style::default().fg(Color::Rgb(120, 120, 120));
-        let bg_style = if is_selected {
+        let bg_style = if is_selected && !classic {
             Style::default().bg(Color::Rgb(40, 40, 40))
         } else {
             Style::default()
         };
 
+        let pad = " ".repeat(inset);
         let line = Line::from(vec![
-            Span::styled(format!(" {} ", cmd_padded), cmd_style),
+            Span::styled(format!("{pad}{cmd_padded} "), cmd_style),
             Span::styled(
-                format!("{}{}", desc_truncated, " ".repeat(padding + 1)),
+                format!("{}{}{pad}", desc_truncated, " ".repeat(padding)),
                 desc_style,
             ),
         ])
@@ -1432,9 +1521,22 @@ mod tests {
     }
 
     #[test]
-    fn prompt_prefix_omits_branch_name() {
-        assert_eq!(prompt_prefix(Some("main")), "❯ ");
-        assert_eq!(prompt_prefix(None), "❯ ");
+    fn every_frame_draws_the_same_prompt_marker() {
+        let _guard = crate::tui::theme::theme_test_guard();
+
+        // `> ` in every theme, with no branch in it — that lives on the status
+        // line.
+        for theme in ["classic", "modern_dark", "modern_light", "oranguday"] {
+            crate::tui::Theme::apply_named(theme).expect("theme");
+            assert_eq!(prompt_prefix(), "> ", "{theme}");
+        }
+
+        crate::tui::Theme::apply_named("classic").expect("classic");
+        assert_eq!(input_left_inset(), 0);
+        crate::tui::Theme::apply_named("modern_dark").expect("modern_dark");
+        assert_eq!(input_left_inset(), 2);
+
+        crate::tui::Theme::apply_named("classic").expect("restore classic");
     }
 
     #[test]
@@ -1485,9 +1587,9 @@ mod tests {
         assert!(line.contains("Pending: 3"));
     }
 
-    #[test]
-    fn output_view_rows_matches_current_layout_math() {
-        let rows = output_view_rows(
+    fn rows_for_theme(theme: &str) -> usize {
+        crate::tui::Theme::apply_named(theme).expect("theme");
+        output_view_rows(
             "0.0.0",
             "model",
             "endpoint",
@@ -1502,8 +1604,21 @@ mod tests {
             "abc",
             80,
             24,
-        );
+        )
+    }
 
-        assert_eq!(rows, 18);
+    #[test]
+    fn output_view_rows_matches_current_layout_math() {
+        let _guard = crate::tui::theme::theme_test_guard();
+
+        // Classic: 24 rows, less the four-row prompt frame, less the nine-row
+        // banner and the blank row under it.
+        assert_eq!(rows_for_theme("classic"), 10);
+        // Modern: the banner only shows on the empty landing screen, so the
+        // output window keeps everything above the prompt but the two blank
+        // spacer rows.
+        assert_eq!(rows_for_theme("modern_dark"), 18);
+
+        crate::tui::Theme::apply_named("classic").expect("restore classic");
     }
 }

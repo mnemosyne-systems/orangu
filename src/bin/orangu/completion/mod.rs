@@ -177,7 +177,7 @@ fn theme_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
                 .map(|value| ("set theme to ".len(), value))
         })?;
     let lower = value.to_ascii_lowercase();
-    let themes = orangu::tui::Theme::available_session_theme_names();
+    let themes = orangu::tui::Theme::available_theme_names();
     let candidates = themes
         .into_iter()
         .filter(|t| t.to_ascii_lowercase().starts_with(&lower))
@@ -581,12 +581,17 @@ mod tests {
                 completion_candidates(prefix, prefix.len(), workspace.path(), &[], &[], &skills)
                     .expect("theme candidates");
             assert_eq!(start, prefix.len());
-            for expected in ["default", "classic", "auto"] {
+            for expected in ["classic", "random"] {
                 assert!(
                     candidates.iter().any(|candidate| candidate == expected),
                     "missing {expected} for {prefix:?}: {candidates:?}"
                 );
             }
+            // `default` is not a theme; the shipped default is `classic`.
+            assert!(
+                !candidates.iter().any(|candidate| candidate == "default"),
+                "'default' offered as a theme for {prefix:?}: {candidates:?}"
+            );
         }
 
         // The inline ghost suffix previews matching theme name

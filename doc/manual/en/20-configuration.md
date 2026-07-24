@@ -123,9 +123,7 @@ theme = classic
 | `quotes` | No | Quote set shown while the model is thinking. Defaults to `none`. Options: `none`, `star_trek`, `star_wars`, `marco_pierre_white`, `gordon_ramsay`, `calvin_and_hobbes`, `sun_tzu_mandarin`, `sun_tzu_english`, `attila_the_hun`, `all` |
 | `width` | No | Virtual terminal width in characters. Controls the layout canvas for `/show_file` output. Defaults to `512` |
 | `banner` | No | Horizontal placement of the banner. Defaults to `left`. Options: `left`, `center`, `right` |
-| `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `oranguday`, `tokyonight`, `rosepine-moon`, and `auto`; user themes are loaded from `~/.orangu/themes/*.theme` |
-| `auto_dark_theme` | No | Concrete theme used when `theme = auto` detects a dark terminal. Defaults to `classic` |
-| `auto_light_theme` | No | Concrete theme used when `theme = auto` detects a light terminal. Defaults to `oranguday` |
+| `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`; `random` draws one of the available themes at each launch. User themes are loaded from `~/.orangu/themes/*.theme` |
 | `drop_down` | No | Enable the autocomplete dropdown for slash commands. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `mouse` | No | Enable mouse capture in the terminal. When `true` (the default), the TUI handles mouse scroll and double-click. Hold **Shift** while clicking/dragging to do native text selection and copy. Set to `false` to disable all mouse handling |
 | `workspaces` | No | Placement of the workspace tabs. Defaults to `top`. Options: `top`, `bottom`, `left`, `right`. See the Workspaces chapter |
@@ -190,7 +188,30 @@ The global default theme is configured in `[orangu]`:
 theme = classic
 ```
 
-Built-in themes are shipped inside the binary: `classic`, `oranguday`, `tokyonight`, and `rosepine-moon`. The `auto` selector follows the detected terminal appearance, using `auto_dark_theme` and `auto_light_theme` internally; on a dark terminal it normally looks the same as `classic`.
+Built-in themes are shipped inside the binary: `classic`, `modern_dark`,
+`modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`. `modern` is
+accepted as a short name for `modern_dark`.
+
+`random` is not a palette of its own: it draws one of the available themes —
+the shipped ones plus anything in `~/.orangu/themes` — when it is applied, and
+holds it for the rest of the run, so the UI never reshuffles mid-session. The
+configuration or session value stays `random`, so the next launch draws again.
+
+A theme selects both a palette and a *chrome* — the screen furniture around
+the content:
+
+| `chrome` | Frame |
+| :-- | :-- |
+| `classic` (the default) | The boxed ORANGU banner pinned to the top of the screen, placed by the `banner` key; the output window directly below it at full width; and full-width separators above and below the input window |
+| `modern` | The banner only on the empty landing screen; an inset output window; code blocks drawn in a box; and a rounded input box |
+
+Both frames share the rest: the input window carries a bare `> ` prompt, and
+closes with the same status line, which shows the branch on the left, a
+centered `Graph:` / `Pending:` group, and the model name flush right.
+
+`classic` and the `modern_*` themes differ only in this: they are the same UI
+in the two frames, so `theme = modern_dark` is the way to keep the
+Ratatui-native look while `theme = classic` reproduces the original one.
 
 Custom themes live in:
 
@@ -198,13 +219,31 @@ Custom themes live in:
 ~/.orangu/themes/<name>.theme
 ```
 
+A theme file is `key = value` lines. Colours are `#RRGGBB`, or `default` to
+leave the terminal's own colour in place; styles accept `fg:`/`bg:` colours
+plus `bold`, `italic`, `underlined` and `reversed`. The `chrome` key takes
+`classic` or `modern`.
+
+**Every key is optional, and `classic` is the base.** Whatever a file leaves
+out keeps its classic value, so a theme that only wants a different link colour
+is one line long:
+
+```ini
+highlight = fg:#66b2ff
+```
+
+That also means a palette-only theme never changes the layout by accident, and
+that adding a key in a later release never invalidates the theme files already
+on disk. A key that isn't recognized is an error rather than a silent no-op, so
+a typo can't quietly fall back to the classic value.
+
 You can switch the current session with `/theme <name>`. That writes a session override to:
 
 ```text
 ~/.orangu/sessions/<UUID>/theme
 ```
 
-Use `/theme default` (or `/theme global`) to remove the session override and return to the global `[orangu].theme`. The command completes built-in themes and user theme files. The startup option `--theme <name-or-path>` applies a theme only for that process and takes precedence over the global and session settings.
+Naming the theme `orangu.conf` already asks for drops the session override instead of pinning a copy of it, so the session goes back to following the global `[orangu].theme`. The command completes built-in themes and user theme files. The startup option `--theme <name-or-path>` applies a theme only for that process and takes precedence over the global and session settings.
 
 ## Server sections
 

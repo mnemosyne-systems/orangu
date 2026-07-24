@@ -37,10 +37,14 @@ The top banner displays:
 
 While no request is active, server and model status are rechecked once per minute.
 
+The banner is boxed and stays on screen under the default `classic` theme, placed by the `banner` configuration key. Under `theme = modern` it is shown centered on the empty landing screen and gives way to the output window once the conversation starts. See the Configuration chapter.
+
 ## Prompt area
 
 The prompt area stays at the bottom of the terminal window.
 
+- The input window carries a bare `> ` prompt; the branch is not part of it
+- Below it, the status line shows the current branch on the left, `Graph:` and `Pending:` centered, and the active model flush right
 - Long input wraps upward
 - Submitted input moves directly into the output area
 - The banner and prompt stay fixed while the output window scrolls independently

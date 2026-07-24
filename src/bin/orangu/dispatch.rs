@@ -617,31 +617,32 @@ pub(crate) fn handle_command(
             if name.is_empty() {
                 return Ok(CommandOutcome::OutputError(format!(
                     "Usage: /theme <name> (available: {})",
-                    orangu::tui::Theme::available_session_theme_summary()
+                    orangu::tui::Theme::available_theme_summary()
                 )));
-            }
-            if matches!(name.trim(), "default" | "global") {
-                save_session_theme(session_dir, None);
-                let configured_theme = orangu::config::load_client_configuration(config_path)
-                    .map(|config| config.theme)
-                    .unwrap_or_else(|_| "auto".to_string());
-                match orangu::tui::Theme::apply_named(&configured_theme) {
-                    Ok(_) => {
-                        return Ok(CommandOutcome::Output(format!(
-                            "Theme reset to config default ({})",
-                            configured_theme
-                        )));
-                    }
-                    Err(err) => return Ok(CommandOutcome::OutputError(err.to_string())),
-                }
             }
             match orangu::tui::Theme::apply_named(name) {
                 Ok(canonical_name) => {
-                    save_session_theme(session_dir, Some(&canonical_name));
-                    Ok(CommandOutcome::Output(format!(
-                        "Theme set to {}",
+                    // Naming the theme `orangu.conf` already asks for drops the
+                    // session override rather than pinning a copy of it, so the
+                    // session keeps following the configured value.
+                    let configured_theme = orangu::config::load_client_configuration(config_path)
+                        .map(|config| config.theme)
+                        .unwrap_or_else(|_| orangu::config::default_theme());
+                    if canonical_name == orangu::tui::Theme::canonical_theme_name(&configured_theme)
+                    {
+                        save_session_theme(session_dir, None);
+                    } else {
+                        save_session_theme(session_dir, Some(&canonical_name));
+                    }
+                    // Under `random` the committed name is the selector, so
+                    // report which theme actually came up.
+                    let resolved = orangu::tui::Theme::resolved_theme_name();
+                    let label = if resolved == canonical_name {
                         canonical_name
-                    )))
+                    } else {
+                        format!("{canonical_name} ({resolved})")
+                    };
+                    Ok(CommandOutcome::Output(format!("Theme set to {label}")))
                 }
                 Err(err) => Ok(CommandOutcome::OutputError(err.to_string())),
             }

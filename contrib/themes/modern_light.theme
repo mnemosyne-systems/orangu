@@ -1,0 +1,19 @@
+# The Ratatui-native orangu UI on a light terminal: the banner only on the
+# empty landing screen, an inset output window, boxed code blocks, and a
+# rounded input box, and a status line below it opening with the branch. The
+# light counterpart of modern_dark.
+chrome = modern
+success = fg:#1e8c3c
+error = fg:#c82828
+ignore = fg:#2864b4
+deep = fg:#7846b4
+muted = fg:#787878
+cursor_line_bg = fg:#000000 bg:#e6e6eb
+selected_file = fg:#000000 bg:#bebebe
+comment_bg = bg:#c8d2c8
+code_block_bg = bg:#f0f0f0
+highlight = fg:#1464b4
+warning = fg:#c88214
+user_input = fg:#000000 bg:#f0e6d2
+bg_base = #fafafa
+text_primary = #1e1e1e

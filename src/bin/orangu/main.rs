@@ -230,10 +230,6 @@ async fn run() -> Result<()> {
     };
     let config = load_client_configuration(&config_path)?;
     let cli_theme_override = args.theme.clone();
-    orangu::tui::theme::Theme::set_auto_theme_names(
-        &config.auto_dark_theme,
-        &config.auto_light_theme,
-    );
     let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
     if let Some(cli_theme) = cli_theme_override.as_deref() {
         orangu::tui::theme::Theme::apply_cli_override(cli_theme)

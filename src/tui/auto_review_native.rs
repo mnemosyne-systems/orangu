@@ -65,8 +65,12 @@ pub fn draw_auto_review_screen(f: &mut Frame, args: AutoReviewScreenArgs<'_>) {
         area,
     );
 
-    let prompt_prefix = crate::tui::prompt_prefix(args.prompt_branch);
-    let input_lines = crate::tui::wrapped_input_lines(args.input, width as usize, &prompt_prefix);
+    let prompt_prefix = crate::tui::prompt_prefix();
+    let input_lines = crate::tui::wrapped_input_lines(
+        args.input,
+        crate::tui::screen::input_wrap_width(width as usize),
+        &prompt_prefix,
+    );
     let prompt_frame_height = (input_lines.len() + 3) as u16;
     let pane_rows = height.saturating_sub(prompt_frame_height).max(2);
 

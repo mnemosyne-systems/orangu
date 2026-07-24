@@ -167,7 +167,7 @@ select server local-llama
 
 Selects the UI theme for the current session.
 
-Built-in themes are shipped inside the binary: `classic`, `oranguday`, `tokyonight`, and `rosepine-moon`. The `auto` selector follows the detected terminal appearance, using the configured `auto_dark_theme` and `auto_light_theme` values from `orangu.conf`.
+Built-in themes are shipped inside the binary: `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon` (`modern` is a short name for `modern_dark`). The `random` selector draws one of the available themes when applied and holds it for the rest of the run.
 
 Custom themes can be placed in:
 
@@ -181,17 +181,17 @@ With a theme name, `/theme` applies it immediately and writes a session override
 ~/.orangu/sessions/<UUID>/theme
 ```
 
-That override is restored when the session is resumed or when you switch back to that workspace tab. Use `/theme default` (or `/theme global`) to remove the session override and return to the global `[orangu].theme` from `orangu.conf`.
+That override is restored when the session is resumed or when you switch back to that workspace tab. Naming the theme `orangu.conf` already asks for drops the override instead of pinning a copy of it, so the session goes back to following the global `[orangu].theme`.
 
-Pressing `Tab` after `/theme ` completes `default`, the built-in themes, `auto`, and any user theme files found in `~/.orangu/themes/`.
+Pressing `Tab` after `/theme ` completes the built-in themes, `random`, and any user theme files found in `~/.orangu/themes/`.
 
 ### Examples
 
 ```text
 /theme classic
 /theme tokyonight
-/theme auto
-/theme default
+/theme modern_light
+/theme random
 ```
 
 \newpage

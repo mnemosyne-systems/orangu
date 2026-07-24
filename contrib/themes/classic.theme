@@ -1,15 +1,20 @@
-# Current orangu main UI, preserved as the canonical shipped default.
+# The original orangu UI: the boxed ORANGU banner pinned to the top of every
+# screen, the output window directly below it, full-width separators around
+# the input window, and the status line under them. The palette is the one
+# orangu drew before themes existed; `default` leaves the terminal's own
+# background and foreground untouched.
+chrome = classic
 success = fg:#50c878
 error = fg:#dc5050
 ignore = fg:#64a0e6
 deep = fg:#aa78dc
 muted = fg:#585858
-cursor_line_bg = fg:#fff5e6 bg:#28282d
-selected_file = fg:#ffffff bg:#3b4261
-comment_bg = bg:#1f2335
-code_block_bg = bg:#191923
-highlight = fg:#7aa2f7
+cursor_line_bg = bg:#3c3c5a
+selected_file = reversed
+comment_bg = bg:#263026
+code_block_bg = bg:default
+highlight = fg:#66b2ff
 warning = fg:#e6c878
-user_input = fg:#ffffff bg:#2d2314
-bg_base = #181818
-text_primary = #f0f0f0
+user_input = bg:#2c2c2c
+bg_base = default
+text_primary = default

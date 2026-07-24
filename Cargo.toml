@@ -39,7 +39,6 @@ printpdf = { version = "0.12.4", default-features = false, features = ["text_lay
 regex = "1.13"
 rustc-hash = "2.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
-rust-fontconfig = "4.4.6"
 rustyline = "18.0.1"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -94,8 +93,6 @@ minijinja-contrib = { version = "2.21", features = ["pycompat"] }
 half = "2.7"
 memmap2 = "0.9"
 rand = "0.10"
-tokio-stream = "0.1"
-futures = "0.3"
 async-stream = "0.3"
 wgpu = { version = "30.0.0", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl", "std"] }
 # Raw-Vulkan decode-submit path (persistent command-buffer reuse). Pinned to
@@ -111,7 +108,6 @@ cubecl-hip-sys = { version = "7", optional = true }
 ratatui = "0.30.2"
 ansi-to-tui = "8.0.1"
 unicode-width = "0.2.2"
-dark-light = "2.0.0"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]
@@ -122,7 +118,6 @@ libc = "0.2"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.27.0"
-ratatui = "0.30.2"
 
 [[bench]]
 name = "compression"

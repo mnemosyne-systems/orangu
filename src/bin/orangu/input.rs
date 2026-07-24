@@ -826,7 +826,7 @@ impl InputState {
         if self.buffer.starts_with('/') && (no_space || is_theme_arg) {
             let candidates = if is_theme_arg {
                 let prefix = &self.buffer["/theme ".len()..];
-                orangu::tui::Theme::available_session_theme_names()
+                orangu::tui::Theme::available_theme_names()
                     .into_iter()
                     .filter(|t| t.starts_with(prefix))
                     .map(|t| (t.to_string(), "".to_string()))
@@ -1232,7 +1232,6 @@ pub fn handle_input_event_with_status(
                     let layout = orangu::tui::main_screen_layout(
                         input_context.render.actual_width,
                         input_context.render.actual_height,
-                        input_context.render.prompt_branch,
                         input_state.as_str(),
                         input_context.render.tab_bar,
                         input_context.render.tab_statuses,
@@ -1246,7 +1245,6 @@ pub fn handle_input_event_with_status(
                     let layout = orangu::tui::main_screen_layout(
                         input_context.render.actual_width,
                         input_context.render.actual_height,
-                        input_context.render.prompt_branch,
                         input_state.as_str(),
                         input_context.render.tab_bar,
                         input_context.render.tab_statuses,
@@ -1293,7 +1291,6 @@ pub fn handle_input_event_with_status(
                 let layout = orangu::tui::main_screen_layout(
                     input_context.render.actual_width,
                     input_context.render.actual_height,
-                    input_context.render.prompt_branch,
                     input_state.as_str(),
                     input_context.render.tab_bar,
                     input_context.render.tab_statuses,
@@ -1324,7 +1321,6 @@ pub fn handle_input_event_with_status(
             let layout = orangu::tui::main_screen_layout(
                 input_context.render.actual_width,
                 input_context.render.actual_height,
-                input_context.render.prompt_branch,
                 input_state.as_str(),
                 input_context.render.tab_bar,
                 input_context.render.tab_statuses,
@@ -1340,7 +1336,6 @@ pub fn handle_input_event_with_status(
             let layout = orangu::tui::main_screen_layout(
                 input_context.render.actual_width,
                 input_context.render.actual_height,
-                input_context.render.prompt_branch,
                 input_state.as_str(),
                 input_context.render.tab_bar,
                 input_context.render.tab_statuses,

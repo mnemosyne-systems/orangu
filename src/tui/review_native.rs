@@ -38,8 +38,9 @@ pub fn draw_review_screen(frame: &mut ratatui::Frame, args: ReviewScreenArgs<'_>
         area,
     );
 
-    let prefix = prompt_prefix(args.prompt_branch);
-    let input_lines_count = wrapped_input_lines(args.input, width as usize, &prefix).len();
+    let prefix = prompt_prefix();
+    let input_lines_count =
+        wrapped_input_lines(args.input, input_wrap_width(width as usize), &prefix).len();
     let prompt_frame_height = (input_lines_count + 3) as u16;
     let pane_rows = height.saturating_sub(prompt_frame_height).max(1);
 

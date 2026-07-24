@@ -94,14 +94,9 @@ pub const REVIEW_COMMENT_BOX_HEIGHT: usize = 5;
 
 /// Number of scrollable body rows in a review pane (or feedback popup): the
 /// space above the prompt frame, minus the single header row.
-pub fn review_pane_body_height(
-    actual_height: usize,
-    input: &str,
-    prompt_branch: Option<&str>,
-    actual_width: usize,
-) -> usize {
-    let prefix = prompt_prefix(prompt_branch);
-    let input_lines = wrapped_input_lines(input, actual_width.max(1), &prefix);
+pub fn review_pane_body_height(actual_height: usize, input: &str, actual_width: usize) -> usize {
+    let prefix = prompt_prefix();
+    let input_lines = wrapped_input_lines(input, input_wrap_width(actual_width.max(1)), &prefix);
     let prompt_frame_height = input_lines.len() + 3;
     actual_height
         .max(1)

@@ -2517,18 +2517,14 @@ pub(crate) fn run_auto_review_prestart(
 ) -> Result<PreStartOutcome> {
     let mut escape_cancel = EscapeCancelState::default();
     loop {
-        let body_height = auto_review_pane_body_height(
-            viewport.actual_height,
-            "",
-            chrome.prompt_branch,
-            viewport.actual_width,
-        );
+        let body_height =
+            auto_review_pane_body_height(viewport.actual_height, "", viewport.actual_width);
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
         let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
         state.clamp(body_height, left_width);
         state.status = auto_review_prestart_status(state);
 
-        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let prefix = orangu::tui::screen::prompt_prefix();
         let prompt_frame_height =
             orangu::tui::screen::wrapped_input_lines("", viewport.actual_width, &prefix).len() + 3;
         // The native layout uses two rows for the mode header, plus the
@@ -2819,7 +2815,6 @@ pub(crate) async fn run_auto_review_request(
                 let body_height = auto_review_pane_body_height(
                     viewport.actual_height,
                     "",
-                    chrome.prompt_branch,
                     viewport.actual_width,
                 );
                 while event::poll(std::time::Duration::ZERO)? {
@@ -3034,7 +3029,6 @@ pub(crate) fn run_auto_review_browse(
         let body_height = auto_review_pane_body_height(
             viewport.actual_height,
             input_state.as_str(),
-            chrome.prompt_branch,
             viewport.actual_width,
         );
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
@@ -3053,7 +3047,7 @@ pub(crate) fn run_auto_review_browse(
         )
         .unwrap_or_default();
 
-        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let prefix = orangu::tui::screen::prompt_prefix();
         let prompt_frame_height = orangu::tui::screen::wrapped_input_lines(
             input_state.as_str(),
             viewport.actual_width,

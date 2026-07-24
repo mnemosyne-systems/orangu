@@ -144,10 +144,9 @@ pub struct AutoReviewScreenArgs<'a> {
 pub fn auto_review_pane_body_height(
     actual_height: usize,
     input: &str,
-    prompt_branch: Option<&str>,
     actual_width: usize,
 ) -> usize {
-    review_pane_body_height(actual_height, input, prompt_branch, actual_width)
+    review_pane_body_height(actual_height, input, actual_width)
         .saturating_sub(1)
         .max(1)
 }
@@ -159,11 +158,8 @@ mod tests {
     fn auto_review_pane_body_height_reserves_the_status_row() {
         // One row less than the `/review` panes (the status area takes it),
         // never less than one.
-        let review = review_pane_body_height(24, "", Some("main"), 80);
-        assert_eq!(
-            auto_review_pane_body_height(24, "", Some("main"), 80),
-            review - 1
-        );
-        assert_eq!(auto_review_pane_body_height(1, "", Some("main"), 80), 1);
+        let review = review_pane_body_height(24, "", 80);
+        assert_eq!(auto_review_pane_body_height(24, "", 80), review - 1);
+        assert_eq!(auto_review_pane_body_height(1, "", 80), 1);
     }
 }

@@ -51,8 +51,6 @@ pub struct ClientAppConfiguration {
     pub mouse: bool,
     pub semantic_budget_tokens: usize,
     pub theme: String,
-    pub auto_dark_theme: String,
-    pub auto_light_theme: String,
 }
 
 impl ClientAppConfiguration {
@@ -160,14 +158,6 @@ pub fn default_theme() -> String {
     "classic".to_string()
 }
 
-pub fn default_auto_dark_theme() -> String {
-    "classic".to_string()
-}
-
-pub fn default_auto_light_theme() -> String {
-    "oranguday".to_string()
-}
-
 pub fn default_auto_downsample_lines() -> usize {
     300
 }
@@ -241,15 +231,6 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         .unwrap_or(16384);
 
     let theme = client.get("theme").cloned().unwrap_or_else(default_theme);
-    let auto_dark_theme = client
-        .get("auto_dark_theme")
-        .cloned()
-        .unwrap_or_else(default_auto_dark_theme);
-    let auto_light_theme = client
-        .get("auto_light_theme")
-        .cloned()
-        .unwrap_or_else(default_auto_light_theme);
-
     // `[orangu].model` is the general default model id; a server section's own
     // `model` takes precedence over it.
     let default_model = client
@@ -298,8 +279,6 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         drop_down,
         mouse,
         theme,
-        auto_dark_theme,
-        auto_light_theme,
     })
 }
 
@@ -645,10 +624,8 @@ mod tests {
         assert!(conf.compression);
         // Absent platform defaults to GitHub.
         assert_eq!(conf.platform, "github");
-        // Absent theme keeps the historical dark UI as the named classic theme.
+        // Absent theme keeps the original orangu UI as the named classic theme.
         assert_eq!(conf.theme, "classic");
-        assert_eq!(conf.auto_dark_theme, "classic");
-        assert_eq!(conf.auto_light_theme, "oranguday");
     }
 
     #[test]
@@ -656,13 +633,11 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu]\nserver = a\ntheme = auto\nauto_dark_theme = tokyonight\nauto_light_theme = oranguday\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
+            "[orangu]\nserver = a\ntheme = random\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
         )
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
-        assert_eq!(conf.theme, "auto");
-        assert_eq!(conf.auto_dark_theme, "tokyonight");
-        assert_eq!(conf.auto_light_theme, "oranguday");
+        assert_eq!(conf.theme, "random");
     }
 
     #[test]

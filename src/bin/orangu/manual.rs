@@ -436,7 +436,7 @@ fn draw_manual_screen(
     let width = viewport.actual_width.max(1) as u16;
     let height = viewport.actual_height.max(1) as u16;
 
-    let prompt_prefix = prompt_prefix(chrome.prompt_branch);
+    let prompt_prefix = prompt_prefix();
     let pane_rows = height.saturating_sub(4).max(1);
 
     let right_width = manual_right_width(&state.sections, width as usize) as u16;
@@ -559,7 +559,7 @@ fn draw_manual_screen(
         left_status: notice.as_ref(),
         pending_count: chrome.pending_count,
         graph_status: None,
-        prompt_branch: None,
+        prompt_branch: chrome.prompt_branch,
     };
     frame.render_widget(prompt_widget, prompt_area);
 }
@@ -577,12 +577,8 @@ pub fn run_manual_mode(
         // The input window is always empty here, so the body height matches a
         // review pane with an empty input. The open search window costs one
         // text row.
-        let body_height = review_pane_body_height(
-            viewport.actual_height,
-            "",
-            chrome.prompt_branch,
-            viewport.actual_width,
-        );
+        let body_height =
+            review_pane_body_height(viewport.actual_height, "", viewport.actual_width);
         let text_height = body_height.saturating_sub(usize::from(state.search.is_some()));
         let right_width = manual_right_width(&state.sections, viewport.actual_width);
         let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);

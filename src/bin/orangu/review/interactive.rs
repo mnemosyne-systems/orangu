@@ -639,7 +639,6 @@ pub(crate) fn run_review_mode(
         let body_height = review_pane_body_height(
             viewport.actual_height,
             input_state.as_str(),
-            chrome.prompt_branch,
             viewport.actual_width,
         );
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
@@ -658,7 +657,7 @@ pub(crate) fn run_review_mode(
         )
         .unwrap_or_default();
 
-        let prefix = orangu::tui::screen::prompt_prefix(chrome.prompt_branch);
+        let prefix = orangu::tui::screen::prompt_prefix();
         let input_lines_count = orangu::tui::screen::wrapped_input_lines(
             input_state.as_str(),
             viewport.actual_width,

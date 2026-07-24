@@ -58,7 +58,7 @@ _orangu() {
             return 0
             ;;
         --theme)
-            COMPREPLY=( $(compgen -W "classic oranguday tokyonight rosepine-moon auto" -- "$cur") $(compgen -f -- "$cur") )
+            COMPREPLY=( $(compgen -W "classic modern_dark modern_light oranguday tokyonight rosepine-moon random" -- "$cur") $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
             ;;
@@ -105,7 +105,7 @@ _orangu_workspaces() {
 
 _orangu_themes() {
     local -a themes
-    themes=(classic oranguday tokyonight rosepine-moon auto)
+    themes=(classic modern_dark modern_light oranguday tokyonight rosepine-moon random)
     compadd -a themes
     _files -g '*.theme'
 }
@@ -150,7 +150,7 @@ function __orangu_workspaces
 end
 
 complete -c orangu -s c -l config           -r                          -d 'Path to the configuration file (orangu.conf)'
-complete -c orangu    -l theme              -r -a 'classic oranguday tokyonight rosepine-moon auto' -d 'Override the TUI theme with a name or .theme file'
+complete -c orangu    -l theme              -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
 complete -c orangu    -l theme              -r -a '(__fish_complete_path)' -d 'Theme file'
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
@@ -160,3 +160,23 @@ complete -c orangu -s i -l init                                           -d 'In
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu -s h -l help                                           -d 'Print help'
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{BASH, FISH, ZSH};
+
+    #[test]
+    fn every_shell_completes_all_built_in_themes() {
+        // The scripts are emitted verbatim, so their theme lists are the one
+        // place that can silently fall behind `BUILT_IN_THEMES`. Adding a
+        // shipped theme must add it here too.
+        for theme in orangu::tui::Theme::built_in_theme_names() {
+            for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+                assert!(
+                    script.contains(&theme),
+                    "{shell} completion omits the built-in theme: {theme}"
+                );
+            }
+        }
+    }
+}

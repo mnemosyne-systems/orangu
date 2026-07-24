@@ -22,6 +22,18 @@ fn setup_test_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
     Terminal::new(backend).unwrap()
 }
 
+/// Every row of the rendered screen, as plain text.
+fn screen_rows(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 fn default_render_args<'a>() -> ScreenRenderArgs<'a> {
     ScreenRenderArgs {
         version: "0.11.0",
@@ -189,4 +201,116 @@ fn test_render_native_auto_review_screen() {
     assert!(content.contains("(pending)"));
     assert!(!content.contains("[1m"));
     assert!(!content.contains("[2m"));
+}
+
+#[test]
+fn classic_chrome_draws_the_boxed_banner_and_separator_prompt() {
+    let _guard = crate::tui::theme::theme_test_guard();
+    crate::tui::Theme::apply_named("classic").expect("classic");
+
+    let mut terminal = setup_test_terminal(120, 24);
+    let mut args = default_render_args();
+    args.actual_width = 120;
+    args.prompt_branch = Some("main");
+    args.transcript = &[];
+
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, 120, 24);
+
+    // The banner is boxed and pinned to the very top, left-aligned per the
+    // `banner` configuration key, with the branding and status beside it.
+    assert!(rows[0].starts_with('\u{250f}'), "{:?}", rows[0]);
+    assert!(rows[1].starts_with('\u{2503}'), "{:?}", rows[1]);
+    assert!(rows[8].starts_with('\u{2517}'), "{:?}", rows[8]);
+    assert!(rows[1..8].iter().any(|row| row.contains("Version: 0.11.0")));
+    assert!(rows[1..8].iter().any(|row| row.contains("Help: /help")));
+    assert!(rows[1..8].iter().any(|row| row.contains('\u{2588}')));
+
+    // The prompt frame is a pair of full-width separators around an input
+    // window carrying a bare `> ` marker — no branch in it — with the status
+    // line below, opening with the branch.
+    assert_eq!(rows[20], "\u{2501}".repeat(120));
+    assert!(rows[21].starts_with("> "), "{:?}", rows[21]);
+    assert_eq!(rows[22], "\u{2501}".repeat(120));
+    assert!(rows[23].starts_with("main "), "{:?}", rows[23]);
+    assert!(rows[23].contains("Graph: "), "{:?}", rows[23]);
+    assert!(rows[23].trim_end().ends_with("gpt-4"), "{:?}", rows[23]);
+    // The branch is not in the prompt.
+    assert!(!rows.iter().any(|row| row.starts_with("main> ")));
+    // No rounded box anywhere.
+    assert!(!rows.iter().any(|row| row.contains('\u{256d}')));
+
+    crate::tui::Theme::apply_named("classic").expect("restore classic");
+}
+
+#[test]
+fn classic_chrome_honors_the_banner_alignment() {
+    let _guard = crate::tui::theme::theme_test_guard();
+    crate::tui::Theme::apply_named("classic").expect("classic");
+
+    let mut terminal = setup_test_terminal(120, 24);
+    let mut args = default_render_args();
+    args.actual_width = 120;
+    args.banner = Banner::Right;
+
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, 120, 24);
+
+    assert!(rows[0].starts_with(' '), "{:?}", rows[0]);
+    assert!(rows[0].trim_end().ends_with('\u{2513}'), "{:?}", rows[0]);
+    assert_eq!(rows[0].trim_end().chars().count(), 120);
+
+    crate::tui::Theme::apply_named("classic").expect("restore classic");
+}
+
+#[test]
+fn modern_chrome_draws_the_rounded_prompt_box() {
+    let _guard = crate::tui::theme::theme_test_guard();
+    crate::tui::Theme::apply_named("modern_dark").expect("modern_dark");
+
+    let mut terminal = setup_test_terminal(120, 26);
+    let mut args = default_render_args();
+    args.actual_width = 120;
+    args.actual_height = 26;
+    args.prompt_branch = Some("main");
+
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, 120, 26);
+
+    // The prompt frame is the last four rows: a three-row rounded box around
+    // the one input line, then the status line.
+    let status = rows.last().expect("status row");
+    let box_bottom = &rows[rows.len() - 2];
+    let box_input = &rows[rows.len() - 3];
+    let box_top = &rows[rows.len() - 4];
+
+    // All four corners are the rounded forms, not the square ┌┐└┘.
+    assert!(box_top.contains('\u{256d}'), "{box_top:?}");
+    assert!(box_top.contains('\u{256e}'), "{box_top:?}");
+    assert!(box_bottom.contains('\u{2570}'), "{box_bottom:?}");
+    assert!(box_bottom.contains('\u{256f}'), "{box_bottom:?}");
+    assert!(
+        !rows.iter().any(|row| row.contains('\u{250c}')
+            || row.contains('\u{2510}')
+            || row.contains('\u{2514}')
+            || row.contains('\u{2518}')),
+        "square corners in the modern frame"
+    );
+    assert!(box_input.contains('\u{2502}'), "{box_input:?}");
+    // The input window carries the same bare `> ` marker as the classic frame.
+    assert!(box_input.contains("> "), "{box_input:?}");
+    // Nothing rides the borders — the box is bare.
+    assert!(!box_bottom.contains("main"), "{box_bottom:?}");
+    // The banner is not boxed.
+    assert!(!rows.iter().any(|row| row.contains('\u{250f}')));
+    // The status line sits clear of the box, on its own row underneath: the
+    // branch on the left, Graph/Pending centered, model flush right. This
+    // frame keeps the branch out of the prompt prefix.
+    assert!(!status.contains('\u{256f}'), "{status:?}");
+    // Inset by two columns to line the row up with the box above it.
+    assert!(status.starts_with("  main "), "{status:?}");
+    assert!(status.contains("Graph: "), "{status:?}");
+    assert!(status.trim_end().ends_with("gpt-4"), "{status:?}");
+
+    crate::tui::Theme::apply_named("classic").expect("restore classic");
 }

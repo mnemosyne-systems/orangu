@@ -26,10 +26,9 @@ use crate::quotes::QUOTE_OPTIONS;
 use anyhow::{Context, Result, anyhow};
 use orangu::{
     config::{
-        CLIENT_SECTION, DEFAULT_PLATFORM, default_auto_dark_theme, default_auto_light_theme,
-        default_code_max_tokens, default_compile_workers, default_drop_down,
-        default_llm_max_tool_rounds, default_review_max_tokens, default_theme, default_timeout,
-        default_virtual_width,
+        CLIENT_SECTION, DEFAULT_PLATFORM, default_code_max_tokens, default_compile_workers,
+        default_drop_down, default_llm_max_tool_rounds, default_review_max_tokens, default_theme,
+        default_timeout, default_virtual_width,
     },
     llm::normalized_openai_endpoint,
 };
@@ -62,18 +61,25 @@ const PLATFORM_OPTIONS: &[&str] = &["github", "gitlab"];
 /// loader accepts (see `orangu::workspaces::WorkspacePlacement`).
 const WORKSPACE_OPTIONS: &[&str] = &["top", "bottom", "left", "right"];
 
-/// Theme values shipped with orangu. User theme files can still be selected at
-/// runtime with `/theme` or `--theme`, but the wizard only writes known-good
-/// bundled values.
-const THEME_OPTIONS: &[&str] = &[
-    "classic",
-    "oranguday",
-    "tokyonight",
-    "rosepine-moon",
-    "auto",
-];
+/// The non-concrete `theme` value: not a palette of its own, but a draw from
+/// the ones that are.
+const THEME_SELECTOR: &str = orangu::tui::Theme::RANDOM_SELECTOR;
 
-const CONCRETE_THEME_OPTIONS: &[&str] = &["classic", "oranguday", "tokyonight", "rosepine-moon"];
+/// Theme values the wizard offers for `theme`: every theme compiled into the
+/// binary, plus the selector. Derived from the runtime list so the wizard's
+/// completion and ghost hints can never drift from the shipped themes. User
+/// theme files can still be selected at runtime with `/theme` or `--theme`,
+/// but the wizard only writes known-good bundled values.
+fn theme_options() -> Vec<String> {
+    let mut options = orangu::tui::Theme::built_in_theme_names();
+    options.push(THEME_SELECTOR.to_string());
+    options
+}
+
+/// Borrow an owned option list for the `&[&str]` prompt helpers.
+fn option_refs(options: &[String]) -> Vec<&str> {
+    options.iter().map(String::as_str).collect()
+}
 
 /// Bundled skills that will be installed into `~/.orangu/skills/` during `--init`
 /// if they do not already exist.
@@ -131,20 +137,9 @@ pub async fn run_init() -> Result<()> {
     let quotes = prompt_with_options("quotes", "none", QUOTE_OPTIONS)?;
     let width = prompt_number::<usize>("width", default_virtual_width())?;
     let banner = prompt_with_options("banner", "left", BANNER_OPTIONS)?;
+    let theme_options = theme_options();
     let default_theme = default_theme();
-    let theme = prompt_with_options("theme", &default_theme, THEME_OPTIONS)?;
-    let default_auto_dark_theme = default_auto_dark_theme();
-    let auto_dark_theme = prompt_with_options(
-        "auto_dark_theme",
-        &default_auto_dark_theme,
-        CONCRETE_THEME_OPTIONS,
-    )?;
-    let default_auto_light_theme = default_auto_light_theme();
-    let auto_light_theme = prompt_with_options(
-        "auto_light_theme",
-        &default_auto_light_theme,
-        CONCRETE_THEME_OPTIONS,
-    )?;
+    let theme = prompt_with_options("theme", &default_theme, &option_refs(&theme_options))?;
     let workspaces = prompt_with_options("workspaces", "top", WORKSPACE_OPTIONS)?;
     let drop_down = prompt_bool("drop_down", default_drop_down())?;
     let feedback = prompt_bool("feedback", false)?;
@@ -188,12 +183,6 @@ pub async fn run_init() -> Result<()> {
     }
     if theme != default_theme {
         client.push(format!("theme = {theme}"));
-    }
-    if auto_dark_theme != default_auto_dark_theme {
-        client.push(format!("auto_dark_theme = {auto_dark_theme}"));
-    }
-    if auto_light_theme != default_auto_light_theme {
-        client.push(format!("auto_light_theme = {auto_light_theme}"));
     }
     if workspaces != "top" {
         client.push(format!("workspaces = {workspaces}"));
@@ -619,9 +608,7 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONCRETE_THEME_OPTIONS, THEME_OPTIONS, WORKSPACE_OPTIONS, pager_executable, tool_status,
-    };
+    use super::{THEME_SELECTOR, WORKSPACE_OPTIONS, pager_executable, theme_options, tool_status};
 
     #[test]
     fn workspace_options_are_all_valid_placements() {
@@ -639,27 +626,39 @@ mod tests {
     }
 
     #[test]
-    fn theme_options_are_known_to_runtime_completion() {
+    fn theme_options_cover_every_built_in_theme() {
+        // The wizard must offer — and therefore Tab-complete and ghost — every
+        // theme compiled into the binary, and nothing the runtime wouldn't
+        // accept.
+        let built_in = orangu::tui::Theme::built_in_theme_names();
         let available = orangu::tui::Theme::available_theme_names();
-        for option in THEME_OPTIONS {
+        let offered = theme_options();
+        for theme in &built_in {
             assert!(
-                available.iter().any(|theme| theme == option),
+                offered.contains(theme),
+                "wizard omits the built-in theme: {theme}"
+            );
+        }
+        for option in &offered {
+            assert!(
+                available.contains(option),
                 "wizard offers an unknown theme value: {option}"
             );
         }
-        assert!(
-            !CONCRETE_THEME_OPTIONS.contains(&"auto"),
-            "auto_dark_theme/auto_light_theme must not offer auto"
-        );
+        assert!(offered.contains(&THEME_SELECTOR.to_string()));
+    }
+
+    #[test]
+    fn theme_defaults_to_classic() {
+        // Pressing Enter at the wizard's `theme` prompt must land on the
+        // original orangu look, not on whichever theme happens to be first.
+        assert_eq!(orangu::config::default_theme(), "classic");
     }
 
     #[test]
     fn option_completer_ghosts_matching_suffix() {
         let completer = super::OptionCompleter {
-            options: THEME_OPTIONS
-                .iter()
-                .map(|option| option.to_string())
-                .collect(),
+            options: theme_options(),
         };
         let history = rustyline::history::DefaultHistory::new();
         let ctx = rustyline::Context::new(&history);
@@ -668,7 +667,7 @@ mod tests {
             Some("yonight".to_string())
         );
         assert_eq!(
-            rustyline::hint::Hinter::hint(&completer, "auto", 4, &ctx),
+            rustyline::hint::Hinter::hint(&completer, "random", 6, &ctx),
             None
         );
     }
