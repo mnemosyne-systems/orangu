@@ -669,6 +669,11 @@ mod tests {
         assert!(!diff.contains("diff --git a/README.md b/README.md"));
     }
 
+    // Unix-only on two counts: the pager it configures is a `#!/bin/sh`
+    // script made executable with `chmod`, and the `.gitconfig` naming it
+    // would hold a Windows path, whose backslashes Git reads as escape
+    // sequences and rejects outright ("bad config line").
+    #[cfg(unix)]
     #[test]
     fn git_workspace_diff_uses_configured_noninteractive_pager() {
         let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());

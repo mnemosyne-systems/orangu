@@ -691,7 +691,9 @@ Runs a shell command in the workspace, streaming its output to the output window
 /shell <command>
 ```
 
-The command line runs through `bash -lc`, exactly like the model-facing `run_shell_command` tool (see the Tools chapter), so it supports everything a login shell does: pipes, redirects, globs, and any executable on `$PATH`, not a fixed allow-list. It runs with the workspace as its current directory. `/shell` requires a command — a bare `/shell` reports usage instead of doing nothing quietly.
+The command line runs through the platform's shell — `bash -lc` on Linux and macOS, `powershell -NoLogo -NonInteractive -Command` on Windows — exactly like the model-facing `run_shell_command` tool (see the Tools chapter). Either way it supports everything that shell does: pipes, redirects, globs, and any executable on the path, not a fixed allow-list. It runs with the workspace as its current directory. `/shell` requires a command — a bare `/shell` reports usage instead of doing nothing quietly.
+
+Note that a command line is passed to the shell verbatim and is not translated between them, so anything beyond the simplest command is written for one platform's shell or the other. Windows uses `powershell` rather than `pwsh` because Windows PowerShell ships with the operating system while PowerShell 7 is an optional install, and `-NonInteractive` so a command that would prompt fails rather than waiting for input that nothing is attached to answer.
 
 The command exits non-zero the same way it would at a real terminal — `/shell` reports the failure but the output already streamed stays in the output window.
 

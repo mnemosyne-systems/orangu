@@ -309,10 +309,10 @@ mod tests {
     #[test]
     fn gelu_matches_reference_values() {
         assert!((gelu(0.0) - 0.0).abs() < 1e-6);
-        // gelu(1) ≈ 0.8411920 (tanh approximation, matches ggml's own value)
-        assert!((gelu(1.0) - 0.8411920).abs() < 1e-5);
-        // gelu(-1) ≈ -0.1588080
-        assert!((gelu(-1.0) - (-0.1588080)).abs() < 1e-5);
+        // gelu(1) ≈ 0.841_192 (tanh approximation, matches ggml's own value)
+        assert!((gelu(1.0) - 0.841_192).abs() < 1e-5);
+        // gelu(-1) ≈ -0.158_808
+        assert!((gelu(-1.0) - (-0.158_808)).abs() < 1e-5);
     }
 
     #[test]

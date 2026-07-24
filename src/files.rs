@@ -469,10 +469,28 @@ fn resolve(workspace: &Path, raw: &str) -> FileResult<PathBuf> {
 /// layout. Falls back to the absolute path if the two share no prefix, which
 /// [`resolve`] has already ruled out for anything that gets this far.
 fn display_path(workspace: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    to_slash(path.strip_prefix(workspace).unwrap_or(path))
+}
+
+/// A path in the form this API reports paths: `/`-separated, on every
+/// platform.
+///
+/// Requests name paths with `/` whatever the host is, so answering with a
+/// `\`-separated path would reply in a different form than was asked, and
+/// would make the same workspace describe itself differently depending on
+/// which platform served it. Windows accepts `/` in every path call, so
+/// normalizing costs nothing there.
+///
+/// Only the *reported* form is normalized — paths handed to the operating
+/// system, and to `git` as arguments, stay native. `\` is not a legal
+/// character in a Windows filename, so the substitution cannot corrupt one.
+pub(crate) fn to_slash(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
 }
 
 #[cfg(unix)]
@@ -1413,7 +1431,14 @@ mod tests {
     fn move_renames_the_file_and_can_set_its_permissions() {
         let dir = workspace_with(&[("a.txt", "content\n")]);
         let mut request = move_request("a.txt", "sub/b.txt");
-        request.mode = Some(Mode::Text("0640".to_string()));
+        // `mode` is optional, and only Unix has anything to apply it to —
+        // `set_mode` refuses it elsewhere by design. Leaving it unset off
+        // Unix keeps what this test is really about (the rename) covered on
+        // every platform.
+        #[cfg(unix)]
+        {
+            request.mode = Some(Mode::Text("0640".to_string()));
+        }
         request.parents = true;
 
         let response = move_(dir.path(), request).expect("move");
@@ -1558,7 +1583,12 @@ mod tests {
         assert!(matches!(err, FileError::NotFound(_)));
 
         let mut request = create_dir_request("a/b/c");
-        request.mode = Some(Mode::Text("0700".to_string()));
+        // Optional, and Unix-only — see `move_renames_the_file_and_can_set_
+        // its_permissions`. The directory creation itself is checked either way.
+        #[cfg(unix)]
+        {
+            request.mode = Some(Mode::Text("0700".to_string()));
+        }
         request.parents = true;
         let response = create_dir(dir.path(), request).expect("create");
 
@@ -1588,7 +1618,12 @@ mod tests {
     fn move_directory_moves_the_whole_subtree() {
         let dir = workspace_with(&[("src/deep/a.txt", "a\n"), ("src/b.txt", "b\n")]);
         let mut request = move_dir_request("src", "lib/src");
-        request.mode = Some(Mode::Text("0750".to_string()));
+        // Optional, and Unix-only — see `move_renames_the_file_and_can_set_
+        // its_permissions`. The subtree move itself is checked either way.
+        #[cfg(unix)]
+        {
+            request.mode = Some(Mode::Text("0750".to_string()));
+        }
         request.parents = true;
 
         let response = move_dir(dir.path(), request).expect("move");

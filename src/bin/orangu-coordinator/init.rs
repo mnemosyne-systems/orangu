@@ -600,9 +600,10 @@ mod tests {
     /// Typing a real subdirectory's prefix ghost-suggests the rest of its
     /// name — the exact scenario the `models` prompt needs: point at a
     /// directory tree and see (without pressing TAB) what's actually there.
-    /// `FilenameCompleter` appends a trailing `/` to directory candidates,
-    /// which carries through into the hint — a small extra cue that what's
-    /// suggested is itself a directory.
+    /// `FilenameCompleter` appends a trailing separator to directory
+    /// candidates, which carries through into the hint — a small extra cue
+    /// that what's suggested is itself a directory. It uses the host's own
+    /// separator, so what the hint ends with is `/` here and `\` on Windows.
     #[test]
     fn hints_the_remainder_of_a_matching_directory_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -613,11 +614,12 @@ mod tests {
         let prefix = dir.path().join("gguf-mod");
         let line = prefix.to_str().unwrap();
         let hint = hinter().hint(line, line.len(), &ctx);
-        assert_eq!(hint.as_deref(), Some("els/"));
+        let expected = format!("els{}", std::path::MAIN_SEPARATOR);
+        assert_eq!(hint.as_deref(), Some(expected.as_str()));
     }
 
     /// No hint once the typed text already exactly matches the only
-    /// candidate (trailing slash included) — there's nothing left to
+    /// candidate (trailing separator included) — there's nothing left to
     /// suggest.
     #[test]
     fn no_hint_once_the_entry_is_fully_typed() {
@@ -627,7 +629,9 @@ mod tests {
         let ctx = RlContext::new(&history);
 
         let prefix = dir.path().join("models");
-        let line = format!("{}/", prefix.to_str().unwrap());
+        // The host's own separator, so this really is "already fully typed"
+        // rather than a path the completer simply fails to match.
+        let line = format!("{}{}", prefix.to_str().unwrap(), std::path::MAIN_SEPARATOR);
         let hint = hinter().hint(&line, line.len(), &ctx);
         assert_eq!(hint, None);
     }

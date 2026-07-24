@@ -297,10 +297,11 @@ impl Repo {
     /// How a path appears in the reported `command`: relative to the
     /// repository root, the way a user would type it themselves.
     fn show(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        // `/`-separated like every other path this crate reports, so the
+        // echoed command reads the same on every platform (see
+        // `files::to_slash`). Only the display form — `path_arg` still
+        // hands `git` the native path it actually ran with.
+        crate::files::to_slash(path.strip_prefix(&self.root).unwrap_or(path))
     }
 }
 

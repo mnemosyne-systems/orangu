@@ -173,7 +173,7 @@ Behavior:
 - `command` is required
 - `cwd` defaults to the workspace root
 - `timeout_seconds` defaults to `30`
-- The command runs through `bash -lc`
+- The command runs through the platform's shell: `bash -lc` on Linux and macOS, `powershell -NoLogo -NonInteractive -Command` on Windows. It is passed verbatim and never translated between them, so anything beyond the simplest command is written for one or the other
 - Output is intercepted and compressed before being sent to the LLM to prevent flooding the context window. Native slash commands (like `/diff`, `/log`, `/build`) execute locally and display their full output to the user, but when this output is injected into the model's context, it is compressed and tracked via a cache identifier to ensure it is only transmitted once if unchanged.
 - Output is returned as pretty-printed JSON with `exit_code`, `stdout`, and `stderr`
 - `stdout` and `stderr` are each truncated to at most 20,000 characters

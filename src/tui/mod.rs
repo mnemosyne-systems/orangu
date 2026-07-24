@@ -89,69 +89,6 @@ pub(crate) mod test_fixtures {
             patch: String::new(),
         }
     }
-
-    pub(crate) fn review_args<'a>(
-        files: &'a [ReviewEntry],
-        selected: usize,
-        scroll: usize,
-        actual_width: usize,
-        actual_height: usize,
-    ) -> ReviewScreenArgs<'a> {
-        ReviewScreenArgs {
-            files,
-            selected,
-            list_offset: 0,
-            line: 0,
-            scroll,
-            x_offset: 0,
-            feedback: None,
-            comment_editor: None,
-            commented_lines: &[],
-            current_model: "model",
-            prompt_branch: None,
-            input: "",
-            cursor: 0,
-            ghost: "",
-            left_status: None,
-            pending_count: 0,
-            actual_width,
-            actual_height,
-        }
-    }
-
-    pub(crate) fn auto_review_args<'a>(
-        files: &'a [ReviewEntry],
-        report_lines: &'a [String],
-        actual_width: usize,
-        actual_height: usize,
-    ) -> AutoReviewScreenArgs<'a> {
-        AutoReviewScreenArgs {
-            files,
-            selected: None,
-            list_offset: 0,
-            reviewing: None,
-            browsing: false,
-            prestart: false,
-            modes: &[],
-            reject: None,
-            diff: None,
-            report_lines,
-            selected_lines: None,
-            scroll: 0,
-            x_offset: 0,
-            status: "File: a.rs (1/1)  Category: Code  Progress: 0/7 (0%)  Time: 5s",
-            input: "",
-            cursor: 0,
-            ghost: "",
-            current_model: "model",
-            prompt_branch: Some("feature/x"),
-            left_status: None,
-            pending_count: 0,
-            graph_status: None,
-            actual_width,
-            actual_height,
-        }
-    }
 }
 
 #[cfg(test)]

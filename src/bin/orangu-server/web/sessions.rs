@@ -439,24 +439,64 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Tests share HOME via env var overrides, and must not run concurrently.
+    // Tests share the home directory via env var overrides, and must not run
+    // concurrently.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The variables `home::home_dir` actually consults, which is not the
+    /// same set everywhere: `HOME` on Unix, `USERPROFILE` on Windows. Setting
+    /// only `HOME` left every one of these tests pointed at the real home
+    /// directory on Windows — so they saw each other's sessions and, worse,
+    /// wrote into the user's own `~/.orangu` while doing it.
+    #[cfg(unix)]
+    const HOME_VARS: &[&str] = &["HOME"];
+    #[cfg(windows)]
+    const HOME_VARS: &[&str] = &["USERPROFILE", "HOME"];
 
     fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var_os("HOME");
+        let original: Vec<_> = HOME_VARS
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
         unsafe {
-            std::env::set_var("HOME", dir.path());
+            for name in HOME_VARS {
+                std::env::set_var(name, dir.path());
+            }
         }
         let result = f();
         unsafe {
-            match &original {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            for (name, value) in &original {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
             }
         }
         result
+    }
+
+    /// Guards the fix above: whatever this platform resolves a home directory
+    /// from, `with_temp_home` has to actually redirect it. If it does not,
+    /// every test here silently shares one directory and starts asserting
+    /// against leftovers from its neighbours.
+    #[test]
+    fn with_temp_home_actually_redirects_the_home_directory() {
+        with_temp_home(|| {
+            // Compared against the variable this platform's lookup is
+            // supposed to follow, entirely inside the lock — reading the
+            // "real" home outside it would race with whichever neighbouring
+            // test currently has the override installed.
+            let overridden = std::env::var_os(HOME_VARS[0]).expect("home variable set");
+            assert_eq!(
+                home::home_dir().expect("a home directory"),
+                PathBuf::from(overridden),
+                "home_dir does not follow {} on this platform, so these \
+                 tests would share one directory",
+                HOME_VARS[0]
+            );
+        });
     }
 
     #[test]

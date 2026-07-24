@@ -196,30 +196,6 @@ pub(crate) fn multiline_cursor_position(text: &str, cursor: usize, width: usize)
 mod tests {
     use super::*;
     use crate::tui::test_fixtures::*;
-    use ratatui::{Terminal, backend::TestBackend};
-
-    fn render_to_buffer(args: ReviewScreenArgs<'_>) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(
-            args.actual_width as u16,
-            args.actual_height as u16,
-        ))
-        .unwrap();
-        terminal
-            .draw(|f| crate::tui::review_native::draw_review_screen(f, args))
-            .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
-        let mut out = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                out.push_str(buffer.cell((x, y)).unwrap().symbol());
-            }
-            out.push_str("\r\n");
-        }
-        out
-    }
 
     #[test]
     fn multiline_cursor_position_counts_logical_lines_and_wraps() {

@@ -481,7 +481,7 @@ mod tests {
             vendor: "Test".to_string(),
             name: "Test GPU 1".to_string(),
             vram_total_bytes: Some(4 * GIB),
-            vram_used_bytes: Some(1 * GIB),
+            vram_used_bytes: Some(GIB),
             driver: None,
             memory_kind: MemoryKind::Dedicated,
         }];

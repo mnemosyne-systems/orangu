@@ -601,7 +601,11 @@ impl ToolExecutor {
                 content: updated.clone(),
                 // A brand-new file gets 0644, matching what this tool has
                 // always created; an existing one keeps its own bits.
-                mode: created.then_some(crate::files::Mode::Bits(0o644)),
+                // Permission bits are a Unix concept and `files::set_mode`
+                // refuses them anywhere else by design, so off Unix this
+                // stays `None` — asking for a mode there would fail the
+                // whole write rather than just the part that cannot apply.
+                mode: (created && cfg!(unix)).then_some(crate::files::Mode::Bits(0o644)),
                 overwrite: true,
                 parents: true,
                 git: args.git.unwrap_or_else(crate::files::git_default),
@@ -687,9 +691,12 @@ impl ToolExecutor {
         };
         let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(30));
 
-        let mut child = Command::new("bash");
+        // `bash -lc` on Unix, PowerShell on Windows — see
+        // `crate::shell::command_parts` for why each.
+        let (program, shell_args) = crate::shell::command_parts();
+        let mut child = Command::new(program);
         child
-            .arg("-lc")
+            .args(shell_args)
             .arg(&args.command)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -1113,6 +1120,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Unix-only: the fixture is a `#!/usr/bin/env bash` script made
+    // executable with `chmod`, which Windows has no equivalent for.
+    // The output compression under test is platform-independent; only
+    // this way of standing up a fake `cargo` is not.
+    #[cfg(unix)]
     async fn run_shell_command_compresses_cargo_test_success_noise() {
         let workspace = tempfile::tempdir().unwrap();
         let cargo = workspace.path().join("cargo");
@@ -1136,6 +1148,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Unix-only: the fixture is a `#!/usr/bin/env bash` script made
+    // executable with `chmod`, which Windows has no equivalent for.
+    // The output compression under test is platform-independent; only
+    // this way of standing up a fake `cargo` is not.
+    #[cfg(unix)]
     async fn run_shell_command_keeps_cargo_test_failures_visible() {
         let workspace = tempfile::tempdir().unwrap();
         let cargo = workspace.path().join("cargo");
@@ -1176,6 +1193,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Unix-only: the fixture is a `#!/usr/bin/env bash` script made
+    // executable with `chmod`, which Windows has no equivalent for.
+    // The output compression under test is platform-independent; only
+    // this way of standing up a fake `cargo` is not.
+    #[cfg(unix)]
     async fn run_shell_command_without_compression_keeps_raw_output() {
         let workspace = tempfile::tempdir().unwrap();
         let cargo = workspace.path().join("cargo");
@@ -1367,16 +1389,19 @@ mod file_lifecycle_tool_tests {
         let workspace = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(workspace.path());
 
+        // `mode` is optional and Unix-only (`files::set_mode` refuses it
+        // elsewhere), so it is left out off Unix — the life cycle this test
+        // covers is the same either way.
+        let mut create_args = vec![
+            ("path", json!("src/a.txt")),
+            ("content", json!("one\ntwo\n")),
+            ("parents", json!(true)),
+        ];
+        if cfg!(unix) {
+            create_args.push(("mode", json!("0640")));
+        }
         executor
-            .execute(
-                "create_file",
-                &args(&[
-                    ("path", json!("src/a.txt")),
-                    ("content", json!("one\ntwo\n")),
-                    ("mode", json!("0640")),
-                    ("parents", json!(true)),
-                ]),
-            )
+            .execute("create_file", &args(&create_args))
             .await
             .expect("create_file");
         assert_eq!(

@@ -431,7 +431,12 @@ mod real_model_tests {
             *v /= norm;
         }
 
-        let reference: Vec<f32> = include_str!("testdata/qwen3vl_embedding_reference.csv")
+        let Some(csv) =
+            crate::engine::arch::read_reference_fixture("qwen3vl_embedding_reference.csv")
+        else {
+            return;
+        };
+        let reference: Vec<f32> = csv
             .trim()
             .split(',')
             .map(|v| v.parse().expect("reference fixture value"))

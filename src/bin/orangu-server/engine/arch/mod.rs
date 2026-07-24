@@ -28,6 +28,31 @@ use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::ModelConfig;
 use anyhow::Result;
 
+/// Reads one of the `testdata/` reference vectors the `#[ignore]`d
+/// real-model embedding tests compare against, returning `None` (with a
+/// note on stderr) when it isn't there.
+///
+/// Read at run time rather than through `include_str!` on purpose. These
+/// fixtures are ground truth captured from real llama.cpp, so a checkout
+/// may legitimately be missing one that nobody has generated yet — and a
+/// compile-time include turns that into a build failure for the *whole*
+/// test binary, including every test that never touches a fixture. A
+/// missing fixture now skips its own test and nothing else, which is how
+/// these tests already treat a missing `ORANGU_TEST_*_MODEL`.
+#[cfg(test)]
+pub fn read_reference_fixture(name: &str) -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/bin/orangu-server/engine/arch/testdata")
+        .join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(err) => {
+            eprintln!("skipping: no reference fixture {} ({err})", path.display());
+            None
+        }
+    }
+}
+
 /// Repeat-penalty state a caller passes to [`ModelForward::forward_maybe_
 /// sampling`] when it wants greedy sampling done for it.
 /// `recent_tokens` must already be trimmed to the sampler's own

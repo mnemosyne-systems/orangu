@@ -1661,6 +1661,13 @@ fn busy_poll() -> bool {
     *B.get_or_init(|| std::env::var_os("ORANGU_BUSY_POLL").is_some())
 }
 
+/// How long [`VulkanBackend::wait_mapped`] keeps polling for a buffer's map
+/// callback before it treats the device as lost and panics, rather than
+/// blocking a request forever. A real readback resolves in well under a
+/// millisecond; this only ever bounds a wedged or lost device, so it is set
+/// far above any legitimate wait.
+const READBACK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// If `ORANGU_DUMP_SHADERS=<dir>` is set, writes the generated WGSL for the
 /// decode-path kernels into `<dir>` (one `.wgsl` file each) at backend
 /// startup, then continues normally. A profiling aid: the driver's own
@@ -4148,14 +4155,18 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The same map + wait as `submit_and_readback_u32`, sharing
+        // `wait_mapped` so this readback is not left carrying the single-poll
+        // race that method's doc comment describes.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_cb = done.clone();
         readback_buffer
             .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
+            .map_async(wgpu::MapMode::Read, move |result| {
                 result.expect("mapping a generic readback buffer failed");
+                done_cb.store(true, std::sync::atomic::Ordering::Release);
             });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling for a generic readback failed");
+        self.wait_mapped(&done);
         let data = readback_buffer
             .slice(..)
             .get_mapped_range()
@@ -4171,24 +4182,55 @@ impl VulkanBackend {
     /// that kernel, reading back 4 bytes instead of the `[n_vocab]` logits
     /// vector `submit_and_readback` would otherwise need.
     /// Waits for a pending `map_async` whose callback stores `true` into
-    /// `done`. The blocking path issues one `PollType::Wait` (which parks
-    /// the thread until the GPU work behind the map completes); the
-    /// `ORANGU_BUSY_POLL` path spins on non-blocking `PollType::Poll` until
-    /// the callback has run, keeping the calling core hot (see
-    /// [`busy_poll`]). Either way the map is complete on return, so the
-    /// subsequent `get_mapped_range` never races.
+    /// `done`, so the map is complete on return and the subsequent
+    /// `get_mapped_range` never races.
+    ///
+    /// Both modes **loop until the callback has actually run**, rather than
+    /// trusting a single poll. `wgpu` invokes map callbacks during a `poll`,
+    /// and when several threads share one `Device` — the tests do, and so
+    /// does the server under concurrent requests — a `PollType::Wait` can
+    /// return having synced the GPU but *before this buffer's own callback
+    /// has fired*, because the callback drain races between concurrent
+    /// pollers. A single wait is therefore not enough on its own; re-polling
+    /// picks the callback up on the next pass. (An earlier version asserted
+    /// one wait sufficed and tripped intermittently under exactly that
+    /// contention.)
+    ///
+    /// The blocking path parks the thread on `PollType::Wait`; the
+    /// `ORANGU_BUSY_POLL` path spins on non-blocking `PollType::Poll` to keep
+    /// the calling core hot (see [`busy_poll`]). Either way the loop is
+    /// bounded by [`READBACK_WAIT_TIMEOUT`] so a lost device panics with a
+    /// clear message instead of hanging the request forever.
     fn wait_mapped(&self, done: &std::sync::atomic::AtomicBool) {
         use std::sync::atomic::Ordering;
-        if busy_poll() {
-            while !done.load(Ordering::Acquire) {
-                let _ = self.device.poll(wgpu::PollType::Poll);
-                std::hint::spin_loop();
-            }
-        } else {
+        let spin = busy_poll();
+        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        loop {
+            let poll_type = if spin {
+                wgpu::PollType::Poll
+            } else {
+                wgpu::PollType::wait_indefinitely()
+            };
             self.device
-                .poll(wgpu::PollType::wait_indefinitely())
+                .poll(poll_type)
                 .expect("polling for a GPU readback failed");
-            debug_assert!(done.load(Ordering::Acquire));
+            if done.load(Ordering::Acquire) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "GPU readback map did not complete within {READBACK_WAIT_TIMEOUT:?}; \
+                     the device may be lost"
+                );
+            }
+            if spin {
+                std::hint::spin_loop();
+            } else {
+                // The blocking `Wait` above returned without our callback yet
+                // — the queue is now empty, so re-polling returns at once;
+                // yield so a co-scheduled poller isn't starved between passes.
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -10586,7 +10628,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         };
 
         let elems = block_elems(ggml_type);
-        assert!(in_dim % elems == 0, "in_dim must be a multiple of {elems}");
+        assert!(
+            in_dim.is_multiple_of(elems),
+            "in_dim must be a multiple of {elems}"
+        );
         let n_blocks_per_row = in_dim / elems;
 
         let mut seed = 0xC0FFEE_u64;

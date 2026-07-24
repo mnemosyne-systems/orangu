@@ -34,6 +34,7 @@ pub mod model_download;
 pub mod model_spec;
 
 pub mod session;
+pub mod shell;
 pub mod skills;
 pub mod tools;
 pub mod tui;

@@ -56,6 +56,13 @@ struct ActiveProcess {
 /// exit signal or "timed out".
 const OUTPUT_TAIL_LINES: usize = 20;
 
+/// How long a failed startup waits for the output-capture tasks to finish
+/// draining before it gives up and reports whatever it has. They normally
+/// finish immediately — the pipes are at EOF once the process is gone —
+/// so this only bounds the case where something else inherited a pipe and
+/// is holding it open.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Rolling tail of a process's combined stdout/stderr output.
 type OutputTail = Arc<Mutex<VecDeque<String>>>;
 
@@ -446,14 +453,20 @@ impl Coordinator {
             .store(child.id().unwrap_or(0), Ordering::Relaxed);
 
         let tail: OutputTail = Arc::new(Mutex::new(VecDeque::new()));
+        // Kept so a startup failure can wait for these to drain before it
+        // reports what the process said — see `wait_until_healthy`.
+        let mut capture = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            spawn_output_capture(stdout, tail.clone(), self.quiet);
+            capture.push(spawn_output_capture(stdout, tail.clone(), self.quiet));
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_output_capture(stderr, tail.clone(), self.quiet);
+            capture.push(spawn_output_capture(stderr, tail.clone(), self.quiet));
         }
 
-        if let Err(err) = self.wait_until_healthy(entry, &mut child, &tail).await {
+        if let Err(err) = self
+            .wait_until_healthy(entry, &mut child, &tail, capture)
+            .await
+        {
             let _ = child.start_kill();
             let _ = child.wait().await;
             self.current_pid.store(0, Ordering::Relaxed);
@@ -468,6 +481,7 @@ impl Coordinator {
         entry: &CoordinatorLlmEntry,
         child: &mut tokio::process::Child,
         tail: &OutputTail,
+        capture: Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<()> {
         let startup_timeout = self.config.read().unwrap().startup_timeout_seconds;
         let deadline = Instant::now() + Duration::from_secs(startup_timeout);
@@ -475,6 +489,21 @@ impl Coordinator {
 
         loop {
             if let Ok(Some(status)) = child.try_wait() {
+                // `try_wait` sees the exit the instant it happens, but the
+                // tasks draining stdout/stderr into `tail` are separate —
+                // on a loaded machine they may not have run yet. Reporting
+                // straight away is how a crash could still surface as a
+                // bare status with no diagnostic, which is the very thing
+                // capturing the output was meant to prevent. The pipes are
+                // at EOF now that the process is gone, so these finish on
+                // their own; the timeout only guards against a stray child
+                // inheriting a pipe and holding it open.
+                let _ = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+                    for task in capture {
+                        let _ = task.await;
+                    }
+                })
+                .await;
                 return Err(anyhow!(
                     "orangu-server for '{}' exited before becoming ready (status: {status}){}",
                     entry.name,
@@ -516,7 +545,7 @@ fn spawn_output_capture(
     stream: impl AsyncRead + Send + Unpin + 'static,
     tail: OutputTail,
     quiet: bool,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -529,7 +558,7 @@ fn spawn_output_capture(
             }
             tail.push_back(line);
         }
-    });
+    })
 }
 
 /// Formats a process's captured output tail as an error-message suffix:

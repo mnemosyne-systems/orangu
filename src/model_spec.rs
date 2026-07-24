@@ -267,9 +267,18 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
         std::fs::remove_file(path)
             .with_context(|| format!("failed to delete {}", path.display()))?;
 
+        // `blob_target` came from `canonicalize`, so every path it is
+        // compared against has to be canonical too. On macOS the temporary
+        // and home directories reach the filesystem through a symlink
+        // (`/var` → `/private/var`), so a canonical blob path and an
+        // uncanonicalized repo root disagree on their prefix and none of
+        // this ran — the blob survived its last symlink and the space was
+        // never reclaimed. Linux has no such symlink, which is why that
+        // only ever showed up off Linux.
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         if let Some(blob) = blob_target
             && let Some(repo_root) = hf_repo_root_from_path(path)
-            && blob.starts_with(repo_root.join("blobs"))
+            && blob.starts_with(canonical(&repo_root).join("blobs"))
             && !blob_still_referenced(&repo_root, &blob)
             && std::fs::remove_file(&blob).is_ok()
         {
@@ -278,7 +287,11 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
             // upward sweep — otherwise a now-empty `blobs/` (and, once
             // both it and `snapshots/` are gone, the whole repo directory)
             // would survive even though nothing is left inside it.
-            remove_empty_ancestors(&blob, models_dir);
+            //
+            // Swept against a canonical `models_dir` for the same reason
+            // the prefix test above uses one: `blob` is canonical, and the
+            // sweep stops the moment an ancestor stops matching `stop_at`.
+            remove_empty_ancestors(&blob, &canonical(models_dir));
         }
 
         remove_empty_ancestors(path, models_dir);

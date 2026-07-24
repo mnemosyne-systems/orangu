@@ -2,15 +2,22 @@ name: Rust CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, ci ]
   pull_request:
     branches: [ main ]
+
+# A second push to the same branch makes the in-flight run obsolete. The
+# three-OS test matrix is the expensive part, so cancelling early matters
+# more here than it did when every job was a single ubuntu runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -21,7 +28,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - uses: Swatinem/rust-cache@v2
     - name: Install stable toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -33,14 +40,181 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - uses: Swatinem/rust-cache@v2
     - name: Install stable toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
+    # `--all-targets` so test code is linted too, not just what ships. It
+    # is the larger half of some modules, and was going unchecked.
     - name: Run cargo clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
+
+  # Puts the GGUF the real-model tests need into the Actions cache, so the
+  # three `test` jobs restore it instead of pulling ~4 GB from Hugging Face
+  # each. One job does the fetching: three matrix jobs missing the cache in
+  # parallel would download the same file three times and then race to save
+  # the same key, of which only the first write wins anyway.
+  #
+  # On a cache hit this job is a lookup and nothing else — `lookup-only`
+  # skips actually restoring 3 GB this job has no use for. Only a miss pays
+  # for the build and the download.
+  model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      key: ${{ env.MODEL_CACHE_KEY }}
+    env:
+      # Bump the trailing version to force a re-download (a new upstream
+      # upload, or a change to what this job stores). Everything else in
+      # the key is fixed on purpose: pinning it to the upstream commit
+      # would turn any re-upload by the model author into a surprise 4 GB
+      # download in an unrelated pull request.
+      MODEL_CACHE_KEY: gguf-gemma-4-E2B-it-Q4_K_M-v1
+      MODELS: ${{ github.workspace }}/.ci-models
+    steps:
+      - uses: actions/checkout@v5
+      - name: Look up the cached model
+        id: lookup
+        uses: actions/cache/restore@v4
+        with:
+          # Relative on purpose. actions/cache derives an internal
+          # cache *version* by hashing this input as written, so an
+          # absolute path — which contains /home/runner on Linux and
+          # /Users/runner on macOS — hashes differently per platform
+          # and can never be restored across them, key match or not.
+          # A relative path is the same literal on every runner, and
+          # resolves against the workspace just the same.
+          path: .ci-models
+          key: ${{ env.MODEL_CACHE_KEY }}
+          lookup-only: true
+          enableCrossOsArchive: true
+      - name: Install stable toolchain
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: steps.lookup.outputs.cache-hit != 'true'
+        with:
+          key: model
+      - name: Configure orangu-server for this runner
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.orangu "$MODELS"
+          # `download` resolves its target against `[orangu-server].models`,
+          # so a config file is the one prerequisite. Everything else is
+          # what a headless runner wants: no GPU to find, no second
+          # listener to bind, one slot.
+          cat > ~/.orangu/orangu-server.conf <<CONF
+          [orangu-server]
+          models = $MODELS
+          backend = cpu
+          host = 127.0.0.1
+          port = 8080
+          web = 0
+          slots = 1
+          CONF
+          cat ~/.orangu/orangu-server.conf
+      - name: Download the model
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo build --release --bin orangu-server
+          # Pin the quant rather than letting the default tag preference
+          # pick it, so the cache key above stays an accurate description
+          # of what is in the cache.
+          ./target/release/orangu-server download unsloth/gemma-4-E2B-it-GGUF:Q4_K_M | tee download.log
+          path=$(sed -n 's/^Downloaded to //p' download.log)
+          test -n "$path" && test -f "$path"
+          # Store one plain file rather than the Hugging Face tree. That
+          # drops the ~1 GB mmproj sibling `download` fetches alongside the
+          # model (nothing tested here is multimodal), and avoids the
+          # blobs/snapshots symlinks, which do not survive a restore onto
+          # Windows.
+          cp -L "$path" "$MODELS/model.gguf.part"
+          rm -rf "$MODELS"/models--* download.log
+          mv "$MODELS/model.gguf.part" "$MODELS/model.gguf"
+          ls -l "$MODELS"
+      - name: Save the model to the cache
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          # Relative for cross-platform cache versioning — see the
+          # `model` job's lookup step.
+          path: .ci-models
+          key: ${{ env.MODEL_CACHE_KEY }}
+          enableCrossOsArchive: true
+
+  # Unit tests on all three supported platforms. `format`/`lint`/`audit`
+  # stay ubuntu-only on purpose: rustfmt, clippy and the advisory database
+  # are platform-independent, so running them three times would only spend
+  # runner minutes to reach the same verdict. What is genuinely per-platform
+  # is whether the code compiles and behaves the same — that is this job.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: model
+    timeout-minutes: 90
+    strategy:
+      # One platform failing should not hide whether the other two pass —
+      # that is the whole point of testing on three.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      MODELS: ${{ github.workspace }}/.ci-models
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Run cargo test
+        run: cargo test
+      - name: Restore the cached model
+        uses: actions/cache/restore@v4
+        with:
+          # Relative for cross-platform cache versioning — see the
+          # `model` job's lookup step.
+          path: .ci-models
+          key: ${{ needs.model.outputs.key }}
+          # The `model` job has already guaranteed this key exists, so a
+          # miss here is a bug in the workflow rather than a condition to
+          # tolerate — fail instead of silently skipping the tests below.
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+      # `--ignored` as a whole cannot be used: most of these tests want a
+      # different model (`ORANGU_TEST_MOE_MODEL`, `ORANGU_TEST_PLKV_MODEL`,
+      # a qwen or embedding GGUF), a Vulkan device, or are `_scratch_`
+      # benchmarks. Named individually, these two are exactly the ones the
+      # cached gemma-4-E2B GGUF satisfies on CPU.
+      #
+      # `--release` is not optional: a CPU forward pass of a 5B model in a
+      # debug build turns seconds into a timeout.
+      - name: Run real-model tests
+        # `run` defaults to PowerShell on Windows, where `\` does not continue
+        # a line — the command silently became `cargo test … \`, matched no
+        # test at all, and then failed on the orphaned second line. Naming
+        # bash keeps one syntax across all three platforms.
+        shell: bash
+        env:
+          ORANGU_TEST_MODEL: ${{ github.workspace }}/.ci-models/model.gguf
+        run: |
+          set -euo pipefail
+          for test in gemma4_predicts_paris_after_capital_of_france \
+                      forward_batch_decode_matches_independent_forward_calls_cpu; do
+            cargo test --release --bin orangu-server \
+              "engine::arch::gemma::real_model_tests::$test" \
+              -- --ignored --exact --nocapture | tee result.log
+            # A filter matching nothing is a *success* to libtest — it exits 0
+            # reporting "0 passed". Renaming or moving one of these tests would
+            # otherwise quietly stop testing it while CI stayed green, so
+            # require that a test actually ran.
+            grep -q '^test result: ok\. 1 passed' result.log
+          done
+          rm -f result.log
 
   audit:
     runs-on: ubuntu-latest
@@ -51,7 +225,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run cargo audit
         uses: rustsec/audit-check@v1.4.1
         with:

@@ -827,6 +827,13 @@ mod tests {
         assert!(output.contains("println!"));
     }
 
+    // Unix-only: it stands in a fake `bat` as a `#!/bin/sh` script made
+    // executable with `chmod`, and puts it on `PATH` with `:` as the
+    // separator. Windows has no equivalent of the first and uses `;` for the
+    // second. What is under test — the flags `show_file_output` passes to
+    // `bat` — is platform-independent; only this way of intercepting them is
+    // not.
+    #[cfg(unix)]
     #[test]
     fn show_file_uses_bat_when_available_without_metadata_columns() {
         let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());

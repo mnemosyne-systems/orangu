@@ -7,3 +7,5 @@ rpmbuild/
 *.svg
 *.txt
 llama.cpp/
+.ci-models/
+src/bin/orangu-server/engine/arch/testdata/*.csv

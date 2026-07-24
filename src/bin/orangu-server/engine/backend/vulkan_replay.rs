@@ -40,6 +40,17 @@ use ash::vk;
 
 /// The `wgpu-hal` API marker for the Vulkan backend — `as_hal::<Vulkan>()`
 /// yields the `wgpu_hal::vulkan::*` types this module reaches into.
+///
+/// Apple targets build `wgpu` against Metal and have no Vulkan backend at all,
+/// so neither this marker type nor `naga`'s SPIR-V writer (which rides in on
+/// the same `vulkan` feature) exists there. The three items that reach through
+/// them — [`ReplayContext::from_wgpu`], [`compile_wgsl_to_spirv`] and
+/// [`raw_buffer_handle`] — are therefore compiled per-target, the Apple side
+/// reporting "no Vulkan here" through the `None`/`Err` each already returns for
+/// a non-Vulkan adapter. Everything else in this module, including every
+/// capture type `vulkan.rs` and `gemma.rs` record into, is portable and is
+/// compiled everywhere.
+#[cfg(not(target_vendor = "apple"))]
 type Vulkan = wgpu::hal::api::Vulkan;
 
 /// An owned handle onto the raw Vulkan objects underneath a `wgpu::Device`.
@@ -73,6 +84,7 @@ impl ReplayContext {
     /// `wgpu::Device` alive for the lifetime of this context, and must not
     /// submit to `queue` concurrently with `wgpu` (both require external
     /// synchronization on the `VkQueue`).
+    #[cfg(not(target_vendor = "apple"))]
     pub unsafe fn from_wgpu(device: &wgpu::Device) -> Option<ReplayContext> {
         let hal = unsafe { device.as_hal::<Vulkan>()? };
         let instance = hal.shared_instance().raw_instance().clone();
@@ -93,6 +105,19 @@ impl ReplayContext {
         })
     }
 
+    /// Apple build of [`Self::from_wgpu`]. There is no Vulkan backend to reach
+    /// through here, which is the same "not the Vulkan backend" answer the
+    /// real one already gives on a non-Vulkan adapter — so every caller's
+    /// existing `None` gate covers this with no change.
+    ///
+    /// # Safety
+    /// Trivially safe (it borrows nothing), but kept `unsafe` so the signature
+    /// matches the target this stands in for.
+    #[cfg(target_vendor = "apple")]
+    pub unsafe fn from_wgpu(_device: &wgpu::Device) -> Option<ReplayContext> {
+        None
+    }
+
     /// Picks a memory type index satisfying `type_bits` (from a buffer's
     /// `MemoryRequirements`) and containing all of `flags`.
     fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -109,6 +134,7 @@ impl ReplayContext {
 /// The entry point must be named `main`. `@group(0) @binding(n)` in the WGSL
 /// becomes descriptor set 0, binding `n` — matching the single-set layout this
 /// module builds per pipeline.
+#[cfg(not(target_vendor = "apple"))]
 pub fn compile_wgsl_to_spirv(src: &str, api_version: u32) -> Result<Vec<u32>, String> {
     use wgpu::naga;
     let module = naga::front::wgsl::parse_str(src).map_err(|e| format!("wgsl parse: {e:?}"))?;
@@ -157,6 +183,35 @@ pub fn compile_wgsl_to_spirv(src: &str, api_version: u32) -> Result<Vec<u32>, St
     };
     naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| format!("spv write: {e:?}"))
+}
+
+/// Apple build of [`compile_wgsl_to_spirv`]. `naga`'s `spv-out` writer is only
+/// compiled in by `wgpu`'s `vulkan` feature, which Apple targets do not build,
+/// so there is nothing to compile SPIR-V with. Unreachable in practice —
+/// [`ReplayContext::from_wgpu`] already returns `None` here, so no graph gets
+/// as far as compiling a shader — but it keeps the module's surface identical
+/// across targets rather than making every caller target-aware.
+#[cfg(target_vendor = "apple")]
+pub fn compile_wgsl_to_spirv(_src: &str, _api_version: u32) -> Result<Vec<u32>, String> {
+    Err("SPIR-V compilation is unavailable: wgpu has no Vulkan backend on Apple targets".into())
+}
+
+/// The raw `VkBuffer` behind a `wgpu::Buffer`, for binding orangu's existing
+/// GPU-resident buffers into the replay graph without copying them.
+#[cfg(not(target_vendor = "apple"))]
+fn raw_buffer_handle(b: &wgpu::Buffer) -> Result<vk::Buffer, String> {
+    unsafe {
+        b.as_hal::<Vulkan>()
+            .map(|h| h.raw_handle())
+            .ok_or_else(|| "buffer is not a Vulkan buffer".to_string())
+    }
+}
+
+/// Apple build of [`raw_buffer_handle`] — see [`compile_wgsl_to_spirv`]'s
+/// counterpart for why this is unreachable rather than merely unsupported.
+#[cfg(target_vendor = "apple")]
+fn raw_buffer_handle(_b: &wgpu::Buffer) -> Result<vk::Buffer, String> {
+    Err("buffer is not a Vulkan buffer: wgpu has no Vulkan backend on Apple targets".into())
 }
 
 /// A raw host-visible, coherent, persistently-mapped buffer we own outright —
@@ -875,11 +930,7 @@ impl ReplayGraph {
             // graph so `update_per_token` can patch them each token.
             let mut per_token: Vec<(MappedBuffer, Vec<PerTokenField>)> = Vec::new();
 
-            let raw = |b: &wgpu::Buffer| -> Result<vk::Buffer, String> {
-                b.as_hal::<Vulkan>()
-                    .map(|h| h.raw_handle())
-                    .ok_or_else(|| "buffer is not a Vulkan buffer".to_string())
-            };
+            let raw = raw_buffer_handle;
 
             for step in steps {
                 match step {
@@ -1154,7 +1205,12 @@ pub fn host_inputs(steps: &[CaptureStep]) -> Vec<(HostInputTag, wgpu::Buffer, u6
         .collect()
 }
 
-#[cfg(test)]
+// Not built on Apple targets. These exercise the raw-Vulkan path, and their
+// usual "skip if there is no adapter" guard does not cover this case: `wgpu`
+// finds a *Metal* adapter on macOS, so `shared_backend()` returns `Some` and
+// the tests proceed to ask for `VkBuffer` handles that cannot exist there.
+// Excluded at compile time rather than left to fail at run time.
+#[cfg(all(test, not(target_vendor = "apple")))]
 mod tests {
     use super::*;
 
@@ -1327,7 +1383,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `as_hal` surface. The handle is `Copy`; the `wgpu::Buffer` must outlive
     /// its use (the underlying `VkBuffer` lives as long as the wgpu buffer).
     unsafe fn raw_vk_buffer(buf: &wgpu::Buffer) -> vk::Buffer {
-        unsafe { buf.as_hal::<Vulkan>().expect("vulkan buffer").raw_handle() }
+        // Via the module's own helper rather than `as_hal` directly, so this
+        // resolves per-target like every other reach into the Vulkan backend
+        // (the marker type does not exist on Apple). Unreachable there
+        // regardless — every test calling this skips first on
+        // `shared_backend()` returning `None`.
+        super::raw_buffer_handle(buf).expect("vulkan buffer")
     }
 
     /// The keystone: run orangu's **real** `rmsnorm` WGSL through the raw path,

@@ -1402,7 +1402,11 @@ mod tests {
                 workspace.path(),
                 crate::commands::CreateFileArgs {
                     path: std::borrow::Cow::Borrowed(path),
-                    mode: Some(std::borrow::Cow::Borrowed("0644")),
+                    // Optional, and Unix-only — `files::set_mode` refuses a
+                    // mode off Unix rather than silently ignoring it, so
+                    // asking for one there would fail the create outright.
+                    // The staging this test is about happens either way.
+                    mode: cfg!(unix).then(|| std::borrow::Cow::Borrowed("0644")),
                     content: content.map(std::borrow::Cow::Borrowed),
                 },
             )
@@ -1411,6 +1415,9 @@ mod tests {
 
         match create("notes.md", Some("first")) {
             CommandOutcome::Output(message) => {
+                assert!(message.starts_with("Created notes.md"), "{message}");
+                // Only reported where a mode was asked for and applied.
+                #[cfg(unix)]
                 assert!(message.starts_with("Created notes.md (0644)"), "{message}");
                 assert!(message.contains("(staged)"), "{message}");
             }

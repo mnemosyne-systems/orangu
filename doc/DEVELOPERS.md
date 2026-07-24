@@ -18,6 +18,105 @@ cargo fmt
 cargo test
 ```
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests.
+
+`format`, `lint` and `audit` run on `ubuntu-latest` only — rustfmt, clippy
+and the advisory database give the same verdict on every platform, so
+running them three times would only spend runner minutes. `test` runs the
+full suite on `ubuntu-latest`, `macos-latest` and `windows-latest`, because
+whether the code compiles and behaves identically is the one thing that is
+genuinely per-platform.
+
+### The cached model
+
+The `#[ignore]`d real-model tests need a GGUF, and re-downloading ~4 GB from
+Hugging Face for every job on every run is not viable. A `model` job fetches
+it once with `orangu-server download` and puts it in the GitHub Actions
+cache; the three `test` jobs restore it.
+
+Notes on how it is set up, and why:
+
+- **One job fetches.** Three matrix jobs missing the cache in parallel would
+  each download the same file and then race to save the same key, of which
+  only the first write wins.
+- **One file is cached, not the Hugging Face tree.** `download` also fetches
+  the ~1 GB `mmproj` sibling, which nothing here tests, and lays the model
+  out as `blobs`/`snapshots` symlinks that do not survive a restore onto
+  Windows. The job flattens it to a single `model.gguf` and caches that.
+- **One cache entry is shared across all three platforms**, via
+  `enableCrossOsArchive: true`. A repository gets 10 GB of cache in total,
+  shared with the `Swatinem/rust-cache` entries, so three per-OS copies of
+  the model would evict everything else.
+- **Caches are evicted after 7 days without a hit**, so a quiet week costs
+  one re-download. That is deliberate — the alternative is pinning the key
+  to the upstream commit, which turns any re-upload by the model author into
+  a surprise 4 GB download in an unrelated pull request.
+- To force a re-download, bump the trailing version in `MODEL_CACHE_KEY`
+  (`gguf-gemma-4-E2B-it-Q4_K_M-v1`). Cache entries are immutable, so
+  changing what the job stores requires a new key.
+
+`orangu-server download` resolves its target against
+`[orangu-server].models`, so the job writes a `~/.orangu/orangu-server.conf`
+first, pointing at the workspace and pinning `backend = cpu` (no GPU on a
+runner) with `web = 0` (no second listener to bind).
+
+Only the two tests the cached gemma-4-E2B GGUF actually satisfies are run,
+named individually. `-- --ignored` as a whole would not work: the other
+ignored tests want a different model (`ORANGU_TEST_MOE_MODEL`,
+`ORANGU_TEST_PLKV_MODEL`, a qwen or embedding GGUF), a Vulkan device, or are
+`_scratch_` benchmarks. They also need `--release`; a CPU forward pass of a
+5B model in a debug build turns seconds into a timeout.
+
+### Reference fixtures
+
+The `#[ignore]`d embedding tests compare against vectors captured from real
+llama.cpp, in `src/bin/orangu-server/engine/arch/testdata/`.
+
+**These are generated, not committed.** They are gitignored, and are read at
+run time (`engine::arch::read_reference_fixture`) rather than through
+`include_str!`, so a checkout without them still compiles and each affected
+test simply skips. Generate one when you want to run the test that uses it.
+Always capture from llama.cpp, never from orangu's own output — the whole
+point is an independent implementation to cross-check against.
+
+Each test's doc comment records the exact llama.cpp build, model, invocation
+and input its vector came from. For `embeddinggemma_reference.csv`:
+
+```sh
+llama-server -m /path/to/embeddinggemma-300M-Q8_0.gguf \
+    --embedding --pooling mean --ctx-size 2048 --port 18080
+
+# Confirm the tokenization still matches the ids the test feeds directly —
+# [2, 818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 1].
+curl -s localhost:18080/tokenize \
+    -d '{"content":"The quick brown fox jumps over the lazy dog","add_special":true}'
+
+curl -s localhost:18080/embedding \
+    -d '{"content":"The quick brown fox jumps over the lazy dog"}' \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin)[0]["embedding"][0]; \
+      print(",".join(repr(x) for x in v))' \
+  > src/bin/orangu-server/engine/arch/testdata/embeddinggemma_reference.csv
+```
+
+Then run the test against it:
+
+```sh
+ORANGU_TEST_EMBEDDING_MODEL=/path/to/embeddinggemma-300M-Q8_0.gguf \
+    cargo test --release --bin orangu-server \
+    gemma_embedding_matches_real_llama_cpp -- --ignored
+```
+
+`qwen3vl_embedding_reference.csv` follows the same pattern but needs a
+`Qwen3-VL-Embedding-8B` GGUF and `--pooling last`; see
+`qwen3vl_embedding_matches_real_llama_cpp`'s doc comment in
+`engine/arch/llama.rs`.
+
+CI never generates these: the tests that use them need embedding models that
+are not cached there, so they skip, exactly as an unset `ORANGU_TEST_*_MODEL`
+already makes them skip.
+
 ## Documentation workflow
 
 The manual sources live under `doc/manual/en`.
