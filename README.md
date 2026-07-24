@@ -330,7 +330,17 @@ Useful first commands:
 
 ## Tested platforms
 
-- [Fedora](https://getfedora.org/) 44
+Continuous integration builds and runs the full test suite on every push and
+pull request across all three supported operating systems, using
+GitHub-hosted runners:
+
+| Operating system | CI runner |
+| :-- | :-- |
+| Linux | `ubuntu-latest` |
+| macOS | `macos-latest` |
+| Windows | `windows-latest` |
+
+Day-to-day development happens on [Fedora](https://getfedora.org/) 44.
 
 ## Sponsors
 
