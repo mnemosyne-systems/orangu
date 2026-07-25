@@ -68,7 +68,7 @@ const THEME_SELECTOR: &str = orangu::tui::Theme::RANDOM_SELECTOR;
 /// Theme values the wizard offers for `theme`: every theme compiled into the
 /// binary, plus the selector. Derived from the runtime list so the wizard's
 /// completion and ghost hints can never drift from the shipped themes. User
-/// theme files can still be selected at runtime with `/theme` or `--theme`,
+/// theme files can still be selected at runtime with `/theme` or `-t`/`--theme`,
 /// but the wizard only writes known-good bundled values.
 fn theme_options() -> Vec<String> {
     let mut options = orangu::tui::Theme::built_in_theme_names();

@@ -5,17 +5,19 @@
 **orangu** has shell completion built in. Run `orangu -s` to print the
 completion script for the shell detected from `$SHELL`, then source it:
 
-| Short | Long                  | Completion    |
-| ----- | --------------------- | ------------- |
-| `-c`  | `--config`            | files         |
-| `-w`  | `--workspace`         | directories   |
-| `-r`  | `--resume`            | session UUIDs |
-| `-a`  | `--all`               | —             |
-| `-p`  | `--prompt`            | —             |
-| `-l`  | `--list`              | —             |
-| `-i`  | `--init`              | —             |
-| `-s`  | `--shell-completions` | —             |
-| `-h`  | `--help`              | —             |
+| Short | Long                  | Completion              |
+| ----- | --------------------- | ----------------------- |
+| `-c`  | `--config`            | files                   |
+| `-t`  | `--theme`             | theme names and `.theme` files |
+| `-w`  | `--workspace`         | directories             |
+| `-r`  | `--resume`            | session UUIDs           |
+| `-a`  | `--all`               | —                       |
+| `-p`  | `--prompt`            | —                       |
+| `-q`  | `--quiet`             | —                       |
+| `-l`  | `--list`              | —                       |
+| `-i`  | `--init`              | —                       |
+| `-s`  | `--shell-completions` | —                       |
+| `-h`  | `--help`              | —                       |
 
 Completion for `--resume` scans `~/.orangu/sessions/` for the available session
 UUIDs and offers them newest first. The in-app `/session` Tab completion offers

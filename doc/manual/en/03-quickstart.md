@@ -176,7 +176,7 @@ comment on 42 with auto review  # post it on GitHub/GitLab issue/PR #42
 
 By default the tools operate on the current directory. Use `--workspace /path/to/project` to point **orangu** at another tree.
 
-The startup flags have short forms: `-c` for `--config`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the tabs from the previous run), `-l` for `--list` (print every stored session as a table and exit), and `-i` for `--init`.
+Every startup flag has a short form: `-c` for `--config`, `-t` for `--theme`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the tabs from the previous run), `-l` for `--list` (print every stored session as a table and exit), `-i` for `--init`, `-p` for `--prompt` (run one prompt or command and exit), `-q` for `--quiet` (print nothing on success), and `-s` for `--shell-completions`. `orangu --help` lists them all.
 
 **orangu** automatically resumes an existing session when you return to the same workspace and Git branch. When a previous session is found, the status bar shows:
 

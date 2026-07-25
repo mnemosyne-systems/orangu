@@ -129,18 +129,21 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// Path to the configuration file; defaults to ./orangu.conf, then
+    /// ~/.orangu/orangu.conf.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Override the configured TUI theme. Pass a shipped/user theme name, or a
-    /// path to a `.theme` file (typically under `~/.orangu/themes/`).
-    #[arg(long)]
+    /// Override the configured TUI theme.
+    #[arg(short = 't', long = "theme")]
     theme: Option<String>,
+    /// Workspace root the local tools operate on; defaults to the current
+    /// directory.
     #[arg(short, long)]
     workspace: Option<PathBuf>,
+    /// Resume a stored session by UUID.
     #[arg(short, long)]
     resume: Option<String>,
-    /// Reopen the workspace tabs that were open at the end of the last run
-    /// (saved in ~/.orangu/workspaces).
+    /// Reopen the workspace tabs that were open at the end of the last run.
     #[arg(short = 'a', long = "all")]
     all: bool,
     /// List all stored sessions as a table (SESSION, WORKSPACE, BRANCH) and exit.
@@ -150,24 +153,20 @@ struct Args {
     #[arg(short, long)]
     init: bool,
     /// Send a single prompt to the configured server, print the answer on the
-    /// console and exit. No terminal UI and no session on disk; timings are
-    /// printed on stderr, so `orangu -p "Hello"` is the quick way to tell a slow
-    /// server from a slow prompt.
+    /// console and exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
+    /// Print nothing on success: no answer, no command output, no diagnostics.
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
     /// Print the shell completion script for the detected shell and exit.
-    ///
-    /// Detects the current shell from $SHELL. Pipe into your shell's eval or
-    /// drop the output into the appropriate completions directory:
-    ///
-    ///   bash: eval "$(orangu -s)"
-    ///   zsh:  orangu -s > ~/.zsh/completions/_orangu
-    ///   fish: orangu -s > ~/.config/fish/completions/orangu.fish
     #[arg(short = 's', long = "shell-completions")]
     shell_completions: bool,
 }
 
-fn print_shell_completions() -> Result<()> {
+/// Detect the shell and print its completion script. `-q` silences the script
+/// itself — the detection, and the error when it fails, are what remain.
+fn print_shell_completions(quiet: bool) -> Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_default();
     let script = if shell.ends_with("/bash") || shell == "bash" {
         shell::BASH
@@ -186,7 +185,9 @@ fn print_shell_completions() -> Result<()> {
              \x20 fish: orangu -s > ~/.config/fish/completions/orangu.fish"
         ));
     };
-    print!("{script}");
+    if !quiet {
+        print!("{script}");
+    }
     Ok(())
 }
 
@@ -215,17 +216,34 @@ fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
     let mut args = Args::parse();
     if args.shell_completions {
-        return print_shell_completions();
+        return print_shell_completions(args.quiet);
     }
     if args.list {
-        print!("{}", list_all_sessions_output()?);
+        let listing = list_all_sessions_output()?;
+        if !args.quiet {
+            print!("{listing}");
+        }
         return Ok(());
     }
     if args.init {
+        if args.quiet {
+            return Err(anyhow!(
+                "-q/--quiet cannot be combined with -i/--init: creating the configuration \
+                 is a dialogue, and its questions are the output"
+            ));
+        }
         return init::run_init().await;
+    }
+    // Everything below this point either runs one prompt and exits, or opens the
+    // terminal interface. The interface has nothing to silence, so say so rather
+    // than opening it with a flag that does nothing.
+    if args.quiet && args.prompt.is_none() {
+        return Err(anyhow!(
+            "-q/--quiet applies to the modes that print and exit (-p, -l, -s); \
+             the terminal interface has nothing to silence"
+        ));
     }
     let config_path = match args.config.or_else(default_client_config_path) {
         Some(path) => path,
@@ -236,16 +254,26 @@ async fn run() -> Result<()> {
         }
     };
     let config = load_client_configuration(&config_path)?;
+    // A one-shot prints a report and exits. Applying a theme here would emit the
+    // OSC sequences that repaint the terminal's own background and foreground —
+    // a lasting change to someone else's terminal, and output where `-q`
+    // promises none. `-t` is for the interface, so it stays with the interface.
     if let Some(prompt) = args.prompt.take() {
         return oneshot::run_prompt(
             &prompt,
             oneshot::OneshotContext {
                 workspace: resolve_workspace_root(args.workspace)?,
                 config,
+                config_path,
+                quiet: args.quiet,
             },
         )
         .await;
     }
+    // Only from here on is there an interface to name: the modes above print to
+    // stdout and exit, and a terminal-title escape sequence in that output is
+    // something a script or a pipe has to strip.
+    let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
     let cli_theme_override = args.theme.clone();
     let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
     if let Some(cli_theme) = cli_theme_override.as_deref() {

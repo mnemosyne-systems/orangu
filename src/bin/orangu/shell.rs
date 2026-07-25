@@ -57,7 +57,7 @@ _orangu() {
             fi
             return 0
             ;;
-        --theme)
+        -t|--theme)
             COMPREPLY=( $(compgen -W "classic modern_dark modern_light oranguday tokyonight rosepine-moon random" -- "$cur") $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -66,7 +66,7 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config --theme -w --workspace -r --resume -a --all -p --prompt -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
         return 0
     fi
 }
@@ -113,11 +113,12 @@ _orangu_themes() {
 _orangu() {
     _arguments -s \
         '(-c --config)'{-c,--config}'[Path to the configuration file (orangu.conf)]:config file:_files' \
-        '(--theme)'--theme'[Override the TUI theme with a name or .theme file]:theme:_orangu_themes' \
+        '(-t --theme)'{-t,--theme}'[Override the TUI theme with a name or .theme file]:theme:_orangu_themes' \
         '(-w --workspace)'{-w,--workspace}'[Workspace root for local tools]:workspace:_orangu_workspaces' \
         '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
-        '(-p --prompt)'{-p,--prompt}'[Send one prompt, print the answer and exit]:prompt:' \
+        '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
+        '(-q --quiet)'{-q,--quiet}'[Print nothing on success; the exit code is the result]' \
         '(-l --list)'{-l,--list}'[List all stored sessions as a table and exit]' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
@@ -151,12 +152,13 @@ function __orangu_workspaces
 end
 
 complete -c orangu -s c -l config           -r                          -d 'Path to the configuration file (orangu.conf)'
-complete -c orangu    -l theme              -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
-complete -c orangu    -l theme              -r -a '(__fish_complete_path)' -d 'Theme file'
+complete -c orangu -s t -l theme             -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
+complete -c orangu -s t -l theme             -r -a '(__fish_complete_path)' -d 'Theme file'
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'
-complete -c orangu -s p -l prompt            -x                           -d 'Send one prompt, print the answer and exit'
+complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
+complete -c orangu -s q -l quiet                                          -d 'Print nothing on success; the exit code is the result'
 complete -c orangu -s l -l list                                           -d 'List all stored sessions as a table and exit'
 complete -c orangu -s i -l init                                           -d 'Interactively create ~/.orangu/orangu.conf and exit'
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
@@ -166,6 +168,51 @@ complete -c orangu -s h -l help                                           -d 'Pr
 #[cfg(test)]
 mod tests {
     use super::{BASH, FISH, ZSH};
+
+    /// The scripts are hand-written, so a new command-line option reaches them
+    /// only if someone remembers. Ask clap what the options actually are.
+    #[test]
+    fn every_shell_completes_every_command_line_option() {
+        use clap::CommandFactory;
+
+        for argument in crate::Args::command().get_arguments() {
+            let Some(long) = argument.get_long() else {
+                continue;
+            };
+            // fish spells the long form `-l <name>`; bash and zsh spell it out.
+            for (shell, script, needle) in [
+                ("bash", BASH, format!("--{long}")),
+                ("zsh", ZSH, format!("--{long}")),
+                ("fish", FISH, format!("-l {long}")),
+            ] {
+                assert!(
+                    script.contains(&needle),
+                    "{shell} completion omits the option: --{long}"
+                );
+            }
+
+            let Some(short) = argument.get_short() else {
+                continue;
+            };
+            // zsh pairs the two forms and fish flags the short one; bash lists
+            // it as a bare word, so match whole words there rather than a
+            // substring (`-t` lives inside `--theme`).
+            assert!(
+                BASH.split(|c: char| c.is_whitespace() || c == '"')
+                    .any(|word| word == format!("-{short}")),
+                "bash completion omits the short option: -{short}"
+            );
+            for (shell, script, needle) in [
+                ("zsh", ZSH, format!("{{-{short},--{long}}}")),
+                ("fish", FISH, format!("-s {short} ")),
+            ] {
+                assert!(
+                    script.contains(&needle),
+                    "{shell} completion omits the short option: -{short}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_shell_completes_all_built_in_themes() {

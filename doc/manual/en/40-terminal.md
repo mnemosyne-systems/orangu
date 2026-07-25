@@ -16,15 +16,49 @@ The sync runs in the background so it never delays startup. Its progress and res
 
 | Short | Long          | Description                                                   |
 | ----- | ------------- | ------------------------------------------------------------- |
-| `-c`  | `--config`    | Path to the configuration file (`orangu.conf`).               |
+| `-c`  | `--config`    | Path to the configuration file. Without it, `./orangu.conf`, then `~/.orangu/orangu.conf`. |
 | `-w`  | `--workspace` | Workspace root the local tools operate on. Defaults to `.`.   |
-| `-r`  | `--resume`    | Resume a specific session by UUID.                            |
+| `-r`  | `--resume`    | Resume a stored session by UUID (`-l` prints them).           |
 | `-a`  | `--all`       | Reopen the workspace tabs that were open at the end of the last run. |
-|       | `--theme`     | Apply a theme for this run. Built-in names and paths to `.theme` files are accepted. |
-| `-p`  | `--prompt`    | Send a single prompt to the configured server, print the answer on the console and exit — no terminal UI and no session on disk. Timings (total, time to first token, and the server's prompt/prefill/decode figures when it reports them) go to stderr, so `orangu -p "Hello"` tells a slow server from a slow prompt. |
+| `-t`  | `--theme`     | Apply a theme to the terminal interface for this run. Built-in names and paths to `.theme` files are accepted. |
+| `-p`  | `--prompt`    | Run a single prompt or command and exit — no terminal UI and no session on disk. See One-shot mode below. |
+| `-q`  | `--quiet`     | Print nothing on success — the exit code is the result. Applies to the modes that print and exit (`-p`, `-l`, `-s`). |
 | `-l`  | `--list`      | List all stored sessions as a `SESSION WORKSPACE BRANCH DATE` table and exit. |
 | `-i`  | `--init`      | Interactively create `~/.orangu/orangu.conf` and exit (see the Configuration chapter). |
 | `-s`  | `--shell-completions` | Print the shell completion script for the detected shell (`$SHELL`; bash, zsh, or fish) and exit. |
+
+### One-shot mode
+
+`-p` runs one line and exits, with no terminal interface and no session on disk. The line is offered to the same parser and dispatcher the prompt area uses, so it behaves the way it would if you had typed it:
+
+```text
+orangu -p "Hello"                 # a prompt for the model
+orangu -p "/export pr"            # a command, run locally
+orangu -p "show git status"       # the natural-language form of a command
+orangu -p "/code-review auth"     # a skill, whose expansion goes to the model
+```
+
+A command is handled locally and never reaches the server, so it works while the model is unavailable. Command output goes to stdout and a failed command exits non-zero, which makes `-p` usable from scripts and from `~/.orangu/schedule`. For a prompt, the answer is streamed to stdout and the timings (total, time to first token, and the server's prompt/prefill/decode figures when it reports them) go to stderr, so `orangu -p "Hello"` tells a slow server from a slow prompt.
+
+Two groups of commands are refused rather than run, with a message saying which group they fall in:
+
+- Commands whose only effect is on the running session — `/model`, `/server`, `/theme <name>`, `/verbosity`, `/disconnect`, `/reload` — since a one-shot exits before the change could matter. Select the server and model in `orangu.conf`, or point `--config` at a different file.
+- Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
+
+`/export` covers the targets that are computed at export time: `pr`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
+
+### Quiet mode
+
+`-q` prints nothing on success — no answer, no command output, no diagnostics — and leaves the exit code as the whole result. A failure still prints on stderr and exits non-zero, so `-q` can silence a success without ever hiding a problem:
+
+```text
+orangu -q -p "/export pr"    # writes the PDF, says nothing
+echo $?                      # 0, or 1 with the reason on stderr
+```
+
+That is what makes it suit a crontab or a `~/.orangu/schedule` job: silent until the day it fails. It applies to the modes that print and exit — `-p`, `-l`, and `-s`. Combining it with `-i` or with the terminal interface is an error rather than a no-op, since neither has diagnostics to separate from its output.
+
+`-t`/`--theme` is the other way round: a theme paints the interface — including the terminal's own background and foreground — so it takes effect only when there is an interface. A one-shot ignores it rather than repainting the terminal it printed into.
 
 ## Header
 

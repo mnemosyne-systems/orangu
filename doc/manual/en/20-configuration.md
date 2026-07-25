@@ -243,7 +243,7 @@ You can switch the current session with `/theme <name>`. That writes a session o
 ~/.orangu/sessions/<UUID>/theme
 ```
 
-Naming the theme `orangu.conf` already asks for drops the session override instead of pinning a copy of it, so the session goes back to following the global `[orangu].theme`. The command completes built-in themes and user theme files. The startup option `--theme <name-or-path>` applies a theme only for that process and takes precedence over the global and session settings.
+Naming the theme `orangu.conf` already asks for drops the session override instead of pinning a copy of it, so the session goes back to following the global `[orangu].theme`. The command completes built-in themes and user theme files. The startup option `-t`/`--theme <name-or-path>` applies a theme only for that process and takes precedence over the global and session settings.
 
 ## Server sections
 
