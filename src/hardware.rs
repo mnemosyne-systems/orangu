@@ -429,17 +429,17 @@ fn detect_macos_gpus() -> Vec<GpuInfo> {
         .collect()
 }
 
-/// `system_profiler`'s own two keys already say which kind of memory this
-/// is: `spdisplays_vram` names a real dedicated-VRAM figure (a discrete
-/// card, e.g. an eGPU or an older Mac Pro/MacBook Pro), while
-/// `spdisplays_vram_shared` marks Apple Silicon's unified-memory
-/// architecture or an older Intel Mac's integrated graphics — either way,
-/// memory shared with the CPU rather than a separate pool.
+/// `spdisplays_vram` means dedicated, `spdisplays_vram_shared` means
+/// unified/shared. Some Apple Silicon machines omit both keys (confirmed
+/// on an M5 Pro), so `aarch64` treats that as `Shared` too: every Apple
+/// Silicon Mac is unified memory, no discrete-VRAM model exists. Intel
+/// Macs (`x86_64`) keep the old `Unknown` fallback, since that
+/// architecture shipped both integrated and discrete GPUs.
 #[cfg(target_os = "macos")]
 fn macos_memory_kind(entry: &serde_json::Value) -> MemoryKind {
     if entry.get("spdisplays_vram").is_some() {
         MemoryKind::Dedicated
-    } else if entry.get("spdisplays_vram_shared").is_some() {
+    } else if entry.get("spdisplays_vram_shared").is_some() || cfg!(target_arch = "aarch64") {
         MemoryKind::Shared
     } else {
         MemoryKind::Unknown
@@ -786,13 +786,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_memory_kind_prefers_dedicated_key_then_shared_then_unknown() {
+    fn macos_memory_kind_prefers_dedicated_key_then_shared_key() {
         let dedicated = serde_json::json!({"spdisplays_vram": "8 GB"});
         assert_eq!(macos_memory_kind(&dedicated), MemoryKind::Dedicated);
 
         let shared = serde_json::json!({"spdisplays_vram_shared": "spdisplays_unified"});
         assert_eq!(macos_memory_kind(&shared), MemoryKind::Shared);
+    }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_memory_kind_assumes_shared_on_apple_silicon_without_either_key() {
+        let neither = serde_json::json!({"_name": "Apple GPU"});
+        assert_eq!(macos_memory_kind(&neither), MemoryKind::Shared);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[test]
+    fn macos_memory_kind_is_unknown_without_either_key_on_intel() {
         let neither = serde_json::json!({"_name": "Some GPU"});
         assert_eq!(macos_memory_kind(&neither), MemoryKind::Unknown);
     }
