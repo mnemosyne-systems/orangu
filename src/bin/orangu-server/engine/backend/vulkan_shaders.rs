@@ -411,22 +411,35 @@ fn main(
 /// the dispatch-count math can't drift out of sync. `TILE_TOKENS` (64)
 /// matches the per-row cooperative kernel's own implicit token-tile size
 /// (it loops 64 tokens at a time per weight-block dequant), so weight-
-/// dequant reuse matches that kernel; `TILE_ROWS` (16) additionally reuses
+/// dequant reuse matches that kernel; `TILE_ROWS` (32) additionally reuses
 /// activations across output rows, which the per-row cooperative kernel
 /// does not (one workgroup per row, so every row's workgroup re-reads
-/// `x` from global memory independently). `CHUNK` (32) is the K-dimension
+/// `x` from global memory independently).
+///
+/// The two together also set how much arithmetic each shared-memory load
+/// feeds: a `TILE_ROWS × TILE_TOKENS` tile does `TILE_ROWS * TILE_TOKENS`
+/// multiply-adds per `TILE_ROWS + TILE_TOKENS` loaded elements, so widening
+/// the tile is what moves the kernel off being load-issue-bound. It is not
+/// free to widen indefinitely: the dispatch is one workgroup per
+/// `(row-tile, token-tile)` pair, so a tile too tall leaves a matmul with a
+/// small `out_dim` (a `qkv` projection, say) with fewer workgroups than the
+/// adapter has compute units, and the tail dominates. 32 keeps the smallest
+/// real projection above that floor while still feeding the register block
+/// below.
+///
+/// `CHUNK` (32) is the K-dimension
 /// streaming granularity and is deliberately *smaller* than the K-quant
 /// types' native super-block size (`BLOCK_ELEMS = 256` for `Q4_K`/`Q5_K`/
 /// `Q6_K`) so `tile_w`/`tile_x`'s combined shared-memory footprint
-/// (`(TILE_ROWS + TILE_TOKENS) * CHUNK * 4` bytes = 10 KiB) stays bounded
+/// (`(TILE_ROWS + TILE_TOKENS) * CHUNK * 4` bytes = 12 KiB) stays bounded
 /// regardless of `BLOCK_ELEMS` — using `BLOCK_ELEMS` itself as the tile
-/// depth for `Q4_K` would need `(16 + 64) * 256 * 4` = 80 KiB, well past
+/// depth for `Q4_K` would need `(32 + 64) * 256 * 4` = 96 KiB, well past
 /// typical workgroup-shared-memory limits. `elem_at` (below) restates
 /// `dequant_element`'s existing `block_idx = k / BLOCK_ELEMS; local_k = k %
 /// BLOCK_ELEMS` split (already used by `MAIN_REDUCE_SUFFIX`) as a small
 /// helper so the K-loop can stream in `CHUNK`-sized pieces without knowing
 /// or caring how big a type's native block actually is.
-pub const COOP_TILE_ROWS: u32 = 16;
+pub const COOP_TILE_ROWS: u32 = 32;
 pub const COOP_TILE_TOKENS: u32 = 64;
 pub const COOP_CHUNK: u32 = 32;
 
@@ -438,13 +451,24 @@ pub const COOP_CHUNK: u32 = 32;
 /// One workgroup computes a `TILE_ROWS × TILE_TOKENS` output tile,
 /// streaming the K dimension through shared memory in `CHUNK`-sized
 /// pieces: each of the 64 threads (arranged as an 8-per-column ×
-/// 16-per-row grid — `THREADS_Y × THREADS_X`) cooperatively fills
+/// 8-per-row grid — `THREADS_Y × THREADS_X`) cooperatively fills
 /// `tile_w`/`tile_x` for the current chunk (`elem_at`/`x[...]`, grid-
 /// strided across the tile the same way `MAIN_REDUCE_SUFFIX` grid-strides
-/// across a row), then owns a small `REG_ROWS × REG_TOKENS` (4×4) register
-/// block of the output tile, accumulating its own 16 output elements'
+/// across a row), then owns a `REG_ROWS × REG_TOKENS` (4×8) register
+/// block of the output tile — written out as named scalars by
+/// `coop_tiled_register_block`, see its own doc comment for why an
+/// `array<f32, N>` will not do — accumulating its own 32 output elements'
 /// partial dot products against the shared chunk before the next chunk
-/// overwrites `tile_w`/`tile_x`. This gives every weight element
+/// overwrites `tile_w`/`tile_x`. Both tiles are stored **k-major and as
+/// `vec4`**: k-major so the `REG_ROWS`/`REG_TOKENS` values one thread reads
+/// per `k` sit in consecutive shared-memory addresses rather than `CHUNK`
+/// apart (which keeps a subgroup's lanes off a single bank), and `vec4` so
+/// those contiguous values are fetched a quarter as many instructions —
+/// three loads per `k` instead of twelve, for the same arithmetic. The
+/// fills write through a dynamic component index (`tile[i >> 2u][i & 3u]`),
+/// which keeps each thread's *global*-side access pattern exactly as it was;
+/// the fill is a small fraction of the loop's work and the global pattern is
+/// the part worth protecting. This gives every weight element
 /// `TILE_TOKENS`-way reuse (same as `MAIN_COOP_SUFFIX`) *and* every
 /// activation element `TILE_ROWS`-way reuse (which `MAIN_COOP_SUFFIX` has
 /// none of at all), at the cost of finer-grained K-streaming than that
@@ -461,13 +485,13 @@ const MAIN_COOP_TILED_SUFFIX: &str = r#"
 const TILE_ROWS: u32 = %TILE_ROWS%u;
 const TILE_TOKENS: u32 = %TILE_TOKENS%u;
 const CHUNK: u32 = %CHUNK%u;
-const THREADS_Y: u32 = 4u;
-const THREADS_X: u32 = 16u;
+const THREADS_Y: u32 = 8u;
+const THREADS_X: u32 = 8u;
 const REG_ROWS: u32 = 4u;
-const REG_TOKENS: u32 = 4u;
+const REG_TOKENS: u32 = 8u;
 
-var<workgroup> tile_w: array<f32, %TILE_ROWS%u * %CHUNK%u>;
-var<workgroup> tile_x: array<f32, %TILE_TOKENS%u * %CHUNK%u>;
+var<workgroup> tile_w: array<vec4<f32>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;
+var<workgroup> tile_x: array<vec4<f32>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;
 
 fn elem_at(row_byte_base: u32, k: u32) -> f32 {
     let block_idx = k / BLOCK_ELEMS;
@@ -496,16 +520,7 @@ fn main(
     let ty = local / THREADS_X;
     let tx = local % THREADS_X;
 
-    var acc: array<f32, REG_ROWS * REG_TOKENS>;
-    var zi: u32 = 0u;
-    loop {
-        if (zi >= REG_ROWS * REG_TOKENS) {
-            break;
-        }
-        acc[zi] = 0.0;
-        zi = zi + 1u;
-    }
-
+%ACC_DECL%
     let in_dim = params.in_dim;
     var chunk_start: u32 = 0u;
     loop {
@@ -522,10 +537,18 @@ fn main(
             let kk = fi % CHUNK;
             let row_idx = row_start + rr;
             let k_global = chunk_start + kk;
+            // Written k-major (`k * TILE_ROWS + row`), read back the same way
+            // in the dot-product loop below: consecutive `REG_ROWS`/`REG_
+            // TOKENS` elements then sit in consecutive shared-memory
+            // addresses, so the lanes of one subgroup hit distinct banks.
+            // Traversal stays row-major (`fi / CHUNK`) so each thread's
+            // `elem_at` calls still walk one weight row's K in order, which
+            // is what keeps the dequant reads inside one super-block.
+            let widx = kk * TILE_ROWS + rr;
             if (row_idx < params.out_dim && k_global < in_dim) {
-                tile_w[fi] = elem_at(row_idx * params.row_bytes, k_global);
+                tile_w[widx >> 2u][widx & 3u] = elem_at(row_idx * params.row_bytes, k_global);
             } else {
-                tile_w[fi] = 0.0;
+                tile_w[widx >> 2u][widx & 3u] = 0.0;
             }
             fi = fi + 64u;
         }
@@ -539,84 +562,120 @@ fn main(
             let kk = fj % CHUNK;
             let token_idx = token_start + tt;
             let k_global = chunk_start + kk;
+            // k-major for the same reason as `tile_w` above; the global read
+            // stays token-major so it keeps coalescing across `x`.
+            let xidx = kk * TILE_TOKENS + tt;
             if (token_idx < params.n_tokens && k_global < in_dim) {
-                tile_x[fj] = x[token_idx * in_dim + k_global];
+                tile_x[xidx >> 2u][xidx & 3u] = x[token_idx * in_dim + k_global];
             } else {
-                tile_x[fj] = 0.0;
+                tile_x[xidx >> 2u][xidx & 3u] = 0.0;
             }
             fj = fj + 64u;
         }
 
         workgroupBarrier();
 
+        let w_base = ty * REG_ROWS;
+        let x_base = tx * REG_TOKENS;
         var k: u32 = 0u;
         loop {
             if (k >= CHUNK) {
                 break;
             }
-            var wv: array<f32, REG_ROWS>;
-            var i1: u32 = 0u;
-            loop {
-                if (i1 >= REG_ROWS) {
-                    break;
-                }
-                wv[i1] = tile_w[(ty * REG_ROWS + i1) * CHUNK + k];
-                i1 = i1 + 1u;
-            }
-            var xv: array<f32, REG_TOKENS>;
-            var j1: u32 = 0u;
-            loop {
-                if (j1 >= REG_TOKENS) {
-                    break;
-                }
-                xv[j1] = tile_x[(tx * REG_TOKENS + j1) * CHUNK + k];
-                j1 = j1 + 1u;
-            }
-            i1 = 0u;
-            loop {
-                if (i1 >= REG_ROWS) {
-                    break;
-                }
-                var j2: u32 = 0u;
-                loop {
-                    if (j2 >= REG_TOKENS) {
-                        break;
-                    }
-                    acc[i1 * REG_TOKENS + j2] = acc[i1 * REG_TOKENS + j2] + wv[i1] * xv[j2];
-                    j2 = j2 + 1u;
-                }
-                i1 = i1 + 1u;
-            }
-            k = k + 1u;
+%INNER%
+            k = k + %K_UNROLL%u;
         }
 
         workgroupBarrier();
         chunk_start = chunk_start + CHUNK;
     }
 
-    var i1: u32 = 0u;
-    loop {
-        if (i1 >= REG_ROWS) {
-            break;
-        }
-        let row = row_start + ty * REG_ROWS + i1;
-        if (row < params.out_dim) {
-            var j1: u32 = 0u;
-            loop {
-                if (j1 >= REG_TOKENS) {
-                    break;
-                }
-                let token = token_start + tx * REG_TOKENS + j1;
-                if (token < params.n_tokens) {
-                    y[token * params.out_dim + row] = acc[i1 * REG_TOKENS + j1];
-                }
-                j1 = j1 + 1u;
-            }
-        }
-        i1 = i1 + 1u;
-    }
+%STORE%
 }
 "#;
+
+/// The register-block half of [`MAIN_COOP_TILED_SUFFIX`], written out with
+/// literal indices rather than as `array<f32, N>` locals walked by a loop
+/// variable.
+///
+/// WGSL function-scope arrays indexed dynamically do not become registers:
+/// naga emits them as `Function`-storage variables with dynamic access
+/// chains, which the driver's compiler keeps in scratch memory unless it
+/// manages to promote them. That turned the innermost `REG_ROWS × REG_TOKENS`
+/// accumulator block — the loop that should be pure FMA on values already in
+/// registers — into scratch traffic on every single multiply-add. Emitting
+/// `acc_i_j` scalars keeps the whole 4×4 block in registers, which is the
+/// entire point of an output-tiled GEMM.
+///
+/// Generated from the same `REG_ROWS`/`REG_TOKENS` the tile constants above
+/// imply (4×4, from `TILE_ROWS`/`THREADS_Y` and `TILE_TOKENS`/`THREADS_X`),
+/// so the unrolled text cannot drift from the tile geometry.
+fn coop_tiled_register_block() -> (String, String, String, usize) {
+    const REG_ROWS: usize = 4;
+    const REG_TOKENS: usize = 8;
+    /// K iterations fused into one loop body. Must divide [`COOP_CHUNK`].
+    const K_UNROLL: usize = 2;
+    assert!(
+        (COOP_CHUNK as usize).is_multiple_of(K_UNROLL),
+        "COOP_CHUNK must be a multiple of the K unroll factor"
+    );
+
+    let mut decl = String::new();
+    for i in 0..REG_ROWS {
+        for j in 0..REG_TOKENS {
+            decl.push_str(&format!("    var acc_{i}_{j}: f32 = 0.0;\n"));
+        }
+    }
+
+    // The K loop is unrolled `K_UNROLL`-wide as well: one iteration's 16 FMAs
+    // depend on that iteration's 8 shared loads, so a single-step loop leaves
+    // the FMA units waiting on LDS with nothing else in flight. Interleaving
+    // `K_UNROLL` independent iterations gives the scheduler that other work,
+    // and amortizes the loop's own compare/branch over 4× the arithmetic.
+    let mut inner = String::new();
+    for u in 0..K_UNROLL {
+        for i in 0..REG_ROWS / 4 {
+            inner.push_str(&format!(
+                "            let wv{u}_{i} = tile_w[((k + {u}u) * TILE_ROWS + w_base) / 4u + {i}u];\n"
+            ));
+        }
+        for j in 0..REG_TOKENS / 4 {
+            inner.push_str(&format!(
+                "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
+            ));
+        }
+    }
+    for u in 0..K_UNROLL {
+        for i in 0..REG_ROWS {
+            for j in 0..REG_TOKENS {
+                inner.push_str(&format!(
+                    "            acc_{i}_{j} = fma(wv{u}_{}[{}], xv{u}_{}[{}], acc_{i}_{j});\n",
+                    i / 4,
+                    i % 4,
+                    j / 4,
+                    j % 4
+                ));
+            }
+        }
+    }
+
+    let mut store = String::new();
+    for i in 0..REG_ROWS {
+        store.push_str(&format!(
+            "    let row{i} = row_start + ty * REG_ROWS + {i}u;\n    if (row{i} < params.out_dim) {{\n"
+        ));
+        for j in 0..REG_TOKENS {
+            store.push_str(&format!(
+                "        let token{i}_{j} = token_start + tx * REG_TOKENS + {j}u;\n        \
+                 if (token{i}_{j} < params.n_tokens) {{\n            \
+                 y[token{i}_{j} * params.out_dim + row{i}] = acc_{i}_{j};\n        }}\n"
+            ));
+        }
+        store.push_str("    }\n");
+    }
+
+    (decl, inner, store, K_UNROLL)
+}
 
 /// `{ f32 }`, 1 element. Only one element exists, so `MAIN_COOP_SUFFIX`'s
 /// distributed dequant only ever has thread 0 (`k == 0`) call this.
@@ -2814,10 +2873,15 @@ pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
         t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
         _ => return None,
     };
+    let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block();
     let suffix = MAIN_COOP_TILED_SUFFIX
         .replace("%TILE_ROWS%", &COOP_TILE_ROWS.to_string())
         .replace("%TILE_TOKENS%", &COOP_TILE_TOKENS.to_string())
-        .replace("%CHUNK%", &COOP_CHUNK.to_string());
+        .replace("%CHUNK%", &COOP_CHUNK.to_string())
+        .replace("%ACC_DECL%", &acc_decl)
+        .replace("%INNER%", &inner)
+        .replace("%STORE%", &store)
+        .replace("%K_UNROLL%", &k_unroll.to_string());
     Some(format!("{PRELUDE}\n{middle}\n{suffix}"))
 }
 
@@ -3329,6 +3393,135 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 /// at both of this codebase's two call sites (`wo`'s and `ffn_down`'s own
 /// post-matmul norm+add, `VulkanBackend::build_fused_resources`), removing
 /// one dispatch (`add_pipeline`'s own) from each.
+/// The two norms of a prefill layer's post-attention chain, row-strided:
+/// **one workgroup per token**, each normalising its own `[n_embd]` row at
+/// `wid.x * em.len`. The decode-path bodies above normalise a single row and
+/// are dispatched `(1, 1, 1)`; a prefill chain has `n_tokens` rows to do, and
+/// running them as `n_tokens` separate dispatches (or separate submissions,
+/// as the CPU-orchestrated path did) is exactly the round-trip cost
+/// `VulkanBackend::fused_post_attention_prefill` exists to remove.
+///
+/// `weight` is indexed *without* the row offset — it is per-column, shared by
+/// every row — which is the one thing a naive "add a base offset everywhere"
+/// transformation of the single-row bodies would get wrong.
+///
+/// The tree reduction is used unconditionally rather than the `subgroupAdd`
+/// variant the single-row bodies pick between: these dispatch `n_tokens`
+/// workgroups, so the reduction is a small part of the work, and one body is
+/// one thing to keep correct.
+const RMSNORM_ROWS_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let base = wid.x * em.len;
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[base + k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    partial_sums[local] = partial;
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride) {
+            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mean_sq = partial_sums[0] / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[base + k] = x[base + k] * scale * weight[k];
+        k = k + 64u;
+    }
+}
+"#;
+
+/// [`RMSNORM_ROWS_SHADER_BODY`] with the residual add folded in, the
+/// row-strided counterpart of `RMSNORM_ADD_SHADER_BODY_SUBGROUP`.
+const RMSNORM_ADD_ROWS_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> residual: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> em: ElemMeta;
+
+var<workgroup> partial_sums: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let base = wid.x * em.len;
+    let local = lid.x;
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        let v = x[base + k];
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    partial_sums[local] = partial;
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride) {
+            partial_sums[local] = partial_sums[local] + partial_sums[local + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mean_sq = partial_sums[0] / f32(em.len);
+    let scale = 1.0 / sqrt(mean_sq + em.extra);
+    k = local;
+    loop {
+        if (k >= em.len) {
+            break;
+        }
+        y[base + k] = x[base + k] * scale * weight[k] + residual[base + k];
+        k = k + 64u;
+    }
+}
+"#;
+
+pub fn shader_source_rmsnorm_rows() -> String {
+    format!("{ELEM_META}\n{RMSNORM_ROWS_SHADER_BODY}")
+}
+
+pub fn shader_source_rmsnorm_add_rows() -> String {
+    format!("{ELEM_META}\n{RMSNORM_ADD_ROWS_SHADER_BODY}")
+}
+
 pub fn shader_source_rmsnorm_add(subgroup: bool, wg: usize) -> String {
     if subgroup {
         // As in `shader_source_rmsnorm`, the subgroup variant stays at its
@@ -3408,7 +3601,13 @@ struct AttnMeta {
     n_pos: u32,
     capacity: u32,
     scale: f32,
-    _pad: u32,
+    // The four below are read only by the multi-query (prefill) variant,
+    // which derives each query's own window from them; the single-query
+    // variant takes `window_start`/`n_pos` above as given and ignores these.
+    start_pos: u32,
+    n_query: u32,
+    n_swa: u32,
+    causal: u32,
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -3431,9 +3630,9 @@ var<workgroup> shared_reduce: array<f32, 64>;
 var<workgroup> tile_probs: array<f32, 64>;
 var<workgroup> acc: array<f32, MAX_HEAD_DIM>;
 
-fn score_at(h: u32, kv_head: u32, p: u32) -> f32 {
+fn score_at(q_off: u32, h: u32, kv_head: u32, p: u32) -> f32 {
     let head_dim = am.head_dim;
-    let q_base = h * head_dim;
+    let q_base = q_off + h * head_dim;
     let k_base = (p * am.n_head_kv + kv_head) * head_dim;
     var s: f32 = 0.0;
     var d: u32 = 0u;
@@ -3457,8 +3656,8 @@ fn main(
     let local = lid.x;
     let group_size = am.n_head / am.n_head_kv;
     let kv_head = h / group_size;
-    let n_pos = am.n_pos;
     let head_dim = am.head_dim;
+%QUERY_SETUP%
 
     var zd: u32 = local;
     loop {
@@ -3479,11 +3678,11 @@ fn main(
         }
         let tile_len = min(64u, n_pos - tile_start);
         let has_pos = local < tile_len;
-        let p = am.window_start + tile_start + local;
+        let p = window_start + tile_start + local;
 
         var my_score: f32 = -1e30;
         if (has_pos) {
-            my_score = score_at(h, kv_head, p);
+            my_score = score_at(q_off, h, kv_head, p);
         }
         %MAX_REDUCE_BLOCK%
 
@@ -3510,7 +3709,7 @@ fn main(
                 if (j >= tile_len) {
                     break;
                 }
-                let vp = am.window_start + tile_start + j;
+                let vp = window_start + tile_start + j;
                 let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
                 tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                 j = j + 1u;
@@ -3529,7 +3728,7 @@ fn main(
         if (d3 >= head_dim) {
             break;
         }
-        aout[h * head_dim + d3] = acc[d3] / l;
+        aout[out_off + h * head_dim + d3] = acc[d3] / l;
         d3 = d3 + 64u;
     }
 }
@@ -3772,6 +3971,65 @@ pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool, max_head_d
         .replace("%SUBGROUP_PARAMS%", subgroup_params)
         .replace("%MAX_REDUCE_BLOCK%", max_block)
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
+        .replace("%QUERY_SETUP%", ATTENTION_SINGLE_QUERY_SETUP)
+}
+
+/// One workgroup per `(head, query)` instead of per head: `wid.y` selects the
+/// query, and each one derives its **own** attention window from its absolute
+/// position rather than being handed one in the uniform. That is the whole
+/// difference between decoding a token and prefilling a prompt — every query
+/// in a prompt attends over a different range — and it is what lets a prefill
+/// layer's attention be a dispatch instead of a CPU loop over tokens.
+///
+/// The window rule mirrors `GemmaModel::attention_window` case for case; the
+/// two must agree exactly, which `gpu_attention_prefill_matches_cpu_reference`
+/// checks against the CPU implementation for causal, sliding-window, and
+/// non-causal layers.
+const ATTENTION_MULTI_QUERY_SETUP: &str = r#"
+    let t = wid.y;
+    let q_off = t * am.n_head * head_dim;
+    let out_off = q_off;
+    let pos = am.start_pos + t;
+    var ws: u32 = 0u;
+    var we: u32 = pos;
+    if (am.causal == 0u) {
+        if (am.n_swa > 0u) {
+            let half = am.n_swa / 2u;
+            ws = select(0u, pos - half, pos > half);
+            we = min(pos + half, am.n_query - 1u);
+        } else {
+            ws = 0u;
+            we = am.n_query - 1u;
+        }
+    } else if (am.n_swa > 0u) {
+        ws = select(0u, pos - (am.n_swa - 1u), pos + 1u > am.n_swa);
+    }
+    let window_start = ws;
+    let n_pos = we - ws + 1u;
+"#;
+
+/// The single-query counterpart: the caller already computed the window, and
+/// there is exactly one query at offset zero.
+const ATTENTION_SINGLE_QUERY_SETUP: &str = r#"
+    let q_off = 0u;
+    let out_off = 0u;
+    let window_start = am.window_start;
+    let n_pos = am.n_pos;
+"#;
+
+/// [`shader_source_attention`]'s multi-query variant — see
+/// [`ATTENTION_MULTI_QUERY_SETUP`]. Deliberately the *same* template: the
+/// online-softmax body, the KV reads, and the reductions are shared, so the
+/// two cannot drift apart.
+pub fn shader_source_attention_prefill(
+    kv_storage: KvStorage,
+    subgroup: bool,
+    max_head_dim: u32,
+) -> String {
+    shader_source_attention(kv_storage, subgroup, max_head_dim).replace(
+        ATTENTION_SINGLE_QUERY_SETUP.trim_end(),
+        ATTENTION_MULTI_QUERY_SETUP.trim_end(),
+    )
 }
 
 /// Split-k phase 1 of two. Same
@@ -4094,6 +4352,128 @@ fn main(
     }
 }
 "#;
+
+/// Multi-query attention with the **cooperative** reduction: 32 lanes split
+/// `head_dim` between them for one `(head, query)` pair, so consecutive lanes
+/// read consecutive K/V elements.
+///
+/// This is [`ATTENTION_SPLIT_COOP_SHADER_TEMPLATE`] with the split-k machinery
+/// removed — a prompt has queries to parallelise over, so it needs no splits —
+/// and each query deriving its own window the way
+/// [`ATTENTION_MULTI_QUERY_SETUP`] does.
+///
+/// The distinction from the classic template matters more here than anywhere
+/// else: there, each lane walks its *own* K row, so a subgroup's 32 lanes touch
+/// 32 different rows per step and every read is a separate transaction. That is
+/// tolerable for one decode query and ruinous for a whole prompt's worth.
+const ATTENTION_COOP_PREFILL_TEMPLATE: &str = r#"
+%KV_ENABLE%
+struct AttnMeta {
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    window_start: u32,
+    n_pos: u32,
+    capacity: u32,
+    scale: f32,
+    start_pos: u32,
+    n_query: u32,
+    n_swa: u32,
+    causal: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> aq: array<f32>;
+%KV_BINDINGS%
+@group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
+@group(0) @binding(4) var<storage, read_write> aout: array<f32>;
+@group(0) @binding(5) var<uniform> am: AttnMeta;
+
+%KV_READ_FNS%
+
+const HEAD_DIM: u32 = %HEAD_DIM%u;
+const OWNED: u32 = %OWNED%u;
+
+@compute @workgroup_size(32)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let h = wid.x;
+    let t = wid.y;
+    let lane = lid.x;
+    let group_size = am.n_head / am.n_head_kv;
+    let kv_head = h / group_size;
+    let q_base = (t * am.n_head + h) * HEAD_DIM;
+
+    // Per-query window, same rule as `GemmaModel::attention_window`.
+    let pos_abs = am.start_pos + t;
+    var ws: u32 = 0u;
+    var we: u32 = pos_abs;
+    if (am.causal == 0u) {
+        if (am.n_swa > 0u) {
+            let half = am.n_swa / 2u;
+            ws = select(0u, pos_abs - half, pos_abs > half);
+            we = min(pos_abs + half, am.n_query - 1u);
+        } else {
+            ws = 0u;
+            we = am.n_query - 1u;
+        }
+    } else if (am.n_swa > 0u) {
+        ws = select(0u, pos_abs - (am.n_swa - 1u), pos_abs + 1u > am.n_swa);
+    }
+
+    var q_reg: array<f32, OWNED>;
+    var acc_reg: array<f32, OWNED>;
+    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+        q_reg[i] = aq[q_base + lane + i * 32u];
+        acc_reg[i] = 0.0;
+    }
+
+    var m: f32 = -1e30;
+    var l: f32 = 0.0;
+    var p: u32 = ws;
+    loop {
+        if (p > we) {
+            break;
+        }
+        let k_base = (p * am.n_head_kv + kv_head) * HEAD_DIM;
+        var partial: f32 = 0.0;
+        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+            partial = partial + q_reg[i] * kv_read_k(k_base + lane + i * 32u);
+        }
+        let score = subgroupAdd(partial) * am.scale;
+        let new_m = max(m, score);
+        let alpha = exp(m - new_m);
+        let pw = exp(score - new_m);
+        l = l * alpha + pw;
+        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+            acc_reg[i] = acc_reg[i] * alpha + pw * kv_read_v(k_base + lane + i * 32u);
+        }
+        m = new_m;
+        p = p + 1u;
+    }
+
+    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
+        aout[q_base + lane + i * 32u] = acc_reg[i] / l;
+    }
+}
+"#;
+
+/// Builds [`ATTENTION_COOP_PREFILL_TEMPLATE`] for a specific `head_dim`
+/// (baked in, so the owned loops unroll). Requires subgroups and
+/// `head_dim % 32 == 0`; the caller falls back to
+/// [`shader_source_attention_prefill`] otherwise.
+pub fn shader_source_attention_prefill_coop(kv_storage: KvStorage, head_dim: u32) -> String {
+    debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
+    ATTENTION_COOP_PREFILL_TEMPLATE
+        .replace("%HEAD_DIM%", &head_dim.to_string())
+        .replace("%OWNED%", &(head_dim / 32).to_string())
+        .replace("%KV_ENABLE%", kv_storage.enable_directive())
+        .replace("%KV_BINDINGS%", &kv_bindings)
+        .replace("%KV_READ_FNS%", &kv_read_fns)
+}
 
 /// Builds the cooperative-reduction phase-1 kernel for a specific `head_dim`
 /// (baked in, so the owned loops unroll). See

@@ -230,6 +230,8 @@ Natural-language forms such as `open README.md`, `list models`, `show informatio
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 
+Ctrl+R searches the command history backward like bash: the last command starting with the letters entered is previewed as grey ghost text, Tab completes it, typing narrows the search and Backspace widens it, Ctrl+R again steps to the next older match, Enter submits it, and Esc leaves the search.
+
 As you type, a grey inline hint previews the matching command (e.g. `q` suggests `quit`). Press Tab to accept it. When several commands match, Shift+Tab cycles the hint through them; Tab then accepts the one shown.
 
 Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up / Alt+Down scrolls one line at a time.

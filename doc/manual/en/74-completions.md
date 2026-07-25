@@ -11,6 +11,7 @@ completion script for the shell detected from `$SHELL`, then source it:
 | `-w`  | `--workspace`         | directories   |
 | `-r`  | `--resume`            | session UUIDs |
 | `-a`  | `--all`               | —             |
+| `-p`  | `--prompt`            | —             |
 | `-l`  | `--list`              | —             |
 | `-i`  | `--init`              | —             |
 | `-s`  | `--shell-completions` | —             |

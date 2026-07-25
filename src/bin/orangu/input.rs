@@ -200,6 +200,7 @@ pub struct ScreenState<'a> {
     pub cursor: usize,
     pub ghost_index: usize,
     pub dropdown: Option<&'a DropdownState>,
+    pub reverse_search: Option<&'a ReverseSearchState>,
 }
 
 #[derive(Clone, Default)]
@@ -627,6 +628,46 @@ impl DropdownState {
     }
 }
 
+/// The history entry a `Ctrl+R` search is offering.
+#[derive(Clone, Debug)]
+pub struct ReverseMatch {
+    pub index: usize,
+    pub text: String,
+}
+
+/// An in-progress `Ctrl+R` search over the command history. The letters entered
+/// stay in the input line and are the query; the match is previewed as ghost
+/// text after them and filled in with Tab.
+#[derive(Clone, Debug, Default)]
+pub struct ReverseSearchState {
+    pub matched: Option<ReverseMatch>,
+    /// Set when the last search found nothing: the previous match is kept, and
+    /// the status line says so, the way bash does.
+    pub failed: bool,
+}
+
+impl ReverseSearchState {
+    /// The rest of the match, previewed in grey after the letters entered. Empty
+    /// when nothing matched, or when the line no longer starts with the match —
+    /// the ghost only ever completes what is on screen.
+    pub fn ghost(&self, input: &str) -> &str {
+        self.matched
+            .as_ref()
+            .filter(|matched| matched.text.starts_with(input))
+            .map_or("", |matched| &matched.text[input.len()..])
+    }
+
+    /// The bash-style search prompt shown on the status line under the input.
+    pub fn prompt(&self, input: &str) -> String {
+        let label = if self.failed {
+            "failed reverse-i-search"
+        } else {
+            "reverse-i-search"
+        };
+        format!("({label})`{input}': ")
+    }
+}
+
 #[derive(Default)]
 pub struct InputState {
     pub buffer: String,
@@ -636,6 +677,7 @@ pub struct InputState {
     pub history_index: Option<usize>,
     pub history_draft: String,
     pub dropdown: Option<DropdownState>,
+    pub reverse_search: Option<ReverseSearchState>,
     pub last_mouse_click: Option<(std::time::Instant, u16, u16)>,
 }
 
@@ -656,6 +698,7 @@ impl InputState {
         self.history_index = None;
         self.history_draft.clear();
         self.dropdown = None;
+        self.reverse_search = None;
     }
 
     pub fn set_buffer(&mut self, buffer: String) {
@@ -931,6 +974,7 @@ pub fn read_input(
                     cursor: input_state.cursor(),
                     ghost_index: input_state.ghost_index,
                     dropdown: input_state.dropdown.as_ref(),
+                    reverse_search: input_state.reverse_search.as_ref(),
                 },
             );
             std::io::stdout().flush()?;
@@ -982,6 +1026,7 @@ pub fn handle_input_event_with_status(
             interrupt_state.reset();
             output_state.reset_scroll();
             input_state.insert_str(&text);
+            reverse_search_requery(input_state, input_context.history);
             redraw = true;
         }
         Event::Key(KeyEvent {
@@ -990,6 +1035,22 @@ pub fn handle_input_event_with_status(
             kind,
             ..
         }) if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat => {
+            if input_state.reverse_search.is_some() {
+                match handle_reverse_search_key(input_state, input_context.history, code, modifiers)
+                {
+                    ReverseSearchKey::Handled => {
+                        interrupt_state.reset();
+                        return InputEventResult {
+                            redraw: true,
+                            outcome: None,
+                        };
+                    }
+                    // The search is over; the key itself still acts on the line
+                    // below, which now holds an accepted match or what was typed.
+                    ReverseSearchKey::Passthrough => {}
+                }
+            }
+
             match (code, modifiers) {
                 (KeyCode::Left, modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL)
@@ -1168,6 +1229,13 @@ pub fn handle_input_event_with_status(
                     interrupt_state.reset();
                     input_state.delete_prev_word();
                     redraw = true;
+                }
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    if reverse_search_start(input_state, input_context.history) {
+                        output_state.reset_scroll();
+                        redraw = true;
+                    }
                 }
                 (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                     interrupt_state.reset();
@@ -1348,8 +1416,14 @@ pub fn handle_input_event_with_status(
     }
 
     if redraw {
-        input_state.update_dropdown(input_context.skills, input_context.render.drop_down);
-        sync_theme_preview(input_state);
+        // A history match is not something being typed: it neither opens the
+        // slash-command dropdown nor previews the theme it may name.
+        if input_state.reverse_search.is_some() {
+            input_state.dropdown = None;
+        } else {
+            input_state.update_dropdown(input_context.skills, input_context.render.drop_down);
+            sync_theme_preview(input_state);
+        }
     }
 
     InputEventResult {
@@ -1435,6 +1509,176 @@ pub fn history_next(input_state: &mut InputState, history: &[String]) {
     let new_index = index + 1;
     input_state.history_index = Some(new_index);
     input_state.set_buffer(history[new_index].clone());
+}
+
+/// Whether a key pressed during a `Ctrl+R` search was consumed by the search
+/// itself, or ends the search and is then handled as an ordinary prompt key.
+pub enum ReverseSearchKey {
+    Handled,
+    Passthrough,
+}
+
+/// The newest history entry below `before` (the whole history when `None`) that
+/// starts with `query`, ignoring entries whose text equals `skip` so repeated
+/// `Ctrl+R` presses step over duplicate commands instead of stalling on them.
+fn find_prefix_match(
+    history: &[String],
+    query: &str,
+    before: Option<usize>,
+    skip: Option<&str>,
+) -> Option<usize> {
+    let end = before.unwrap_or(history.len()).min(history.len());
+    history[..end]
+        .iter()
+        .rposition(|entry| entry.starts_with(query) && Some(entry.as_str()) != skip)
+}
+
+/// Where a re-run of the search starts from.
+enum SearchFrom {
+    /// Keep the entry being offered when it still matches, and otherwise walk
+    /// older from there — the way bash extends an incremental search.
+    Current,
+    /// Search the whole history again, for when the letters entered got shorter.
+    Newest,
+}
+
+/// Re-run the search for whatever is typed now and record the result: a match to
+/// preview, or a failed search that keeps the previous preview.
+fn search_reverse(
+    state: &mut ReverseSearchState,
+    history: &[String],
+    from: SearchFrom,
+    query: &str,
+) {
+    let before = match from {
+        SearchFrom::Current => state.matched.as_ref().map(|matched| matched.index + 1),
+        SearchFrom::Newest => None,
+    };
+    match find_prefix_match(history, query, before, None) {
+        Some(index) => {
+            state.matched = Some(ReverseMatch {
+                index,
+                text: history[index].clone(),
+            });
+            state.failed = false;
+        }
+        None => state.failed = true,
+    }
+}
+
+/// Enter `Ctrl+R` search mode. The letters already typed are the query, so `car`
+/// followed by `Ctrl+R` previews the last `cargo …` command right away. Returns
+/// `false` — doing nothing at all — when the history is empty or a search is
+/// already running.
+pub fn reverse_search_start(input_state: &mut InputState, history: &[String]) -> bool {
+    if history.is_empty() || input_state.reverse_search.is_some() {
+        return false;
+    }
+
+    let mut state = ReverseSearchState::default();
+    search_reverse(&mut state, history, SearchFrom::Newest, &input_state.buffer);
+    input_state.reverse_search = Some(state);
+    true
+}
+
+/// Re-run a running search after the line changed outside the key handler — a
+/// paste, say. No-op when no search is running.
+pub fn reverse_search_requery(input_state: &mut InputState, history: &[String]) {
+    if let Some(mut state) = input_state.reverse_search.take() {
+        search_reverse(&mut state, history, SearchFrom::Newest, &input_state.buffer);
+        input_state.reverse_search = Some(state);
+    }
+}
+
+/// Fill the previewed match into the input line and leave the search. Up/Down
+/// then continue from the entry the search landed on, with the letters that were
+/// typed as the draft they restore. Returns `false` when there was no match to
+/// accept.
+fn reverse_search_accept(input_state: &mut InputState, state: ReverseSearchState) -> bool {
+    let Some(matched) = state.matched else {
+        return false;
+    };
+
+    let typed = std::mem::take(&mut input_state.buffer);
+    input_state.set_buffer(matched.text);
+    input_state.history_index = Some(matched.index);
+    input_state.history_draft = typed;
+    true
+}
+
+/// Handle a key while a `Ctrl+R` search is running.
+pub fn handle_reverse_search_key(
+    input_state: &mut InputState,
+    history: &[String],
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> ReverseSearchKey {
+    let Some(mut state) = input_state.reverse_search.take() else {
+        return ReverseSearchKey::Passthrough;
+    };
+
+    match (code, modifiers) {
+        // Step to the next older match, skipping repeats of the one on offer.
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            let found = match &state.matched {
+                Some(matched) if matched.index == 0 => None,
+                Some(matched) => find_prefix_match(
+                    history,
+                    &input_state.buffer,
+                    Some(matched.index),
+                    Some(matched.text.as_str()),
+                ),
+                None => find_prefix_match(history, &input_state.buffer, None, None),
+            };
+            match found {
+                Some(index) => {
+                    state.matched = Some(ReverseMatch {
+                        index,
+                        text: history[index].clone(),
+                    });
+                    state.failed = false;
+                }
+                None => state.failed = true,
+            }
+        }
+        // Tab fills in the match, the same key that accepts a completion.
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            if !reverse_search_accept(input_state, state) {
+                // Nothing matched, so Tab completes as it normally would.
+                return ReverseSearchKey::Passthrough;
+            }
+            return ReverseSearchKey::Handled;
+        }
+        // Enter runs the match, like bash; with nothing matched it submits the
+        // line as typed.
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            reverse_search_accept(input_state, state);
+            return ReverseSearchKey::Passthrough;
+        }
+        // Typing narrows the search; Backspace widens it.
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            input_state.insert_char(ch);
+            search_reverse(
+                &mut state,
+                history,
+                SearchFrom::Current,
+                &input_state.buffer,
+            );
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            input_state.backspace();
+            search_reverse(&mut state, history, SearchFrom::Newest, &input_state.buffer);
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('c' | 'g'), KeyModifiers::CONTROL) => {
+            return ReverseSearchKey::Handled;
+        }
+        // Any other key — a cursor move, an edit, Up/Down — leaves the search and
+        // acts on the line as typed.
+        _ => return ReverseSearchKey::Passthrough,
+    }
+
+    input_state.reverse_search = Some(state);
+    ReverseSearchKey::Handled
 }
 
 /// Advance the inline natural-language ghost preview to the next candidate
@@ -1799,6 +2043,278 @@ mod tests {
 
         assert_eq!(input_state.as_str(), "");
         assert_eq!(input_state.cursor(), 0);
+    }
+
+    fn history(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    /// Press one key at the prompt with `entries` as the command history, in
+    /// oldest-to-newest order.
+    fn press_with_history(
+        input_state: &mut InputState,
+        entries: &[String],
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> InputEventResult {
+        let workspace = tempdir().expect("workspace");
+        let mut interrupt_state = InterruptState::default();
+        let mut output_state = OutputState::default();
+        let mut viewport = ViewportState::new(80, 80, 24);
+
+        handle_input_event(
+            Event::Key(KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Press,
+            )),
+            input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            InputContext {
+                history: entries,
+                ..test_input_context(workspace.path())
+            },
+        )
+    }
+
+    fn ctrl_r(input_state: &mut InputState, entries: &[String]) -> InputEventResult {
+        press_with_history(
+            input_state,
+            entries,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )
+    }
+
+    #[test]
+    fn ctrl_r_does_nothing_when_history_is_empty() {
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        let result = ctrl_r(&mut input_state, &[]);
+
+        assert!(!result.redraw);
+        assert!(result.outcome.is_none());
+        assert!(input_state.reverse_search.is_none());
+        assert_eq!(input_state.as_str(), "car");
+    }
+
+    /// The grey preview the prompt shows for a running search.
+    fn search_ghost(input_state: &InputState) -> &str {
+        input_state
+            .reverse_search
+            .as_ref()
+            .expect("reverse search running")
+            .ghost(input_state.as_str())
+    }
+
+    #[test]
+    fn ctrl_r_ghosts_the_last_command_starting_with_the_typed_letters() {
+        let entries = history(&["cargo test", "git status", "cargo build", "git log"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        let result = ctrl_r(&mut input_state, &entries);
+
+        assert!(result.redraw);
+        assert!(result.outcome.is_none());
+        // The line keeps what was typed; the match is only previewed.
+        assert_eq!(input_state.as_str(), "car");
+        assert_eq!(input_state.cursor(), "car".len());
+        assert_eq!(search_ghost(&input_state), "go build");
+        let search = input_state
+            .reverse_search
+            .as_ref()
+            .expect("reverse search running");
+        assert_eq!(
+            search.matched.as_ref().map(|matched| matched.index),
+            Some(2)
+        );
+        assert_eq!(search.prompt("car"), "(reverse-i-search)`car': ");
+    }
+
+    #[test]
+    fn tab_completes_the_command_the_search_found() {
+        let entries = history(&["cargo test", "git status", "cargo build"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        let result =
+            press_with_history(&mut input_state, &entries, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert!(result.redraw);
+        assert!(result.outcome.is_none());
+        assert!(input_state.reverse_search.is_none());
+        assert_eq!(input_state.as_str(), "cargo build");
+        assert_eq!(input_state.cursor(), "cargo build".len());
+
+        // Up/Down carry on from the entry that was filled in, and walking forward
+        // out of the history brings back the letters that were typed.
+        assert_eq!(input_state.history_index, Some(2));
+        press_with_history(
+            &mut input_state,
+            &entries,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(input_state.as_str(), "car");
+    }
+
+    #[test]
+    fn typing_during_reverse_search_narrows_the_match() {
+        let entries = history(&["cargo test", "git status", "cargo build"]);
+        let mut input_state = InputState::default();
+
+        ctrl_r(&mut input_state, &entries);
+        assert_eq!(search_ghost(&input_state), "cargo build");
+
+        press_with_history(
+            &mut input_state,
+            &entries,
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(input_state.as_str(), "g");
+        assert_eq!(search_ghost(&input_state), "it status");
+    }
+
+    #[test]
+    fn repeated_ctrl_r_steps_back_over_repeated_commands() {
+        let entries = history(&["git status", "cargo fmt", "git status", "git log"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("git".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        assert_eq!(search_ghost(&input_state), " log");
+
+        ctrl_r(&mut input_state, &entries);
+        assert_eq!(search_ghost(&input_state), " status");
+        assert_eq!(
+            input_state
+                .reverse_search
+                .as_ref()
+                .expect("reverse search running")
+                .matched
+                .as_ref()
+                .map(|matched| matched.index),
+            Some(2)
+        );
+
+        // The older `git status` is the same command, so the search reports that
+        // it ran out of matches instead of offering it a second time.
+        ctrl_r(&mut input_state, &entries);
+        let search = input_state
+            .reverse_search
+            .as_ref()
+            .expect("reverse search running");
+        assert!(search.failed);
+        assert_eq!(search.ghost("git"), " status");
+        assert_eq!(search.prompt("git"), "(failed reverse-i-search)`git': ");
+    }
+
+    #[test]
+    fn reverse_search_without_a_match_previews_nothing() {
+        let entries = history(&["cargo test"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("zz".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+
+        let search = input_state
+            .reverse_search
+            .as_ref()
+            .expect("reverse search running");
+        assert!(search.failed);
+        assert!(search.matched.is_none());
+        assert_eq!(search.ghost("zz"), "");
+        assert_eq!(input_state.as_str(), "zz");
+    }
+
+    #[test]
+    fn esc_leaves_reverse_search_with_the_line_as_typed() {
+        let entries = history(&["cargo test", "cargo build"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        let result =
+            press_with_history(&mut input_state, &entries, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(result.redraw);
+        assert!(input_state.reverse_search.is_none());
+        assert_eq!(input_state.as_str(), "car");
+        assert_eq!(input_state.cursor(), "car".len());
+    }
+
+    #[test]
+    fn backspace_widens_reverse_search() {
+        let entries = history(&["cargo test", "git status"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        assert_eq!(search_ghost(&input_state), "go test");
+
+        // `ca` and `c` still match `cargo test`; an empty line widens to the
+        // newest entry of all.
+        for (line, ghost) in [("ca", "rgo test"), ("c", "argo test"), ("", "git status")] {
+            press_with_history(
+                &mut input_state,
+                &entries,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            );
+            assert_eq!(input_state.as_str(), line);
+            assert_eq!(search_ghost(&input_state), ghost);
+        }
+    }
+
+    #[test]
+    fn enter_submits_the_command_the_search_found() {
+        let entries = history(&["cargo test", "cargo build"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        let result = press_with_history(
+            &mut input_state,
+            &entries,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+
+        assert!(matches!(
+            result.outcome,
+            Some(InputResult::Submitted(ref input)) if input == "cargo build"
+        ));
+        assert!(input_state.reverse_search.is_none());
+    }
+
+    #[test]
+    fn arrow_up_leaves_reverse_search_and_walks_the_history() {
+        let entries = history(&["cargo test", "git status", "cargo build"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("car".to_string());
+
+        ctrl_r(&mut input_state, &entries);
+        press_with_history(&mut input_state, &entries, KeyCode::Up, KeyModifiers::NONE);
+
+        assert!(input_state.reverse_search.is_none());
+        assert_eq!(input_state.as_str(), "cargo build");
+
+        // Walking back out of the history restores the letters that were typed.
+        press_with_history(
+            &mut input_state,
+            &entries,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(input_state.as_str(), "car");
     }
 
     #[test]

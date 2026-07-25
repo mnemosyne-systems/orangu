@@ -183,6 +183,7 @@ async fn drive_handle(
                 cursor: input_state.cursor(),
                 ghost_index: input_state.ghost_index,
                 dropdown: input_state.dropdown.as_ref(),
+                reverse_search: input_state.reverse_search.as_ref(),
             },
         );
     }
@@ -243,6 +244,7 @@ async fn drive_handle(
                                     cursor: input_state.cursor(),
                                     ghost_index: input_state.ghost_index,
                                     dropdown: input_state.dropdown.as_ref(),
+                                    reverse_search: input_state.reverse_search.as_ref(),
                                 },
                             );
                             std::io::stdout().flush()?;
@@ -418,6 +420,7 @@ async fn drive_handle(
                             cursor: input_state.cursor(),
                             ghost_index: input_state.ghost_index,
                             dropdown: input_state.dropdown.as_ref(),
+                            reverse_search: input_state.reverse_search.as_ref(),
                         },
                     );
                     std::io::stdout().flush()?;
@@ -512,6 +515,7 @@ pub(crate) async fn wait_for_local_command<T: Send + 'static>(
                         cursor: input_state.cursor(),
             ghost_index: input_state.ghost_index,
             dropdown: input_state.dropdown.as_ref(),
+            reverse_search: input_state.reverse_search.as_ref(),
                     },
                 );
                 std::io::stdout().flush()?;
@@ -651,6 +655,7 @@ pub(crate) async fn wait_for_streaming_command(
                         cursor: input_state.cursor(),
             ghost_index: input_state.ghost_index,
             dropdown: input_state.dropdown.as_ref(),
+            reverse_search: input_state.reverse_search.as_ref(),
                     },
                 );
                 std::io::stdout().flush()?;

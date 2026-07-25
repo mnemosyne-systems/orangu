@@ -25,6 +25,7 @@ mod init;
 mod input;
 mod manual;
 mod models;
+mod oneshot;
 mod quotes;
 mod render;
 mod review;
@@ -148,6 +149,12 @@ struct Args {
     /// Interactively create ~/.orangu/orangu.conf and exit.
     #[arg(short, long)]
     init: bool,
+    /// Send a single prompt to the configured server, print the answer on the
+    /// console and exit. No terminal UI and no session on disk; timings are
+    /// printed on stderr, so `orangu -p "Hello"` is the quick way to tell a slow
+    /// server from a slow prompt.
+    #[arg(short = 'p', long = "prompt")]
+    prompt: Option<String>,
     /// Print the shell completion script for the detected shell and exit.
     ///
     /// Detects the current shell from $SHELL. Pipe into your shell's eval or
@@ -209,7 +216,7 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
-    let args = Args::parse();
+    let mut args = Args::parse();
     if args.shell_completions {
         return print_shell_completions();
     }
@@ -229,6 +236,16 @@ async fn run() -> Result<()> {
         }
     };
     let config = load_client_configuration(&config_path)?;
+    if let Some(prompt) = args.prompt.take() {
+        return oneshot::run_prompt(
+            &prompt,
+            oneshot::OneshotContext {
+                workspace: resolve_workspace_root(args.workspace)?,
+                config,
+            },
+        )
+        .await;
+    }
     let cli_theme_override = args.theme.clone();
     let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
     if let Some(cli_theme) = cli_theme_override.as_deref() {
@@ -1135,6 +1152,7 @@ async fn run() -> Result<()> {
                 cursor: input_state.cursor(),
                 ghost_index: input_state.ghost_index,
                 dropdown: input_state.dropdown.as_ref(),
+                reverse_search: input_state.reverse_search.as_ref(),
             },
         );
         std::io::stdout().flush()?;
@@ -1238,6 +1256,7 @@ async fn run() -> Result<()> {
                 cursor: input_state.cursor(),
                 ghost_index: input_state.ghost_index,
                 dropdown: input_state.dropdown.as_ref(),
+                reverse_search: input_state.reverse_search.as_ref(),
             },
         );
         std::io::stdout().flush()?;

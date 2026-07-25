@@ -21,6 +21,7 @@ The sync runs in the background so it never delays startup. Its progress and res
 | `-r`  | `--resume`    | Resume a specific session by UUID.                            |
 | `-a`  | `--all`       | Reopen the workspace tabs that were open at the end of the last run. |
 |       | `--theme`     | Apply a theme for this run. Built-in names and paths to `.theme` files are accepted. |
+| `-p`  | `--prompt`    | Send a single prompt to the configured server, print the answer on the console and exit — no terminal UI and no session on disk. Timings (total, time to first token, and the server's prompt/prefill/decode figures when it reports them) go to stderr, so `orangu -p "Hello"` tells a slow server from a slow prompt. |
 | `-l`  | `--list`      | List all stored sessions as a `SESSION WORKSPACE BRANCH DATE` table and exit. |
 | `-i`  | `--init`      | Interactively create `~/.orangu/orangu.conf` and exit (see the Configuration chapter). |
 | `-s`  | `--shell-completions` | Print the shell completion script for the detected shell (`$SHELL`; bash, zsh, or fish) and exit. |
@@ -164,6 +165,7 @@ Use:
 
 - `<ARROW_UP>` to move backward in history
 - `<ARROW_DOWN>` to move forward in history
+- `Ctrl+R` to search backward through history for the last command starting with the letters entered (`Tab` completes it)
 
 ## Natural-language command aliases
 
@@ -192,6 +194,7 @@ Natural-language forms are recognized only for the built-in local command phrase
 - `Ctrl+K` deletes from the cursor to the end of the line
 - `Ctrl+U` deletes from the start of the line to the cursor
 - `Ctrl+W` deletes from the cursor to the previous whitespace
+- `Ctrl+R` searches backward through the command history (see below)
 - `Alt+Backspace` deletes backward using bash-style word boundaries
 - `Alt+D` deletes forward using bash-style word boundaries
 - Pasted text is inserted at the current cursor position
@@ -201,6 +204,13 @@ Natural-language forms are recognized only for the built-in local command phrase
 - `<ARROW_UP>` moves backward through command history
 - `<ARROW_DOWN>` moves forward through command history
 - History navigation preserves the current unfinished line as a draft and restores it when you move back out of history
+- `Ctrl+R` searches the command history backward, like the bash key of the same name, and does nothing when the history is empty:
+  - The last command starting with the letters entered is previewed as grey ghost text after them, and `Tab` completes it into the line — the same key that accepts a command hint
+  - The letters already typed are the search, so `car` followed by `Ctrl+R` previews the last `cargo …` command straight away
+  - The status line under the input shows the search prompt, for example ``(reverse-i-search)`car': ``
+  - Typing more letters narrows the search, `Backspace` widens it again
+  - `Ctrl+R` again steps to the next older match, skipping repeats of the command on offer; when nothing older matches, the prompt becomes ``(failed reverse-i-search)`car': `` and the last match stays on offer
+  - `Enter` submits the previewed command, `Esc` (or `Ctrl+C`, `Ctrl+G`) leaves the search with the line as typed, and any other key — a cursor move, an edit, `<ARROW_UP>` — leaves the search and acts on the line as typed
 
 ### Inline command hints (ghost text)
 

@@ -1055,18 +1055,24 @@ impl GemmaModel {
                 head_dim,
                 eps,
             );
-            for t in 0..n_tokens {
-                let pos = start_pos + t;
-                tensor::rope_apply_scaled_inplace(
-                    &mut q[t * self.n_head * head_dim..(t + 1) * self.n_head * head_dim],
-                    self.n_head,
-                    head_dim,
-                    layer.rope_dim,
-                    pos,
-                    layer.rope_freq_base,
-                    freq_factors,
-                );
-            }
+            // Each token's RoPE touches only its own row and depends only on
+            // its own position, so this parallelises across tokens exactly the
+            // way the attention loop below does — and at prefill widths it is
+            // a real share of the per-layer CPU time, not a rounding error.
+            let n_head = self.n_head;
+            q.par_chunks_mut(n_head * head_dim)
+                .enumerate()
+                .for_each(|(t, row)| {
+                    tensor::rope_apply_scaled_inplace(
+                        row,
+                        n_head,
+                        head_dim,
+                        layer.rope_dim,
+                        start_pos + t,
+                        layer.rope_freq_base,
+                        freq_factors,
+                    );
+                });
 
             if layer.has_kv {
                 let kv_dim = layer.n_head_kv * head_dim;
@@ -1088,17 +1094,23 @@ impl GemmaModel {
                 };
                 rmsnorm_weightless_inplace(&mut v, n_tokens * layer.n_head_kv, head_dim, eps);
 
-                for t in 0..n_tokens {
-                    let pos = start_pos + t;
+                // RoPE across tokens in parallel (per-row and position-only,
+                // like `q` above), then push in order — the cache is appended
+                // sequentially and every later query's window is defined by
+                // those positions, so only the rotation parallelises.
+                let n_head_kv = layer.n_head_kv;
+                k.par_chunks_mut(kv_dim).enumerate().for_each(|(t, row)| {
                     tensor::rope_apply_scaled_inplace(
-                        &mut k[t * kv_dim..(t + 1) * kv_dim],
-                        layer.n_head_kv,
+                        row,
+                        n_head_kv,
                         head_dim,
                         layer.rope_dim,
-                        pos,
+                        start_pos + t,
                         layer.rope_freq_base,
                         freq_factors,
                     );
+                });
+                for t in 0..n_tokens {
                     cache.layers[cache_index].push(
                         &k[t * kv_dim..(t + 1) * kv_dim],
                         &v[t * kv_dim..(t + 1) * kv_dim],
@@ -1110,123 +1122,244 @@ impl GemmaModel {
             // range before this loop starts reading), so a non-causal
             // model's attention window can freely include positions *after*
             // `pos`, not just up to it — see `Self::attention_window`.
-            attn_out.clear();
-            attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
             let t0 = Instant::now();
-            // Prefill attention is O(n_tokens²) and single-threaded was the
-            // second-largest prefill cost (after the GPU matmuls) and the one
-            // that grows quadratically with prompt length. Each query token's
-            // attention is independent — reads the (now fully-populated,
-            // read-only) KV cache + `q`, writes only its own `attn_out` slice —
-            // so parallelise across tokens with rayon (byte-exact: no cross-token
-            // dependency, per-token accumulation order unchanged). Every thread
-            // keeps its own `scores` scratch.
-            let n_head = self.n_head;
-            let attention_scale = self.attention_scale;
-            let is_swa = layer.is_swa;
-            let cache_layer = &cache.layers[cache_index];
-            attn_out
-                .par_chunks_mut(n_head * head_dim)
-                .enumerate()
-                .for_each(|(t, out_t)| {
-                    let pos = start_pos + t;
-                    let (window_start, window_end) = self.attention_window(is_swa, pos, n_tokens);
-                    let mut scores: Vec<f32> = Vec::new();
-                    for h in 0..n_head {
-                        let kv_head = h / group_size;
-                        let qh = &q[t * n_head * head_dim + h * head_dim
-                            ..t * n_head * head_dim + (h + 1) * head_dim];
+            // One dispatch for the whole prompt's attention — each query
+            // derives its own window in the shader. The CPU loop below stays
+            // as the reference implementation and the non-Vulkan path; the two
+            // are cross-checked against each other for every window shape
+            // (`gpu_attention_prefill_matches_cpu_reference_*`).
+            let gpu_attn = self
+                .backend
+                .as_vulkan()
+                .filter(|vulkan| vulkan.prefill_attention_enabled())
+                .map(|vulkan| {
+                    vulkan.gpu_attention_prefill(
+                        &q,
+                        &mut cache.layers[cache_index],
+                        start_pos,
+                        n_tokens,
+                        self.n_head,
+                        layer.n_head_kv,
+                        head_dim,
+                        if layer.is_swa { self.n_swa } else { 0 },
+                        self.causal,
+                        self.attention_scale,
+                    )
+                });
+            if let Some(out) = gpu_attn {
+                attn_out = out;
+                if prefill_trace {
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} gpu_attention \
+                         n_tokens={n_tokens}: {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            } else {
+                attn_out.clear();
+                attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
+                // Prefill attention is O(n_tokens²) and single-threaded was the
+                // second-largest prefill cost (after the GPU matmuls) and the one
+                // that grows quadratically with prompt length. Each query token's
+                // attention is independent — reads the (now fully-populated,
+                // read-only) KV cache + `q`, writes only its own `attn_out` slice —
+                // so parallelise across tokens with rayon (byte-exact: no cross-token
+                // dependency, per-token accumulation order unchanged). Every thread
+                // keeps its own `scores` scratch.
+                let n_head = self.n_head;
+                let attention_scale = self.attention_scale;
+                let is_swa = layer.is_swa;
+                let cache_layer = &cache.layers[cache_index];
+                attn_out
+                    .par_chunks_mut(n_head * head_dim)
+                    .enumerate()
+                    .for_each(|(t, out_t)| {
+                        let pos = start_pos + t;
+                        let (window_start, window_end) =
+                            self.attention_window(is_swa, pos, n_tokens);
+                        let mut scores: Vec<f32> = Vec::new();
+                        for h in 0..n_head {
+                            let kv_head = h / group_size;
+                            let qh = &q[t * n_head * head_dim + h * head_dim
+                                ..t * n_head * head_dim + (h + 1) * head_dim];
 
-                        scores.clear();
-                        for p in window_start..=window_end {
-                            let kh = cache_layer.key_at(p, kv_head, head_dim);
-                            scores.push(tensor::dot(qh, kh) * attention_scale);
-                        }
-                        tensor::softmax_inplace(&mut scores);
+                            scores.clear();
+                            for p in window_start..=window_end {
+                                let kh = cache_layer.key_at(p, kv_head, head_dim);
+                                scores.push(tensor::dot(qh, kh) * attention_scale);
+                            }
+                            tensor::softmax_inplace(&mut scores);
 
-                        let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
-                        for (offset, &weight) in scores.iter().enumerate() {
-                            let p = window_start + offset;
-                            let vh = cache_layer.value_at(p, kv_head, head_dim);
-                            for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                                *o += weight * vi;
+                            let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
+                            for (offset, &weight) in scores.iter().enumerate() {
+                                let p = window_start + offset;
+                                let vh = cache_layer.value_at(p, kv_head, head_dim);
+                                for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                                    *o += weight * vi;
+                                }
                             }
                         }
-                    }
-                });
-            if prefill_trace {
-                eprintln!(
-                    "orangu-server: [prefill-trace] layer {il} cpu_attention \
+                    });
+                if prefill_trace {
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} cpu_attention \
                      n_tokens={n_tokens}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
 
+            // The whole post-attention half of a dense layer — `wo`, both
+            // residuals, both norms, and the FFN — in one submission. Only a
+            // dense layer qualifies: a MoE layer's routed experts are chosen
+            // per token on the CPU, so its FFN can't be recorded ahead of
+            // time, and it takes the step-by-step path below.
             let t0 = Instant::now();
-            let mut attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
-            if prefill_trace {
-                eprintln!(
-                    "orangu-server: [prefill-trace] layer {il} wo_matmul \
-                     n_tokens={n_tokens}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            tensor::rmsnorm_inplace(&mut attn_proj, &layer.attn_post_norm, n_tokens, n_embd, eps);
-            tensor::add_inplace(&mut x, &attn_proj);
-
-            // FFN. Dense (GEGLU) for most Gemma variants; a MoE layer
-            // (`gemma-4-26B-A4B`) instead runs a dense shared MLP plus routed
-            // experts and sums them (`moe_ffn_result`). Either way the shared
-            // `ffn_post_norm` and the residual add follow.
-            if let Some(moe) = &layer.moe {
-                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens);
-                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
-                tensor::add_inplace(&mut x, &ffn_out);
+            let fused_layer = if layer.moe.is_none() {
+                self.backend.as_vulkan().and_then(|vulkan| {
+                    vulkan.fused_post_attention_prefill(
+                        &attn_out,
+                        &x,
+                        n_tokens,
+                        &layer.wo,
+                        &layer.attn_post_norm,
+                        &layer.ffn_norm,
+                        &layer.ffn_gate,
+                        &layer.ffn_up,
+                        &layer.ffn_down,
+                        &layer.ffn_post_norm,
+                        eps,
+                    )
+                })
             } else {
-                // `x` is the post-attention residual and is *not* mutated
-                // again until the FFN residual add below (the norm runs on the
-                // `ffn_normed` copy, not `x`), so the old `attn_out_residual =
-                // x.clone(); …; x = attn_out_residual` round-trip was a redundant
-                // ~n_tokens×n_embd clone per layer — dropped. `ffn_normed` reuses a
-                // hoisted scratch buffer instead of allocating a fresh clone.
-                ffn_normed.clear();
-                ffn_normed.extend_from_slice(&x);
-                tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-                let t0 = Instant::now();
-                let mut gate_up = self.backend.matmul_batch(&[
-                    MatmulOp {
-                        x: &ffn_normed,
-                        n_tokens,
-                        w: &layer.ffn_gate,
-                    },
-                    MatmulOp {
-                        x: &ffn_normed,
-                        n_tokens,
-                        w: &layer.ffn_up,
-                    },
-                ]);
+                None
+            };
+            if let Some(fused) = fused_layer {
                 if prefill_trace {
                     eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
+                        "orangu-server: [prefill-trace] layer {il} fused_post_attention \
                          n_tokens={n_tokens}: {:.1}ms",
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                let up = gate_up.pop().unwrap();
-                let mut gate = gate_up.pop().unwrap();
-                tensor::gelu_inplace(&mut gate);
-                tensor::mul_inplace(&mut gate, &up);
-                let t0 = Instant::now();
-                let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
-                if prefill_trace {
-                    eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
-                         n_tokens={n_tokens}: {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
+                x = fused;
+            } else {
+                let mut attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                tensor::rmsnorm_inplace(
+                    &mut attn_proj,
+                    &layer.attn_post_norm,
+                    n_tokens,
+                    n_embd,
+                    eps,
+                );
+                tensor::add_inplace(&mut x, &attn_proj);
+
+                // FFN. Dense (GEGLU) for most Gemma variants; a MoE layer
+                // (`gemma-4-26B-A4B`) instead runs a dense shared MLP plus routed
+                // experts and sums them (`moe_ffn_result`). Either way the shared
+                // `ffn_post_norm` and the residual add follow.
+                if let Some(moe) = &layer.moe {
+                    let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens);
+                    tensor::rmsnorm_inplace(
+                        &mut ffn_out,
+                        &layer.ffn_post_norm,
+                        n_tokens,
+                        n_embd,
+                        eps,
                     );
+                    tensor::add_inplace(&mut x, &ffn_out);
+                } else {
+                    // `x` is the post-attention residual and is *not* mutated
+                    // again until the FFN residual add below (the norm runs on the
+                    // `ffn_normed` copy, not `x`), so the old `attn_out_residual =
+                    // x.clone(); …; x = attn_out_residual` round-trip was a redundant
+                    // ~n_tokens×n_embd clone per layer — dropped. `ffn_normed` reuses a
+                    // hoisted scratch buffer instead of allocating a fresh clone.
+                    ffn_normed.clear();
+                    ffn_normed.extend_from_slice(&x);
+                    tensor::rmsnorm_inplace(
+                        &mut ffn_normed,
+                        &layer.ffn_norm,
+                        n_tokens,
+                        n_embd,
+                        eps,
+                    );
+                    // One submission for gate + up + GEGLU + down, with the
+                    // `n_tokens * ffn_len` intermediate staying on the GPU. The
+                    // `else` below is the same work as four CPU-orchestrated
+                    // steps: two blocking submissions with a CPU elementwise pass
+                    // between them. Kept as the fallback for the CPU backend and
+                    // for `ORANGU_Q4K_MMVQ`, which needs a quantize pass the fused
+                    // recorder doesn't emit.
+                    let t0 = Instant::now();
+                    let fused = self.backend.as_vulkan().and_then(|vulkan| {
+                        vulkan.fused_ffn_prefill(
+                            &ffn_normed,
+                            n_tokens,
+                            &layer.ffn_gate,
+                            &layer.ffn_up,
+                            &layer.ffn_down,
+                        )
+                    });
+                    if let Some(mut ffn_out) = fused {
+                        if prefill_trace {
+                            eprintln!(
+                                "orangu-server: [prefill-trace] layer {il} fused_ffn \
+                             n_tokens={n_tokens}: {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        tensor::rmsnorm_inplace(
+                            &mut ffn_out,
+                            &layer.ffn_post_norm,
+                            n_tokens,
+                            n_embd,
+                            eps,
+                        );
+                        tensor::add_inplace(&mut x, &ffn_out);
+                    } else {
+                        let mut gate_up = self.backend.matmul_batch(&[
+                            MatmulOp {
+                                x: &ffn_normed,
+                                n_tokens,
+                                w: &layer.ffn_gate,
+                            },
+                            MatmulOp {
+                                x: &ffn_normed,
+                                n_tokens,
+                                w: &layer.ffn_up,
+                            },
+                        ]);
+                        if prefill_trace {
+                            eprintln!(
+                                "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
+                         n_tokens={n_tokens}: {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        let up = gate_up.pop().unwrap();
+                        let mut gate = gate_up.pop().unwrap();
+                        tensor::gelu_inplace(&mut gate);
+                        tensor::mul_inplace(&mut gate, &up);
+                        let t0 = Instant::now();
+                        let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
+                        if prefill_trace {
+                            eprintln!(
+                                "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
+                         n_tokens={n_tokens}: {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        tensor::rmsnorm_inplace(
+                            &mut ffn_out,
+                            &layer.ffn_post_norm,
+                            n_tokens,
+                            n_embd,
+                            eps,
+                        );
+                        tensor::add_inplace(&mut x, &ffn_out);
+                    }
                 }
-                tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n_tokens, n_embd, eps);
-                tensor::add_inplace(&mut x, &ffn_out);
             }
 
             if let (Some(inp_per_layer), Some(gate_w), Some(proj_w), Some(post_norm)) = (
@@ -1239,30 +1372,38 @@ impl GemmaModel {
                 // above — `x` (the post-FFN residual) is read by the PLE
                 // matmuls below but never mutated until the `+= proj` add, so
                 // the `pe_in = x.clone(); …; x = pe_in` round-trip was dropped.
+                // This layer's slice of the per-token, per-layer input block,
+                // gathered into the contiguous `[n_tokens, per_layer]` the
+                // fused recorder multiplies by. The unfused path below reads
+                // the same strided slices one token at a time instead.
                 let t0 = Instant::now();
-                let mut g = self.backend.matmul(&x, n_tokens, gate_w);
-                if prefill_trace {
-                    eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} ple_gate_matmul \
-                         n_tokens={n_tokens}: {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
-                tensor::gelu_inplace(&mut g);
-                for t in 0..n_tokens {
-                    let slice = &inp_per_layer[(t * self.layers.len() + il) * per_layer
-                        ..(t * self.layers.len() + il + 1) * per_layer];
-                    tensor::mul_inplace(&mut g[t * per_layer..(t + 1) * per_layer], slice);
-                }
-                let t0 = Instant::now();
-                let mut proj = self.backend.matmul(&g, n_tokens, proj_w);
-                if prefill_trace {
-                    eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} ple_proj_matmul \
-                         n_tokens={n_tokens}: {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
+                let fused = self.backend.as_vulkan().and_then(|vulkan| {
+                    let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
+                    for t in 0..n_tokens {
+                        let base = (t * self.layers.len() + il) * per_layer;
+                        per_layer_in.extend_from_slice(&inp_per_layer[base..base + per_layer]);
+                    }
+                    vulkan.fused_ple_prefill(&x, n_tokens, gate_w, proj_w, &per_layer_in)
+                });
+                let mut proj = if let Some(proj) = fused {
+                    if prefill_trace {
+                        eprintln!(
+                            "orangu-server: [prefill-trace] layer {il} fused_ple \
+                             n_tokens={n_tokens}: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    proj
+                } else {
+                    let mut g = self.backend.matmul(&x, n_tokens, gate_w);
+                    tensor::gelu_inplace(&mut g);
+                    for t in 0..n_tokens {
+                        let slice = &inp_per_layer[(t * self.layers.len() + il) * per_layer
+                            ..(t * self.layers.len() + il + 1) * per_layer];
+                        tensor::mul_inplace(&mut g[t * per_layer..(t + 1) * per_layer], slice);
+                    }
+                    self.backend.matmul(&g, n_tokens, proj_w)
+                };
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n_tokens, n_embd, eps);
                 tensor::add_inplace(&mut x, &proj);
             }
@@ -2601,12 +2742,20 @@ impl GemmaModel {
 /// unlike every other norm in this architecture).
 fn rmsnorm_weightless_inplace(x: &mut [f32], n_rows: usize, dim: usize, eps: f32) {
     debug_assert_eq!(x.len(), n_rows * dim);
-    for row in x.chunks_mut(dim) {
+    let norm_row = |row: &mut [f32]| {
         let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
         let scale = 1.0 / (mean_sq + eps).sqrt();
         for v in row.iter_mut() {
             *v *= scale;
         }
+    };
+    // Row-independent, so it parallelises at prefill widths on the same
+    // row-count rule `tensor::rmsnorm_inplace` uses; a decode step's single
+    // row keeps the serial path and its lower overhead.
+    if n_rows >= tensor::PAR_ROWS_THRESHOLD {
+        x.par_chunks_mut(dim).for_each(norm_row);
+    } else {
+        x.chunks_mut(dim).for_each(norm_row);
     }
 }
 

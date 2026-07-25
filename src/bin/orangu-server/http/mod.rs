@@ -43,6 +43,12 @@ pub struct AppState {
     /// "id" in `/v1/models` and `/props` — not necessarily a real file path,
     /// so a client can display it directly.
     pub model_label: String,
+    /// Backend and device this model is running on, exactly as the startup
+    /// banner prints it (e.g. `Vulkan/AMD Radeon RX 5500M (RADV NAVI14)`).
+    /// Reported by `/props` so a benchmark can record *what* it measured
+    /// alongside the numbers — a throughput figure with no device attached
+    /// to it cannot be compared against anything later.
+    pub backend_label: String,
     /// The root directory this server operates in (`-w`/`--workspace`, or
     /// the current working directory). Reported by `/props` so a client can
     /// see which tree it is talking to.

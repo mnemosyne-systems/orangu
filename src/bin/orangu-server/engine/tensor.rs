@@ -30,7 +30,7 @@
 use rayon::prelude::*;
 
 /// Row count at/above which `rmsnorm_inplace` parallelises across rows.
-const PAR_ROWS_THRESHOLD: usize = 32;
+pub(crate) const PAR_ROWS_THRESHOLD: usize = 32;
 /// Element count at/above which `add`/`mul`/`gelu`_inplace parallelise.
 const PAR_ELEMS_THRESHOLD: usize = 1 << 15;
 

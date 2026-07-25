@@ -25,9 +25,55 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::AppState;
 use super::native::finish_reason_str;
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
-use crate::engine::generate::{GenerateRequest, StreamEvent};
+use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::loader::PoolingType;
 use crate::engine::sampling::SamplingParams;
+
+/// OpenAI's `usage` object.
+pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
+    json!({
+        "prompt_tokens": stats.prompt_tokens,
+        "completion_tokens": stats.generated_tokens,
+        "total_tokens": stats.prompt_tokens + stats.generated_tokens,
+        // OpenAI's own field for the part of the prompt served from cache;
+        // `prompt_progress` below carries the same number in llama.cpp's shape.
+        "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
+    })
+}
+
+/// llama.cpp's `timings` object, field for field, so a client (this
+/// project's own `llm::openai`, `orangu-bench`, or anything written against
+/// llama-server) reads prompt- and decode-rate the same way from either
+/// server. Rates come from [`GenerateStats`], which is also what the
+/// per-request console log prints — one source of truth for "how fast was
+/// that", rather than a wall-clock guess at the far end of an HTTP stream.
+pub(crate) fn timings_json(stats: &GenerateStats) -> serde_json::Value {
+    let prompt_ms = stats.prompt_time.as_secs_f64() * 1000.0;
+    let predicted_ms = stats.generate_time.as_secs_f64() * 1000.0;
+    json!({
+        "prompt_n": stats.prompt_tokens,
+        "prompt_ms": prompt_ms,
+        "prompt_per_token_ms": prompt_ms / (stats.prompt_tokens.max(1) as f64),
+        "prompt_per_second": stats.prompt_tokens_per_second(),
+        "predicted_n": stats.generated_tokens,
+        "predicted_ms": predicted_ms,
+        "predicted_per_token_ms": predicted_ms / (stats.generated_tokens.max(1) as f64),
+        "predicted_per_second": stats.generate_tokens_per_second(),
+    })
+}
+
+/// llama.cpp's `prompt_progress` object. llama-server emits it repeatedly
+/// *during* prefill; this server has no mid-prefill progress event, so it is
+/// sent once, with the finished request's totals — enough to tell a cache hit
+/// from real prompt processing, which is what it is read for.
+pub(crate) fn prompt_progress_json(stats: &GenerateStats) -> serde_json::Value {
+    json!({
+        "total": stats.prompt_tokens,
+        "cache": stats.cached_tokens,
+        "processed": stats.prefilled_tokens(),
+        "time_ms": stats.prompt_time.as_millis() as i64,
+    })
+}
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
@@ -62,6 +108,15 @@ pub struct ChatCompletionRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
+    /// llama.cpp's field name and default: reuse an already-computed KV cache
+    /// for whatever prefix of this prompt one exists for. `false` forces a
+    /// full prefill.
+    #[serde(default = "default_cache_prompt")]
+    cache_prompt: bool,
+}
+
+pub(crate) fn default_cache_prompt() -> bool {
+    true
 }
 
 /// `Role::Review`'s reasoning-suppression approximation: real llama-server
@@ -151,6 +206,7 @@ pub async fn chat_completions(
             sampling,
             max_tokens,
             stop_token_ids,
+            cache_prompt: req.cache_prompt,
         })
         .await;
 
@@ -158,6 +214,7 @@ pub async fn chat_completions(
         let mut content = String::new();
         let mut finish_reason = "stop";
         let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+        let mut timings = serde_json::Value::Null;
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
@@ -166,11 +223,8 @@ pub async fn chat_completions(
                     stats,
                 } => {
                     finish_reason = finish_reason_str(fr);
-                    usage = json!({
-                        "prompt_tokens": stats.prompt_tokens,
-                        "completion_tokens": stats.generated_tokens,
-                        "total_tokens": stats.prompt_tokens + stats.generated_tokens,
-                    });
+                    usage = usage_json(&stats);
+                    timings = timings_json(&stats);
                     break;
                 }
                 StreamEvent::Error(err) => {
@@ -193,6 +247,7 @@ pub async fn chat_completions(
                 "finish_reason": finish_reason,
             }],
             "usage": usage,
+            "timings": timings,
         }))
         .into_response();
     }
@@ -209,10 +264,18 @@ pub async fn chat_completions(
                     });
                     yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
                 }
-                StreamEvent::Done { finish_reason, .. } => {
+                StreamEvent::Done { finish_reason, stats } => {
+                    // The final chunk carries what the request cost, in both
+                    // OpenAI's shape (`usage`) and llama.cpp's (`timings`,
+                    // `prompt_progress`) — a streaming client otherwise has
+                    // only its own wall clock, which cannot separate prefill
+                    // from decode or a cache hit from real work.
                     let chunk = json!({
                         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason_str(finish_reason)}],
+                        "usage": usage_json(&stats),
+                        "timings": timings_json(&stats),
+                        "prompt_progress": prompt_progress_json(&stats),
                     });
                     yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
                     yield Ok(axum::response::sse::Event::default().data("[DONE]"));
@@ -243,6 +306,10 @@ pub struct CompletionsRequest {
     /// regardless of what the model would otherwise stop on.
     #[serde(default)]
     ignore_eos: bool,
+    /// See [`ChatCompletionRequest::cache_prompt`]. `orangu-bench --pp` sets
+    /// this `false` so each timed run prefills for real.
+    #[serde(default = "default_cache_prompt")]
+    cache_prompt: bool,
 }
 
 pub async fn completions(
@@ -282,6 +349,7 @@ pub async fn completions(
             sampling,
             max_tokens,
             stop_token_ids,
+            cache_prompt: req.cache_prompt,
         })
         .await;
 
@@ -297,7 +365,19 @@ pub async fn completions(
                         });
                         yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
                     }
-                    StreamEvent::Done { .. } => {
+                    StreamEvent::Done { stats, .. } => {
+                        // A final chunk before `[DONE]`, carrying the same
+                        // cost figures the chat endpoint reports — this is
+                        // the endpoint `orangu-bench` measures through, so
+                        // it is where prefill numbers have to come from.
+                        let chunk = json!({
+                            "id": format!("cmpl-{created}"), "object": "text_completion", "created": created,
+                            "model": model, "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                            "usage": usage_json(&stats),
+                            "timings": timings_json(&stats),
+                            "prompt_progress": prompt_progress_json(&stats),
+                        });
+                        yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
                         yield Ok(axum::response::sse::Event::default().data("[DONE]"));
                         break;
                     }
@@ -313,13 +393,18 @@ pub async fn completions(
 
     let mut text = String::new();
     let mut finish_reason = "stop";
+    let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    let mut timings = serde_json::Value::Null;
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::Token(t) => text.push_str(&t),
             StreamEvent::Done {
-                finish_reason: fr, ..
+                finish_reason: fr,
+                stats,
             } => {
                 finish_reason = finish_reason_str(fr);
+                usage = usage_json(&stats);
+                timings = timings_json(&stats);
                 break;
             }
             StreamEvent::Error(err) => {
@@ -334,6 +419,8 @@ pub async fn completions(
         "created": created,
         "model": model,
         "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
+        "usage": usage,
+        "timings": timings,
     }))
     .into_response()
 }
@@ -431,4 +518,67 @@ pub(crate) async fn pooled_embedding(
         }
     }
     Ok(pooled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn stats() -> GenerateStats {
+        GenerateStats {
+            prompt_tokens: 200,
+            cached_tokens: 50,
+            prompt_time: Duration::from_millis(4000),
+            generated_tokens: 30,
+            generate_time: Duration::from_millis(1000),
+        }
+    }
+
+    #[test]
+    fn usage_reports_totals_and_the_cached_share_of_the_prompt() {
+        let usage = usage_json(&stats());
+        assert_eq!(usage["prompt_tokens"], 200);
+        assert_eq!(usage["completion_tokens"], 30);
+        assert_eq!(usage["total_tokens"], 230);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 50);
+    }
+
+    #[test]
+    fn timings_report_prompt_and_decode_rates_in_llama_cpp_field_names() {
+        let timings = timings_json(&stats());
+        assert_eq!(timings["prompt_n"], 200);
+        assert_eq!(timings["prompt_ms"], 4000.0);
+        // 200 tokens in 4s, 30 tokens in 1s.
+        assert_eq!(timings["prompt_per_second"], 50.0);
+        assert_eq!(timings["predicted_per_second"], 30.0);
+        assert_eq!(timings["prompt_per_token_ms"], 20.0);
+    }
+
+    /// A prompt served entirely from cache must not read as instant prefill:
+    /// `processed` is what actually went through a forward pass.
+    #[test]
+    fn prompt_progress_separates_cached_tokens_from_processed_ones() {
+        let progress = prompt_progress_json(&stats());
+        assert_eq!(progress["total"], 200);
+        assert_eq!(progress["cache"], 50);
+        assert_eq!(progress["processed"], 150);
+        assert_eq!(progress["time_ms"], 4000);
+    }
+
+    /// Rate helpers divide by the token count; an empty generation (a prompt
+    /// that stopped immediately) must not produce a division by zero.
+    #[test]
+    fn timings_survive_a_request_that_generated_nothing() {
+        let empty = GenerateStats {
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            prompt_time: Duration::ZERO,
+            generated_tokens: 0,
+            generate_time: Duration::ZERO,
+        };
+        let timings = timings_json(&empty);
+        assert_eq!(timings["prompt_per_token_ms"], 0.0);
+        assert_eq!(timings["predicted_per_token_ms"], 0.0);
+    }
 }

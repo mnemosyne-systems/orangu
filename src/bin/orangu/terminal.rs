@@ -130,16 +130,28 @@ impl TerminalUiGuard {
         // `ghost_index` selects which candidate to preview (cycled with Shift+Tab).
         // Structured argument completions (branches, tags, files, models, servers)
         // fall last, previewing the first candidate Tab would fill in.
-        let structured_ghost = completion::input_ghost_suffix(
-            screen.input,
-            screen.cursor,
-            screen.ghost_index,
-            render.workspace,
-            render.server_names,
-            render.available_models,
-            render.skills,
-        );
-        let ghost = structured_ghost.as_deref().unwrap_or("");
+        // A running Ctrl+R search owns the hint: the grey text after the line is
+        // the history command it found, filled in with Tab, and the status line
+        // carries the bash-style search prompt.
+        let structured_ghost = screen
+            .reverse_search
+            .is_none()
+            .then(|| {
+                completion::input_ghost_suffix(
+                    screen.input,
+                    screen.cursor,
+                    screen.ghost_index,
+                    render.workspace,
+                    render.server_names,
+                    render.available_models,
+                    render.skills,
+                )
+            })
+            .flatten();
+        let ghost = match screen.reverse_search {
+            Some(search) => search.ghost(screen.input),
+            None => structured_ghost.as_deref().unwrap_or(""),
+        };
         let mut valid_command_len = 0;
         if screen.input.starts_with('/') {
             let first_word = screen.input.split_whitespace().next().unwrap_or("");
@@ -166,7 +178,10 @@ impl TerminalUiGuard {
             transcript: screen.transcript,
             transcript_epoch: screen.transcript_epoch,
             scroll_offset: screen.scroll_offset,
-            left_status: screen.left_status,
+            left_status: screen
+                .reverse_search
+                .map(|search| StatusFragment::plain(search.prompt(screen.input)))
+                .or(screen.left_status),
             pending_count: screen.pending_count,
             pending_lines: screen.pending_lines,
             input: screen.input,

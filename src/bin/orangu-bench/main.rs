@@ -13,14 +13,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! `orangu-bench` — a small developer tool that measures **decode
-//! throughput** (token-generation tok/s) of a running OpenAI-compatible
-//! server over HTTP, at one or more context depths. It is the HTTP-client
-//! analogue of `llama-bench`'s `tg` test: point it at any server that speaks
-//! `POST /v1/completions` with SSE streaming — **both `orangu-server` and
-//! `llama-server`** do — and it reports steady-state decode tok/s, isolating
-//! generation from prompt processing (it times from the first streamed token
-//! to the last, so prefill/TTFT is excluded from the rate).
+//! `orangu-bench` — a small developer tool that measures the throughput of a
+//! running OpenAI-compatible server over HTTP. Point it at any server that
+//! speaks `POST /v1/completions` with SSE streaming — **both `orangu-server`
+//! and `llama-server`** do — and it reports either:
+//!
+//! - **decode** (the default, and `--curve`): steady-state token-generation
+//!   tok/s at one or more context depths, timed from the first streamed token
+//!   to the last so prefill and TTFT are excluded — `llama-bench`'s `tg`.
+//! - **prefill** (`--pp`): prompt-processing tok/s, taken from the server's
+//!   own `timings` so the token count is exact and a prefix-cache hit is
+//!   visible rather than disguised as a fast run — `llama-bench`'s `pp`.
 //!
 //! It exists because "how fast is decode, and how does it scale with context?"
 //! needs the *same* measurement applied to both engines through the *same*
@@ -36,6 +39,8 @@
 //! orangu-bench --url http://127.0.0.1:8100 --depths 0,512,1024,2048,3072 --gen 128
 //! # llama-server on :8300, same harness (uses the OpenAI-compat endpoint)
 //! orangu-bench --url http://127.0.0.1:8300 --depths 0,512,1024,2048,3072 --gen 128
+//! # prefill throughput at a few prompt lengths
+//! orangu-bench --url http://127.0.0.1:8100 --pp 128,512,1024,2048
 //! ```
 
 use std::io::{BufRead, BufReader};
@@ -55,6 +60,16 @@ struct Args {
     /// Comma-separated context depths to sweep.
     #[arg(long, default_value = "0", value_delimiter = ',')]
     depths: Vec<u32>,
+
+    /// Prefill mode: comma-separated prompt lengths (in tokens) to sweep,
+    /// reporting **prompt-processing** throughput instead of the decode sweep
+    /// — `llama-bench`'s `pp` to the default `tg`. Rates come from the
+    /// server's own `timings`, so the token count is exact rather than
+    /// inferred from the requested length, and the reported cache hit makes a
+    /// prompt that was never actually processed impossible to mistake for a
+    /// fast one.
+    #[arg(long, value_delimiter = ',')]
+    pp: Vec<u32>,
 
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128)]
@@ -142,6 +157,132 @@ fn build_prompt(depth: u32) -> String {
     }
     s.push_str(tail);
     s
+}
+
+/// One prefill measurement, as the server reported it.
+struct PrefillSample {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    prompt_ms: f64,
+    /// `None` when the server reported no `timings` — the rate then falls back
+    /// to wall-clock time-to-first-token over the *requested* length, which is
+    /// approximate, and the caller marks the row.
+    server_reported: bool,
+}
+
+impl PrefillSample {
+    fn tok_per_s(&self) -> f64 {
+        if self.prompt_ms > 0.0 {
+            self.prompt_tokens as f64 / (self.prompt_ms / 1000.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Send one prompt, generate a single token, and report what prefill cost.
+///
+/// `cache_prompt: false` is what keeps this honest: without it the second and
+/// later reps would find their prompt already in the server's prefix cache and
+/// report the speed of a cache lookup. Both `orangu-server` and `llama-server`
+/// honour it; the `cached` column the caller prints is the check that whatever
+/// server answered actually did.
+fn run_prefill_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    prompt: &str,
+    model: &Option<String>,
+) -> anyhow::Result<PrefillSample> {
+    let mut body = serde_json::json!({
+        "prompt": prompt,
+        // One token: enough to force the whole prompt through prefill and to
+        // get a final chunk, with as little decode as possible in the way.
+        "max_tokens": 1,
+        "n_predict": 1,
+        "temperature": 0,
+        "stream": true,
+        "cache_prompt": false,
+        // llama-server only attaches `timings` to its OpenAI-compatible
+        // responses when asked; orangu-server always sends them.
+        "timings_per_token": true,
+    });
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.clone());
+    }
+
+    let endpoint = format!("{url}/v1/completions");
+    let t0 = Instant::now();
+    let resp = client
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("server returned HTTP {}", resp.status());
+    }
+
+    let mut reader = BufReader::new(resp);
+    let mut line = String::new();
+    let mut first: Option<Instant> = None;
+    let mut timings: Option<(u32, f64)> = None;
+    let mut cached = 0u32;
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let payload = match line.trim_start().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload == "[DONE]" {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let text = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .or_else(|| v.get("content").and_then(|t| t.as_str()))
+            .unwrap_or("");
+        if !text.is_empty() && first.is_none() {
+            first = Some(Instant::now());
+        }
+        if let Some(t) = v.get("timings") {
+            let n = t.get("prompt_n").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+            let ms = t.get("prompt_ms").and_then(|m| m.as_f64()).unwrap_or(0.0);
+            if n > 0 && ms > 0.0 {
+                timings = Some((n, ms));
+            }
+        }
+        if let Some(p) = v.get("prompt_progress") {
+            cached = p.get("cache").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+        }
+    }
+
+    match timings {
+        Some((prompt_tokens, prompt_ms)) => Ok(PrefillSample {
+            prompt_tokens,
+            cached_tokens: cached,
+            prompt_ms,
+            server_reported: true,
+        }),
+        // No `timings` from this server: fall back to time-to-first-token,
+        // which includes queueing and the first decode step. The caller marks
+        // these rows so the two are never silently compared.
+        None => Ok(PrefillSample {
+            prompt_tokens: 0,
+            cached_tokens: cached,
+            prompt_ms: (first.unwrap_or_else(Instant::now) - t0).as_secs_f64() * 1000.0,
+            server_reported: false,
+        }),
+    }
 }
 
 /// Send one streaming completion and time the decode window.
@@ -260,12 +401,17 @@ fn run(args: &Args) -> anyhow::Result<()> {
         run_once(&client, &args.url, &p, 8, &args.model)?;
     }
 
+    report_environment(&client, args);
+
+    if !args.pp.is_empty() {
+        return run_pp(&client, args);
+    }
+
     if args.curve > 0 {
         return run_curve(&client, args);
     }
 
     if !args.json {
-        println!("orangu-bench → {}", args.url);
         println!(
             "{:>8} | {:>5} | {:>7} | {:>8} | {:>8} | {:>16}",
             "depth", "gen", "ttft_ms", "n_tok", "best", "mean ± sd"
@@ -310,6 +456,167 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Prefill mode: for each requested prompt length, time prompt processing at
+/// that length. The rate is `prompt_n / prompt_ms` straight from the server, so
+/// it excludes decode entirely — the `pp` counterpart to the decode sweep.
+fn run_pp(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()> {
+    if !args.json {
+        println!(
+            "{:>8} | {:>7} | {:>7} | {:>9} | {:>8} | {:>16}",
+            "pp", "n_tok", "cached", "prompt_ms", "best", "mean ± sd"
+        );
+        println!("{}", "-".repeat(70));
+    }
+
+    for &len in &args.pp {
+        let prompt = build_prompt(len);
+        let mut rates = Vec::new();
+        let mut last: Option<PrefillSample> = None;
+        for _ in 0..args.reps.max(1) {
+            let s = run_prefill_once(client, &args.url, &prompt, &args.model)?;
+            rates.push(s.tok_per_s());
+            last = Some(s);
+        }
+        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
+        let sd = var.sqrt();
+        let s = last.expect("at least one rep ran");
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pp": len,
+                    "prompt_tokens": s.prompt_tokens,
+                    "cached_tokens": s.cached_tokens,
+                    "prompt_ms": s.prompt_ms,
+                    "tok_per_s_best": best,
+                    "tok_per_s_mean": mean,
+                    "tok_per_s_sd": sd,
+                    "server_reported": s.server_reported,
+                })
+            );
+        } else if s.server_reported {
+            println!(
+                "{:>8} | {:>7} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
+                len, s.prompt_tokens, s.cached_tokens, s.prompt_ms, best, mean, sd
+            );
+        } else {
+            // No server timings: the only honest thing to print is the
+            // wall-clock TTFT, and that it is not the same measurement.
+            println!(
+                "{:>8} | {:>7} | {:>7} | {:>9.1} | {:>8} | no server timings (ttft only)",
+                len, "?", s.cached_tokens, s.prompt_ms, "-"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What was measured, printed before the numbers: server, model, backend, and
+/// the GPU's clock state. The last one matters because an AMD card left at
+/// `power_dpm_force_performance_level = auto` can idle its core clock down
+/// between requests, which moves throughput enough to swamp the difference a
+/// benchmark is usually run to detect — a rate recorded without it is not
+/// comparable against a later one.
+fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
+    let props: Option<serde_json::Value> = client
+        .get(format!("{}/props", args.url))
+        .send()
+        .ok()
+        .and_then(|r| r.json().ok());
+    let field = |key: &str| -> String {
+        props
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let model = field("model");
+    let backend = field("backend");
+    let gpus = gpu_clock_states();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "env",
+                "url": args.url,
+                "model": model,
+                "backend": backend,
+                "gpus": gpus,
+            })
+        );
+    } else {
+        println!("orangu-bench → {}", args.url);
+        println!("  model    {model}");
+        println!("  backend  {backend}");
+        for gpu in &gpus {
+            println!(
+                "  gpu      {} sclk {} ({})",
+                gpu.card, gpu.sclk, gpu.power_level
+            );
+        }
+    }
+}
+
+/// One GPU's current core clock and power-management mode, read from sysfs.
+#[derive(serde::Serialize)]
+struct GpuClock {
+    card: String,
+    sclk: String,
+    power_level: String,
+}
+
+/// Current core clock and DPM mode of every AMD card exposing them under
+/// `/sys/class/drm`. Empty on any platform or driver that does not (nothing to
+/// report is not an error — the rest of the run is unaffected).
+fn gpu_clock_states() -> Vec<GpuClock> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return out;
+    };
+    let mut cards: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
+        })
+        .collect();
+    cards.sort();
+    for card in cards {
+        let device = card.join("device");
+        let Ok(sclk_raw) = std::fs::read_to_string(device.join("pp_dpm_sclk")) else {
+            continue;
+        };
+        // The active level is the one sysfs marks with a trailing `*`; its
+        // line reads `<level>: <freq> *`, and only the frequency is wanted.
+        let sclk = sclk_raw
+            .lines()
+            .find(|l| l.trim_end().ends_with('*'))
+            .and_then(|l| l.trim_end().trim_end_matches('*').trim().split_once(": "))
+            .map(|(_, freq)| freq.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let power_level = std::fs::read_to_string(device.join("power_dpm_force_performance_level"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        out.push(GpuClock {
+            card: card
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("card")
+                .to_string(),
+            sclk,
+            power_level,
+        });
+    }
+    out
 }
 
 /// Curve mode: one generation of `args.curve` tokens, timestamping each streamed
@@ -382,10 +689,7 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
     }
 
     if !args.json {
-        println!(
-            "orangu-bench → {} (curve: {} tokens, bucket {})",
-            args.url, n, args.bucket
-        );
+        println!("curve: {} tokens, bucket {}", n, args.bucket);
         println!("{:>8} | {:>8}", "ctx", "tok/s");
         println!("{}", "-".repeat(19));
     }

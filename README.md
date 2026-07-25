@@ -77,7 +77,7 @@ Every layer talks to the next over the OpenAI-compatible API, so the pieces stay
 **Comfortable terminal experience.**
 
 - Persistent terminal UI with workspace, server, and model status in the header, refreshed every minute while idle
-- Shell-style prompt editing, history, scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches)
+- Shell-style prompt editing, history with bash-style `Ctrl+R` reverse search (the match is ghosted inline, Tab completes it), scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches)
 - Natural-language aliases for nearly every command — e.g. `review`, `auto review`, `open README.md`, `list models`, `pull 58`, `commit "[#42] My feature"`, `rebase`, `merge feature/foo`, `get comments for issue 51`, `export review`
 - Streaming responses with live footer status such as `Thinking (...)` and native `Working @ X.Y t/s (...)`
 - Queued local commands while a response is in flight, plus double-`Esc` request cancellation

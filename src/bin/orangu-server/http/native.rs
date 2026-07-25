@@ -42,6 +42,7 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.engine.model.config();
     Json(serde_json::json!({
         "model": state.model_label,
+        "backend": state.backend_label,
         "architecture": cfg.architecture,
         "n_ctx": cfg.n_ctx_train,
         "n_vocab": state.engine.tokenizer.vocab_size(),
@@ -211,6 +212,10 @@ pub struct CompletionRequest {
     prompt: String,
     #[serde(default = "default_n_predict")]
     n_predict: usize,
+    /// See `openai::ChatCompletionRequest::cache_prompt` — llama.cpp's field
+    /// name and default (`true`) on its own native endpoint too.
+    #[serde(default = "super::openai::default_cache_prompt")]
+    cache_prompt: bool,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -255,15 +260,20 @@ pub async fn completion(
             sampling,
             max_tokens: req.n_predict,
             stop_token_ids,
+            cache_prompt: req.cache_prompt,
         })
         .await;
 
     if !req.stream {
         let mut content = String::new();
+        let mut timings = serde_json::Value::Null;
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
-                StreamEvent::Done { .. } => break,
+                StreamEvent::Done { stats, .. } => {
+                    timings = super::openai::timings_json(&stats);
+                    break;
+                }
                 StreamEvent::Error(err) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
                 }
@@ -273,7 +283,8 @@ pub async fn completion(
             .engine
             .tokenizer
             .clean_up_tokenization_spaces(&content);
-        return Json(serde_json::json!({"content": content, "stop": true})).into_response();
+        return Json(serde_json::json!({"content": content, "stop": true, "timings": timings}))
+            .into_response();
     }
 
     let stream = async_stream::stream! {
@@ -285,12 +296,14 @@ pub async fn completion(
                             .data(serde_json::json!({"content": text, "stop": false}).to_string()),
                     );
                 }
-                StreamEvent::Done { finish_reason, .. } => {
+                StreamEvent::Done { finish_reason, stats } => {
                     yield Ok(axum::response::sse::Event::default().data(
                         serde_json::json!({
                             "content": "",
                             "stop": true,
                             "finish_reason": finish_reason_str(finish_reason),
+                            "timings": super::openai::timings_json(&stats),
+                            "prompt_progress": super::openai::prompt_progress_json(&stats),
                         })
                         .to_string(),
                     ));

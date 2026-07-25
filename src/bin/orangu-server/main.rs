@@ -600,6 +600,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
         model_label: model_label.clone(),
+        backend_label: backend_label.clone(),
         workspace: workspace.clone(),
         started_at: std::time::Instant::now(),
         shutdown_tx,

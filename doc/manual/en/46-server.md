@@ -504,6 +504,45 @@ Three equivalent ways: `Ctrl+C`, `SIGINT` (`kill -INT <pid>`), or
 same safety rule `orangu-coordinator`'s own shutdown endpoint uses). Both
 the API and (if enabled) the web UI listener stop together.
 
+## What a request cost
+
+Every generation endpoint reports what the request cost, so a client never has
+to infer it from its own wall clock — which cannot separate prompt processing
+from generation, nor a cache hit from real work:
+
+- **`usage`** (OpenAI's shape) — `prompt_tokens`, `completion_tokens`,
+  `total_tokens`, and `prompt_tokens_details.cached_tokens` for the part of the
+  prompt served from the prefix cache.
+- **`timings`** (llama.cpp's shape, field for field) — `prompt_n`,
+  `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+  `predicted_per_second` and their per-token equivalents. These are the same
+  figures the per-request console log prints.
+- **`prompt_progress`** (llama.cpp's shape) — `total`, `cache`, `processed`,
+  `time_ms`. llama-server emits this repeatedly *during* prefill; this server
+  has no mid-prefill progress event and sends it once, with the finished
+  request's totals.
+
+On a streaming response they ride on the final chunk (the one carrying
+`finish_reason`), immediately before `[DONE]`; on a non-streaming response they
+are top-level fields. `orangu-bench --pp` reads them to report prefill
+throughput, and the orangu client reads them for its status-line rates.
+
+### `cache_prompt`
+
+`/v1/chat/completions`, `/v1/completions`, and `/completion` accept
+`cache_prompt` (llama.cpp's field name, default `true`). It controls whether a
+request may **reuse** an already-computed KV cache for whatever prefix of its
+prompt one exists for — the cross-slot prefix pool, or a slot's own retained
+cache. Leaving it at the default is what makes a growing conversation cheap:
+only the new suffix is processed.
+
+Set it `false` to force the whole prompt through a real forward pass. That is
+what a prefill measurement needs, since a cached prompt is reported as
+processing thousands of tokens per second while doing almost nothing —
+`usage.prompt_tokens_details.cached_tokens` and `prompt_progress.cache` show
+exactly how much was skipped. The flag governs only what a request *reads*: the
+resulting cache is still stored for later requests either way.
+
 ## Endpoint reference
 
 | Endpoint | |
@@ -513,7 +552,7 @@ the API and (if enabled) the web UI listener stop together.
 | `POST /v1/completions` | legacy OpenAI completion, no chat template needed; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized |
 | `GET /health` | |
-| `GET /props` | model + server metadata |
+| `GET /props` | model + server metadata, including the `backend` and device the model is running on |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
 | `POST /completion` | native, streaming; disabled under `--embedding` |

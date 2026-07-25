@@ -494,6 +494,7 @@ async fn send_message(
             sampling: SamplingParams::default(),
             max_tokens: MAX_TOKENS,
             stop_token_ids,
+            cache_prompt: true,
         })
         .await;
 

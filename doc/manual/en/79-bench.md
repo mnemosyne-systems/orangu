@@ -1,13 +1,14 @@
 \newpage
 
-## Benchmarking decode throughput (`orangu-bench`)
+## Benchmarking throughput (`orangu-bench`)
 
 `orangu-bench` (`src/bin/orangu-bench/`) is a **developer tool** — a fourth
 binary in the same Cargo package as `orangu`, `orangu-coordinator`, and
 `orangu-server`. It is not part of the served product and has no bearing on
 running a model in production; it exists to answer one question during
-performance work: *how fast does token generation (decode) run, and how does
-that rate change as the context grows?*
+performance work: *how fast does token generation (decode) run, how does that
+rate change as the context grows, and how fast is prompt processing
+(prefill)?*
 
 It is the HTTP-client analogue of `llama.cpp`'s `llama-bench -n` (its `tg`,
 token-generation, test). Rather than embedding an inference engine, it points
@@ -62,6 +63,60 @@ orangu-bench → http://127.0.0.1:8100
     2048 |   128 |     980 |      128 |    20.10 |    19.95 ±  0.20
 ```
 
+### Prefill mode (`--pp`) — prompt processing, not decode
+
+`--pp` sweeps *prompt lengths* and reports **prompt-processing** throughput —
+`llama-bench`'s `pp` test to the default's `tg`. Each run sends a prompt of
+roughly the requested length and generates a single token, so what is timed is
+prefill and nothing else.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --pp 128,512,1024,2048
+```
+
+```
+orangu-bench → http://127.0.0.1:8100
+  model    unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+  backend  Vulkan/AMD Radeon RX 5500M (RADV NAVI14) (Vulkan)
+  gpu      card1 sclk 1700Mhz (auto)
+      pp |   n_tok |  cached | prompt_ms |     best |        mean ± sd
+----------------------------------------------------------------------
+     256 |     288 |       0 |    6021.7 |    47.83 |    44.73 ±  3.10
+    1024 |    1120 |       0 |   24037.8 |    46.59 |    44.35 ±  2.24
+```
+
+Two columns exist to keep the number honest:
+
+- **`n_tok`** is the prompt length the *server* reported (`timings.prompt_n`),
+  not the length that was asked for. The `--pp` value is only a target, since
+  the tool has no tokenizer — the rate is computed from what was actually
+  processed.
+- **`cached`** is how much of the prompt came from the server's prefix cache
+  and so never went through a forward pass. A cached prompt "prefills"
+  instantly and would otherwise look like a spectacular result. Every run
+  sends `cache_prompt: false`, which both `orangu-server` and `llama-server`
+  honour, so this column should read `0`; if it ever climbs toward `n_tok`,
+  the server ignored the flag and the row is measuring a cache lookup rather
+  than prefill.
+
+A server that reports no `timings` at all (an older `orangu-server`, or a
+llama-server built without them) gets a row marked `no server timings (ttft
+only)`, carrying wall-clock time-to-first-token instead. That figure includes
+queueing and the first decode step, so it is not comparable with the rest — the
+row says so rather than quietly printing a smaller number.
+
+### What was measured
+
+Every run opens with the server's model and backend (from `GET /props`) and,
+on Linux with an AMD card, each GPU's current core clock and DPM mode read from
+`/sys/class/drm/card*/device/`. This is not decoration: a card left at
+`power_dpm_force_performance_level = auto` can idle its clock down between
+requests, which moves throughput by more than the difference most benchmarks
+are run to detect. A rate recorded without the device and clock state beside it
+cannot be compared against one recorded later. Under `--json` the same
+information is the first object emitted, tagged `"type": "env"`, so a stored
+result carries its own provenance.
+
 ### Options
 
 `orangu-bench --help`:
@@ -72,6 +127,7 @@ Usage: orangu-bench [OPTIONS]
 Options:
       --url <URL>          Base URL of the server [default: http://127.0.0.1:8100]
       --depths <DEPTHS>    Comma-separated context depths to sweep [default: 0]
+      --pp <PP>            Prefill mode: comma-separated prompt lengths to sweep, reporting prompt-processing throughput
       --gen <N_GEN>        Number of tokens to generate per timed run [default: 128]
       --curve <CURVE>      Curve mode: ONE generation of this many tokens, decode rate bucketed by context [default: 0]
       --bucket <BUCKET>    Bucket width (in context tokens) for --curve [default: 256]

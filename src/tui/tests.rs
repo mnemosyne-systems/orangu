@@ -117,6 +117,37 @@ fn test_render_dropdown_popup() {
 }
 
 #[test]
+fn reverse_search_ghosts_the_match_and_shows_its_prompt() {
+    let mut terminal = setup_test_terminal(80, 24);
+    let mut args = default_render_args();
+
+    // What `Ctrl+R` hands the renderer: the letters entered in the input line,
+    // the rest of the history match as ghost text, and the search prompt in the
+    // left status slot.
+    args.input = "car";
+    args.cursor = 3;
+    args.ghost = "go build";
+    args.left_status = Some(StatusFragment::plain(
+        "(reverse-i-search)`car': ".to_string(),
+    ));
+
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, 80, 24);
+
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("car") && row.contains("go build")),
+        "prompt row should preview the match: {rows:?}"
+    );
+    assert!(
+        rows.last()
+            .expect("status row")
+            .contains("(reverse-i-search)`car': "),
+        "status row should carry the search prompt: {rows:?}"
+    );
+}
+
+#[test]
 fn test_render_cursor_position() {
     let mut terminal = setup_test_terminal(80, 24);
     let mut args = default_render_args();

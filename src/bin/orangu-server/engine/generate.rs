@@ -44,6 +44,13 @@ pub enum FinishReason {
 #[derive(Clone, Debug)]
 pub struct GenerateStats {
     pub prompt_tokens: usize,
+    /// How many of `prompt_tokens` came from a cache (the cross-slot prefix
+    /// pool or this slot's own retained cache) and so never went through a
+    /// forward pass. The difference between this and `prompt_tokens` is what
+    /// `prompt_time` was actually spent on, which is what makes a prefill
+    /// measurement interpretable — a fast prompt that was 99% cached says
+    /// nothing about prefill speed.
+    pub cached_tokens: usize,
     pub prompt_time: Duration,
     pub generated_tokens: usize,
     pub generate_time: Duration,
@@ -56,6 +63,11 @@ impl GenerateStats {
 
     pub fn generate_tokens_per_second(&self) -> f64 {
         self.generated_tokens as f64 / self.generate_time.as_secs_f64().max(1e-9)
+    }
+
+    /// Prompt tokens that actually needed a forward pass this request.
+    pub fn prefilled_tokens(&self) -> usize {
+        self.prompt_tokens.saturating_sub(self.cached_tokens)
     }
 
     /// The line printed to stdout per completed request — llama-server's
@@ -78,6 +90,26 @@ pub struct GenerateRequest {
     pub sampling: SamplingParams,
     pub max_tokens: usize,
     pub stop_token_ids: Vec<u32>,
+    /// Whether this request may reuse an already-computed KV cache for
+    /// whatever prefix of its prompt one is available for (llama.cpp's field
+    /// of the same name, and its default of `true`). Setting it `false` forces
+    /// every prompt token through a real forward pass, which is what makes a
+    /// prefill measurement mean anything — a cached prompt "prefills" in
+    /// microseconds and measures only the lookup. It does not stop this
+    /// request's own cache from being *stored* for later requests.
+    pub cache_prompt: bool,
+}
+
+impl Default for GenerateRequest {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: Vec::new(),
+            sampling: SamplingParams::default(),
+            max_tokens: 0,
+            stop_token_ids: Vec::new(),
+            cache_prompt: true,
+        }
+    }
 }
 
 pub enum StreamEvent {
@@ -266,9 +298,14 @@ fn run(
     // forward call to produce fresh logits for the first sampled token
     // from (this only matters for the degenerate case of re-sending a
     // prompt identical to one already fully cached).
+    //
+    // `cache_prompt: false` skips both reuse paths below, so the prompt is
+    // prefilled in full. Storing this request's own cache afterwards is
+    // unaffected — the flag governs what this request may *read*.
     let mut new_cache = model.new_kv_cache(capacity);
     let mut reused_len = 0usize;
-    if let Some(pool) = prefix_cache
+    if req.cache_prompt
+        && let Some(pool) = prefix_cache
         && let Some((matched, entry)) = pool.take_best_match(&req.prompt_tokens)
     {
         let matched = matched.min(req.prompt_tokens.len().saturating_sub(1));
@@ -281,7 +318,8 @@ fn run(
     // does this slot's own durably-retained cache (`engine::slot_store`, the
     // source a `restore` populated) get consulted — it applies the same
     // leave-one-token and recurrent-state rules internally.
-    if reused_len == 0
+    if req.cache_prompt
+        && reused_len == 0
         && let Some(store) = slot_store
     {
         reused_len = store.reuse_into(guard.id(), &req.prompt_tokens, &mut new_cache);
@@ -361,6 +399,7 @@ fn run(
         if last_report.elapsed() >= Duration::from_secs(1) {
             let partial = GenerateStats {
                 prompt_tokens: req.prompt_tokens.len(),
+                cached_tokens: reused_len,
                 prompt_time,
                 generated_tokens: generated,
                 generate_time: generate_start.elapsed(),
@@ -509,6 +548,7 @@ fn run(
 
     let stats = GenerateStats {
         prompt_tokens: req.prompt_tokens.len(),
+        cached_tokens: reused_len,
         prompt_time,
         generated_tokens: generated,
         generate_time,
@@ -780,6 +820,26 @@ mod tests {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
     ) -> (String, bool) {
+        run_request_cached(
+            model,
+            tokenizer,
+            prefix_cache,
+            prompt_tokens,
+            max_tokens,
+            true,
+        )
+    }
+
+    /// `run_request` with explicit control over whether the request is allowed
+    /// to read a cache (`GenerateRequest::cache_prompt`).
+    fn run_request_cached(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        prefix_cache: Option<&PrefixCache>,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        cache_prompt: bool,
+    ) -> (String, bool) {
         let slots = SlotPool::new(1);
         let guard = pollster::block_on(slots.acquire());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -788,6 +848,7 @@ mod tests {
             sampling: greedy_params(),
             max_tokens,
             stop_token_ids: vec![],
+            cache_prompt,
         };
         run(model, tokenizer, None, prefix_cache, None, &guard, req, tx).unwrap();
         drain(rx)
@@ -873,6 +934,61 @@ mod tests {
             turn2_forwarded_reuse,
             1 + turn2_suffix.len() + 2,
             "reuse must skip turn 1's first 7 cached positions, forwarding only its own uncached 8th token, the new suffix, and this turn's own 2 real decode steps"
+        );
+    }
+
+    /// `cache_prompt: false` must put every prompt token through a real
+    /// forward pass even when a `PrefixCache` holds an exact match for the
+    /// whole prompt — the property a prefill benchmark depends on, since a
+    /// request served from cache reports a prompt time that measures the
+    /// lookup and nothing else. Checked by counting forwarded tokens, not by
+    /// timing: the same run repeated with the flag left at its default must
+    /// skip that work, so the two counts bracket what the flag controls.
+    #[test]
+    fn cache_prompt_false_reprefills_a_prompt_the_cache_already_holds() {
+        let n_vocab = 32;
+        let tokenizer = letter_tokenizer(n_vocab);
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let model = DeterministicModel::new(n_vocab);
+        let pool = PrefixCache::new(4);
+
+        // Populate the pool, then re-send the identical prompt twice.
+        let (first_text, ok) = run_request(&model, &tokenizer, Some(&pool), prompt.clone(), 3);
+        assert!(ok);
+
+        let before_uncached = model.forwarded_tokens.load(Ordering::Relaxed);
+        let (uncached_text, ok) = run_request_cached(
+            &model,
+            &tokenizer,
+            Some(&pool),
+            prompt.clone(),
+            3,
+            /* cache_prompt */ false,
+        );
+        assert!(ok);
+        let uncached_forwarded = model.forwarded_tokens.load(Ordering::Relaxed) - before_uncached;
+
+        let before_cached = model.forwarded_tokens.load(Ordering::Relaxed);
+        let (cached_text, ok) = run_request(&model, &tokenizer, Some(&pool), prompt.clone(), 3);
+        assert!(ok);
+        let cached_forwarded = model.forwarded_tokens.load(Ordering::Relaxed) - before_cached;
+
+        // Skipping the cache changes cost, never output.
+        assert_eq!(uncached_text, first_text);
+        assert_eq!(cached_text, first_text);
+        // All 5 prompt tokens forwarded, plus this run's own 2 real decode
+        // steps (the 3rd generated token's forward call is skipped — see
+        // `prefix_cache_reuse_matches_a_full_recompute` for why).
+        assert_eq!(
+            uncached_forwarded,
+            prompt.len() + 2,
+            "cache_prompt: false must prefill the whole prompt"
+        );
+        assert!(
+            cached_forwarded < uncached_forwarded,
+            "the same request with caching allowed must forward fewer tokens \
+             ({cached_forwarded} vs {uncached_forwarded}) — otherwise this test \
+             proves nothing about the flag"
         );
     }
 
@@ -964,6 +1080,7 @@ mod tests {
                 sampling: greedy_params(),
                 max_tokens: 4,
                 stop_token_ids: vec![],
+                cache_prompt: true,
             })
             .await;
 
