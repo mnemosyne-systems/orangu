@@ -51,6 +51,11 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "chat_template": state.engine.chat_template_source,
         "workspace": state.workspace.display().to_string(),
         "uptime_seconds": state.started_at.elapsed().as_secs(),
+        // Identifies *which* server process answered. Paired with
+        // `uptime_seconds` this is what lets a benchmark prove it is talking to
+        // the build it just launched rather than one left over from a previous
+        // run — see `orangu-bench`'s `report_environment`.
+        "pid": std::process::id(),
     }))
 }
 

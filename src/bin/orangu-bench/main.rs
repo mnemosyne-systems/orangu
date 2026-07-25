@@ -516,12 +516,23 @@ fn run_pp(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()>
     Ok(())
 }
 
-/// What was measured, printed before the numbers: server, model, backend, and
-/// the GPU's clock state. The last one matters because an AMD card left at
+/// What was measured, printed before the numbers: which server process, the
+/// model, the backend, and the GPU's clock state.
+///
+/// The GPU clock matters because an AMD card left at
 /// `power_dpm_force_performance_level = auto` can idle its core clock down
 /// between requests, which moves throughput enough to swamp the difference a
 /// benchmark is usually run to detect — a rate recorded without it is not
 /// comparable against a later one.
+///
+/// `pid`/`up` matter for the same reason, and catch a sharper failure: an A/B
+/// that never actually swapped binaries. A launcher that stops the old server
+/// by process name misses a build copied under a different filename, the new
+/// server then fails to bind the port and exits, and the benchmark happily
+/// measures the *old* one — reporting the two builds as identical, which reads
+/// as a credible "no change" result rather than as the broken measurement it
+/// is. A pid that does not change between runs, or an uptime far longer than
+/// this run, says so immediately.
 fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
     let props: Option<serde_json::Value> = client
         .get(format!("{}/props", args.url))
@@ -536,8 +547,16 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
             .unwrap_or("unknown")
             .to_string()
     };
+    let num = |key: &str| -> Option<u64> {
+        props
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(serde_json::Value::as_u64)
+    };
     let model = field("model");
     let backend = field("backend");
+    let pid = num("pid");
+    let uptime = num("uptime_seconds");
     let gpus = gpu_clock_states();
 
     if args.json {
@@ -548,6 +567,8 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
                 "url": args.url,
                 "model": model,
                 "backend": backend,
+                "pid": pid,
+                "uptime_seconds": uptime,
                 "gpus": gpus,
             })
         );
@@ -555,6 +576,12 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
         println!("orangu-bench → {}", args.url);
         println!("  model    {model}");
         println!("  backend  {backend}");
+        // Only for a server that reports them; llama-server does not, and a
+        // missing field is not worth a line of output.
+        if pid.is_some() || uptime.is_some() {
+            let show = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
+            println!("  server   pid {} up {}s", show(pid), show(uptime));
+        }
         for gpu in &gpus {
             println!(
                 "  gpu      {} sclk {} ({})",

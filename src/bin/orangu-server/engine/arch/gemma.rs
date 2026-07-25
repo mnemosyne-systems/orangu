@@ -1019,193 +1019,260 @@ impl GemmaModel {
             let wk = wk.transpose()?;
             let owns_v = layer.has_kv && layer.wv.is_some();
 
-            let mut ops = vec![MatmulOp {
-                x: &normed,
-                n_tokens,
-                w: &layer.wq,
-            }];
-            if let Some(wk) = wk {
-                ops.push(MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: wk,
-                });
-            }
-            if owns_v {
-                ops.push(MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: layer.wv.as_ref().unwrap(),
-                });
-            }
-            let t0 = Instant::now();
-            let mut results = self.backend.matmul_batch(&ops).into_iter();
-            if prefill_trace {
-                eprintln!(
-                    "orangu-server: [prefill-trace] layer {il} qkv_matmul_batch \
-                     n_tokens={n_tokens}: {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            let mut q = results.next().unwrap();
-            tensor::rmsnorm_inplace(
-                &mut q,
-                &layer.attn_q_norm,
-                n_tokens * self.n_head,
-                head_dim,
-                eps,
-            );
-            // Each token's RoPE touches only its own row and depends only on
-            // its own position, so this parallelises across tokens exactly the
-            // way the attention loop below does — and at prefill widths it is
-            // a real share of the per-layer CPU time, not a rounding error.
-            let n_head = self.n_head;
-            q.par_chunks_mut(n_head * head_dim)
-                .enumerate()
-                .for_each(|(t, row)| {
-                    tensor::rope_apply_scaled_inplace(
-                        row,
-                        n_head,
-                        head_dim,
-                        layer.rope_dim,
-                        start_pos + t,
-                        layer.rope_freq_base,
-                        freq_factors,
-                    );
-                });
-
-            if layer.has_kv {
-                let kv_dim = layer.n_head_kv * head_dim;
-                let mut k = results.next().unwrap();
-                tensor::rmsnorm_inplace(
-                    &mut k,
-                    layer
-                        .attn_k_norm
-                        .as_ref()
-                        .context("layer has_kv but no attn_k_norm")?,
-                    n_tokens * layer.n_head_kv,
-                    head_dim,
-                    eps,
-                );
-                let mut v = if owns_v {
-                    results.next().unwrap()
-                } else {
-                    k.clone()
-                };
-                rmsnorm_weightless_inplace(&mut v, n_tokens * layer.n_head_kv, head_dim, eps);
-
-                // RoPE across tokens in parallel (per-row and position-only,
-                // like `q` above), then push in order — the cache is appended
-                // sequentially and every later query's window is defined by
-                // those positions, so only the rotation parallelises.
-                let n_head_kv = layer.n_head_kv;
-                k.par_chunks_mut(kv_dim).enumerate().for_each(|(t, row)| {
-                    tensor::rope_apply_scaled_inplace(
-                        row,
-                        n_head_kv,
-                        head_dim,
-                        layer.rope_dim,
-                        start_pos + t,
-                        layer.rope_freq_base,
-                        freq_factors,
-                    );
-                });
-                for t in 0..n_tokens {
-                    cache.layers[cache_index].push(
-                        &k[t * kv_dim..(t + 1) * kv_dim],
-                        &v[t * kv_dim..(t + 1) * kv_dim],
-                    );
-                }
-            }
-            // Every token's K/V for this layer is already in `cache` by this
-            // point (the push loop above ran for the full `0..n_tokens`
-            // range before this loop starts reading), so a non-causal
-            // model's attention window can freely include positions *after*
-            // `pos`, not just up to it — see `Self::attention_window`.
-            let t0 = Instant::now();
-            // One dispatch for the whole prompt's attention — each query
-            // derives its own window in the shader. The CPU loop below stays
-            // as the reference implementation and the non-Vulkan path; the two
-            // are cross-checked against each other for every window shape
-            // (`gpu_attention_prefill_matches_cpu_reference_*`).
-            let gpu_attn = self
+            // The whole pre-attention half in one submission, when the Vulkan
+            // backend can take it: Q/K/V, the per-head norms, RoPE, the
+            // KV-cache write and attention all stay in GPU memory, so the
+            // projections' output never reaches the CPU and attention's Q is
+            // never uploaded. `None` falls through to the step-by-step path
+            // below, which stays the reference implementation the fused one is
+            // cross-checked against
+            // (`fused_attention_prefill_matches_the_unfused_sequence_*`).
+            let t_fused = Instant::now();
+            // Set when attention left its result on the GPU, so the
+            // post-attention chain can read it there instead of taking it
+            // through host memory and back.
+            let mut fused_attn_buf: Option<wgpu::Buffer> = None;
+            let fused_attn = self
                 .backend
                 .as_vulkan()
-                .filter(|vulkan| vulkan.prefill_attention_enabled())
-                .map(|vulkan| {
-                    vulkan.gpu_attention_prefill(
-                        &q,
+                .filter(|vulkan| vulkan.prefill_fused_attention_enabled())
+                .and_then(|vulkan| {
+                    vulkan.fused_attention_prefill(
+                        crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                            normed: &normed,
+                            n_tokens,
+                            start_pos,
+                            wq: &layer.wq,
+                            q_norm: &layer.attn_q_norm,
+                            kv: wk.map(|wk| crate::engine::backend::vulkan::FusedAttnPrefillKv {
+                                wk,
+                                k_norm: layer
+                                    .attn_k_norm
+                                    .as_ref()
+                                    .expect("layer has_kv but no attn_k_norm"),
+                                wv: owns_v.then(|| layer.wv.as_ref().unwrap()),
+                            }),
+                            n_head: self.n_head,
+                            n_head_kv: layer.n_head_kv,
+                            head_dim,
+                            rope_dim: layer.rope_dim,
+                            rope_freq_base: layer.rope_freq_base,
+                            freq_factors,
+                            eps,
+                            n_swa: if layer.is_swa { self.n_swa } else { 0 },
+                            causal: self.causal,
+                            scale: self.attention_scale,
+                            // A dense layer hands the GPU buffer straight to
+                            // `fused_post_attention_prefill`; only a MoE
+                            // layer, whose FFN is CPU-orchestrated, needs
+                            // attention's output on the host.
+                            want_attn_out_host: layer.moe.is_some(),
+                        },
                         &mut cache.layers[cache_index],
-                        start_pos,
-                        n_tokens,
-                        self.n_head,
-                        layer.n_head_kv,
-                        head_dim,
-                        if layer.is_swa { self.n_swa } else { 0 },
-                        self.causal,
-                        self.attention_scale,
                     )
                 });
-            if let Some(out) = gpu_attn {
-                attn_out = out;
+            if let Some(out) = fused_attn {
+                // The recorder has already committed each stripe's K/V into the
+                // cache (it has to — a later stripe's attention reads them), so
+                // there is nothing to commit here.
+                attn_out = out.attn_out;
+                fused_attn_buf = Some(out.attn_out_buf);
                 if prefill_trace {
                     eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} gpu_attention \
+                        "orangu-server: [prefill-trace] layer {il} fused_attention \
+                         n_tokens={n_tokens}: {:.1}ms",
+                        t_fused.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            } else {
+                let mut ops = vec![MatmulOp {
+                    x: &normed,
+                    n_tokens,
+                    w: &layer.wq,
+                }];
+                if let Some(wk) = wk {
+                    ops.push(MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: wk,
+                    });
+                }
+                if owns_v {
+                    ops.push(MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: layer.wv.as_ref().unwrap(),
+                    });
+                }
+                let t0 = Instant::now();
+                let mut results = self.backend.matmul_batch(&ops).into_iter();
+                if prefill_trace {
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} qkv_matmul_batch \
                          n_tokens={n_tokens}: {:.1}ms",
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-            } else {
-                attn_out.clear();
-                attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
-                // Prefill attention is O(n_tokens²) and single-threaded was the
-                // second-largest prefill cost (after the GPU matmuls) and the one
-                // that grows quadratically with prompt length. Each query token's
-                // attention is independent — reads the (now fully-populated,
-                // read-only) KV cache + `q`, writes only its own `attn_out` slice —
-                // so parallelise across tokens with rayon (byte-exact: no cross-token
-                // dependency, per-token accumulation order unchanged). Every thread
-                // keeps its own `scores` scratch.
+                let mut q = results.next().unwrap();
+                tensor::rmsnorm_inplace(
+                    &mut q,
+                    &layer.attn_q_norm,
+                    n_tokens * self.n_head,
+                    head_dim,
+                    eps,
+                );
+                // Each token's RoPE touches only its own row and depends only on
+                // its own position, so this parallelises across tokens exactly the
+                // way the attention loop below does — and at prefill widths it is
+                // a real share of the per-layer CPU time, not a rounding error.
                 let n_head = self.n_head;
-                let attention_scale = self.attention_scale;
-                let is_swa = layer.is_swa;
-                let cache_layer = &cache.layers[cache_index];
-                attn_out
-                    .par_chunks_mut(n_head * head_dim)
+                q.par_chunks_mut(n_head * head_dim)
                     .enumerate()
-                    .for_each(|(t, out_t)| {
-                        let pos = start_pos + t;
-                        let (window_start, window_end) =
-                            self.attention_window(is_swa, pos, n_tokens);
-                        let mut scores: Vec<f32> = Vec::new();
-                        for h in 0..n_head {
-                            let kv_head = h / group_size;
-                            let qh = &q[t * n_head * head_dim + h * head_dim
-                                ..t * n_head * head_dim + (h + 1) * head_dim];
+                    .for_each(|(t, row)| {
+                        tensor::rope_apply_scaled_inplace(
+                            row,
+                            n_head,
+                            head_dim,
+                            layer.rope_dim,
+                            start_pos + t,
+                            layer.rope_freq_base,
+                            freq_factors,
+                        );
+                    });
 
-                            scores.clear();
-                            for p in window_start..=window_end {
-                                let kh = cache_layer.key_at(p, kv_head, head_dim);
-                                scores.push(tensor::dot(qh, kh) * attention_scale);
-                            }
-                            tensor::softmax_inplace(&mut scores);
+                if layer.has_kv {
+                    let kv_dim = layer.n_head_kv * head_dim;
+                    let mut k = results.next().unwrap();
+                    tensor::rmsnorm_inplace(
+                        &mut k,
+                        layer
+                            .attn_k_norm
+                            .as_ref()
+                            .context("layer has_kv but no attn_k_norm")?,
+                        n_tokens * layer.n_head_kv,
+                        head_dim,
+                        eps,
+                    );
+                    let mut v = if owns_v {
+                        results.next().unwrap()
+                    } else {
+                        k.clone()
+                    };
+                    rmsnorm_weightless_inplace(&mut v, n_tokens * layer.n_head_kv, head_dim, eps);
 
-                            let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
-                            for (offset, &weight) in scores.iter().enumerate() {
-                                let p = window_start + offset;
-                                let vh = cache_layer.value_at(p, kv_head, head_dim);
-                                for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                                    *o += weight * vi;
+                    // RoPE across tokens in parallel (per-row and position-only,
+                    // like `q` above), then push in order — the cache is appended
+                    // sequentially and every later query's window is defined by
+                    // those positions, so only the rotation parallelises.
+                    let n_head_kv = layer.n_head_kv;
+                    k.par_chunks_mut(kv_dim).enumerate().for_each(|(t, row)| {
+                        tensor::rope_apply_scaled_inplace(
+                            row,
+                            n_head_kv,
+                            head_dim,
+                            layer.rope_dim,
+                            start_pos + t,
+                            layer.rope_freq_base,
+                            freq_factors,
+                        );
+                    });
+                    for t in 0..n_tokens {
+                        cache.layers[cache_index].push(
+                            &k[t * kv_dim..(t + 1) * kv_dim],
+                            &v[t * kv_dim..(t + 1) * kv_dim],
+                        );
+                    }
+                }
+                // Every token's K/V for this layer is already in `cache` by this
+                // point (the push loop above ran for the full `0..n_tokens`
+                // range before this loop starts reading), so a non-causal
+                // model's attention window can freely include positions *after*
+                // `pos`, not just up to it — see `Self::attention_window`.
+                let t0 = Instant::now();
+                // One dispatch for the whole prompt's attention — each query
+                // derives its own window in the shader. The CPU loop below stays
+                // as the reference implementation and the non-Vulkan path; the two
+                // are cross-checked against each other for every window shape
+                // (`gpu_attention_prefill_matches_cpu_reference_*`).
+                let gpu_attn = self
+                    .backend
+                    .as_vulkan()
+                    .filter(|vulkan| vulkan.prefill_attention_enabled())
+                    .map(|vulkan| {
+                        vulkan.gpu_attention_prefill(
+                            &q,
+                            &mut cache.layers[cache_index],
+                            start_pos,
+                            n_tokens,
+                            self.n_head,
+                            layer.n_head_kv,
+                            head_dim,
+                            if layer.is_swa { self.n_swa } else { 0 },
+                            self.causal,
+                            self.attention_scale,
+                        )
+                    });
+                if let Some(out) = gpu_attn {
+                    attn_out = out;
+                    if prefill_trace {
+                        eprintln!(
+                            "orangu-server: [prefill-trace] layer {il} gpu_attention \
+                             n_tokens={n_tokens}: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                } else {
+                    attn_out.clear();
+                    attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
+                    // Prefill attention is O(n_tokens²) and single-threaded was the
+                    // second-largest prefill cost (after the GPU matmuls) and the one
+                    // that grows quadratically with prompt length. Each query token's
+                    // attention is independent — reads the (now fully-populated,
+                    // read-only) KV cache + `q`, writes only its own `attn_out` slice —
+                    // so parallelise across tokens with rayon (byte-exact: no cross-token
+                    // dependency, per-token accumulation order unchanged). Every thread
+                    // keeps its own `scores` scratch.
+                    let n_head = self.n_head;
+                    let attention_scale = self.attention_scale;
+                    let is_swa = layer.is_swa;
+                    let cache_layer = &cache.layers[cache_index];
+                    attn_out
+                        .par_chunks_mut(n_head * head_dim)
+                        .enumerate()
+                        .for_each(|(t, out_t)| {
+                            let pos = start_pos + t;
+                            let (window_start, window_end) =
+                                self.attention_window(is_swa, pos, n_tokens);
+                            let mut scores: Vec<f32> = Vec::new();
+                            for h in 0..n_head {
+                                let kv_head = h / group_size;
+                                let qh = &q[t * n_head * head_dim + h * head_dim
+                                    ..t * n_head * head_dim + (h + 1) * head_dim];
+
+                                scores.clear();
+                                for p in window_start..=window_end {
+                                    let kh = cache_layer.key_at(p, kv_head, head_dim);
+                                    scores.push(tensor::dot(qh, kh) * attention_scale);
+                                }
+                                tensor::softmax_inplace(&mut scores);
+
+                                let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
+                                for (offset, &weight) in scores.iter().enumerate() {
+                                    let p = window_start + offset;
+                                    let vh = cache_layer.value_at(p, kv_head, head_dim);
+                                    for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                                        *o += weight * vi;
+                                    }
                                 }
                             }
-                        }
-                    });
-                if prefill_trace {
-                    eprintln!(
-                        "orangu-server: [prefill-trace] layer {il} cpu_attention \
-                     n_tokens={n_tokens}: {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
+                        });
+                    if prefill_trace {
+                        eprintln!(
+                            "orangu-server: [prefill-trace] layer {il} cpu_attention \
+                         n_tokens={n_tokens}: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                 }
             }
 
@@ -1218,7 +1285,12 @@ impl GemmaModel {
             let fused_layer = if layer.moe.is_none() {
                 self.backend.as_vulkan().and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
-                        &attn_out,
+                        match &fused_attn_buf {
+                            Some(b) => {
+                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
+                            }
+                            None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                        },
                         &x,
                         n_tokens,
                         &layer.wo,
@@ -2088,6 +2160,14 @@ impl ModelForward for GemmaModel {
                 slot_id + 1,
             );
             let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
+            // The same report `Self::forward`'s fused branch makes. GPU argmax
+            // is on by default, so *this* is the path a real decode step takes
+            // — without this, `ORANGU_GPU_TIMESTAMPS` printed nothing at all
+            // against a running server while still working in the `forward`
+            // path the tests drive.
+            if vulkan.gpu_timestamps() {
+                vulkan.report_timestamps(start_pos, self.layers.len());
+            }
             return Ok(ForwardOutcome::Token(next));
         }
         self.forward(cache, tokens, start_pos, slot_id)
@@ -2740,7 +2820,7 @@ impl GemmaModel {
 /// A plain (unweighted) RMSNorm — Gemma4's `Vcur` normalization
 /// (`ggml_rms_norm` with no following `ggml_mul` by a learned weight,
 /// unlike every other norm in this architecture).
-fn rmsnorm_weightless_inplace(x: &mut [f32], n_rows: usize, dim: usize, eps: f32) {
+pub(crate) fn rmsnorm_weightless_inplace(x: &mut [f32], n_rows: usize, dim: usize, eps: f32) {
     debug_assert_eq!(x.len(), n_rows * dim);
     let norm_row = |row: &mut [f32]| {
         let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;

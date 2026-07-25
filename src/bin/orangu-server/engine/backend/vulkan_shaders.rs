@@ -4266,9 +4266,93 @@ pub fn shader_source_attention_split(
 /// multiple of 32 (gemma's 512/256 are). Not byte-identical to the serial
 /// kernel (the `subgroupAdd` reduces the dot in a different order) — validated
 /// by greedy-output match, like the flash/GQA variants.
-const ATTENTION_SPLIT_COOP_SHADER_TEMPLATE: &str = r#"
-%KV_ENABLE%
-struct AttnSplitMeta {
+/// Emits `count` straight-line `let {prefix}{i} = {read_fn}(kv_base + {i*32}u);`
+/// bindings — one named scalar per owned dim, no loop.
+///
+/// This exists because a `for (var i = 0u; i < OWNED; i = i + 1u)` over the
+/// owned dims does **not** compile to batched loads, even with `OWNED` baked in
+/// and every value in registers. ACO reuses one destination register for the
+/// load and emits a full `s_waitcnt vmcnt(0)` before each use, so the reads
+/// serialise into `OWNED` dependent memory round trips per position — visible
+/// only in `RADV_DEBUG=shaders`, since `shaderstats` reports no spills and no
+/// scratch. Written out as separate `let` bindings the loads land in distinct
+/// registers with no branch between them, and the wave issues all of them
+/// before draining with counted `s_waitcnt vmcnt(N)`.
+fn owned_dim_loads(prefix: &str, read_fn: &str, count: u32) -> String {
+    (0..count)
+        .map(|i| {
+            format!(
+                "        let {prefix}{i} = {read_fn}(kv_base + {}u);\n",
+                i * 32
+            )
+        })
+        .collect()
+}
+
+/// The left-to-right sum `q{0} * {k}0 + q{1} * {k}1 + …`, matching the
+/// accumulation order of the serial loop it replaces so the result is
+/// bit-identical to it.
+fn owned_dim_dot(q_prefix: &str, k_prefix: &str, count: u32) -> String {
+    (0..count)
+        .map(|i| format!("{q_prefix}{i} * {k_prefix}{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// **Cooperative-reduction** split-k phase 1 (the decode default). Targets the
+/// classic split kernel's *serial* per-thread `head_dim` dot product (one
+/// thread does all `head_dim` MACs for one KV position, with the wave's 32
+/// lanes reading K at a `head_dim`-strided address each — badly uncoalesced)
+/// and its per-tile `workgroupBarrier`s.
+///
+/// A **32-lane subgroup owns one KV position at a time, split across the head
+/// dim**: lane `L` owns dims `{L, L+32, …}`, so consecutive lanes read
+/// consecutive K/V elements — **fully coalesced** — and the score is a
+/// barrier-free `subgroupAdd` of each lane's partial dot instead of a
+/// `head_dim`-deep serial chain. Q and the accumulator live in registers, and
+/// the owned dims are emitted **unrolled as named scalars** rather than as a
+/// loop over an `array<f32, OWNED>` — see [`owned_dim_loads`] for why that is
+/// not the same thing. No workgroup shared memory, no `workgroupBarrier`.
+///
+/// Output layout (`partial_ml`/`partial_acc`) is identical to
+/// [`ATTENTION_SPLIT_SHADER_TEMPLATE`], so the same phase-2
+/// [`ATTENTION_SPLIT_REDUCE_SHADER`] merges it unchanged.
+///
+/// Subgroup-only and assumes a subgroup width `>= 32` (the 32 workgroup threads
+/// always fall in one subgroup, whatever the adapter's actual width). Requires
+/// `head_dim % 32 == 0`. Not byte-identical to the *serial* kernel (the
+/// `subgroupAdd` reduces the dot in a different order), but it is bit-identical
+/// to the rolled cooperative kernel it replaces.
+pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) -> String {
+    debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
+    let owned = head_dim / 32;
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
+    let enable = kv_storage.enable_directive();
+
+    let regs: String = (0..owned)
+        .map(|i| {
+            let off = i * 32;
+            format!("    var q{i}: f32 = aq[q_base + {off}u + lane];\n    var a{i}: f32 = 0.0;\n")
+        })
+        .collect();
+    let k_reads = owned_dim_loads("k", "kv_read_k", owned);
+    let dot = owned_dim_dot("q", "k", owned);
+    let v_reads = owned_dim_loads("v", "kv_read_v", owned);
+    let acc: String = (0..owned)
+        .map(|i| format!("        a{i} = a{i} * alpha + pw * v{i};\n"))
+        .collect();
+    let writes: String = (0..owned)
+        .map(|i| {
+            format!(
+                "    partial_acc[out_base * HEAD_DIM + {}u + lane] = a{i};\n",
+                i * 32
+            )
+        })
+        .collect();
+
+    format!(
+        r#"{enable}
+struct AttnSplitMeta {{
     n_head: u32,
     n_head_kv: u32,
     head_dim: u32,
@@ -4277,24 +4361,23 @@ struct AttnSplitMeta {
     k_num: u32,
     scale: f32,
     _pad: u32,
-}
+}}
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
-%KV_BINDINGS%
+{kv_bindings}
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
 
-%KV_READ_FNS%
+{kv_read_fns}
 
-const HEAD_DIM: u32 = %HEAD_DIM%u;
-const OWNED: u32 = %OWNED%u;
+const HEAD_DIM: u32 = {head_dim}u;
 
 @compute @workgroup_size(32)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
-) {
+) {{
     let h = wid.x;
     let split_idx = wid.y;
     let lane = lid.x;
@@ -4303,15 +4386,9 @@ fn main(
     let k_num = am.k_num;
     let q_base = h * HEAD_DIM;
 
-    // Each lane owns dims { lane, lane+32, … } — HEAD_DIM/32 of them. Stage the
-    // owned query elements into registers and zero the owned accumulators.
-    var q_reg: array<f32, OWNED>;
-    var acc_reg: array<f32, OWNED>;
-    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
-        q_reg[i] = aq[q_base + lane + i * 32u];
-        acc_reg[i] = 0.0;
-    }
-
+    // Each lane owns dims {{ lane, lane+32, … }}. Stage the owned query
+    // elements into registers and zero the owned accumulators.
+{regs}
     let split_len = (am.n_pos + k_num - 1u) / k_num;
     let split_start = split_idx * split_len;
     let split_end = min(split_start + split_len, am.n_pos);
@@ -4320,44 +4397,36 @@ fn main(
     var l: f32 = 0.0;
 
     var pos: u32 = split_start;
-    loop {
-        if (pos >= split_end) {
+    loop {{
+        if (pos >= split_end) {{
             break;
-        }
+        }}
         let p = am.window_start + pos;
-        let k_base = (p * am.n_head_kv + kv_head) * HEAD_DIM;
-        var partial: f32 = 0.0;
-        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
-            partial = partial + q_reg[i] * kv_read_k(k_base + lane + i * 32u);
-        }
-        let score = subgroupAdd(partial) * am.scale;
+        let kv_base = (p * am.n_head_kv + kv_head) * HEAD_DIM + lane;
+{k_reads}        let score = subgroupAdd({dot}) * am.scale;
         let new_m = max(m, score);
         let alpha = exp(m - new_m);
         let pw = exp(score - new_m);
         l = l * alpha + pw;
-        for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
-            acc_reg[i] = acc_reg[i] * alpha + pw * kv_read_v(k_base + lane + i * 32u);
-        }
-        m = new_m;
+{v_reads}{acc}        m = new_m;
         pos = pos + 1u;
-    }
+    }}
 
     let out_base = h * k_num + split_idx;
-    if (lane == 0u) {
+    if (lane == 0u) {{
         partial_ml[out_base * 2u] = m;
         partial_ml[out_base * 2u + 1u] = l;
-    }
-    for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
-        partial_acc[out_base * HEAD_DIM + lane + i * 32u] = acc_reg[i];
-    }
+    }}
+{writes}}}
+"#
+    )
 }
-"#;
 
 /// Multi-query attention with the **cooperative** reduction: 32 lanes split
 /// `head_dim` between them for one `(head, query)` pair, so consecutive lanes
 /// read consecutive K/V elements.
 ///
-/// This is [`ATTENTION_SPLIT_COOP_SHADER_TEMPLATE`] with the split-k machinery
+/// This is [`shader_source_attention_split_coop`] with the split-k machinery
 /// removed — a prompt has queries to parallelise over, so it needs no splits —
 /// and each query deriving its own window the way
 /// [`ATTENTION_MULTI_QUERY_SETUP`] does.
@@ -4460,6 +4529,216 @@ fn main(
 }
 "#;
 
+/// Per-lane `f32` register budget the GQA prefill kernel sizes itself to.
+/// Each query head a workgroup owns costs `head_dim / 32` registers for its
+/// slice of Q and the same again for its accumulator, and the kernel spends
+/// further registers on the staged K/V values and the per-head softmax state.
+///
+/// Sharing a KV read across more heads and keeping enough waves resident to
+/// hide that read pull in opposite directions, and the useful range between
+/// them is narrow: sweeping `ORANGU_GQA_HEADS` over an MQA-shaped model, one
+/// head per workgroup (no sharing) and a whole eight-head group in one
+/// workgroup were both clearly worse than the two settings between them, which
+/// tied. This budget picks from inside that band at either head_dim — it is
+/// well under the hardware ceiling on purpose, because the binding constraint
+/// is occupancy, not correctness.
+const GQA_PREFILL_REG_BUDGET: u32 = 64;
+
+/// How many query heads of one KV group a single GQA prefill workgroup owns.
+///
+/// The kernel keeps every owned head's Q slice *and* running accumulator in
+/// registers so a KV element read once serves all of them; that footprint is
+/// `heads * (head_dim / 32) * 2` per lane and grows with both the group size
+/// and the head dim. This returns the largest divisor of `group` that stays
+/// inside [`GQA_PREFILL_REG_BUDGET`] — the fewest workgroups, hence the most
+/// sharing, that still fits. `ORANGU_GQA_HEADS` pins it for measurement.
+///
+/// Splitting a group across several workgroups rather than across several
+/// subgroups of one wide workgroup is deliberate: a 32-thread workgroup is at
+/// most one subgroup whatever the adapter's subgroup size turns out to be, so
+/// the `subgroupAdd` that reduces the score is correct without the kernel
+/// having to know that size. A wider workgroup would have to assume it.
+pub fn gqa_prefill_heads_per_workgroup(head_dim: u32, group: u32) -> u32 {
+    if let Some(pinned) = std::env::var("ORANGU_GQA_HEADS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n >= 1 && n <= group && group.is_multiple_of(n))
+    {
+        return pinned;
+    }
+    let owned = (head_dim / 32).max(1);
+    (1..=group)
+        .rev()
+        .filter(|heads| group.is_multiple_of(*heads))
+        .find(|heads| heads * owned * 2 <= GQA_PREFILL_REG_BUDGET)
+        .unwrap_or(1)
+}
+
+/// **GQA-sharing** multi-query attention: one workgroup per `(kv_head,
+/// head-slice, query)` instead of per `(head, query)`, so the KV head that a
+/// whole query-head group shares is read from global **once** for all the
+/// heads in the slice rather than once per head.
+///
+/// [`ATTENTION_COOP_PREFILL_TEMPLATE`] already reads K and V coalesced, but
+/// every query head reads them again for itself: a model whose `n_head_kv` is
+/// far below its `n_head` therefore streams the same window `n_head /
+/// n_head_kv` times per layer, and that redundancy — not the attention
+/// arithmetic — is what the dispatch spends its time on. Here the 32 lanes
+/// still split `head_dim` between them exactly as the cooperative kernel does
+/// (lane `L` owns dims `{L, L+32, …}`, consecutive lanes on consecutive
+/// elements), but each lane holds `heads` query slices at once: one
+/// `kv_read_k` feeds `heads` partial dots, one `kv_read_v` feeds `heads`
+/// accumulator updates.
+///
+/// `heads` is [`gqa_prefill_heads_per_workgroup`] — the whole group when its
+/// registers fit, a divisor of it when they do not, with the remaining slices
+/// covered by further workgroups along `x`. Every Q slice, accumulator and
+/// per-head `(m, l)` is emitted as a **named scalar**, not an indexed
+/// `array<f32, N>` local, because only the former reliably lands in registers.
+///
+/// Each query still derives its own window from `start_pos + t`, the same four
+/// cases [`ATTENTION_MULTI_QUERY_SETUP`] and `GemmaModel::attention_window`
+/// implement, and the per-position accumulation order is unchanged from the
+/// cooperative kernel — so this produces bit-identical output to it, and only
+/// changes which workgroup reads what.
+pub fn shader_source_attention_prefill_gqa(
+    kv_storage: KvStorage,
+    head_dim: u32,
+    group: u32,
+    heads: u32,
+) -> String {
+    debug_assert_eq!(head_dim % 32, 0, "gqa attention needs head_dim % 32 == 0");
+    debug_assert!(heads >= 1 && group.is_multiple_of(heads));
+    let owned = head_dim / 32;
+    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
+    let enable = kv_storage.enable_directive();
+
+    let mut regs = String::new();
+    for j in 0..heads {
+        for i in 0..owned {
+            let off = j * head_dim + i * 32;
+            regs += &format!("    var q{j}_{i}: f32 = aq[q_base + {off}u + lane];\n");
+            regs += &format!("    var a{j}_{i}: f32 = 0.0;\n");
+        }
+        regs += &format!("    var m{j}: f32 = -1e30;\n    var l{j}: f32 = 0.0;\n");
+    }
+
+    // One K read per owned dim, shared by every head's partial dot. The dot is
+    // summed left to right, matching the cooperative kernel's serial loop.
+    let k_reads = owned_dim_loads("k", "kv_read_k", owned);
+    let mut scores = String::new();
+    for j in 0..heads {
+        let dot = owned_dim_dot(&format!("q{j}_"), "k", owned);
+        scores += &format!("        let s{j} = subgroupAdd({dot}) * am.scale;\n");
+    }
+    // Per-head online-softmax update, then one V read per owned dim shared by
+    // every head's accumulator rescale.
+    let mut softmax = String::new();
+    for j in 0..heads {
+        softmax += &format!(
+            "        let nm{j} = max(m{j}, s{j});\n\
+             \x20       let al{j} = exp(m{j} - nm{j});\n\
+             \x20       let pw{j} = exp(s{j} - nm{j});\n\
+             \x20       l{j} = l{j} * al{j} + pw{j};\n\
+             \x20       m{j} = nm{j};\n"
+        );
+    }
+    // All V loads first, then every head's accumulator rescale — the loads are
+    // independent of each other and of the rescales, so issuing them as one
+    // block is what lets them go in flight together (see `owned_dim_loads`).
+    let v_reads = owned_dim_loads("v", "kv_read_v", owned);
+    let acc: String = (0..owned)
+        .flat_map(|i| {
+            (0..heads)
+                .map(move |j| format!("        a{j}_{i} = a{j}_{i} * al{j} + pw{j} * v{i};\n"))
+        })
+        .collect();
+
+    let mut writes = String::new();
+    for j in 0..heads {
+        for i in 0..owned {
+            let off = j * head_dim + i * 32;
+            writes += &format!("    aout[q_base + {off}u + lane] = a{j}_{i} / l{j};\n");
+        }
+    }
+
+    format!(
+        r#"{enable}
+struct AttnMeta {{
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    window_start: u32,
+    n_pos: u32,
+    capacity: u32,
+    scale: f32,
+    start_pos: u32,
+    n_query: u32,
+    n_swa: u32,
+    causal: u32,
+    _pad: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> aq: array<f32>;
+{kv_bindings}
+@group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
+@group(0) @binding(4) var<storage, read_write> aout: array<f32>;
+@group(0) @binding(5) var<uniform> am: AttnMeta;
+
+{kv_read_fns}
+
+const HEAD_DIM: u32 = {head_dim}u;
+const GROUP: u32 = {group}u;
+const HEADS: u32 = {heads}u;
+
+@compute @workgroup_size(32)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    // `x` enumerates (kv_head, head-slice); `y` the query token.
+    let slices = GROUP / HEADS;
+    let kv_head = wid.x / slices;
+    let slice = wid.x - kv_head * slices;
+    let t = wid.y;
+    let lane = lid.x;
+    // First query head this workgroup owns; the rest follow contiguously, so
+    // one `q_base` plus a constant offset addresses all of them.
+    let h0 = kv_head * GROUP + slice * HEADS;
+    let q_base = (t * am.n_head + h0) * HEAD_DIM;
+
+    // Per-query window, same rule as `GemmaModel::attention_window`.
+    let pos_abs = am.start_pos + t;
+    var ws: u32 = 0u;
+    var we: u32 = pos_abs;
+    if (am.causal == 0u) {{
+        if (am.n_swa > 0u) {{
+            let half = am.n_swa / 2u;
+            ws = select(0u, pos_abs - half, pos_abs > half);
+            we = min(pos_abs + half, am.n_query - 1u);
+        }} else {{
+            ws = 0u;
+            we = am.n_query - 1u;
+        }}
+    }} else if (am.n_swa > 0u) {{
+        ws = select(0u, pos_abs - (am.n_swa - 1u), pos_abs + 1u > am.n_swa);
+    }}
+
+{regs}
+    var p: u32 = ws;
+    loop {{
+        if (p > we) {{
+            break;
+        }}
+        let kv_base = (p * am.n_head_kv + kv_head) * HEAD_DIM + lane;
+{k_reads}{scores}{softmax}{v_reads}{acc}        p = p + 1u;
+    }}
+
+{writes}}}
+"#
+    )
+}
+
 /// Builds [`ATTENTION_COOP_PREFILL_TEMPLATE`] for a specific `head_dim`
 /// (baked in, so the owned loops unroll). Requires subgroups and
 /// `head_dim % 32 == 0`; the caller falls back to
@@ -4468,20 +4747,6 @@ pub fn shader_source_attention_prefill_coop(kv_storage: KvStorage, head_dim: u32
     debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     ATTENTION_COOP_PREFILL_TEMPLATE
-        .replace("%HEAD_DIM%", &head_dim.to_string())
-        .replace("%OWNED%", &(head_dim / 32).to_string())
-        .replace("%KV_ENABLE%", kv_storage.enable_directive())
-        .replace("%KV_BINDINGS%", &kv_bindings)
-        .replace("%KV_READ_FNS%", &kv_read_fns)
-}
-
-/// Builds the cooperative-reduction phase-1 kernel for a specific `head_dim`
-/// (baked in, so the owned loops unroll). See
-/// [`ATTENTION_SPLIT_COOP_SHADER_TEMPLATE`]. Requires `head_dim % 32 == 0`.
-pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) -> String {
-    debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
-    let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
-    ATTENTION_SPLIT_COOP_SHADER_TEMPLATE
         .replace("%HEAD_DIM%", &head_dim.to_string())
         .replace("%OWNED%", &(head_dim / 32).to_string())
         .replace("%KV_ENABLE%", kv_storage.enable_directive())
@@ -5165,7 +5430,7 @@ struct RopeMeta {
     rope_dim: u32,
     pos: u32,
     freq_base: f32,
-    _pad0: u32,
+    n_tokens: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -5177,16 +5442,21 @@ struct RopeMeta {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let half = rm.rope_dim / 2u;
-    let total = rm.n_head * half;
+    // Rows are `[n_tokens, n_head, head_dim]`; `hg` is the flat row index over
+    // the whole batch, so `hg / n_head` is the token and `pos + t` its
+    // position. A decode step passes `n_tokens = 1`, where `t` is 0 and this
+    // reduces to the single-position form.
+    let total = rm.n_tokens * rm.n_head * half;
     let idx = gid.x;
     if (idx >= total) {
         return;
     }
-    let h = idx / half;
+    let hg = idx / half;
     let i = idx % half;
-    let base = h * rm.head_dim;
+    let t = hg / rm.n_head;
+    let base = hg * rm.head_dim;
     let freq = pow(rm.freq_base, -2.0 * f32(i) / f32(rm.rope_dim)) / rff[i];
-    let theta = f32(rm.pos) * freq;
+    let theta = f32(rm.pos + t) * freq;
     let s = sin(theta);
     let c = cos(theta);
     let a = rx[base + i];
@@ -5510,6 +5780,20 @@ pub fn shader_source_perhead_rmsnorm_weightless(subgroup: bool) -> String {
 /// (one `begin_compute_pass`/pipeline-bind/launch instead of two) and the
 /// eliminated intermediate global read+write, not fewer barriers.
 ///
+/// **Dispatched `(n_head, n_tokens, 1)`.** `y` selects the token within a
+/// prefill batch: row `(t, h)` lives at `(t * n_head + h) * head_dim` and takes
+/// position `pos + t`, which is the layout and the position rule
+/// `GemmaModel::run_layers_cpu`'s own per-token RoPE loop uses. A decode step
+/// dispatches `(n_head, 1, 1)`, where `t` is 0 and both expressions collapse to
+/// the single-token form this shader started as — so the decode path's output
+/// is unchanged, not merely equivalent.
+///
+/// The token index cannot be folded into `x` the way the per-head norms fold
+/// theirs (those are position-independent, so a prefill just dispatches
+/// `n_tokens * n_head` workgroups against the same shader): RoPE's angle
+/// depends on the row's position, so the shader has to be able to tell which
+/// token it is looking at.
+///
 /// Binding order (`fnw` the learned norm weight, `fnff` RoPE's per-
 /// frequency divisor, `fnx` the buffer normalized and rotated in place,
 /// `fnm` the uniform meta) matches [`elem4_bind_group_layout`]'s shape —
@@ -5542,8 +5826,15 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let h = wid.x;
+    // `y` is the token within a prefill batch; a decode step dispatches
+    // `(n_head, 1, 1)`, so `t` is 0 and both expressions below collapse to
+    // exactly what the single-token version computed. The rows of a batch are
+    // contiguous and each carries its own position, which is the only reason
+    // this cannot be folded into `x` the way the per-head norms are.
+    let t = wid.y;
     let local = lid.x;
-    let base = h * fnm.head_dim;
+    let base = (t * fnm.n_head + h) * fnm.head_dim;
+    let pos = fnm.pos + t;
 
     // Stage 1 (= PERHEAD_RMSNORM_SHADER's own first stage): sum of
     // squares, staging each raw value into `fn_head` on the way so stage 2
@@ -5596,7 +5887,7 @@ fn main(
             break;
         }
         let freq = pow(fnm.freq_base, -2.0 * f32(k) / f32(fnm.rope_dim)) / fnff[k];
-        let theta = f32(fnm.pos) * freq;
+        let theta = f32(pos) * freq;
         let s = sin(theta);
         let c = cos(theta);
         let a = fn_head[k];

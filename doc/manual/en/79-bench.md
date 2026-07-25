@@ -173,6 +173,29 @@ orangu-bench → http://127.0.0.1:8100 (curve: 3072 tokens, bucket 256)
 Context position is approximated by the generated-token index (the prompt is
 short). `--json` emits `{"ctx":…,"tok_per_s":…,"tokens":…}` per bucket.
 
+### Confirm you are measuring the build you think you are
+
+The header line
+
+```
+  server   pid 2623608 up 2s
+```
+
+is there to be checked, not skipped. When A/B-ing two builds, the **pid must
+change** between the two runs and `up` must be a few seconds, not minutes.
+
+The failure it catches is quiet and convincing. Stop the old server by process
+name (`pkill -x orangu-server`) and it will miss a build you copied to another
+filename — `pkill` matches the *binary's* name, not the path. The replacement
+server then fails to bind the port, exits, and `orangu-bench` measures the
+server that is still running: the old one. Both runs report the same numbers,
+which reads as a clean "this change did nothing" result rather than as a broken
+measurement. Keeping both builds named `orangu-server` in separate directories
+avoids it; checking the pid proves it.
+
+`llama-server` does not report these fields, so the line is omitted for it —
+there, check the process yourself.
+
 ### Interpreting a comparison
 
 Run the same sweep against both servers and compare **the shape of the curve**,

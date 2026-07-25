@@ -527,6 +527,53 @@ impl LayerCache {
         self.len += 1;
     }
 
+    /// Commits `n = k_rows.len() / kv_dim` positions whose K/V a GPU-resident
+    /// prefill has **already written straight into the mirror**, mirroring the
+    /// same values into the host `k`/`v` so the two stay consistent.
+    ///
+    /// This is the batched counterpart of [`Self::advance_gpu_only`], and it
+    /// deliberately does *not* share that method's shortcut. `advance_gpu_only`
+    /// leaves the host copy zeroed, which is only safe under the condition its
+    /// own doc comment states — a cache is CPU-prefilled and then decode-only.
+    /// A GPU-resident *prefill* removes that condition, and the host copy is
+    /// what [`KvCache::to_bytes`] serializes for slot save and what the CPU
+    /// attention path reads, so those positions have to be real.
+    ///
+    /// `k_rows`/`v_rows` must be the **f32 values fed to the mirror write**
+    /// (K after its norm and RoPE, V after its weightless norm), not a readback
+    /// of the mirror itself: the mirror may be `f16` or block-quantized, and
+    /// the host side should hold what the CPU path would have held. The mirror
+    /// is then marked current so [`Self::sync_gpu`] does not re-upload rows the
+    /// GPU just wrote.
+    // Not wired into a forward pass yet — the batched prefill recorder that
+    // will call it is still being built; its own tests cover it meanwhile.
+    #[allow(dead_code)]
+    pub fn commit_gpu_written(&mut self, k_rows: &[f32], v_rows: &[f32]) {
+        assert_eq!(
+            k_rows.len(),
+            v_rows.len(),
+            "K and V must commit the same number of positions"
+        );
+        assert_eq!(
+            k_rows.len() % self.kv_dim,
+            0,
+            "committed rows ({}) are not a whole number of kv_dim ({}) positions",
+            k_rows.len(),
+            self.kv_dim
+        );
+        for (k, v) in k_rows
+            .chunks_exact(self.kv_dim)
+            .zip(v_rows.chunks_exact(self.kv_dim))
+        {
+            self.push(k, v);
+        }
+        // The GPU wrote these into the mirror itself, so the incremental upload
+        // in `sync_gpu` has nothing left to do for them.
+        if let Some(gpu) = &mut self.gpu {
+            gpu.synced_len = self.len;
+        }
+    }
+
     /// The key vector at cached position `pos` for KV head `kv_head`
     /// (`[head_dim]`).
     pub fn key_at(&self, pos: usize, kv_head: usize, head_dim: usize) -> &[f32] {
@@ -992,6 +1039,54 @@ mod tests {
         // head_dim=3, kv_head=1 -> elements [3..6).
         assert_eq!(cache.key_at(0, 1, 3), &[4.0, 5.0, 6.0]);
         assert_eq!(cache.value_at(0, 0, 3), &[6.0, 5.0, 4.0]);
+    }
+
+    /// A GPU-resident prefill commits a whole batch at once, and the host copy
+    /// it leaves behind must be indistinguishable from the one the CPU path's
+    /// per-token `push` loop would have left — that copy is what slot save
+    /// serializes and what the CPU attention path reads.
+    #[test]
+    fn commit_gpu_written_leaves_the_same_host_state_as_pushing_each_row() {
+        let kv_dim = 6;
+        let rows: Vec<f32> = (0..3 * kv_dim).map(|i| i as f32).collect();
+        let vrows: Vec<f32> = (0..3 * kv_dim).map(|i| -(i as f32)).collect();
+
+        let mut pushed = LayerCache::new(8, kv_dim);
+        for t in 0..3 {
+            pushed.push(
+                &rows[t * kv_dim..(t + 1) * kv_dim],
+                &vrows[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
+
+        let mut committed = LayerCache::new(8, kv_dim);
+        committed.commit_gpu_written(&rows, &vrows);
+
+        assert_eq!(committed.len, pushed.len);
+        assert_eq!(committed.k, pushed.k);
+        assert_eq!(committed.v, pushed.v);
+        // head_dim=3, kv_head=1 on the last committed position.
+        assert_eq!(committed.key_at(2, 1, 3), pushed.key_at(2, 1, 3));
+    }
+
+    /// Committing rows the GPU already wrote must not leave `sync_gpu` wanting
+    /// to upload them again — the whole point of the batched write is that the
+    /// mirror is already current.
+    #[test]
+    fn commit_gpu_written_marks_the_mirror_current() {
+        let mut cache = LayerCache::new(8, 4);
+        // No GPU mirror allocated yet: the bookkeeping must still be sound, and
+        // a later `sync_gpu` builds one and uploads from the host copy.
+        cache.commit_gpu_written(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(cache.len, 1);
+        assert!(cache.gpu.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a whole number of kv_dim")]
+    fn commit_gpu_written_rejects_a_partial_row() {
+        let mut cache = LayerCache::new(4, 4);
+        cache.commit_gpu_written(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
     }
 
     #[test]
