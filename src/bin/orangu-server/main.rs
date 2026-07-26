@@ -805,9 +805,18 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
                 None => select_model_for_deletion(&conf.models)?,
             };
             let plural = if group.paths.len() == 1 { "" } else { "s" };
+            // The quantization is named explicitly, not just the label: two
+            // quantizations of one repo now share a `MODEL` cell (`QUANT` is
+            // what tells them apart in `list`), so the label alone wouldn't
+            // say which of them this irreversible step is about to remove.
+            let quant = group
+                .quantization
+                .as_deref()
+                .map(|quant| format!("{quant}, "))
+                .unwrap_or_default();
             if !yes {
                 let confirmed = confirm(&format!(
-                    "Delete '{}' ({} file{plural}, {}) from {}? [y/N]: ",
+                    "Delete '{}' ({quant}{} file{plural}, {}) from {}? [y/N]: ",
                     group.label,
                     group.paths.len(),
                     orangu::format::format_bytes(group.size_bytes),
@@ -820,7 +829,7 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             }
             orangu::model_spec::delete_model(&conf.models, &group)?;
             println!(
-                "Deleted '{}' ({} file{plural}, {})",
+                "Deleted '{}' ({quant}{} file{plural}, {})",
                 group.label,
                 group.paths.len(),
                 orangu::format::format_bytes(group.size_bytes),
@@ -1014,9 +1023,11 @@ fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
     // A single listed model is not a choice — take it and move straight on
     // to the role prompt, rather than asking for the only NR on offer. The
     // table above is still printed: it's what names the model being taken,
-    // and whether this build supports it at all.
+    // and whether this build supports it at all. Echoed in the same
+    // `key: value` shape as the `role [all]: ` prompt that follows, matching
+    // how `--init` echoes the same decision.
     if let Some(only) = init::sole_model(&groups) {
-        println!("\nUsing the only model listed: {}", only.label);
+        println!("\nmodel: {}", only.label);
         return Ok((only.representative_path.clone(), only.label.clone()));
     }
 

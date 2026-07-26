@@ -177,10 +177,27 @@ reinventing the convention:
 - The quant-tag regex, `[-.]([A-Z0-9_]+)$` in llama.cpp's `re_tag`, is
   reimplemented as `hf_tag_from_label`: the trailing run of
   alphanumeric/underscore characters after the *last* `-` or `.` in the
-  (shard-stripped) name, uppercased. This is why `MODEL`'s `:quant` suffix
-  can say `Q4_K_M` where the coarser `QUANT` column can only say `Q4_K` —
-  the tag comes from the filename llama.cpp itself would match against, not
-  from the tensor types.
+  (shard-stripped) name, uppercased. It comes from the filename llama.cpp
+  itself would match against, not from the tensor types, so it can say
+  `Q4_K_M` where the ggml-type accounting can only say `Q4_K`. `QUANT` uses
+  the same tag, narrowed by `quant_tag_from_label`/`is_quant_tag` to tags
+  that really name a quantization (`hf_tag_from_label` alone would offer
+  `IT` for `gemma-4-E2B-it`, fine to try as an `-hf` tag but not something
+  to print as a quantization), and falls back to the dominant `ggml_type`
+  only for a file whose name says nothing.
+
+`group_models` then drops that `:TAG` back off the `MODEL` label whenever
+`QUANT` already shows the same string — repeating it only widens the table's
+widest column. Two quantizations of one repo consequently share a `MODEL`
+cell, so `MODEL` is no longer a unique key: `ModelGroup::matches_label`
+accepts the printed label *and* the reconstructed `<repo>:<quant>` form
+(which keeps every spelling ever printed resolving locally, instead of
+falling through to `resolve_or_fetch_model`'s download path), and a bare
+request takes the first matching row. The final `sort_by` is stable, so rows
+sharing a label keep their `(parent directory, file stem)` order and both
+`NR` and first-match resolution stay put between runs. `delete` prints the
+group's `quantization` in its confirmation line for the same reason — the
+label alone can't say which of two rows is about to go.
 
 `hf_repo_id_from_path` recovers `<user>/<model>` by walking a file's
 ancestor directories for one matching `models--<user>--<model>` (checking

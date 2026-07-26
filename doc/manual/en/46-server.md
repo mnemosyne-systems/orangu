@@ -51,9 +51,9 @@ orangu-server
 ```
 
 ```
-NR  MODEL                                   QUANT  SIZE        SUPPORTED
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
- 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M      Q5_K   2.89 GiB    Yes (gemma4)
+NR  MODEL                            QUANT   SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
+ 2  unsloth/gemma-4-E2B-it-GGUF      Q4_K_M  2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
 role [all]: 
@@ -65,10 +65,10 @@ names the model and whether this build supports it), and the run goes
 straight on to the role prompt:
 
 ```
-NR  MODEL                                   QUANT  SIZE        SUPPORTED
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+NR  MODEL                            QUANT   SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
 
-Using the only model listed: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
 role [all]: 
 ```
 
@@ -209,19 +209,26 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                               QUANT  SIZE        SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M    Q4_K   17.28 GiB   Yes (qwen3)
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M  Q4_K   270.14 GiB  Yes (qwen3)
- 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                 Q4_K   7.14 GiB    Yes (gemma4)
- 4  unsloth/GLM-5.2-GGUF:Q4_K_M                         Q4_K   433.83 GiB  No (glm-dsa)
+NR  MODEL                                        QUANT   SIZE        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order, starting from 1 — a shorthand for
 `show` so you don't have to retype a long `MODEL` string. When a file was
-downloaded by `-hf`/`--hf-repo`, `MODEL` is exactly the string to hand back
-to `-hf`: `<user>/<model>[:quant]`. A multimodal projector ("mmproj")
-sidecar file doesn't count as its own model — it's meant to be loaded
-*alongside* a base model, not to stand in as one.
+downloaded by `-hf`/`--hf-repo`, `MODEL` is the repo id to hand back to
+`-hf`: `<user>/<model>`. The `:quant` tag is left off — `QUANT` shows it in
+the next column — so two quantizations of one repo print the same `MODEL` and
+are told apart by their `QUANT` cells. Both spellings resolve against what's
+on disk, so `unsloth/gemma-4-E2B-it-GGUF` and
+`unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` name the same local model; use the
+tagged form (or the row's `NR`) to pick one particular quantization of a repo
+that has several, and to ask for one that isn't downloaded yet. A
+multimodal projector ("mmproj") sidecar file doesn't count as its own
+model — it's meant to be loaded *alongside* a base model, not to stand in as
+one.
 
 `SUPPORTED` says whether this build can actually load the model's
 architecture — `Yes (<arch>)` or `No (<arch>)`, where `<arch>` is the GGUF
@@ -238,7 +245,7 @@ interactively (`list`'s own table, then an `NR` prompt):
 
 ```sh
 orangu-server show 3                                     # NR from `list`
-orangu-server show unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server show unsloth/Qwen3-Coder-Next-GGUF          # MODEL from `list`
 orangu-server show Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `models`
 orangu-server show ./relative/or/absolute/path.gguf
 orangu-server show 3 --tensors   # also list every tensor's shape/type/offset
@@ -260,13 +267,13 @@ multi-shard model is deleted atomically rather than leaving orphans behind:
 
 ```sh
 orangu-server delete 3                                     # NR from `list`
-orangu-server delete unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server delete unsloth/Qwen3-Coder-Next-GGUF          # MODEL from `list`
 orangu-server delete                                        # no argument: interactive
 ```
 
 ```
-Delete 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB) from /home/you/models? [y/N]: y
-Deleted 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)
+Delete 'unsloth/Qwen3-Coder-Next-GGUF' (Q4_K_M, 4 files, 17.28 GiB) from /home/you/models? [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (Q4_K_M, 4 files, 17.28 GiB)
 ```
 
 Asks for confirmation first (`[y/N]`, defaulting to **No**) unless

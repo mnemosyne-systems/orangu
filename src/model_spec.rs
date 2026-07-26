@@ -161,7 +161,7 @@ pub fn resolve_show_target(models_dir: &Path, requested: &str) -> Result<PathBuf
 
     groups
         .iter()
-        .find(|group| group.label == requested)
+        .find(|group| group.matches_label(requested))
         .map(|group| group.representative_path.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -237,7 +237,7 @@ pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<Model
 
     groups
         .into_iter()
-        .find(|group| group.label == requested)
+        .find(|group| group.matches_label(requested))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "'{requested}' was not found as a file, an NR, or a MODEL name; run 'orangu-server list' to see valid values"
@@ -367,6 +367,11 @@ fn remove_empty_ancestors(path: &Path, stop_at: &Path) {
 pub struct ModelGroup {
     pub label: String,
     pub size_bytes: u64,
+    /// The `QUANT` column: the quantization scheme this model was produced
+    /// with, taken from its own filename tag ([`quant_tag_from_label`]) when
+    /// it carries one, and only otherwise from the ggml type most of its
+    /// tensor elements are stored as. See [`group_models`] for why the name
+    /// wins.
     pub quantization: Option<String>,
     /// Parse errors from any shard in this group; a non-empty list is shown
     /// instead of `quantization`/`size_bytes`.
@@ -392,15 +397,50 @@ pub struct ModelGroup {
     pub local_commit: Option<String>,
 }
 
+impl ModelGroup {
+    /// Whether `requested` names this group's `MODEL` column. Accepts the
+    /// label as printed *and* the fully-tagged `<repo>:<quant>` spelling —
+    /// which is what the same row printed before [`group_models`] began
+    /// dropping a `:TAG` that only repeats the `QUANT` column, and so what a
+    /// `model =` config value, a shell alias, or a script written against an
+    /// older listing still says. Keep this in step with whatever
+    /// `group_models` does to `label`: every spelling ever printed has to go
+    /// on resolving locally, or a saved config silently turns into a
+    /// re-download.
+    ///
+    /// It is also the only way to name one particular quantization of a repo
+    /// that has several on disk: those rows all print the same bare `MODEL`,
+    /// so a bare request matches whichever comes first (an `NR` from `list`
+    /// picks a row exactly, too).
+    pub fn matches_label(&self, requested: &str) -> bool {
+        if self.label == requested {
+            return true;
+        }
+        match (&self.hf_repo, &self.quantization) {
+            (Some(repo), Some(quant)) => requested == format!("{repo}:{quant}"),
+            _ => false,
+        }
+    }
+}
+
 /// Collapses a multi-part model's shard files (`name-00001-of-00004.gguf`,
 /// `name-00002-of-00004.gguf`, ...) into a single [`ModelGroup`]: one entry
 /// per model rather than one per shard, with `size_bytes` summed across
-/// shards and `quantization` picked from the combined element counts of
-/// every shard's tensors (a single shard's own tensors are only part of the
-/// whole model — see [`crate::gguf::GgufFile::type_element_totals`]).
+/// shards.
 /// Grouping is keyed by (parent directory, shard-suffix-stripped file stem),
 /// so two files that merely share a name in different directories (e.g. two
 /// Hugging Face cache snapshots of the same release) are kept separate.
+///
+/// `quantization` is the scheme named by the file itself
+/// ([`quant_tag_from_label`]) whenever it carries one, and only falls back to
+/// the ggml type most of the model's tensor *elements* are stored as (summed
+/// across every shard — a single shard's tensors are only part of the whole
+/// model, see [`crate::gguf::GgufFile::type_element_totals`]) for a file
+/// whose name says nothing. The name has to win: a mixed scheme is *defined*
+/// by storing some tensors at a heavier type than its name, so the dominant
+/// ggml type of a genuine `Q4_K_M` model can legitimately come out `Q5_K` or
+/// `Q6_K` — a `QUANT` column contradicting the `MODEL` label right next to
+/// it, for a model that is exactly what its name says.
 ///
 /// `label` is the exact string to hand to llama.cpp's `-hf`/`--hf-repo`
 /// (`<user>/<model>[:quant]`) when the file lives under a Hugging Face hub
@@ -457,6 +497,7 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
         .into_values()
         .map(|acc| {
             let hf_repo = hf_repo_id_from_path(&acc.representative_path);
+            let quant_tag = quant_tag_from_label(&acc.shard_label);
             let label = match &hf_repo {
                 Some(repo) => match hf_tag_from_label(&acc.shard_label) {
                     Some(tag) => format!("{repo}:{tag}"),
@@ -468,11 +509,12 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
             ModelGroup {
                 label,
                 size_bytes: acc.size_bytes,
-                quantization: acc
-                    .type_totals
-                    .into_iter()
-                    .max_by_key(|(_, total)| *total)
-                    .map(|(ty, _)| ggml_type_name(ty)),
+                quantization: quant_tag.or_else(|| {
+                    acc.type_totals
+                        .into_iter()
+                        .max_by_key(|(_, total)| *total)
+                        .map(|(ty, _)| ggml_type_name(ty))
+                }),
                 errors: acc.errors,
                 representative_path: acc.representative_path,
                 paths: acc.paths,
@@ -481,6 +523,26 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
             }
         })
         .collect();
+
+    // `list` prints the quantization in its own `QUANT` column, so carrying it
+    // in `MODEL` too just makes the widest column wider for no added
+    // information — drop the `:TAG` suffix when it says exactly what `QUANT`
+    // already does. Two quantizations of one repo therefore share a `MODEL`
+    // cell and are told apart by their `QUANT` cells; either spelling still
+    // resolves, and the tagged one is what names a specific quantization —
+    // see [`ModelGroup::matches_label`].
+    for group in &mut result {
+        let (Some(repo), Some(quant)) = (&group.hf_repo, &group.quantization) else {
+            continue;
+        };
+        if group.label == format!("{repo}:{quant}") {
+            group.label = repo.clone();
+        }
+    }
+
+    // Stable, so two rows left sharing a label keep the order their (parent
+    // directory, file stem) key gave them — `NR` and "first match wins"
+    // resolution stay the same between one `list` and the next.
     result.sort_by(|a, b| a.label.cmp(&b.label));
     result
 }
@@ -560,6 +622,33 @@ fn hf_tag_from_label(label: &str) -> Option<String> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
     .then(|| candidate.to_uppercase())
+}
+
+/// The quantization scheme a file names itself for: [`hf_tag_from_label`]'s
+/// trailing tag, but only when it actually reads as a quantization —
+/// [`hf_tag_from_label`] happily returns `IT` for `gemma-4-E2B-it`, or `1B`
+/// for `TinyLlama-1.1B`, which are fine as `-hf` tags to try but must never
+/// be shown in `list`'s `QUANT` column. Everything else falls back to the
+/// ggml type counted out of the tensors (see [`group_models`]).
+fn quant_tag_from_label(label: &str) -> Option<String> {
+    let tag = hf_tag_from_label(label)?;
+    is_quant_tag(&tag).then_some(tag)
+}
+
+/// Whether an already-uppercased tag names a ggml quantization: the float
+/// types spelled out, or one of the `Q`/`IQ`/`TQ` families — a digit-led
+/// bit-width followed by any number of `_`-separated variant parts (`Q4_0`,
+/// `Q6_K`, `Q4_K_M`, `IQ2_XXS`, `IQ4_NL`, `TQ1_0`, and unsloth's own
+/// `Q4_K_XL`). Deliberately a shape check rather than a fixed list: new
+/// quantizations appear regularly, and a name-shaped tag this build's
+/// [`ggml_type_name`] doesn't know yet is still the right thing to print for
+/// a file that carries it.
+fn is_quant_tag(tag: &str) -> bool {
+    static QUANT_TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = QUANT_TAG.get_or_init(|| {
+        regex::Regex::new(r"^(?:F16|F32|BF16|MXFP\d+|(?:Q|IQ|TQ)\d+(?:_[A-Z0-9]+)*)$").unwrap()
+    });
+    pattern.is_match(tag)
 }
 
 /// Whether this build can load a model's architecture, plus the
@@ -926,6 +1015,108 @@ mod tests {
         assert_eq!(groups[0].quantization.as_deref(), Some("Q4_K"));
     }
 
+    /// The reported `QUANT` is what the file calls itself, not the ggml type
+    /// its tensors mostly use: a mixed scheme stores part of the model at a
+    /// heavier type by definition, so a real `Q4_K_M` model whose dominant
+    /// type is `Q5_K` (type 13) must still read `Q4_K_M` — anything else
+    /// contradicts the `MODEL` label beside it.
+    #[test]
+    fn quantization_prefers_the_name_the_file_carries_over_its_dominant_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(
+            &dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf"),
+            "llama",
+            Some((13, 4096)),
+        );
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups[0].quantization.as_deref(), Some("Q4_K_M"));
+    }
+
+    /// A lowercase tag counts too — plenty of published GGUFs spell it that
+    /// way — and is shown uppercased, like the `:quant` label is.
+    #[test]
+    fn quantization_accepts_a_lowercase_name_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(
+            &dir.path().join("qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+            "qwen2",
+            Some((13, 4096)),
+        );
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups[0].quantization.as_deref(), Some("Q4_K_M"));
+    }
+
+    /// A name whose trailing token isn't a quantization at all (`-it` here)
+    /// must not be shown as one: those fall back to the ggml type counted
+    /// out of the tensors, which is all such a file says about itself.
+    #[test]
+    fn quantization_falls_back_to_the_dominant_type_without_a_name_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(
+            &dir.path().join("gemma-4-E2B-it.gguf"),
+            "llama",
+            Some((13, 4096)),
+        );
+        write_minimal_gguf(
+            &dir.path().join("TinyLlama-1.1B.gguf"),
+            "llama",
+            Some((0, 8)),
+        );
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        let quants: Vec<_> = groups
+            .iter()
+            .map(|group| (group.label.as_str(), group.quantization.as_deref()))
+            .collect();
+        assert_eq!(
+            quants,
+            vec![
+                ("TinyLlama-1.1B", Some("F32")),
+                ("gemma-4-E2B-it", Some("Q5_K")),
+            ]
+        );
+    }
+
+    /// The tag shapes that count as a quantization, and the near-misses that
+    /// don't — `hf_tag_from_label` still returns those to try as `-hf` tags,
+    /// they just can't be printed as this model's quantization.
+    #[test]
+    fn quant_tag_from_label_accepts_only_quantization_shaped_tags() {
+        for label in [
+            "model-Q4_0",
+            "model-Q6_K",
+            "model-Q4_K_M",
+            "model-UD-Q4_K_XL",
+            "model-IQ2_XXS",
+            "model-IQ4_NL",
+            "model-TQ1_0",
+            "model.F16",
+            "model-BF16",
+            "model-MXFP4",
+            "model-q8_0",
+        ] {
+            assert!(
+                quant_tag_from_label(label).is_some(),
+                "should be a quantization: {label}"
+            );
+        }
+        for label in [
+            "gemma-4-E2B-it",
+            "TinyLlama-1.1B",
+            "model-Instruct",
+            "Meta-Llama-3-8B",
+            "model",
+        ] {
+            assert_eq!(
+                quant_tag_from_label(label),
+                None,
+                "should not be a quantization: {label}"
+            );
+        }
+    }
+
     #[test]
     fn same_named_files_in_different_directories_are_not_merged() {
         let dir = tempfile::tempdir().unwrap();
@@ -986,32 +1177,117 @@ mod tests {
         assert_eq!(hf_tag_from_label("model"), None);
     }
 
-    #[test]
-    fn group_models_formats_hf_repo_and_tag_for_hub_cache_files() {
-        let dir = tempfile::tempdir().unwrap();
+    /// Writes `file` into a hub-cache layout for `repo` under `dir`, the way
+    /// `-hf` itself lays a download out: `models--<user>--<model>/snapshots/
+    /// <rev>/<file>`.
+    fn write_hub_cache_gguf(dir: &Path, repo: &str, rev: &str, file: &str) {
         let repo_dir = dir
-            .path()
-            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(rev);
         std::fs::create_dir_all(&repo_dir).unwrap();
-        write_minimal_gguf(
-            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
-            "llama",
-            None,
+        write_minimal_gguf(&repo_dir.join(file), "llama", None);
+    }
+
+    /// `MODEL` drops a `:TAG` that only repeats the `QUANT` column — but the
+    /// tagged spelling it used to print (and that saved `model =` values still
+    /// carry) has to keep resolving, or a config silently turns into a
+    /// re-download.
+    #[test]
+    fn group_models_drops_a_quant_tag_the_quant_column_already_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hub_cache_gguf(
+            dir.path(),
+            "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            "rev1",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
         );
 
-        let models = scan_models_dir(dir.path()).unwrap();
-        let groups = group_models(&models);
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
 
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].label,
-            "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
-        );
+        assert_eq!(groups[0].label, "bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert_eq!(groups[0].quantization.as_deref(), Some("Q4_K_M"));
         assert_eq!(
             groups[0].hf_repo.as_deref(),
             Some("bartowski/Llama-3.2-3B-Instruct-GGUF")
         );
         assert_eq!(groups[0].local_commit.as_deref(), Some("rev1"));
+        assert!(groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF"));
+        assert!(groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"));
+        assert!(!groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0"));
+    }
+
+    /// Two quantizations of one repo share a `MODEL` cell — `QUANT` is what
+    /// tells them apart — but each still resolves individually by its tagged
+    /// spelling, which is the only way (besides `NR`) to name one of them.
+    #[test]
+    fn two_quants_of_one_repo_share_a_label_and_differ_by_quant() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            "Llama-3.2-3B-Instruct-Q8_0.gguf",
+        ] {
+            write_hub_cache_gguf(
+                dir.path(),
+                "bartowski/Llama-3.2-3B-Instruct-GGUF",
+                "rev1",
+                file,
+            );
+        }
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.label.as_str(), group.quantization.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("bartowski/Llama-3.2-3B-Instruct-GGUF", Some("Q4_K_M")),
+                ("bartowski/Llama-3.2-3B-Instruct-GGUF", Some("Q8_0")),
+            ]
+        );
+
+        let q4 =
+            resolve_show_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M").unwrap();
+        let q8 =
+            resolve_show_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0").unwrap();
+        assert!(q4.ends_with("Llama-3.2-3B-Instruct-Q4_K_M.gguf"));
+        assert!(q8.ends_with("Llama-3.2-3B-Instruct-Q8_0.gguf"));
+
+        // A bare request is genuinely ambiguous: it takes the first row, the
+        // same one `NR` 1 names, deterministically between runs.
+        let bare = resolve_show_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF").unwrap();
+        assert_eq!(bare, q4);
+        assert_eq!(resolve_show_target(dir.path(), "1").unwrap(), q4);
+
+        // `delete` resolves the same way, and returns the whole group so the
+        // confirmation names that one quantization's files only.
+        let target =
+            resolve_delete_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0").unwrap();
+        assert_eq!(target.quantization.as_deref(), Some("Q8_0"));
+        assert_eq!(target.paths, vec![q8]);
+    }
+
+    /// The stripped `MODEL` string and the tagged one both resolve through
+    /// `show`'s own resolver — to the same file.
+    #[test]
+    fn resolve_show_target_accepts_a_model_label_with_or_without_its_quant_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hub_cache_gguf(
+            dir.path(),
+            "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            "rev1",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        );
+
+        let stripped =
+            resolve_show_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF").unwrap();
+        let tagged =
+            resolve_show_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M").unwrap();
+        assert_eq!(stripped, tagged);
+        assert!(stripped.ends_with("Llama-3.2-3B-Instruct-Q4_K_M.gguf"));
     }
 
     #[test]

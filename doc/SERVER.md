@@ -49,9 +49,9 @@ orangu-server
 ```
 
 ```
-NR  MODEL                                   QUANT  SIZE        SUPPORTED
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
- 2  unsloth/gemma-4-E2B-it-GGUF:Q4_K_M      Q5_K   2.89 GiB    Yes (gemma4)
+NR  MODEL                            QUANT   SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
+ 2  unsloth/gemma-4-E2B-it-GGUF      Q4_K_M  2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
 role [all]: 
@@ -63,10 +63,10 @@ names the model and whether this build supports it), and the run goes
 straight on to the role prompt:
 
 ```
-NR  MODEL                                   QUANT  SIZE        SUPPORTED
- 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+NR  MODEL                            QUANT   SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
 
-Using the only model listed: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
 role [all]: 
 ```
 
@@ -319,11 +319,11 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                               QUANT  SIZE        SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M    Q4_K   17.28 GiB   Yes (qwen3)
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:Q4_K_M  Q4_K   270.14 GiB  Yes (qwen3)
- 3  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M                 Q4_K   7.14 GiB    Yes (gemma4)
- 4  unsloth/GLM-5.2-GGUF:Q4_K_M                         Q4_K   433.83 GiB  No (glm-dsa)
+NR  MODEL                                        QUANT   SIZE        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order (alphabetically by `MODEL`), starting
@@ -359,25 +359,57 @@ listed:
 
 When a file was downloaded by `-hf`/`--hf-repo` (llama.cpp stores those in
 the standard Hugging Face hub cache, `models--<user>--<model>/...`), `MODEL`
-is exactly the string to hand back to `-hf`: `<user>/<model>[:quant]` — e.g.
-`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M` above can be pasted
-straight into `orangu-server -hf unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M`
-(or `orangu-server unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M` — see
-**Quick start** above). The `:quant` tag is extracted from the filename the
-same way llama.cpp's own `-hf` resolver does (`common/download.cpp`'s
-`get_gguf_split_info`): the trailing run of letters/digits/underscores after
-the last `-` or `.` in the name, once any shard suffix is stripped. A file
-outside a Hugging Face hub cache directory (no repo to recommend) falls back
-to that same shard-stripped filename on its own.
+is the repo id to hand back to `-hf`: `<user>/<model>` — e.g.
+`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` above can be pasted straight into
+`orangu-server unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` (see **Quick start**
+above). A file outside a Hugging Face hub cache directory (no repo to
+recommend) falls back to the shard-stripped filename on its own.
 
-`QUANT` is a separate, coarser best-effort label: the `ggml_type` accounting
-for the most tensor *elements* overall, combined across every shard (not
-just the most tensors — a model has far more small `F32` bias/norm tensors
-than large weight matrices, but those matrices hold nearly all the
-parameters). It can't distinguish e.g. `Q4_K_S` from `Q4_K_M` — both use the
-`Q4_K` ggml type for most tensors — which is exactly why `MODEL`'s `:quant`
-tag (read from the filename, not the tensor types) is the one to actually use
-with `-hf`. A file that fails to parse (truncated download, not actually a
+The `:quant` tag is left off, since `QUANT` shows it in its own column right
+beside it. Two quantizations of the same repo therefore print the same
+`MODEL` and are told apart by their `QUANT` cells:
+
+```
+NR  MODEL              QUANT   SIZE        SUPPORTED
+ 1  acme/Test-3B-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
+ 2  acme/Test-3B-GGUF  Q8_0    4.97 GiB    Yes (gemma4)
+```
+
+Both spellings resolve against what's already on disk — `acme/Test-3B-GGUF`
+and `acme/Test-3B-GGUF:Q8_0` alike — so a `model =` value or a script written
+against an older listing keeps working. For a repo with several
+quantizations on disk, the tagged form (or the row's `NR`) is what names one
+of them in particular; a bare repo id takes the first row it matches, the one
+`NR` 1 above names. `delete` always spells out the quantization it is about to
+remove in its confirmation line (`Delete 'acme/Test-3B-GGUF' (Q8_0, 1 file,
+4.97 GiB) ...`), so an ambiguous argument can't quietly take the wrong one.
+The tagged form is also how you ask for a specific quantization that *isn't*
+downloaded yet, since a bare repo id lets the downloader pick (`Q4_K_M`, then
+`Q8_0`).
+
+The tag itself is extracted from the filename the same way llama.cpp's own
+`-hf` resolver does (`common/download.cpp`'s `get_gguf_split_info`): the
+trailing run of letters/digits/underscores after the last `-` or `.` in the
+name, once any shard suffix is stripped.
+
+`QUANT` is the quantization scheme the model itself names — the same
+filename tag `MODEL`'s `:quant` suffix comes from, so the two always agree.
+It is only shown when that tag really reads as a quantization (`Q4_K_M`,
+`IQ2_XXS`, `TQ1_0`, `F16`, ...); a name whose trailing token is something
+else (`gemma-4-E2B-it`, `TinyLlama-1.1B`) falls back to a coarser
+best-effort label instead: the `ggml_type` accounting for the most tensor
+*elements* overall, combined across every shard (not just the most tensors —
+a model has far more small `F32` bias/norm tensors than large weight
+matrices, but those matrices hold nearly all the parameters).
+
+The fallback is genuinely coarser, which is why the name wins whenever there
+is one. A mixed scheme is *defined* by storing part of the model at a heavier
+type than its name — a real `Q4_K_M` model can have `Q5_K` or `Q6_K` as its
+single most common type — so reporting the dominant type would contradict the
+`MODEL` label sitting right next to it. It also can't tell `Q4_K_S` from
+`Q4_K_M` at all, since both store most tensors as `Q4_K`.
+
+A file that fails to parse (truncated download, not actually a
 GGUF file) is still listed, with its error in place of `QUANT`/`SIZE` — one
 bad file doesn't abort the scan.
 
@@ -405,9 +437,9 @@ in parallel across every distinct repo on the row list. A row whose local
 commit is behind gets a trailing `(Refresh)` marker, after `SIZE`:
 
 ```
-NR  MODEL                                             QUANT  SIZE       SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M  Q4_K   17.28 GiB  Yes (qwen3)  (Refresh)
- 2  ggml-org/gemma-4-12B-it-GGUF:Q4_K_M               Q4_K   7.14 GiB   Yes (gemma4)
+NR  MODEL                                      QUANT   SIZE       SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3)  (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)
 ```
 
 Re-running `orangu-server download` on that repo fetches the newer commit.
@@ -419,7 +451,7 @@ cache layout has no repo to check and never gets a marker.
 
 ```sh
 orangu-server show 3                                     # NR from `list`
-orangu-server show unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server show unsloth/Qwen3-Coder-Next-GGUF          # MODEL from `list`
 orangu-server show Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `models`
 orangu-server show ./relative/or/absolute/path.gguf
 orangu-server show 3 --tensors   # also list every tensor's shape/type/offset
@@ -451,14 +483,14 @@ multi-gigabyte model files.
 
 ```sh
 orangu-server delete 3                                     # NR from `list`
-orangu-server delete unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M   # MODEL from `list`
+orangu-server delete unsloth/Qwen3-Coder-Next-GGUF          # MODEL from `list`
 orangu-server delete Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `models`
 orangu-server delete                                        # no argument: prints `list`'s table and prompts for an NR
 ```
 
 ```
-Delete 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB) from /home/you/models? [y/N]: y
-Deleted 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)
+Delete 'unsloth/Qwen3-Coder-Next-GGUF' (Q4_K_M, 4 files, 17.28 GiB) from /home/you/models? [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (Q4_K_M, 4 files, 17.28 GiB)
 ```
 
 Resolves its argument exactly the way `show` does — direct/relative/

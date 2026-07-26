@@ -157,15 +157,15 @@ fn prompt_dir(label: &str, default: Option<&std::path::Path>) -> Result<String> 
         } else {
             value
         };
+        // A directory that isn't there yet is simply created, silently —
+        // only a failure is worth a line, since that's the one case the
+        // prompt comes back for.
         let path = PathBuf::from(&value);
-        if !path.is_dir() {
-            match std::fs::create_dir_all(&path) {
-                Ok(()) => println!("Created '{value}'."),
-                Err(err) => {
-                    println!("failed to create '{value}': {err}");
-                    continue;
-                }
-            }
+        if !path.is_dir()
+            && let Err(err) = std::fs::create_dir_all(&path)
+        {
+            println!("failed to create '{value}': {err}");
+            continue;
         }
         return Ok(value);
     }
@@ -212,11 +212,6 @@ impl Highlighter for OptionCompleter {}
 impl Validator for OptionCompleter {}
 impl Helper for OptionCompleter {}
 
-/// The `model` prompt's label, shared by the interactive prompt and the
-/// line [`prompt_model`] echoes when it auto-selects instead, so the two
-/// can't drift apart.
-const MODEL_PROMPT: &str = "model (optional, only used with --daemon)";
-
 /// Prompts for the optional `model` key — only consulted in `--daemon`
 /// mode — TAB-completing over the models already
 /// installed under `models_dir`: every `NR` *and* every `MODEL` label,
@@ -232,16 +227,18 @@ const MODEL_PROMPT: &str = "model (optional, only used with --daemon)";
 /// entry is fine too — daemon mode is the only thing that needs it.
 ///
 /// The one case that isn't asked at all is a `models_dir` holding exactly
-/// one model (see [`sole_model`]) — there's nothing to choose between,
-/// so it's taken and echoed rather than typed out.
+/// one model (see [`sole_model`]) — there's nothing to choose between, so
+/// it's taken and echoed as a plain `model: <label>` line rather than
+/// typed out.
 fn prompt_model(models_dir: &Path) -> Result<String> {
     let groups = orangu::model_spec::scan_models_dir(models_dir)
         .map(|models| orangu::model_spec::group_models(&models))
         .unwrap_or_default();
 
     if let Some(only) = sole_model(&groups) {
-        println!("{MODEL_PROMPT}: {}", only.label);
-        println!("(the only model under {} — selected)", models_dir.display());
+        // Echoed in the same `key: value` shape as the prompts around it,
+        // so the transcript reads as if it had been answered.
+        println!("model: {}", only.label);
         return Ok(only.label.clone());
     }
 
@@ -254,7 +251,7 @@ fn prompt_model(models_dir: &Path) -> Result<String> {
         labels: model_hint_options(&groups),
     }));
 
-    match editor.readline(&format!("{MODEL_PROMPT} []: ")) {
+    match editor.readline("model (optional, only used with --daemon) []: ") {
         Ok(line) => Ok(line.trim().to_string()),
         Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
             Err(anyhow!("aborted: reached end of input"))
