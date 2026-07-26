@@ -48,6 +48,9 @@ use std::time::Instant;
 
 use clap::Parser;
 
+mod chart;
+mod history;
+
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
 #[derive(Parser, Debug)]
@@ -105,6 +108,22 @@ struct Args {
     /// Emit machine-readable JSON.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Append each measured point to this tab-separated history file.
+    #[arg(long)]
+    history: Option<String>,
+
+    /// Series name recorded in the history file (defaults to the server's model).
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Render the history file to this SVG after measuring.
+    #[arg(long)]
+    chart: Option<String>,
+
+    /// Only render the chart from an existing history file; measure nothing.
+    #[arg(long, default_value_t = false)]
+    chart_only: bool,
 }
 
 /// One decode measurement: how many tokens streamed, time-to-first-token,
@@ -390,6 +409,13 @@ fn main() {
 }
 
 fn run(args: &Args) -> anyhow::Result<()> {
+    // Chart-only never touches the network, so it works on a history file
+    // carried off the machine that produced it — and, more usefully, after a
+    // hand-edit of that file, without needing a server up to redraw.
+    if args.chart_only {
+        return write_chart(args, &[]);
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
@@ -401,15 +427,27 @@ fn run(args: &Args) -> anyhow::Result<()> {
         run_once(&client, &args.url, &p, 8, &args.model)?;
     }
 
+    let label = args
+        .label
+        .clone()
+        .unwrap_or_else(|| server_label(&client, args));
+
     report_environment(&client, args);
 
     if !args.pp.is_empty() {
-        return run_pp(&client, args);
+        let records = run_pp(&client, args, &label)?;
+        return record_and_chart(args, &records);
     }
 
     if args.curve > 0 {
-        return run_curve(&client, args);
+        // Curve mode reports one generation bucketed by position, not a rate at
+        // a named workload; there is no series for it to extend, so it is not
+        // recorded. A chart requested alongside it still redraws the file.
+        run_curve(&client, args)?;
+        return record_and_chart(args, &[]);
     }
+
+    let mut records = Vec::new();
 
     if !args.json {
         println!(
@@ -453,15 +491,97 @@ fn run(args: &Args) -> anyhow::Result<()> {
                 depth, args.n_gen, s.ttft_ms, s.gen_tokens, best, mean, sd
             );
         }
+
+        records.push(history::Record {
+            date: history::today(),
+            label: label.clone(),
+            mode: "tg".to_string(),
+            n: depth,
+            best,
+            mean,
+            sd,
+        });
     }
 
+    record_and_chart(args, &records)
+}
+
+/// Append this run's points to `--history` (when given) and redraw `--chart`
+/// (when given) from the file *including* them.
+///
+/// Drawing from the file rather than from `records` is what makes the chart a
+/// history rather than a snapshot: a run that measured only orangu still
+/// redraws llama.cpp's line beside it.
+fn record_and_chart(args: &Args, records: &[history::Record]) -> anyhow::Result<()> {
+    if let Some(path) = &args.history
+        && !records.is_empty()
+    {
+        history::append(path, records)?;
+        if !args.json {
+            println!("  history  {} rows appended to {path}", records.len());
+        }
+    }
+    write_chart(args, records)
+}
+
+/// Render `--chart` from `--history`. `extra` is folded in so a chart requested
+/// without a history file still shows the run that just happened.
+fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
+    let Some(chart_path) = &args.chart else {
+        if args.chart_only {
+            anyhow::bail!("--chart-only needs --chart <FILE.svg>");
+        }
+        return Ok(());
+    };
+    let mut records = match &args.history {
+        Some(h) => history::read(h)?,
+        None => Vec::new(),
+    };
+    // Only when there is no history file: otherwise these rows are already in
+    // it, and folding them in again would double every point of this run.
+    if args.history.is_none() {
+        records.extend_from_slice(extra);
+    }
+    if records.is_empty() {
+        anyhow::bail!("nothing to chart — pass --history <FILE> with recorded rows");
+    }
+    let subtitle = format!(
+        "{} · rendered {}",
+        args.history.as_deref().unwrap_or("this run"),
+        history::today()
+    );
+    std::fs::write(chart_path, chart::render(&records, &subtitle))?;
+    if !args.json {
+        println!("  chart    {chart_path}");
+    }
     Ok(())
+}
+
+/// The series name for a server that was not given one: its model id, which is
+/// the field that actually distinguishes two rows in the history file.
+fn server_label(client: &reqwest::blocking::Client, args: &Args) -> String {
+    client
+        .get(format!("{}/props", args.url))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|p| {
+            p.get("model")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Prefill mode: for each requested prompt length, time prompt processing at
 /// that length. The rate is `prompt_n / prompt_ms` straight from the server, so
 /// it excludes decode entirely — the `pp` counterpart to the decode sweep.
-fn run_pp(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()> {
+fn run_pp(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
     if !args.json {
         println!(
             "{:>8} | {:>7} | {:>7} | {:>9} | {:>8} | {:>16}",
@@ -512,8 +632,23 @@ fn run_pp(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()>
                 len, "?", s.cached_tokens, s.prompt_ms, "-"
             );
         }
+
+        // A row without server timings is a time-to-first-token, not a prefill
+        // rate. Recording it would put a different measurement on the same line
+        // as the real ones, so it is printed and dropped.
+        if s.server_reported {
+            records.push(history::Record {
+                date: history::today(),
+                label: label.to_string(),
+                mode: "pp".to_string(),
+                n: s.prompt_tokens,
+                best,
+                mean,
+                sd,
+            });
+        }
     }
-    Ok(())
+    Ok(records)
 }
 
 /// What was measured, printed before the numbers: which server process, the

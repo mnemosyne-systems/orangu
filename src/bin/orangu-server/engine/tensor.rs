@@ -60,26 +60,127 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Four independent accumulators, not one.
+///
+/// A single accumulator makes the loop a **dependency chain**: each
+/// `_mm256_fmadd_ps` has to wait for the previous one to retire, so a
+/// `head_dim = 256` dot product serialises 32 FMAs at ~4 cycles of latency
+/// each where the core could otherwise issue two per cycle. That is the loop's
+/// real cost — the arithmetic is nowhere near the limit, the chain is — and
+/// attention runs one of these per query × head × window position.
+///
+/// Four chains cover the latency (4 cycles × 2 per cycle needs ≥ 8 in flight,
+/// and each iteration issues 4 independent FMAs plus their loads). Widening
+/// past four stops paying: the loads become the constraint.
+///
+/// This changes the *summation order* — four partial sums combined pairwise at
+/// the end rather than one running total — so it is not bit-identical to the
+/// single-accumulator form. That is float reassociation, the same kind
+/// `dot_scalar` and the vector path have always differed by (a sequential sum
+/// versus eight lanes plus a horizontal reduction), and it is why `dot` has
+/// never been the reference for a bit-exact claim. `axpy_inplace` next door
+/// *is* bit-exact, because its reference is a specific scalar loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-        let n = a.len();
-        let chunks = n / 8;
-        let mut acc = _mm256_setzero_ps();
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
-            acc = _mm256_fmadd_ps(va, vb, acc);
+        let n = a.len().min(b.len());
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let pa = a.as_ptr();
+        let pb = b.as_ptr();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 8)),
+                _mm256_loadu_ps(pb.add(i + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 16)),
+                _mm256_loadu_ps(pb.add(i + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 24)),
+                _mm256_loadu_ps(pb.add(i + 24)),
+                acc3,
+            );
+            i += 32;
         }
+        while i + 8 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            i += 8;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         let mut buf = [0f32; 8];
         _mm256_storeu_ps(buf.as_mut_ptr(), acc);
         let mut sum: f32 = buf.iter().sum();
-        for i in chunks * 8..n {
-            sum += a[i] * b[i];
+        for j in i..n {
+            sum += a[j] * b[j];
         }
         sum
+    }
+}
+
+/// `out[i] += scale * v[i]` — attention's value accumulation.
+///
+/// The companion to [`dot`], and it exists for the same reason. Attention runs
+/// exactly as many of these as it runs dot products (one per query × head ×
+/// window position), but only the dot product was ever vectorized; this half
+/// was a `out.iter_mut().zip(v.iter())` loop, and a CPU profile of prefill
+/// found the zip's own iteration machinery — `next`, `spec_next`,
+/// `unchecked_add` — accounting for more samples than the arithmetic it was
+/// carrying.
+///
+/// **Bit-exact with the scalar form**, deliberately: a separate multiply and
+/// add, not `_mm256_fmadd_ps`. An FMA rounds once where the scalar rounds
+/// twice, so fusing here would change every attention output slightly and cost
+/// the ability to verify this by byte-comparing a generation against the
+/// previous build. [`dot`] can use FMA because its own reference is the same
+/// AVX2 code; this one's reference is the loop it replaced.
+pub fn axpy_inplace(out: &mut [f32], v: &[f32], scale: f32) {
+    debug_assert_eq!(out.len(), v.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // AVX2 alone is enough — no `fma` bit needed, unlike `dot`.
+        if is_x86_feature_detected!("avx2") {
+            // Safety: guarded by the runtime feature check above.
+            unsafe { axpy_avx2(out, v, scale) };
+            return;
+        }
+    }
+    axpy_scalar(out, v, scale);
+}
+
+fn axpy_scalar(out: &mut [f32], v: &[f32], scale: f32) {
+    for (o, vi) in out.iter_mut().zip(v.iter()) {
+        *o += scale * vi;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn axpy_avx2(out: &mut [f32], v: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = out.len().min(v.len());
+        let chunks = n / 8;
+        let vs = _mm256_set1_ps(scale);
+        for i in 0..chunks {
+            let vo = _mm256_loadu_ps(out.as_ptr().add(i * 8));
+            let vv = _mm256_loadu_ps(v.as_ptr().add(i * 8));
+            // Multiply then add, matching `axpy_scalar`'s two roundings.
+            let prod = _mm256_mul_ps(vs, vv);
+            _mm256_storeu_ps(out.as_mut_ptr().add(i * 8), _mm256_add_ps(vo, prod));
+        }
+        for i in chunks * 8..n {
+            *out.get_unchecked_mut(i) += scale * *v.get_unchecked(i);
+        }
     }
 }
 
@@ -361,5 +462,44 @@ mod tests {
         rope_apply_inplace(&mut x, 1, 4, 4, 5, 10000.0);
         let norm_after = (x[0] * x[0] + x[2] * x[2]).sqrt();
         assert!((norm_before - norm_after).abs() < 1e-5);
+    }
+
+    /// `axpy_inplace` replaced attention's value-accumulation loop, so its
+    /// reference is that loop — and the claim is not "close", it is **equal**.
+    /// A separate multiply and add rounds exactly where the scalar version
+    /// does; had this used `_mm256_fmadd_ps` instead, this test would fail and
+    /// every attention output would have moved by an amount too small to
+    /// notice and too large to ignore when byte-comparing two builds.
+    ///
+    /// Lengths straddle the 8-wide vector body deliberately: `0` (no work),
+    /// under one vector, exact multiples, and multiples plus a tail, including
+    /// the 256 and 512 real `head_dim`s.
+    #[test]
+    fn axpy_is_bit_exact_with_the_scalar_loop_it_replaced() {
+        let mut seed = 0x9E37_79B9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 4.0 - 2.0
+        };
+        for len in [
+            0usize, 1, 3, 7, 8, 9, 15, 16, 31, 33, 64, 255, 256, 257, 512,
+        ] {
+            let v: Vec<f32> = (0..len).map(|_| next()).collect();
+            let base: Vec<f32> = (0..len).map(|_| next()).collect();
+            for scale in [0.0f32, 1.0, -1.0, 0.37, 1e-8, 1e8, next()] {
+                let mut got = base.clone();
+                axpy_inplace(&mut got, &v, scale);
+                let mut want = base.clone();
+                axpy_scalar(&mut want, &v, scale);
+                assert_eq!(
+                    got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "len {len} scale {scale}: vectorized axpy is not bit-identical \
+                     to the scalar loop it replaced"
+                );
+            }
+        }
     }
 }

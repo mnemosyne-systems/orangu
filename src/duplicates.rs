@@ -201,12 +201,6 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         function_kinds: &["value_definition"],
     },
     LanguageSpec {
-        name: "Haskell",
-        extensions: &["hs"],
-        grammar: || tree_sitter_haskell::LANGUAGE.into(),
-        function_kinds: &["function"],
-    },
-    LanguageSpec {
         name: "Julia",
         extensions: &["jl"],
         grammar: || tree_sitter_julia::LANGUAGE.into(),

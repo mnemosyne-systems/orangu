@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod arch;
+pub mod attention;
 pub mod backend;
 pub mod batch;
 pub mod chat_template;

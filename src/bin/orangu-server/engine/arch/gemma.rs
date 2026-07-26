@@ -1224,48 +1224,20 @@ impl GemmaModel {
                 } else {
                     attn_out.clear();
                     attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
-                    // Prefill attention is O(n_tokens²) and single-threaded was the
-                    // second-largest prefill cost (after the GPU matmuls) and the one
-                    // that grows quadratically with prompt length. Each query token's
-                    // attention is independent — reads the (now fully-populated,
-                    // read-only) KV cache + `q`, writes only its own `attn_out` slice —
-                    // so parallelise across tokens with rayon (byte-exact: no cross-token
-                    // dependency, per-token accumulation order unchanged). Every thread
-                    // keeps its own `scores` scratch.
-                    let n_head = self.n_head;
-                    let attention_scale = self.attention_scale;
+                    // Prefill attention is O(n_tokens²) and is the largest CPU cost
+                    // here — see `engine::attention` for the loop order and why it is
+                    // shared with every other architecture rather than copied.
                     let is_swa = layer.is_swa;
-                    let cache_layer = &cache.layers[cache_index];
-                    attn_out
-                        .par_chunks_mut(n_head * head_dim)
-                        .enumerate()
-                        .for_each(|(t, out_t)| {
-                            let pos = start_pos + t;
-                            let (window_start, window_end) =
-                                self.attention_window(is_swa, pos, n_tokens);
-                            let mut scores: Vec<f32> = Vec::new();
-                            for h in 0..n_head {
-                                let kv_head = h / group_size;
-                                let qh = &q[t * n_head * head_dim + h * head_dim
-                                    ..t * n_head * head_dim + (h + 1) * head_dim];
-
-                                scores.clear();
-                                for p in window_start..=window_end {
-                                    let kh = cache_layer.key_at(p, kv_head, head_dim);
-                                    scores.push(tensor::dot(qh, kh) * attention_scale);
-                                }
-                                tensor::softmax_inplace(&mut scores);
-
-                                let out = &mut out_t[h * head_dim..(h + 1) * head_dim];
-                                for (offset, &weight) in scores.iter().enumerate() {
-                                    let p = window_start + offset;
-                                    let vh = cache_layer.value_at(p, kv_head, head_dim);
-                                    for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                                        *o += weight * vi;
-                                    }
-                                }
-                            }
-                        });
+                    crate::engine::attention::multi_head_attention(
+                        &mut attn_out,
+                        &q,
+                        &cache.layers[cache_index],
+                        self.n_head,
+                        group_size,
+                        head_dim,
+                        self.attention_scale,
+                        |t| self.attention_window(is_swa, start_pos + t, n_tokens),
+                    );
                     if prefill_trace {
                         eprintln!(
                             "orangu-server: [prefill-trace] layer {il} cpu_attention \
@@ -1449,19 +1421,22 @@ impl GemmaModel {
                 // fused recorder multiplies by. The unfused path below reads
                 // the same strided slices one token at a time instead.
                 let t0 = Instant::now();
+                let mut gather_ms = 0.0;
                 let fused = self.backend.as_vulkan().and_then(|vulkan| {
+                    let t_gather = Instant::now();
                     let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
                     for t in 0..n_tokens {
                         let base = (t * self.layers.len() + il) * per_layer;
                         per_layer_in.extend_from_slice(&inp_per_layer[base..base + per_layer]);
                     }
+                    gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
                     vulkan.fused_ple_prefill(&x, n_tokens, gate_w, proj_w, &per_layer_in)
                 });
                 let mut proj = if let Some(proj) = fused {
                     if prefill_trace {
                         eprintln!(
                             "orangu-server: [prefill-trace] layer {il} fused_ple \
-                             n_tokens={n_tokens}: {:.1}ms",
+                             n_tokens={n_tokens}: {:.1}ms (gather {gather_ms:.1}ms)",
                             t0.elapsed().as_secs_f64() * 1000.0
                         );
                     }
@@ -1485,6 +1460,13 @@ impl GemmaModel {
                     *v *= scale;
                 }
             }
+        }
+
+        // Once per prefill, not per layer: what the backend's own allocators
+        // have committed. `mem_info_vram_used` gives the total; this attributes
+        // it (P11).
+        if let Some(vulkan) = self.backend.as_vulkan().filter(|_| prefill_trace) {
+            eprintln!("{}", vulkan.footprint_report());
         }
 
         Ok(x)
@@ -2422,9 +2404,7 @@ impl ModelForward for GemmaModel {
                     for (offset, &weight) in scores.iter().enumerate() {
                         let p = window_start + offset;
                         let vh = item.cache.layers[cache_index].value_at(p, kv_head, head_dim);
-                        for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                            *o += weight * vi;
-                        }
+                        tensor::axpy_inplace(out, vh, weight);
                     }
                 }
             }

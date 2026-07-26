@@ -439,9 +439,230 @@ fn main(
 /// BLOCK_ELEMS` split (already used by `MAIN_REDUCE_SUFFIX`) as a small
 /// helper so the K-loop can stream in `CHUNK`-sized pieces without knowing
 /// or caring how big a type's native block actually is.
-pub const COOP_TILE_ROWS: u32 = 32;
-pub const COOP_TILE_TOKENS: u32 = 64;
-pub const COOP_CHUNK: u32 = 32;
+/// The tiled prefill GEMM's geometry, as one value because the five numbers
+/// are not independent: the output tile is exactly what the thread grid and
+/// each thread's register block multiply out to, and the staging run length
+/// falls out of the tile and the thread count. Setting one without the others
+/// produces a kernel whose dispatch grid and whose shader disagree.
+///
+/// Env-tunable as one knob for sweeping — `ORANGU_COOP_GEOM=ty:tx:ry:rx:chunk`
+/// — because the interesting axis is shared-memory footprint against
+/// occupancy, and that moves only when several of them move together. An
+/// unparseable or invalid setting falls back to the default with a warning
+/// rather than building a kernel that is quietly wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoopGeom {
+    /// Threads down the output tile; `threads_y * threads_x` must be 64.
+    pub threads_y: u32,
+    pub threads_x: u32,
+    /// Output rows and tokens each thread accumulates in registers.
+    pub reg_rows: u32,
+    pub reg_tokens: u32,
+    /// K-dimension streaming granularity.
+    pub chunk: u32,
+}
+
+impl CoopGeom {
+    pub const fn tile_rows(self) -> u32 {
+        self.threads_y * self.reg_rows
+    }
+    pub const fn tile_tokens(self) -> u32 {
+        self.threads_x * self.reg_tokens
+    }
+    /// Bytes of workgroup-shared memory the two staging tiles occupy — the
+    /// quantity that actually caps occupancy on this kernel.
+    pub const fn lds_bytes(self) -> u32 {
+        (self.tile_rows() + self.tile_tokens()) * self.chunk * 4
+    }
+    /// Weight elements one thread stages per k-chunk.
+    pub const fn run(self) -> u32 {
+        (self.tile_rows() * self.chunk) / COOP_THREADS
+    }
+
+    /// Every constraint the generated kernel relies on. Returns why, so a bad
+    /// `ORANGU_COOP_GEOM` says which rule it broke instead of failing later as
+    /// wrong output or a driver error.
+    fn check(self) -> Result<(), String> {
+        if self.threads_y * self.threads_x != COOP_THREADS {
+            return Err(format!(
+                "threads_y * threads_x must be {COOP_THREADS}, got {}",
+                self.threads_y * self.threads_x
+            ));
+        }
+        if self.reg_rows == 0 || self.reg_tokens == 0 || self.chunk == 0 {
+            return Err("reg_rows, reg_tokens and chunk must be non-zero".into());
+        }
+        if !self.tile_rows().is_multiple_of(4) || !self.tile_tokens().is_multiple_of(4) {
+            return Err("tile rows and tokens must be multiples of 4 (vec4 staging)".into());
+        }
+        // The register block reads `tile_w`/`tile_x` as `vec4`, indexing
+        // `(k * TILE + base) / 4`, so each thread's `base` — `ty * reg_rows`
+        // and `tx * reg_tokens` — has to be 4-aligned for every thread.
+        if !self.reg_rows.is_multiple_of(4) || !self.reg_tokens.is_multiple_of(4) {
+            return Err(
+                "reg_rows and reg_tokens must be multiples of 4 (vec4 register block)".into(),
+            );
+        }
+        // The recorded-dispatch path still assumes the default token tile; a
+        // narrower one disagrees with it at `n_tokens` past one tile
+        // (`recorded_matmul_matches_backend_matmul_model_shaped` catches it).
+        if self.tile_tokens() != COOP_GEOM_DEFAULT.tile_tokens() {
+            return Err(format!(
+                "token tile must be {} for now",
+                COOP_GEOM_DEFAULT.tile_tokens()
+            ));
+        }
+        // `coop_tiled_x_fill` relies on `local % chunk` being the same on
+        // every one of a thread's staging steps, which needs the chunk to
+        // divide the thread count.
+        if !COOP_THREADS.is_multiple_of(self.chunk) {
+            return Err(format!(
+                "chunk {} must divide the thread count {COOP_THREADS}",
+                self.chunk
+            ));
+        }
+        let run = self.run();
+        if run == 0 || !self.chunk.is_multiple_of(run) {
+            return Err(format!(
+                "staging run {run} must divide chunk {}",
+                self.chunk
+            ));
+        }
+        // **16, not 32.** `Q4_K`/`Q5_K` change scale/min every 32 elements, but
+        // `Q6_K` changes its 8-bit scale every **16** (`sc_idx` is `l / 16`),
+        // and `coop_tiled_run_fill` hoists that scale out of the run. A run of
+        // 32 therefore dequantizes half its `Q6_K` elements with the wrong
+        // scale — silently, and only for that one type. This bound was `32`
+        // until a geometry sweep produced `run == 32` and
+        // `matmul_matches_cpu_backend_cooperative_path_q6_k` caught it.
+        if !16u32.is_multiple_of(run) {
+            return Err(format!(
+                "staging run {run} must divide 16 — Q6_K's scale group, the \
+                 narrowest a K-quant has"
+            ));
+        }
+        if self.lds_bytes() > 32 * 1024 {
+            return Err(format!(
+                "{} B of shared memory exceeds 32 KiB",
+                self.lds_bytes()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Threads per tiled-GEMM workgroup. One wave64 / two wave32s.
+pub const COOP_THREADS: u32 = 64;
+
+/// The default geometry: a 32×64 output tile from an 8×8 thread grid with a
+/// 4×8 register block per thread, streaming K **16** at a time — 6144 B of
+/// shared memory.
+///
+/// The chunk was 32, and halving it is worth **+21–22% on prefill at every
+/// prompt length**. It is the one knob here that changes shared-memory
+/// footprint without changing the arithmetic: FMAs and staged elements both
+/// scale linearly with the chunk, so the ratio between them — 21 multiply-adds
+/// per staged element — is identical either way. What changes is that the two
+/// tiles drop from 12 288 B to 6144 B, and this kernel's occupancy is capped by
+/// exactly that: 6 subgroups/SIMD becomes 8, with the registers left over.
+///
+/// | chunk | LDS | waves/SIMD | pp 1120 | pp 3356 |
+/// | ---: | ---: | ---: | ---: | ---: |
+/// | 32 | 12 288 B | 6 | 130.7 | 127.7 |
+/// | **16** | **6144 B** | **8** | **159.4 / 159.0** | **154.2 / 155.0** |
+/// | 8 | 3072 B | — | 156.8 | 152.3 |
+///
+/// 8 is worse than 16: twice as many `workgroupBarrier` rounds over the K
+/// dimension stops paying for the occupancy it buys.
+pub const COOP_GEOM_DEFAULT: CoopGeom = CoopGeom {
+    threads_y: 8,
+    threads_x: 8,
+    reg_rows: 4,
+    reg_tokens: 8,
+    chunk: 16,
+};
+
+/// Whether the tiled GEMM stages its two shared tiles as `f16` instead of
+/// `f32`.
+///
+/// P5 established that this kernel is capped by shared-memory footprint, not by
+/// registers or arithmetic — halving the K chunk from 32 to 16 took occupancy
+/// from 6 to 8 subgroups/SIMD and prefill up 21%. Halving the element width
+/// does the same thing again without touching the tile geometry, so weight
+/// reuse and the FMA-per-staged-element ratio are unchanged; only the footprint
+/// and the LDS traffic move.
+///
+/// Accumulation stays `f32` — only the staged values narrow. Weights arrive
+/// from a K-quant dequant (a `f16`-derived scale times a 4- to 6-bit integer,
+/// minus a `f16`-derived min), so `f16`'s 10-bit mantissa holds them almost
+/// exactly; the activations are the side that can lose precision.
+///
+/// **Opt-in, and staying that way.** Measured: occupancy does rise a long way
+/// — 6144 B and 10 subgroups/SIMD become 3072 B and 16–18 — and prefill moves
+/// only **+2.4% at 1120 tokens, +3.3% at 2238**. That is the finding, not the
+/// speedup: after P5 this kernel is no longer occupancy-bound, so halving the
+/// footprint again buys almost nothing. The cost is real, though — staging the
+/// inputs at `f16` puts ~1.7% relative error on a 512-term dot product of
+/// adversarial random data (√512 × 2⁻¹¹), which is why
+/// `matmul_matches_cpu_backend_*` and the fused-chain cross-checks fail under
+/// this flag. Their tolerances are calibrated for `f32` staging and were left
+/// alone deliberately: loosening a correctness bound to admit a 3% win is the
+/// wrong trade, and real activations are not the adversarial case anyway.
+///
+/// Kept because it is written, measured and documented, and because a device
+/// where LDS bandwidth rather than footprint is the limit would see more from
+/// it than this one does.
+///
+/// `ORANGU_COOP_F16_TILES=1`. Needs `SHADER_F16`, which the caller checks.
+pub fn coop_f16_tiles() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("ORANGU_COOP_F16_TILES").is_some())
+}
+
+/// The geometry in force, read once from `ORANGU_COOP_GEOM`.
+pub fn coop_geom() -> CoopGeom {
+    static G: std::sync::OnceLock<CoopGeom> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        let Some(spec) = std::env::var_os("ORANGU_COOP_GEOM") else {
+            return COOP_GEOM_DEFAULT;
+        };
+        let spec = spec.to_string_lossy().to_string();
+        let parts: Vec<u32> = spec
+            .split(':')
+            .filter_map(|f| f.trim().parse::<u32>().ok())
+            .collect();
+        if parts.len() != 5 {
+            eprintln!(
+                "orangu-server: ORANGU_COOP_GEOM={spec}: expected ty:tx:ry:rx:chunk, using default"
+            );
+            return COOP_GEOM_DEFAULT;
+        }
+        let g = CoopGeom {
+            threads_y: parts[0],
+            threads_x: parts[1],
+            reg_rows: parts[2],
+            reg_tokens: parts[3],
+            chunk: parts[4],
+        };
+        match g.check() {
+            Ok(()) => {
+                eprintln!(
+                    "orangu-server: coop tile {}x{} chunk {} ({} B LDS, run {})",
+                    g.tile_rows(),
+                    g.tile_tokens(),
+                    g.chunk,
+                    g.lds_bytes(),
+                    g.run()
+                );
+                g
+            }
+            Err(why) => {
+                eprintln!("orangu-server: ORANGU_COOP_GEOM={spec}: {why}; using default");
+                COOP_GEOM_DEFAULT
+            }
+        }
+    })
+}
 
 /// The tiled-GEMM alternative to `MAIN_COOP_SUFFIX` — see `Self::
 /// shader_source_coop_tiled` and `MAIN_COOP_SUFFIX`'s own doc comment for
@@ -452,9 +673,8 @@ pub const COOP_CHUNK: u32 = 32;
 /// streaming the K dimension through shared memory in `CHUNK`-sized
 /// pieces: each of the 64 threads (arranged as an 8-per-column ×
 /// 8-per-row grid — `THREADS_Y × THREADS_X`) cooperatively fills
-/// `tile_w`/`tile_x` for the current chunk (`elem_at`/`x[...]`, grid-
-/// strided across the tile the same way `MAIN_REDUCE_SUFFIX` grid-strides
-/// across a row), then owns a `REG_ROWS × REG_TOKENS` (4×8) register
+/// `tile_w`/`tile_x` for the current chunk, then owns a
+/// `REG_ROWS × REG_TOKENS` (4×8) register
 /// block of the output tile — written out as named scalars by
 /// `coop_tiled_register_block`, see its own doc comment for why an
 /// `array<f32, N>` will not do — accumulating its own 32 output elements'
@@ -474,24 +694,40 @@ pub const COOP_CHUNK: u32 = 32;
 /// none of at all), at the cost of finer-grained K-streaming than that
 /// kernel's native per-block granularity — more `workgroupBarrier` rounds
 /// for the K-quant types, whose native block is 256 elements wide vs. this
-/// kernel's fixed 32-element `CHUNK`, but no additional per-element
-/// dequant cost (`dequant_element` already re-derives each element's
-/// scale/min independently regardless of how the caller chunks its calls).
+/// kernel's fixed 32-element `CHUNK`.
+///
+/// The weight fill is **run-oriented**: one thread stages `RUN` consecutive
+/// `k` of a single row through `fill_w_run` ([`coop_tiled_run_fill`]), rather
+/// than one element each of many rows. That is what lets a quantized type
+/// derive its shared per-block constants once per run. The earlier
+/// element-at-a-time fill made `dequant_element` re-derive, for every one of
+/// the 1024 weight elements staged per chunk, values that 32 of them (the
+/// sub-block scale/min) and 256 of them (the block scale) share — seven to
+/// eight dependent loads to produce one float, against a kernel with ~6
+/// waves/SIMD to hide them behind. `ORANGU_NO_TILE_DEQUANT_RUN=1` restores it
+/// for A/B.
+///
 /// Out-of-range rows/tokens (a tile straddling the matrix edge) are zero-
 /// filled while loading and skipped while writing, the same bounds-check
 /// idiom `MAIN_REDUCE_SUFFIX` already uses for `REDUCE_N_ROWS`-imperfect
-/// `out_dim`.
+/// `out_dim`; the weight fill takes a bounds-checked per-element path there
+/// rather than complicating the run.
 const MAIN_COOP_TILED_SUFFIX: &str = r#"
 const TILE_ROWS: u32 = %TILE_ROWS%u;
 const TILE_TOKENS: u32 = %TILE_TOKENS%u;
 const CHUNK: u32 = %CHUNK%u;
-const THREADS_Y: u32 = 8u;
-const THREADS_X: u32 = 8u;
-const REG_ROWS: u32 = 4u;
-const REG_TOKENS: u32 = 8u;
+const THREADS_Y: u32 = %THREADS_Y%u;
+const THREADS_X: u32 = %THREADS_X%u;
+const REG_ROWS: u32 = %REG_ROWS%u;
+const REG_TOKENS: u32 = %REG_TOKENS%u;
+// Weight elements one thread stages per k-chunk, all from a single row and
+// contiguous in k — see fill_w_run below.
+const RUN: u32 = %RUN%u;
+const RUNS_PER_ROW: u32 = CHUNK / RUN;
+const THREADS: u32 = %THREADS%u;
 
-var<workgroup> tile_w: array<vec4<f32>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;
-var<workgroup> tile_x: array<vec4<f32>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;
+var<workgroup> tile_w: array<vec4<%TILE_T%>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;
+var<workgroup> tile_x: array<vec4<%TILE_T%>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;
 
 fn elem_at(row_byte_base: u32, k: u32) -> f32 {
     let block_idx = k / BLOCK_ELEMS;
@@ -499,7 +735,25 @@ fn elem_at(row_byte_base: u32, k: u32) -> f32 {
     return dequant_element(row_byte_base + block_idx * BLOCK_BYTES, local_k);
 }
 
-@compute @workgroup_size(64)
+// `tile_w` is k-major (`k * TILE_ROWS + row`); the fill and the dot-product
+// loop agree on that through this one helper rather than by restating the
+// index arithmetic at each site.
+fn store_w(rr: u32, kk: u32, v: f32) {
+    let widx = kk * TILE_ROWS + rr;
+    tile_w[widx >> 2u][widx & 3u] = %TILE_T%(v);
+}
+
+// `tile_x` is k-major too (`k * TILE_TOKENS + token`), same reason as
+// `tile_w`: the values one thread reads per `k` end up in consecutive
+// shared-memory addresses.
+fn store_x(tt: u32, kk: u32, v: f32) {
+    let xidx = kk * TILE_TOKENS + tt;
+    tile_x[xidx >> 2u][xidx & 3u] = %TILE_T%(v);
+}
+
+%RUN_FILL%
+
+@compute @workgroup_size(%THREADS%)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -528,50 +782,9 @@ fn main(
             break;
         }
 
-        var fi: u32 = local;
-        loop {
-            if (fi >= TILE_ROWS * CHUNK) {
-                break;
-            }
-            let rr = fi / CHUNK;
-            let kk = fi % CHUNK;
-            let row_idx = row_start + rr;
-            let k_global = chunk_start + kk;
-            // Written k-major (`k * TILE_ROWS + row`), read back the same way
-            // in the dot-product loop below: consecutive `REG_ROWS`/`REG_
-            // TOKENS` elements then sit in consecutive shared-memory
-            // addresses, so the lanes of one subgroup hit distinct banks.
-            // Traversal stays row-major (`fi / CHUNK`) so each thread's
-            // `elem_at` calls still walk one weight row's K in order, which
-            // is what keeps the dequant reads inside one super-block.
-            let widx = kk * TILE_ROWS + rr;
-            if (row_idx < params.out_dim && k_global < in_dim) {
-                tile_w[widx >> 2u][widx & 3u] = elem_at(row_idx * params.row_bytes, k_global);
-            } else {
-                tile_w[widx >> 2u][widx & 3u] = 0.0;
-            }
-            fi = fi + 64u;
-        }
+%W_FILL%
 
-        var fj: u32 = local;
-        loop {
-            if (fj >= TILE_TOKENS * CHUNK) {
-                break;
-            }
-            let tt = fj / CHUNK;
-            let kk = fj % CHUNK;
-            let token_idx = token_start + tt;
-            let k_global = chunk_start + kk;
-            // k-major for the same reason as `tile_w` above; the global read
-            // stays token-major so it keeps coalescing across `x`.
-            let xidx = kk * TILE_TOKENS + tt;
-            if (token_idx < params.n_tokens && k_global < in_dim) {
-                tile_x[xidx >> 2u][xidx & 3u] = x[token_idx * in_dim + k_global];
-            } else {
-                tile_x[xidx >> 2u][xidx & 3u] = 0.0;
-            }
-            fj = fj + 64u;
-        }
+%X_FILL%
 
         workgroupBarrier();
 
@@ -610,19 +823,19 @@ fn main(
 /// Generated from the same `REG_ROWS`/`REG_TOKENS` the tile constants above
 /// imply (4×4, from `TILE_ROWS`/`THREADS_Y` and `TILE_TOKENS`/`THREADS_X`),
 /// so the unrolled text cannot drift from the tile geometry.
-fn coop_tiled_register_block() -> (String, String, String, usize) {
-    const REG_ROWS: usize = 4;
-    const REG_TOKENS: usize = 8;
-    /// K iterations fused into one loop body. Must divide [`COOP_CHUNK`].
-    const K_UNROLL: usize = 2;
-    assert!(
-        (COOP_CHUNK as usize).is_multiple_of(K_UNROLL),
-        "COOP_CHUNK must be a multiple of the K unroll factor"
-    );
+fn coop_tiled_register_block(g: CoopGeom, f16_tiles: bool) -> (String, String, String, usize) {
+    let reg_rows = g.reg_rows as usize;
+    let reg_tokens = g.reg_tokens as usize;
+    // K iterations fused into one loop body; must divide the chunk.
+    let k_unroll: usize = if (g.chunk as usize).is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
 
     let mut decl = String::new();
-    for i in 0..REG_ROWS {
-        for j in 0..REG_TOKENS {
+    for i in 0..reg_rows {
+        for j in 0..reg_tokens {
             decl.push_str(&format!("    var acc_{i}_{j}: f32 = 0.0;\n"));
         }
     }
@@ -633,38 +846,45 @@ fn coop_tiled_register_block() -> (String, String, String, usize) {
     // `K_UNROLL` independent iterations gives the scheduler that other work,
     // and amortizes the loop's own compare/branch over 4× the arithmetic.
     let mut inner = String::new();
-    for u in 0..K_UNROLL {
-        for i in 0..REG_ROWS / 4 {
+    for u in 0..k_unroll {
+        for i in 0..reg_rows.div_ceil(4) {
             inner.push_str(&format!(
                 "            let wv{u}_{i} = tile_w[((k + {u}u) * TILE_ROWS + w_base) / 4u + {i}u];\n"
             ));
         }
-        for j in 0..REG_TOKENS / 4 {
+        for j in 0..reg_tokens.div_ceil(4) {
             inner.push_str(&format!(
                 "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
             ));
         }
     }
-    for u in 0..K_UNROLL {
-        for i in 0..REG_ROWS {
-            for j in 0..REG_TOKENS {
+    for u in 0..k_unroll {
+        for i in 0..reg_rows {
+            for j in 0..reg_tokens {
+                let (w, x) = if f16_tiles {
+                    (
+                        format!("f32(wv{u}_{}[{}])", i / 4, i % 4),
+                        format!("f32(xv{u}_{}[{}])", j / 4, j % 4),
+                    )
+                } else {
+                    (
+                        format!("wv{u}_{}[{}]", i / 4, i % 4),
+                        format!("xv{u}_{}[{}]", j / 4, j % 4),
+                    )
+                };
                 inner.push_str(&format!(
-                    "            acc_{i}_{j} = fma(wv{u}_{}[{}], xv{u}_{}[{}], acc_{i}_{j});\n",
-                    i / 4,
-                    i % 4,
-                    j / 4,
-                    j % 4
+                    "            acc_{i}_{j} = fma({w}, {x}, acc_{i}_{j});\n"
                 ));
             }
         }
     }
 
     let mut store = String::new();
-    for i in 0..REG_ROWS {
+    for i in 0..reg_rows {
         store.push_str(&format!(
             "    let row{i} = row_start + ty * REG_ROWS + {i}u;\n    if (row{i} < params.out_dim) {{\n"
         ));
-        for j in 0..REG_TOKENS {
+        for j in 0..reg_tokens {
             store.push_str(&format!(
                 "        let token{i}_{j} = token_start + tx * REG_TOKENS + {j}u;\n        \
                  if (token{i}_{j} < params.n_tokens) {{\n            \
@@ -674,7 +894,292 @@ fn coop_tiled_register_block() -> (String, String, String, usize) {
         store.push_str("    }\n");
     }
 
-    (decl, inner, store, K_UNROLL)
+    (decl, inner, store, k_unroll)
+}
+
+/// How many weight elements one thread stages per k-chunk in
+/// [`MAIN_COOP_TILED_SUFFIX`]'s fill — the whole tile spread over the 64
+/// threads.
+///
+/// The two divisibility conditions are what make the per-run hoisting in
+/// [`coop_tiled_run_fill`] *correct*, not merely faster, so they are asserted
+/// here rather than left as a comment:
+///
+/// - `CHUNK % RUN == 0` makes each run's first `k` a multiple of `RUN`, since
+///   the chunk start already is a multiple of `CHUNK`.
+/// - `16 % RUN == 0` keeps the whole run inside one scale group. `Q4_K`/`Q5_K`
+///   change scale/min every 32 elements, but **`Q6_K` changes its 8-bit scale
+///   every 16** (`sc_idx` is `l / 16`), so 16 is the binding figure. A run that
+///   straddled two groups would silently dequantize half its `Q6_K` elements
+///   with the wrong scale — which is exactly what `run == 32` did until a
+///   geometry sweep produced it.
+fn coop_tiled_run_len(g: CoopGeom) -> u32 {
+    debug_assert!(g.check().is_ok(), "geometry validated before use");
+    g.run()
+}
+
+/// The weight-staging loop [`MAIN_COOP_TILED_SUFFIX`] runs once per k-chunk,
+/// and the `fill_w_run` it calls, as `(fill, run_fn)`.
+///
+/// `amortized == false` restores the element-at-a-time grid-strided fill this
+/// replaced, verbatim, so `ORANGU_NO_TILE_DEQUANT_RUN=1` is a genuine control
+/// rather than a different arrangement of the new one — an A/B against a
+/// halfway variant would have measured neither the change nor the baseline.
+fn coop_tiled_weight_fill(ggml_type: u32, run: u32, amortized: bool) -> (String, String) {
+    if !amortized {
+        return (
+            r#"        var fi: u32 = local;
+        loop {
+            if (fi >= TILE_ROWS * CHUNK) {
+                break;
+            }
+            let rr = fi / CHUNK;
+            let kk = fi % CHUNK;
+            let row_idx = row_start + rr;
+            let k_global = chunk_start + kk;
+            if (row_idx < params.out_dim && k_global < in_dim) {
+                store_w(rr, kk, elem_at(row_idx * params.row_bytes, k_global));
+            } else {
+                store_w(rr, kk, 0.0);
+            }
+            fi = fi + %THREADS%u;
+        }
+"#
+            .to_string(),
+            String::new(),
+        );
+    }
+    let fill = r#"        // Each thread stages `RUN` consecutive k of ONE row, so every
+        // constant a quantized weight element shares with its neighbours —
+        // the block scale, and for the K-quants the sub-block scale/min pair
+        // — is derived once per run instead of once per element. `RUN`
+        // divides both `CHUNK` and the K-quants' 32-element sub-block, so a
+        // run never straddles two sub-blocks and those constants really are
+        // constant across it; `coop_tiled_run_len` enforces that.
+        let fill_row = local / RUNS_PER_ROW;
+        let fill_kk0 = (local % RUNS_PER_ROW) * RUN;
+        let fill_row_idx = row_start + fill_row;
+        let fill_k0 = chunk_start + fill_kk0;
+        if (fill_row_idx < params.out_dim && fill_k0 + RUN <= in_dim) {
+            fill_w_run(fill_row_idx * params.row_bytes, fill_k0, fill_row, fill_kk0);
+        } else {
+            // A tile straddling the matrix edge: zero-fill what is out of
+            // range, one bounds-checked element at a time. Off the hot path —
+            // only the last row-tile and, for a type whose block is smaller
+            // than `CHUNK`, the last k-chunk can reach it.
+            var i: u32 = 0u;
+            loop {
+                if (i >= RUN) {
+                    break;
+                }
+                var v: f32 = 0.0;
+                if (fill_row_idx < params.out_dim && fill_k0 + i < in_dim) {
+                    v = elem_at(fill_row_idx * params.row_bytes, fill_k0 + i);
+                }
+                store_w(fill_row, fill_kk0 + i, v);
+                i = i + 1u;
+            }
+        }
+"#
+    .to_string();
+    (fill, coop_tiled_run_fill(ggml_type, run))
+}
+
+/// The activation fill exactly as it was before it was straightened — the
+/// control for `ORANGU_NO_TILE_X_STRAIGHT`.
+const ROLLED_X_FILL: &str = r#"        var fj: u32 = local;
+        loop {
+            if (fj >= TILE_TOKENS * CHUNK) {
+                break;
+            }
+            let tt = fj / CHUNK;
+            let kk = fj % CHUNK;
+            let token_idx = token_start + tt;
+            let k_global = chunk_start + kk;
+            var v: f32 = 0.0;
+            if (token_idx < params.n_tokens && k_global < in_dim) {
+                v = x[token_idx * in_dim + k_global];
+            }
+            store_x(tt, kk, v);
+            fj = fj + THREADS;
+        }
+"#;
+
+/// The activation-staging loop for [`MAIN_COOP_TILED_SUFFIX`], as straight-line
+/// code with **every global load issued before any of them is consumed**.
+///
+/// This was a rolled loop over `TILE_TOKENS * CHUNK / 64` iterations, each
+/// loading one `x` element and immediately writing it to shared memory. That is
+/// the shape LESSONS §7 is about: RADV/ACO gives such a loop one destination
+/// register and emits `s_waitcnt vmcnt(0)` before each use, so the loads run one
+/// at a time. An ISA census of the kernel found **12 `vmcnt(0)` full drains**
+/// against 1 in the decode GEMV, and this loop is where they were.
+///
+/// Written out, the loads land in distinct registers with no branch between
+/// them and drain with counted `vmcnt(N)`. The addresses are unchanged — thread
+/// `local` still reads `k = chunk_start + local % CHUNK` for tokens
+/// `local / CHUNK` stepping by `THREADS / CHUNK` — so a subgroup still reads
+/// `CHUNK` consecutive floats of one token's row per step, exactly as coalesced
+/// as before.
+///
+/// The bounds check is hoisted to a whole-tile test rather than being paid per
+/// element: both conditions are uniform across the workgroup, so the fast path
+/// takes no divergent branch at all. The edge keeps the original rolled,
+/// per-element form.
+fn coop_tiled_x_fill(g: CoopGeom) -> String {
+    // `ORANGU_NO_TILE_X_STRAIGHT=1` restores the rolled loop verbatim, so the
+    // change can be A/B'd in one binary against the code it replaced rather
+    // than against an approximation of it (LESSONS §17).
+    if std::env::var_os("ORANGU_NO_TILE_X_STRAIGHT").is_some() {
+        return ROLLED_X_FILL.to_string();
+    }
+    let run = (g.tile_tokens() * g.chunk) / COOP_THREADS;
+    let step = COOP_THREADS / g.chunk;
+    let mut s = String::from(
+        "        // Straight-line, loads-before-stores — see `coop_tiled_x_fill`.\n                 let x_kk = local % CHUNK;\n                 let x_tt0 = local / CHUNK;\n                 let x_k = chunk_start + x_kk;\n                 if (token_start + TILE_TOKENS <= params.n_tokens && chunk_start + CHUNK <= in_dim) {\n                     let x_base = (token_start + x_tt0) * in_dim + x_k;\n",
+    );
+    for i in 0..run {
+        s.push_str(&format!(
+            "            let xv{i} = x[x_base + {}u * in_dim];
+",
+            i * step
+        ));
+    }
+    for i in 0..run {
+        s.push_str(&format!(
+            "            store_x(x_tt0 + {}u, x_kk, xv{i});
+",
+            i * step
+        ));
+    }
+    s.push_str(
+        "        } else {\n                     var fj: u32 = local;\n                     loop {\n                         if (fj >= TILE_TOKENS * CHUNK) {\n                             break;\n                         }\n                         let tt = fj / CHUNK;\n                         let kk = fj % CHUNK;\n                         let token_idx = token_start + tt;\n                         let k_global = chunk_start + kk;\n                         var v: f32 = 0.0;\n                         if (token_idx < params.n_tokens && k_global < in_dim) {\n                             v = x[token_idx * in_dim + k_global];\n                         }\n                         store_x(tt, kk, v);\n                         fj = fj + THREADS;\n                     }\n                 }\n",
+    );
+    s
+}
+
+/// The `fill_w_run` a tiled kernel of `ggml_type` uses: dequantize `RUN`
+/// consecutive `k` of one weight row into `tile_w`.
+///
+/// This is where the tiled GEMM stopped re-deriving, per element, values that
+/// a whole run shares. The generic form below is what every element used to
+/// cost: for `Q4_K` that is four `read_u8` for `d`/`dmin`, a
+/// `get_scale_min_k4` (two or three more), and one for the nibble — seven to
+/// eight dependent loads to produce a single float, with only ~6 waves/SIMD to
+/// hide them behind. The specializations lift all of that out and leave one
+/// load per element in the body.
+///
+/// Each specialization must be read against its type's `dequant_element` in
+/// the corresponding `*_COOP_MIDDLE`; they are two statements of one format,
+/// and `matmul_matches_cpu_backend_*` is what holds them to it.
+fn coop_tiled_run_fill(ggml_type: u32, run: u32) -> String {
+    let body = match ggml_type {
+        t if t == GGML_TYPE_Q4_K => {
+            let mut s = String::from(
+                "    let block_idx = k0 / BLOCK_ELEMS;\n\
+                 \x20   let local_k0 = k0 % BLOCK_ELEMS;\n\
+                 \x20   let byte_offset = row_byte_base + block_idx * BLOCK_BYTES;\n\
+                 \x20   let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));\n\
+                 \x20   let dmin = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));\n\
+                 \x20   // Sub-block index is `local_k / 32`, constant over the run.\n\
+                 \x20   let sm = get_scale_min_k4(byte_offset + 4u, local_k0 / 32u);\n\
+                 \x20   let ds = d * f32(sm.x);\n\
+                 \x20   let dm = dmin * f32(sm.y);\n\
+                 \x20   // Low nibbles serve the first 32 of each 64-element group, high the\n\
+                 \x20   // second, and both halves index the same 32 packed bytes.\n\
+                 \x20   let q_base = byte_offset + 16u + (local_k0 / 64u) * 32u + (local_k0 % 32u);\n\
+                 \x20   var shift: u32 = 0u;\n\
+                 \x20   if ((local_k0 % 64u) >= 32u) {\n        shift = 4u;\n    }\n",
+            );
+            for i in 0..run {
+                s.push_str(&format!(
+                    "    store_w(rr, kk0 + {i}u, ds * f32((read_u8(q_base + {i}u) >> shift) & 0xFu) - dm);\n"
+                ));
+            }
+            s
+        }
+        t if t == GGML_TYPE_Q5_K => {
+            let mut s = String::from(
+                "    let block_idx = k0 / BLOCK_ELEMS;\n\
+                 \x20   let local_k0 = k0 % BLOCK_ELEMS;\n\
+                 \x20   let byte_offset = row_byte_base + block_idx * BLOCK_BYTES;\n\
+                 \x20   let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));\n\
+                 \x20   let dmin = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));\n\
+                 \x20   let idx = local_k0 / 64u;\n\
+                 \x20   let l0 = local_k0 % 32u;\n\
+                 \x20   var sub: u32 = idx * 2u;\n\
+                 \x20   var nib_shift: u32 = 0u;\n\
+                 \x20   var umask: u32 = 1u << (2u * idx);\n\
+                 \x20   if ((local_k0 % 64u) >= 32u) {\n        \
+                 sub = sub + 1u;\n        nib_shift = 4u;\n        \
+                 umask = 2u << (2u * idx);\n    }\n\
+                 \x20   let sm = get_scale_min_k4(byte_offset + 4u, sub);\n\
+                 \x20   let ds = d * f32(sm.x);\n\
+                 \x20   let dm = dmin * f32(sm.y);\n\
+                 \x20   let ql_base = byte_offset + 48u + idx * 32u + l0;\n\
+                 \x20   let qh_base = byte_offset + 16u + l0;\n",
+            );
+            for i in 0..run {
+                s.push_str(&format!(
+                    "    let lo{i} = (read_u8(ql_base + {i}u) >> nib_shift) & 0xFu;\n\
+                     \x20   var hi{i}: i32 = 0;\n\
+                     \x20   if ((read_u8(qh_base + {i}u) & umask) != 0u) {{\n        hi{i} = 16;\n    }}\n\
+                     \x20   store_w(rr, kk0 + {i}u, ds * f32(i32(lo{i}) + hi{i}) - dm);\n"
+                ));
+            }
+            s
+        }
+        t if t == GGML_TYPE_Q6_K => {
+            let mut s = String::from(
+                "    let block_idx = k0 / BLOCK_ELEMS;\n\
+                 \x20   let local_k0 = k0 % BLOCK_ELEMS;\n\
+                 \x20   let byte_offset = row_byte_base + block_idx * BLOCK_BYTES;\n\
+                 \x20   let d = f16_to_f32(read_u8(byte_offset + 208u) | (read_u8(byte_offset + 209u) << 8u));\n\
+                 \x20   let idx = local_k0 / 128u;\n\
+                 \x20   // Which of the four interleaved 32-wide output ranges this run sits\n\
+                 \x20   // in, and where in it — both constant over the run.\n\
+                 \x20   let which_q = (local_k0 % 128u) / 32u;\n\
+                 \x20   let l0 = local_k0 % 32u;\n\
+                 \x20   let ql_base = byte_offset + idx * 64u + l0;\n\
+                 \x20   let qh_base = byte_offset + 128u + idx * 32u + l0;\n\
+                 \x20   var sc: i32 = i32(read_u8(byte_offset + 192u + idx * 8u + l0 / 16u + which_q * 2u));\n\
+                 \x20   if (sc >= 128) {\n        sc = sc - 256;\n    }\n\
+                 \x20   let dsc = d * f32(sc);\n\
+                 \x20   var ql_extra: u32 = 0u;\n\
+                 \x20   var ql_shift: u32 = 0u;\n\
+                 \x20   let qh_shift: u32 = which_q * 2u;\n\
+                 \x20   if (which_q == 1u || which_q == 3u) {\n        ql_extra = 32u;\n    }\n\
+                 \x20   if (which_q >= 2u) {\n        ql_shift = 4u;\n    }\n",
+            );
+            for i in 0..run {
+                s.push_str(&format!(
+                    "    let ql{i} = (read_u8(ql_base + ql_extra + {i}u) >> ql_shift) & 0xFu;\n\
+                     \x20   let qh{i} = ((read_u8(qh_base + {i}u) >> qh_shift) & 3u) << 4u;\n\
+                     \x20   store_w(rr, kk0 + {i}u, dsc * f32(i32(ql{i} | qh{i}) - 32));\n"
+                ));
+            }
+            s
+        }
+        // Everything else already costs about one load per element — `d` is
+        // per 32 for `Q4_0`/`Q5_0`/`Q8_0` and there is no block header at all
+        // for the float types — so the run is only straightened out, not
+        // restructured. Straight-line rather than a loop because a rolled loop
+        // (RADV/ACO) keeps one destination register and drains with
+        // `vmcnt(0)`, serializing what should be `RUN` loads in flight.
+        _ => {
+            let mut s = String::new();
+            for i in 0..run {
+                s.push_str(&format!(
+                    "    store_w(rr, kk0 + {i}u, elem_at(row_byte_base, k0 + {i}u));\n"
+                ));
+            }
+            s
+        }
+    };
+    format!(
+        "// Dequantize `RUN` consecutive k of one weight row into `tile_w`.\n\
+         fn fill_w_run(row_byte_base: u32, k0: u32, rr: u32, kk0: u32) {{\n{body}}}\n"
+    )
 }
 
 /// `{ f32 }`, 1 element. Only one element exists, so `MAIN_COOP_SUFFIX`'s
@@ -2079,6 +2584,47 @@ fn main(
 /// `mul_mat_vec_q4_k.comp`. The activation `x` is rebound as
 /// `array<vec4<f32>>` (binding shape unchanged — storage is element-type
 /// agnostic), so B is read as `vec4` and each thread's dot is four `dot()`s.
+/// A **profiling probe, not a correct kernel**: `Q4K_LIGHT_PRELUDE` with every
+/// load kept and the arithmetic between them removed.
+///
+/// P4 has ruled out the memory system for the decode GEMV — the hardware serves
+/// its exact access shape at 170 GB/s against the 48 GB/s it achieves — leaving
+/// two candidates that no static measurement separates: the dequant/dot ALU,
+/// and the fixed per-workgroup cost (launch, subgroup reduction, store) spread
+/// over one output row's worth of work.
+///
+/// This separates them. The seven loads per block are identical — same header
+/// `vec4`, same two `read_word_v4`, same four activation `vec4`s, same
+/// addresses, so the memory traffic and the workgroup count are untouched — and
+/// roughly 140 VALU ops of dequantization and dot product become about ten.
+/// If throughput moves toward the 170 GB/s the pattern can sustain, the ALU is
+/// the cost; if it stays near 48, the per-workgroup overhead is.
+///
+/// The output is deliberately meaningless. `ORANGU_GEMV_STUB=1`, and every
+/// cross-check fails under it by design.
+const Q4K_LIGHT_STUB_SB: &str = r#"
+fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im: u32) -> f32 {
+    let header = weights[block_byte_off / 16u];
+    let qs0 = read_word_v4(block_byte_off + 16u + q_offset);
+    let qs64 = read_word_v4(block_byte_off + 16u + q_offset + 64u);
+    let y1 = (x_block_elem + y_offset) / 4u;
+    let y2 = (x_block_elem + y_offset + 128u) / 4u;
+    // Every component of every load is consumed, or the compiler narrows the
+    // `vec4` fetches to scalars and the probe stops reading what the real
+    // kernel reads. The load census is asserted to match before it is trusted.
+    let a1 = xv[y1];
+    let a2 = xv[y1 + 8u];
+    let a3 = xv[y2];
+    let a4 = xv[y2 + 8u];
+    let h = (header.x ^ header.y ^ header.z ^ header.w ^ qs0 ^ qs64) & 0xFFu;
+    return f32(h)
+        + (a1.x + a1.y + a1.z + a1.w)
+        + (a2.x + a2.y + a2.z + a2.w)
+        + (a3.x + a3.y + a3.z + a3.w)
+        + (a4.x + a4.y + a4.z + a4.w);
+}
+"#;
+
 const Q4K_LIGHT_PRELUDE: &str = r#"
 struct Meta {
     in_dim: u32,
@@ -2209,7 +2755,25 @@ fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im
 /// the allocation is compiler-determined. It is therefore *not* the occupancy
 /// lever it was meant to be; kept for reference / other GPUs.
 pub fn shader_source_reduce_q4k_light(n_rows: usize, subgroup: bool) -> String {
-    let mut s = String::from(Q4K_LIGHT_PRELUDE);
+    // `ORANGU_GEMV_STUB=1` swaps the block reader for a load-preserving,
+    // arithmetic-free stub — see `Q4K_LIGHT_STUB_SB`. Wrong output on purpose.
+    let mut s = if std::env::var_os("ORANGU_GEMV_STUB").is_some() {
+        let start = Q4K_LIGHT_PRELUDE
+            .find("\nfn sb(")
+            .expect("prelude defines sb");
+        let end = Q4K_LIGHT_PRELUDE[start..]
+            .find("\n}\n")
+            .map(|e| start + e + 3)
+            .expect("sb has a closing brace");
+        let mut t = String::from(&Q4K_LIGHT_PRELUDE[..start]);
+        // Keep the leading newline: the prelude's `fn sb` is preceded by a
+        // `//` comment, and splicing onto that line comments the function out.
+        t.push_str(Q4K_LIGHT_STUB_SB);
+        t.push_str(&Q4K_LIGHT_PRELUDE[end..]);
+        t
+    } else {
+        String::from(Q4K_LIGHT_PRELUDE)
+    };
     s.push_str(&format!(
         "\nvar<workgroup> psums: array<f32, {}>;\n\n",
         n_rows * 32
@@ -2230,22 +2794,119 @@ pub fn shader_source_reduce_q4k_light(n_rows: usize, subgroup: bool) -> String {
     s.push_str("    let tid = lid.x;\n    let itid = tid % 16u;\n    let ix = tid / 16u;\n");
     s.push_str("    let il = itid / 4u;\n    let ir = itid % 4u;\n    let v_im = il / 2u;\n    let v_in = il % 2u;\n    let l0 = 4u * (2u * ir + v_in);\n    let q_offset = 32u * v_im + l0;\n    let y_offset = 64u * v_im + l0;\n");
     s.push_str("    let num_blocks = params.in_dim / 256u;\n    let x_tok = t * params.in_dim;\n");
+    // `ORANGU_REDUCE_ROW_LOOP=1`: one workgroup still covers `n_rows` output
+    // rows, but walks them in a loop with a **single** accumulator live rather
+    // than unrolling `acc0..accN` into registers.
+    //
+    // P4's remaining candidate is per-workgroup fixed cost — launch, reduction,
+    // store — spread over a loop of only three iterations. Raising `n_rows` is
+    // the obvious way to amortize it and makes things monotonically worse, but
+    // the unrolled form pays for that amortization in register pressure, so the
+    // two effects cannot be told apart. This form amortizes the *launch* over
+    // `n_rows` rows at constant register cost; the reduction and store still
+    // happen per row. If throughput now rises with `n_rows` where it fell
+    // before, the launch is the cost.
+    if row_loop() && n_rows > 1 {
+        s.push_str(&format!(
+            "    var row: u32 = 0u;\n    loop {{\n        if (row >= {n_rows}u) {{\n            break;\n        }}\n        let orow = o0 + row;\n        if (orow < params.out_dim) {{\n            var acc0: f32 = 0.0;\n            var i: u32 = ix;\n            loop {{\n                if (i >= num_blocks) {{\n                    break;\n                }}\n                let xrb = x_tok + i * 256u;\n                acc0 = acc0 + sb(orow * params.row_bytes + i * 144u, xrb, y_offset, q_offset, v_im);\n                i = i + 2u;\n            }}\n"
+        ));
+        if subgroup {
+            s.push_str("            let sg0 = subgroupAdd(acc0);\n            if (sg_lane == 0u) {\n                y[t * params.out_dim + orow] = sg0;\n            }\n");
+        } else {
+            s.push_str("            psums[tid] = acc0;\n            workgroupBarrier();\n            var stride: u32 = 16u;\n            loop {\n                if (stride == 0u) {\n                    break;\n                }\n                if (tid < stride) {\n                    psums[tid] = psums[tid] + psums[tid + stride];\n                }\n                workgroupBarrier();\n                stride = stride / 2u;\n            }\n            if (tid == 0u) {\n                y[t * params.out_dim + orow] = psums[0];\n            }\n            workgroupBarrier();\n");
+        }
+        s.push_str("        }\n        row = row + 1u;\n    }\n}\n");
+        return s;
+    }
     for i in 0..n_rows {
         s.push_str(&format!("    var acc{i}: f32 = 0.0;\n"));
     }
-    s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n        let xrb = x_tok + i * 256u;\n");
+    // it_size = workgroup_size(32) / 16 = 2 super-blocks per iteration, so a
+    // thread walks blocks `ix, ix+2, ix+4, ...`.
+    //
+    // Unrolled `U` blocks at a time. Rolled, this loop drained every
+    // outstanding load once per block — 12 sequential `vmcnt(0)` waits for an
+    // `ffn_down` row (24 blocks, stride 2) with only 7 loads in flight between
+    // them. `U` independent `sb()` calls have no dependency between them, so
+    // their loads issue together and drain once. Same shape as the tiled GEMM's
+    // staging fill, same reason (LESSONS §7).
+    //
+    // The accumulation stays **bit-exact**: `acc = acc + a0 + a1 + ...` is
+    // left-associative, which is the same order the rolled loop's successive
+    // `acc = acc + a` statements produced.
+    let unroll = reduce_block_unroll();
+    let sb_call = |row: usize, blk: usize| {
+        format!(
+            "sb(o{row} * params.row_bytes + (i + {}u) * 144u, x_tok + (i + {}u) * 256u, y_offset, q_offset, v_im)",
+            blk * 2,
+            blk * 2
+        )
+    };
+    if unroll > 1 {
+        s.push_str(&format!(
+            "    var i: u32 = ix;\n    loop {{\n        if (i + {}u >= num_blocks) {{\n            break;\n        }}\n",
+            (unroll - 1) * 2
+        ));
+        for row in 0..n_rows {
+            let terms: Vec<String> = (0..unroll).map(|b| sb_call(row, b)).collect();
+            let sum = terms.join("\n            + ");
+            if row == 0 {
+                s.push_str(&format!("        acc0 = acc0 + {sum};\n"));
+            } else {
+                s.push_str(&format!(
+                    "        if (o{row} < params.out_dim) {{\n            acc{row} = acc{row} + {sum};\n        }}\n"
+                ));
+            }
+        }
+        s.push_str(&format!("        i = i + {}u;\n    }}\n", unroll * 2));
+        // Remainder: the same body one block at a time.
+        s.push_str("    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n");
+    } else {
+        s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n");
+    }
+    s.push_str("        let xrb = x_tok + i * 256u;\n");
     s.push_str("        acc0 = acc0 + sb(o0 * params.row_bytes + i * 144u, xrb, y_offset, q_offset, v_im);\n");
     for i in 1..n_rows {
         s.push_str(&format!(
             "        if (o{i} < params.out_dim) {{\n            acc{i} = acc{i} + sb(o{i} * params.row_bytes + i * 144u, xrb, y_offset, q_offset, v_im);\n        }}\n"
         ));
     }
-    // it_size = workgroup_size(32) / 16 = 2 super-blocks per iteration.
     s.push_str("        i = i + 2u;\n    }\n\n");
     s.push_str(&light_reduce(n_rows, subgroup));
     s.push_str("}\n");
     s
 }
+
+/// Super-blocks the decode `Q4_K` GEMV fuses into one loop body, so that many
+/// blocks' loads are in flight at once instead of one block's.
+///
+/// `ORANGU_REDUCE_UNROLL`, clamped `1..=8`. `1` restores the rolled loop
+/// verbatim and is the control.
+fn reduce_block_unroll() -> usize {
+    static U: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *U.get_or_init(|| {
+        std::env::var("ORANGU_REDUCE_UNROLL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&u| (1..=8).contains(&u))
+            .unwrap_or(REDUCE_BLOCK_UNROLL_DEFAULT)
+    })
+}
+
+/// Whether the decode GEMV walks its workgroup's output rows in a loop with one
+/// live accumulator instead of unrolling them into registers — see the emission
+/// site. `ORANGU_REDUCE_ROW_LOOP=1`.
+fn row_loop() -> bool {
+    static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *R.get_or_init(|| std::env::var_os("ORANGU_REDUCE_ROW_LOOP").is_some())
+}
+
+/// See [`reduce_block_unroll`]. **1** — measured flat at 2, 4 and 8
+/// (ffn-side 13.41–13.57 ms across all of them), so the plain loop ships.
+/// Unlike the tiled GEMM's staging fill, this loop is not latency-exposed:
+/// decode dispatches one workgroup per output row, thousands of them, and that
+/// hides load latency without any help from unrolling.
+const REDUCE_BLOCK_UNROLL_DEFAULT: usize = 1;
 
 /// Reduction for [`shader_source_reduce_q4k_light`] — sums each row's `acc`
 /// across all 32 lanes (a single 32-lane subgroup, so `subgroupAdd` when
@@ -2873,16 +3534,35 @@ pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
         t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
         _ => return None,
     };
-    let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block();
+    let g = coop_geom();
+    let f16_tiles = coop_f16_tiles();
+    let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block(g, f16_tiles);
+    let run = coop_tiled_run_len(g);
+    // `ORANGU_NO_TILE_DEQUANT_RUN=1` restores the per-element fill this
+    // replaced, so the two can be A/B'd in one build. Same output either way —
+    // it is a knob for measuring the change, not for choosing behaviour.
+    let amortized = std::env::var_os("ORANGU_NO_TILE_DEQUANT_RUN").is_none();
+    let (w_fill, run_fill) = coop_tiled_weight_fill(ggml_type, run, amortized);
     let suffix = MAIN_COOP_TILED_SUFFIX
-        .replace("%TILE_ROWS%", &COOP_TILE_ROWS.to_string())
-        .replace("%TILE_TOKENS%", &COOP_TILE_TOKENS.to_string())
-        .replace("%CHUNK%", &COOP_CHUNK.to_string())
+        .replace("%TILE_T%", if f16_tiles { "f16" } else { "f32" })
+        .replace("%THREADS_Y%", &g.threads_y.to_string())
+        .replace("%THREADS_X%", &g.threads_x.to_string())
+        .replace("%REG_ROWS%", &g.reg_rows.to_string())
+        .replace("%REG_TOKENS%", &g.reg_tokens.to_string())
+        .replace("%THREADS%", &COOP_THREADS.to_string())
+        .replace("%TILE_ROWS%", &g.tile_rows().to_string())
+        .replace("%TILE_TOKENS%", &g.tile_tokens().to_string())
+        .replace("%CHUNK%", &g.chunk.to_string())
+        .replace("%RUN%", &run.to_string())
+        .replace("%W_FILL%", &w_fill)
+        .replace("%RUN_FILL%", &run_fill)
+        .replace("%X_FILL%", &coop_tiled_x_fill(g))
         .replace("%ACC_DECL%", &acc_decl)
         .replace("%INNER%", &inner)
         .replace("%STORE%", &store)
         .replace("%K_UNROLL%", &k_unroll.to_string());
-    Some(format!("{PRELUDE}\n{middle}\n{suffix}"))
+    let enable = if f16_tiles { "enable f16;\n" } else { "" };
+    Some(format!("{enable}{PRELUDE}\n{middle}\n{suffix}"))
 }
 
 /// Shared `Meta` layout for every elementwise/norm shader below: `len` is
@@ -6169,4 +6849,111 @@ pub fn shader_source_argmax_split() -> String {
 
 pub fn shader_source_argmax_reduce() -> String {
     format!("{ELEM_META}\n{ARGMAX_REDUCE_SHADER_BODY}")
+}
+
+#[cfg(test)]
+mod coop_geom_tests {
+    use super::*;
+
+    /// The default has to satisfy its own rules, or every other check here is
+    /// checking a shape nothing uses.
+    #[test]
+    fn the_default_geometry_is_valid() {
+        assert_eq!(COOP_GEOM_DEFAULT.check(), Ok(()));
+        assert_eq!(COOP_GEOM_DEFAULT.tile_rows(), 32);
+        assert_eq!(COOP_GEOM_DEFAULT.tile_tokens(), 64);
+        assert_eq!(COOP_GEOM_DEFAULT.lds_bytes(), 6_144);
+        assert_eq!(COOP_GEOM_DEFAULT.run(), 8);
+    }
+
+    /// The rule that matters most, because breaking it is silent and
+    /// type-specific: `coop_tiled_run_fill` hoists `Q6_K`'s 8-bit scale out of
+    /// the staging run, and `Q6_K` changes that scale every **16** elements
+    /// where `Q4_K`/`Q5_K` change theirs every 32. A geometry giving `run == 32`
+    /// passes a "divides 32" test and dequantizes half of every `Q6_K` run with
+    /// the wrong scale. Two such geometries came out of a real sweep.
+    #[test]
+    fn a_staging_run_wider_than_a_q6_k_scale_group_is_rejected() {
+        for g in [
+            // 64-row tile: run 32.
+            CoopGeom {
+                threads_y: 8,
+                threads_x: 8,
+                reg_rows: 8,
+                reg_tokens: 8,
+                chunk: 32,
+            },
+            // chunk 64: run 32.
+            CoopGeom {
+                threads_y: 8,
+                threads_x: 8,
+                reg_rows: 4,
+                reg_tokens: 8,
+                chunk: 64,
+            },
+        ] {
+            assert_eq!(g.run(), 32, "geometry chosen to give run 32");
+            let err = g.check().expect_err("run 32 must be rejected");
+            assert!(
+                err.contains("16"),
+                "reason should name the 16-element group: {err}"
+            );
+        }
+        // And the ones that do divide 16 are accepted.
+        for chunk in [16u32, 32] {
+            let g = CoopGeom {
+                chunk,
+                ..COOP_GEOM_DEFAULT
+            };
+            assert!(16u32.is_multiple_of(g.run()));
+            assert_eq!(g.check(), Ok(()), "chunk {chunk} should be valid");
+        }
+    }
+
+    /// The register block indexes the staging tiles as `vec4`, so each thread's
+    /// base offset must be 4-aligned — `reg_rows = 2` gives odd threads a
+    /// misaligned read and wrong output on 18 tests.
+    #[test]
+    fn a_register_block_that_breaks_vec4_alignment_is_rejected() {
+        for (ry, rx) in [(2u32, 8u32), (4, 2), (1, 8), (8, 2)] {
+            let g = CoopGeom {
+                reg_rows: ry,
+                reg_tokens: rx,
+                ..COOP_GEOM_DEFAULT
+            };
+            assert!(g.check().is_err(), "reg {ry}x{rx} should be rejected");
+        }
+        assert_eq!(
+            CoopGeom {
+                threads_y: 4,
+                threads_x: 16,
+                reg_rows: 8,
+                reg_tokens: 4,
+                chunk: 32
+            }
+            .check(),
+            Ok(()),
+            "a transposed thread grid with 4-aligned register blocks is fine"
+        );
+    }
+
+    #[test]
+    fn thread_count_and_shared_memory_are_bounded() {
+        assert!(
+            CoopGeom {
+                threads_y: 8,
+                threads_x: 4,
+                ..COOP_GEOM_DEFAULT
+            }
+            .check()
+            .is_err()
+        );
+        // 32 KiB of shared memory is the cap; a big chunk blows it.
+        let huge = CoopGeom {
+            chunk: 256,
+            ..COOP_GEOM_DEFAULT
+        };
+        assert!(huge.lds_bytes() > 32 * 1024);
+        assert!(huge.check().is_err());
+    }
 }

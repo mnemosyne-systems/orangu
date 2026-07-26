@@ -501,28 +501,16 @@ impl Qwen35MoeModel {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let mut attn_out = vec![0f32; n_tokens * n_head * head_dim];
-        for t in 0..n_tokens {
-            let pos = start_pos + t;
-            for h in 0..n_head {
-                let kv_head = h / group_size;
-                let qh = &q[t * n_head * head_dim + h * head_dim
-                    ..t * n_head * head_dim + (h + 1) * head_dim];
-                let mut scores = Vec::with_capacity(pos + 1);
-                for p in 0..=pos {
-                    let kh = layer_cache.key_at(p, kv_head, head_dim);
-                    scores.push(tensor::dot(qh, kh) * scale);
-                }
-                tensor::softmax_inplace(&mut scores);
-                let out = &mut attn_out[t * n_head * head_dim + h * head_dim
-                    ..t * n_head * head_dim + (h + 1) * head_dim];
-                for (p, &weight) in scores.iter().enumerate() {
-                    let vh = layer_cache.value_at(p, kv_head, head_dim);
-                    for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                        *o += weight * vi;
-                    }
-                }
-            }
-        }
+        crate::engine::attention::multi_head_attention(
+            &mut attn_out,
+            &q,
+            layer_cache,
+            n_head,
+            group_size,
+            head_dim,
+            scale,
+            |t| (0, start_pos + t),
+        );
         // Gate the attention output (sigmoid), then project.
         for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
             *o *= tensor::sigmoid(g);

@@ -290,25 +290,6 @@ mod scala_queries {
     "#;
 }
 
-mod haskell_queries {
-    pub const DEFS: &str = r#"
-      (function name: (variable) @name) @fn
-      (bind name: (variable) @name) @fn
-      (data_type name: (name) @name) @type
-      (newtype name: (name) @name) @type
-      (type_synomym name: (name) @name) @type
-      (class name: (name) @name) @class
-    "#;
-
-    pub const CALLS: &str = r#"
-      (apply function: (variable) @callee) @call
-    "#;
-
-    pub const IMPORTS: &str = r#"
-      (import module: (module) @import_path)
-    "#;
-}
-
 mod julia_queries {
     pub const DEFS: &str = r#"
       (function_definition (signature (call_expression (identifier) @name))) @fn
@@ -497,7 +478,6 @@ pub enum SupportedLanguage {
     Ruby,
     Bash,
     Scala,
-    Haskell,
     Julia,
     Lua,
     R,
@@ -526,7 +506,6 @@ impl SupportedLanguage {
             "rb" => Some(Self::Ruby),
             "sh" | "bash" => Some(Self::Bash),
             "scala" | "sc" => Some(Self::Scala),
-            "hs" => Some(Self::Haskell),
             "jl" => Some(Self::Julia),
             "lua" => Some(Self::Lua),
             "r" | "R" => Some(Self::R),
@@ -556,7 +535,6 @@ impl SupportedLanguage {
             Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Scala => tree_sitter_scala::LANGUAGE.into(),
-            Self::Haskell => tree_sitter_haskell::LANGUAGE.into(),
             Self::Julia => tree_sitter_julia::LANGUAGE.into(),
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::R => tree_sitter_r::LANGUAGE.into(),
@@ -585,7 +563,6 @@ impl SupportedLanguage {
             Self::Ruby => ruby_queries::DEFS,
             Self::Bash => bash_queries::DEFS,
             Self::Scala => scala_queries::DEFS,
-            Self::Haskell => haskell_queries::DEFS,
             Self::Julia => julia_queries::DEFS,
             Self::Lua => lua_queries::DEFS,
             Self::R => r_queries::DEFS,
@@ -614,7 +591,6 @@ impl SupportedLanguage {
             Self::Ruby => ruby_queries::CALLS,
             Self::Bash => bash_queries::CALLS,
             Self::Scala => scala_queries::CALLS,
-            Self::Haskell => haskell_queries::CALLS,
             Self::Julia => julia_queries::CALLS,
             Self::Lua => lua_queries::CALLS,
             Self::R => r_queries::CALLS,
@@ -643,7 +619,6 @@ impl SupportedLanguage {
             Self::Ruby => ruby_queries::IMPORTS,
             Self::Bash => bash_queries::IMPORTS,
             Self::Scala => scala_queries::IMPORTS,
-            Self::Haskell => haskell_queries::IMPORTS,
             Self::Julia => julia_queries::IMPORTS,
             Self::Lua => lua_queries::IMPORTS,
             Self::R => r_queries::IMPORTS,
@@ -672,7 +647,6 @@ impl SupportedLanguage {
             Self::Ruby => "ruby",
             Self::Bash => "bash",
             Self::Scala => "scala",
-            Self::Haskell => "haskell",
             Self::Julia => "julia",
             Self::Lua => "lua",
             Self::R => "r",
@@ -914,21 +888,6 @@ const LANGUAGE_BUILTIN_GLOBALS: &[&str] = &[
     "exec",
     // Scala built-ins
     "require",
-    // Haskell built-ins (Prelude)
-    "putStrLn",
-    "putStr",
-    "show",
-    "read",
-    "fmap",
-    "pure",
-    "return",
-    "head",
-    "tail",
-    "null",
-    "foldl",
-    "foldr",
-    "concatMap",
-    "lookup",
     // Julia built-ins
     "typeof",
     // Lua built-ins
@@ -1063,7 +1022,6 @@ pub struct GraphExtractor {
     ruby: LanguageQueries,
     bash: LanguageQueries,
     scala: LanguageQueries,
-    haskell: LanguageQueries,
     julia: LanguageQueries,
     lua: LanguageQueries,
     r: LanguageQueries,
@@ -1092,7 +1050,6 @@ impl GraphExtractor {
             ruby: LanguageQueries::compile(SupportedLanguage::Ruby)?,
             bash: LanguageQueries::compile(SupportedLanguage::Bash)?,
             scala: LanguageQueries::compile(SupportedLanguage::Scala)?,
-            haskell: LanguageQueries::compile(SupportedLanguage::Haskell)?,
             julia: LanguageQueries::compile(SupportedLanguage::Julia)?,
             lua: LanguageQueries::compile(SupportedLanguage::Lua)?,
             r: LanguageQueries::compile(SupportedLanguage::R)?,
@@ -1280,7 +1237,6 @@ impl GraphExtractor {
             SupportedLanguage::Ruby => &self.ruby,
             SupportedLanguage::Bash => &self.bash,
             SupportedLanguage::Scala => &self.scala,
-            SupportedLanguage::Haskell => &self.haskell,
             SupportedLanguage::Julia => &self.julia,
             SupportedLanguage::Lua => &self.lua,
             SupportedLanguage::R => &self.r,
@@ -1334,7 +1290,6 @@ fn enclosing_function_or_method(
         SupportedLanguage::Ruby => &["method", "singleton_method"],
         SupportedLanguage::Bash => &["function_definition"],
         SupportedLanguage::Scala => &["function_definition"],
-        SupportedLanguage::Haskell => &["function", "bind"],
         SupportedLanguage::Julia => &["function_definition"],
         SupportedLanguage::Lua => &["function_declaration"],
         SupportedLanguage::R => &["function_definition"],
@@ -1358,7 +1313,6 @@ fn enclosing_function_or_method(
         | SupportedLanguage::Ruby
         | SupportedLanguage::Bash
         | SupportedLanguage::Scala
-        | SupportedLanguage::Haskell
         | SupportedLanguage::Julia
         | SupportedLanguage::Lua
         | SupportedLanguage::R
@@ -1829,45 +1783,6 @@ class Cache {
         let ex = extractor();
         let (_, edges) = ex
             .extract_from_file(&PathBuf::from("a.scala"), "a.scala", SCALA_SAMPLE)
-            .unwrap();
-        assert!(
-            edges.iter().any(|e| e.relation == "imports"),
-            "no import edge"
-        );
-    }
-
-    const HASKELL_SAMPLE: &str = r#"
-module MyModule where
-
-import Data.Map
-
-data Color = Red | Green | Blue
-
-get :: String -> Maybe String
-get key = lookup key []
-
-process :: String -> String
-process = id
-"#;
-
-    #[test]
-    fn haskell_extracts_types_and_functions() {
-        let ex = extractor();
-        let (nodes, _) = ex
-            .extract_from_file(&PathBuf::from("a.hs"), "a.hs", HASKELL_SAMPLE)
-            .unwrap();
-        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-        assert!(
-            kinds.contains(&"type") || kinds.contains(&"fn"),
-            "{kinds:?}"
-        );
-    }
-
-    #[test]
-    fn haskell_extracts_import_edges() {
-        let ex = extractor();
-        let (_, edges) = ex
-            .extract_from_file(&PathBuf::from("a.hs"), "a.hs", HASKELL_SAMPLE)
             .unwrap();
         assert!(
             edges.iter().any(|e| e.relation == "imports"),

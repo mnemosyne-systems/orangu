@@ -266,31 +266,17 @@ impl LlamaModel {
             // start_pos+t) attends to every cached position up to and
             // including its own.
             let mut attn_out = vec![0f32; n_tokens * n_head * head_dim];
-            for t in 0..n_tokens {
-                let pos = start_pos + t;
-                for h in 0..n_head {
-                    let kv_head = h / group_size;
-                    let qh = &q[t * n_head * head_dim + h * head_dim
-                        ..t * n_head * head_dim + (h + 1) * head_dim];
-
-                    let mut scores = Vec::with_capacity(pos + 1);
-                    let scale = 1.0 / (head_dim as f32).sqrt();
-                    for p in 0..=pos {
-                        let kh = layer_cache.key_at(p, kv_head, head_dim);
-                        scores.push(tensor::dot(qh, kh) * scale);
-                    }
-                    tensor::softmax_inplace(&mut scores);
-
-                    let out = &mut attn_out[t * n_head * head_dim + h * head_dim
-                        ..t * n_head * head_dim + (h + 1) * head_dim];
-                    for (p, &weight) in scores.iter().enumerate() {
-                        let vh = layer_cache.value_at(p, kv_head, head_dim);
-                        for (o, vi) in out.iter_mut().zip(vh.iter()) {
-                            *o += weight * vi;
-                        }
-                    }
-                }
-            }
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            crate::engine::attention::multi_head_attention(
+                &mut attn_out,
+                &q,
+                layer_cache,
+                n_head,
+                group_size,
+                head_dim,
+                scale,
+                |t| (0, start_pos + t),
+            );
 
             let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
             tensor::add_inplace(&mut x, &attn_proj);

@@ -136,6 +136,10 @@ Options:
       --timeout <TIMEOUT>  Per-request timeout in seconds [default: 600]
       --model <MODEL>      Model id to request
       --json               Emit machine-readable JSON
+      --history <HISTORY>  Append each measured point to this tab-separated history file
+      --label <LABEL>      Series name recorded in the history file
+      --chart <CHART>      Render the history file to this SVG after measuring
+      --chart-only         Only render the chart from an existing history file; measure nothing
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -145,6 +149,79 @@ Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
 best (fastest) run with mean ± standard deviation alongside; warmup (one short
 generation) is on unless `--no-warmup`; `--json` emits one JSON object per depth
 instead of the table.
+
+### Tracking throughput over time (`--history`, `--chart`)
+
+A rate on its own says nothing. The two things it needs to be read against —
+*the other engine* and *last month's build* — are both outside any single
+invocation, so `--history` appends each measured point to a tab-separated file
+that accumulates across runs, and `--chart` draws the chart from **that file**
+rather than from the run that produced it. A run measuring only orangu still
+redraws llama.cpp's line beside it.
+
+```sh
+# orangu, recorded as its own series
+orangu-bench --url http://127.0.0.1:8100 --label "orangu $(git rev-parse --short HEAD)" \
+             --pp 128,512,1024,2048 --history perf-history.tsv --chart perf-history.svg
+
+# the reference, same harness, same file
+orangu-bench --url http://127.0.0.1:8300 --label "llama.cpp b10104" \
+             --depths 0,512,1024,2048 --history perf-history.tsv --chart perf-history.svg
+
+# redraw after hand-editing the file — no server needed
+orangu-bench --chart-only --history perf-history.tsv --chart perf-history.svg
+```
+
+The file is plain TSV with a `#` header, so it diffs in review and is
+hand-editable; blank lines, comments and unparseable rows are skipped rather
+than fatal. Each row is `date`, `label`, `mode` (`pp` or `tg`), `n`, and the
+best / mean / sd of the run's repetitions:
+
+```text
+#date	label	mode	n	best	mean	sd
+2026-07-25	orangu af7c767	pp	1120	81.75	81.40	0.26
+2026-07-25	llama.cpp b10104	pp	1120	1061.66	1049.40	8.84
+```
+
+Nothing is ever rewritten — a row is a measurement that was taken, and a later
+run that disagrees is another row, not a correction.
+
+`--label` is the series identity, so it must stay stable across runs for a line
+to be drawn; it defaults to the server's model id, which distinguishes two
+models but *not* two builds of orangu, so pass it explicitly when A/B-ing
+builds. Prompt-processing rows are keyed by the token count the server actually
+reported rather than the requested length, and a row without server timings is
+printed but not recorded — a time-to-first-token is a different measurement and
+does not belong on the same line as a prefill rate.
+
+The chart is a standalone SVG with no external references: **two charts** —
+prompt processing and token generation — each plotting **tokens/second against
+context length**, with one line per engine.
+
+Two charts rather than a grid of small multiples because the question the file
+is kept to answer is how throughput behaves *as context grows*: whether a curve
+is flat or falling away, and how far apart two engines stay along it. That is a
+shape, and a shape needs the workload on an axis rather than spread across
+facets. Prefill and decode stay separate because they are different
+measurements that happen to share a unit — putting them in one frame would
+need a second y-axis, which makes unrelated quantities look comparable.
+
+The y-axis is **logarithmic**. The engines on it differ by an order of
+magnitude, so on a linear axis the slower one collapses onto the baseline and
+its own shape — the thing being tracked — becomes unreadable. On a log axis a
+constant ratio is a constant vertical distance, which is how "N× behind" should
+read; the bounds are `1/2/5 × 10^k` so every gridline is a round number.
+
+Only the **newest measurement date** in the file is drawn, and the subtitle says
+which — `showing 2026-07-26 (18 of 50 rows)`. The file keeps every run; that is
+what it is for. But a chart of "how does throughput behave as context grows" is
+answered by the build that exists, and overlaying superseded runs on top of it
+only crowds the lines it is being read for. To look at history, read the file,
+or point `--chart` at a filtered copy of it. Repeated measurements of one series
+at one context on one date collapse to their best, for the same reason a single
+run reports its best repetition. Series colours are assigned in first-seen order and never
+recycled; past the last slot a label is dropped from the chart rather than
+given a colour another series already owns.
 
 ### Curve mode (`--curve`) — decode scaling without prefill
 

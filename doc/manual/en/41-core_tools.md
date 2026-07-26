@@ -1026,16 +1026,28 @@ A file is analysed when its extension matches one of the built-in languages:
 |---|---|---|---|
 | Rust | `.rs` | Scala | `.scala`, `.sc` |
 | C | `.c`, `.h` | OCaml | `.ml`, `.mli` |
-| C++ | `.cc`, `.cpp`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx` | Haskell | `.hs` |
-| C# | `.cs` | Julia | `.jl` |
-| Go | `.go` | Lua | `.lua` |
-| Java | `.java` | R | `.r` |
-| Python | `.py`, `.pyi` | Zig | `.zig` |
-| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | Swift | `.swift` |
-| TypeScript | `.ts`, `.mts`, `.cts` | Dart | `.dart` |
-| TSX | `.tsx` | Erlang | `.erl`, `.hrl` |
-| Ruby | `.rb` | PHP | `.php` |
+| C++ | `.cc`, `.cpp`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx` | Julia | `.jl` |
+| C# | `.cs` | Lua | `.lua` |
+| Go | `.go` | R | `.r` |
+| Java | `.java` | Zig | `.zig` |
+| Python | `.py`, `.pyi` | Swift | `.swift` |
+| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | Dart | `.dart` |
+| TypeScript | `.ts`, `.mts`, `.cts` | Erlang | `.erl`, `.hrl` |
+| TSX | `.tsx` | PHP | `.php` |
+| Ruby | `.rb` | | |
 | Bash | `.sh`, `.bash` | | |
+
+> **Haskell is not in this list.** It was, until
+> `tree-sitter-haskell`'s external scanner was found to write past a
+> heap buffer on every parse (valgrind: `Invalid write of size 4` in
+> `tree_sitter_haskell_external_scanner_scan`, reached from
+> `ts_parser_parse`). That is undefined behaviour in any process that
+> opens a `.hs` file, and it surfaced as a heap-corruption abort in an
+> unrelated allocation later on. Upstream's last release is v0.23.1
+> (November 2024) and its scanner has not been touched since September
+> 2024, so there is no version to move to. The grammar was removed
+> rather than shipped. Every other grammar is valgrind-clean over the
+> same suite.
 
 Functions are only ever compared **within the same language**, never across two — even where two languages share a file family (a `.ts` is never compared against a `.tsx`, nor a `.c` against a `.cpp`). Each language is a self-contained entry in orangu's grammar registry, so support for a new one is a small, isolated addition.
 
