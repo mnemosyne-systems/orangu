@@ -577,4 +577,17 @@ mod tests {
             assert!(report.contains("Suggested model size (Combined)"));
         }
     }
+
+    /// On a machine with no GPU at all, `format_report` leaves the GPU
+    /// section out entirely — the suggestion block that follows still starts
+    /// with its own blank line, so the report doesn't run together.
+    #[test]
+    fn format_suggestion_has_no_gpu_section_without_a_gpu() {
+        let report = format_suggestion(&cpu(64 * GIB), &[]);
+        assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
+        assert!(
+            report.contains("\n\nSuggested model size (Combined)\n"),
+            "report:\n{report}"
+        );
+    }
 }

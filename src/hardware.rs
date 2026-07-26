@@ -645,10 +645,14 @@ pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
         yes_no(cpu.features.avx512f)
     ));
 
-    out.push_str("\nGPU\n");
+    // No GPU at all means no GPU section: a heading over a single "none
+    // found" line is two lines of report saying nothing the reader can act
+    // on, and it's the CPU inventory above that matters on such a machine.
     if gpus.is_empty() {
-        out.push_str("  No GPU detected\n");
+        return out;
     }
+
+    out.push_str("\nGPU\n");
     for (index, gpu) in gpus.iter().enumerate() {
         if index > 0 {
             out.push('\n');
@@ -704,6 +708,54 @@ mod tests {
             driver: None,
             memory_kind,
         }
+    }
+
+    fn cpu() -> CpuInfo {
+        CpuInfo {
+            brand: "Test CPU".to_string(),
+            vendor: "TestVendor".to_string(),
+            arch: "x86_64".to_string(),
+            physical_cores: Some(8),
+            logical_cores: 16,
+            frequency_mhz: 4200,
+            total_memory_bytes: 64 * 1024 * 1024 * 1024,
+            available_memory_bytes: 32 * 1024 * 1024 * 1024,
+            features: CpuFeatures {
+                sse4_2: true,
+                avx2: true,
+                avx512f: false,
+            },
+        }
+    }
+
+    /// A machine with no GPU gets no GPU section at all — not a heading over
+    /// a "none found" line. The CPU inventory is the whole report there, so
+    /// it also ends without a trailing blank line.
+    #[test]
+    fn the_gpu_section_is_omitted_when_no_gpu_was_detected() {
+        let report = format_report(&cpu(), &[]);
+        assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
+        assert!(report.starts_with("CPU\n"), "report:\n{report}");
+        assert!(
+            report.ends_with("AVX512           : No\n"),
+            "report:\n{report}"
+        );
+    }
+
+    /// The section is still there — heading, blank line before it, and one
+    /// indexed block per device — as soon as there's a device to report.
+    #[test]
+    fn the_gpu_section_is_kept_when_a_gpu_was_detected() {
+        let report = format_report(
+            &cpu(),
+            &[gpu(MemoryKind::Dedicated, Some(4 * 1024 * 1024 * 1024))],
+        );
+        assert!(report.contains("\nGPU\n"), "report:\n{report}");
+        assert!(report.contains("[0] Test GPU"), "report:\n{report}");
+        assert!(
+            report.contains("VRAM total   : 4.00 GiB"),
+            "report:\n{report}"
+        );
     }
 
     #[test]

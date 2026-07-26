@@ -343,7 +343,6 @@ struct Prepared {
     /// process to `/`), so a relative value still means what it meant in the
     /// launching shell.
     workspace: PathBuf,
-    conf: ServerConfiguration,
     api_listener: std::net::TcpListener,
     web_listener: Option<std::net::TcpListener>,
     daemon: bool,
@@ -496,7 +495,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         role,
     });
 
-    let api_addr = format!("{}:{}", conf.host, conf.port);
+    // `all` (the default) and its `*` alias become `0.0.0.0` here — see
+    // `config::resolve_bind_host`; every other value is a literal address
+    // `bind` gets as written.
+    let bind_host = config::resolve_bind_host(&conf.host);
+    let api_addr = format!("{bind_host}:{}", conf.port);
     let api_listener = std::net::TcpListener::bind(&api_addr)
         .with_context(|| format!("failed to bind {api_addr}"))?;
     api_listener
@@ -504,7 +507,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         .with_context(|| format!("failed to configure listener on {api_addr}"))?;
 
     let web_listener = if conf.web != 0 {
-        let web_addr = format!("{}:{}", conf.host, conf.web);
+        let web_addr = format!("{bind_host}:{}", conf.web);
         let listener = std::net::TcpListener::bind(&web_addr)
             .with_context(|| format!("failed to bind web UI to {web_addr}"))?;
         listener
@@ -525,7 +528,6 @@ fn prepare(args: Args) -> Result<Prepared> {
         architecture,
         backend_label,
         workspace,
-        conf,
         api_listener,
         web_listener,
         daemon: args.daemon,
@@ -578,7 +580,6 @@ async fn serve(prepared: Prepared) -> Result<()> {
         architecture,
         backend_label,
         workspace,
-        conf,
         api_listener,
         web_listener,
         daemon,
@@ -621,7 +622,9 @@ async fn serve(prepared: Prepared) -> Result<()> {
             Some(l) => println!("UI         http://{}", l.local_addr()?),
             None => println!("UI         disabled"),
         }
-        println!("API        http://{}:{}", conf.host, conf.port);
+        // The bound address, not the configured `host`: `all` says nothing
+        // about where to point a client, `0.0.0.0:8100` does.
+        println!("API        http://{}", listener.local_addr()?);
         println!("Workspace  {}", workspace.display());
         for advisory in orangu::hardware::performance_advisories() {
             println!("Note       {advisory}");
@@ -982,6 +985,10 @@ fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {
 /// gives for any other unsupported model) and prompts for an `NR`, for
 /// `orangu-server` invoked with no model argument. Returns the chosen
 /// model's file path and its display label.
+///
+/// A directory holding exactly one model ([`init::sole_model`], shared with
+/// the `--init` wizard's own `model` prompt) skips the `NR` prompt entirely
+/// and goes straight on to the caller's role prompt.
 fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
@@ -1003,6 +1010,15 @@ fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
             std::io::stdout().is_terminal(),
         )
     );
+
+    // A single listed model is not a choice — take it and move straight on
+    // to the role prompt, rather than asking for the only NR on offer. The
+    // table above is still printed: it's what names the model being taken,
+    // and whether this build supports it at all.
+    if let Some(only) = init::sole_model(&groups) {
+        println!("\nUsing the only model listed: {}", only.label);
+        return Ok((only.representative_path.clone(), only.label.clone()));
+    }
 
     print!("\nSelect a model (NR): ");
     std::io::stdout().flush().ok();

@@ -108,6 +108,7 @@ cubecl-hip-sys = { version = "7", optional = true }
 ratatui = "0.30.2"
 ansi-to-tui = "8.0.1"
 unicode-width = "0.2.2"
+if-addrs = "0.15.0"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]

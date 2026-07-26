@@ -57,6 +57,19 @@ Select a model (NR): 2
 role [all]: 
 ```
 
+When the directory holds exactly one model there is nothing to choose
+between, so the `NR` prompt is skipped — the table is still printed (it
+names the model and whether this build supports it), and the run goes
+straight on to the role prompt:
+
+```
+NR  MODEL                                   QUANT  SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+
+Using the only model listed: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+role [all]: 
+```
+
 On startup, `orangu-server` prints the same CPU/GPU report `system` does
 (so a startup log alone is enough to see what hardware the process actually
 has to work with), followed by the model/UI/API/workspace summary:
@@ -72,7 +85,7 @@ GPU
 
 Model      unsloth/gemma-4-E2B-it-GGUF (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
-API        http://127.0.0.1:8100
+API        http://0.0.0.0:8100
 Workspace  /home/user/src/orangu
 ```
 
@@ -180,7 +193,9 @@ frequency, total/available system RAM) come from [`sysinfo`](https://docs.rs/sys
 
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources and reports whatever they find — a card no source
-recognizes simply doesn't show up:
+recognizes simply doesn't show up, and a machine where none of them finds
+anything gets no `GPU` section at all (the CPU inventory is the whole
+report) rather than a heading over a "none detected" line:
 
 - **NVIDIA** (Linux and Windows): `nvidia-smi`'s CSV query mode, installed
   alongside any NVIDIA driver. Always reported as `Dedicated` — no consumer
@@ -478,7 +493,7 @@ removed from them are cleaned up too — never anything above the configured
 [orangu-server]
 models = ~/models
 model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
-host = 127.0.0.1
+host = all
 port = 8100
 slots = 1
 web = 8101
@@ -499,8 +514,21 @@ role = all
   or prompts interactively if none is given, exactly as before; `model`
   in the config is otherwise ignored. `-i`/`--init` prompts for it with
   TAB-completion over the models already installed under `models` — every
-  `NR` and every `MODEL` label, in the same order `list` prints them.
-- `host`/`port` — the bind address, printed on startup.
+  `NR` and every `MODEL` label, in the same order `list` prints them. The
+  labels also drive an inline grey ghost suggestion: the prompt opens
+  already previewing the first model listed, and narrows to whatever the
+  typed prefix matches (an `NR` is completed but never ghosted — it's a
+  shorthand to type, not a name to preview). A
+  `models` directory holding exactly one model is not asked about at all:
+  that model is taken (and echoed), since there is nothing to choose
+  between.
+- `host`/`port` — the bind address, printed on startup. `host` defaults to
+  `all` (`*` is accepted as an alias for it), which binds every network
+  interface on the machine — the API and the web UI are then reachable from
+  anywhere that can route to it, not just from this machine. Give a literal
+  address instead to narrow that down: `127.0.0.1` keeps the server on the
+  loopback interface only, and any other address of a local interface binds
+  just that one.
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
@@ -535,9 +563,13 @@ same as a shell would; defaults to Hugging Face's own cache location —
 `~/.cache/huggingface/hub` on Linux/macOS,
 `%USERPROFILE%\.cache\huggingface\hub` on Windows, the same directory
 llama.cpp's own `-hf` falls back to — so pressing Enter without typing
-anything points `orangu-server` at whatever's likely already there), then
+anything points `orangu-server` at whatever's likely already there, and a
+directory that doesn't exist yet is created, parents included), then
 `model` and `role` (TAB-completing the five valid names, defaulting to
-`all`), then `host`/`port`/`web`, shows the resulting file, and asks for
+`all`), then `host` (TAB-completing — and previewing as an inline grey
+ghost — `all`, `*`, and every address this machine's network interfaces
+actually have, each listed with the interface it belongs to), then
+`port`/`web`, shows the resulting file, and asks for
 confirmation before writing (creating the directory if needed, and
 overwriting any existing file). Only writes the `role =` line when a
 non-default value was chosen.

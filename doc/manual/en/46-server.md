@@ -59,6 +59,19 @@ Select a model (NR): 2
 role [all]: 
 ```
 
+When the directory holds exactly one model there is nothing to choose
+between, so the `NR` prompt is skipped — the table is still printed (it
+names the model and whether this build supports it), and the run goes
+straight on to the role prompt:
+
+```
+NR  MODEL                                   QUANT  SIZE        SUPPORTED
+ 1  Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M  Q5_0   468.64 MiB  Yes (qwen2)
+
+Using the only model listed: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+role [all]: 
+```
+
 On startup, `orangu-server` prints the same CPU/GPU report `system` does,
 followed by the model/UI/API/workspace summary:
 
@@ -73,7 +86,7 @@ GPU
 
 Model      unsloth/gemma-4-E2B-it-GGUF (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
-API        http://127.0.0.1:8100
+API        http://0.0.0.0:8100
 Workspace  /home/user/src/orangu
 ```
 
@@ -153,7 +166,9 @@ GPU detection has no single cross-platform API, so it layers several
 best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
 `/sys/class/drm` for everything else on Linux (AMD, Intel, and any other
 PCI display device), and native OS tools (`system_profiler`/PowerShell's
-`Win32_VideoController`) on macOS and Windows. `Memory type` tells apart a
+`Win32_VideoController`) on macOS and Windows. A machine where none of
+them finds anything gets no `GPU` section at all — the CPU inventory is the
+whole report — rather than a heading over a "none detected" line. `Memory type` tells apart a
 genuine dedicated card from an integrated GPU/APU sharing the CPU's system
 RAM — a `Shared` GPU's `VRAM total` is always reported as the machine's
 total system RAM regardless of what its own platform query said, since
@@ -269,7 +284,7 @@ anything above the configured `models` directory itself.
 [orangu-server]
 models = ~/models
 model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
-host = 127.0.0.1
+host = all
 port = 8100
 slots = 1
 web = 8101
@@ -289,8 +304,20 @@ role = all
   normal, attached-terminal run still takes its model from the CLI argument,
   or prompts interactively if none is given, exactly as before; `model`
   in the config is otherwise ignored. `-i`/`--init` prompts for it with
-  TAB-completion over the models already installed under `models`.
-- `host`/`port` — the bind address, printed on startup.
+  TAB-completion over the models already installed under `models`, and an
+  inline grey ghost suggestion that opens on the first of them and narrows
+  as you type — unless exactly one is installed there, which is taken
+  without asking.
+- `host`/`port` — the bind address, printed on startup. `host` defaults to
+  `all` (`*` is accepted as an alias for it), which binds every network
+  interface on the machine — the API and the web UI are then reachable from
+  anywhere that can route to it, not just from this machine. Give a literal
+  address instead to narrow that down: `127.0.0.1` keeps the server on the
+  loopback interface only, and any other address of a local interface binds
+  just that one. `-i`/`--init` prompts for it with TAB-completion (and an
+  inline grey ghost suggestion) over `all`, `*`, and every address this
+  machine's interfaces actually have, each shown with the interface it
+  belongs to.
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
@@ -318,7 +345,8 @@ order every subcommand above resolves it in too, not just serving.
 `-i`/`--init` writes `~/.orangu/orangu-server.conf` interactively — it also
 prompts for `role` (TAB-completing over the five valid names, defaulting to
 `all`), right after `model`, and only writes the `role =` line when a
-non-default value was chosen. `-d`/`--daemon` detaches
+non-default value was chosen. A `models` directory that doesn't exist yet is
+created, parents included, rather than refused. `-d`/`--daemon` detaches
 from the terminal and runs in the background (Unix-only) — it requires
 `model` to be set in the config, since there's no attached terminal left to
 pass a CLI argument to or prompt on; the config and model are resolved, and

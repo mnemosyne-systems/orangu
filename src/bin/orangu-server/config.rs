@@ -22,8 +22,30 @@ use std::path::{Path, PathBuf};
 
 pub const SERVER_SECTION: &str = "orangu-server";
 
+/// The `host` value meaning "every network interface on this machine" —
+/// the default, and what `--init`'s `host` prompt offers first. `*` is
+/// accepted as an alias for it, since that is the spelling most other
+/// server config files use for the same idea.
+pub const HOST_ALL: &str = "all";
+pub const HOST_ALL_ALIAS: &str = "*";
+
 pub fn default_host() -> String {
-    "127.0.0.1".to_string()
+    HOST_ALL.to_string()
+}
+
+/// Turns a configured `host` into an address [`std::net::TcpListener::bind`]
+/// actually understands: [`HOST_ALL`] (and its `*` alias) become the IPv4
+/// wildcard `0.0.0.0`, so the listener answers on every interface rather
+/// than only the loopback one; anything else — a literal interface address
+/// such as `127.0.0.1` or `192.168.1.10` — is passed through untouched and
+/// left for `bind` itself to reject if it isn't one of this machine's.
+pub fn resolve_bind_host(host: &str) -> &str {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case(HOST_ALL) || host == HOST_ALL_ALIAS {
+        "0.0.0.0"
+    } else {
+        host
+    }
 }
 
 pub fn default_port() -> u16 {
@@ -331,7 +353,7 @@ mod tests {
 
         let conf = load_server_configuration(file.path(), None, false).unwrap();
         assert_eq!(conf.models, PathBuf::from("/srv/models"));
-        assert_eq!(conf.host, "127.0.0.1");
+        assert_eq!(conf.host, "all");
         assert_eq!(conf.port, 8100);
         // orangu is local/single-user: generation defaults to one slot.
         assert_eq!(conf.slots, 1);
@@ -411,6 +433,19 @@ mod tests {
         assert_eq!(conf.port, 9090);
         assert_eq!(conf.slots, 4);
         assert_eq!(conf.web, 8081);
+    }
+
+    /// `all`/`*` are the only two values rewritten before binding — spelled
+    /// any way, since the config file is hand-edited — and a real address is
+    /// handed to `bind` exactly as written.
+    #[test]
+    fn resolves_only_the_all_host_to_the_wildcard_address() {
+        for value in ["all", "ALL", " All ", "*", " * "] {
+            assert_eq!(resolve_bind_host(value), "0.0.0.0", "host = {value}");
+        }
+        for value in ["127.0.0.1", "0.0.0.0", "192.168.1.10", "::1"] {
+            assert_eq!(resolve_bind_host(value), value, "host = {value}");
+        }
     }
 
     #[test]
