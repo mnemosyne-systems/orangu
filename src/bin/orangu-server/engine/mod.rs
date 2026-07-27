@@ -27,3 +27,4 @@ pub mod scheduler;
 pub mod slot_store;
 pub mod tensor;
 pub mod tokenizer;
+pub mod vecdot;
