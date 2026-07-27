@@ -11871,7 +11871,7 @@ impl VulkanBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 impl VulkanBackend {
     /// Test-only: build a layer's cached pre-attention resources so the replay
     /// cross-checks can enumerate the exact buffers the `attn_norm` dispatch
@@ -11944,7 +11944,7 @@ impl VulkanBackend {
 
 /// The buffers backing one layer's `attn_norm` dispatch, handed to the
 /// raw-Vulkan replay cross-check. Test-only.
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 pub(crate) struct AttnNormCaptureBuffers {
     pub n_embd_bytes: u64,
     pub x_buf: wgpu::Buffer,
@@ -11959,7 +11959,7 @@ pub(crate) struct AttnNormCaptureBuffers {
 /// the replay cross-check. Test-only. The weight comes from
 /// [`VulkanBackend::test_weight_buffer`]; the `Meta` uniform the replay rebuilds
 /// host-side (its values are all known constants).
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 pub(crate) struct OpCaptureBuffers {
     pub x_buffer: wgpu::Buffer,
     pub x_offset: u64,

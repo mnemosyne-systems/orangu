@@ -23,7 +23,10 @@
 //! registered, so [`OpenClBackend::try_init`] finds zero platforms here and
 //! gracefully returns `None`, the same as every other machine with no
 //! OpenCL device — this module's cross-check tests skip in exactly that
-//! case, per the same convention `vulkan.rs`/`cuda.rs` use.
+//! case, per the same convention `vulkan.rs`/`cuda.rs` use. Apple targets
+//! are the one exception: their OpenCL ICD does report a device, but
+//! segfaults on the first real matmul call, so `try_init` refuses to
+//! initialize there at all rather than crash.
 //!
 //! **Always compiled in**, like `cudarc`/`wgpu` — no Cargo feature needed.
 //! The `opencl3` version resolved here defaults to its `dynamic` feature
@@ -457,6 +460,12 @@ impl OpenClBackend {
     /// otherwise fails — callers fall back to `CpuBackend`, the same
     /// contract `VulkanBackend`/`CudaBackend::try_init` have.
     pub fn try_init() -> Option<Self> {
+        // Apple's own OpenCL ICD reports a device but segfaults inside
+        // clSetKernelArg on the first real matmul call (confirmed on Apple
+        // Silicon). Refuse to initialize there rather than crash.
+        if cfg!(target_vendor = "apple") {
+            return None;
+        }
         let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU).ok()?.first()?;
         let device = Device::new(device_id);
         let device_name = device.name().unwrap_or_else(|_| "OpenCL".to_string());
