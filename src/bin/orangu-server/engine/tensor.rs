@@ -773,10 +773,6 @@ mod tests {
         );
     }
 
-    /// Both layouts are pure rotations of *some* pair, so each leaves the
-    /// summed squared magnitude of the rotated block unchanged. Guards
-    /// against an indexing slip that drops or double-writes an element.
-    #[test]
     /// `freq_factors` **divides** the frequency, so an entry of 32 rotates
     /// that pair 32x slower. This is the whole mechanism behind a
     /// Llama-3.1/3.2 checkpoint's `rope_freqs.weight`, and dropping it is not
@@ -823,6 +819,9 @@ mod tests {
         }
     }
 
+    /// Both layouts are pure rotations of *some* pair, so each leaves the
+    /// summed squared magnitude of the rotated block unchanged. Guards
+    /// against an indexing slip that drops or double-writes an element.
     #[test]
     fn rope_layouts_preserve_total_energy() {
         for layout in [RopeLayout::Neox, RopeLayout::Norm] {

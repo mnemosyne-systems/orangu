@@ -1303,7 +1303,11 @@ impl GemmaModel {
                 // experts and sums them (`moe_ffn_result`). Either way the shared
                 // `ffn_post_norm` and the residual add follow.
                 if let Some(moe) = &layer.moe {
-                    let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens);
+                    // `false`: this is `forward`'s own path, where a single
+                    // sequence's `n_tokens` is its prompt length — nothing to
+                    // stay bit-identical to. (At `n_tokens == 1` the backend
+                    // takes the GEMV kernel anyway.)
+                    let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens, false);
                     tensor::rmsnorm_inplace(
                         &mut ffn_out,
                         &layer.ffn_post_norm,
@@ -2318,7 +2322,7 @@ impl ModelForward for GemmaModel {
                     w: layer.wv.as_ref().unwrap(),
                 });
             }
-            let mut results = self.backend.matmul_batch(&ops).into_iter();
+            let mut results = self.backend.matmul_batch_decode(&ops).into_iter();
             let mut q = results.next().unwrap();
             tensor::rmsnorm_inplace(&mut q, &layer.attn_q_norm, n * self.n_head, head_dim, eps);
             // RoPE stays per-sequence: each sequence has its own position.
@@ -2409,7 +2413,7 @@ impl ModelForward for GemmaModel {
                 }
             }
 
-            let mut attn_proj = self.backend.matmul(&attn_out, n, &layer.wo);
+            let mut attn_proj = self.backend.matmul_decode(&attn_out, n, &layer.wo);
             tensor::rmsnorm_inplace(&mut attn_proj, &layer.attn_post_norm, n, n_embd, eps);
             tensor::add_inplace(&mut x, &attn_proj);
 
@@ -2417,14 +2421,14 @@ impl ModelForward for GemmaModel {
             // across the `n` sequences instead of a prompt's positions. `x`
             // is the post-attention residual at this point.
             if let Some(moe) = &layer.moe {
-                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n);
+                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n, true);
                 tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
                 tensor::add_inplace(&mut x, &ffn_out);
             } else {
                 let attn_out_residual = x.clone();
                 let mut ffn_normed = x.clone();
                 tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n, n_embd, eps);
-                let mut gate_up = self.backend.matmul_batch(&[
+                let mut gate_up = self.backend.matmul_batch_decode(&[
                     MatmulOp {
                         x: &ffn_normed,
                         n_tokens: n,
@@ -2440,7 +2444,7 @@ impl ModelForward for GemmaModel {
                 let mut gate = gate_up.pop().unwrap();
                 tensor::gelu_inplace(&mut gate);
                 tensor::mul_inplace(&mut gate, &up);
-                let mut ffn_out = self.backend.matmul(&gate, n, &layer.ffn_down);
+                let mut ffn_out = self.backend.matmul_decode(&gate, n, &layer.ffn_down);
                 tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
                 x = attn_out_residual;
                 tensor::add_inplace(&mut x, &ffn_out);
@@ -2452,13 +2456,13 @@ impl ModelForward for GemmaModel {
                 &layer.per_layer_post_norm,
             ) {
                 let pe_in = x.clone();
-                let mut g = self.backend.matmul(&x, n, gate_w);
+                let mut g = self.backend.matmul_decode(&x, n, gate_w);
                 tensor::gelu_inplace(&mut g);
                 for (i, per_layer_input) in inp_per_layer.iter().enumerate() {
                     let slice = &per_layer_input[il * per_layer..(il + 1) * per_layer];
                     tensor::mul_inplace(&mut g[i * per_layer..(i + 1) * per_layer], slice);
                 }
-                let mut proj = self.backend.matmul(&g, n, proj_w);
+                let mut proj = self.backend.matmul_decode(&g, n, proj_w);
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n, n_embd, eps);
                 x = pe_in;
                 tensor::add_inplace(&mut x, &proj);
@@ -2472,7 +2476,7 @@ impl ModelForward for GemmaModel {
         }
 
         tensor::rmsnorm_inplace(&mut x, &self.output_norm, n, n_embd, eps);
-        let mut logits = self.backend.matmul(&x, n, &self.output_weight);
+        let mut logits = self.backend.matmul_decode(&x, n, &self.output_weight);
         if let Some(cap) = self.final_logit_softcapping {
             for v in logits.iter_mut() {
                 *v = (*v / cap).tanh() * cap;
@@ -2615,7 +2619,17 @@ impl GemmaModel {
     /// scaled by `1/sqrt(n_embd)` and multiplied elementwise by the learned
     /// per-dim `ffn_gate_inp.scale`, then projected through the router
     /// (`ffn_gate_inp`).
-    fn moe_router_logits(&self, moe: &GemmaMoe, attn_out: &[f32], n_tokens: usize) -> Vec<f32> {
+    ///
+    /// `decode` picks the backend entry point: a decode batch's rows are one
+    /// per sequence and must not shift with the batch around them, so it
+    /// takes [`Backend::matmul_decode`] — see that method's doc comment.
+    fn moe_router_logits(
+        &self,
+        moe: &GemmaMoe,
+        attn_out: &[f32],
+        n_tokens: usize,
+        decode: bool,
+    ) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let scale = 1.0 / (n_embd as f32).sqrt();
@@ -2628,7 +2642,11 @@ impl GemmaModel {
             }
         }
         // `[n_tokens, n_expert]` — one router score per expert per token.
-        self.backend.matmul(&tmp, n_tokens, &moe.gate_inp)
+        if decode {
+            self.backend.matmul_decode(&tmp, n_tokens, &moe.gate_inp)
+        } else {
+            self.backend.matmul(&tmp, n_tokens, &moe.gate_inp)
+        }
     }
 
     /// A MoE gemma4 layer's FFN contribution *before* the shared
@@ -2646,12 +2664,19 @@ impl GemmaModel {
     ///   `post_ffw_norm_2`. The routing weights come from
     ///   [`Self::moe_router_logits`] (which reads `attn_out`, not this
     ///   branch's `pre_ffw_norm_2`-normed input).
+    ///
+    /// `decode` is threaded down to the two backend calls the shared MLP
+    /// branch makes, for the reason [`Backend::matmul_decode`] documents.
+    /// The routed-expert branch below takes every `(token, expert)` pair as
+    /// its own `tensor::dot` already, so it is `n_tokens`-independent by
+    /// construction and needs no flag.
     fn moe_ffn_result(
         &self,
         layer: &GemmaLayer,
         moe: &GemmaMoe,
         attn_out: &[f32],
         n_tokens: usize,
+        decode: bool,
     ) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
@@ -2660,7 +2685,7 @@ impl GemmaModel {
         // using this layer's ffn_norm/ffn_gate/ffn_up/ffn_down.
         let mut mlp_normed = attn_out.to_vec();
         tensor::rmsnorm_inplace(&mut mlp_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-        let mut gate_up = self.backend.matmul_batch(&[
+        let ops = [
             MatmulOp {
                 x: &mlp_normed,
                 n_tokens,
@@ -2671,12 +2696,21 @@ impl GemmaModel {
                 n_tokens,
                 w: &layer.ffn_up,
             },
-        ]);
+        ];
+        let mut gate_up = if decode {
+            self.backend.matmul_batch_decode(&ops)
+        } else {
+            self.backend.matmul_batch(&ops)
+        };
         let up = gate_up.pop().unwrap();
         let mut gate = gate_up.pop().unwrap();
         tensor::gelu_inplace(&mut gate);
         tensor::mul_inplace(&mut gate, &up);
-        let mut result = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
+        let mut result = if decode {
+            self.backend.matmul_decode(&gate, n_tokens, &layer.ffn_down)
+        } else {
+            self.backend.matmul(&gate, n_tokens, &layer.ffn_down)
+        };
         tensor::rmsnorm_inplace(&mut result, &moe.post_norm_1, n_tokens, n_embd, eps);
 
         // Routed-expert branch. Expert input is its own `pre_ffw_norm_2`-normed
@@ -2684,7 +2718,7 @@ impl GemmaModel {
         // `attn_out` — see `moe_router_logits`.
         let mut expert_in = attn_out.to_vec();
         tensor::rmsnorm_inplace(&mut expert_in, &moe.pre_norm_2, n_tokens, n_embd, eps);
-        let logits = self.moe_router_logits(moe, attn_out, n_tokens);
+        let logits = self.moe_router_logits(moe, attn_out, n_tokens, decode);
         let n_expert = moe.gate_inp.out_dim;
 
         // Route every token first (cheap, sequential): softmax its logits,

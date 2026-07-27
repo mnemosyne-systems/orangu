@@ -1661,13 +1661,7 @@ pub fn dot_k_pair(w0: &KRow, w1: &KRow, a: &ActQ8K, out0: &mut [f32], out1: &mut
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vnni,avx512vl,avx2,ssse3")]
-unsafe fn dot_k_pair_vnni(
-    w0: &KRow,
-    w1: &KRow,
-    a: &ActQ8K,
-    out0: &mut [f32],
-    out1: &mut [f32],
-) {
+unsafe fn dot_k_pair_vnni(w0: &KRow, w1: &KRow, a: &ActQ8K, out0: &mut [f32], out1: &mut [f32]) {
     dot_k_pair_impl::<ISA_VNNI>(w0, w1, a, out0, out1)
 }
 
@@ -1998,8 +1992,8 @@ impl ActQ8Flat {
                     let scale = amax / 127.0;
                     let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
                     d[(tl * n_block + b) * TOKEN_TILE + k] = scale;
-                    let dst = &mut q[((tl * n_block + b) * TOKEN_TILE + k) * ACT_BLOCK..]
-                        [..ACT_BLOCK];
+                    let dst =
+                        &mut q[((tl * n_block + b) * TOKEN_TILE + k) * ACT_BLOCK..][..ACT_BLOCK];
                     for (slot, &v) in dst.iter_mut().zip(chunk) {
                         // `round` then clamp, as in `quantize_act`: the
                         // extreme is exactly ±127, never -128.
@@ -2524,11 +2518,6 @@ mod tests {
         }
     }
 
-    /// 896 and 4864 are `Qwen2.5-Coder-0.5B`'s own two row widths, and 896
-    /// is the one that matters: it is not a multiple of 256, which is why
-    /// its rows carry `IQ4_NL` rather than the `Q2_K`/`Q3_K` the file name
-    /// advertises.
-    #[test]
     /// The vectorized nibble->level lookup must agree with the scalar
     /// reference for **every** byte value, not just the ones a fixture
     /// happens to produce: all 256 inputs are enumerated, which covers each
@@ -2536,7 +2525,9 @@ mod tests {
     #[test]
     fn iq4_nl_block_unpack_is_exact_for_every_byte_value() {
         for base in 0..=255u8 {
-            let qs: Vec<u8> = (0..16u8).map(|j| base.wrapping_add(j.wrapping_mul(17))).collect();
+            let qs: Vec<u8> = (0..16u8)
+                .map(|j| base.wrapping_add(j.wrapping_mul(17)))
+                .collect();
             let mut want = [0i8; 32];
             let mut got = [0i8; 32];
             unpack_block_iq4_nl_scalar(&qs, &mut want);
@@ -2552,6 +2543,10 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// 896 and 4864 are `Qwen2.5-Coder-0.5B`'s own two row widths, and 896
+    /// is the one that matters: it is not a multiple of 256, which is why
+    /// its rows carry `IQ4_NL` rather than the `Q2_K`/`Q3_K` the file name
+    /// advertises.
     #[test]
     fn iq4_nl_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
@@ -2561,13 +2556,14 @@ mod tests {
     }
 
     /// The decode half of `IQ4_XS`. Widths are multiples of 256 because that
-    /// is what `supports` requires of it.
+    /// is what `supports` requires of it — 4864 already is one (19 blocks),
+    /// so it is the same row width the `IQ4_NL` test above uses.
     #[test]
     fn iq4_xs_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
             check(GGML_TYPE_IQ4_XS, 256, seed);
             check(GGML_TYPE_IQ4_XS, 2048, seed);
-            check(GGML_TYPE_IQ4_XS, 4864 - 4864 % 256, seed);
+            check(GGML_TYPE_IQ4_XS, 4864, seed);
         }
     }
 
@@ -2693,9 +2689,12 @@ mod tests {
                 let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, n_tokens, 4242);
                 let got = k_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
                 for o in 0..out_dim {
-                    let w =
-                        quant::dequantize(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], in_dim)
-                            .unwrap();
+                    let w = quant::dequantize(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        in_dim,
+                    )
+                    .unwrap();
                     for t in 0..n_tokens {
                         let xs = &x[t * in_dim..(t + 1) * in_dim];
                         let reference: f32 = w.iter().zip(xs).map(|(a, b)| a * b).sum();
@@ -2895,8 +2894,7 @@ mod tests {
                     let out_dim = 5; // odd, so the trailing-row path runs
                     let (raw, x, row_bytes) =
                         flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 909);
-                    let flat =
-                        flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                    let flat = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
                     let generic =
                         generic_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
                     assert_eq!(
@@ -2948,7 +2946,15 @@ mod tests {
         let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, 8, 31337);
         let full = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, 8);
         for n in [2usize, 3, 5, 7] {
-            let got = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x[..n * in_dim], n);
+            let got = flat_gemm(
+                ggml_type,
+                &raw,
+                row_bytes,
+                in_dim,
+                out_dim,
+                &x[..n * in_dim],
+                n,
+            );
             for o in 0..out_dim {
                 for t in 0..n {
                     assert_eq!(

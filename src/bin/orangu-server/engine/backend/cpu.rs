@@ -37,7 +37,7 @@ use crate::engine::loader::QuantMatrix;
 use crate::engine::tensor;
 use crate::engine::vecdot;
 
-use super::Backend;
+use super::{Backend, MatmulOp};
 
 #[derive(Default)]
 pub struct CpuBackend;
@@ -194,7 +194,13 @@ impl CpuBackend {
         let acts = vecdot::ActQ8Flat::quantize(x, in_dim, n_tokens);
         let mut yt = vec![0f32; out_dim * n_tokens];
         yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
-            || (vecdot::UnpackedRow::new(), vecdot::UnpackedRow::new(), Vec::new()),
+            || {
+                (
+                    vecdot::UnpackedRow::new(),
+                    vecdot::UnpackedRow::new(),
+                    Vec::new(),
+                )
+            },
             |(s0, s1, scratch), (pair, dst)| {
                 let o0 = pair * 2;
                 let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
@@ -217,6 +223,59 @@ impl CpuBackend {
             }
         }
         y
+    }
+
+    /// [`Self::matmul_fused`]'s decode form: the GEMV kernel
+    /// ([`vecdot::dot_row`]) for *every* token, whatever `n_tokens` is.
+    ///
+    /// A decode batch is `n` sequences each contributing a single token, so
+    /// each row's result has to match what that sequence would have got
+    /// decoding alone — see [`Backend::matmul_decode`]. Taking the same
+    /// `dot_row` per `(row, token)` pair as the `n_tokens == 1` path makes
+    /// that equality bit-for-bit by construction rather than by tolerance.
+    ///
+    /// Only the *unpack* half of the GEMM win is given up, not the whole of
+    /// it: the row stays parallelized across workers and each packed row is
+    /// still read once for all `n` tokens, close enough together to stay in
+    /// cache. What it does not do is materialize the row as `int8` once and
+    /// reuse it, which is what the GEMM paths buy and what costs the
+    /// bit-exactness.
+    fn matmul_fused_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Option<Vec<f32>> {
+        let in_dim = w.in_dim;
+        let out_dim = w.out_dim;
+        let ggml_type = w.ggml_type();
+        if !vecdot::supports(ggml_type, in_dim) {
+            return None;
+        }
+        let raw = w.raw_bytes();
+        let row_bytes = w.row_bytes();
+
+        let acts: Vec<vecdot::ActQ8> = (0..n_tokens)
+            .map(|t| vecdot::quantize_act(&x[t * in_dim..(t + 1) * in_dim]))
+            .collect();
+
+        // Transposed accumulation and the row-major transpose back, exactly
+        // as `matmul_fused` does — see its comments.
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        yt.par_chunks_mut(n_tokens)
+            .enumerate()
+            .for_each(|(o, dst)| {
+                let row = &raw[o * row_bytes..(o + 1) * row_bytes];
+                for (slot, act) in dst.iter_mut().zip(&acts) {
+                    *slot = vecdot::dot_row(ggml_type, row, act);
+                }
+            });
+
+        if n_tokens == 1 {
+            return Some(yt);
+        }
+        let mut y = vec![0f32; n_tokens * out_dim];
+        for o in 0..out_dim {
+            for t in 0..n_tokens {
+                y[t * out_dim + o] = yt[o * n_tokens + t];
+            }
+        }
+        Some(y)
     }
 
     /// The dequantize path, on its own: every weight row widened to `f32`
@@ -263,5 +322,114 @@ impl Backend for CpuBackend {
             return y;
         }
         self.matmul_dequant(x, n_tokens, w)
+    }
+
+    fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+        if let Some(y) = self.matmul_fused_decode(x, n_tokens, w) {
+            return y;
+        }
+        // The dequantize path takes every `(row, token)` pair as its own
+        // full-precision dot already, so it needs no decode form of its own.
+        self.matmul_dequant(x, n_tokens, w)
+    }
+
+    /// Per op, since `CpuBackend` has nothing to amortize across a batch —
+    /// the same reason it leaves [`Backend::matmul_batch`] at its default.
+    fn matmul_batch_decode(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        ops.iter()
+            .map(|op| self.matmul_decode(op.x, op.n_tokens, op.w))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::loader::test_quant_matrix;
+    use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
+
+    fn next_byte(seed: &mut u64) -> u8 {
+        *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (*seed >> 33) as u8
+    }
+
+    /// Bytes per block and elements per block, for the two types this module
+    /// tests. Hard-coded rather than read from `engine::quant`, whose own
+    /// `block_layout` is private — the same thing the CUDA/OpenCL/ROCm test
+    /// modules do with their `block_elems_for`.
+    fn block_layout(ggml_type: u32) -> (usize, usize) {
+        match ggml_type {
+            GGML_TYPE_Q8_0 => (2 + 32, 32),
+            GGML_TYPE_Q4_K => (2 + 2 + 12 + 128, 256),
+            other => panic!("no fixture for ggml_type {other}"),
+        }
+    }
+
+    /// One weight matrix of `ggml_type`. Float scale fields get bounded,
+    /// non-degenerate values; every other field is read back as an integer,
+    /// so arbitrary bits are fine there.
+    fn weights(ggml_type: u32, in_dim: usize, out_dim: usize, seed: &mut u64) -> Vec<u8> {
+        let (block_bytes, block_elems) = block_layout(ggml_type);
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / block_elems) {
+            let mut block = vec![0u8; block_bytes];
+            let scale = 0.05 + (next_byte(seed) as f32 / 255.0) * 1.95;
+            block[0..2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+            let quants_from = if ggml_type == GGML_TYPE_Q4_K {
+                let dmin = 0.05 + (next_byte(seed) as f32 / 255.0) * 0.95;
+                block[2..4].copy_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+                4
+            } else {
+                2
+            };
+            for slot in block[quants_from..].iter_mut() {
+                *slot = next_byte(seed);
+            }
+            bytes.extend(block);
+        }
+        bytes
+    }
+
+    /// The invariant `engine::arch::gemma`'s `forward_batch_decode_matches_
+    /// independent_forward_calls_cpu` checks end to end on a real model, at
+    /// the one call this module is responsible for and without needing a
+    /// 4 GB GGUF: a decode batch's row `t` must be **bit-for-bit** what that
+    /// token would have produced decoding on its own.
+    ///
+    /// It is [`Backend::matmul_decode`] that owes this, not [`Backend::
+    /// matmul`] — the latter is free to pick the faster multi-token GEMM
+    /// kernels, which round differently (see `matmul_fused_decode`). Both
+    /// fused kernel families are covered: `Q8_0` reaches the flat GEMM and
+    /// `Q4_K` the K-quant GEMM, and each rounds differently from the GEMV
+    /// in its own way.
+    #[test]
+    fn decode_batch_is_bit_identical_to_deciding_each_token_alone() {
+        for (ggml_type, in_dim) in [(GGML_TYPE_Q8_0, 128), (GGML_TYPE_Q4_K, 512)] {
+            // Odd, so the trailing lone-row chunk of the paired GEMM paths
+            // is exercised rather than only the even pairs.
+            let out_dim = 7;
+            let n_tokens = 5;
+            let mut seed = 0x0051_AB1E_5EED_u64;
+            let bytes = weights(ggml_type, in_dim, out_dim, &mut seed);
+            let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+
+            let x: Vec<f32> = (0..n_tokens * in_dim)
+                .map(|_| (next_byte(&mut seed) as f32 / 255.0) * 2.0 - 1.0)
+                .collect();
+
+            let batched = CpuBackend.matmul_decode(&x, n_tokens, &w);
+            for t in 0..n_tokens {
+                let alone = CpuBackend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, &w);
+                for (o, want) in alone.iter().enumerate() {
+                    let got = batched[t * out_dim + o];
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "ggml_type {ggml_type}, token {t}, row {o}: alone={want} batched={got}"
+                    );
+                }
+            }
+        }
     }
 }

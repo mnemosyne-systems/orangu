@@ -86,6 +86,36 @@ pub trait Backend: Send + Sync {
             .collect()
     }
 
+    /// The same product as [`Backend::matmul`], for a **decode** batch:
+    /// `x`'s rows are one per *sequence* rather than one per position in a
+    /// prompt.
+    ///
+    /// It exists because `n_tokens > 1` is not, on its own, a safe signal
+    /// to switch kernels. `CpuBackend` picks its kernel from `n_tokens`,
+    /// and the multi-token (GEMM) kernels are *not* bit-identical to the
+    /// single-token (GEMV) one — they sum in a different order, and the
+    /// K-quant GEMM quantizes activations one scale per 256 elements
+    /// against the GEMV's one per 32. Both stay inside `engine::vecdot`'s
+    /// error budget, but routing a decode batch through them would make a
+    /// sequence's logits depend on how many *other* sequences happened to
+    /// be decoding alongside it in that window — the same token, decoded
+    /// alone or in a busy batch, would come out differently. Prefill has
+    /// no such twin to agree with and keeps the faster GEMM.
+    ///
+    /// The default is `matmul` itself, which is right for every backend
+    /// whose kernels don't vary with `n_tokens`.
+    fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        self.matmul(x, n_tokens, w)
+    }
+
+    /// [`Backend::matmul_batch`]'s decode counterpart — see
+    /// [`Backend::matmul_decode`] for why decode needs its own entry point.
+    /// Defaults to `matmul_batch` so a backend that overrode *that* for
+    /// submission batching keeps it here too.
+    fn matmul_batch_decode(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        self.matmul_batch(ops)
+    }
+
     /// Downcast hook for the one GPU-specific fast path that doesn't fit
     /// this trait's backend-agnostic shape: `VulkanBackend::
     /// fused_post_attention` chains a whole gemma4 sub-layer's matmuls and
