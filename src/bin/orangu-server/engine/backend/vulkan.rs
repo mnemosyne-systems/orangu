@@ -92,8 +92,59 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // The `IQ*` codebooks (`vulkan_shaders::IQ_GRID_PRELUDE`). Only
+            // the five `IQ*` types' shaders declare this binding; it is in
+            // the shared layout regardless because a bind group layout may
+            // carry entries a shader never reads — only the reverse is
+            // rejected — and one layout for every matmul pipeline is worth
+            // more than saving a ~15 KiB binding on the other eleven.
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
         ],
     })
+}
+
+/// The `IQ*` codebooks packed into one `u32` array for upload, at the
+/// offsets `vulkan_shaders::IQ_GRID_PRELUDE` declares. The two `iq2*` grids
+/// hold `u64` lattice points and go in low word first; the `iq3*` grids are
+/// already `u32`; `ksigns_iq2xs` and `kvalues_iq4nl` are byte tables packed
+/// four to a word, little-end first, so the shader's
+/// `>> ((i & 3) * 8)` reads them back in order.
+///
+/// The offsets are asserted rather than computed from the slice lengths so
+/// that growing a table without updating the WGSL constants fails here, at
+/// startup, instead of silently shifting every later table.
+fn iq_grid_words() -> Vec<u32> {
+    use crate::engine::iq_grids::{
+        IQ2S_GRID, IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    };
+
+    let mut words = Vec::with_capacity(3876);
+    for &g in IQ2XS_GRID.iter().chain(IQ2S_GRID.iter()) {
+        words.push(g as u32);
+        words.push((g >> 32) as u32);
+    }
+    assert_eq!(words.len(), 3072, "iq2 grids must end at IQ3XXS_GRID_OFF");
+    words.extend_from_slice(&IQ3XXS_GRID);
+    words.extend_from_slice(&IQ3S_GRID);
+    assert_eq!(words.len(), 3840, "iq3 grids must end at KSIGNS_OFF");
+    words.extend(
+        KSIGNS_IQ2XS
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+    );
+    assert_eq!(words.len(), 3872, "ksigns must end at KVALUES_IQ4NL_OFF");
+    words.extend(
+        KVALUES_IQ4NL
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])),
+    );
+    assert_eq!(words.len(), 3876, "packed IQ grid size");
+    words
 }
 
 /// `Meta` in `vulkan_shaders::PRELUDE` — `#[repr(C)]` so its layout matches
@@ -880,6 +931,11 @@ pub struct VulkanBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// The `IQ*` codebooks (`iq_grid_words`), uploaded once and bound at
+    /// `@binding(4)` of every matmul bind group. ~15 KiB, device-resident
+    /// for the backend's whole life — the `IQ*` `dequant_element`s cannot
+    /// compute their lattice points, only look them up.
+    iq_grid_buffer: wgpu::Buffer,
     pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// The workgroup-cooperative variant of each type's pipeline (see
     /// `vulkan_shaders::shader_source_coop`) — dispatched instead of
@@ -2135,11 +2191,20 @@ const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_F16,
     crate::engine::quant::GGML_TYPE_BF16,
     crate::engine::quant::GGML_TYPE_Q4_0,
+    crate::engine::quant::GGML_TYPE_Q4_1,
     crate::engine::quant::GGML_TYPE_Q5_0,
+    crate::engine::quant::GGML_TYPE_Q5_1,
     crate::engine::quant::GGML_TYPE_Q8_0,
+    crate::engine::quant::GGML_TYPE_Q2_K,
+    crate::engine::quant::GGML_TYPE_Q3_K,
     crate::engine::quant::GGML_TYPE_Q4_K,
     crate::engine::quant::GGML_TYPE_Q5_K,
     crate::engine::quant::GGML_TYPE_Q6_K,
+    crate::engine::quant::GGML_TYPE_IQ2_XS,
+    crate::engine::quant::GGML_TYPE_IQ2_S,
+    crate::engine::quant::GGML_TYPE_IQ3_XXS,
+    crate::engine::quant::GGML_TYPE_IQ3_S,
+    crate::engine::quant::GGML_TYPE_IQ4_XS,
 ];
 
 impl VulkanBackend {
@@ -2475,6 +2540,14 @@ impl VulkanBackend {
         });
 
         let bind_group_layout = bind_group_layout(&device);
+        let iq_grid_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("orangu-server IQ codebook grids"),
+                contents: bytemuck::cast_slice(&iq_grid_words()),
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("orangu-server matmul pipeline layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
@@ -3004,6 +3077,7 @@ impl VulkanBackend {
             device,
             queue,
             bind_group_layout,
+            iq_grid_buffer,
             pipelines,
             pipelines_coop,
             pipelines_coop_tiled,
@@ -3385,6 +3459,10 @@ impl VulkanBackend {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.iq_grid_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -4304,6 +4382,10 @@ impl VulkanBackend {
                     binding: 3,
                     resource: BindSrc::Slice(&meta_chunk, meta_offset, meta_size).resource(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.iq_grid_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -4421,6 +4503,10 @@ impl VulkanBackend {
                             binding: 3,
                             resource: BindSrc::Slice(&meta_chunk, meta_offset, meta_size)
                                 .resource(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.iq_grid_buffer.as_entire_binding(),
                         },
                     ],
                 });
@@ -5856,6 +5942,10 @@ impl VulkanBackend {
                     binding: 3,
                     resource: BindSrc::Slice(&entry.meta_chunk, entry.meta_offset, entry.meta_size)
                         .resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.iq_grid_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -11885,8 +11975,10 @@ mod tests {
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K,
-        GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
+        GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+        GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+        GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
     /// One `VulkanBackend` shared by every test in this module, rather
@@ -13257,7 +13349,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
                 out.extend(next_bytes(seed, 16));
             }
+            t if t == GGML_TYPE_Q4_1 => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 16));
+            }
             t if t == GGML_TYPE_Q5_0 => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 4));
+                out.extend(next_bytes(seed, 16));
+            }
+            t if t == GGML_TYPE_Q5_1 => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
                 out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
                 out.extend(next_bytes(seed, 4));
                 out.extend(next_bytes(seed, 16));
@@ -13285,6 +13388,50 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 out.extend(next_bytes(seed, 16));
                 out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
             }
+            t if t == GGML_TYPE_Q2_K => {
+                out.extend(next_bytes(seed, 16));
+                out.extend(next_bytes(seed, 64));
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+            }
+            t if t == GGML_TYPE_Q3_K => {
+                out.extend(next_bytes(seed, 32));
+                out.extend(next_bytes(seed, 64));
+                out.extend(next_bytes(seed, 12));
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+            }
+            // Every `IQ*` field below is a codebook index, a sign pattern or
+            // a packed scale, all of which are valid for any bit pattern —
+            // no field needs constraining to keep the block well formed, so
+            // random bytes reach the whole encoding space.
+            t if t == GGML_TYPE_IQ2_XS => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 64));
+                out.extend(next_bytes(seed, 8));
+            }
+            t if t == GGML_TYPE_IQ2_S => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 64));
+                out.extend(next_bytes(seed, 8));
+                out.extend(next_bytes(seed, 8));
+            }
+            t if t == GGML_TYPE_IQ3_XXS => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 96));
+            }
+            t if t == GGML_TYPE_IQ3_S => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 64));
+                out.extend(next_bytes(seed, 8));
+                out.extend(next_bytes(seed, 32));
+                out.extend(next_bytes(seed, 4));
+            }
+            t if t == GGML_TYPE_IQ4_XS => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 2));
+                out.extend(next_bytes(seed, 4));
+                out.extend(next_bytes(seed, 128));
+            }
             other => panic!("build_block: unhandled ggml_type {other}"),
         }
         out
@@ -13293,7 +13440,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     fn block_elems(ggml_type: u32) -> usize {
         match ggml_type {
             t if t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 1,
-            t if t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 => 32,
+            t if t == GGML_TYPE_Q4_0
+                || t == GGML_TYPE_Q4_1
+                || t == GGML_TYPE_Q5_0
+                || t == GGML_TYPE_Q5_1
+                || t == GGML_TYPE_Q8_0 =>
+            {
+                32
+            }
             _ => 256,
         }
     }
@@ -13510,6 +13664,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cross_check(GGML_TYPE_Q5_0, 64, 17);
     }
 
+    /// The `_1` legacy quants, which store a per-block minimum rather than
+    /// assuming a symmetric range around a fixed offset.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_1() {
+        cross_check(GGML_TYPE_Q4_1, 64, 17);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q5_1() {
+        cross_check(GGML_TYPE_Q5_1, 64, 17);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_for_q8_0() {
         cross_check(GGML_TYPE_Q8_0, 64, 17);
@@ -13576,6 +13742,51 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// run only ever exercises one of the two, whichever the environment
     /// selected at first construction) for real: `cross_check`'s own
     /// `n_tokens = 3` never reaches either.
+    /// The K-quant and `IQ*` types added for mixed "dynamic" releases, on
+    /// the per-token reduce path.
+    ///
+    /// `engine::quant`'s own fixture already holds the CPU dequantizers to
+    /// ggml bit-for-bit, so the CPU side of this comparison is ground truth
+    /// rather than a second opinion — what these check is the WGSL
+    /// restatement of each `dequant_element` as a function of `k`, which is
+    /// where a K-quant's four-pass `shift` walk or an `IQ*` type's
+    /// index/sign/scale decomposition can go wrong independently of the
+    /// Rust.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q2_k() {
+        cross_check(GGML_TYPE_Q2_K, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q3_k() {
+        cross_check(GGML_TYPE_Q3_K, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xs() {
+        cross_check(GGML_TYPE_IQ2_XS, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_s() {
+        cross_check(GGML_TYPE_IQ2_S, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_xxs() {
+        cross_check(GGML_TYPE_IQ3_XXS, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_s() {
+        cross_check(GGML_TYPE_IQ3_S, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq4_xs() {
+        cross_check(GGML_TYPE_IQ4_XS, 512, 5);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_cooperative_path_f32() {
         cross_check_n_tokens(GGML_TYPE_F32, 64, 17, 130);
@@ -13602,6 +13813,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 
     #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_q4_1() {
+        cross_check_n_tokens(GGML_TYPE_Q4_1, 64, 17, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_q5_1() {
+        cross_check_n_tokens(GGML_TYPE_Q5_1, 64, 17, 130);
+    }
+
+    #[test]
     fn matmul_matches_cpu_backend_cooperative_path_q8_0() {
         cross_check_n_tokens(GGML_TYPE_Q8_0, 64, 17, 130);
     }
@@ -13609,6 +13830,46 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn matmul_matches_cpu_backend_cooperative_path_q4_k() {
         cross_check_n_tokens(GGML_TYPE_Q4_K, 512, 5, 130);
+    }
+
+    /// The same seven types through the cooperative/tiled kernel, whose
+    /// `fill_w_run` reaches `dequant_element` via the generic per-element
+    /// fallback rather than one of the `Q4_K`/`Q5_K`/`Q6_K` specializations
+    /// — a different call path over the same function, and the one the model
+    /// actually takes during prefill.
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_q2_k() {
+        cross_check_n_tokens(GGML_TYPE_Q2_K, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_q3_k() {
+        cross_check_n_tokens(GGML_TYPE_Q3_K, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq2_xs() {
+        cross_check_n_tokens(GGML_TYPE_IQ2_XS, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq2_s() {
+        cross_check_n_tokens(GGML_TYPE_IQ2_S, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq3_xxs() {
+        cross_check_n_tokens(GGML_TYPE_IQ3_XXS, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq3_s() {
+        cross_check_n_tokens(GGML_TYPE_IQ3_S, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq4_xs() {
+        cross_check_n_tokens(GGML_TYPE_IQ4_XS, 512, 5, 130);
     }
 
     /// The cooperative tiled kernel past its own `COOP_TILE_ROWS = 32` output

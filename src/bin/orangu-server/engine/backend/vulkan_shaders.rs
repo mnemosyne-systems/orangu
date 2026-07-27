@@ -38,13 +38,18 @@
 //!   `(row, token)` pair when many tokens genuinely share the same row.
 //!
 //! `PRELUDE` (buffer bindings + byte/half-float decode helpers) is shared
-//! by both, concatenated with a type's `*_COOP_MIDDLE` and the relevant
-//! `MAIN_*_SUFFIX` once at `VulkanBackend` construction time into 18
-//! complete, self-contained WGSL modules (9 types × 2 dispatch strategies).
+//! by both, concatenated with a type's `*_COOP_MIDDLE` (see [`coop_middle`])
+//! and the relevant `MAIN_*_SUFFIX` once at `VulkanBackend` construction
+//! time into one complete, self-contained WGSL module per (type, dispatch
+//! strategy) pair. The `IQ*` types additionally get [`IQ_GRID_PRELUDE`],
+//! which declares the codebook buffer their `dequant_element`s look their
+//! lattice points up in.
 
 use crate::engine::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
+    GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -101,6 +106,86 @@ fn get_scale_min_k4(base: u32, j: u32) -> vec2<u32> {
     let sc = (qj4 & 0xFu) | ((qjm4 >> 6u) << 4u);
     let m = (qj4 >> 4u) | ((qj >> 6u) << 4u);
     return vec2<u32>(sc, m);
+}
+
+// Q3_K's `i`th 6-bit sub-block scale (0..16), still biased by 32, out of the
+// 12 bytes at `base`. Mirrors `quant::unpack_q3_k_scales` for one index.
+fn q3k_scale(base: u32, i: u32) -> u32 {
+    var low: u32;
+    if (i < 8u) {
+        low = read_u8(base + i) & 0xFu;
+    } else {
+        low = read_u8(base + i - 8u) >> 4u;
+    }
+    let high = (read_u8(base + 8u + (i % 4u)) >> (2u * (i / 4u))) & 3u;
+    return low | (high << 4u);
+}
+"#;
+
+/// The `IQ*` codebooks, appended to [`PRELUDE`] for the `IQ*` types only.
+///
+/// A K-quant block stores its weights; an `IQ*` block stores *indices* into
+/// a fixed codebook of lattice points. That codebook cannot be computed —
+/// it has to be read — so it is uploaded once at
+/// `VulkanBackend::try_init` as one ~15 KiB storage buffer
+/// (`VulkanBackend::iq_grid_buffer`, packed by `iq_grid_words`) and bound at
+/// `@binding(4)` for every matmul pipeline. Only these shaders declare it;
+/// the other types' modules never mention the binding, which WGSL permits
+/// (a bind group layout may carry entries a shader does not use — the
+/// reverse is what is rejected).
+///
+/// Uploading beats baking the numbers into the WGSL text: a module-scope
+/// `array` initializer indexed by a runtime value is not a uniform-control-
+/// flow constant, so RADV would place a per-invocation copy in scratch and
+/// every lookup would be a scratch load. A read-only storage buffer is
+/// cached like any other weight read.
+///
+/// The `u32` offsets below must stay in step with `iq_grid_words`.
+const IQ_GRID_PRELUDE: &str = r#"
+@group(0) @binding(4) var<storage, read> iq_grids: array<u32>;
+
+const IQ2XS_GRID_OFF: u32 = 0u;
+const IQ2S_GRID_OFF: u32 = 1024u;
+const IQ3XXS_GRID_OFF: u32 = 3072u;
+const IQ3S_GRID_OFF: u32 = 3328u;
+const KSIGNS_OFF: u32 = 3840u;
+const KVALUES_IQ4NL_OFF: u32 = 3872u;
+
+// Byte `j` (0..8) of the 8-element lattice point `idx` in an `iq2*` grid,
+// which stores two `u32` words per entry.
+fn iq_grid8(base: u32, idx: u32, j: u32) -> u32 {
+    let word = iq_grids[base + idx * 2u + (j >> 2u)];
+    return (word >> ((j & 3u) * 8u)) & 0xFFu;
+}
+
+// Byte `j` (0..4) of the 4-element lattice point `idx` in an `iq3*` grid,
+// one `u32` word per entry.
+fn iq_grid4(base: u32, idx: u32, j: u32) -> u32 {
+    let word = iq_grids[base + idx];
+    return (word >> ((j & 3u) * 8u)) & 0xFFu;
+}
+
+// `ksigns_iq2xs[i]`: the 8 sign bits a 7-bit sign field expands to.
+fn iq_ksigns(i: u32) -> u32 {
+    return (iq_grids[KSIGNS_OFF + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// `kvalues_iq4nl[i]`, sign-extended from the `int8_t` it is stored as.
+fn iq_kvalue(i: u32) -> f32 {
+    let b = (iq_grids[KVALUES_IQ4NL_OFF + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+    var v: i32 = i32(b);
+    if (v >= 128) {
+        v = v - 256;
+    }
+    return f32(v);
+}
+
+// `kmask_iq2xs[j]` is `1 << j`, so the sign of element `j` is bit `j`.
+fn iq_sign(signs: u32, j: u32) -> f32 {
+    if ((signs & (1u << j)) != 0u) {
+        return -1.0;
+    }
+    return 1.0;
 }
 "#;
 
@@ -1238,6 +1323,47 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_q4_1`: mirrors `quant::dequantize_q4_1` — `Q4_0`'s nibble split
+/// with a stored per-block minimum added instead of a fixed 8 subtracted.
+const Q4_1_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 20u;
+const BLOCK_ELEMS: u32 = 32u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let m = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));
+    if (k < 16u) {
+        let byte = read_u8(byte_offset + 4u + k);
+        return f32(byte & 0xFu) * d + m;
+    }
+    let byte = read_u8(byte_offset + 4u + (k - 16u));
+    return f32(byte >> 4u) * d + m;
+}
+"#;
+
+/// `block_q5_1`: mirrors `quant::dequantize_q5_1` — `Q5_0`'s fifth bit
+/// packed across `qh`, with `Q4_1`'s stored minimum.
+const Q5_1_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 24u;
+const BLOCK_ELEMS: u32 = 32u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let m = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));
+    let qh = read_u8(byte_offset + 4u) | (read_u8(byte_offset + 5u) << 8u)
+        | (read_u8(byte_offset + 6u) << 16u) | (read_u8(byte_offset + 7u) << 24u);
+    if (k < 16u) {
+        let byte = read_u8(byte_offset + 8u + k);
+        let xh_0 = ((qh >> k) << 4u) & 0x10u;
+        return f32((byte & 0xFu) | xh_0) * d + m;
+    }
+    let j = k - 16u;
+    let byte = read_u8(byte_offset + 8u + j);
+    let xh_1 = (qh >> (j + 12u)) & 0x10u;
+    return f32((byte >> 4u) | xh_1) * d + m;
+}
+"#;
+
 /// `block_q5_0`: mirrors `quant::dequantize_q5_0` — same low/high-nibble
 /// split as `Q4_0_COOP_MIDDLE`, plus the 5th bit packed across `qh`.
 const Q5_0_COOP_MIDDLE: &str = r#"
@@ -1410,28 +1536,269 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
-/// The complete, compiled-ready WGSL source for `ggml_type`'s *reduction*
-/// pipeline (see `MAIN_REDUCE_SUFFIX`), or `None` if this backend has no
-/// shader for it (the same set `engine::quant` supports on the CPU path —
-/// see its module doc for what's missing). Reuses the same `*_COOP_MIDDLE`
-/// constant `shader_source_coop` does — both dispatch strategies share the
-/// exact same `dequant_element` per type, only `MAIN_REDUCE_SUFFIX` vs.
-/// `MAIN_COOP_SUFFIX` (and so the resulting compute `main`) differs.
-pub fn shader_source_reduce(ggml_type: u32, n_rows: usize, subgroup: bool) -> Option<String> {
-    let middle = match ggml_type {
+/// `block_q2_K`: mirrors `quant::dequantize_q2_k`. Its sequential form walks
+/// two 128-element halves, each re-reading the same 32 `qs` bytes four times
+/// at `shift` 0/2/4/6 and splitting each pass into two 16-element sub-blocks
+/// — restated per `k`, that is exactly the four-digit decomposition below
+/// (`n`, `s`, `h`, `l`), which fixes the scale index and the shift outright.
+const Q2_K_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let scales_off = byte_offset;
+    let qs_off = byte_offset + 16u;
+    let d = f16_to_f32(read_u8(byte_offset + 80u) | (read_u8(byte_offset + 81u) << 8u));
+    let dmin = f16_to_f32(read_u8(byte_offset + 82u) | (read_u8(byte_offset + 83u) << 8u));
+    let n = k / 128u;
+    let r = k % 128u;
+    let s = r / 32u;
+    let h = (r % 32u) / 16u;
+    let l = r % 16u;
+    let sc = read_u8(scales_off + n * 8u + s * 2u + h);
+    let dl = d * f32(sc & 0xFu);
+    let ml = dmin * f32(sc >> 4u);
+    let byte = read_u8(qs_off + n * 32u + h * 16u + l);
+    return dl * f32((byte >> (2u * s)) & 3u) - ml;
+}
+"#;
+
+/// `block_q3_K`: mirrors `quant::dequantize_q3_k` — `Q2_K`'s decomposition
+/// with two differences. The third quant bit comes from `hmask`, whose byte
+/// index deliberately excludes `n` (one 32-byte mask covers all 256 weights,
+/// one bit per weight, selected by `m = 1 << (n * 4 + s)`), and it is
+/// *inverted*: a set bit means "don't subtract 4".
+const Q3_K_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let hmask_off = byte_offset;
+    let qs_off = byte_offset + 32u;
+    let scales_off = byte_offset + 96u;
+    let d_all = f16_to_f32(read_u8(byte_offset + 108u) | (read_u8(byte_offset + 109u) << 8u));
+    let n = k / 128u;
+    let r = k % 128u;
+    let s = r / 32u;
+    let h = (r % 32u) / 16u;
+    let l = r % 16u;
+    let idx = h * 16u + l;
+    let m = 1u << (n * 4u + s);
+    let dl = d_all * f32(i32(q3k_scale(scales_off, n * 8u + s * 2u + h)) - 32);
+    var hi: i32 = 4;
+    if ((read_u8(hmask_off + idx) & m) != 0u) {
+        hi = 0;
+    }
+    let q = (read_u8(qs_off + n * 32u + idx) >> (2u * s)) & 3u;
+    return dl * f32(i32(q) - hi);
+}
+"#;
+
+/// `block_iq2_xs`: mirrors `quant::dequantize_iq2_xs`. Each of the 32 `u16`
+/// in `qs` covers 8 weights — low 9 bits the lattice point, top 7 the sign
+/// pattern — so `k`'s group (`ib32`), which of that group's four lookups
+/// (`l`) and which element of the lookup (`j`) is the whole decomposition.
+/// `l / 2` picks the scale nibble, since one nibble serves 16 weights.
+const IQ2_XS_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 74u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let scales_off = byte_offset + 66u;
+    let ib32 = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let qo = qs_off + 2u * (4u * ib32 + l);
+    let q = read_u8(qo) | (read_u8(qo + 1u) << 8u);
+    let sc = (read_u8(scales_off + ib32) >> (4u * (l / 2u))) & 0xFu;
+    let db = d * (0.5 + f32(sc)) * 0.25;
+    let g = iq_grid8(IQ2XS_GRID_OFF, q & 511u, j);
+    return db * f32(g) * iq_sign(iq_ksigns(q >> 9u), j);
+}
+"#;
+
+/// `block_iq2_s`: mirrors `quant::dequantize_iq2_s` — `IQ2_XS`'s scales and
+/// decomposition, but a 10-bit lattice index (8 bits from `qs`, 2 more from
+/// the group's `qh` byte) and an explicit sign byte rather than a 7-bit
+/// index into `ksigns`. Those sign bytes live in the *second half* of `qs`,
+/// which ggml spells as the alias `signs = qs + QK_K/8` — here, the `+ 32u`.
+const IQ2_S_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 82u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 66u;
+    let scales_off = byte_offset + 74u;
+    let signs_off = qs_off + 32u;
+    let ib32 = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let qh = read_u8(qh_off + ib32);
+    let idx = read_u8(qs_off + 4u * ib32 + l) | ((qh << (8u - 2u * l)) & 0x300u);
+    let sc = (read_u8(scales_off + ib32) >> (4u * (l / 2u))) & 0xFu;
+    let db = d * (0.5 + f32(sc)) * 0.25;
+    let g = iq_grid8(IQ2S_GRID_OFF, idx, j);
+    return db * f32(g) * iq_sign(read_u8(signs_off + 4u * ib32 + l), j);
+}
+"#;
+
+/// `block_iq3_xxs`: mirrors `quant::dequantize_iq3_xxs`. The one `qs` array
+/// is two: 64 bytes of lattice indices, then 32 read as eight `u32`, one per
+/// group, packing four 7-bit sign fields and a 4-bit scale in the top
+/// nibble. The lattice points are 4 elements wide, so an 8-element run is
+/// two lookups — `j < 4` picks the first, `j >= 4` the second — while the
+/// sign pattern spans all 8 and is indexed by `j` throughout.
+const IQ3_XXS_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 98u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let aux_off = qs_off + 64u;
+    let ib32 = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let ao = aux_off + 4u * ib32;
+    let aux32 = read_u8(ao) | (read_u8(ao + 1u) << 8u)
+        | (read_u8(ao + 2u) << 16u) | (read_u8(ao + 3u) << 24u);
+    let db = d * (0.5 + f32(aux32 >> 28u)) * 0.5;
+    let signs = iq_ksigns((aux32 >> (7u * l)) & 127u);
+    let idx = read_u8(qs_off + 8u * ib32 + 2u * l + (j >> 2u));
+    let g = iq_grid4(IQ3XXS_GRID_OFF, idx, j & 3u);
+    return db * f32(g) * iq_sign(signs, j);
+}
+"#;
+
+/// `block_iq3_s`: mirrors `quant::dequantize_iq3_s`. A 9-bit lattice index —
+/// 8 bits from `qs`, the ninth from the group's `qh` byte, a *different* bit
+/// per lookup — with signs stored outright and a scale of `1 + 2*s` rather
+/// than `IQ2_*`'s `(0.5 + s) * 0.25`. The two 4-element lookups of an
+/// 8-element run take their ninth bit from adjacent positions, hence the
+/// `8 - 2*l` / `7 - 2*l` shift pair collapsing to one expression in `j`.
+const IQ3_S_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 66u;
+    let signs_off = byte_offset + 74u;
+    let scales_off = byte_offset + 106u;
+    let ib32 = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let sc = (read_u8(scales_off + ib32 / 2u) >> (4u * (ib32 % 2u))) & 0xFu;
+    let db = d * f32(1u + 2u * sc);
+    let hb = read_u8(qh_off + ib32);
+    let half = j >> 2u;
+    let idx = read_u8(qs_off + 8u * ib32 + 2u * l + half)
+        | ((hb << (8u - 2u * l - half)) & 256u);
+    let g = iq_grid4(IQ3S_GRID_OFF, idx, j & 3u);
+    return db * f32(g) * iq_sign(read_u8(signs_off + 4u * ib32 + l), j);
+}
+"#;
+
+/// `block_iq4_xs`: mirrors `quant::dequantize_iq4_xs`. The only new type
+/// with no codebook of lattice points — a nibble selects one of 16
+/// non-uniformly spaced levels. Its 6-bit group scale is split across
+/// `scales_l` (4 low bits, two groups per byte) and `scales_h` (2 high bits,
+/// eight groups per `u16`), and within a group the low nibbles are the first
+/// 16 weights and the high nibbles the next 16 — split halves, not
+/// interleaved.
+const IQ4_XS_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 136u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let scales_h = read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u);
+    let scales_l_off = byte_offset + 4u;
+    let qs_off = byte_offset + 8u;
+    let ib = k / 32u;
+    let r = k % 32u;
+    let low = (read_u8(scales_l_off + ib / 2u) >> (4u * (ib % 2u))) & 0xFu;
+    let high = (scales_h >> (2u * ib)) & 3u;
+    let dl = d * f32(i32(low | (high << 4u)) - 32);
+    let byte = read_u8(qs_off + 16u * ib + (r % 16u));
+    var nib: u32 = byte & 0xFu;
+    if (r >= 16u) {
+        nib = byte >> 4u;
+    }
+    return dl * iq_kvalue(nib);
+}
+"#;
+
+/// The `dequant_element` (plus `BLOCK_BYTES`/`BLOCK_ELEMS`/`shared_vals`)
+/// for `ggml_type`, or `None` if this backend has no shader for it.
+///
+/// Every dispatch strategy — reduce, thin-tile reduce, coop, coop-tiled —
+/// shares one `dequant_element` per type and differs only in the `main` it
+/// is concatenated with, so the type coverage lives here once. Four
+/// entry points used to each carry their own copy of this match, which is
+/// four places a newly supported type has to be remembered in.
+fn coop_middle(ggml_type: u32) -> Option<&'static str> {
+    Some(match ggml_type {
         t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
         t if t == GGML_TYPE_F16 => F16_COOP_MIDDLE,
         t if t == GGML_TYPE_BF16 => BF16_COOP_MIDDLE,
         t if t == GGML_TYPE_Q4_0 => Q4_0_COOP_MIDDLE,
+        t if t == GGML_TYPE_Q4_1 => Q4_1_COOP_MIDDLE,
         t if t == GGML_TYPE_Q5_0 => Q5_0_COOP_MIDDLE,
+        t if t == GGML_TYPE_Q5_1 => Q5_1_COOP_MIDDLE,
         t if t == GGML_TYPE_Q8_0 => Q8_0_COOP_MIDDLE,
+        t if t == GGML_TYPE_Q2_K => Q2_K_COOP_MIDDLE,
+        t if t == GGML_TYPE_Q3_K => Q3_K_COOP_MIDDLE,
         t if t == GGML_TYPE_Q4_K => Q4_K_COOP_MIDDLE,
         t if t == GGML_TYPE_Q5_K => Q5_K_COOP_MIDDLE,
         t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ2_XS => IQ2_XS_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ2_S => IQ2_S_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ3_XXS => IQ3_XXS_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ3_S => IQ3_S_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
         _ => return None,
-    };
+    })
+}
+
+/// Whether `ggml_type`'s `dequant_element` reads the `IQ*` codebooks, and so
+/// needs [`IQ_GRID_PRELUDE`]'s `@binding(4)` declaration.
+fn needs_iq_grids(ggml_type: u32) -> bool {
+    ggml_type == GGML_TYPE_IQ2_XS
+        || ggml_type == GGML_TYPE_IQ2_S
+        || ggml_type == GGML_TYPE_IQ3_XXS
+        || ggml_type == GGML_TYPE_IQ3_S
+        || ggml_type == GGML_TYPE_IQ4_XS
+}
+
+/// [`PRELUDE`] for `ggml_type`, with [`IQ_GRID_PRELUDE`] appended for the
+/// codebook types. Kept off the other types' modules so a shader only ever
+/// declares the bindings it reads.
+fn prelude_for(ggml_type: u32) -> String {
+    if needs_iq_grids(ggml_type) {
+        format!("{PRELUDE}\n{IQ_GRID_PRELUDE}")
+    } else {
+        PRELUDE.to_string()
+    }
+}
+
+/// The complete, compiled-ready WGSL source for `ggml_type`'s *reduction*
+/// pipeline (see `MAIN_REDUCE_SUFFIX`), or `None` if this backend has no
+/// shader for it (the same set `engine::quant` supports on the CPU path —
+/// see its module doc for what's missing). Reuses the same [`coop_middle`]
+/// `shader_source_coop` does — both dispatch strategies share the
+/// exact same `dequant_element` per type, only `MAIN_REDUCE_SUFFIX` vs.
+/// `MAIN_COOP_SUFFIX` (and so the resulting compute `main`) differs.
+pub fn shader_source_reduce(ggml_type: u32, n_rows: usize, subgroup: bool) -> Option<String> {
+    let middle = coop_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
     let suffix = main_reduce_suffix(n_rows, subgroup);
-    Some(format!("{PRELUDE}\n{middle}\n{suffix}"))
+    Some(format!("{prelude}\n{middle}\n{suffix}"))
 }
 
 /// The **thin-tile reduce** entry point (`fn main`) for an arbitrary
@@ -1595,20 +1962,10 @@ pub fn shader_source_reduce_thin_tile(
     tile: usize,
     subgroup: bool,
 ) -> Option<String> {
-    let middle = match ggml_type {
-        t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
-        t if t == GGML_TYPE_F16 => F16_COOP_MIDDLE,
-        t if t == GGML_TYPE_BF16 => BF16_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_0 => Q4_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_0 => Q5_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q8_0 => Q8_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_K => Q4_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_K => Q5_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
-        _ => return None,
-    };
+    let middle = coop_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
     Some(format!(
-        "{PRELUDE}\n{middle}\n{}",
+        "{prelude}\n{middle}\n{}",
         thin_tile_reduce_suffix(n_rows, tile, subgroup)
     ))
 }
@@ -3502,19 +3859,9 @@ fn main(
 /// dequantizing each block once per workgroup and sharing it across many
 /// tokens beats each token's thread dequantizing it independently.
 pub fn shader_source_coop(ggml_type: u32) -> Option<String> {
-    let middle = match ggml_type {
-        t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
-        t if t == GGML_TYPE_F16 => F16_COOP_MIDDLE,
-        t if t == GGML_TYPE_BF16 => BF16_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_0 => Q4_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_0 => Q5_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q8_0 => Q8_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_K => Q4_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_K => Q5_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
-        _ => return None,
-    };
-    Some(format!("{PRELUDE}\n{middle}\n{MAIN_COOP_SUFFIX}"))
+    let middle = coop_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
+    Some(format!("{prelude}\n{middle}\n{MAIN_COOP_SUFFIX}"))
 }
 
 /// The default (opt out with `ORANGU_NO_TILED_PREFILL=1`) tiled-GEMM
@@ -3522,18 +3869,8 @@ pub fn shader_source_coop(ggml_type: u32) -> Option<String> {
 /// own doc comment for the design, and `MAIN_COOP_SUFFIX`'s for why this
 /// is the default now.
 pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
-    let middle = match ggml_type {
-        t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,
-        t if t == GGML_TYPE_F16 => F16_COOP_MIDDLE,
-        t if t == GGML_TYPE_BF16 => BF16_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_0 => Q4_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_0 => Q5_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q8_0 => Q8_0_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q4_K => Q4_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q5_K => Q5_K_COOP_MIDDLE,
-        t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
-        _ => return None,
-    };
+    let middle = coop_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
     let g = coop_geom();
     let f16_tiles = coop_f16_tiles();
     let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block(g, f16_tiles);
@@ -3562,7 +3899,7 @@ pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
         .replace("%STORE%", &store)
         .replace("%K_UNROLL%", &k_unroll.to_string());
     let enable = if f16_tiles { "enable f16;\n" } else { "" };
-    Some(format!("{enable}{PRELUDE}\n{middle}\n{suffix}"))
+    Some(format!("{enable}{prelude}\n{middle}\n{suffix}"))
 }
 
 /// Shared `Meta` layout for every elementwise/norm shader below: `len` is

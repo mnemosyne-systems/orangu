@@ -19,6 +19,7 @@ pub mod backend;
 pub mod batch;
 pub mod chat_template;
 pub mod generate;
+pub mod iq_grids;
 pub mod kv_cache;
 pub mod loader;
 pub mod prefix_cache;
