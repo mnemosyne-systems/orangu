@@ -83,13 +83,16 @@ GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
       ...
 
-Model      unsloth/gemma-4-E2B-it-GGUF (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
+Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
 API        http://0.0.0.0:8100
 Workspace  /home/user/src/orangu
 ```
 
-The model line's second field names the backend the forward pass actually
+The model line names the model as `MODEL:QUANT` — the quantization the
+resolved file is actually stored at, the same value `list`'s `QUANT` column
+shows, appended unless the model was named with a `:tag` of its own already.
+Its second field names the backend the forward pass actually
 ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `CUDA/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
 was used (see **GPU backend** below). The workspace line is the directory

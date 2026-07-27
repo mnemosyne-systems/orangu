@@ -635,6 +635,27 @@ fn quant_tag_from_label(label: &str) -> Option<String> {
     is_quant_tag(&tag).then_some(tag)
 }
 
+/// The quantization scheme to show for one already-resolved model file, by
+/// the same rule [`group_models`] fills `list`'s `QUANT` column with: the tag
+/// the filename carries whenever it reads as a quantization
+/// ([`quant_tag_from_label`]), falling back to the ggml type most of the
+/// file's tensor *elements* are stored as.
+///
+/// Unlike [`group_models`], the fallback sees a single file rather than every
+/// shard of a multi-part model, so for a sharded model it reports the
+/// dominant type of the shard handed in. Only that fallback is affected — a
+/// file whose name carries a quantization tag (the overwhelmingly common
+/// case) reads its scheme off the name either way.
+pub fn quantization_for_file(path: &Path, gguf: &GgufFile) -> Option<String> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    quant_tag_from_label(shard_group_label(stem)).or_else(|| {
+        gguf.type_element_totals()
+            .into_iter()
+            .max_by_key(|(_, total)| *total)
+            .map(|(ty, _)| ggml_type_name(ty))
+    })
+}
+
 /// Whether an already-uppercased tag names a ggml quantization: the float
 /// types spelled out, or one of the `Q`/`IQ`/`TQ` families — a digit-led
 /// bit-width followed by any number of `_`-separated variant parts (`Q4_0`,
@@ -1031,6 +1052,29 @@ mod tests {
 
         let groups = group_models(&scan_models_dir(dir.path()).unwrap());
         assert_eq!(groups[0].quantization.as_deref(), Some("Q4_K_M"));
+    }
+
+    /// One resolved file — what `orangu-server`'s startup banner reports —
+    /// reads its quantization by the same two rules `list`'s `QUANT` column
+    /// does: the name's tag when it carries one, the dominant ggml type
+    /// otherwise. A shard suffix is stripped first, so any shard of a
+    /// multi-part model answers with the model's own tag.
+    #[test]
+    fn quantization_for_file_reads_the_name_tag_then_the_dominant_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let tagged = dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf");
+        write_minimal_gguf(&tagged, "gemma4", Some((13, 4096)));
+        let sharded = dir.path().join("gemma-4-E2B-it-Q4_K_M-00002-of-00003.gguf");
+        write_minimal_gguf(&sharded, "gemma4", Some((13, 4096)));
+        let untagged = dir.path().join("gemma-4-E2B-it.gguf");
+        write_minimal_gguf(&untagged, "gemma4", Some((13, 4096)));
+
+        let quant = |path: &Path| {
+            quantization_for_file(path, &GgufFile::open(path).unwrap()).unwrap_or_default()
+        };
+        assert_eq!(quant(&tagged), "Q4_K_M");
+        assert_eq!(quant(&sharded), "Q4_K_M");
+        assert_eq!(quant(&untagged), "Q5_K");
     }
 
     /// A lowercase tag counts too — plenty of published GGUFs spell it that

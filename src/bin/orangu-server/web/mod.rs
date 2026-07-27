@@ -160,9 +160,13 @@ const MAX_TOKENS: usize = 8192;
 
 pub struct WebState {
     pub engine: Arc<Engine>,
-    pub model_label: String,
+    /// The model as named to a human — `MODEL:QUANT` (see `serve`) — for the
+    /// topbar and the debug report. Deliberately *not* the API's model id:
+    /// nothing the web UI sends back is keyed by it, both uses here are
+    /// display only.
+    pub model_display: String,
     /// Echoed into `GET /api/system-report`'s debug report (`app.js`'s
-    /// error-bubble Save button) alongside `model_label`/`version` — the
+    /// error-bubble Save button) alongside `model_display`/`version` — the
     /// same detail `serve`'s own startup banner prints, not otherwise
     /// available to the web UI at all.
     pub architecture: String,
@@ -198,7 +202,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
 async fn index(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let html = INDEX_HTML
         .replace("{{VERSION}}", state.version)
-        .replace("{{MODEL}}", &html_escape(&state.model_label))
+        .replace("{{MODEL}}", &html_escape(&state.model_display))
         .replace("{{YEAR}}", &current_year().to_string())
         .replace("{{ASSET_VERSION}}", asset_version());
     Html(html)
@@ -246,7 +250,7 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
     let mut report = format!(
         "orangu-server {}\nModel        {}\nArchitecture {}\nBackend      {}\nWorkspace    {}\n\n",
         state.version,
-        state.model_label,
+        state.model_display,
         state.architecture,
         state.backend_label,
         state.workspace.display(),

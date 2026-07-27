@@ -335,6 +335,12 @@ fn main() -> ExitCode {
 struct Prepared {
     engine: Arc<Engine>,
     model_label: String,
+    /// The quantization the resolved file is stored at
+    /// ([`orangu::model_spec::quantization_for_file`]), for the startup
+    /// banner's `MODEL:QUANT` line. `None` when `model_label` already carries
+    /// a `:tag` of its own (the label was named that way), or when the file
+    /// says nothing about its scheme.
+    quantization: Option<String>,
     architecture: String,
     backend_label: String,
     /// Absolute, normalized root directory the server operates in — from
@@ -404,6 +410,11 @@ fn prepare(args: Args) -> Result<Prepared> {
     };
 
     let gguf = GgufFile::open(&path)?;
+    // Only when the label doesn't already name a tag itself (`-m
+    // user/model:Q4_K_M`), so the banner never reads `...:Q4_K_M:Q4_K_M`.
+    let quantization = (!label_carries_tag(&model_label))
+        .then(|| orangu::model_spec::quantization_for_file(&path, &gguf))
+        .flatten();
     let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
     let chat_template_source = metadata_string(&gguf, "tokenizer.chat_template");
 
@@ -525,6 +536,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     Ok(Prepared {
         engine,
         model_label,
+        quantization,
         architecture,
         backend_label,
         workspace,
@@ -557,6 +569,20 @@ fn resolve_workspace(cli: Option<PathBuf>) -> Result<PathBuf> {
     Ok(workspace)
 }
 
+/// Whether a model label already names a tag of its own — the
+/// `<user>/<model>:<quant>` spelling `--model` accepts (see
+/// [`orangu::model_spec::ModelGroup::matches_label`]) — so the startup banner
+/// appends the resolved quantization to a bare label only, never producing
+/// `user/model:Q4_K_M:Q4_K_M`. Looked for in the last path segment rather
+/// than the whole string, so a `:` somewhere in a directory name along a
+/// model *path* isn't read as a tag.
+fn label_carries_tag(label: &str) -> bool {
+    label
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|last| last.contains(':'))
+}
+
 /// Detach from the controlling terminal and continue running in the
 /// background. Only the final, fully-detached process returns `Ok(())`; the
 /// original (and an intermediate) process exit here and never return.
@@ -577,6 +603,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
         engine,
         model_label,
+        quantization,
         architecture,
         backend_label,
         workspace,
@@ -597,6 +624,18 @@ async fn serve(prepared: Prepared) -> Result<()> {
         None => None,
     };
 
+    // How the model is *named* to a human — `MODEL:QUANT`, so which of a
+    // repo's quantizations is actually loaded is visible at a glance. Kept
+    // apart from `model_label`, which is this server's model *id* on the API
+    // (`/v1/models`, every response's `model` field) and in the slot-store
+    // fingerprint, and so has to stay exactly the string it was resolved
+    // from. Shared by the startup banner and the web UI, which say the same
+    // thing about the same process.
+    let model_display = match &quantization {
+        Some(quant) => format!("{model_label}:{quant}"),
+        None => model_label.clone(),
+    };
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
@@ -614,7 +653,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         print!("{}", orangu::hardware::format_report(&cpu, &gpus));
         println!();
         println!(
-            "Model      {model_label} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
+            "Model      {model_display} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
             engine.model.config().n_layer,
             engine.model.config().n_ctx_train,
         );
@@ -634,7 +673,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     if let Some(web_listener) = web_listener {
         let web_state = Arc::new(web::WebState {
             engine,
-            model_label,
+            model_display,
             architecture,
             backend_label,
             workspace,
@@ -1205,7 +1244,7 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace;
+    use super::{label_carries_tag, resolve_workspace};
 
     #[test]
     fn workspace_defaults_to_the_current_directory() {
@@ -1244,5 +1283,17 @@ mod tests {
             err.to_string().contains("does not exist"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// The banner appends the resolved quantization to a bare label, but a
+    /// label that already names a tag keeps exactly the spelling it was
+    /// started with.
+    #[test]
+    fn only_a_bare_label_gets_the_quantization_appended() {
+        assert!(!label_carries_tag("unsloth/gemma-4-E2B-it-GGUF"));
+        assert!(!label_carries_tag("gemma-4-E2B-it-Q4_K_M.gguf"));
+        assert!(label_carries_tag("unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"));
+        // A `:` above the file itself is part of a directory name, not a tag.
+        assert!(!label_carries_tag("/mnt/models:old/gemma-4-E2B-it.gguf"));
     }
 }
