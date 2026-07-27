@@ -684,17 +684,74 @@ pub struct ModelSupport {
     pub architecture: Option<String>,
     /// Whether this build recognises (and can load) that architecture.
     pub supported: bool,
+    /// The name of a tensor quantization this build has no dequantizer for
+    /// (e.g. `TQ1_0`), when the group carries one — checked across *every*
+    /// shard, since a split model's later shards can introduce a type shard
+    /// 1 never uses. `None` when every tensor type is readable.
+    ///
+    /// Kept separate from [`ModelSupport::supported`] so the `SUPPORTED`
+    /// cell can say *which* of the two reasons applies: an architecture
+    /// this build doesn't implement is a different problem from a
+    /// quantization it can't decode, and only the latter is fixed by
+    /// downloading a different file of the same model.
+    pub unsupported_quant: Option<String>,
 }
 
 impl ModelSupport {
-    /// The `SUPPORTED` cell text, e.g. `Yes (llama)` or `No (glm-dsa)`.
+    /// Whether this build can actually load the model — a recognised
+    /// architecture *and* no unreadable tensor type.
+    pub fn loadable(&self) -> bool {
+        self.supported && self.unsupported_quant.is_none()
+    }
+
+    /// The `SUPPORTED` cell text, e.g. `Yes (llama)`, `No (glm-dsa)`, or
+    /// `No (llama, TQ1_0)` when the architecture is fine but a tensor type
+    /// isn't.
     fn cell(&self) -> String {
         let arch = self.architecture.as_deref().unwrap_or("unknown");
-        if self.supported {
-            format!("Yes ({arch})")
-        } else {
-            format!("No ({arch})")
+        match (&self.unsupported_quant, self.supported) {
+            (Some(quant), true) => format!("No ({arch}, {quant})"),
+            (Some(quant), false) => format!("No ({arch}, {quant})"),
+            (None, true) => format!("Yes ({arch})"),
+            (None, false) => format!("No ({arch})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod support_cell_tests {
+    use super::ModelSupport;
+
+    fn support(arch: &str, supported: bool, quant: Option<&str>) -> ModelSupport {
+        ModelSupport {
+            architecture: Some(arch.to_string()),
+            supported,
+            unsupported_quant: quant.map(str::to_string),
+        }
+    }
+
+    /// The distinction the cell exists to draw: a readable architecture in
+    /// an unreadable quantization is *not* the same as an unimplemented
+    /// architecture, and only the first is worth re-downloading a different
+    /// file for. Before the quant check existed the first case rendered as
+    /// a plain `Yes (llama)` and then failed at load.
+    #[test]
+    fn cell_distinguishes_a_bad_quant_from_a_bad_architecture() {
+        assert_eq!(support("llama", true, None).cell(), "Yes (llama)");
+        assert_eq!(
+            support("llama", true, Some("TQ1_0")).cell(),
+            "No (llama, TQ1_0)"
+        );
+        assert_eq!(support("glm-dsa", false, None).cell(), "No (glm-dsa)");
+    }
+
+    /// `loadable()` is what greys the row and gates the pickers, so it has
+    /// to fail on *either* reason, not just the architecture.
+    #[test]
+    fn loadable_requires_both_a_known_arch_and_a_readable_quant() {
+        assert!(support("llama", true, None).loadable());
+        assert!(!support("llama", true, Some("TQ1_0")).loadable());
+        assert!(!support("glm-dsa", false, None).loadable());
     }
 }
 
@@ -819,7 +876,7 @@ pub fn format_groups(
                 format_bytes(group.size_bytes),
             )
         };
-        let unsupported = show_support && !support[index].supported;
+        let unsupported = show_support && !support[index].loadable();
         if unsupported && colorize {
             out.push_str(&format!("{ANSI_DIM}{row}{ANSI_RESET}\n"));
         } else {

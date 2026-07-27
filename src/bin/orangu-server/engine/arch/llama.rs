@@ -71,6 +71,52 @@ pub struct LlamaModel {
     output_norm: Vec<f32>,
     output_weight: QuantMatrix,
     layers: Vec<LlamaLayer>,
+    /// `rope_freqs.weight` (`[rope_dim / 2]`) — the per-pair frequency
+    /// divisor a Llama-3.1/3.2 checkpoint carries because its RoPE uses
+    /// Meta's `"llama3"` scaling, which `convert_hf_to_gguf.py` bakes into
+    /// this tensor at conversion time rather than leaving as scalar
+    /// hyperparameters for the runtime to re-derive.
+    ///
+    /// Upstream applies it unconditionally when present:
+    /// `llama_model::get_rope_factors` returns `layers[il].rope_freqs`
+    /// from its *first* branch, before any context-length test, and
+    /// `src/models/llama.cpp` hands the result to `ggml_rope_ext` as
+    /// `freq_factors` for both Q and K.
+    ///
+    /// `None` for every checkpoint without the tensor — plain Llama 2,
+    /// Qwen2/Qwen3, Mistral, qwen3vl — which is why loading it is purely
+    /// additive: those models rotate exactly as they did before.
+    ///
+    /// Ignoring it is not a subtle quality regression. Llama-3.2-1B answers
+    /// "What is the capital of France?" with `"I am I am I am I am"` when
+    /// this is left unapplied, and correctly when it is.
+    rope_freq_factors: Option<Vec<f32>>,
+    /// Rotary width, base and pairing, bundled so the rope call doesn't
+    /// take nine positional arguments. `arch::mistral` builds a richer one
+    /// of these for YaRN; nothing this module serves needs that.
+    rope: tensor::RopeParams,
+}
+
+/// `llama_model_rope_type`'s answer (`llama.cpp/src/llama-model.cpp`) for
+/// the architectures `engine::loader::LLAMA_STYLE_ARCHITECTURES` routes
+/// here.
+///
+/// `llama` sits in upstream's `LLAMA_ROPE_TYPE_NORM` arm ("use what we call
+/// a normal RoPE, operating on pairs of consecutive head values"), together
+/// with `mistral`; `qwen2`/`qwen3`/`qwen3vl` sit in the
+/// `LLAMA_ROPE_TYPE_NEOX` one ("the pairs of head values are offset by
+/// n_rot/2"). Treating them alike — which this module did, rotating
+/// everything NEOX-style — leaves Qwen correct and every Llama checkpoint
+/// quietly wrong: `Qcur` matches real llama.cpp to 5 significant figures
+/// *before* RoPE and comes out at `-354.6` against upstream's `6.66`
+/// after. Unknown architectures keep the previous NEOX default rather than
+/// failing to load, since that is the majority answer upstream and the
+/// behavior everything here already had.
+fn rope_layout_for(architecture: &str) -> tensor::RopeLayout {
+    match architecture {
+        "llama" | "mistral" => tensor::RopeLayout::Norm,
+        _ => tensor::RopeLayout::Neox,
+    }
 }
 
 impl LlamaModel {
@@ -137,6 +183,29 @@ impl LlamaModel {
             });
         }
 
+        let rope_freq_factors = if loaded.has_tensor("rope_freqs.weight") {
+            let (factors, _) = loaded
+                .tensor("rope_freqs.weight")
+                .context("loading rope_freqs.weight")?;
+            anyhow::ensure!(
+                factors.len() >= config.rope_dim / 2,
+                "rope_freqs.weight has {} entries, need {} for rope.dimension_count = {}",
+                factors.len(),
+                config.rope_dim / 2,
+                config.rope_dim,
+            );
+            Some(factors)
+        } else {
+            None
+        };
+
+        let rope_layout = rope_layout_for(&config.architecture);
+        let rope = tensor::RopeParams {
+            rope_dim: config.rope_dim,
+            freq_base: config.rope_freq_base,
+            layout: rope_layout,
+            ..tensor::RopeParams::default()
+        };
         Ok(Self {
             config,
             backend,
@@ -144,11 +213,13 @@ impl LlamaModel {
             output_norm,
             output_weight,
             layers,
+            rope_freq_factors,
+            rope,
         })
     }
 
     fn head_dim(&self) -> usize {
-        self.config.n_embd / self.config.n_head
+        self.config.head_dim
     }
 }
 
@@ -240,21 +311,21 @@ impl LlamaModel {
             let layer_cache = &mut cache.layers[layer_idx];
             for t in 0..n_tokens {
                 let pos = start_pos + t;
-                tensor::rope_apply_inplace(
+                tensor::rope_apply_params_inplace(
                     &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
                     n_head,
                     head_dim,
-                    cfg.rope_dim,
                     pos,
-                    cfg.rope_freq_base,
+                    self.rope_freq_factors.as_deref(),
+                    &self.rope,
                 );
-                tensor::rope_apply_inplace(
+                tensor::rope_apply_params_inplace(
                     &mut k[t * kv_dim..(t + 1) * kv_dim],
                     n_head_kv,
                     head_dim,
-                    cfg.rope_dim,
                     pos,
-                    cfg.rope_freq_base,
+                    self.rope_freq_factors.as_deref(),
+                    &self.rope,
                 );
                 layer_cache.push(
                     &k[t * kv_dim..(t + 1) * kv_dim],
@@ -357,6 +428,118 @@ impl ModelForward for LlamaModel {
 mod real_model_tests {
     use super::*;
     use crate::engine::loader::PoolingType;
+
+    /// End-to-end greedy decode against a real Llama-3-family `.gguf`
+    /// (`bartowski/Llama-3.2-1B-Instruct-GGUF` and its 3B sibling are what
+    /// this was verified against, every published quantization of each).
+    ///
+    /// This file's forward pass is shared by five `general.architecture`
+    /// values, so most of it is already exercised by other models — what a
+    /// Llama-3.2 checkpoint specifically adds is a head dimension that is
+    /// *not* implied by the usual `n_embd / n_head` reading of a GGUF
+    /// (`llama.attention.key_length`/`value_length` are set explicitly),
+    /// tied output embeddings on the 1B, and an `IQ3_S`-carrying
+    /// quantization (`IQ3_M`) that no other model in this suite reaches.
+    ///
+    /// The assertion is on *text*, not logits, for the reason spelled out in
+    /// `arch::phi`'s equivalent test: a wrong-but-plausible forward pass
+    /// produces fluent output that a tolerance-based logit check can be
+    /// talked into accepting, while a factual one-word answer cannot survive
+    /// a genuinely broken attention or FFN.
+    ///
+    /// The prompt comes from the model's own `tokenizer.chat_template`,
+    /// rendered the way `http::openai` renders it (`add_generation_prompt`,
+    /// the vocab's own BOS/EOS text, then `encode(.., add_bos: false)`
+    /// because the template emits `{{- bos_token }}` itself). Hand-writing
+    /// the `<|start_header_id|>` framing instead is what an earlier version
+    /// of this test did, and it is *wrong in a way that looks right*: Llama
+    /// 3.2's template unconditionally injects a `system` block ("Cutting
+    /// Knowledge Date… Today Date…") even when the caller passes no system
+    /// message, and without it the 1B answers "What is the capital of
+    /// France?" with `"I hope that the capital\nThe capital\nThe"` — a
+    /// failure that looks exactly like a broken forward pass but is purely
+    /// a missing preamble. Rendering the real template is also what the
+    /// server does, so this exercises the path users actually hit.
+    ///
+    /// Run with `ORANGU_TEST_LLAMA_MODEL=/path/to/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+    /// cargo test --release --bin orangu-server real_model_tests -- --ignored`.
+    #[test]
+    #[ignore]
+    fn llama3_answers_a_factual_question() {
+        let path = std::env::var("ORANGU_TEST_LLAMA_MODEL").expect("set ORANGU_TEST_LLAMA_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        // Any architecture this module serves — the test is about the
+        // shared forward pass, and `mistral3` exercises strictly more of it
+        // (YaRN, a head_dim that isn't n_embd/n_head, temperature scaling).
+        assert!(
+            matches!(
+                loaded.config.architecture.as_str(),
+                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3vl"
+            ),
+            "unexpected architecture {}",
+            loaded.config.architecture
+        );
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let tokenizer =
+            crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let model =
+            LlamaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+
+        let template_source = gguf
+            .metadata
+            .iter()
+            .find_map(|(k, v)| match (k.as_str(), v) {
+                ("tokenizer.chat_template", orangu::gguf::GgufValue::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("model has a chat template");
+        let prompt = crate::engine::chat_template::ChatTemplate::new(template_source)
+            .render(
+                &[crate::engine::chat_template::ChatMessage {
+                    role: "user".to_string(),
+                    content: "What is the capital of France? Answer in one word.".to_string(),
+                }],
+                true,
+                tokenizer
+                    .bos_token
+                    .and_then(|id| tokenizer.token_text(id))
+                    .unwrap_or(""),
+                tokenizer
+                    .eos_token
+                    .and_then(|id| tokenizer.token_text(id))
+                    .unwrap_or(""),
+                None,
+            )
+            .expect("render chat template");
+        let tokens = tokenizer.encode(&prompt, false);
+        let mut cache = model.new_kv_cache(tokens.len() + 16);
+        let mut logits = model.forward(&mut cache, &tokens, 0, 0).expect("prefill");
+
+        let stop = tokenizer.stop_token_ids();
+        let mut generated = Vec::new();
+        for step in 0..16 {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).expect("logits are finite"))
+                .expect("non-empty logits")
+                .0 as u32;
+            if stop.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            logits = model
+                .forward(&mut cache, &[next], tokens.len() + step, 0)
+                .expect("decode");
+        }
+
+        let text = tokenizer.decode(&generated);
+        assert!(
+            text.contains("Paris"),
+            "expected the answer to name Paris, got {text:?}"
+        );
+    }
 
     /// Cross-check against real llama.cpp (`mradermacher/Qwen3-VL-
     /// Embedding-8B-GGUF:Q4_K_M`, `llama-server --embedding --pooling

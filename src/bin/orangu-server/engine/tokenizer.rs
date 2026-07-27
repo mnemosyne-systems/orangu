@@ -79,6 +79,81 @@ const NO_TOKEN: u32 = u32::MAX;
 /// space attached to the following word).
 const SPLIT_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
 
+/// Llama 3's pre-tokenizer (`tokenizer.ggml.pre` = `llama3`/`llama-bpe`/…),
+/// transcribed from upstream `llama.cpp`'s own
+/// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` arm in `src/llama-vocab.cpp`.
+///
+/// The load-bearing difference from [`SPLIT_PATTERN`] is `\p{N}{1,3}`:
+/// digits split into runs of **at most three**, and with no optional
+/// leading space. Under the generic pattern, ` ?\p{N}+` swallows `2023` as
+/// one chunk that BPE then merges to `20`+`23`, where Llama 3 produces
+/// `202`+`3`. That is not a harmless difference in an equally-valid
+/// segmentation: Llama 3.2's chat template injects `Cutting Knowledge Date:
+/// December 2023` / `Today Date: …` into the system block of *every*
+/// request, so mis-tokenized digits reached the model on every single chat
+/// turn, and the 1B/3B Instruct models answered "What is the capital of
+/// France?" by echoing dates back (`"The 2021\nThe\nThe"`) instead of
+/// answering.
+///
+/// As with [`SPLIT_PATTERN`], upstream's trailing-whitespace alternative
+/// `\s+(?!\S)` is dropped — the `regex` crate has no look-around — leaving
+/// the same minor difference in how a run of 2+ spaces before a word
+/// splits.
+const SPLIT_PATTERN_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// GPT-4o's pre-tokenizer (`tokenizer.ggml.pre` = `gpt-4o`, e.g.
+/// Phi-4-mini), from upstream's `LLAMA_VOCAB_PRE_TYPE_GPT4O` arm. Shares
+/// `\p{N}{1,3}` with [`SPLIT_PATTERN_LLAMA3`] and additionally splits
+/// letter runs on an upper/lower-case boundary.
+const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// Mistral's "tekken" pre-tokenizer (`tokenizer.ggml.pre = "tekken"`, e.g.
+/// `Ministral-3-3B-Instruct`), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_TEKKEN` arm. Transcribed from the *original*
+/// regex upstream keeps in a comment above the active one — the active
+/// form only exists to work around C++ `std::regex` lacking `\p{Lu}`, using
+/// look-ahead this crate can't compile either, whereas the original's
+/// Unicode classes are directly supported here.
+///
+/// Note `\p{N}` (a **single** digit), not `\p{N}{1,3}` as llama3/gpt-4o
+/// use, and no contraction alternatives at all. Like llama3 it sets
+/// `ignore_merges`. Upstream also sets `clean_spaces = false`, which needs
+/// no code here: that cleanup pass is `"gemma4"`-only in this module, so a
+/// `"gpt2"`-shaped vocab already skips it.
+const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` (its own list, verbatim). Every one of
+/// them also sets `ignore_merges`.
+const LLAMA3_PRE_TYPES: &[&str] = &[
+    "llama3",
+    "llama-v3",
+    "llama-bpe",
+    "falcon3",
+    "falcon-h1",
+    "pixtral",
+    "midm-2.0",
+    "lfm2",
+    "jina-v5-nano",
+];
+
+/// Picks the pre-tokenizer split pattern and upstream's `ignore_merges`
+/// flag for a `tokenizer.ggml.pre` value, falling back to the generic
+/// GPT-2-ish pattern for anything not specifically handled (the behavior
+/// every `"gpt2"`-model vocab got before per-`pre` patterns existed).
+fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
+    if LLAMA3_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_LLAMA3, true);
+    }
+    if pre == "gpt-4o" {
+        return (SPLIT_PATTERN_GPT4O, false);
+    }
+    if pre == "tekken" {
+        return (SPLIT_PATTERN_TEKKEN, true);
+    }
+    (SPLIT_PATTERN, false)
+}
+
 /// SentencePiece's word-boundary marker (U+2581, "▁") — gemma4-family
 /// vocabs escape every literal space to this before running BPE merges, and
 /// unescape it back on the way out.
@@ -100,6 +175,11 @@ pub struct Tokenizer {
     byte_to_char: [char; 256],
     char_to_byte: FxHashMap<char, u8>,
     split_re: Regex,
+    /// Upstream's `vocab.get_ignore_merges()`: when a whole pre-tokenized
+    /// word is *itself* a vocab token, emit it directly instead of running
+    /// the merge loop over its bytes. Set for every `LLAMA3_PRE_TYPES`
+    /// vocab; false elsewhere, which is exactly the previous behavior.
+    ignore_merges: bool,
     /// Control/special tokens (`tokenizer.ggml.token_type` == `CONTROL`),
     /// longest-string-first, so a literal occurrence in text (e.g. a chat
     /// template's `<|start_header_id|>`) is recognized as one atomic token
@@ -266,6 +346,17 @@ impl Tokenizer {
             "llama" => VocabKind::SpmUnigram,
             _ => VocabKind::Gpt2Byte,
         };
+        // The pre-tokenizer split pattern is a property of `tokenizer.ggml.
+        // pre`, not of `tokenizer.ggml.model` — every vocab below is still
+        // `"gpt2"`-shaped, they just disagree on where word boundaries fall.
+        let (split_pattern, ignore_merges) = match vocab_kind {
+            VocabKind::Gpt2Byte => split_pattern_for_pre(
+                metadata_string(gguf, "tokenizer.ggml.pre")
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            _ => (SPLIT_PATTERN, false),
+        };
         let scores = f32_array(gguf, "tokenizer.ggml.scores").unwrap_or_default();
         let add_space_prefix =
             metadata_u32(gguf, "tokenizer.ggml.add_space_prefix").is_none_or(|v| v != 0);
@@ -350,7 +441,8 @@ impl Tokenizer {
             merge_map,
             byte_to_char,
             char_to_byte,
-            split_re: Regex::new(SPLIT_PATTERN).context("building tokenizer split regex")?,
+            split_re: Regex::new(split_pattern).context("building tokenizer split regex")?,
+            ignore_merges,
             special_tokens,
             special_ids,
             bos_token,
@@ -422,8 +514,25 @@ impl Tokenizer {
     }
 
     fn encode_plain_byte(&self, text: &str, ids: &mut Vec<u32>) {
+        // Reused across words so `ignore_merges`' whole-word lookup doesn't
+        // allocate per pre-token; untouched entirely when the flag is off.
+        let mut mapped = String::new();
         for word_match in self.split_re.find_iter(text) {
-            self.bpe_merge_word(word_match.as_str(), false, ids);
+            let word = word_match.as_str();
+            // Upstream's `llm_tokenizer_bpe_session::tokenize`: with
+            // `ignore_merges`, a pre-tokenized word that is already a vocab
+            // token is emitted as that token rather than being rebuilt from
+            // its bytes by the merge loop (which can land on a different,
+            // equally-mergeable split).
+            if self.ignore_merges {
+                mapped.clear();
+                mapped.extend(word.bytes().map(|b| self.byte_to_char[b as usize]));
+                if let Some(&id) = self.token_to_id.get(&mapped) {
+                    ids.push(id);
+                    continue;
+                }
+            }
+            self.bpe_merge_word(word, false, ids);
         }
     }
 

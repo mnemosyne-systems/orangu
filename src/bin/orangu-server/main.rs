@@ -47,6 +47,7 @@ use config::{
 use engine::arch::ModelForward;
 use engine::arch::gemma::GemmaModel;
 use engine::arch::llama::LlamaModel;
+use engine::arch::mistral::MistralModel;
 use engine::arch::phi::PhiModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
@@ -439,6 +440,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         ArchFamily::Phi3 => Arc::new(
             PhiModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
+        ArchFamily::Mistral3 => Arc::new(
+            MistralModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
+        ),
     };
 
     let slots = SlotPool::new(conf.slots);
@@ -762,13 +766,27 @@ fn model_support(
     groups
         .iter()
         .map(|group| {
-            let (architecture, supported) = GgufFile::open(&group.representative_path)
-                .ok()
-                .map(|gguf| engine::loader::model_load_support(&gguf))
-                .unwrap_or((None, false));
+            // Every shard, not just the representative: a split model's
+            // later shards carry their own tensor directory, and can use a
+            // quantization shard 1 never does. Headers only — no tensor
+            // data is read, so this stays cheap even for a many-shard model.
+            let mut architecture = None;
+            let mut unsupported_quant = None;
+            for path in &group.paths {
+                let Ok(gguf) = GgufFile::open(path) else {
+                    continue;
+                };
+                let (arch, bad_quant) = engine::loader::model_load_support(&gguf);
+                architecture = architecture.or(arch);
+                unsupported_quant = unsupported_quant.or(bad_quant);
+            }
+            let supported = architecture
+                .as_deref()
+                .is_some_and(|arch| engine::loader::resolve_arch_family(arch).is_ok());
             orangu::model_spec::ModelSupport {
                 architecture,
                 supported,
+                unsupported_quant,
             }
         })
         .collect()

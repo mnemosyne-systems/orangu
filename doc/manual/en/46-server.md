@@ -637,7 +637,7 @@ compatible API above, and only reachable at all when `web` is configured:
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for five
+Text-in/text-out GGUF chat, completion, and embedding models, for six
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -649,10 +649,17 @@ shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing), and Phi-3
 (`phi3`, covering Phi-3 and Phi-4-mini — Llama-style attention and SwiGLU,
 but with the query/key/value projections fused into one `attn_qkv` tensor,
 the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
-frequency factors on a partially-rotated head) — using
-`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` tensors. Weight matrices and embedding tables are read lazily from the
+frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
+e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
+width read from `attention.key_length` rather than derived from
+`n_embd / n_head`, and an attention temperature scale) — using
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
-eagerly resident, so even large models fit in modest RAM.
+eagerly resident, so even large models fit in modest RAM. A model split
+across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
+shard — the shard count comes from the `split.count` metadata key, and each
+shard is mapped separately.
 
 Not yet built, and out of scope for now: multimodal input, `/infill`,
 `/rerank`, LoRA hot-swap, and slot save/restore.

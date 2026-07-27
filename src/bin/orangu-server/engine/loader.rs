@@ -38,6 +38,16 @@ pub struct ModelConfig {
     pub n_layer: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
+    /// Per-head width — `<arch>.attention.key_length` when the file sets it,
+    /// otherwise the usual `n_embd / n_head`.
+    ///
+    /// These are **not** always the same number, and assuming they are is a
+    /// silent shape error rather than a load failure. `Ministral-3-3B`
+    /// (`mistral3`) has `n_embd = 3072` and `n_head = 32`, which would imply
+    /// 96, but declares `key_length = 128` — and its `attn_q.weight` really
+    /// is `[3072, 4096]` (`n_head * 128`), not `[3072, 3072]`. Upstream reads
+    /// this into `hparams.n_embd_head_k` with the same fallback.
+    pub head_dim: usize,
     pub n_ctx_train: usize,
     /// RoPE rotary dimension — defaults to `n_embd / n_head` when the file
     /// doesn't set `<arch>.rope.dimension_count`.
@@ -92,6 +102,11 @@ pub enum ArchFamily {
     /// frequency factors, and a RoPE magnitude factor. See
     /// `engine::arch::phi`.
     Phi3,
+    /// Mistral 3 / Ministral-3 — `arch::llama`'s block shape plus YaRN RoPE
+    /// scaling, NORM rope pairing, a head width read from
+    /// `attention.key_length` rather than derived, and an attention
+    /// temperature scale. See `engine::arch::mistral`.
+    Mistral3,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -116,6 +131,9 @@ pub enum ArchFamily {
 /// video) input itself is out of scope, per this project's existing
 /// deferred-multimodal decision.
 const LLAMA_STYLE_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "mistral", "qwen3vl"];
+/// `mistral3` (e.g. `unsloth/Ministral-3-3B-Instruct-2512-GGUF`) — see
+/// [`ArchFamily::Mistral3`] and `engine::arch::mistral`.
+const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];
 /// `gemma-embedding` (e.g. `ggml-org/embeddinggemma-300M-GGUF`) is the
 /// bidirectional-attention, embeddings-only sibling of the causal
 /// gemma3/gemma4 decoders — same per-layer block shape (QK-norm, sandwich
@@ -156,6 +174,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if PHI3_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Phi3);
     }
+    if MISTRAL_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Mistral3);
+    }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
@@ -165,6 +186,7 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(QWEN35MOE_ARCHITECTURES)
             .chain(QWEN35_ARCHITECTURES)
             .chain(PHI3_ARCHITECTURES)
+            .chain(MISTRAL_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
@@ -178,30 +200,43 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
 /// the architecture *string*: a model whose architecture is recognised can
 /// still carry tensors this build rejects when it goes to build the model,
 /// so a bare `resolve_arch_family` "yes" would promise a load that then
-/// fails. There is no such case for the recognised architectures today —
-/// gemma MoE checkpoints (`gemma-4-26B-A4B`, `ffn_gate_inp` present) load via
-/// [`super::arch::gemma`]'s routed-expert path — so this mirrors
-/// [`resolve_arch_family`].
+/// fails.
 ///
-/// Returns `(architecture, supported)`: `architecture` is `None` only when
-/// the file has no `general.architecture` at all.
-pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, bool) {
+/// Both halves are checked. Beyond the architecture string, every tensor's
+/// `ggml_type` must be one [`quant::dequantize`] can actually read: a
+/// recognised architecture quantized to a type this build lacks (an
+/// `unsloth` `IQ`-mix is the usual way to meet one) loads far enough to
+/// report `Yes` from its header and then fails on the first tensor. Only
+/// the tensor *directory* is consulted, never the data, so this stays as
+/// cheap as reading the header.
+///
+/// Returns `(architecture, unsupported_quant)`. `architecture` is `None`
+/// only when the file has no `general.architecture` at all;
+/// `unsupported_quant` names the first tensor type this build can't decode,
+/// and is `None` when every type is readable.
+pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
     let architecture = metadata_string(gguf, "general.architecture");
-    let Some(arch) = architecture.as_deref() else {
-        return (None, false);
-    };
-    let supported = resolve_arch_family(arch).is_ok();
-    (architecture, supported)
+    let unsupported = gguf
+        .tensors
+        .iter()
+        .find(|t| !quant::supports_type(t.ggml_type))
+        .map(|t| orangu::gguf::ggml_type_name(t.ggml_type));
+    (architecture, unsupported)
 }
 
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct TensorLocation {
     ggml_type: u32,
     dims: Vec<u64>,
-    /// Absolute byte offset into the mmap'd file.
+    /// Absolute byte offset into [`TensorLocation::mmap`].
     start: usize,
     len: usize,
+    /// The shard this tensor's bytes live in. A single-file model has one
+    /// mmap shared by every tensor; a split one (`model-00001-of-00003.gguf`
+    /// …) has a different mapping per shard, and each tensor's `start` is
+    /// relative to its own.
+    mmap: Arc<Mmap>,
 }
 
 pub struct LoadedModel {
@@ -211,7 +246,6 @@ pub struct LoadedModel {
     /// `engine::arch::gemma`) reads its own further hyperparameters
     /// (per-layer arrays, architecture-specific keys) directly from this.
     pub metadata: Vec<(String, GgufValue)>,
-    mmap: Arc<Mmap>,
     tensors: HashMap<String, TensorLocation>,
 }
 
@@ -375,6 +409,65 @@ impl ExpertQuantMatrix {
     }
 }
 
+/// Every file making up this model, in shard order — just `[path]` for an
+/// ordinary single-file GGUF.
+///
+/// A model too large for one file is written as `<prefix>-00001-of-000NN.
+/// gguf` … `<prefix>-000NN-of-000NN.gguf`, with the hyperparameters and most
+/// tensors in shard 1 and the remaining tensors spread across the rest —
+/// `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M` keeps `output_norm.weight`
+/// and the last 59 tensors in shard 2. Mapping only the named file therefore
+/// doesn't fail cleanly; it loads a model that is *missing tensors*, and the
+/// first architecture module to ask for one reports it as absent.
+///
+/// The shard count comes from `split.count` (upstream's own `LLM_KV_SPLIT_
+/// COUNT`) rather than from globbing the directory, so a stray file that
+/// merely looks like a shard can't join the set. The filename pattern is
+/// upstream's `llama_split_path` format, `%s-%05d-of-%05d.gguf`.
+fn shard_paths(path: &Path, gguf: &GgufFile) -> Result<Vec<std::path::PathBuf>> {
+    let count = metadata_u64(gguf, "split.count").unwrap_or(0);
+    if count <= 1 {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("{} has no usable file name", path.display()))?;
+    // `<prefix>-00001-of-000NN.gguf` — split off the last two fields.
+    let stem = name
+        .strip_suffix(".gguf")
+        .ok_or_else(|| anyhow!("split model shard {name} is not a .gguf file"))?;
+    let (prefix, rest) = stem
+        .rsplit_once("-of-")
+        .and_then(|(head, tail)| head.rsplit_once('-').map(|(p, no)| (p, (no, tail))))
+        .ok_or_else(|| {
+            anyhow!(
+                "{name} declares split.count = {count} but isn't named \
+                 <prefix>-00001-of-{count:05}.gguf"
+            )
+        })?;
+    anyhow::ensure!(
+        rest.0.len() == 5 && rest.1.len() == 5,
+        "{name} declares split.count = {count} but its shard numbering isn't 5 digits"
+    );
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let paths: Vec<std::path::PathBuf> = (1..=count)
+        .map(|no| dir.join(format!("{prefix}-{no:05}-of-{count:05}.gguf")))
+        .collect();
+    for shard in &paths {
+        anyhow::ensure!(
+            shard.exists(),
+            "split model is missing shard {} of {count} ({})",
+            shard
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+            shard.display()
+        );
+    }
+    Ok(paths)
+}
+
 impl LoadedModel {
     pub fn open(path: &Path) -> Result<Self> {
         let gguf = GgufFile::open(path)?;
@@ -384,43 +477,78 @@ impl LoadedModel {
 
         let config = read_model_config(&gguf, &architecture)?;
 
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        // Safety: the file is opened read-only and not mutated by anything
-        // else for the lifetime of this mapping — the standard caveat of
-        // `Mmap::map` (another process truncating the file underneath us
-        // would be undefined behavior, same risk llama.cpp itself accepts
-        // when it mmaps a GGUF file).
-        let mmap = Arc::new(
-            unsafe { Mmap::map(&file) }
-                .with_context(|| format!("failed to mmap {}", path.display()))?,
-        );
-
+        // Every shard's tensor directory, merged. A single-file model is
+        // just the one-shard case of this.
         let mut tensors = HashMap::with_capacity(gguf.tensors.len());
-        for tensor in &gguf.tensors {
-            let element_count: u64 = tensor.dims.iter().product();
-            let len = quant::tensor_byte_size(tensor.ggml_type, element_count)
-                .with_context(|| format!("tensor '{}'", tensor.name))?
-                as usize;
-            let start = gguf.data_offset as usize + tensor.offset as usize;
-            if start + len > mmap.len() {
-                bail!("tensor '{}' extends past the end of the file", tensor.name);
+        let shards = shard_paths(path, &gguf)?;
+        let mut total_tensors = 0usize;
+        for (index, shard_path) in shards.iter().enumerate() {
+            // Shard 1's header is already parsed; the rest still need
+            // reading. Only shard 1 carries the model's hyperparameters —
+            // the others hold `split.*` and their own tensor directory.
+            let shard_gguf = if index == 0 {
+                None
+            } else {
+                Some(GgufFile::open(shard_path)?)
+            };
+            let shard_gguf = shard_gguf.as_ref().unwrap_or(&gguf);
+
+            let file = File::open(shard_path)
+                .with_context(|| format!("failed to open {}", shard_path.display()))?;
+            // Safety: the file is opened read-only and not mutated by anything
+            // else for the lifetime of this mapping — the standard caveat of
+            // `Mmap::map` (another process truncating the file underneath us
+            // would be undefined behavior, same risk llama.cpp itself accepts
+            // when it mmaps a GGUF file).
+            let mmap = Arc::new(
+                unsafe { Mmap::map(&file) }
+                    .with_context(|| format!("failed to mmap {}", shard_path.display()))?,
+            );
+
+            for tensor in &shard_gguf.tensors {
+                let element_count: u64 = tensor.dims.iter().product();
+                let len = quant::tensor_byte_size(tensor.ggml_type, element_count)
+                    .with_context(|| format!("tensor '{}'", tensor.name))?
+                    as usize;
+                let start = shard_gguf.data_offset as usize + tensor.offset as usize;
+                if start + len > mmap.len() {
+                    bail!(
+                        "tensor '{}' extends past the end of {}",
+                        tensor.name,
+                        shard_path.display()
+                    );
+                }
+                total_tensors += 1;
+                tensors.insert(
+                    tensor.name.clone(),
+                    TensorLocation {
+                        ggml_type: tensor.ggml_type,
+                        dims: tensor.dims.clone(),
+                        start,
+                        len,
+                        mmap: mmap.clone(),
+                    },
+                );
             }
-            tensors.insert(
-                tensor.name.clone(),
-                TensorLocation {
-                    ggml_type: tensor.ggml_type,
-                    dims: tensor.dims.clone(),
-                    start,
-                    len,
-                },
+        }
+
+        // `split.tensors.count` is the whole model's tensor count, so this
+        // catches a shard that is present but truncated, or two shards that
+        // collide on a tensor name — either of which would otherwise surface
+        // much later as a confusing "model is missing tensor X".
+        if let Some(expected) = metadata_u64(&gguf, "split.tensors.count")
+            && total_tensors != expected as usize
+        {
+            bail!(
+                "split model has {total_tensors} tensors across {} shard(s), but its header \
+                 declares {expected}",
+                shards.len()
             );
         }
 
         Ok(Self {
             config,
             metadata: gguf.metadata,
-            mmap,
             tensors,
         })
     }
@@ -436,13 +564,33 @@ impl LoadedModel {
             .and_then(|(_, v)| v.as_u64())
     }
 
+    /// A `<arch>.<suffix>` string metadata value — e.g.
+    /// `rope.scaling.type`, which selects between an unscaled rope and
+    /// YaRN.
+    pub fn metadata_string(&self, suffix: &str) -> Option<String> {
+        let key = format!("{}.{suffix}", self.config.architecture);
+        self.metadata.iter().find_map(|(k, v)| {
+            (*k == key).then_some(v).and_then(|v| match v {
+                GgufValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    /// A `<arch>.<suffix>` numeric metadata value as `f32`.
+    ///
+    /// Integer-typed values are accepted too, not just `F32`/`F64`: a
+    /// conversion script is free to write a whole-numbered hyperparameter
+    /// (`mistral3.rope.scaling.yarn_beta_fast = 32`) as an integer, and
+    /// silently returning `None` for it would fall back to a default that
+    /// happens to be plausible — the worst kind of wrong.
     pub fn metadata_f32(&self, suffix: &str) -> Option<f32> {
         let key = format!("{}.{suffix}", self.config.architecture);
         self.metadata.iter().find_map(|(k, v)| {
             (*k == key).then_some(v).and_then(|v| match v {
                 GgufValue::F32(f) => Some(*f),
                 GgufValue::F64(f) => Some(*f as f32),
-                _ => None,
+                other => other.as_u64().map(|i| i as f32),
             })
         })
     }
@@ -468,7 +616,7 @@ impl LoadedModel {
             .tensors
             .get(name)
             .ok_or_else(|| anyhow!("model is missing tensor '{name}'"))?;
-        let bytes = &self.mmap[loc.start..loc.start + loc.len];
+        let bytes = &loc.mmap[loc.start..loc.start + loc.len];
         let element_count: u64 = loc.dims.iter().product();
         let values = quant::dequantize(loc.ggml_type, bytes, element_count as usize)
             .with_context(|| format!("tensor '{name}'"))?;
@@ -505,7 +653,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(QuantMatrix {
-            mmap: self.mmap.clone(),
+            mmap: loc.mmap.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
             row_bytes,
@@ -539,7 +687,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(ExpertQuantMatrix {
-            mmap: self.mmap.clone(),
+            mmap: loc.mmap.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
             row_bytes,
@@ -606,9 +754,15 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
     if n_head == 0 || n_head_kv == 0 {
         bail!("{architecture}.attention.head_count(_kv) must be nonzero");
     }
-    let rope_dim = metadata_u64(gguf, &format!("{architecture}.rope.dimension_count"))
+    let head_dim = metadata_u64(gguf, &format!("{architecture}.attention.key_length"))
         .map(|v| v as usize)
         .unwrap_or(n_embd / n_head);
+    if head_dim == 0 {
+        bail!("{architecture}.attention.key_length must be nonzero");
+    }
+    let rope_dim = metadata_u64(gguf, &format!("{architecture}.rope.dimension_count"))
+        .map(|v| v as usize)
+        .unwrap_or(head_dim);
     let rope_freq_base =
         metadata_f32(gguf, &format!("{architecture}.rope.freq_base")).unwrap_or(10000.0);
     let rms_eps = metadata_f32(
@@ -631,6 +785,7 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
         n_layer,
         n_head,
         n_head_kv,
+        head_dim,
         n_ctx_train,
         rope_dim,
         rope_freq_base,
@@ -722,10 +877,10 @@ mod tests {
 
     #[test]
     fn model_load_support_accepts_a_dense_gemma_model() {
-        let (arch, supported) =
+        let (arch, bad_quant) =
             model_load_support(&header_only("gemma4", &["blk.0.ffn_gate.weight"]));
         assert_eq!(arch.as_deref(), Some("gemma4"));
-        assert!(supported);
+        assert_eq!(bad_quant, None);
     }
 
     #[test]
@@ -733,24 +888,39 @@ mod tests {
         // A gemma checkpoint with per-layer MoE expert tensors
         // (`gemma-4-26B-A4B`) — `arch::gemma` now loads the routed-expert
         // path, so it's reported supported under the plain architecture.
-        let (arch, supported) =
+        let (arch, bad_quant) =
             model_load_support(&header_only("gemma4", &["blk.0.ffn_gate_inp.weight"]));
         assert_eq!(arch.as_deref(), Some("gemma4"));
-        assert!(supported);
+        assert_eq!(bad_quant, None);
     }
 
     #[test]
     fn model_load_support_accepts_a_moe_qwen_model() {
-        let (arch, supported) =
+        let (arch, bad_quant) =
             model_load_support(&header_only("qwen35moe", &["blk.0.ffn_gate_inp.weight"]));
         assert_eq!(arch.as_deref(), Some("qwen35moe"));
-        assert!(supported);
+        assert_eq!(bad_quant, None);
+    }
+
+    /// A recognised architecture whose tensors are quantized to a type this
+    /// build has no dequantizer for. The header alone says `llama`, so
+    /// checking only the architecture would advertise a load that dies on
+    /// the first tensor — `TQ1_0` (ggml type 34) is such a type today.
+    #[test]
+    fn model_load_support_rejects_an_unreadable_tensor_type() {
+        let mut gguf = header_only("llama", &["blk.0.attn_q.weight"]);
+        gguf.tensors[0].ggml_type = 34;
+        let (arch, bad_quant) = model_load_support(&gguf);
+        assert_eq!(arch.as_deref(), Some("llama"));
+        assert_eq!(bad_quant.as_deref(), Some("TQ1_0"));
     }
 
     #[test]
     fn model_load_support_reports_an_unknown_arch_unsupported() {
-        let (arch, supported) = model_load_support(&header_only("glm-dsa", &[]));
+        let (arch, bad_quant) = model_load_support(&header_only("glm-dsa", &[]));
         assert_eq!(arch.as_deref(), Some("glm-dsa"));
-        assert!(!supported);
+        // Unreadable because of its *architecture*, not its tensor types.
+        assert_eq!(bad_quant, None);
+        assert!(resolve_arch_family("glm-dsa").is_err());
     }
 }

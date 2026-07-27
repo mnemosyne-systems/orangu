@@ -95,9 +95,35 @@ impl ChatTemplate {
     }
 }
 
+/// English abbreviated (`%b`) and full (`%B`) month names, indexed by
+/// month - 1. Hardcoded rather than locale-derived on purpose: a chat
+/// template's date line is model-facing text that the model was trained
+/// against in English, so rendering it in the host's locale would be a bug,
+/// not a feature.
+const MONTH_NAMES: [(&str, &str); 12] = [
+    ("Jan", "January"),
+    ("Feb", "February"),
+    ("Mar", "March"),
+    ("Apr", "April"),
+    ("May", "May"),
+    ("Jun", "June"),
+    ("Jul", "July"),
+    ("Aug", "August"),
+    ("Sep", "September"),
+    ("Oct", "October"),
+    ("Nov", "November"),
+    ("Dec", "December"),
+];
+
 /// A minimal `strftime`: only the handful of specifiers real templates
 /// actually use (`%Y-%m-%d` for a "knowledge cutoff" style date line), via
 /// `SystemTime` rather than pulling in a date/time crate for one function.
+///
+/// `%b`/`%B` are here because Llama 3.1/3.2's own chat template calls
+/// `strftime_now("%d %b %Y")` — an unhandled specifier isn't inert, it
+/// reaches the model verbatim: the rendered system block read `Today Date:
+/// 27 %b 2026`, tokenizing the literal `%`/`b` into the prompt of every
+/// chat request against those models.
 fn strftime_now(fmt: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -117,9 +143,19 @@ fn strftime_now(fmt: &str) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
-    fmt.replace("%Y", &y.to_string())
+    // `%B` before `%b` is irrelevant here (distinct keys), but `%%` is
+    // handled first and restored last so an escaped percent can't be
+    // re-interpreted as a specifier by a later replacement.
+    const PERCENT: &str = "\u{0}orangu-percent\u{0}";
+    let (abbrev, full) = MONTH_NAMES[(m as usize).clamp(1, 12) - 1];
+    fmt.replace("%%", PERCENT)
+        .replace("%Y", &y.to_string())
         .replace("%m", &format!("{m:02}"))
         .replace("%d", &format!("{d:02}"))
+        .replace("%e", &format!("{d:2}"))
+        .replace("%b", abbrev)
+        .replace("%B", full)
+        .replace(PERCENT, "%")
 }
 
 #[cfg(test)]
@@ -215,5 +251,37 @@ mod tests {
         let parts: Vec<&str> = out.split('-').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].len(), 4);
+    }
+
+    /// Llama 3.1/3.2's own chat template calls `strftime_now("%d %b %Y")`.
+    /// An unimplemented specifier is not inert — it reaches the model as a
+    /// literal `%b` inside the system block of every chat request — so the
+    /// assertion is that *no* unexpanded specifier survives, not merely
+    /// that the output is non-empty.
+    #[test]
+    fn strftime_now_expands_llama3_style_month_names() {
+        let out = strftime_now("%d %b %Y");
+        assert!(!out.contains('%'), "unexpanded specifier in {out:?}");
+        let parts: Vec<&str> = out.split(' ').collect();
+        assert_eq!(parts.len(), 3, "{out:?}");
+        assert!(
+            MONTH_NAMES.iter().any(|(abbrev, _)| *abbrev == parts[1]),
+            "{:?} is not an abbreviated month name",
+            parts[1]
+        );
+
+        let full = strftime_now("%B");
+        assert!(
+            MONTH_NAMES.iter().any(|(_, name)| *name == full),
+            "{full:?} is not a full month name"
+        );
+    }
+
+    /// An escaped `%%` must survive as a single literal `%` without its
+    /// output being rescanned — otherwise `%%b` would expand to a month.
+    #[test]
+    fn strftime_now_leaves_an_escaped_percent_alone() {
+        assert_eq!(strftime_now("100%%"), "100%");
+        assert_eq!(strftime_now("%%b"), "%b");
     }
 }

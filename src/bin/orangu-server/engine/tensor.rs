@@ -256,12 +256,39 @@ pub fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
 }
 
-/// Applies rotary position embedding (RoPE, NEOX/GPT-NeoX-style pairing —
-/// the convention llama.cpp's own GGUF tensors are laid out for) in place to
-/// `x`, one token's `[n_head, head_dim]` block, at absolute position `pos`.
-/// Only the leading `rope_dim` elements of each head rotate; any remainder
-/// (`head_dim > rope_dim`, e.g. some partial-RoPE models) passes through
-/// unchanged.
+/// Which two elements of a head RoPE rotates together — llama.cpp's own
+/// `LLAMA_ROPE_TYPE_NEOX` vs `LLAMA_ROPE_TYPE_NORM`, chosen **per
+/// architecture** by `llama_model_rope_type` (`src/llama-model.cpp`), not
+/// per file and not globally.
+///
+/// This is not a stylistic detail: the two conventions rotate *different
+/// pairs of numbers by the same angles*, so using the wrong one is silently
+/// wrong rather than an error. It degrades gracefully in the worst way —
+/// position 0 is the identity under both, and small positions rotate by
+/// small angles, so a short prompt still produces plausible text while a
+/// longer one collapses into repetition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeLayout {
+    /// Pairs offset by `rope_dim / 2`: element `i` with element `i +
+    /// rope_dim/2` (ggml's `rotate_pairs(n_dims, n_dims/2, ..)`). Used by
+    /// `qwen2`/`qwen3`/`qwen3vl`/`phi3`/`falcon` and the whole gemma family.
+    Neox,
+    /// Pairs of *consecutive* elements: `2p` with `2p+1` (ggml's
+    /// `rotate_pairs(n_dims, 1, .., scale = 1)`). Used by `llama` — every
+    /// Llama 1/2/3/3.1/3.2 checkpoint — plus `mistral`, `deci`, `granite`,
+    /// `cohere` and the other architectures in upstream's `NORM` arm.
+    Norm,
+}
+
+/// Applies rotary position embedding (RoPE) in place to `x`, one token's
+/// `[n_head, head_dim]` block, at absolute position `pos`, using NEOX
+/// pairing. Only the leading `rope_dim` elements of each head rotate; any
+/// remainder (`head_dim > rope_dim`, e.g. some partial-RoPE models) passes
+/// through unchanged.
+///
+/// See [`RopeLayout`] — this entry point is NEOX-only for the callers whose
+/// architecture is NEOX; a `llama`-architecture caller must go through
+/// [`rope_apply_layout_inplace`] with [`RopeLayout::Norm`].
 pub fn rope_apply_inplace(
     x: &mut [f32],
     n_head: usize,
@@ -331,22 +358,185 @@ pub fn rope_apply_mscale_inplace(
     freq_factors: Option<&[f32]>,
     attn_factor: f32,
 ) {
+    rope_apply_layout_inplace(
+        x,
+        n_head,
+        head_dim,
+        rope_dim,
+        pos,
+        freq_base,
+        freq_factors,
+        attn_factor,
+        RopeLayout::Neox,
+    );
+}
+
+/// The full RoPE: [`rope_apply_mscale_inplace`] plus an explicit
+/// [`RopeLayout`], for the architectures whose pairing isn't NEOX.
+///
+/// Both layouts use the *same* per-pair angle — pair `p` of `rope_dim/2`
+/// rotates by `pos * freq_base^(-2p/rope_dim) / freq_factors[p]` — and
+/// differ only in which two elements of the head that angle is applied to,
+/// exactly as ggml's own `rotate_pairs` does with its `n_offset`/`scale`
+/// arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_apply_layout_inplace(
+    x: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+    attn_factor: f32,
+    layout: RopeLayout,
+) {
+    rope_apply_params_inplace(
+        x,
+        n_head,
+        head_dim,
+        pos,
+        freq_factors,
+        &RopeParams {
+            rope_dim,
+            freq_base,
+            attn_factor,
+            layout,
+            ..RopeParams::default()
+        },
+    );
+}
+
+/// Everything that shapes a RoPE rotation, so the growing set of knobs
+/// travels as one value instead of nine positional arguments.
+///
+/// The defaults are the *unscaled* rope every non-YaRN model uses:
+/// `freq_scale = 1`, `ext_factor = 0`, `attn_factor = 1`. With
+/// `ext_factor == 0` the YaRN branch is skipped entirely and the result is
+/// bit-identical to the plain rope, which is what keeps every existing
+/// caller unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeParams {
+    pub rope_dim: usize,
+    pub freq_base: f32,
+    /// `1 / rope.scaling.factor` — how far positions are compressed. `1.0`
+    /// for an unscaled model.
+    pub freq_scale: f32,
+    /// YaRN interpolation strength (upstream's `cparams.yarn_ext_factor`):
+    /// `1.0` for a file declaring `rope.scaling.type = yarn`, `0.0` for
+    /// everything else, which disables the ramp and the mscale correction.
+    pub ext_factor: f32,
+    /// Magnitude scale applied to cos/sin (ggml's `mscale`).
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    /// `rope.scaling.original_context_length` — the context the model was
+    /// trained at before YaRN stretched it.
+    pub n_ctx_orig: usize,
+    pub layout: RopeLayout,
+}
+
+impl Default for RopeParams {
+    fn default() -> Self {
+        Self {
+            rope_dim: 0,
+            freq_base: 10000.0,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            n_ctx_orig: 0,
+            layout: RopeLayout::Neox,
+        }
+    }
+}
+
+/// ggml's `ggml_rope_yarn_corr_dim` — the pair index at which a rotation of
+/// `n_rot` full turns fits inside the original context.
+fn yarn_corr_dim(n_dims: usize, n_ctx_orig: usize, n_rot: f32, base: f32) -> f32 {
+    n_dims as f32 * (n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * base.ln())
+}
+
+/// ggml's `ggml_rope_yarn_corr_dims`: the `[low, high]` pair-index band over
+/// which YaRN ramps from pure interpolation to pure extrapolation.
+fn yarn_corr_dims(
+    n_dims: usize,
+    n_ctx_orig: usize,
+    base: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> (f32, f32) {
+    let start = yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, base).floor();
+    let end = yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, base).ceil();
+    (start.max(0.0), end.min(n_dims as f32 - 1.0))
+}
+
+/// The general RoPE: NEOX or NORM pairing, optional per-pair frequency
+/// divisors, and optional YaRN interpolation — a direct transcription of
+/// ggml's `ggml_rope_cache_init` + `rope_yarn` (`ggml-cpu/ops.cpp`).
+pub fn rope_apply_params_inplace(
+    x: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
+    pos: usize,
+    freq_factors: Option<&[f32]>,
+    params: &RopeParams,
+) {
     debug_assert_eq!(x.len(), n_head * head_dim);
+    let rope_dim = params.rope_dim;
     let half = rope_dim / 2;
+    let (corr_lo, corr_hi) = if params.ext_factor != 0.0 {
+        yarn_corr_dims(
+            rope_dim,
+            params.n_ctx_orig,
+            params.freq_base,
+            params.beta_fast,
+            params.beta_slow,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    // ggml folds this correction into mscale once per call, not per pair,
+    // and only when the YaRN ramp is active.
+    let mscale = if params.ext_factor != 0.0 {
+        params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
+    } else {
+        params.attn_factor
+    };
+
     for h in 0..n_head {
         let head = &mut x[h * head_dim..(h + 1) * head_dim];
         for i in 0..half {
-            let mut freq = freq_base.powf(-2.0 * i as f32 / rope_dim as f32);
+            let mut freq = params.freq_base.powf(-2.0 * i as f32 / rope_dim as f32);
             if let Some(ff) = freq_factors {
                 freq /= ff[i];
             }
-            let theta = pos as f32 * freq;
+            let theta_extrap = pos as f32 * freq;
+            let theta = if params.ext_factor != 0.0 {
+                // `rope_yarn_ramp`: 1 at the low end of the band (pure
+                // interpolation) falling to 0 above it.
+                let y = (i as f32 - corr_lo) / (corr_hi - corr_lo).max(0.001);
+                let ramp = 1.0 - y.clamp(0.0, 1.0);
+                let mix = ramp * params.ext_factor;
+                let theta_interp = params.freq_scale * theta_extrap;
+                theta_interp * (1.0 - mix) + theta_extrap * mix
+            } else {
+                params.freq_scale * theta_extrap
+            };
             let (sin, cos) = theta.sin_cos();
-            let (sin, cos) = (sin * attn_factor, cos * attn_factor);
-            let a = head[i];
-            let b = head[i + half];
-            head[i] = a * cos - b * sin;
-            head[i + half] = a * sin + b * cos;
+            let (sin, cos) = (sin * mscale, cos * mscale);
+            // NEOX rotates `i` against `i + rope_dim/2`; NORM rotates the
+            // consecutive pair `2i`/`2i+1`.
+            let (lo, hi) = match params.layout {
+                RopeLayout::Neox => (i, i + half),
+                RopeLayout::Norm => (2 * i, 2 * i + 1),
+            };
+            let a = head[lo];
+            let b = head[hi];
+            head[lo] = a * cos - b * sin;
+            head[hi] = a * sin + b * cos;
         }
     }
 }
@@ -530,6 +720,72 @@ mod tests {
             assert!(
                 (p * 1.1902381 - s).abs() < 1e-5,
                 "expected {p} * 1.1902381, got {s}"
+            );
+        }
+    }
+
+    /// `RopeLayout::Neox` must stay bit-identical to what the NEOX-only
+    /// implementation produced, since every gemma/qwen/phi caller and every
+    /// GPU cross-check in `engine::backend::vulkan` is calibrated against
+    /// it — the `llama` fix must not move any of them.
+    #[test]
+    fn rope_neox_layout_rotates_pairs_offset_by_half() {
+        let mut x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        rope_apply_layout_inplace(&mut x, 1, 8, 8, 3, 10000.0, None, 1.0, RopeLayout::Neox);
+        // Pair p rotates element p against p+4.
+        let mut expected = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for p in 0..4 {
+            let theta = 3.0 * 10000f32.powf(-2.0 * p as f32 / 8.0);
+            let (sin, cos) = theta.sin_cos();
+            let (a, b) = (expected[p], expected[p + 4]);
+            expected[p] = a * cos - b * sin;
+            expected[p + 4] = a * sin + b * cos;
+        }
+        for (got, want) in x.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-6, "{x:?} vs {expected:?}");
+        }
+    }
+
+    /// `RopeLayout::Norm` rotates *consecutive* pairs (`2p`, `2p+1`) — the
+    /// convention `llama`-architecture checkpoints are laid out for. It must
+    /// differ from NEOX, or the `llama` fix is a no-op.
+    #[test]
+    fn rope_norm_layout_rotates_consecutive_pairs() {
+        let mut x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        rope_apply_layout_inplace(&mut x, 1, 8, 8, 3, 10000.0, None, 1.0, RopeLayout::Norm);
+        let mut expected = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for p in 0..4 {
+            let theta = 3.0 * 10000f32.powf(-2.0 * p as f32 / 8.0);
+            let (sin, cos) = theta.sin_cos();
+            let (a, b) = (expected[2 * p], expected[2 * p + 1]);
+            expected[2 * p] = a * cos - b * sin;
+            expected[2 * p + 1] = a * sin + b * cos;
+        }
+        for (got, want) in x.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-6, "{x:?} vs {expected:?}");
+        }
+
+        let mut neox: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        rope_apply_layout_inplace(&mut neox, 1, 8, 8, 3, 10000.0, None, 1.0, RopeLayout::Neox);
+        assert!(
+            neox != x,
+            "NORM and NEOX must not coincide, or the llama fix does nothing"
+        );
+    }
+
+    /// Both layouts are pure rotations of *some* pair, so each leaves the
+    /// summed squared magnitude of the rotated block unchanged. Guards
+    /// against an indexing slip that drops or double-writes an element.
+    #[test]
+    fn rope_layouts_preserve_total_energy() {
+        for layout in [RopeLayout::Neox, RopeLayout::Norm] {
+            let mut x: [f32; 8] = [1.0, -2.0, 3.0, 4.0, -5.0, 6.0, 7.0, -8.0];
+            let before: f32 = x.iter().map(|v| v * v).sum();
+            rope_apply_layout_inplace(&mut x, 1, 8, 8, 7, 10000.0, None, 1.0, layout);
+            let after: f32 = x.iter().map(|v| v * v).sum();
+            assert!(
+                (before - after).abs() < 1e-3,
+                "{layout:?}: {before} vs {after}"
             );
         }
     }

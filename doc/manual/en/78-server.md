@@ -42,7 +42,7 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,qwen35moe,qwen35}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,qwen35moe,qwen35}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,cuda,opencl,rocm}.rs` —
   the `Backend` trait and its five implementors; see below.
@@ -464,19 +464,26 @@ deliberately doesn't decide *what* is supported: that judgement lives in
 `model_support` opens each group's representative file (header only — no
 tensor data, the same cheap read `show` does), calls `model_load_support`,
 and stores the result as one `model_spec::ModelSupport { architecture,
-supported }` per group before handing the slice to `format_groups`. An empty
+supported, unsupported_quant }` per group before handing the slice to
+`format_groups`. Every *shard* of a group is inspected, not just its
+representative file: a split model's later shards carry their own tensor
+directory and can use a quantization shard 1 never does. An empty
 slice omits the column entirely, which is what `format_list` (lib-side
 tests) and any caller without the loader pass.
 
 `model_load_support` is deliberately allowed to be *stricter* than
 `resolve_arch_family` (whose family tables are the single source of truth
 for the architecture *string*): a model whose architecture is recognised can
-still carry tensors the arch module rejects at build time, so a bare
-`resolve_arch_family` "yes" could promise a load that then fails. No
-recognised architecture hits that today, though — gemma MoE checkpoints
-(`gemma-4-26B-A4B`, `blk.{i}.ffn_gate_inp.weight` present) load via
-`arch::gemma`'s routed-expert path and report `Yes (gemma4)`, so
-`model_load_support` just mirrors `resolve_arch_family`.
+still carry tensors this build cannot read, so a bare `resolve_arch_family`
+"yes" would promise a load that then fails partway through. It therefore
+also checks every tensor's `ggml_type` against `quant::supports_type` and
+reports the first unreadable one, which `ModelSupport::cell` renders as
+`No (llama, TQ1_0)` — distinct from `No (glm-dsa)`, because only the former
+is fixed by fetching a different quantization of the same model. Note this
+is *not* the same question as the arch module's own tensor expectations:
+gemma MoE checkpoints (`gemma-4-26B-A4B`, `blk.{i}.ffn_gate_inp.weight`
+present) load via `arch::gemma`'s routed-expert path and report
+`Yes (gemma4)`.
 
 A `No` row is *greyed* (dim ANSI SGR), not hidden: a user can still pick it
 and will hit the same clear "not yet supported" error `prepare` gives for
@@ -759,6 +766,24 @@ mod`), so adding a family is additive rather than a rewrite:
   shared by `llama`/`qwen2`/`qwen3`/`mistral`/`qwen3vl` GGUFs (tensor names
   confirmed against `llama.cpp/src/llama-arch.cpp`'s `LLM_TENSOR_NAMES`
   table for `LLM_ARCH_LLAMA`).
+
+  These architectures share a block shape but **do not share a RoPE
+  pairing**, and the module selects it per architecture
+  (`rope_layout_for`), mirroring upstream's `llama_model_rope_type`:
+  `llama` and `mistral` rotate *consecutive* elements
+  (`LLAMA_ROPE_TYPE_NORM`, pairs `2p`/`2p+1`), while `qwen2`, `qwen3` and
+  `qwen3vl` rotate elements offset by half the rotary width
+  (`LLAMA_ROPE_TYPE_NEOX`). Using one pairing for all of them is silently
+  wrong rather than an error — position 0 is the identity under both and
+  small positions rotate by small angles, so a short prompt still reads
+  fine while a longer one collapses into repetition.
+
+  A Llama-3.1/3.2 checkpoint additionally ships `rope_freqs.weight`, the
+  per-pair frequency divisor its `"llama3"` RoPE scaling is baked into at
+  conversion time; upstream applies it whenever present
+  (`get_rope_factors`' first branch), and so does this module. It only
+  moves the lowest frequencies, so it matters at long context rather than
+  in a short prompt.
 - `gemma.rs` — targets `gemma4` (confirmed against upstream `llama.cpp`'s
   `src/models/gemma4.cpp`), with `gemma`/`gemma2`/`gemma3` as subsets of
   its hyperparameter set: soft-capping, sliding-window attention,
@@ -771,6 +796,17 @@ mod`), so adding a family is additive rather than a rewrite:
   full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
   `llm_build_delta_net_base` upstream), but a plain SwiGLU FFN in place of
   MoE routing.
+- `mistral.rs` — `mistral3` (Mistral 3 / Ministral-3), confirmed against
+  upstream `src/models/mistral3.cpp`. The block shape is `llama.rs`'s node
+  for node; what earns it a module is four hyperparameters that are
+  wrong-by-default rather than absent: a head width read from
+  `attention.key_length` (Ministral-3-3B declares 128 where
+  `n_embd / n_head` would give 96, and its `attn_q.weight` really is
+  `[3072, 4096]`), YaRN RoPE scaling, `NORM` rope pairing, and a
+  Llama-4-style attention temperature scale — the last of which is exactly
+  `1.0` below the trained context, so a short prompt cannot tell whether it
+  is implemented at all.
+
 - `phi.rs` — `phi3`, covering both Phi-3 and Phi-4-mini (e.g.
   `unsloth/Phi-4-mini-instruct-GGUF`), confirmed against upstream
   `src/models/phi3.cpp` and the ggml kernels it calls. Llama-shaped
@@ -1046,6 +1082,8 @@ with a clear message if its variable is unset when the test is run
 | `ORANGU_TEST_MODEL` | Gemma/qwen35moe/qwen35 real-model forward-pass tests | A local `.gguf` chat model file |
 | `ORANGU_TEST_EMBEDDING_MODEL` | embedding-model tests | A local `.gguf` embedding model file |
 | `ORANGU_TEST_QWEN3VL_MODEL` | qwen3vl tokenizer/embedding tests | A local qwen3vl `.gguf` file |
+| `ORANGU_TEST_LLAMA_MODEL` | `llama`-architecture forward-pass test | A local Llama-3.x Instruct `.gguf` file |
+| `ORANGU_TEST_MISTRAL_MODEL` | `mistral3` forward-pass test | A local Ministral-3 `.gguf` file |
 | `ORANGU_TEST_PHI_MODEL` | phi3 real-model forward-pass test | A local Phi-3/Phi-4-mini `.gguf` file |
 
 ### HTTP layer and web UI
