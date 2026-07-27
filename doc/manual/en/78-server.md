@@ -39,6 +39,12 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/loader.rs` — memory-maps a GGUF file, reads `<arch>.*`
   hyperparameters, resolves tensor byte ranges.
 - `engine/quant.rs` — dequantization for every supported `ggml_type`.
+- `engine/vecdot.rs` — the fused `int8` CPU kernels: a dot product taken
+  against the still-quantized weight bytes, skipping the dequantize
+  entirely. See below.
+- `engine/iq_grids.rs` — the `IQ*` codebooks (lattice-point tables, the
+  sign table, and `KVALUES_IQ4NL`) that `quant`, `vecdot` and the Vulkan
+  shaders' uploaded grid buffer all read from one copy.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
@@ -485,6 +491,15 @@ gemma MoE checkpoints (`gemma-4-26B-A4B`, `blk.{i}.ffn_gate_inp.weight`
 present) load via `arch::gemma`'s routed-expert path and report
 `Yes (gemma4)`.
 
+`SUPPORTED` answers "can this build read the file", which is not quite the
+same question as "will it run on the backend you selected". Every GPU
+backend covers fewer `ggml_type`s than `engine::quant` does, so a row can
+read `Yes` and still be refused at startup by
+`engine::backend::unsupported_tensor_types` — see the CUDA/OpenCL/ROCm
+section for the coverage each backend has. The column deliberately does not
+fold that in: it is rendered before a backend is chosen, and the same file
+that one backend refuses runs on `cpu`.
+
 A `No` row is *greyed* (dim ANSI SGR), not hidden: a user can still pick it
 and will hit the same clear "not yet supported" error `prepare` gives for
 any other unsupported model — the greying just deprioritizes it visually.
@@ -817,6 +832,59 @@ bit-for-bit. Regenerate it with `testdata/ggml-dequant-reference.c` (see
 `quant.rs`'s `read_ggml_reference` for the command) when adding a type —
 appending to that file's type list leaves every existing entry
 byte-identical.
+
+### The fused `int8` CPU path (`engine::vecdot`)
+
+The obvious way to multiply a quantized weight matrix on the CPU is to
+dequantize each row to `f32` and take an `f32` dot product. `engine::vecdot`
+does neither: it quantizes the *activations* to `int8` once (32 elements per
+shared `f32` scale), then dots them against the weight bytes while those are
+still quantized, using integer SIMD. That removes the dequantize, removes
+the per-row allocation, and replaces scalar `f32` multiplies with 16- or
+32-wide `int8` ones (NEON `vmull_s8`/`sdot` on aarch64; AVX-512 VNNI, AVX2
+or SSE4.1 on x86-64, all chosen by runtime feature detection).
+
+Five types have a fused kernel — `Q8_0`, `Q5_0`, `IQ4_NL`, `Q4_K`, `Q6_K`.
+Anything else returns `false` from `vecdot::supports` and the caller keeps
+the ordinary dequantize path, so the module is strictly additive.
+
+`supports` takes the row length as well as the type, and that second check
+is load-bearing rather than defensive. A GGUF row is only guaranteed to be
+a whole number of blocks, and the block sizes differ: `Q8_0`, `Q5_0` and
+`IQ4_NL` need `32 | in_dim`, while `Q4_K` and `Q6_K` need `256 | in_dim`.
+Real small models mix both within one file — `Qwen2.5-0.5B` is 896 wide and
+`SmolLM2-360M` 960, each a whole number of 32-element blocks but neither a
+multiple of 256, so their attention weights take the 32-block kernels while
+only the `256`-divisible `ffn_down` reaches a K-quant one.
+
+Every supported type reduces to the same shape, which is what lets one dot
+loop serve all five:
+
+```text
+weight[i] = scale[i / GROUP] * q[i]  -  min[i / GROUP]
+```
+
+`min` is zero for the symmetric types (`Q8_0`, `Q5_0`, `Q6_K` and `IQ4_NL`
+all fold their bias — or, for `IQ4_NL`, their codebook level — straight into
+the signed `int8` weight, so no correction term survives); only `Q4_K` is
+genuinely asymmetric. `GROUP` is 16 because `Q6_K` carries one scale per 16
+weights; every other type repeats its scale across the two halves of its
+32-element block, which the dot loop exploits.
+
+There are two entry points, because decode and prefill want different
+things. `dot_row` (GEMV) walks a row's blocks once for a single token.
+`unpack_row` + `dot_unpacked_multi` (GEMM) unpack a row into plain `int8`
+plus per-group scale metadata **once per matmul rather than once per
+(row, token)**, which is what stops prefill from re-unpacking the same row
+for every token in the batch.
+
+Quantizing activations to `int8` is lossy, exactly as it is in llama.cpp —
+that is the accepted tradeoff of this kernel family, not an oversight. The
+tests check every kernel against `quant::dequantize` plus an exact `f32`
+dot, to within the error `int8` activation quantization can introduce, and
+separately require the two entry points to agree with each other far more
+tightly than either agrees with the reference (they quantize identically,
+so only summation order differs).
 
 ### Model forward passes
 

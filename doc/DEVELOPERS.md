@@ -113,9 +113,35 @@ ORANGU_TEST_EMBEDDING_MODEL=/path/to/embeddinggemma-300M-Q8_0.gguf \
 `qwen3vl_embedding_matches_real_llama_cpp`'s doc comment in
 `engine/arch/llama.rs`.
 
+The same arrangement covers a second, unrelated fixture:
+`src/bin/orangu-server/engine/testdata/ggml-dequant-reference.bin`, which
+pins `engine::quant`'s dequantizers. It holds random quantized blocks of
+every type paired with the `f32`s **ggml itself** produced from them, via
+`ggml_get_type_traits(t)->to_float` — the same entry point llama.cpp reads
+a weight tensor through — so the comparison is bit-for-bit rather than
+approximate. Its generator, `ggml-dequant-reference.c`, sits beside it and
+is gitignored too; building it needs `libggml-base` installed:
+
+```sh
+cc -O2 -o genfix \
+    src/bin/orangu-server/engine/testdata/ggml-dequant-reference.c \
+    -I/usr/local/include -L/usr/local/lib64 -lggml-base
+LD_LIBRARY_PATH=/usr/local/lib64 ./genfix \
+    src/bin/orangu-server/engine/testdata/ggml-dequant-reference.bin
+```
+
+Adding a quantization type means appending it to the `types[]` list in that
+generator and regenerating. Appending is safe: each type is seeded from its
+own `ggml_type` id and written as an independent record, so every existing
+entry stays byte-identical and only the header count changes — diff the old
+and new files to confirm before trusting a regeneration. Two tests read the
+fixture, and `dequantize_matches_ggml_for_every_quantized_type` asserts the
+type count, so bump that number in the same change.
+
 CI never generates these: the tests that use them need embedding models that
 are not cached there, so they skip, exactly as an unset `ORANGU_TEST_*_MODEL`
-already makes them skip.
+already makes them skip. The dequant fixture skips the same way when absent
+(`read_ggml_reference` returns `None` with a note on stderr).
 
 ## Documentation workflow
 
