@@ -966,14 +966,19 @@ buffer for. A model carrying a type the selected backend lacks is refused at
 startup, naming each missing type, rather than failing partway through the
 first request.
 
-Three `ggml_type`s are refused on purpose: `Q4_0_4_4`, `Q4_0_4_8`, and
-`Q4_0_8_8` (and the `IQ4_NL_*` equivalents). These were ARM-SIMD
-pre-repacked layouts that ggml **removed** — upstream `llama.cpp` cannot
-read such a file either ("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime
-repacking"), since repacking now happens at load time from the plain type.
-Many 2024-era repos still serve all three next to the files that work, so
-the error names the type and points at the `Q4_0` upload in the same
-repository rather than reading as a missing feature.
+Six further types load that upstream cannot read at all: `Q4_0_4_4`,
+`Q4_0_4_8`, `Q4_0_8_8`, and the `IQ4_NL_4_4`/`_4_8`/`_8_8` equivalents.
+ggml retired those ids and `llama.cpp` refuses such a file outright
+("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime repacking"). They are
+ARM-SIMD *pre-repacked* `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
+rows, and for the `Q4_0` family also flips a bit per nibble. That is a
+lossless permutation, so orangu undoes it once when the model opens and
+serves the result as ordinary `Q4_0`/`IQ4_NL`. Quality is identical to a
+plain build of the same weights — bit-identical, not merely close — and no
+GPU backend needs a kernel for any of them. One consequence worth knowing:
+those tensors are held in memory rather than read from the mapped file,
+because interleaving rows leaves no row with a contiguous range to be lazy
+about.
 
 Not yet built, and out of scope for now: multimodal input, `/infill`,
 `/rerank`, LoRA hot-swap, and slot save/restore.

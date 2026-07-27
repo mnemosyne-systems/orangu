@@ -224,19 +224,32 @@ pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
     (architecture, unsupported)
 }
 
+/// A tensor's bytes: normally the shard `Mmap` they live in, but an owned
+/// buffer for a tensor the loader had to rewrite before anything could read
+/// it (see [`LoadedModel::open`]'s repacked-`Q4_0` conversion).
+///
+/// `Mmap` and `Vec<u8>` both deref to `[u8]`, so one trait object serves
+/// both and every reader stays identical. Behind an `Arc` because a tensor
+/// view (`QuantMatrix`) is cloned freely and must keep its bytes alive; the
+/// address is also what `QuantMatrix::cache_key` hands the GPU backends as
+/// a stable identity, which holds for either variant as long as the model
+/// does.
+pub(crate) type TensorBytes = Arc<dyn std::ops::Deref<Target = [u8]> + Send + Sync>;
+
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
 #[derive(Clone)]
 struct TensorLocation {
     ggml_type: u32,
     dims: Vec<u64>,
-    /// Absolute byte offset into [`TensorLocation::mmap`].
+    /// Absolute byte offset into [`TensorLocation::bytes`].
     start: usize,
     len: usize,
-    /// The shard this tensor's bytes live in. A single-file model has one
-    /// mmap shared by every tensor; a split one (`model-00001-of-00003.gguf`
-    /// …) has a different mapping per shard, and each tensor's `start` is
-    /// relative to its own.
-    mmap: Arc<Mmap>,
+    /// Where this tensor's bytes live. A single-file model has one mmap
+    /// shared by every tensor; a split one (`model-00001-of-00003.gguf` …)
+    /// has a different mapping per shard, and each tensor's `start` is
+    /// relative to its own. A rewritten tensor owns its buffer outright and
+    /// starts at 0.
+    bytes: TensorBytes,
 }
 
 pub struct LoadedModel {
@@ -260,7 +273,7 @@ pub struct LoadedModel {
 /// plus whatever rows are transiently live during a single matmul call.
 #[derive(Clone)]
 pub struct QuantMatrix {
-    mmap: Arc<Mmap>,
+    bytes: TensorBytes,
     ggml_type: u32,
     start: usize,
     row_bytes: usize,
@@ -273,7 +286,7 @@ impl QuantMatrix {
     /// or one embedding table entry) to `f32`. `index` must be `< out_dim`.
     pub fn row(&self, index: usize) -> Vec<f32> {
         let offset = self.start + index * self.row_bytes;
-        let bytes = &self.mmap[offset..offset + self.row_bytes];
+        let bytes = &self.bytes[offset..offset + self.row_bytes];
         quant::dequantize(self.ggml_type, bytes, self.in_dim)
             .expect("row byte range was validated when this QuantMatrix was constructed")
     }
@@ -295,7 +308,7 @@ impl QuantMatrix {
     /// as-is and dequantizes on the shader, rather than row-by-row on the
     /// CPU like [`QuantMatrix::row`].
     pub fn raw_bytes(&self) -> &[u8] {
-        &self.mmap[self.start..self.start + self.row_bytes * self.out_dim]
+        &self.bytes[self.start..self.start + self.row_bytes * self.out_dim]
     }
 
     /// A stable identity for this tensor's byte range, valid for as long as
@@ -304,7 +317,7 @@ impl QuantMatrix {
     /// identity, so a weight already on the GPU isn't re-uploaded on every
     /// `matmul` call (every decode step reuses the same weight tensors).
     pub fn cache_key(&self) -> (usize, usize) {
-        (self.mmap.as_ptr() as usize, self.start)
+        (self.bytes.as_ptr() as usize, self.start)
     }
 }
 
@@ -366,7 +379,7 @@ pub(crate) fn test_quant_matrix(
         .expect("leaked test mmap registry poisoned")
         .push(mmap.clone());
     QuantMatrix {
-        mmap,
+        bytes: mmap,
         ggml_type,
         start: 0,
         row_bytes: bytes.len() / out_dim,
@@ -384,7 +397,7 @@ pub(crate) fn test_quant_matrix(
 /// entirely wasted work, not just wasted memory.
 #[derive(Clone)]
 pub struct ExpertQuantMatrix {
-    mmap: Arc<Mmap>,
+    bytes: TensorBytes,
     ggml_type: u32,
     start: usize,
     row_bytes: usize,
@@ -403,7 +416,7 @@ impl ExpertQuantMatrix {
             self.n_expert
         );
         let offset = self.start + expert * self.expert_stride + index * self.row_bytes;
-        let bytes = &self.mmap[offset..offset + self.row_bytes];
+        let bytes = &self.bytes[offset..offset + self.row_bytes];
         quant::dequantize(self.ggml_type, bytes, self.in_dim)
             .expect("row byte range was validated when this ExpertQuantMatrix was constructed")
     }
@@ -536,10 +549,47 @@ impl LoadedModel {
                         dims: tensor.dims.clone(),
                         start,
                         len,
-                        mmap: mmap.clone(),
+                        bytes: mmap.clone(),
                     },
                 );
             }
+        }
+
+        // Rewrite every row-interleaved repack (`Q4_0_4_4`/`_4_8`/`_8_8`
+        // and the `IQ4_NL` trio) into the plain `Q4_0`/`IQ4_NL` it was built
+        // from, before anything can read one. This is the only point where
+        // those six `ggml_type`s exist at all: past here the model is
+        // indistinguishable from one quantized to the base type directly,
+        // so the CPU fused kernel (`engine::vecdot`) and every GPU backend's
+        // existing shader serve it unchanged, with no new kernel anywhere.
+        //
+        // Done eagerly rather than per row because the packing interleaves
+        // *rows* — a row's blocks are strided across its 4- or 8-row group,
+        // so there is no row-shaped slice to be lazy about. The rewritten
+        // tensor is exactly as large as the mapped bytes it replaces, and
+        // only these files pay for it.
+        for (name, loc) in tensors.iter_mut() {
+            if !quant::is_repacked(loc.ggml_type) {
+                continue;
+            }
+            anyhow::ensure!(
+                loc.dims.len() == 2,
+                "tensor '{name}' is {} but not a 2D matrix (dims: {:?}); the repacked layouts \
+                 only ever applied to 2D weights",
+                orangu::gguf::ggml_type_name(loc.ggml_type),
+                loc.dims
+            );
+            let (base, plain) = quant::deinterleave_repack(
+                loc.ggml_type,
+                &loc.bytes[loc.start..loc.start + loc.len],
+                loc.dims[0] as usize,
+                loc.dims[1] as usize,
+            )
+            .with_context(|| format!("tensor '{name}'"))?;
+            loc.ggml_type = base;
+            loc.start = 0;
+            loc.len = plain.len();
+            loc.bytes = Arc::new(plain);
         }
 
         // `split.tensors.count` is the whole model's tensor count, so this
@@ -626,7 +676,7 @@ impl LoadedModel {
             .tensors
             .get(name)
             .ok_or_else(|| anyhow!("model is missing tensor '{name}'"))?;
-        let bytes = &loc.mmap[loc.start..loc.start + loc.len];
+        let bytes = &loc.bytes[loc.start..loc.start + loc.len];
         let element_count: u64 = loc.dims.iter().product();
         let values = quant::dequantize(loc.ggml_type, bytes, element_count as usize)
             .with_context(|| format!("tensor '{name}'"))?;
@@ -663,7 +713,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(QuantMatrix {
-            mmap: loc.mmap.clone(),
+            bytes: loc.bytes.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
             row_bytes,
@@ -697,7 +747,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(ExpertQuantMatrix {
-            mmap: loc.mmap.clone(),
+            bytes: loc.bytes.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
             row_bytes,

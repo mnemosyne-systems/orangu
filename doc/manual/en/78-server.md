@@ -770,6 +770,46 @@ this one type alone; `quant::block_layout`, `vecdot::supports`, and every
 backend's block-size table each place it with the 32-element quants
 deliberately.
 
+The six repacked layouts — `Q4_0_4_4`/`_4_8`/`_8_8` (ggml ids 31-33) and
+`IQ4_NL_4_4`/`_4_8`/`_8_8` (36-38) — are handled differently from every
+other type, in `engine::loader` rather than `engine::quant`'s per-row
+dequantizers. They are ARM-SIMD pre-repacked `Q4_0`/`IQ4_NL`: ggml retired
+the ids and never shipped a `to_float` for any of them (only `gemv`/`gemm`
+kernels), which is why upstream refuses such a file. The packing is
+lossless though — `repack_{q4_0,iq4_nl}_to_*_bl` plus the `make_block_*`
+functions interleave 4 or 8 *rows* into shared records — so
+`quant::deinterleave_repack` inverts it and `LoadedModel::open` rewrites
+every such tensor to its plain base type before anything reads one. Past
+the loader these ids do not exist, so the CPU fused kernel and all four GPU
+backends serve them with no new code.
+
+`quant::repack_layout` is the whole specification, as
+`(base type, rows, run, xor)`. Two entries in it do not follow from the
+type names and would corrupt every weight if guessed:
+
+- `*_4_8` interleaves **4** rows in 8-byte runs, not 8 rows. The digits are
+  (rows) x (run), and `block_q4_0x4`/`block_iq4_nlx4` back both the `4_4`
+  and `4_8` variants.
+- The `Q4_0` family XORs each byte with `0x88`, letting the ARM kernels
+  read a nibble as a signed offset without a subtract. The `IQ4_NL` family
+  does **not** — its nibble indexes `KVALUES_IQ4NL`, so flipping the high
+  bit would select a different level for every weight rather than adjusting
+  a sign.
+
+`IQ4_NL_4_8` is the one layout with no executable upstream definition:
+`make_block_iq4_nlx4`'s 8-byte branch is commented out and marked "this
+branch seems wrong". Its entry is the straightforward generalization — the
+`x4` index math with 8-byte runs — and no released file is known to carry
+the id.
+
+Two properties follow from the row interleaving. The conversion is eager,
+not lazy: a row's blocks are strided across its 4- or 8-row group, so there
+is no row-shaped slice of the mapped file to defer — `TensorLocation` holds
+an owned buffer for these tensors instead of an `Mmap` slice (both behind
+the `TensorBytes` trait object, so readers are unchanged). And
+`quant::dequantize` refuses these ids outright rather than decoding a
+"row", since bytes for one row are not a thing that exists in this layout.
+
 Correctness is pinned by `testdata/ggml-dequant-reference.bin`: random
 blocks of every quantized type paired with the `f32`s ggml's own
 `ggml_get_type_traits(t)->to_float` produced from them, compared

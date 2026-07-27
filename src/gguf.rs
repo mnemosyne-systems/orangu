@@ -435,39 +435,24 @@ const GGML_TYPE_NAMES: &[Option<&str>] = &[
     Some("Q1_0"),       // 41
 ];
 
-/// `ggml_type` ids ggml itself has **deleted**, paired with the type that
-/// superseded them — `None` where nothing did.
+/// `ggml_type` ids ggml itself has **deleted** *and* that this build cannot
+/// read either.
 ///
-/// These are not "not yet implemented": upstream `llama.cpp` cannot read a
-/// file carrying one either (`ggml.h` keeps them only as commented-out enum
-/// slots, "support has been removed from gguf files"). The `*_4_4`/`*_4_8`/
-/// `*_8_8` triples were ARM-SIMD *pre-repacked* layouts of `Q4_0`/`IQ4_NL`,
-/// dropped once llama.cpp started repacking at load time from the plain
-/// type — so the plain file in the same repo is the direct replacement, not
-/// a downgrade. `Q4_2`/`Q4_3` predate the K-quants and have no successor.
-///
-/// Worth naming rather than rejecting generically because the files are
-/// still up: every `bartowski/*-GGUF` repo published in 2024 still carries
-/// all three `Q4_0_*` uploads next to the ones that work.
-const REMOVED_GGML_TYPES: &[(u32, Option<&str>)] = &[
-    (4, None),
-    (5, None),
-    (31, Some("Q4_0")),
-    (32, Some("Q4_0")),
-    (33, Some("Q4_0")),
-    (36, Some("IQ4_NL")),
-    (37, Some("IQ4_NL")),
-    (38, Some("IQ4_NL")),
-];
+/// "Removed upstream" and "unreadable here" are not the same set, which is
+/// why this list is far narrower than the retired ids in
+/// [`GGML_TYPE_NAMES`]. All six ARM-SIMD pre-repacked layouts (31–33 over
+/// `Q4_0`, 36–38 over `IQ4_NL`) are retired upstream but *are* read here:
+/// the packing is a lossless permutation that
+/// `engine::quant::deinterleave_repack` undoes at load time. What remains
+/// is `Q4_2`/`Q4_3`, which predate the K-quants and have no successor at
+/// all — nothing to point a user at but their own source weights.
+const REMOVED_GGML_TYPES: &[u32] = &[4, 5];
 
-/// `Some(replacement)` when `ggml_type` is one ggml has removed — see
-/// [`REMOVED_GGML_TYPES`]. The outer `Option` distinguishes "not a removed
-/// type" from the inner "removed, with no successor".
-pub fn removed_ggml_type(ggml_type: u32) -> Option<Option<&'static str>> {
-    REMOVED_GGML_TYPES
-        .iter()
-        .find(|(id, _)| *id == ggml_type)
-        .map(|(_, replacement)| *replacement)
+/// Whether `ggml_type` is one ggml has removed *and* this build cannot read
+/// — see [`REMOVED_GGML_TYPES`] for why that is a narrower set than the
+/// retired ids.
+pub fn is_removed_ggml_type(ggml_type: u32) -> bool {
+    REMOVED_GGML_TYPES.contains(&ggml_type)
 }
 
 pub fn ggml_type_name(ggml_type: u32) -> String {
@@ -559,12 +544,17 @@ mod tests {
         assert_eq!(ggml_type_name(31), "Q4_0_4_4");
         assert_eq!(ggml_type_name(33), "Q4_0_8_8");
         assert_eq!(ggml_type_name(36), "IQ4_NL_4_4");
-        assert_eq!(removed_ggml_type(31), Some(Some("Q4_0")));
-        assert_eq!(removed_ggml_type(37), Some(Some("IQ4_NL")));
-        assert_eq!(removed_ggml_type(4), Some(None));
+        assert!(is_removed_ggml_type(4));
+        assert!(is_removed_ggml_type(5));
+        // 31-33 and 36-38 are retired upstream but readable here
+        // (de-interleaved at load), so they must NOT be listed as
+        // unreadable — doing so would reject a file this build can serve.
+        for readable in [31, 32, 33, 36, 37, 38] {
+            assert!(!is_removed_ggml_type(readable), "type {readable}");
+        }
         // Live types must not be mistaken for retired ones.
-        assert_eq!(removed_ggml_type(2), None);
-        assert_eq!(removed_ggml_type(20), None);
+        assert!(!is_removed_ggml_type(2));
+        assert!(!is_removed_ggml_type(20));
         assert_eq!(ggml_type_name(255), "unknown(255)");
     }
 

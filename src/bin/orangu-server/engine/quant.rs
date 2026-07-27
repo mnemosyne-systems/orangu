@@ -36,7 +36,7 @@
 use anyhow::{Result, bail};
 use half::f16;
 
-use orangu::gguf::{ggml_type_name, removed_ggml_type};
+use orangu::gguf::{ggml_type_name, is_removed_ggml_type};
 
 use crate::engine::iq_grids::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
@@ -76,6 +76,29 @@ pub(crate) const GGML_TYPE_IQ4_XS: u32 = 23;
 /// scale is reassembled from nibbles spread across `scales`.
 pub(crate) const GGML_TYPE_IQ1_M: u32 = 29;
 pub(crate) const GGML_TYPE_BF16: u32 = 30;
+// The three ARM-SIMD *repacked* `Q4_0` layouts. ggml has retired these ids
+// and never shipped a `to_float` for them (only `gemv`/`gemm` kernels), so
+// upstream `llama.cpp` refuses a file carrying one outright. They are not
+// lossy or damaged, though: the packing is a pure permutation of `Q4_0`'s
+// own bytes plus a per-nibble `^ 8`, so [`deinterleave_repack`] turns
+// a tensor back into exactly the `Q4_0` it was built from, and
+// `engine::loader` does that once at load. Nothing downstream of the
+// loader ever sees these ids.
+//
+// The trailing digits are (rows interleaved) x (bytes interleaved), except
+// that `Q4_0_4_8` interleaves 4 rows in 8-byte runs — so the row count is
+// **not** always the first digit's pair. See [`repack_layout`].
+pub(crate) const GGML_TYPE_Q4_0_4_4: u32 = 31;
+pub(crate) const GGML_TYPE_Q4_0_4_8: u32 = 32;
+pub(crate) const GGML_TYPE_Q4_0_8_8: u32 = 33;
+// The same three interleavings applied to `IQ4_NL` instead of `Q4_0`. Same
+// 18-byte block, same record shape, same row grouping — and *no* `^ 8`,
+// because an `IQ4_NL` nibble is an index into a codebook rather than a
+// signed integer, so there is no sign convention to fold away
+// (`make_block_iq4_nlx4`/`x8` copy the runs verbatim).
+pub(crate) const GGML_TYPE_IQ4_NL_4_4: u32 = 36;
+pub(crate) const GGML_TYPE_IQ4_NL_4_8: u32 = 37;
+pub(crate) const GGML_TYPE_IQ4_NL_8_8: u32 = 38;
 
 const QK4_0: usize = 32;
 const QK4_1: usize = 32;
@@ -110,6 +133,12 @@ fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_IQ2_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 32, QK_K)),
         GGML_TYPE_IQ3_XXS => Some((2 + 3 * (QK_K / 8), QK_K)),
         GGML_TYPE_IQ3_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64, QK_K)),
+        // Byte-for-byte the same footprint as the `Q4_0` they repack — the
+        // interleaving moves bytes around, it doesn't add or drop any — so
+        // `tensor_byte_size` is right for them without knowing anything
+        // about the interleaving itself.
+        GGML_TYPE_Q4_0_4_4 | GGML_TYPE_Q4_0_4_8 | GGML_TYPE_Q4_0_8_8 | GGML_TYPE_IQ4_NL_4_4
+        | GGML_TYPE_IQ4_NL_4_8 | GGML_TYPE_IQ4_NL_8_8 => Some((2 + QK4_0 / 2, QK4_0)),
         GGML_TYPE_IQ4_NL => Some((2 + QK4_NL / 2, QK4_NL)),
         GGML_TYPE_IQ4_XS => Some((2 + 2 + QK_K / 64 + QK_K / 2, QK_K)),
         _ => None,
@@ -129,29 +158,162 @@ pub fn supports_type(ggml_type: u32) -> bool {
     block_layout(ggml_type).is_some()
 }
 
+/// Bytes in one `Q4_0` block, and elements it covers.
+const Q4_0_BLOCK_BYTES: usize = 2 + QK4_0 / 2;
+
+/// How a repacked type maps back to a plain one: `(base type, rows
+/// interleaved, bytes per interleave run, per-byte XOR)`. `None` for
+/// anything that isn't a repack.
+///
+/// Read off ggml's own `block<K, N>` / `block_iq4_nlx*` structs and the
+/// `make_block_*` functions beside them, because two things about this
+/// table do not follow from the type names:
+///
+/// - **Row counts.** `*_4_4` and `*_4_8` both pack **4** rows per record
+///   and differ only in run length; only `*_8_8` packs 8. Reading the
+///   second digit as a row count would scramble every tensor while still
+///   producing plausible-looking output.
+/// - **The XOR.** The `Q4_0` family flips both nibbles of every byte
+///   (`^ 0x88`), which is what lets the ARM kernels treat a nibble as a
+///   signed offset without a separate subtract. The `IQ4_NL` family does
+///   **not**: its nibble is an index into [`KVALUES_IQ4NL`], so there is no
+///   sign convention to fold, and `make_block_iq4_nlx4`/`x8` copy the runs
+///   verbatim. Applying the `Q4_0` mask to an `IQ4_NL` tensor would pick
+///   the wrong codebook entry for every single weight.
+///
+/// Both base types use an 18-byte, 32-element block, so all six share one
+/// set of byte arithmetic.
+///
+/// `IQ4_NL_4_8` is the one entry without a live upstream implementation:
+/// `make_block_iq4_nlx4`'s 8-byte branch is commented out and marked "this
+/// branch seems wrong", so ggml has no executable definition of it. The
+/// entry below is the straightforward generalization — the `x4` index math
+/// with 8-byte runs, exactly as the `Q4_0` pair differ from each other.
+const fn repack_layout(ggml_type: u32) -> Option<(u32, usize, usize, u8)> {
+    match ggml_type {
+        GGML_TYPE_Q4_0_4_4 => Some((GGML_TYPE_Q4_0, 4, 4, 0x88)),
+        GGML_TYPE_Q4_0_4_8 => Some((GGML_TYPE_Q4_0, 4, 8, 0x88)),
+        GGML_TYPE_Q4_0_8_8 => Some((GGML_TYPE_Q4_0, 8, 8, 0x88)),
+        GGML_TYPE_IQ4_NL_4_4 => Some((GGML_TYPE_IQ4_NL, 4, 4, 0x00)),
+        GGML_TYPE_IQ4_NL_4_8 => Some((GGML_TYPE_IQ4_NL, 4, 8, 0x00)),
+        GGML_TYPE_IQ4_NL_8_8 => Some((GGML_TYPE_IQ4_NL, 8, 8, 0x00)),
+        _ => None,
+    }
+}
+
+/// Whether `ggml_type` is one of the row-interleaved repack layouts that
+/// [`deinterleave_repack`] converts at load time.
+pub fn is_repacked(ggml_type: u32) -> bool {
+    repack_layout(ggml_type).is_some()
+}
+
+/// Rewrites a whole repacked tensor (`src`, an `[in_dim, out_dim]` matrix)
+/// into the plain `Q4_0` or `IQ4_NL` bytes it was packed from, returning
+/// `(base type, bytes)`.
+///
+/// The inverse of ggml's `repack_{q4_0,iq4_nl}_to_*_bl` plus the
+/// `make_block_*` functions they call (`ggml/src/ggml-cpu/repack.cpp`),
+/// read directly from those rather than reconstructed from the format's
+/// description. Two things are going on at once:
+///
+/// - **Rows.** Records are emitted per group of `n_rows` consecutive rows:
+///   for group `g` and block-column `x`, one record carries block `x` of
+///   *every* row in the group. So a row's blocks are strided across the
+///   group, not contiguous — which is why this cannot be done per row, and
+///   why `QuantMatrix`'s `start + index * row_bytes` addressing would read
+///   pure noise from an untouched tensor.
+/// - **Bytes.** Within a record, the `qs` payload is emitted in `run`-byte
+///   runs round-robin across the group's rows, each XORed with the mask
+///   [`repack_layout`] gives for the type (`0x88` for the `Q4_0` family,
+///   nothing for `IQ4_NL`). XOR is its own inverse, so undoing it is the
+///   same operation.
+///
+/// The returned bytes are the same length as `src`; an error means the
+/// tensor's shape can't have been produced by the packer at all.
+pub fn deinterleave_repack(
+    ggml_type: u32,
+    src: &[u8],
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<(u32, Vec<u8>)> {
+    let Some((base, n_rows, run, xor)) = repack_layout(ggml_type) else {
+        bail!(
+            "{} is not a row-interleaved repack layout",
+            ggml_type_name(ggml_type)
+        );
+    };
+    // Both are enforced by the packer itself (`repack_q4_0_to_q4_0_4_bl`
+    // returns -1 rather than packing), so a file violating either is
+    // malformed, not merely unusual.
+    if !in_dim.is_multiple_of(QK4_0) {
+        bail!(
+            "{} row length {in_dim} is not a multiple of {QK4_0}",
+            ggml_type_name(ggml_type)
+        );
+    }
+    if !out_dim.is_multiple_of(n_rows) {
+        bail!(
+            "{} row count {out_dim} is not a multiple of the {n_rows} rows it interleaves",
+            ggml_type_name(ggml_type)
+        );
+    }
+    let n_blocks = in_dim / QK4_0;
+    // One record holds `n_rows` whole `Q4_0` blocks: their `f16` scales
+    // first, then their `qs` payloads interleaved.
+    let scale_bytes = 2 * n_rows;
+    let record_bytes = n_rows * Q4_0_BLOCK_BYTES;
+    let expected = record_bytes * n_blocks * (out_dim / n_rows);
+    if src.len() != expected {
+        bail!(
+            "{} tensor is {} bytes, expected {expected} for {in_dim} x {out_dim}",
+            ggml_type_name(ggml_type),
+            src.len()
+        );
+    }
+
+    let mut out = vec![0u8; out_dim * n_blocks * Q4_0_BLOCK_BYTES];
+    // Runs per record, straight from ggml's `end`: the group's whole `qs`
+    // payload (`16` bytes per row) cut into `run`-byte pieces.
+    let runs = (Q4_0_BLOCK_BYTES - 2) * n_rows / run;
+    for group in 0..out_dim / n_rows {
+        for x in 0..n_blocks {
+            let record = &src[(group * n_blocks + x) * record_bytes..][..record_bytes];
+            let (scales, qs) = record.split_at(scale_bytes);
+            // Where row `r` of this group keeps its block `x`, in the
+            // plain-`Q4_0` output.
+            let block_at = |r: usize| ((group * n_rows + r) * n_blocks + x) * Q4_0_BLOCK_BYTES;
+            for r in 0..n_rows {
+                out[block_at(r)..block_at(r) + 2].copy_from_slice(&scales[2 * r..2 * r + 2]);
+            }
+            for i in 0..runs {
+                let row = i % n_rows;
+                let dst = block_at(row) + 2 + (i / n_rows) * run;
+                for (b, &byte) in qs[i * run..][..run].iter().enumerate() {
+                    out[dst + b] = byte ^ xor;
+                }
+            }
+        }
+    }
+    Ok((base, out))
+}
+
 /// The error for a `ggml_type` this build can't read, phrased by *why*.
 ///
 /// A type ggml itself removed is a different situation from one this engine
 /// hasn't implemented, and the difference is the whole of what the reader
-/// should do next: waiting for orangu to add `Q4_0_4_4` is waiting forever,
-/// because upstream `llama.cpp` dropped it too and the plain `Q4_0` upload
-/// sitting next to it in the same repo is the intended replacement. Saying
-/// "not yet supported" for both sends them to the wrong place.
+/// should do next: waiting for orangu to add `Q4_2` is waiting forever,
+/// because upstream `llama.cpp` dropped it too and nothing succeeded it.
+/// Saying "not yet supported" for both sends them to the wrong place.
 fn unsupported_type_error(ggml_type: u32) -> anyhow::Error {
     let name = ggml_type_name(ggml_type);
-    match removed_ggml_type(ggml_type) {
-        Some(Some(replacement)) => anyhow::anyhow!(
+    if is_removed_ggml_type(ggml_type) {
+        return anyhow::anyhow!(
             "tensor type {name} was removed from ggml itself — upstream llama.cpp cannot read \
-             this file either. It was a pre-repacked layout of {replacement}, now done at load \
-             time instead, so download the {replacement} file from the same repository."
-        ),
-        Some(None) => anyhow::anyhow!(
-            "tensor type {name} was removed from ggml itself — upstream llama.cpp cannot read \
-             this file either. It predates the K-quants and has no direct replacement; \
-             re-quantize from the source weights."
-        ),
-        None => anyhow::anyhow!("tensor type {name} is not yet supported by orangu-server"),
+             this file either. It predates the K-quants and has no successor; re-quantize \
+             from the source weights."
+        );
     }
+    anyhow::anyhow!("tensor type {name} is not yet supported by orangu-server")
 }
 
 /// The exact byte length a tensor with `element_count` elements of
@@ -209,6 +371,18 @@ pub fn dequantize(ggml_type: u32, bytes: &[u8], element_count: usize) -> Result<
         GGML_TYPE_IQ2_S => Ok(dequantize_iq2_s(bytes, element_count)),
         GGML_TYPE_IQ3_XXS => Ok(dequantize_iq3_xxs(bytes, element_count)),
         GGML_TYPE_IQ3_S => Ok(dequantize_iq3_s(bytes, element_count)),
+        // Deliberately not dequantized here. A repacked row's blocks are
+        // strided across its 4- or 8-row group, so `bytes` for "one row" is
+        // not a thing that exists — the unit is the whole tensor, whose
+        // shape this function is never told. `engine::loader` converts them
+        // to `Q4_0` when the model opens, so reaching this arm means a new
+        // caller bypassed that; say so rather than return plausible noise.
+        t if is_repacked(t) => bail!(
+            "{} must be de-interleaved with quant::deinterleave_repack before any row of it \
+             is read — engine::loader does this at load time, so this is a bug in a caller \
+             that built a tensor view directly",
+            ggml_type_name(ggml_type)
+        ),
         GGML_TYPE_IQ4_NL => Ok(dequantize_iq4_nl(bytes, element_count)),
         GGML_TYPE_IQ4_XS => Ok(dequantize_iq4_xs(bytes, element_count)),
         _ => Err(unsupported_type_error(ggml_type)),
@@ -1402,29 +1576,196 @@ mod tests {
         assert!(out.iter().all(|&v| v == 64.0), "got {:?}", &out[..8]);
     }
 
+    /// ggml's own `make_block_q4_0x4`/`x8` and `make_block_iq4_nlx4`/`x8`
+    /// plus the `repack_*_bl` loop around them
+    /// (`ggml/src/ggml-cpu/repack.cpp`), transcribed line for line — the
+    /// *forward* direction, so it is genuine ground truth for the inverse
+    /// rather than the inverse restated. All four differ only in row count,
+    /// run length, and whether a run is XORed, which is exactly what
+    /// `repack_layout` claims. `plain` is `out_dim * n_blocks` consecutive
+    /// 18-byte blocks.
+    fn ggml_repack(plain: &[u8], n_rows: usize, run: usize, xor: u8, in_dim: usize) -> Vec<u8> {
+        let n_blocks = in_dim / QK4_0;
+        let out_dim = plain.len() / (n_blocks * Q4_0_BLOCK_BYTES);
+        let mut out = Vec::with_capacity(plain.len());
+        for b in (0..out_dim).step_by(n_rows) {
+            for x in 0..n_blocks {
+                let src = |i: usize| &plain[((b + i) * n_blocks + x) * Q4_0_BLOCK_BYTES..];
+                for i in 0..n_rows {
+                    out.extend_from_slice(&src(i)[..2]);
+                }
+                // ggml: `end = QK4_0 * (2 or 4) / blck_size_interleave`,
+                // `src_id = i % N`, `src_offset = (i / N) * S`.
+                let end = (QK4_0 / 2) * n_rows / run;
+                for i in 0..end {
+                    let src_id = i % n_rows;
+                    let src_offset = (i / n_rows) * run;
+                    let qs = &src(src_id)[2 + src_offset..2 + src_offset + run];
+                    out.extend(qs.iter().map(|b| b ^ xor));
+                }
+            }
+        }
+        out
+    }
+
+    /// Round-trips every repacked layout through ggml's packer: pack a
+    /// known plain-`Q4_0` tensor, then de-interleave it back and require
+    /// byte equality.
+    ///
+    /// Shapes are the real `SmolLM2-360M` ones (`960` and `2560` wide,
+    /// `320`/`960`/`2560` rows) rather than a tidy single group, so the
+    /// group stride is exercised across many groups — a de-interleave that
+    /// got the row striding wrong would still pass on one group. This same
+    /// round-trip was also run against the actual
+    /// `bartowski/SmolLM2-360M-Instruct-GGUF` `Q4_0_4_4`/`Q4_0_4_8`/
+    /// `Q4_0_8_8` files and matched byte-for-byte on every tensor.
+    #[test]
+    fn deinterleave_inverts_ggmls_own_repack() {
+        for (ggml_type, base, n_rows, run, xor) in [
+            (GGML_TYPE_Q4_0_4_4, GGML_TYPE_Q4_0, 4usize, 4usize, 0x88u8),
+            (GGML_TYPE_Q4_0_4_8, GGML_TYPE_Q4_0, 4, 8, 0x88),
+            (GGML_TYPE_Q4_0_8_8, GGML_TYPE_Q4_0, 8, 8, 0x88),
+            (GGML_TYPE_IQ4_NL_4_4, GGML_TYPE_IQ4_NL, 4, 4, 0x00),
+            (GGML_TYPE_IQ4_NL_4_8, GGML_TYPE_IQ4_NL, 4, 8, 0x00),
+            (GGML_TYPE_IQ4_NL_8_8, GGML_TYPE_IQ4_NL, 8, 8, 0x00),
+        ] {
+            for (in_dim, out_dim) in [(960usize, 320usize), (960, 2560), (2560, 960)] {
+                let n_bytes = out_dim * (in_dim / QK4_0) * Q4_0_BLOCK_BYTES;
+                // Deterministic pseudo-random block bytes; the scale field
+                // is left random too, since nothing here interprets it.
+                let mut s = 0x2545_F491_4F6C_DD1Du64;
+                let plain: Vec<u8> = (0..n_bytes)
+                    .map(|_| {
+                        s ^= s >> 12;
+                        s ^= s << 25;
+                        s ^= s >> 27;
+                        (s >> 33) as u8
+                    })
+                    .collect();
+
+                let packed = ggml_repack(&plain, n_rows, run, xor, in_dim);
+                assert_eq!(packed.len(), plain.len(), "repack must not change size");
+                let (got_base, back) =
+                    deinterleave_repack(ggml_type, &packed, in_dim, out_dim).unwrap();
+                assert_eq!(got_base, base, "{}", ggml_type_name(ggml_type));
+                assert_eq!(
+                    back,
+                    plain,
+                    "{} {in_dim}x{out_dim} did not round-trip",
+                    ggml_type_name(ggml_type)
+                );
+            }
+        }
+    }
+
+    /// Two things here read backwards and would both corrupt every weight
+    /// silently. `*_4_8` interleaves **4** rows in 8-byte runs, not 8 rows
+    /// — the digits are (rows) x (run). And the `IQ4_NL` family carries
+    /// **no** XOR, unlike `Q4_0`'s `^ 0x88`: its nibble is a codebook
+    /// index, so flipping the high bit would select a different level for
+    /// every weight rather than adjusting a sign.
+    #[test]
+    fn repack_layouts_pin_row_count_and_xor_per_family() {
+        assert_eq!(
+            repack_layout(GGML_TYPE_Q4_0_4_4),
+            Some((GGML_TYPE_Q4_0, 4, 4, 0x88))
+        );
+        assert_eq!(
+            repack_layout(GGML_TYPE_Q4_0_4_8),
+            Some((GGML_TYPE_Q4_0, 4, 8, 0x88))
+        );
+        assert_eq!(
+            repack_layout(GGML_TYPE_Q4_0_8_8),
+            Some((GGML_TYPE_Q4_0, 8, 8, 0x88))
+        );
+        assert_eq!(
+            repack_layout(GGML_TYPE_IQ4_NL_4_4),
+            Some((GGML_TYPE_IQ4_NL, 4, 4, 0x00))
+        );
+        assert_eq!(
+            repack_layout(GGML_TYPE_IQ4_NL_4_8),
+            Some((GGML_TYPE_IQ4_NL, 4, 8, 0x00))
+        );
+        assert_eq!(
+            repack_layout(GGML_TYPE_IQ4_NL_8_8),
+            Some((GGML_TYPE_IQ4_NL, 8, 8, 0x00))
+        );
+        assert_eq!(repack_layout(GGML_TYPE_Q4_0), None);
+        assert_eq!(repack_layout(GGML_TYPE_IQ4_NL), None);
+
+        // A tensor with 4 rows can only be packed by a 4-row layout, so the
+        // `8_8` pair must refuse it rather than read past the group.
+        let bytes = vec![0u8; 4 * (64 / QK4_0) * Q4_0_BLOCK_BYTES];
+        for four in [GGML_TYPE_Q4_0_4_8, GGML_TYPE_IQ4_NL_4_8] {
+            assert!(deinterleave_repack(four, &bytes, 64, 4).is_ok());
+        }
+        for eight in [GGML_TYPE_Q4_0_8_8, GGML_TYPE_IQ4_NL_8_8] {
+            let err = deinterleave_repack(eight, &bytes, 64, 4).unwrap_err();
+            assert!(
+                err.to_string().contains("not a multiple of the 8 rows"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Repacked tensors carry exactly as many bytes as the `Q4_0` they were
+    /// built from — the loader's `row_bytes * out_dim == len` check depends
+    /// on it, and so does `deinterleave_repack`'s own length guard.
+    #[test]
+    fn repacked_types_size_exactly_like_q4_0() {
+        for t in [
+            GGML_TYPE_Q4_0_4_4,
+            GGML_TYPE_Q4_0_4_8,
+            GGML_TYPE_Q4_0_8_8,
+            GGML_TYPE_IQ4_NL_4_4,
+            GGML_TYPE_IQ4_NL_4_8,
+            GGML_TYPE_IQ4_NL_8_8,
+        ] {
+            assert!(supports_type(t), "{}", ggml_type_name(t));
+            assert_eq!(
+                tensor_byte_size(t, 960).unwrap(),
+                tensor_byte_size(GGML_TYPE_Q4_0, 960).unwrap()
+            );
+        }
+    }
+
+    /// A repacked row has no contiguous byte range of its own, so reading
+    /// one through `dequantize` cannot be made to work — it has to fail
+    /// loudly instead of returning bytes that decode into plausible noise.
+    #[test]
+    fn dequantize_refuses_a_repacked_row_instead_of_misreading_it() {
+        let err = dequantize(GGML_TYPE_Q4_0_4_4, &[0u8; 18], 32).unwrap_err();
+        assert!(err.to_string().contains("de-interleaved"), "{err}");
+    }
+
     #[test]
     fn dequantize_rejects_unsupported_types() {
         let err = dequantize(99, &[], 0).unwrap_err();
         assert!(err.to_string().contains("not yet supported"));
     }
 
-    /// `Q4_0_4_4` (31) and its two siblings are the ones a user actually
-    /// meets — every 2024-era `bartowski/*-GGUF` repo still serves all
-    /// three. The message must name the type, say the removal was ggml's
-    /// rather than this build's, and point at the `Q4_0` file in the same
-    /// repo; "not yet supported" would imply waiting is the fix.
+    /// For a type ggml removed *and* this build can't read, the message
+    /// must say the removal was ggml's rather than this build's;
+    /// "not yet supported" would imply waiting is the fix. `Q4_2`/`Q4_3`
+    /// are all that is left in that category now that both repack families
+    /// are read by de-interleaving.
     #[test]
     fn removed_ggml_types_explain_themselves_rather_than_reading_as_unimplemented() {
-        for (ggml_type, name) in [(31u32, "Q4_0_4_4"), (32, "Q4_0_4_8"), (33, "Q4_0_8_8")] {
+        for (ggml_type, name) in [(4u32, "Q4_2"), (5, "Q4_3")] {
             let err = dequantize(ggml_type, &[], 0).unwrap_err().to_string();
             assert!(err.contains(name), "{err}");
             assert!(err.contains("removed from ggml itself"), "{err}");
-            assert!(err.contains("download the Q4_0 file"), "{err}");
             assert!(!err.contains("not yet supported"), "{err}");
             // `tensor_byte_size` is the other door into the same rejection —
             // it is what `loader` calls first — so it must say the same thing.
             let sized = tensor_byte_size(ggml_type, 32).unwrap_err().to_string();
             assert!(sized.contains("removed from ggml itself"), "{sized}");
         }
+        // And a type that is merely unimplemented must NOT borrow that
+        // wording, or it would tell the reader to give up on a gap that
+        // could genuinely be filled.
+        let err = dequantize(99, &[], 0).unwrap_err().to_string();
+        assert!(err.contains("not yet supported"), "{err}");
+        assert!(!err.contains("removed from ggml"), "{err}");
     }
 }
