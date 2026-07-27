@@ -16,11 +16,11 @@
 - [A complete local AI coding stack](#a-complete-local-ai-coding-stack)
 - [Features](#features)
   - [Code review and auto review](#code-review-and-auto-review)
+  - [The inference server](#the-inference-server)
 - [orangu vs. a cloud coding assistant](#orangu-vs-a-cloud-coding-assistant)
 - [Installation](#installation)
-  - [Install dependencies on Fedora](#install-dependencies-on-fedora)
-  - [Release build](#release-build)
-  - [Debug build](#debug-build)
+  - [One-liner install (Linux, macOS, Windows)](#one-liner-install-linux-macos-windows)
+  - [Build from source](#build-from-source)
 - [Configuration and first run](#configuration-and-first-run)
 - [Documentation](#documentation)
 - [Tested platforms](#tested-platforms)
@@ -38,8 +38,11 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 - **A complete local stack, all in Rust** — orangu is more than a client. It ships its own native GGUF inference server (`orangu-server`) and an on-demand model coordinator (`orangu-coordinator`), so the whole pipeline — editor, coordinator, and engine — is one pure-Rust toolchain with **no llama.cpp, ggml, or Python dependency**. See [A complete local AI coding stack](#a-complete-local-ai-coding-stack).
 - **A single fast native binary** — written entirely in Rust, with quick startup, no runtime to install, no garbage-collector pauses, and a small download.
 - **The whole Git loop lives in the prompt** — branch, commit, rebase, squash, cherry-pick, stash, bisect, push, and GitHub/GitLab pull requests, comments, and issues, all without leaving the terminal.
-- **Built for orangu-server** — live tokens/second in the footer, and an interactive `--init` wizard that auto-detects the model your server is serving.
+- **Built for orangu-server** — live tokens/second in the footer, an interactive `--init` wizard that auto-detects the model your server is serving, and `/information` to probe exactly which endpoints the active server implements.
 - **Agent Skills & Memory** — discovers reusable `SKILL.md` skills and merges cross-session memory and instructions from global (`~/.orangu/AGENTS.md`) and workspace-level (`./AGENTS.md`) files directly into the LLM context.
+- **Builds your project too** — `/build` detects the toolchain (Cargo, CMake, Autotools, Meson, Maven, Python, Go, plain `make`) and runs format, lint, build, and test as one reported pipeline, with `debug`/`release` profiles and per-target scoping.
+- **Scriptable and schedulable** — `-p` runs a single prompt or command and exits (`-q` silences it down to the exit code), and a built-in cron-style scheduler (`~/.orangu/schedule`) runs commands unattended while orangu is up.
+- **Themeable terminal UI** — six built-in themes (`classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`), `random`, or your own `~/.orangu/themes/*.theme`, applied per run (`-t`) or per session (`/theme`).
 - **Natural to drive** — dozens of slash commands, each with plain-English aliases (`review`, `auto review`, `commit "..."`, `merge feature/foo`, `pull 58`).
 
 ## A complete local AI coding stack
@@ -50,9 +53,11 @@ Most local-AI setups are a patchwork: one tool for the editor, a separate engine
 
 - **`orangu`** — the workspace-aware coding environment you drive: the terminal UI, local and Git/forge tools, `/review` and `/auto_review`, the knowledge graph, semantic `/search`, and the context-compression engine.
 - **`orangu-coordinator`** — an optional companion HTTP proxy that starts and stops `orangu-server` on demand and swaps to whichever model each request needs, so a single-GPU machine can use a different model per role without ever running more than one server. Skip it if you have the VRAM to keep every model resident.
-- **`orangu-server`** — *is* the inference engine. GGUF loading, tokenization, the transformer forward pass, sampling, and request scheduling are implemented directly in Rust with **no dependency on llama.cpp/ggml's compiled code**, running on CPU or GPU (Vulkan, CUDA, ROCm, OpenCL). It exposes an OpenAI-compatible API plus native health/props/slots/metrics endpoints, and doubles as the machine's GGUF inventory (`list`/`show`/`download`/`suggest`/`system`).
+- **`orangu-server`** — *is* the inference engine. GGUF loading, tokenization, the transformer forward pass, sampling, and request scheduling are implemented directly in Rust with **no dependency on llama.cpp/ggml's compiled code**, running on CPU or GPU (Vulkan, CUDA, ROCm, OpenCL). It exposes an OpenAI-compatible API plus native health/props/slots/metrics endpoints and a workspace-scoped file API, ships an optional browser chat console, and doubles as the machine's GGUF inventory (`list`/`show`/`download`/`delete`/`suggest`/`system`/`prune`). See [The inference server](#the-inference-server).
 
-Every layer talks to the next over the OpenAI-compatible API, so the pieces stay cleanly separated, yet they ship and run as one: a **fully local, fully private, single-language AI coding stack — no Python, no llama.cpp, no cloud**. The coordinator ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md)) and server ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md)) each have their own chapter.
+Every layer talks to the next over the OpenAI-compatible API, so the pieces stay cleanly separated, yet they ship and run as one: a **fully local, fully private, single-language AI coding stack — no Python, no llama.cpp, no cloud**. The coordinator ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/44-coordinator.md)) and server ([manual](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md)) each have their own chapter, with the internals documented separately ([coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md), [server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md)).
+
+A fourth binary, `orangu-bench`, is a developer tool rather than part of the stack: it measures decode and prefill throughput of any OpenAI-compatible server over HTTP — `orangu-server` or another engine under the identical harness — and can record and chart results over time. See the [Benchmarking](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/79-bench.md) chapter.
 
 ## Features
 
@@ -60,7 +65,9 @@ Every layer talks to the next over the OpenAI-compatible API, so the pieces stay
 
 **Code review built in.** orangu's standout feature is a pair of in-terminal review workflows — an interactive reviewer and a fully automated, LLM-driven one — covered in [Code review and auto review](#code-review-and-auto-review) below.
 
-**Workspace-aware tooling.** Local tools read, edit, list, search (`/grep`), and fetch files, and run shell commands — all scoped to your workspace. A full set of Git commands (`/status`, `/diff`, `/log`, `/show`, `/commit`, `/amend`, `/squash`, `/rebase`, `/merge`, `/cherry_pick`, `/branch`, `/stash`, `/bisect`, `/push`, `/pull`, …) and forge integration (`/pull_request`, `/comment`, `/close`, `/get_comments` on GitHub and GitLab) keep the whole change-and-review loop in one place.
+**Workspace-aware tooling.** Local tools show, create, modify, move, and delete files and directories, list and search (`/grep`) the tree, fetch URLs, and run shell commands (`/shell`, streamed live) — all rooted in your workspace, with paths that escape it rejected. In a Git repository the file tools make their change *with* Git (`git add`/`git mv`/`git rm`), so work is staged as it happens and nothing is ever committed behind your back. A full set of Git commands (`/status`, `/diff`, `/log`, `/show`, `/commit`, `/amend`, `/squash`, `/rebase`, `/merge`, `/cherry_pick`, `/branch`, `/stash`, `/bisect`, `/fetch`, `/restore`, `/push`, `/pull`, …) and forge integration (`/pull_request`, `/comment`, `/issue`, `/close`, `/get_comments` on GitHub and GitLab) keep the whole change-and-review loop in one place.
+
+**Builds the project, not just the code.** `/build` detects the toolchain from the workspace root and runs the whole pipeline, reporting each step and stopping at the first failure: Rust (`cargo fmt` → `clippy` → `build` → `test`), CMake, Autotools, Meson, plain `make`, Maven, Python, and Go. It takes a `debug`/`release` profile and an optional target (a Cargo binary, a Make/Meson/CMake target, a Maven goal, a Go package), Tab-completes the targets it discovers, and reuses configured build directories so a second build is incremental.
 
 **Advanced Context Compression Engine.** orangu protects the LLM's context window and minimizes latency using a state-of-the-art compression pipeline. Features include AST-aware file downsampling, an intelligent Git diff engine, session fingerprinting, secret redaction, and automatic transcript compaction. See the [Compression](doc/manual/en/75-compression.md) manual for details.
 
@@ -74,16 +81,24 @@ Every layer talks to the next over the OpenAI-compatible API, so the pieces stay
 
 **Semantic code search.** `/search <query>` retrieves code by *meaning*, not just text — a query like `where is rate-limiting handled?` surfaces a `throttle_requests` function whose name shares no words with the query. orangu embeds every symbol offline through the server's OpenAI-compatible `/v1/embeddings` endpoint, persists the vectors under `~/.orangu/workspace/<hash>/embeddings/` (re-embedding only changed files and dropping deleted ones on every search, like the knowledge graph cache), and ranks results by a hybrid of cosine similarity and the knowledge graph's call edges — a semantic seed followed by structural expansion. It enables itself automatically: tag a server `role = embeddings` (or let the default `all` server serve it), and `/search` turns on when that endpoint responds at startup — otherwise it stays dormant and retrieval falls back to `/grep` and the knowledge graph. See the [`/search`](doc/manual/en/41-core_tools.md) tool.
 
+**Unattended and scriptable.** `orangu -p "<line>"` runs a single prompt, command, or natural-language form and exits — no terminal UI, no session on disk — streaming the answer to stdout and the timings (total, time to first token, the server's own prefill/decode figures) to stderr, so a slow server is distinguishable from a slow prompt. `-q` reduces a run to its exit code, silent until the day it fails. The built-in cron-style scheduler reads `~/.orangu/schedule` every minute and runs jobs in the active workspace tab — `0 6 * * * auto review immediate && export auto review` produces a review report each morning with nobody at the keyboard. `/schedule` lists the jobs with the next time each one fires.
+
+**Knows how much you have been working.** `/usage` reports the current session, and `/statistics` reports persistent per-workspace activity that survives restarts — sessions, turns, tokens, LLM and tool time — folded together with the repository's own `git log` into commit totals, active-day streaks, a heatmap, and a per-author breakdown. `/statistics total` aggregates every workspace; `/export statistics` writes it to PDF.
+
 **Comfortable terminal experience.**
 
 - Persistent terminal UI with workspace, server, and model status in the header, refreshed every minute while idle
-- Shell-style prompt editing, history with bash-style `Ctrl+R` reverse search (the match is ghosted inline, Tab completes it), scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches)
+- Six built-in themes (`classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`), a `random` selector, and user themes from `~/.orangu/themes/*.theme` — set globally in `orangu.conf`, per run with `-t`, or per session with `/theme` (the override is stored with the session and restored on resume)
+- Shell-style prompt editing, history with bash-style `Ctrl+R` reverse search (the match is ghosted inline, Tab completes it), scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches) and a slash-command dropdown
+- Mouse scroll and double-click, on by default and switchable off (hold **Shift** for the terminal's own text selection)
 - Natural-language aliases for nearly every command — e.g. `review`, `auto review`, `open README.md`, `list models`, `pull 58`, `commit "[#42] My feature"`, `rebase`, `merge feature/foo`, `get comments for issue 51`, `export review`
 - Streaming responses with live footer status such as `Thinking (...)` and native `Working @ X.Y t/s (...)`
 - Queued local commands while a response is in flight, plus double-`Esc` request cancellation
 - Markdown rendering in the console (bold, italic, headings, lists, links, code) with syntax highlighting for fenced code blocks
 
-**Share what you produce.** Export the output window, the last review report, or a duplicate-code report to a PDF in the workspace root (`/export console`, `/export review`, `/export duplicates`), or post a review straight onto an issue or pull request with `/comment <number> with review` / `with auto review`.
+**Share what you produce.** Export the output window, the last interactive or automated review report, a pull-request summary, the activity statistics, or a duplicate-code report to a PDF in the workspace root (`/export console`, `/export review`, `/export auto review`, `/export pr`, `/export statistics`, `/export duplicates`), or post a review straight onto an issue or pull request with `/comment <number> with review` / `with auto review`.
+
+**Sessions and servers under your control.** Conversations are stored and resumable — `-r <uuid>` resumes one, `-l` lists every stored session as a table, `/session` lists and switches between them (or opens a directory as a new workspace), and `/prune` deletes them by id, workspace, or age. `/model` and `/server` switch model or configured server at runtime, `/information` reports which OpenAI-compatible and native endpoints the active server actually implements (plus the local knowledge-graph scan status), `/reload` returns to the configured model and server and starts a clean exchange, `/restart` re-execs orangu in place to pick up a freshly built binary without losing the session, and `/disconnect` drops the connection.
 
 **Works offline, end to end.** Even the built-in user manual (`/manual`) — a two-pane viewer with full-text search (`Alt+S`) — is embedded in the binary at compile time, so the docs are there with no network.
 
@@ -120,6 +135,22 @@ Run `/auto_review <file>` to review a single file (the whole file on `main`/`mas
 > The per-request length cap is `review_max_tokens` (default `512`; `0` disables it). If you review with a model that *thinks* before answering, raise it (e.g. `2048`) so the reasoning tokens don't crowd out the answer — see the [Configuration](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/20-configuration.md) chapter (*Response-token caps*). Set `feedback = on` to get the blinking terminal title and completion bell during a run.
 
 See [Core tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/41-core_tools.md) in the manual for the full reference and key bindings.
+
+### The inference server
+
+`orangu-server` is the engine the rest of the stack runs on, and it is usable on its own — point any OpenAI-compatible client at it.
+
+**Model coverage.** Text-in/text-out GGUF chat, completion, and embedding models across six architecture families: Llama-style (`llama`, `qwen2`, `qwen3`, `mistral`, and Qwen3-VL's text backbone), Gemma (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and** the routed-expert `gemma-4-26B-A4B` MoE, plus the embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE, Qwen3.5 dense, Phi-3/Phi-4-mini, and Mistral 3. Tensors are read as `F32`/`F16`/`BF16`, `Q8_0`/`Q4_0`/`Q5_0`, the K-quants (`Q2_K`–`Q6_K`), and the I-quants (`IQ1_S` through `IQ4_XS`). Weights are dequantized lazily from the memory-mapped file, so large models fit in modest RAM, and models split across shards load from every file.
+
+**Backends.** CPU, plus four GPU backends selected by `backend` in the config or auto-detected: **Vulkan** (the most tuned — GPU-resident weights and fused decode submissions; reaches AMD, NVIDIA, and Intel GPUs through any working driver, with no Vulkan SDK needed to build), **CUDA**, **OpenCL**, and **ROCm** (behind the `rocm` Cargo feature). The three narrower backends are cross-checked in automated tests against the CPU backend's output. Naming a backend explicitly fails to start rather than silently falling back to the CPU.
+
+**Serving.** OpenAI-compatible `/v1/chat/completions` (streaming and not), `/v1/completions`, `/v1/models`, and `/v1/embeddings`, alongside native `/health`, `/props`, `/slots`, `/metrics`, `/completion`, `/tokenize`, `/detokenize`, `/apply-template`, and a loopback-only `/v1/shutdown`. Requests are scheduled across configurable slots with continuous batching, a prefix cache, and durable slot persistence so a resumed conversation need not re-prefill. Deployment roles (`--all`/`--code`/`--review`/`--explorer`/`--embedding`) adjust slot counts, sampling defaults, reasoning suppression, and which endpoints are served at all.
+
+**Workspace file API.** Eight endpoints (`/v1/create_file`, `/v1/modify_file`, `/v1/move_file`, `/v1/delete_file`, `/v1/show_file`, and the three `*_directory` counterparts) operate inside the server's `-w`/`--workspace` root and refuse any path that escapes it — the same shared implementation the client's own file tools use, so a tool call, a typed command, and an HTTP request behave identically, staging through Git and never committing.
+
+**Built-in web console.** Set `web` in the config for a browser chat UI on its own port: a streaming transcript with server-rendered markdown and syntax highlighting, LaTeX, live tokens/second, a Stop button, persistent chat history across restarts, file attachments (text/code, PDF, and Office/OpenDocument documents extracted to text), and a downloadable debug report. Plain server-rendered HTML/CSS/JS from the same binary — no build step, no WASM, no external assets.
+
+**Model inventory.** The same binary manages the machine's models: `list`, `show`, `download` (from Hugging Face, sharded models included), `delete`, `prune`, `suggest` (a size recommendation from the detected hardware), and `system` (a CPU/GPU/memory report). See the [Inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md) chapter.
 
 ## orangu vs. a cloud coding assistant
 
@@ -285,7 +316,15 @@ Or run it directly from the build tree:
 
 By default, local tools operate on the current working directory. Use `--workspace /path/to/project` (`-w`) to point **orangu** at another tree.
 
-The startup flags also have short forms: `-c` for `--config`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the last run's workspace tabs), `-l` for `--list` (print every stored session as a table and exit), `-i` for `--init`, and `-s` for `--shell-completions`.
+The startup flags also have short forms: `-c` for `--config`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the last run's workspace tabs), `-t` for `--theme`, `-p` for `--prompt` (run one prompt or command and exit), `-q` for `--quiet` (print nothing on success; the exit code is the result), `-l` for `--list` (print every stored session as a table and exit), `-i` for `--init`, and `-s` for `--shell-completions`.
+
+`-p` makes orangu usable from a script or a crontab, since a command is handled locally and never reaches the server:
+
+```sh
+orangu -p "Hello"                 # a prompt for the model
+orangu -q -p "/export pr"         # writes the PDF, says nothing, exit code is the result
+orangu -p "show git status"       # the natural-language form of a command
+```
 
 Shell completion scripts (bash, zsh, fish) for these flags live in [`contrib/shell/`](contrib/shell/README.md).
 
@@ -295,6 +334,7 @@ Useful first commands:
 /help
 /skills
 /tools
+/information
 /list_files
 /open_file README.md
 /show_file README.md
@@ -309,24 +349,35 @@ Useful first commands:
 /show aafd1cb
 /squash
 /status
+/build
 /graph
+/search where is rate-limiting handled?
+/statistics
+/theme tokyonight
 ```
 
 ## Documentation
 
-- [Latest manual](https://github.com/mnemosyne-systems/orangu/tree/main/doc/manual/en)
+- [Latest manual](https://github.com/mnemosyne-systems/orangu/tree/main/doc/manual/en) — also available offline inside the binary with `/manual`
 - [Getting Started](https://github.com/mnemosyne-systems/orangu/blob/main/doc/GETTING_STARTED.md)
 - [orangu-coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/COORDINATOR.md) — auto-start/stop orangu-server for machines that only run one local model at a time
 - [orangu-server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/SERVER.md) — a native, pure-Rust GGUF inference server with an OpenAI-compatible API, plus CPU/GPU hardware detection and local GGUF model inventory
 - [Quick start](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/03-quickstart.md)
 - [Configuration](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/20-configuration.md)
+- [Tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/30-tools.md)
 - [Workspaces](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/31-workspaces.md)
 - [Skills](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/32-skills.md)
 - [Terminal interface](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/40-terminal.md)
 - [Core tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/41-core_tools.md)
 - [Git tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/42-git_tools.md)
 - [Usage tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/43-usage_tools.md)
-- [Tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/30-tools.md)
+- [Coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/44-coordinator.md)
+- [Inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md)
+- [Serving models per role](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/73-openai.md)
+- [Shell completions](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/74-completions.md)
+- [Compression](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/75-compression.md)
+- [Benchmarking](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/79-bench.md)
+- Internals: [coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md), [inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md), [developer information](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/70-dev.md)
 
 ## Tested platforms
 
