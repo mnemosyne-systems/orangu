@@ -803,43 +803,67 @@ mod tests {
     ///     -I/usr/local/include -L/usr/local/lib64 -lggml-base
     /// ./genfix testdata/ggml-dequant-reference.bin
     /// ```
-    const GGML_REFERENCE: &[u8] = include_bytes!("testdata/ggml-dequant-reference.bin");
+    ///
+    /// Read at run time rather than through `include_bytes!`, for the same
+    /// reason as `arch::read_reference_fixture`: the fixture is ground truth
+    /// captured from a machine with `libggml-base` installed, so a checkout
+    /// may legitimately not have it, and a compile-time include turns that
+    /// into a build failure for the *whole* test binary rather than a skip of
+    /// the two tests that need it. Returns `None` (with a note on stderr)
+    /// when it isn't there.
+    fn read_ggml_reference() -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/orangu-server/engine/testdata/ggml-dequant-reference.bin");
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) => {
+                eprintln!("skipping: no reference fixture {} ({err})", path.display());
+                None
+            }
+        }
+    }
 
-    /// Splits [`GGML_REFERENCE`] into
-    /// `(ggml_type, elements per block, raw bytes, expected f32s)`.
-    fn ggml_reference_cases() -> Vec<(u32, usize, Vec<u8>, Vec<f32>)> {
-        let take = |at: &mut usize, n: usize| -> &'static [u8] {
-            let s = &GGML_REFERENCE[*at..*at + n];
+    /// One type's fixture entry: `(ggml_type, elements per block, raw bytes,
+    /// expected f32s)`.
+    type ReferenceCase = (u32, usize, Vec<u8>, Vec<f32>);
+
+    /// Splits the fixture read by [`read_ggml_reference`] into one
+    /// [`ReferenceCase`] per type, or `None` when the fixture isn't present
+    /// in this checkout.
+    fn ggml_reference_cases() -> Option<Vec<ReferenceCase>> {
+        fn take<'a>(fixture: &'a [u8], at: &mut usize, n: usize) -> &'a [u8] {
+            let s = &fixture[*at..*at + n];
             *at += n;
             s
-        };
-        let u32_at = |at: &mut usize| -> u32 {
-            u32::from_le_bytes(take(at, 4).try_into().expect("4 bytes"))
-        };
+        }
+        fn u32_at(fixture: &[u8], at: &mut usize) -> u32 {
+            u32::from_le_bytes(take(fixture, at, 4).try_into().expect("4 bytes"))
+        }
 
+        let fixture = read_ggml_reference()?;
         let mut at = 0;
-        assert_eq!(take(&mut at, 8), b"ORQFIX02", "fixture magic");
-        let n_types = u32_at(&mut at);
+        assert_eq!(take(&fixture, &mut at, 8), b"ORQFIX02", "fixture magic");
+        let n_types = u32_at(&fixture, &mut at);
 
         let mut cases = Vec::new();
         for _ in 0..n_types {
-            let ggml_type = u32_at(&mut at);
-            let n_blocks = u32_at(&mut at) as usize;
-            let block_bytes = u32_at(&mut at) as usize;
+            let ggml_type = u32_at(&fixture, &mut at);
+            let n_blocks = u32_at(&fixture, &mut at) as usize;
+            let block_bytes = u32_at(&fixture, &mut at) as usize;
             // Element count comes from the fixture rather than being derived
             // from `block_layout`: parsing the reference with the table under
             // test would turn a wrong block size into a misaligned read
             // somewhere downstream instead of a clean failure here.
-            let n_elems = u32_at(&mut at) as usize;
-            let raw = take(&mut at, n_blocks * block_bytes).to_vec();
-            let floats = take(&mut at, n_elems * 4)
+            let n_elems = u32_at(&fixture, &mut at) as usize;
+            let raw = take(&fixture, &mut at, n_blocks * block_bytes).to_vec();
+            let floats = take(&fixture, &mut at, n_elems * 4)
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
                 .collect();
             cases.push((ggml_type, n_elems / n_blocks, raw, floats));
         }
-        assert_eq!(at, GGML_REFERENCE.len(), "trailing bytes in fixture");
-        cases
+        assert_eq!(at, fixture.len(), "trailing bytes in fixture");
+        Some(cases)
     }
 
     /// Every K-quant and `IQ*` type, bit-for-bit against ggml's own output.
@@ -853,7 +877,9 @@ mod tests {
     /// vacuously agreeing.
     #[test]
     fn dequantize_matches_ggml_for_every_quantized_type() {
-        let cases = ggml_reference_cases();
+        let Some(cases) = ggml_reference_cases() else {
+            return;
+        };
         assert_eq!(cases.len(), 15, "fixture should cover 15 types");
 
         for (ggml_type, block_elems, raw, want) in cases {
@@ -885,7 +911,10 @@ mod tests {
     /// trusting a match against them.
     #[test]
     fn ggml_reference_values_are_non_degenerate() {
-        for (ggml_type, _, _, want) in ggml_reference_cases() {
+        let Some(cases) = ggml_reference_cases() else {
+            return;
+        };
+        for (ggml_type, _, _, want) in cases {
             let name = ggml_type_name(ggml_type);
             assert!(
                 want.iter().all(|v| v.is_finite()),
