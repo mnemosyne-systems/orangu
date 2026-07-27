@@ -14,13 +14,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! One implementor per architecture family — `llama` (GQA/RoPE/RMSNorm/
-//! SwiGLU), `gemma` (soft-capping/sliding-window/GEGLU), `qwen35`
-//! (hybrid full-attention/gated-DeltaNet, dense FFN), and `qwen35moe`
-//! (the same hybrid attention shape, mixture-of-experts FFN) — so adding
-//! a family is additive rather than a rewrite of the others.
+//! SwiGLU), `gemma` (soft-capping/sliding-window/GEGLU), `phi` (fused
+//! QKV and gate/up, LongRoPE), `qwen35` (hybrid full-attention/gated-
+//! DeltaNet, dense FFN), and `qwen35moe` (the same hybrid attention shape,
+//! mixture-of-experts FFN) — so adding a family is additive rather than a
+//! rewrite of the others.
 
 pub mod gemma;
 pub mod llama;
+pub mod phi;
 pub mod qwen35;
 pub mod qwen35moe;
 

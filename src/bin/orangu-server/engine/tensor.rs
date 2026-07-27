@@ -287,6 +287,50 @@ pub fn rope_apply_scaled_inplace(
     freq_base: f32,
     freq_factors: Option<&[f32]>,
 ) {
+    rope_apply_mscale_inplace(
+        x,
+        n_head,
+        head_dim,
+        rope_dim,
+        pos,
+        freq_base,
+        freq_factors,
+        1.0,
+    );
+}
+
+/// Like [`rope_apply_scaled_inplace`], but additionally scales every rotated
+/// pair by `attn_factor` — ggml's own `mscale` in `rope_yarn` (`ggml-cpu/
+/// ops.cpp`), which multiplies *both* `cos_theta` and `sin_theta` by it, so
+/// the rotated pair comes out `attn_factor` times longer while its angle is
+/// unchanged.
+///
+/// `phi3` (Phi-4-mini) is the architecture here that needs it: its GGUF
+/// carries `phi3.rope.scaling.attn_factor` (1.1902381 for Phi-4-mini), which
+/// upstream reads into `hparams.rope_attn_factor` and folds into the value
+/// it passes as `mscale` (`llama-context.cpp`: `cparams.yarn_attn_factor *=
+/// hparams.rope_attn_factor`). The `mscale *= 1 + 0.1*ln(1/freq_scale)`
+/// correction next to it in `rope_yarn` is guarded by `ext_factor != 0`,
+/// which is YaRN-only (`cparams.yarn_ext_factor` is 0 unless the file
+/// declares `rope.scaling.type = yarn`, which `phi3` does not) — so for
+/// every model this function currently serves, `attn_factor` reaches the
+/// cos/sin unmodified.
+///
+/// Note this is *not* equivalent to scaling the attention logits: only the
+/// leading `rope_dim` elements of each head rotate, so the un-rotated tail
+/// (`head_dim > rope_dim`, exactly Phi-4-mini's case: 96 of 128) is
+/// deliberately left alone.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_apply_mscale_inplace(
+    x: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+    attn_factor: f32,
+) {
     debug_assert_eq!(x.len(), n_head * head_dim);
     let half = rope_dim / 2;
     for h in 0..n_head {
@@ -298,6 +342,7 @@ pub fn rope_apply_scaled_inplace(
             }
             let theta = pos as f32 * freq;
             let (sin, cos) = theta.sin_cos();
+            let (sin, cos) = (sin * attn_factor, cos * attn_factor);
             let a = head[i];
             let b = head[i + half];
             head[i] = a * cos - b * sin;
@@ -462,6 +507,43 @@ mod tests {
         rope_apply_inplace(&mut x, 1, 4, 4, 5, 10000.0);
         let norm_after = (x[0] * x[0] + x[2] * x[2]).sqrt();
         assert!((norm_before - norm_after).abs() < 1e-5);
+    }
+
+    /// `attn_factor` (ggml's `mscale`) scales both `cos_theta` and
+    /// `sin_theta`, so a rotated pair keeps its *angle* and comes out
+    /// exactly `attn_factor` times longer — the property that distinguishes
+    /// it from a plain post-RoPE scale of the whole head, and from rotating
+    /// by a different angle.
+    #[test]
+    fn rope_attn_factor_scales_pair_length_without_rotating_further() {
+        let plain = {
+            let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+            rope_apply_mscale_inplace(&mut x, 1, 4, 4, 5, 10000.0, None, 1.0);
+            x
+        };
+        let scaled = {
+            let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+            rope_apply_mscale_inplace(&mut x, 1, 4, 4, 5, 10000.0, None, 1.1902381);
+            x
+        };
+        for (p, s) in plain.iter().zip(&scaled) {
+            assert!(
+                (p * 1.1902381 - s).abs() < 1e-5,
+                "expected {p} * 1.1902381, got {s}"
+            );
+        }
+    }
+
+    /// The un-rotated tail of a partial-RoPE head (`head_dim > rope_dim` —
+    /// Phi-4-mini rotates 96 of 128) passes through untouched, `attn_factor`
+    /// included: ggml's rope copies those channels verbatim rather than
+    /// running them through `rope_yarn`, so scaling them too would silently
+    /// change every `phi3` attention score.
+    #[test]
+    fn rope_attn_factor_leaves_the_unrotated_tail_alone() {
+        let mut x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        rope_apply_mscale_inplace(&mut x, 1, 8, 4, 5, 10000.0, None, 1.1902381);
+        assert_eq!(&x[4..], &[5.0, 6.0, 7.0, 8.0]);
     }
 
     /// `axpy_inplace` replaced attention's value-accumulation loop, so its

@@ -917,16 +917,20 @@ compatible API above, and only reachable at all when `web` is configured:
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for four
+Text-in/text-out GGUF chat, completion, and embedding models, for five
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
-embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`), and
+embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`),
 Qwen3.5 dense (`qwen35` — the same hybrid full-attention/gated-DeltaNet layer
-shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing) — using
-`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q4_K`/`Q5_K`/`Q6_K` tensors. Weight matrices and embedding tables are read lazily from the
+shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing), and Phi-3
+(`phi3`, covering Phi-3 and Phi-4-mini — Llama-style attention and SwiGLU,
+but with the query/key/value projections fused into one `attn_qkv` tensor,
+the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
+frequency factors on a partially-rotated head) — using
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. Runs on CPU or,
 via `backend = vulkan`/`cuda`/`opencl`/`rocm`/`auto`

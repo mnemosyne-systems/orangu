@@ -86,6 +86,12 @@ pub enum ArchFamily {
     /// shape as [`ArchFamily::Qwen35Moe`], but a plain dense SwiGLU FFN
     /// instead of MoE routing. See `engine::arch::qwen35`.
     Qwen35,
+    /// Phi-3 / Phi-4-mini — GQA + RoPE + RMSNorm + SwiGLU like
+    /// [`ArchFamily::LlamaStyle`], but with a fused QKV projection, a fused
+    /// gate/up FFN projection, partial NEOX RoPE carrying LongRoPE
+    /// frequency factors, and a RoPE magnitude factor. See
+    /// `engine::arch::phi`.
+    Phi3,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -124,6 +130,15 @@ const QWEN35MOE_ARCHITECTURES: &[&str] = &["qwen35moe"];
 /// `qwen35` (e.g. `unsloth/Ornith-1.0-9B-GGUF`) — the dense sibling of
 /// `qwen35moe`; see [`ArchFamily::Qwen35`].
 const QWEN35_ARCHITECTURES: &[&str] = &["qwen35"];
+/// `phi3` covers both Phi-3 and Phi-4-mini (e.g. `unsloth/Phi-4-mini-
+/// instruct-GGUF`) — upstream converts both under the one
+/// `general.architecture` string, and `llama_model_phi3` serves both from
+/// one graph. `phi2` is *not* here: it's a different shape entirely
+/// (LayerNorm rather than RMSNorm, GELU rather than SwiGLU, parallel
+/// attention/FFN branches, biases throughout). `phimoe` (Phi-3.5-MoE) isn't
+/// either — same attention block, but routed experts this module has no
+/// path for.
+const PHI3_ARCHITECTURES: &[&str] = &["phi3"];
 
 pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LLAMA_STYLE_ARCHITECTURES.contains(&architecture) {
@@ -138,6 +153,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if QWEN35_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Qwen35);
     }
+    if PHI3_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Phi3);
+    }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
@@ -146,6 +164,7 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(GEMMA_ARCHITECTURES)
             .chain(QWEN35MOE_ARCHITECTURES)
             .chain(QWEN35_ARCHITECTURES)
+            .chain(PHI3_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
@@ -649,6 +668,26 @@ mod tests {
     fn resolve_arch_family_accepts_qwen35() {
         for arch in QWEN35_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen35);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_phi3() {
+        for arch in PHI3_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Phi3);
+        }
+    }
+
+    /// `phi2` and `phimoe` share a name prefix with `phi3` but neither
+    /// shares its forward pass (`phi2`: LayerNorm + GELU + parallel
+    /// attention/FFN; `phimoe`: routed experts). A prefix-match rather than
+    /// an exact-match here would load either one through `arch::phi` and
+    /// produce garbage instead of an "unsupported" error.
+    #[test]
+    fn resolve_arch_family_rejects_other_phi_architectures() {
+        for arch in ["phi2", "phimoe"] {
+            let err = resolve_arch_family(arch).unwrap_err();
+            assert!(err.to_string().contains("not yet supported"), "{err}");
         }
     }
 

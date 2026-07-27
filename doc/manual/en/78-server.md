@@ -42,8 +42,8 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,qwen35moe,qwen35}.rs` — one `ModelForward`
-  implementor per architecture family.
+- `engine/arch/{mod,llama,gemma,phi,qwen35moe,qwen35}.rs` — one
+  `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,cuda,opencl,rocm}.rs` —
   the `Backend` trait and its five implementors; see below.
 - `engine/tokenizer.rs` — a from-scratch BPE tokenizer.
@@ -771,6 +771,30 @@ mod`), so adding a family is additive rather than a rewrite:
   full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
   `llm_build_delta_net_base` upstream), but a plain SwiGLU FFN in place of
   MoE routing.
+- `phi.rs` — `phi3`, covering both Phi-3 and Phi-4-mini (e.g.
+  `unsloth/Phi-4-mini-instruct-GGUF`), confirmed against upstream
+  `src/models/phi3.cpp` and the ggml kernels it calls. Llama-shaped
+  attention and SwiGLU, but with four details that each silently corrupt
+  output if guessed: query/key/value fused into one `attn_qkv.weight`
+  sliced Q-then-K-then-V; the FFN gate and up projections fused into one
+  `[n_embd, 2*n_ff]` `ffn_up.weight` whose **first** half is the activated
+  one; partial NEOX RoPE carrying LongRoPE `rope_factors_long`/
+  `rope_factors_short` divisors; and a `rope.scaling.attn_factor`
+  magnitude scale on cos/sin. Sliding-window attention is deliberately
+  *not* implemented, matching upstream, which disables it for this
+  architecture even when the GGUF declares a window.
+
+  Which LongRoPE factor tensor applies is a property of the serving
+  context, not of a request: upstream picks `long` when the context
+  exceeds `rope.scaling.original_context_length` and `short` otherwise,
+  once, so every key already in the KV cache was rotated the same way as
+  the query reading it. This server has no separate context knob —
+  `engine::generate` caps a sequence at the model's own `n_ctx_train` — so
+  `n_ctx_train` is what the comparison uses. For Phi-4-mini (131072
+  trained, 4096 original) that selects the long factors, matching
+  `llama-server -c 0`; note upstream's CLI default of `-c 4096` selects
+  the short ones instead, so a logit-level comparison has to pass a
+  matching `-c`.
 
 ### Request scheduling and continuous batching
 
@@ -1022,6 +1046,7 @@ with a clear message if its variable is unset when the test is run
 | `ORANGU_TEST_MODEL` | Gemma/qwen35moe/qwen35 real-model forward-pass tests | A local `.gguf` chat model file |
 | `ORANGU_TEST_EMBEDDING_MODEL` | embedding-model tests | A local `.gguf` embedding model file |
 | `ORANGU_TEST_QWEN3VL_MODEL` | qwen3vl tokenizer/embedding tests | A local qwen3vl `.gguf` file |
+| `ORANGU_TEST_PHI_MODEL` | phi3 real-model forward-pass test | A local Phi-3/Phi-4-mini `.gguf` file |
 
 ### HTTP layer and web UI
 
