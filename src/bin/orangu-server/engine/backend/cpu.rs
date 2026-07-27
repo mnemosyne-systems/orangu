@@ -53,12 +53,34 @@ impl CpuBackend {
         if !vecdot::supports(ggml_type, in_dim) {
             return None;
         }
+        let raw = w.raw_bytes();
+        let row_bytes = w.row_bytes();
+
+        // K-quant prefill takes a dedicated GEMM: `q8_K`-style activations
+        // (one scale per 256) accumulated in `i32` across the super-block,
+        // laid out interleaved by token tile. Worth +45% to +84% per tensor
+        // over the generic path on a `Llama-3.2-1B-Instruct-Q4_K_M`, which is
+        // 100% `Q4_K`/`Q6_K`. See `engine::vecdot`'s section comment.
+        if n_tokens > 1 && vecdot::supports_k(ggml_type, in_dim) {
+            return Some(Self::matmul_k_gemm(
+                x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
+            ));
+        }
+
+        // The symmetric per-32 types take the same flat activation layout,
+        // minus the per-256 accumulation their scales cannot support. Worth
+        // it because a `Q8_0` prefill profile is 74.9% *loads* — see
+        // `engine::vecdot`'s section comment.
+        if n_tokens > 1 && vecdot::supports_flat(ggml_type, in_dim) {
+            return Some(Self::matmul_flat_gemm(
+                x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
+            ));
+        }
+
         // Once per call, not once per (row, token) — this is the whole point.
         let acts: Vec<vecdot::ActQ8> = (0..n_tokens)
             .map(|t| vecdot::quantize_act(&x[t * in_dim..(t + 1) * in_dim]))
             .collect();
-        let raw = w.raw_bytes();
-        let row_bytes = w.row_bytes();
 
         // Accumulate transposed (`[out_dim, n_tokens]`) so the rayon split is
         // over output rows, which is the only dimension with real parallelism
@@ -113,6 +135,88 @@ impl CpuBackend {
             }
         }
         Some(y)
+    }
+
+    /// The K-quant prefill GEMM. Same shape as the generic path below it —
+    /// accumulate transposed, two output rows per rayon chunk, one scratch
+    /// row per worker — but over [`vecdot::ActQ8K`]/[`vecdot::KRow`].
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_k_gemm(
+        x: &[f32],
+        n_tokens: usize,
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let acts = vecdot::ActQ8K::quantize(x, in_dim, n_tokens);
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
+            || (vecdot::KRow::new(), vecdot::KRow::new(), Vec::new()),
+            |(s0, s1, scratch), (pair, dst)| {
+                let o0 = pair * 2;
+                let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+                vecdot::unpack_k_row(ggml_type, row(o0), in_dim, s0);
+                if dst.len() == n_tokens * 2 {
+                    vecdot::unpack_k_row(ggml_type, row(o0 + 1), in_dim, s1);
+                    let (d0, d1) = dst.split_at_mut(n_tokens);
+                    vecdot::dot_k_pair(s0, s1, &acts, d0, d1);
+                } else {
+                    // `out_dim` is odd — this chunk holds the last row alone.
+                    vecdot::dot_k_multi(s0, &acts, dst, scratch);
+                }
+            },
+        );
+
+        let mut y = vec![0f32; n_tokens * out_dim];
+        for o in 0..out_dim {
+            for t in 0..n_tokens {
+                y[t * out_dim + o] = yt[o * n_tokens + t];
+            }
+        }
+        y
+    }
+
+    /// The `Q8_0`/`Q5_0`/`IQ4_NL` prefill GEMM, over [`vecdot::ActQ8Flat`].
+    /// Identical in shape to [`Self::matmul_k_gemm`]; they differ only in the
+    /// activation type and the kernel called.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_flat_gemm(
+        x: &[f32],
+        n_tokens: usize,
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let acts = vecdot::ActQ8Flat::quantize(x, in_dim, n_tokens);
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
+            || (vecdot::UnpackedRow::new(), vecdot::UnpackedRow::new(), Vec::new()),
+            |(s0, s1, scratch), (pair, dst)| {
+                let o0 = pair * 2;
+                let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+                vecdot::unpack_row(ggml_type, row(o0), in_dim, s0);
+                if dst.len() == n_tokens * 2 {
+                    vecdot::unpack_row(ggml_type, row(o0 + 1), in_dim, s1);
+                    let (d0, d1) = dst.split_at_mut(n_tokens);
+                    vecdot::dot_flat_pair(s0, s1, &acts, d0, d1);
+                } else {
+                    // `out_dim` is odd — this chunk holds the last row alone.
+                    vecdot::dot_flat_multi(s0, &acts, dst, scratch);
+                }
+            },
+        );
+
+        let mut y = vec![0f32; n_tokens * out_dim];
+        for o in 0..out_dim {
+            for t in 0..n_tokens {
+                y[t * out_dim + o] = yt[o * n_tokens + t];
+            }
+        }
+        y
     }
 
     /// The dequantize path, on its own: every weight row widened to `f32`

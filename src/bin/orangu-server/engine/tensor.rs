@@ -777,6 +777,53 @@ mod tests {
     /// summed squared magnitude of the rotated block unchanged. Guards
     /// against an indexing slip that drops or double-writes an element.
     #[test]
+    /// `freq_factors` **divides** the frequency, so an entry of 32 rotates
+    /// that pair 32x slower. This is the whole mechanism behind a
+    /// Llama-3.1/3.2 checkpoint's `rope_freqs.weight`, and dropping it is not
+    /// a subtle quality loss — `LlamaModel::rope_freq_factors` documents the
+    /// `"I am I am I am I am"` it produces.
+    ///
+    /// Asserted as the *ratio* between two rotation angles rather than
+    /// against a hand-computed constant: the ratio is the invariant, and a
+    /// literal here would only re-encode `freq_base.powf(...)` in the test.
+    #[test]
+    fn rope_freq_factors_divide_the_rotation_frequency() {
+        for layout in [RopeLayout::Neox, RopeLayout::Norm] {
+            // Pair 1 of a 4-wide rotation. Only that pair's factor differs
+            // between the two runs, so any change in it is attributable.
+            let angle_of = |ff: Option<&[f32]>| {
+                let mut x: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+                // Put the unit into whichever slot pair 1 reads as its "a".
+                let a = match layout {
+                    RopeLayout::Neox => 1,
+                    RopeLayout::Norm => 2,
+                };
+                x[a] = 1.0;
+                rope_apply_layout_inplace(&mut x, 1, 4, 4, 1, 10000.0, ff, 1.0, layout);
+                // …and read the "b" slot, which holds sin(theta).
+                x[match layout {
+                    RopeLayout::Neox => 3,
+                    RopeLayout::Norm => 3,
+                }]
+            };
+            let plain = angle_of(None);
+            let slowed = angle_of(Some(&[1.0, 32.0]));
+            assert!(plain > 0.0 && slowed > 0.0, "{layout:?}: {plain}, {slowed}");
+            // Both angles are small enough that sin(t) ~ t, so the ratio of
+            // the sin components is the ratio of the frequencies.
+            let ratio = plain / slowed;
+            assert!(
+                (ratio - 32.0).abs() < 1e-2,
+                "{layout:?}: expected 32x slower, got {ratio}x"
+            );
+
+            // A factor of 1.0 is exactly the no-op, and `None` must agree
+            // with it bit for bit rather than merely closely.
+            assert_eq!(angle_of(Some(&[1.0, 1.0])), plain, "{layout:?}");
+        }
+    }
+
+    #[test]
     fn rope_layouts_preserve_total_energy() {
         for layout in [RopeLayout::Neox, RopeLayout::Norm] {
             let mut x: [f32; 8] = [1.0, -2.0, 3.0, 4.0, -5.0, 6.0, 7.0, -8.0];

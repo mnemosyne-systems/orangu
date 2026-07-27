@@ -45,8 +45,8 @@
 
 use super::iq_grids::KVALUES_IQ4NL;
 use super::quant::{
-    GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-    get_scale_min_k4, read_f16,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
 };
 
 /// Elements per activation-quantization block — one shared `f32` scale per
@@ -118,7 +118,7 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
 pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
     match ggml_type {
         GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => in_dim.is_multiple_of(32),
-        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K => in_dim.is_multiple_of(256),
+        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
         _ => false,
     }
 }
@@ -208,6 +208,7 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q8_0 => unpack_q8_0(row, out),
         GGML_TYPE_Q5_0 => unpack_q5_0(row, out),
         GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
+        GGML_TYPE_IQ4_XS => unpack_iq4_xs(row, out),
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
         // Unreachable via `supports`, but a wrong answer here would be a
@@ -737,9 +738,79 @@ unsafe fn dot16_sse41(w: &[i8], x: &[i8]) -> i32 {
 /// register-resident table, not a bit-shuffle worth intrinsics.
 #[inline(always)]
 fn unpack_block_iq4_nl(qs: &[u8], w: &mut [i8; 32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safety: NEON (`asimd`) is architecturally mandatory on aarch64, so
+        // this needs no runtime check — unlike `dotprod`/`i8mm`.
+        return unsafe { unpack_block_iq4_nl_neon(qs, w) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Checked per block rather than per row. `is_x86_feature_detected!`
+        // compiles to a relaxed load of a cached bitmask plus a
+        // perfectly-predicted branch, which is far below the ~60 scalar ops
+        // it saves.
+        if is_x86_feature_detected!("ssse3") {
+            // Safety: guarded by the runtime feature check above.
+            return unsafe { unpack_block_iq4_nl_ssse3(qs, w) };
+        }
+    }
+    #[allow(unreachable_code)]
+    unpack_block_iq4_nl_scalar(qs, w)
+}
+
+/// The reference form, and the fallback where no byte-shuffle exists.
+#[inline(always)]
+fn unpack_block_iq4_nl_scalar(qs: &[u8], w: &mut [i8; 32]) {
     for j in 0..16 {
         w[j] = KVALUES_IQ4NL[(qs[j] & 0x0F) as usize];
         w[j + 16] = KVALUES_IQ4NL[(qs[j] >> 4) as usize];
+    }
+}
+
+/// `vqtbl1q_s8` is a 16-entry byte table lookup across a whole vector —
+/// exactly the shape of [`KVALUES_IQ4NL`], which is 16 `i8` by construction.
+///
+/// This replaces ~64 scalar operations with 8 instructions, and it is not a
+/// micro-optimization: a decode profile of `SmolLM2-360M-IQ4_XS` put **79.3%**
+/// of all time in the scalar form (52.1% in `ld1 {v.b}[n]` lane inserts,
+/// 27.2% in the `ldrb` table reads) against **0.4%** in the actual
+/// multiply-accumulate. The kernel was not computing, it was gathering bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack_block_iq4_nl_neon(qs: &[u8], w: &mut [i8; 32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let table = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+        let packed = vld1q_u8(qs.as_ptr());
+        // Low nibbles land in elements 0..16, high nibbles in 16..32 — the
+        // layout both `IQ4_NL` and `IQ4_XS` blocks use.
+        let lo = vandq_u8(packed, vdupq_n_u8(0x0F));
+        let hi = vshrq_n_u8::<4>(packed);
+        vst1q_s8(w.as_mut_ptr(), vqtbl1q_s8(table, lo));
+        vst1q_s8(w.as_mut_ptr().add(16), vqtbl1q_s8(table, hi));
+    }
+}
+
+/// `pshufb` is x86's byte-table shuffle and behaves like `vqtbl1q_s8` for
+/// indices below 16 (it zeroes a lane only when the index's high bit is set,
+/// which a 4-bit nibble never has). Same 8-instruction shape as the NEON
+/// path above.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn unpack_block_iq4_nl_ssse3(qs: &[u8], w: &mut [i8; 32]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let table = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+        let packed = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let lo = _mm_and_si128(packed, _mm_set1_epi8(0x0F));
+        // No 8-bit shift on x86: shift 16-bit lanes and mask the borrowed bits.
+        let hi = _mm_and_si128(_mm_srli_epi16::<4>(packed), _mm_set1_epi8(0x0F));
+        _mm_storeu_si128(w.as_mut_ptr() as *mut __m128i, _mm_shuffle_epi8(table, lo));
+        _mm_storeu_si128(
+            w.as_mut_ptr().add(16) as *mut __m128i,
+            _mm_shuffle_epi8(table, hi),
+        );
     }
 }
 
@@ -892,6 +963,36 @@ fn unpack_q5_0(row: &[u8], out: &mut UnpackedRow) {
 /// `block_iq4_nl`: `{ d: f16, qs: [u8; 16] }`, 32 elements — `Q4_0`'s block
 /// shape with a codebook lookup in place of the `- 8`. Symmetric like
 /// `Q5_0`: one scale per 32, no `min` term.
+/// `IQ4_XS` into the generic [`UnpackedRow`] form — per-32 `f32` scales,
+/// no min.
+///
+/// Not reachable through [`supports`] today: `IQ4_XS` requires `256 | in_dim`
+/// there, which is exactly [`supports_k`]'s condition, so prefill always
+/// routes to [`dot_k_pair`] instead. It exists because `unpack_row`'s
+/// fallthrough is a `panic!`, and a gating change that silently turned a
+/// missing arm into a crash would be a poor trade for the dozen lines this
+/// costs.
+fn unpack_iq4_xs(row: &[u8], out: &mut UnpackedRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    out.has_min = false;
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = read_f16(block, 0);
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..BLOCK_BYTES];
+        for ib in 0..SUBS {
+            let b = s * SUBS + ib;
+            let low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            let high = ((scales_h >> (2 * ib)) & 3) as u8;
+            let ls = ((low | (high << 4)) as i32) - 32;
+            let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
+            unpack_block_iq4_nl(&qs[ib * 16..], w);
+            out.scale[b] = d * ls as f32;
+            out.min[b] = 0.0;
+        }
+    }
+}
+
 fn unpack_iq4_nl(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 16;
     out.has_min = false;
@@ -1219,6 +1320,808 @@ fn dot_unpacked_multi_impl<const ISA: u8>(w: &UnpackedRow, acts: &[ActQ8], out: 
 }
 
 // =====================================================================
+// K-quant prefill GEMM: `q8_K`-style activations, tile-interleaved.
+//
+// A second GEMM path used only for `Q4_K`/`Q6_K` with several tokens. Those
+// two types are 100% of a `Llama-3.2-1B-Instruct-Q4_K_M` (58% `Q4_K`, 42%
+// `Q6_K`) — `embedding_length` 2048 is a multiple of 256, so unlike
+// `Qwen2.5-0.5B` nothing falls back to `Q5_0` — and on that model the generic
+// path above reached only 61% of llama.cpp's prefill. A `perf annotate` of a
+// real prefill put ~80% of all time in `dot_unpacked_pair_impl`'s
+// `per32 && has_min` branch and showed three distinct problems, which this
+// path fixes together:
+//
+// 1. **Pointer chasing.** `acts: &[ActQ8]` is a slice of structs of three
+//    `Vec`s, so the inner loop reloads three data pointers plus their lengths
+//    for every (block, token) — the 72-byte `ActQ8` stride appears literally
+//    as `ldr x16, [x26], #72`, and one activation load alone carried 21.6% of
+//    the profile. [`ActQ8K`] is instead one flat allocation with the tile's
+//    four tokens interleaved per block, so the whole loop is one sequential
+//    stream off a single base pointer.
+// 2. **`f32` bookkeeping every 32 elements.** The generic path converts to
+//    `f32` and does a multiply/subtract/FMA per 32-element sub-block. ggml
+//    carries a separate `block_q8_K` activation format with one scale per 256
+//    precisely so it can keep `scale * partial` in `i32` across a whole
+//    super-block and touch `f32` once per 256 — see
+//    `ggml_vec_dot_q4_K_q8_K`'s NEON branch, whose entire per-super-block
+//    `f32` work is `sumf += d * (sumi1 + sumi2)`. This does the same.
+// 3. **A slow scalar tail.** `n_tokens % TOKEN_TILE` tokens went through the
+//    untiled `dot_unpacked_impl`; at a 79-token prompt that was 4.2% of
+//    prefill. Here the token count is padded up to a whole tile with zero
+//    activations, which contribute nothing, so every token is tiled.
+//
+// `Q4_K`'s asymmetric `-dmin*m` correction is computed in its own pass over
+// the row rather than inside the dot loop. It reads only two small `i16`
+// arrays that stay in L1 and touches neither the weight quants nor the
+// activations, and hoisting it out frees four registers in the hot loop —
+// worth +10% on `ffn_down` at 4 threads.
+//
+// Measured on the reference Pi 4 at 4 threads, 64 tokens, against the generic
+// path at the real Llama-3.2-1B shapes: `wq`/`wo` +52%, `gate`/`up` +45%,
+// `ffn_down` +61% (`Q6_K`) and +84% (`Q4_K`), `attn_v` +47%.
+//
+// `Q8_0`/`Q5_0` deliberately keep the generic path: they have no super-block
+// to accumulate across, so only point 1 would apply to them, and the
+// `Qwen2.5-0.5B` numbers that path was tuned against are already at 89% of
+// llama.cpp.
+// =====================================================================
+
+/// Elements per K-quant super-block.
+pub const SUPER_BLOCK: usize = 256;
+/// 32-element sub-blocks per super-block.
+const SUBS: usize = SUPER_BLOCK / 32;
+/// Scale groups per `Q6_K` super-block (one per 16 elements).
+const Q6K_GROUPS: usize = SUPER_BLOCK / GROUP;
+
+/// Whether [`ActQ8K`] and [`dot_k_pair`] handle `ggml_type` at this `in_dim`.
+///
+/// Narrower than [`supports`] on purpose: this path exists for the two K-quant
+/// types, which are the only ones with a 256-element super-block to accumulate
+/// across.
+pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
+    matches!(
+        ggml_type,
+        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
+    ) && in_dim.is_multiple_of(SUPER_BLOCK)
+}
+
+/// Activations quantized to `int8` with **one `f32` scale per 256 elements**
+/// (ggml's `block_q8_K`) and laid out interleaved by token tile.
+///
+/// The coarser scale is what makes integer accumulation across a super-block
+/// possible, and is the same tradeoff ggml makes for K-quant weights — it uses
+/// `block_q8_K` for exactly these types and the finer `block_q8_0`/`q8_1` for
+/// the rest. Accuracy stays inside the same budget [`ActQ8`] is held to; see
+/// the tests.
+pub struct ActQ8K {
+    n_tokens: usize,
+    /// `in_dim / 32`
+    n_block: usize,
+    /// `in_dim / 256`
+    n_super: usize,
+    /// `n_tokens.div_ceil(TOKEN_TILE)`
+    n_tile: usize,
+    /// `[tile][block][token][32]` — the tile's four tokens contiguous per
+    /// block, so the dot loop walks one stream instead of four.
+    q: Vec<i8>,
+    /// `[tile][super][token]`
+    d: Vec<f32>,
+    /// `[tile][super][token][8]` — `sum(q)` per 32-element sub-block, for
+    /// `Q4_K`'s min term. Grouped eight-at-a-time per (super-block, token) so
+    /// the correction is one short contiguous dot in its own pass.
+    bsum: Vec<i16>,
+}
+
+impl ActQ8K {
+    /// `x` is `[n_tokens][in_dim]`, token-major. `in_dim` must be a multiple
+    /// of [`SUPER_BLOCK`] — guaranteed by [`supports_k`].
+    pub fn quantize(x: &[f32], in_dim: usize, n_tokens: usize) -> Self {
+        debug_assert_eq!(in_dim % SUPER_BLOCK, 0);
+        debug_assert_eq!(x.len(), n_tokens * in_dim);
+        let n_block = in_dim / 32;
+        let n_super = in_dim / SUPER_BLOCK;
+        let n_tile = n_tokens.div_ceil(TOKEN_TILE);
+        // The padding tokens of the last tile stay zero: a zero activation
+        // block has a zero scale and contributes nothing, and their outputs
+        // are never read.
+        let mut q = vec![0i8; n_tile * n_block * TOKEN_TILE * 32];
+        let mut d = vec![0f32; n_tile * n_super * TOKEN_TILE];
+        let mut bsum = vec![0i16; n_tile * n_super * TOKEN_TILE * SUBS];
+        for tl in 0..n_tile {
+            for k in 0..TOKEN_TILE {
+                let t = tl * TOKEN_TILE + k;
+                if t >= n_tokens {
+                    break;
+                }
+                let row = &x[t * in_dim..(t + 1) * in_dim];
+                for s in 0..n_super {
+                    let chunk = &row[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK];
+                    let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let scale = amax / 127.0;
+                    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                    d[(tl * n_super + s) * TOKEN_TILE + k] = scale;
+                    for j in 0..SUBS {
+                        let b = s * SUBS + j;
+                        let src = &chunk[j * 32..(j + 1) * 32];
+                        let dst = &mut q[((tl * n_block + b) * TOKEN_TILE + k) * 32..][..32];
+                        let mut sum = 0i32;
+                        for (slot, &v) in dst.iter_mut().zip(src) {
+                            // `round` then clamp, as in `quantize_act`: the
+                            // extreme is exactly ±127, never -128.
+                            let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                            *slot = qi;
+                            sum += qi as i32;
+                        }
+                        // |sum| <= 32 * 127 = 4064, so `i16` is ample.
+                        bsum[((tl * n_super + s) * TOKEN_TILE + k) * SUBS + j] = sum as i16;
+                    }
+                }
+            }
+        }
+        Self {
+            n_tokens,
+            n_block,
+            n_super,
+            n_tile,
+            q,
+            d,
+            bsum,
+        }
+    }
+}
+
+/// One unpacked K-quant weight row, with the scales left as **integers**.
+///
+/// That is the difference from [`UnpackedRow`], and the whole point: only the
+/// per-super-block `d`/`dmin` are `f32`, so the dot loop can fold each
+/// sub-block's scale into an `i32` running sum and convert once per 256
+/// elements instead of once per 32.
+pub struct KRow {
+    /// `int8` weights. `Q4_K` keeps its unsigned `0..=15`; `Q6_K` folds its
+    /// `-32` bias in, giving `-32..=31`.
+    q: Vec<i8>,
+    /// Integer scale — per 32 elements for `Q4_K`, per [`GROUP`] for `Q6_K`.
+    sc: Vec<i16>,
+    /// Integer min per 32 elements. `Q4_K` only; empty otherwise.
+    mins: Vec<i16>,
+    /// Per-super-block `f32` scale.
+    d: Vec<f32>,
+    /// Per-super-block `f32` min scale. `Q4_K` only.
+    dmin: Vec<f32>,
+    /// Which loop shape this row needs. These differ structurally, not just
+    /// by constant, so this selects a kernel rather than parameterizing one.
+    kind: KKind,
+}
+
+/// The three K-quant shapes [`KRow`] can hold.
+///
+/// Note what the discriminating properties actually are — scale granularity
+/// and symmetry — rather than the type names: `Q4_K` and `IQ4_XS` share a
+/// loop and differ only in whether the min pass runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KKind {
+    /// Per-32 integer scales *and* a per-32 integer min. The only asymmetric
+    /// K-quant, so the only one that needs the correction pass.
+    Q4K,
+    /// Per-[`GROUP`] (16) signed scales, symmetric.
+    Q6K,
+    /// Per-32 signed scales, symmetric — `Q4_K`'s loop with the min pass
+    /// skipped, which is exactly how it is implemented.
+    Iq4Xs,
+}
+
+impl KRow {
+    pub fn new() -> Self {
+        Self {
+            q: Vec::new(),
+            sc: Vec::new(),
+            mins: Vec::new(),
+            d: Vec::new(),
+            dmin: Vec::new(),
+            // Overwritten by `resize_for` before any read; the buffers are
+            // empty until then.
+            kind: KKind::Q4K,
+        }
+    }
+
+    fn resize_for(&mut self, in_dim: usize, kind: KKind) {
+        let n_super = in_dim / SUPER_BLOCK;
+        // Only `Q6_K` carries scales per 16; the other two are per 32. Only
+        // `Q4_K` carries mins at all.
+        let n_sc = if kind == KKind::Q6K {
+            in_dim / GROUP
+        } else {
+            in_dim / 32
+        };
+        let q4k = kind == KKind::Q4K;
+        let n_min = if q4k { in_dim / 32 } else { 0 };
+        // Resize *and* truncate both ways, so a buffer reused across tensors
+        // of different types or widths cannot keep a stale tail.
+        self.q.resize(in_dim, 0);
+        self.q.truncate(in_dim);
+        self.sc.resize(n_sc, 0);
+        self.sc.truncate(n_sc);
+        self.mins.resize(n_min, 0);
+        self.mins.truncate(n_min);
+        self.d.resize(n_super, 0.0);
+        self.d.truncate(n_super);
+        self.dmin.resize(if q4k { n_super } else { 0 }, 0.0);
+        self.dmin.truncate(if q4k { n_super } else { 0 });
+        self.kind = kind;
+    }
+}
+
+impl Default for KRow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Unpacks one weight row into `out`. `ggml_type`/`in_dim` must have passed
+/// [`supports_k`].
+pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
+    match ggml_type {
+        GGML_TYPE_Q4_K => {
+            out.resize_for(in_dim, KKind::Q4K);
+            unpack_k_q4_k(row, out);
+        }
+        GGML_TYPE_Q6_K => {
+            out.resize_for(in_dim, KKind::Q6K);
+            unpack_k_q6_k(row, out);
+        }
+        GGML_TYPE_IQ4_XS => {
+            out.resize_for(in_dim, KKind::Iq4Xs);
+            unpack_k_iq4_xs(row, out);
+        }
+        other => panic!("vecdot::unpack_k_row called for unsupported ggml_type {other}"),
+    }
+}
+
+/// Same bit layout as [`unpack_q4_k`], but `sc`/`m` stay integers and `d`/
+/// `dmin` are kept once per super-block rather than multiplied in.
+fn unpack_k_q4_k(row: &[u8], out: &mut KRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+    let mut sb = 0usize;
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        out.d[s] = read_f16(block, 0);
+        out.dmin[s] = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qs = &block[16..];
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let w = &mut out.q[(sb + half) * 32..(sb + half) * 32 + 32];
+                for (j, &byte) in bytes.iter().enumerate() {
+                    w[j] = ((byte >> shift) & 0x0F) as i8;
+                }
+                out.sc[sb + half] = sc as i16;
+                out.mins[sb + half] = m as i16;
+            }
+            sb += 2;
+        }
+    }
+}
+
+/// Same bit layout as [`unpack_q6_k`], with the `i8` scales kept as integers.
+fn unpack_k_q6_k(row: &[u8], out: &mut KRow) {
+    const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let sc = &block[192..208];
+        out.d[s] = read_f16(block, 208);
+        let base = s * SUPER_BLOCK;
+        for h in 0..2 {
+            let qh_run = &qh[h * 32..h * 32 + 32];
+            for (run, &(ql_add, hshift, high)) in Q6K_RUNS.iter().enumerate() {
+                let e0 = base + h * 128 + run * 32;
+                let ql_run = &ql[h * 64 + ql_add..h * 64 + ql_add + 32];
+                let w: &mut [i8; 32] = (&mut out.q[e0..e0 + 32]).try_into().unwrap();
+                unpack_q6k_run(ql_run, qh_run, hshift, high, w);
+                // This 32-element run spans two scale groups of 16. `scales`
+                // is `int8_t` in ggml's struct — a negative scale must stay
+                // negative, hence the `as i8` before widening.
+                let gi = e0 / GROUP;
+                out.sc[gi] = sc[gi % 16] as i8 as i16;
+                out.sc[gi + 1] = sc[(gi + 1) % 16] as i8 as i16;
+            }
+        }
+    }
+}
+
+/// Dots **two** unpacked K-quant rows against every token, sharing each
+/// activation load between them — the prefill entry point for
+/// `Q4_K`/`Q6_K`/`IQ4_XS`.
+///
+/// `out0`/`out1` are `n_tokens` long; the tile padding is dropped on the way
+/// out.
+pub fn dot_k_pair(w0: &KRow, w1: &KRow, a: &ActQ8K, out0: &mut [f32], out1: &mut [f32]) {
+    debug_assert_eq!(w0.kind, w1.kind);
+    debug_assert_eq!(out0.len(), a.n_tokens);
+    debug_assert_eq!(out1.len(), a.n_tokens);
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        return dot_k_pair_impl::<ISA_DOTPROD>(w0, w1, a, out0, out1);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_vnni() {
+            // Safety: `have_vnni` verified the features and the kernel's
+            // output against AVX2.
+            return unsafe { dot_k_pair_vnni(w0, w1, a, out0, out1) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            // Safety: guarded by the runtime feature check above.
+            return unsafe { dot_k_pair_avx2(w0, w1, a, out0, out1) };
+        }
+    }
+    dot_k_pair_impl::<ISA_BASELINE>(w0, w1, a, out0, out1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl,avx2,ssse3")]
+unsafe fn dot_k_pair_vnni(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    dot_k_pair_impl::<ISA_VNNI>(w0, w1, a, out0, out1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_pair_avx2(w0: &KRow, w1: &KRow, a: &ActQ8K, out0: &mut [f32], out1: &mut [f32]) {
+    dot_k_pair_impl::<ISA_AVX2>(w0, w1, a, out0, out1)
+}
+
+fn dot_k_pair_impl<const ISA: u8>(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    match w0.kind {
+        KKind::Q4K => gemm_k_q4_k::<ISA>(w0, w1, a, out0, out1),
+        KKind::Q6K => gemm_k_q6_k::<ISA>(w0, w1, a, out0, out1),
+        KKind::Iq4Xs => gemm_k_iq4_xs::<ISA>(w0, w1, a, out0, out1),
+    }
+}
+
+/// One row against every token — the trailing row when `out_dim` is odd.
+///
+/// Runs the pair kernel with the row supplied twice and the duplicate results
+/// discarded. `out_dim` is even for every tensor in every model this has been
+/// run against, so this is a correctness path, not a hot one; giving it its
+/// own copy of the loop would double the kernel surface to save nothing
+/// measurable.
+pub fn dot_k_multi(w: &KRow, a: &ActQ8K, out: &mut [f32], scratch: &mut Vec<f32>) {
+    scratch.clear();
+    scratch.resize(out.len(), 0.0);
+    dot_k_pair(w, w, a, out, scratch);
+}
+
+fn gemm_k_q4_k<const ISA: u8>(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    for tl in 0..a.n_tile {
+        let mut acc0 = [0f32; TOKEN_TILE];
+        let mut acc1 = [0f32; TOKEN_TILE];
+        let qtile = &a.q[tl * a.n_block * TOKEN_TILE * 32..];
+        let dtile = &a.d[tl * a.n_super * TOKEN_TILE..];
+        let btile = &a.bsum[tl * a.n_super * TOKEN_TILE * SUBS..];
+
+        // Pass 1: the asymmetric `-dmin*m` correction, `sum_j m[j]*bsum[j]`
+        // per (super-block, token). Reads ~1 KiB of `i16` and never touches
+        // the weight quants or activations, so it stays in L1 and leaves the
+        // dot loop below four registers freer.
+        for s in 0..a.n_super {
+            let ad = &dtile[s * TOKEN_TILE..];
+            let m0 = &w0.mins[s * SUBS..];
+            let m1 = &w1.mins[s * SUBS..];
+            let (dm0, dm1) = (w0.dmin[s], w1.dmin[s]);
+            for k in 0..TOKEN_TILE {
+                let bs = &btile[(s * TOKEN_TILE + k) * SUBS..];
+                let mut i0 = 0i32;
+                let mut i1 = 0i32;
+                for j in 0..SUBS {
+                    let b = bs[j] as i32;
+                    i0 += m0[j] as i32 * b;
+                    i1 += m1[j] as i32 * b;
+                }
+                acc0[k] -= ad[k] * dm0 * i0 as f32;
+                acc1[k] -= ad[k] * dm1 * i1 as f32;
+            }
+        }
+
+        // Pass 2: the symmetric dot, shared with `IQ4_XS`.
+        accumulate_sym32::<ISA>(w0, w1, a, qtile, dtile, &mut acc0, &mut acc1);
+        store_tile(tl, &acc0, out0);
+        store_tile(tl, &acc1, out1);
+    }
+}
+
+/// The per-32 symmetric dot: `sum_s d * sum_j sc[j] * (q[j] . x[j])`, one
+/// `f32` conversion per super-block.
+///
+/// Shared verbatim by [`gemm_k_q4_k`] (as its second pass, after the min
+/// correction) and [`gemm_k_iq4_xs`] (which has no min term). Factored out
+/// rather than copied so the two cannot drift, and so `Q4_K` — the
+/// best-measured path here — keeps bit-identical arithmetic.
+///
+/// Integer range: `Q4_K`'s `sc` is `0..=63` against unsigned `0..=15` quants,
+/// `IQ4_XS`'s is `-32..=31` against `KVALUES_IQ4NL`'s `-127..=113`. The larger
+/// case is |sc| 32 * 32 lanes * 127 * 127 ~ 1.65e7 per sub-block, so eight of
+/// them stay far inside `i32`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn accumulate_sym32<const ISA: u8>(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    qtile: &[i8],
+    dtile: &[f32],
+    acc0: &mut [f32; TOKEN_TILE],
+    acc1: &mut [f32; TOKEN_TILE],
+) {
+    for s in 0..a.n_super {
+        let mut isum0 = [0i32; TOKEN_TILE];
+        let mut isum1 = [0i32; TOKEN_TILE];
+        for j in 0..SUBS {
+            let b = s * SUBS + j;
+            let sc0 = w0.sc[b] as i32;
+            let sc1 = w1.sc[b] as i32;
+            let q0 = &w0.q[b * 32..];
+            let q1 = &w1.q[b * 32..];
+            let xq = &qtile[b * TOKEN_TILE * 32..];
+            for k in 0..TOKEN_TILE {
+                let x = &xq[k * 32..];
+                isum0[k] += sc0 * dot32::<ISA>(q0, x);
+                isum1[k] += sc1 * dot32::<ISA>(q1, x);
+            }
+        }
+        let (d0, d1) = (w0.d[s], w1.d[s]);
+        let ad = &dtile[s * TOKEN_TILE..];
+        for k in 0..TOKEN_TILE {
+            acc0[k] += ad[k] * (d0 * isum0[k] as f32);
+            acc1[k] += ad[k] * (d1 * isum1[k] as f32);
+        }
+    }
+}
+
+/// `IQ4_XS` prefill: [`gemm_k_q4_k`] without the min pass. Its scales are
+/// per-32 and signed, and its quants already carry the `KVALUES_IQ4NL` levels
+/// as `int8`, so nothing is left to correct.
+fn gemm_k_iq4_xs<const ISA: u8>(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    for tl in 0..a.n_tile {
+        let mut acc0 = [0f32; TOKEN_TILE];
+        let mut acc1 = [0f32; TOKEN_TILE];
+        let qtile = &a.q[tl * a.n_block * TOKEN_TILE * 32..];
+        let dtile = &a.d[tl * a.n_super * TOKEN_TILE..];
+        accumulate_sym32::<ISA>(w0, w1, a, qtile, dtile, &mut acc0, &mut acc1);
+        store_tile(tl, &acc0, out0);
+        store_tile(tl, &acc1, out1);
+    }
+}
+
+/// Unpacks an `IQ4_XS` row: one `f16` per 256, a 6-bit scale per 32 split
+/// across `scales_l`/`scales_h` and biased by -32, and 4-bit indices into
+/// [`KVALUES_IQ4NL`] laid out exactly as `IQ4_NL`'s — low nibbles to elements
+/// 0..16, high nibbles to 16..32 — so [`unpack_block_iq4_nl`] serves both.
+///
+/// Scales stay **integers** here, as with `Q4_K`/`Q6_K`: that is what lets the
+/// dot accumulate in `i32` across a whole super-block.
+fn unpack_k_iq4_xs(row: &[u8], out: &mut KRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        out.d[s] = read_f16(block, 0);
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..BLOCK_BYTES];
+        for ib in 0..SUBS {
+            let low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            let high = ((scales_h >> (2 * ib)) & 3) as u8;
+            out.sc[s * SUBS + ib] = ((low | (high << 4)) as i16) - 32;
+            let w: &mut [i8; 32] = (&mut out.q[(s * SUBS + ib) * 32..][..32])
+                .try_into()
+                .unwrap();
+            unpack_block_iq4_nl(&qs[ib * 16..], w);
+        }
+    }
+}
+
+fn gemm_k_q6_k<const ISA: u8>(
+    w0: &KRow,
+    w1: &KRow,
+    a: &ActQ8K,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    for tl in 0..a.n_tile {
+        let mut acc0 = [0f32; TOKEN_TILE];
+        let mut acc1 = [0f32; TOKEN_TILE];
+        let qtile = &a.q[tl * a.n_block * TOKEN_TILE * 32..];
+        let dtile = &a.d[tl * a.n_super * TOKEN_TILE..];
+        for s in 0..a.n_super {
+            let mut isum0 = [0i32; TOKEN_TILE];
+            let mut isum1 = [0i32; TOKEN_TILE];
+            // `Q6_K` is symmetric — the `-32` bias is folded into the `int8`
+            // weight — so there is no min pass, but its scales genuinely vary
+            // per 16, hence [`GROUP`]-wide steps. |sc| <= 127 and a group
+            // partial is at most 16*32*127 = 65024, so 16 of them stay inside
+            // `i32`.
+            for g in 0..Q6K_GROUPS {
+                let e = s * SUPER_BLOCK + g * GROUP;
+                let sc0 = w0.sc[s * Q6K_GROUPS + g] as i32;
+                let sc1 = w1.sc[s * Q6K_GROUPS + g] as i32;
+                let q0 = &w0.q[e..];
+                let q1 = &w1.q[e..];
+                // Element `e` sits at offset `e % 32` inside block `e / 32`,
+                // and `GROUP` divides 32, so the 16 activations are contiguous.
+                let xq = &qtile[(e / 32) * TOKEN_TILE * 32..];
+                let off = e % 32;
+                for k in 0..TOKEN_TILE {
+                    let x = &xq[k * 32 + off..];
+                    isum0[k] += sc0 * dot16::<ISA>(q0, x);
+                    isum1[k] += sc1 * dot16::<ISA>(q1, x);
+                }
+            }
+            let (d0, d1) = (w0.d[s], w1.d[s]);
+            let ad = &dtile[s * TOKEN_TILE..];
+            for k in 0..TOKEN_TILE {
+                acc0[k] += ad[k] * (d0 * isum0[k] as f32);
+                acc1[k] += ad[k] * (d1 * isum1[k] as f32);
+            }
+        }
+        store_tile(tl, &acc0, out0);
+        store_tile(tl, &acc1, out1);
+    }
+}
+
+/// Writes one tile's accumulators, dropping the padded tail tokens.
+#[inline]
+fn store_tile(tl: usize, acc: &[f32; TOKEN_TILE], out: &mut [f32]) {
+    let base = tl * TOKEN_TILE;
+    let n = TOKEN_TILE.min(out.len().saturating_sub(base));
+    out[base..base + n].copy_from_slice(&acc[..n]);
+}
+
+// =====================================================================
+// Flat-activation prefill GEMM for the symmetric per-32 types.
+//
+// The K-quant GEMM above fixed three defects at once; this applies the first
+// of them — the activation *layout* — to the path K-quants do not take.
+//
+// A `perf` profile of `Q8_0` prefill (600-token prompt, DWARF) put 74.8% of
+// all time in `dot_unpacked_pair`, and inside it **74.9% in loads** against
+// 12.4% in the actual arithmetic (`smull` + `sadalp`). The kernel was starved,
+// not busy. Two load patterns accounted for it:
+//
+// * `ldp q26, q18, [x14, #-16]` (12.3% + 10.7% + 7.2% + 6.1%) — the `q`
+//   vectors, reached through a `&[ActQ8]` of structs-of-`Vec`s. Each token is
+//   a separate heap allocation 72 bytes of stride away, so four tokens are
+//   four independent pointer chases the prefetcher cannot follow.
+// * `ldr s17, [x13, x12, lsl #2]` (5.2% + 4.6% + 4.6% + 4.1% + 3.7%, ~22%
+//   total) — **scalar** 32-bit loads of `a.d[b]`, the per-block activation
+//   scale, fetched one at a time from four different `Vec<f32>`s.
+//
+// Flattening to `[tile][block][token][32]` for `q` and `[tile][block][token]`
+// for `d` turns the first into four sequential streams and collapses the
+// second into a single 16-byte load of four contiguous scales.
+//
+// Unlike the K path this does **not** widen the activation scale: `Q8_0` and
+// `Q5_0` carry one weight scale per 32, so `d_act * d_w * sum` genuinely has
+// to be accumulated in `f32` every block — exactly as ggml's own
+// `ggml_vec_dot_q8_0_q8_0` does. This is a pure layout change, and the
+// numbers it produces are bit-identical to the path it replaces.
+//
+// Why only the symmetric per-32 types: after the K GEMM landed, they are the
+// only ones that reach here. [`supports`] and [`supports_k`] impose the *same*
+// 256-divisibility on `Q4_K`/`Q6_K`, so any K-quant that gets through
+// `supports` also satisfies `supports_k` and is routed away before this. That
+// leaves `Q8_0`, `Q5_0` and `IQ4_NL` — all `per32`, all symmetric — so there
+// is no `has_min` correction and no per-`GROUP` branch to carry.
+//
+// `IQ4_NL` qualifies for exactly the reason the other two do, despite its
+// non-uniform quantization levels: `unpack_iq4_nl` resolves the 16-entry
+// `KVALUES_IQ4NL` table into plain `int8` weights and leaves `has_min` false,
+// so by the time a row reaches this kernel it is indistinguishable in shape
+// from a `Q8_0` one. Anything that unpacks to per-32 scales and no min term
+// belongs here; the test below is what pins that down rather than the type
+// list itself.
+
+/// Whether the flat-activation GEMM covers this type. Deliberately narrower
+/// than [`supports`]: the per-`GROUP` (`Q6_K`) and asymmetric (`Q4_K`) shapes
+/// are handled by the K-quant GEMM, and a type that satisfied neither would
+/// fall back to [`dot_unpacked_pair`] rather than being handled wrongly here.
+pub fn supports_flat(ggml_type: u32, in_dim: usize) -> bool {
+    matches!(
+        ggml_type,
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL
+    ) && in_dim.is_multiple_of(ACT_BLOCK)
+}
+
+/// Activations for [`dot_flat_pair`], laid out so a token tile is contiguous.
+///
+/// Same idea as [`ActQ8K`] but with the scale granularity the symmetric
+/// per-32 types actually have: one `f32` per (block, token) rather than one
+/// per (super-block, token), and no `bsum` — nothing here needs a min
+/// correction.
+pub struct ActQ8Flat {
+    n_tokens: usize,
+    n_block: usize,
+    n_tile: usize,
+    /// `[tile][block][token][32]`.
+    q: Vec<i8>,
+    /// `[tile][block][token]` — the four scales a tile needs for a given
+    /// block are adjacent, which is the entire point of this struct.
+    d: Vec<f32>,
+}
+
+impl ActQ8Flat {
+    /// `x` is `[n_tokens][in_dim]`, token-major. `in_dim` must be a multiple
+    /// of [`ACT_BLOCK`] — guaranteed by [`supports_flat`].
+    pub fn quantize(x: &[f32], in_dim: usize, n_tokens: usize) -> Self {
+        debug_assert_eq!(in_dim % ACT_BLOCK, 0);
+        debug_assert_eq!(x.len(), n_tokens * in_dim);
+        let n_block = in_dim / ACT_BLOCK;
+        let n_tile = n_tokens.div_ceil(TOKEN_TILE);
+        // Padding tokens in the last tile stay zero: a zero block has a zero
+        // scale and contributes nothing, and their outputs are never read.
+        // `k_gemm_result_is_independent_of_the_batch_size`'s analogue below
+        // pins that down.
+        let mut q = vec![0i8; n_tile * n_block * TOKEN_TILE * ACT_BLOCK];
+        let mut d = vec![0f32; n_tile * n_block * TOKEN_TILE];
+        for tl in 0..n_tile {
+            for k in 0..TOKEN_TILE {
+                let t = tl * TOKEN_TILE + k;
+                if t >= n_tokens {
+                    break;
+                }
+                let row = &x[t * in_dim..(t + 1) * in_dim];
+                for b in 0..n_block {
+                    let chunk = &row[b * ACT_BLOCK..(b + 1) * ACT_BLOCK];
+                    let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let scale = amax / 127.0;
+                    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                    d[(tl * n_block + b) * TOKEN_TILE + k] = scale;
+                    let dst = &mut q[((tl * n_block + b) * TOKEN_TILE + k) * ACT_BLOCK..]
+                        [..ACT_BLOCK];
+                    for (slot, &v) in dst.iter_mut().zip(chunk) {
+                        // `round` then clamp, as in `quantize_act`: the
+                        // extreme is exactly ±127, never -128.
+                        *slot = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                    }
+                }
+            }
+        }
+        Self {
+            n_tokens,
+            n_block,
+            n_tile,
+            q,
+            d,
+        }
+    }
+}
+
+/// Two weight rows against every token, over [`ActQ8Flat`]. The `UnpackedRow`
+/// side is unchanged — only the activations were relaid out.
+///
+/// Both rows must be `per32` and symmetric; [`supports_flat`] is what
+/// guarantees it at the call site.
+pub fn dot_flat_pair(
+    w0: &UnpackedRow,
+    w1: &UnpackedRow,
+    a: &ActQ8Flat,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    debug_assert_eq!(a.n_tokens, out0.len());
+    debug_assert_eq!(a.n_tokens, out1.len());
+    debug_assert!(w0.per32 && w1.per32);
+    debug_assert!(!w0.has_min && !w1.has_min);
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        return dot_flat_pair_impl::<ISA_DOTPROD>(w0, w1, a, out0, out1);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_vnni() {
+            // Safety: see `dot_row`.
+            return unsafe { dot_flat_pair_vnni(w0, w1, a, out0, out1) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            // Safety: guarded by the runtime feature check above.
+            return unsafe { dot_flat_pair_avx2(w0, w1, a, out0, out1) };
+        }
+    }
+    dot_flat_pair_impl::<ISA_BASELINE>(w0, w1, a, out0, out1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl,avx2,ssse3")]
+unsafe fn dot_flat_pair_vnni(
+    w0: &UnpackedRow,
+    w1: &UnpackedRow,
+    a: &ActQ8Flat,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    dot_flat_pair_impl::<ISA_VNNI>(w0, w1, a, out0, out1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_flat_pair_avx2(
+    w0: &UnpackedRow,
+    w1: &UnpackedRow,
+    a: &ActQ8Flat,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    dot_flat_pair_impl::<ISA_AVX2>(w0, w1, a, out0, out1)
+}
+
+/// One weight row. Runs the pair kernel against itself and discards the
+/// duplicate column — the trailing row of an odd `out_dim` only, so the
+/// wasted half is at most one row per matmul.
+pub fn dot_flat_multi(w: &UnpackedRow, a: &ActQ8Flat, out: &mut [f32], scratch: &mut Vec<f32>) {
+    scratch.clear();
+    scratch.resize(out.len(), 0.0);
+    dot_flat_pair(w, w, a, out, scratch);
+}
+
+/// Parenthesised to match [`dot_unpacked_pair_impl`]'s `per32`/no-min branch
+/// term for term, so both produce bit-identical results and the tests can
+/// compare them for exact equality.
+fn dot_flat_pair_impl<const ISA: u8>(
+    w0: &UnpackedRow,
+    w1: &UnpackedRow,
+    a: &ActQ8Flat,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    for tl in 0..a.n_tile {
+        let mut acc0 = [0f32; TOKEN_TILE];
+        let mut acc1 = [0f32; TOKEN_TILE];
+        // One tile's activations are one contiguous run: the block loop walks
+        // it forwards and never revisits, which is what the old layout could
+        // not do.
+        let qtile = &a.q[tl * a.n_block * TOKEN_TILE * ACT_BLOCK..];
+        let dtile = &a.d[tl * a.n_block * TOKEN_TILE..];
+        for b in 0..a.n_block {
+            let (s0, s1) = (w0.scale[b], w1.scale[b]);
+            let (q0, q1) = (&w0.q[b * ACT_BLOCK..], &w1.q[b * ACT_BLOCK..]);
+            let xq = &qtile[b * TOKEN_TILE * ACT_BLOCK..];
+            // Four adjacent `f32` — one vector load, not four scalar ones.
+            let ad = &dtile[b * TOKEN_TILE..];
+            for k in 0..TOKEN_TILE {
+                let x = &xq[k * ACT_BLOCK..];
+                let d = ad[k];
+                acc0[k] += d * s0 * dot32::<ISA>(q0, x) as f32;
+                acc1[k] += d * s1 * dot32::<ISA>(q1, x) as f32;
+            }
+        }
+        store_tile(tl, &acc0, out0);
+        store_tile(tl, &acc1, out1);
+    }
+}
+
+// =====================================================================
 // Single-token (GEMV) path: fuse unpack and dot, per block.
 //
 // The `unpack_row` + `dot_unpacked` pair above wins when several tokens
@@ -1276,6 +2179,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_IQ4_NL => dot_iq4_nl::<ISA>(row, act),
         GGML_TYPE_Q4_K => dot_q4_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
+        GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
         other => panic!("vecdot::dot_row called for unsupported ggml_type {other}"),
     }
 }
@@ -1360,6 +2264,31 @@ fn dot_q4_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
 
 /// `block_q6_K`, 256 elements, one scale per 16 — so each 32-element run needs
 /// two separate 16-lane dots. `q - 32` folds into the signed `int8` weight.
+/// `IQ4_XS` decode. One `dot32` per sub-block rather than `Q6_K`'s two
+/// `dot16`, because the scale is uniform across all 32 — the same reason
+/// `UnpackedRow::per32` exists.
+fn dot_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    let mut total = 0f32;
+    let mut blk = 0usize;
+    let mut w = [0i8; 32];
+    for block in row.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..BLOCK_BYTES];
+        for ib in 0..SUBS {
+            let low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            let high = ((scales_h >> (2 * ib)) & 3) as u8;
+            let ls = ((low | (high << 4)) as i32) - 32;
+            unpack_block_iq4_nl(&qs[ib * 16..], &mut w);
+            total += act.d[blk] * d * (ls as f32) * dot32::<ISA>(&w, &act.q[blk * 32..]) as f32;
+            blk += 1;
+        }
+    }
+    total
+}
+
 fn dot_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
     let mut total = 0f32;
@@ -1424,6 +2353,7 @@ mod tests {
             GGML_TYPE_IQ4_NL => (18, 32),
             GGML_TYPE_Q4_K => (144, 256),
             GGML_TYPE_Q6_K => (210, 256),
+            GGML_TYPE_IQ4_XS => (136, 256),
             other => panic!("unhandled {other}"),
         };
         let row_bytes = in_dim / block_elems * block_bytes;
@@ -1442,6 +2372,7 @@ mod tests {
                     block[2..4].copy_from_slice(&[0x00, 0x2c]);
                 }
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 other => panic!("unhandled {other}"),
             }
         }
@@ -1598,10 +2529,45 @@ mod tests {
     /// its rows carry `IQ4_NL` rather than the `Q2_K`/`Q3_K` the file name
     /// advertises.
     #[test]
+    /// The vectorized nibble->level lookup must agree with the scalar
+    /// reference for **every** byte value, not just the ones a fixture
+    /// happens to produce: all 256 inputs are enumerated, which covers each
+    /// of the 16 table entries in both nibble positions.
+    #[test]
+    fn iq4_nl_block_unpack_is_exact_for_every_byte_value() {
+        for base in 0..=255u8 {
+            let qs: Vec<u8> = (0..16u8).map(|j| base.wrapping_add(j.wrapping_mul(17))).collect();
+            let mut want = [0i8; 32];
+            let mut got = [0i8; 32];
+            unpack_block_iq4_nl_scalar(&qs, &mut want);
+            unpack_block_iq4_nl(&qs, &mut got);
+            assert_eq!(got, want, "qs = {qs:?}");
+        }
+        // And the trivial case that exercises every table entry in order.
+        let qs: Vec<u8> = (0..16u8).map(|j| j | (15 - j) << 4).collect();
+        let mut want = [0i8; 32];
+        let mut got = [0i8; 32];
+        unpack_block_iq4_nl_scalar(&qs, &mut want);
+        unpack_block_iq4_nl(&qs, &mut got);
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn iq4_nl_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
             check(GGML_TYPE_IQ4_NL, 896, seed);
             check(GGML_TYPE_IQ4_NL, 4864, seed);
+        }
+    }
+
+    /// The decode half of `IQ4_XS`. Widths are multiples of 256 because that
+    /// is what `supports` requires of it.
+    #[test]
+    fn iq4_xs_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_IQ4_XS, 256, seed);
+            check(GGML_TYPE_IQ4_XS, 2048, seed);
+            check(GGML_TYPE_IQ4_XS, 4864 - 4864 % 256, seed);
         }
     }
 
@@ -1643,5 +2609,373 @@ mod tests {
         assert!(a.d.iter().all(|d| *d == 0.0));
         assert!(a.q.iter().all(|q| *q == 0));
         assert!(a.sums.iter().all(|s| *s == 0));
+    }
+
+    // ------------------------------------------- K-quant prefill GEMM
+
+    /// A weight matrix of `out_dim` K-quant rows with finite `f16` scales,
+    /// plus `n_tokens` rows of activations.
+    fn k_fixture(
+        ggml_type: u32,
+        in_dim: usize,
+        out_dim: usize,
+        n_tokens: usize,
+        seed: u32,
+    ) -> (Vec<u8>, Vec<f32>, usize) {
+        let block_bytes = match ggml_type {
+            GGML_TYPE_Q4_K => 144,
+            GGML_TYPE_IQ4_XS => 136, // 2 + 2 + 4 + 128
+            _ => 210,                // Q6_K
+        };
+        let row_bytes = in_dim / 256 * block_bytes;
+        let mut raw = pseudo_bytes(row_bytes * out_dim, seed);
+        for block in raw.chunks_exact_mut(block_bytes) {
+            match ggml_type {
+                GGML_TYPE_Q4_K => {
+                    block[0..2].copy_from_slice(&[0x00, 0x30]); // d = 0.125
+                    block[2..4].copy_from_slice(&[0x00, 0x2c]); // dmin = 0.0625
+                }
+                // `d` only; the 6-bit scales stay pseudo-random, which is
+                // what exercises the `scales_l`/`scales_h` split and the -32
+                // bias (so a sub-block scale can legitimately be negative).
+                GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                _ => block[208..210].copy_from_slice(&[0x00, 0x30]),
+            }
+        }
+        let x: Vec<f32> = (0..in_dim * n_tokens)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        (raw, x, row_bytes)
+    }
+
+    /// Runs the K-quant GEMM the way `CpuBackend::matmul_k_gemm` does, and
+    /// returns it transposed as `[out_dim][n_tokens]`.
+    fn k_gemm(
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
+        let acts = ActQ8K::quantize(x, in_dim, n_tokens);
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        let (mut s0, mut s1) = (KRow::new(), KRow::new());
+        let mut scratch = Vec::new();
+        for (pair, dst) in yt.chunks_mut(n_tokens * 2).enumerate() {
+            let o0 = pair * 2;
+            let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+            unpack_k_row(ggml_type, row(o0), in_dim, &mut s0);
+            if dst.len() == n_tokens * 2 {
+                unpack_k_row(ggml_type, row(o0 + 1), in_dim, &mut s1);
+                let (d0, d1) = dst.split_at_mut(n_tokens);
+                dot_k_pair(&s0, &s1, &acts, d0, d1);
+            } else {
+                dot_k_multi(&s0, &acts, dst, &mut scratch);
+            }
+        }
+        yt
+    }
+
+    /// The K-quant GEMM must land inside the same `int8`-activation error
+    /// budget the generic path is held to. Its activation scale is coarser —
+    /// one per 256 rather than one per 32, matching ggml's `block_q8_K` — so
+    /// this is the check that the coarser scale stays acceptable, not just
+    /// that the indexing is right.
+    #[test]
+    fn k_gemm_matches_dequantize_reference() {
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS] {
+            for in_dim in [256usize, 2048, 8192] {
+                // 5 rows and 7 tokens: odd both ways, so the trailing-row and
+                // tile-padding paths both run.
+                let (out_dim, n_tokens) = (5usize, 7usize);
+                let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, n_tokens, 4242);
+                let got = k_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                for o in 0..out_dim {
+                    let w =
+                        quant::dequantize(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], in_dim)
+                            .unwrap();
+                    for t in 0..n_tokens {
+                        let xs = &x[t * in_dim..(t + 1) * in_dim];
+                        let reference: f32 = w.iter().zip(xs).map(|(a, b)| a * b).sum();
+                        let magnitude: f32 = w.iter().zip(xs).map(|(a, b)| (a * b).abs()).sum();
+                        let err = (got[o * n_tokens + t] - reference).abs();
+                        assert!(
+                            err <= 0.01 * magnitude.max(1e-6),
+                            "type {ggml_type} in_dim {in_dim} row {o} token {t}: \
+                             got {} want {reference} (err {err}, term-magnitude {magnitude})",
+                            got[o * n_tokens + t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tile padding must not leak into the answer: a token's result has to be
+    /// the same whatever else is batched alongside it. This is the check that
+    /// the zero-padded tail tokens really contribute nothing, and that
+    /// `store_tile` drops them rather than writing past `out`.
+    #[test]
+    fn k_gemm_result_is_independent_of_the_batch_size() {
+        let in_dim = 512;
+        let out_dim = 4;
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+            let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, 8, 77);
+            let full = k_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, 8);
+            for n in [2usize, 3, 5, 7] {
+                let part = k_gemm(
+                    ggml_type,
+                    &raw,
+                    row_bytes,
+                    in_dim,
+                    out_dim,
+                    &x[..n * in_dim],
+                    n,
+                );
+                for o in 0..out_dim {
+                    for t in 0..n {
+                        assert_eq!(
+                            part[o * n + t],
+                            full[o * 8 + t],
+                            "type {ggml_type}, {n} of 8 tokens, row {o} token {t}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `KRow` reused across rows — and across *types*, which changes every
+    /// buffer's length — must not keep a stale tail.
+    #[test]
+    fn k_row_buffer_is_safe_to_reuse() {
+        let in_dim = 512;
+        let n_tokens = 4;
+        let mut scratch = KRow::new();
+        for ggml_type in [
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_Q6_K,
+        ] {
+            let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, 2, n_tokens, 31);
+            let acts = ActQ8K::quantize(&x, in_dim, n_tokens);
+            let mut fresh = KRow::new();
+            unpack_k_row(ggml_type, &raw[row_bytes..], in_dim, &mut fresh);
+            unpack_k_row(ggml_type, &raw[..row_bytes], in_dim, &mut scratch);
+            unpack_k_row(ggml_type, &raw[row_bytes..], in_dim, &mut scratch);
+
+            let (mut want, mut got) = (vec![0f32; n_tokens], vec![0f32; n_tokens]);
+            let mut sp = Vec::new();
+            dot_k_multi(&fresh, &acts, &mut want, &mut sp);
+            dot_k_multi(&scratch, &acts, &mut got, &mut sp);
+            assert_eq!(got, want, "stale state for ggml_type {ggml_type}");
+        }
+    }
+
+    #[test]
+    fn supports_k_covers_only_the_k_quants() {
+        assert!(supports_k(GGML_TYPE_Q4_K, 2048));
+        assert!(supports_k(GGML_TYPE_Q6_K, 8192));
+        // `IQ4_XS` is a 256-element super-block type like the other two, and
+        // must NOT be claimed by `supports_flat` — its scales are per-32 but
+        // it accumulates per-256, which is the K-quant kernel's shape.
+        assert!(supports_k(GGML_TYPE_IQ4_XS, 2048));
+        assert!(!supports_flat(GGML_TYPE_IQ4_XS, 2048));
+        // 896 is not a multiple of 256 — a `Qwen2.5-0.5B` row.
+        assert!(!supports_k(GGML_TYPE_Q4_K, 896));
+        // `Q8_0`/`Q5_0` have no super-block to accumulate across and keep the
+        // generic GEMM.
+        assert!(!supports_k(GGML_TYPE_Q8_0, 2048));
+        assert!(!supports_k(GGML_TYPE_Q5_0, 2048));
+    }
+
+    /// Weight rows for the flat GEMM's types, with valid `f16` scales.
+    /// Random bytes would give NaN/inf scales, so the scale field of every
+    /// block is overwritten.
+    fn flat_fixture(
+        ggml_type: u32,
+        in_dim: usize,
+        out_dim: usize,
+        n_tokens: usize,
+        seed: u32,
+    ) -> (Vec<u8>, Vec<f32>, usize) {
+        let block_bytes = match ggml_type {
+            GGML_TYPE_Q8_0 => 34,   // 2 + 32
+            GGML_TYPE_IQ4_NL => 18, // 2 + 16
+            _ => 22,                // Q5_0: 2 + 4 + 16
+        };
+        let row_bytes = in_dim / 32 * block_bytes;
+        let mut raw = pseudo_bytes(row_bytes * out_dim, seed);
+        for block in raw.chunks_exact_mut(block_bytes) {
+            block[0..2].copy_from_slice(&[0x00, 0x30]); // d = 0.125
+        }
+        let x: Vec<f32> = (0..in_dim * n_tokens)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        (raw, x, row_bytes)
+    }
+
+    /// Drives the flat GEMM the way `cpu::matmul_flat_gemm` does.
+    fn flat_gemm(
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
+        let acts = ActQ8Flat::quantize(x, in_dim, n_tokens);
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        let (mut s0, mut s1) = (UnpackedRow::new(), UnpackedRow::new());
+        let mut scratch = Vec::new();
+        for (pair, dst) in yt.chunks_mut(n_tokens * 2).enumerate() {
+            let o0 = pair * 2;
+            let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+            unpack_row(ggml_type, row(o0), in_dim, &mut s0);
+            if dst.len() == n_tokens * 2 {
+                unpack_row(ggml_type, row(o0 + 1), in_dim, &mut s1);
+                let (d0, d1) = dst.split_at_mut(n_tokens);
+                dot_flat_pair(&s0, &s1, &acts, d0, d1);
+            } else {
+                dot_flat_multi(&s0, &acts, dst, &mut scratch);
+            }
+        }
+        yt
+    }
+
+    /// Same, through the path this replaces.
+    fn generic_gemm(
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
+        let acts: Vec<ActQ8> = (0..n_tokens)
+            .map(|t| quantize_act(&x[t * in_dim..(t + 1) * in_dim]))
+            .collect();
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        let (mut s0, mut s1) = (UnpackedRow::new(), UnpackedRow::new());
+        for (pair, dst) in yt.chunks_mut(n_tokens * 2).enumerate() {
+            let o0 = pair * 2;
+            let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+            unpack_row(ggml_type, row(o0), in_dim, &mut s0);
+            if dst.len() == n_tokens * 2 {
+                unpack_row(ggml_type, row(o0 + 1), in_dim, &mut s1);
+                let (d0, d1) = dst.split_at_mut(n_tokens);
+                dot_unpacked_pair(&s0, &s1, &acts, d0, d1);
+            } else {
+                dot_unpacked_multi(&s0, &acts, dst);
+            }
+        }
+        yt
+    }
+
+    /// The strong claim: relaying the activations out changed *where* values
+    /// are read from, not the arithmetic or the order of it. Exact equality,
+    /// not a tolerance — anything else means the two paths disagree and the
+    /// weaker reference test below could hide it inside its 1% budget.
+    ///
+    /// `n_tokens` 8 is a whole number of tiles and 7 is not, so the
+    /// tile-padding path is compared too (the old code handles that tail with
+    /// a separate scalar loop, this one with zero-padding).
+    #[test]
+    fn flat_gemm_is_bit_identical_to_the_generic_gemm() {
+        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
+            for in_dim in [32usize, 896, 4864] {
+                for n_tokens in [2usize, 7, 8] {
+                    let out_dim = 5; // odd, so the trailing-row path runs
+                    let (raw, x, row_bytes) =
+                        flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 909);
+                    let flat =
+                        flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                    let generic =
+                        generic_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                    assert_eq!(
+                        flat, generic,
+                        "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_gemm_matches_dequantize_reference() {
+        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
+            for in_dim in [896usize, 4864] {
+                let (out_dim, n_tokens) = (5usize, 7usize);
+                let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 4242);
+                let got = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                for o in 0..out_dim {
+                    let w = quant::dequantize(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        in_dim,
+                    )
+                    .unwrap();
+                    for t in 0..n_tokens {
+                        let xs = &x[t * in_dim..(t + 1) * in_dim];
+                        let reference: f32 = w.iter().zip(xs).map(|(a, b)| a * b).sum();
+                        let magnitude: f32 = w.iter().zip(xs).map(|(a, b)| (a * b).abs()).sum();
+                        let err = (got[o * n_tokens + t] - reference).abs();
+                        assert!(
+                            err <= 0.01 * magnitude.max(1e-6),
+                            "type {ggml_type} in_dim {in_dim} row {o} token {t}: \
+                             got {} want {reference} (err {err}, term-magnitude {magnitude})",
+                            got[o * n_tokens + t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The zero-padded tokens of a partial tile must not leak into any real
+    /// token's result: batching 2, 3, 5 or 7 tokens has to give exactly what
+    /// batching 8 gives for those same tokens.
+    #[test]
+    fn flat_gemm_result_is_independent_of_the_batch_size() {
+        let (ggml_type, in_dim, out_dim) = (GGML_TYPE_Q8_0, 896usize, 4usize);
+        let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, 8, 31337);
+        let full = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, 8);
+        for n in [2usize, 3, 5, 7] {
+            let got = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x[..n * in_dim], n);
+            for o in 0..out_dim {
+                for t in 0..n {
+                    assert_eq!(
+                        got[o * n + t],
+                        full[o * 8 + t],
+                        "n_tokens {n} row {o} token {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supports_flat_covers_only_the_symmetric_per32_types() {
+        assert!(supports_flat(GGML_TYPE_Q8_0, 896));
+        assert!(supports_flat(GGML_TYPE_Q5_0, 4864));
+        // `IQ4_NL` unpacks its 16-level table into plain `int8` with no min
+        // term, so it is the same shape as the other two by the time the
+        // kernel sees it. Omitting it here would not be wrong, just slow —
+        // it would fall back to the generic GEMM this path exists to beat.
+        assert!(supports_flat(GGML_TYPE_IQ4_NL, 896));
+        // The K-quants are routed to `dot_k_pair` before this is consulted,
+        // and this kernel has no min correction and no per-GROUP branch, so
+        // it must decline them rather than compute them wrongly.
+        assert!(!supports_flat(GGML_TYPE_Q4_K, 2048));
+        assert!(!supports_flat(GGML_TYPE_Q6_K, 2048));
+        // A row that is not a whole number of 32-element blocks.
+        assert!(!supports_flat(GGML_TYPE_Q8_0, 100));
     }
 }
