@@ -643,7 +643,7 @@ mod tests {
             .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
             .collect();
 
-        let expected = CpuBackend.matmul(&x, n_tokens, &w);
+        let expected = CpuBackend.matmul_dequant(&x, n_tokens, &w);
         let actual = cuda.matmul(&x, n_tokens, &w);
         assert_eq!(expected.len(), actual.len());
         for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {

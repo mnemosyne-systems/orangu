@@ -114,8 +114,8 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
 /// `256`-divisible `ffn_down` is `Q4_K`/`Q6_K`).
 pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
     match ggml_type {
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 => in_dim % 32 == 0,
-        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K => in_dim % 256 == 0,
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 => in_dim.is_multiple_of(32),
+        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K => in_dim.is_multiple_of(256),
         _ => false,
     }
 }
@@ -195,7 +195,11 @@ impl Default for UnpackedRow {
 /// `ggml_type`/`in_dim` must have passed [`supports`].
 pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedRow) {
     // Only `Q6_K` needs per-GROUP scales; everything else is uniform per block.
-    let stride = if ggml_type == GGML_TYPE_Q6_K { GROUP } else { 32 };
+    let stride = if ggml_type == GGML_TYPE_Q6_K {
+        GROUP
+    } else {
+        32
+    };
     out.resize_for(in_dim, stride);
     match ggml_type {
         GGML_TYPE_Q8_0 => unpack_q8_0(row, out),
@@ -256,25 +260,6 @@ fn dot_via_unpack(ggml_type: u32, row: &[u8], act: &ActQ8, in_dim: usize) -> f32
     dot_unpacked(&w, act)
 }
 
-/// `sum_i w[i] * x[i]` over 32 `int8` pairs, into an `i32`. This is the one
-/// primitive every kernel below is built from, so it is the only place that
-/// needs per-architecture SIMD.
-///
-/// * **aarch64 (NEON)** — `vmull_s8` widens to `i16` lanes (max
-///   |127*127| = 16129, so no overflow) and `vpadalq_s16` accumulates
-///   pairwise into `i32`. This is deliberately *not* `vdotq_s32`: a
-///   Cortex-A72 has NEON but not `dotprod`/`i8mm`/SVE, and the widening
-///   chain is exactly what ggml falls back to on such a core. NEON is
-///   baseline on aarch64, so no runtime check is needed.
-/// * **x86_64 (AVX-512 VNNI / AVX2 / SSE2)** — chosen by runtime feature
-///   detection, never assumed from the compile-time baseline, matching how
-///   `engine::tensor::dot` already dispatches. `vpdpbusd` (VNNI) does the
-///   whole thing in one instruction; AVX2/SSE2 sign-extend to `i16` and use
-///   `madd_epi16`, which is exact for this range.
-/// * **anything else** — a scalar loop, which LLVM autovectorizes
-///   acceptably for `i8`->`i32` since the accumulation is integer and
-///   therefore reassociable (unlike the `f32` sum this whole module
-///   replaces).
 /// Which SIMD kernel a monomorphized dot loop should use.
 ///
 /// A plain `u8` rather than an enum because const generics accept only
@@ -366,10 +351,19 @@ fn have_dotprod() -> bool {
         const CASES: [([i8; 16], [i8; 16]); 4] = [
             ([1; 16], [1; 16]),
             ([-1; 16], [1; 16]),
-            ([127, -128, 127, -128, 1, -1, 0, 64, -64, 32, -32, 16, -16, 8, -8, 2], [1; 16]),
             (
-                [3, -5, 7, -11, 13, -17, 19, -23, 29, -31, 37, -41, 43, -47, 53, -59],
-                [2, 4, -6, 8, -10, 12, 14, -16, 18, -20, 22, 24, -26, 28, 30, -32],
+                [
+                    127, -128, 127, -128, 1, -1, 0, 64, -64, 32, -32, 16, -16, 8, -8, 2,
+                ],
+                [1; 16],
+            ),
+            (
+                [
+                    3, -5, 7, -11, 13, -17, 19, -23, 29, -31, 37, -41, 43, -47, 53, -59,
+                ],
+                [
+                    2, 4, -6, 8, -10, 12, 14, -16, 18, -20, 22, 24, -26, 28, 30, -32,
+                ],
             ),
         ];
         CASES.iter().all(|(w, x)| {
@@ -406,12 +400,18 @@ fn have_vnni() -> bool {
             ([1; 16], [1; 16]),
             ([-1; 16], [1; 16]),
             (
-                [127, -128, 127, -128, 1, -1, 0, 64, -64, 32, -32, 16, -16, 8, -8, 2],
+                [
+                    127, -128, 127, -128, 1, -1, 0, 64, -64, 32, -32, 16, -16, 8, -8, 2,
+                ],
                 [1; 16],
             ),
             (
-                [3, -5, 7, -11, 13, -17, 19, -23, 29, -31, 37, -41, 43, -47, 53, -59],
-                [2, 4, -6, 8, -10, 12, 14, -16, 18, -20, 22, 24, -26, 28, 30, -32],
+                [
+                    3, -5, 7, -11, 13, -17, 19, -23, 29, -31, 37, -41, 43, -47, 53, -59,
+                ],
+                [
+                    2, 4, -6, 8, -10, 12, 14, -16, 18, -20, 22, 24, -26, 28, 30, -32,
+                ],
             ),
         ];
         CASES.iter().all(|(w, x)| {
@@ -478,6 +478,22 @@ unsafe fn dot16_sdot(w: &[i8], x: &[i8]) -> i32 {
 /// block, so this is the natural unit for them — worth ~20% on the prefill
 /// GEMM. Kept per-ISA so AVX2, SSE4.1 and AVX-512 all get the single-reduction
 /// form, not just NEON.
+///
+/// * **aarch64 (NEON)** — `vmull_s8` widens to `i16` lanes (max
+///   |127*127| = 16129, so no overflow) and `vpadalq_s16` accumulates
+///   pairwise into `i32`. This is deliberately *not* `vdotq_s32`: a
+///   Cortex-A72 has NEON but not `dotprod`/`i8mm`/SVE, and the widening
+///   chain is exactly what ggml falls back to on such a core. NEON is
+///   baseline on aarch64, so no runtime check is needed.
+/// * **x86_64 (AVX-512 VNNI / AVX2 / SSE4.1)** — chosen by runtime feature
+///   detection, never assumed from the compile-time baseline, matching how
+///   `engine::tensor::dot` already dispatches. `vpdpbusd` (VNNI) does the
+///   whole thing in one instruction; AVX2/SSE4.1 sign-extend to `i16` and
+///   use `madd_epi16`, which is exact for this range.
+/// * **anything else** — a scalar loop, which LLVM autovectorizes
+///   acceptably for `i8`->`i32` since the accumulation is integer and
+///   therefore reassociable (unlike the `f32` sum this whole module
+///   replaces).
 #[inline(always)]
 fn dot32<const ISA: u8>(w: &[i8], x: &[i8]) -> i32 {
     debug_assert!(w.len() >= 32 && x.len() >= 32);
@@ -750,7 +766,10 @@ unsafe fn unpack_block_q5_0_neon(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
         let lo = vorrq_u8(vandq_u8(v, vdupq_n_u8(0x0F)), fifth_lo);
         let hi = vorrq_u8(vshrq_n_u8(v, 4), fifth_hi);
         vst1q_s8(w.as_mut_ptr(), vsubq_s8(vreinterpretq_s8_u8(lo), bias));
-        vst1q_s8(w.as_mut_ptr().add(16), vsubq_s8(vreinterpretq_s8_u8(hi), bias));
+        vst1q_s8(
+            w.as_mut_ptr().add(16),
+            vsubq_s8(vreinterpretq_s8_u8(hi), bias),
+        );
     }
 }
 
@@ -786,13 +805,7 @@ fn unpack_q6k_run(ql: &[u8], qh: &[u8], hshift: i32, high_nib: bool, w: &mut [i8
 /// since an immediate shift of 0 is not encodable.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn unpack_q6k_run_neon(
-    ql: &[u8],
-    qh: &[u8],
-    hshift: i32,
-    high_nib: bool,
-    w: &mut [i8; 32],
-) {
+unsafe fn unpack_q6k_run_neon(ql: &[u8], qh: &[u8], hshift: i32, high_nib: bool, w: &mut [i8; 32]) {
     use std::arch::aarch64::*;
     unsafe {
         let three = vdupq_n_u8(3);
@@ -1391,7 +1404,10 @@ mod tests {
             .map(|(w, v)| (w * v).abs())
             .sum();
 
-        assert!(supports(ggml_type, in_dim), "type {ggml_type} in_dim {in_dim}");
+        assert!(
+            supports(ggml_type, in_dim),
+            "type {ggml_type} in_dim {in_dim}"
+        );
         let act = quantize_act(&x);
 
         // Both production paths must land within the int8-activation error

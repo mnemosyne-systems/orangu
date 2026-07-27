@@ -74,8 +74,7 @@ impl CpuBackend {
         if n_tokens == 1 {
             let act = &acts[0];
             yt.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
-                dst[0] =
-                    vecdot::dot_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], act);
+                dst[0] = vecdot::dot_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], act);
             });
             // The transpose is the identity — hand the buffer straight back.
             return Some(yt);
@@ -115,16 +114,21 @@ impl CpuBackend {
         }
         Some(y)
     }
-}
 
-impl Backend for CpuBackend {
-    fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+    /// The dequantize path, on its own: every weight row widened to `f32`
+    /// and dotted against the **unquantized** activations.
+    ///
+    /// Split out of [`Backend::matmul`] because it is the only
+    /// full-precision matmul this backend has. `matmul` prefers
+    /// [`Self::matmul_fused`], which rounds activations to `int8` and so
+    /// carries a real (bounded, ggml-equivalent) error — fine in production,
+    /// but useless as the *reference* in a cross-check of another backend's
+    /// kernel, which would then be measuring quantization loss rather than
+    /// correctness. Backend cross-checks call this instead; the `int8` error
+    /// itself is bounded separately by `engine::vecdot`'s own tests.
+    pub(crate) fn matmul_dequant(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
-        debug_assert_eq!(x.len(), n_tokens * in_dim);
-        if let Some(y) = self.matmul_fused(x, n_tokens, w) {
-            return y;
-        }
         let mut y = vec![0f32; n_tokens * out_dim];
         // Parallelize over output rows (typically far more of these than
         // tokens) so each weight row is dequantized exactly once and reused
@@ -145,5 +149,15 @@ impl Backend for CpuBackend {
             }
         }
         y
+    }
+}
+
+impl Backend for CpuBackend {
+    fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+        if let Some(y) = self.matmul_fused(x, n_tokens, w) {
+            return y;
+        }
+        self.matmul_dequant(x, n_tokens, w)
     }
 }

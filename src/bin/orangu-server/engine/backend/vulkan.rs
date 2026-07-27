@@ -13379,13 +13379,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         }
     }
 
-    /// Cross-checks `VulkanBackend::matmul` against `CpuBackend::matmul`
-    /// (already known-correct, see `engine::quant`'s own unit tests) for
-    /// `ggml_type`, over random-but-valid quantized data and random
-    /// activations — the only real way to verify the WGSL dequant/dot
-    /// translation is bit-for-bit faithful to its Rust counterpart, short
-    /// of reading GPU assembly. Skips (rather than fails) when no Vulkan
-    /// adapter is available, e.g. in a CI container with no GPU.
+    /// Cross-checks `VulkanBackend::matmul` against
+    /// `CpuBackend::matmul_dequant` (already known-correct, see
+    /// `engine::quant`'s own unit tests) for `ggml_type`, over
+    /// random-but-valid quantized data and random activations — the only
+    /// real way to verify the WGSL dequant/dot translation is bit-for-bit
+    /// faithful to its Rust counterpart, short of reading GPU assembly.
+    /// Skips (rather than fails) when no Vulkan adapter is available, e.g.
+    /// in a CI container with no GPU.
+    ///
+    /// `matmul_dequant`, not `matmul`: the latter now prefers the fused
+    /// `int8`-activation path for `Q8_0`/`Q5_0`/`Q4_K`/`Q6_K`, whose
+    /// quantization loss on this test's adversarial random-uniform data is
+    /// several % — far above the tolerance below, and not something the GPU
+    /// kernel (which keeps activations in `f32`) should be reproducing.
     fn cross_check(ggml_type: u32, in_dim: usize, out_dim: usize) {
         cross_check_n_tokens(ggml_type, in_dim, out_dim, 3);
     }
@@ -13423,7 +13430,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             *v = (b as f32 - 128.0) / 64.0;
         }
 
-        let cpu_out = CpuBackend.matmul(&x, n_tokens, &w);
+        let cpu_out = CpuBackend.matmul_dequant(&x, n_tokens, &w);
         let gpu_out = vulkan.matmul(&x, n_tokens, &w);
 
         // The reference the GPU is checked against. The MMVQ path
@@ -13653,7 +13660,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 for v in x.iter_mut() {
                     *v = (next_byte(&mut seed) as f32 - 128.0) / 512.0;
                 }
-                let cpu = CpuBackend.matmul(&x, nt, &w);
+                let cpu = CpuBackend.matmul_dequant(&x, nt, &w);
                 let gpu = vulkan.matmul(&x, nt, &w);
                 let ca: f64 = cpu.iter().map(|v| v.abs() as f64).sum();
                 let ga: f64 = gpu.iter().map(|v| v.abs() as f64).sum();
@@ -14507,9 +14514,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             *v = (next_byte(&mut seed) as f32 - 128.0) / 64.0;
         }
 
-        let expected_q = CpuBackend.matmul(&x, n_tokens, &wq);
-        let expected_k = CpuBackend.matmul(&x, n_tokens, &wk);
-        let expected_v = CpuBackend.matmul(&x, n_tokens, &wv);
+        let expected_q = CpuBackend.matmul_dequant(&x, n_tokens, &wq);
+        let expected_k = CpuBackend.matmul_dequant(&x, n_tokens, &wk);
+        let expected_v = CpuBackend.matmul_dequant(&x, n_tokens, &wv);
 
         let mut batch = vulkan.matmul_batch(&[
             MatmulOp {
@@ -14596,8 +14603,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             *v = (next_byte(&mut seed) as f32 - 128.0) / 64.0;
         }
 
-        let expected_q = CpuBackend.matmul(&x, n_tokens, &wq);
-        let expected_k = CpuBackend.matmul(&x, n_tokens, &wk);
+        let expected_q = CpuBackend.matmul_dequant(&x, n_tokens, &wq);
+        let expected_k = CpuBackend.matmul_dequant(&x, n_tokens, &wk);
 
         let mut batch = vulkan.matmul_batch(&[
             MatmulOp {
@@ -14752,7 +14759,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         // Reference: the exact CPU sequence `GemmaModel::forward` runs for
         // this part of a layer.
-        let mut attn_proj = CpuBackend.matmul(&attn_out, 1, &wo);
+        let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
         crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
         let mut x = residual.clone();
         crate::engine::tensor::add_inplace(&mut x, &attn_proj);
@@ -14760,24 +14767,24 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         let mut ffn_normed = x.clone();
         crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
-        let mut gate = CpuBackend.matmul(&ffn_normed, 1, &ffn_gate);
-        let up = CpuBackend.matmul(&ffn_normed, 1, &ffn_up);
+        let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+        let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
         for g in gate.iter_mut() {
             *g = crate::engine::tensor::gelu(*g);
         }
         crate::engine::tensor::mul_inplace(&mut gate, &up);
-        let mut ffn_out = CpuBackend.matmul(&gate, 1, &ffn_down);
+        let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
         crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
         x = attn_out_residual;
         crate::engine::tensor::add_inplace(&mut x, &ffn_out);
 
         let pe_in = x.clone();
-        let mut g = CpuBackend.matmul(&x, 1, &ple_gate_w);
+        let mut g = CpuBackend.matmul_dequant(&x, 1, &ple_gate_w);
         for v in g.iter_mut() {
             *v = crate::engine::tensor::gelu(*v);
         }
         crate::engine::tensor::mul_inplace(&mut g, &per_layer_slice);
-        let mut proj = CpuBackend.matmul(&g, 1, &ple_proj_w);
+        let mut proj = CpuBackend.matmul_dequant(&g, 1, &ple_proj_w);
         crate::engine::tensor::rmsnorm_inplace(&mut proj, &ple_post_norm, 1, n_embd, eps);
         x = pe_in;
         crate::engine::tensor::add_inplace(&mut x, &proj);
@@ -14863,7 +14870,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let ffn_norm = rand_vec(n_embd, &mut seed);
         let ffn_post_norm = rand_vec(n_embd, &mut seed);
 
-        let mut attn_proj = CpuBackend.matmul(&attn_out, 1, &wo);
+        let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
         crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
         let mut x = residual.clone();
         crate::engine::tensor::add_inplace(&mut x, &attn_proj);
@@ -14871,13 +14878,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         let mut ffn_normed = x.clone();
         crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
-        let mut gate = CpuBackend.matmul(&ffn_normed, 1, &ffn_gate);
-        let up = CpuBackend.matmul(&ffn_normed, 1, &ffn_up);
+        let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+        let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
         for g in gate.iter_mut() {
             *g = crate::engine::tensor::gelu(*g);
         }
         crate::engine::tensor::mul_inplace(&mut gate, &up);
-        let mut ffn_out = CpuBackend.matmul(&gate, 1, &ffn_down);
+        let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
         crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
         x = attn_out_residual;
         crate::engine::tensor::add_inplace(&mut x, &ffn_out);
@@ -14967,7 +14974,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                              residual: &[f32],
                              per_layer_slice: &[f32]|
          -> Vec<f32> {
-            let mut attn_proj = CpuBackend.matmul(attn_out, 1, &wo);
+            let mut attn_proj = CpuBackend.matmul_dequant(attn_out, 1, &wo);
             crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
             let mut x = residual.to_vec();
             crate::engine::tensor::add_inplace(&mut x, &attn_proj);
@@ -14975,24 +14982,24 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
             let mut ffn_normed = x.clone();
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
-            let mut gate = CpuBackend.matmul(&ffn_normed, 1, &ffn_gate);
-            let up = CpuBackend.matmul(&ffn_normed, 1, &ffn_up);
+            let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+            let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
             for g in gate.iter_mut() {
                 *g = crate::engine::tensor::gelu(*g);
             }
             crate::engine::tensor::mul_inplace(&mut gate, &up);
-            let mut ffn_out = CpuBackend.matmul(&gate, 1, &ffn_down);
+            let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
             x = attn_out_residual;
             crate::engine::tensor::add_inplace(&mut x, &ffn_out);
 
             let pe_in = x.clone();
-            let mut g = CpuBackend.matmul(&x, 1, &ple_gate_w);
+            let mut g = CpuBackend.matmul_dequant(&x, 1, &ple_gate_w);
             for v in g.iter_mut() {
                 *v = crate::engine::tensor::gelu(*v);
             }
             crate::engine::tensor::mul_inplace(&mut g, per_layer_slice);
-            let mut proj = CpuBackend.matmul(&g, 1, &ple_proj_w);
+            let mut proj = CpuBackend.matmul_dequant(&g, 1, &ple_proj_w);
             crate::engine::tensor::rmsnorm_inplace(&mut proj, &ple_post_norm, 1, n_embd, eps);
             x = pe_in;
             crate::engine::tensor::add_inplace(&mut x, &proj);
@@ -15960,7 +15967,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         // CPU reference, matching `GemmaModel::compute_per_layer_inputs`'s
         // projection/scale/norm/residual stages (the gather is `gathered`,
         // already done).
-        let mut expected = CpuBackend.matmul(&x, 1, &proj_w);
+        let mut expected = CpuBackend.matmul_dequant(&x, 1, &proj_w);
         let projection_scale = 1.0 / (n_embd as f32).sqrt();
         for v in expected.iter_mut() {
             *v *= projection_scale;
@@ -16268,7 +16275,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
             // CPU reference, matching `GemmaModel::forward`'s statement
             // order exactly.
-            let mut q = CpuBackend.matmul(&normed, 1, &wq);
+            let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
             crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
             crate::engine::tensor::rope_apply_scaled_inplace(
                 &mut q,
@@ -16279,9 +16286,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 rope_freq_base,
                 None,
             );
-            let mut k = CpuBackend.matmul(&normed, 1, &wk);
+            let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
             crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
-            let mut v = CpuBackend.matmul(&normed, 1, &wv);
+            let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
             for row in v.chunks_mut(head_dim) {
                 let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
                 let s = 1.0 / (mean_sq + eps).sqrt();
@@ -16429,7 +16436,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             let window_start = 0;
             let normed = rand_vec(n_embd, &mut seed);
 
-            let mut q = CpuBackend.matmul(&normed, 1, &wq);
+            let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
             crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
             crate::engine::tensor::rope_apply_scaled_inplace(
                 &mut q,
@@ -16440,9 +16447,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 rope_freq_base,
                 None,
             );
-            let mut k = CpuBackend.matmul(&normed, 1, &wk);
+            let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
             crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
-            let mut v = CpuBackend.matmul(&normed, 1, &wv);
+            let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
             for row in v.chunks_mut(head_dim) {
                 let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
                 let s = 1.0 / (mean_sq + eps).sqrt();
@@ -16583,7 +16590,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let window_start = 0;
         let normed = rand_vec(n_embd, &mut seed);
 
-        let mut q = CpuBackend.matmul(&normed, 1, &wq);
+        let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
         crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
         crate::engine::tensor::rope_apply_scaled_inplace(
             &mut q,
@@ -16594,7 +16601,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             rope_freq_base,
             Some(&freq_factors),
         );
-        let mut k = CpuBackend.matmul(&normed, 1, &wk);
+        let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
         crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
         let mut v = k.clone();
         for row in v.chunks_mut(head_dim) {
@@ -16752,7 +16759,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             out
         };
         let cpu_q = |wq: &QuantMatrix, q_norm: &[f32], normed: &[f32], pos: usize| -> Vec<f32> {
-            let mut q = CpuBackend.matmul(normed, 1, wq);
+            let mut q = CpuBackend.matmul_dequant(normed, 1, wq);
             crate::engine::tensor::rmsnorm_inplace(&mut q, q_norm, n_head, head_dim, eps);
             crate::engine::tensor::rope_apply_scaled_inplace(
                 &mut q,
@@ -16778,7 +16785,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let normed_a = rand_vec(n_embd, &mut seed);
         let wq_a = build(n_embd, n_head * head_dim, &mut seed);
         let q_norm_a = rand_vec(head_dim, &mut seed);
-        let mut k_a = CpuBackend.matmul(&normed_a, 1, &wk);
+        let mut k_a = CpuBackend.matmul_dequant(&normed_a, 1, &wk);
         crate::engine::tensor::rmsnorm_inplace(&mut k_a, &k_norm, n_head_kv, head_dim, eps);
         let mut v_a = k_a.clone();
         for row in v_a.chunks_mut(head_dim) {
@@ -17943,7 +17950,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             let mut normed = x.clone();
             crate::engine::tensor::rmsnorm_inplace(&mut normed, &attn_norm, 1, n_embd, eps);
 
-            let mut q = CpuBackend.matmul(&normed, 1, &wq);
+            let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
             crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
             crate::engine::tensor::rope_apply_scaled_inplace(
                 &mut q,
@@ -17954,9 +17961,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 rope_freq_base,
                 None,
             );
-            let mut k = CpuBackend.matmul(&normed, 1, &wk);
+            let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
             crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
-            let mut v = CpuBackend.matmul(&normed, 1, &wv);
+            let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
             for row in v.chunks_mut(head_dim) {
                 let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
                 let s = 1.0 / (mean_sq + eps).sqrt();
@@ -17995,7 +18002,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 }
             }
 
-            let mut attn_proj = CpuBackend.matmul(&attn_out, 1, &wo);
+            let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
             crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
             let mut xr = x.clone();
             crate::engine::tensor::add_inplace(&mut xr, &attn_proj);
@@ -18003,24 +18010,24 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
             let mut ffn_normed = xr.clone();
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
-            let mut gate = CpuBackend.matmul(&ffn_normed, 1, &ffn_gate);
-            let up = CpuBackend.matmul(&ffn_normed, 1, &ffn_up);
+            let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+            let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
             for g in gate.iter_mut() {
                 *g = crate::engine::tensor::gelu(*g);
             }
             crate::engine::tensor::mul_inplace(&mut gate, &up);
-            let mut ffn_out = CpuBackend.matmul(&gate, 1, &ffn_down);
+            let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
             xr = attn_out_residual;
             crate::engine::tensor::add_inplace(&mut xr, &ffn_out);
 
             let pe_in = xr.clone();
-            let mut g = CpuBackend.matmul(&xr, 1, &ple_gate_w);
+            let mut g = CpuBackend.matmul_dequant(&xr, 1, &ple_gate_w);
             for v in g.iter_mut() {
                 *v = crate::engine::tensor::gelu(*v);
             }
             crate::engine::tensor::mul_inplace(&mut g, &per_layer_slice);
-            let mut proj = CpuBackend.matmul(&g, 1, &ple_proj_w);
+            let mut proj = CpuBackend.matmul_dequant(&g, 1, &ple_proj_w);
             crate::engine::tensor::rmsnorm_inplace(&mut proj, &ple_post_norm, 1, n_embd, eps);
             xr = pe_in;
             crate::engine::tensor::add_inplace(&mut xr, &proj);
@@ -18199,7 +18206,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             let mut normed = x.to_vec();
             crate::engine::tensor::rmsnorm_inplace(&mut normed, &l.attn_norm, 1, n_embd, eps);
 
-            let mut q = CpuBackend.matmul(&normed, 1, &l.wq);
+            let mut q = CpuBackend.matmul_dequant(&normed, 1, &l.wq);
             crate::engine::tensor::rmsnorm_inplace(&mut q, &l.q_norm, n_head, head_dim, eps);
             crate::engine::tensor::rope_apply_scaled_inplace(
                 &mut q,
@@ -18212,9 +18219,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             );
 
             if let Some((wk, k_norm, wv)) = kv {
-                let mut k = CpuBackend.matmul(&normed, 1, wk);
+                let mut k = CpuBackend.matmul_dequant(&normed, 1, wk);
                 crate::engine::tensor::rmsnorm_inplace(&mut k, k_norm, n_head_kv, head_dim, eps);
-                let mut v = CpuBackend.matmul(&normed, 1, wv);
+                let mut v = CpuBackend.matmul_dequant(&normed, 1, wv);
                 for row in v.chunks_mut(head_dim) {
                     let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
                     let s = 1.0 / (mean_sq + eps).sqrt();
@@ -18253,7 +18260,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 }
             }
 
-            let mut attn_proj = CpuBackend.matmul(&attn_out, 1, &l.wo);
+            let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &l.wo);
             crate::engine::tensor::rmsnorm_inplace(
                 &mut attn_proj,
                 &l.attn_post_norm,
@@ -18267,13 +18274,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
             let mut ffn_normed = xr.clone();
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &l.ffn_norm, 1, n_embd, eps);
-            let mut gate = CpuBackend.matmul(&ffn_normed, 1, &l.ffn_gate);
-            let up = CpuBackend.matmul(&ffn_normed, 1, &l.ffn_up);
+            let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &l.ffn_gate);
+            let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &l.ffn_up);
             for g in gate.iter_mut() {
                 *g = crate::engine::tensor::gelu(*g);
             }
             crate::engine::tensor::mul_inplace(&mut gate, &up);
-            let mut ffn_out = CpuBackend.matmul(&gate, 1, &l.ffn_down);
+            let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &l.ffn_down);
             crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &l.ffn_post_norm, 1, n_embd, eps);
             xr = attn_out_residual;
             crate::engine::tensor::add_inplace(&mut xr, &ffn_out);
