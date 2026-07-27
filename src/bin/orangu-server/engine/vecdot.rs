@@ -37,13 +37,16 @@
 //! relative error stays around 1e-3 (see the tests, which check every
 //! kernel against the `quant::dequantize` reference).
 //!
-//! Only the four types that actually carry weight in real GGUF releases get
-//! a fused kernel — `Q8_0`, `Q5_0`, `Q4_K`, `Q6_K`. Anything else returns
-//! `false` from [`supports`] and the caller keeps its old dequantize path,
-//! so this is strictly an addition: no existing type changes behavior.
+//! Only the five types that actually carry weight in real GGUF releases get
+//! a fused kernel — `Q8_0`, `Q5_0`, `Q4_K`, `Q6_K`, `IQ4_NL`. Anything else
+//! returns `false` from [`supports`] and the caller keeps its old
+//! dequantize path, so this is strictly an addition: no existing type
+//! changes behavior.
 
+use super::iq_grids::KVALUES_IQ4NL;
 use super::quant::{
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    get_scale_min_k4, read_f16,
 };
 
 /// Elements per activation-quantization block — one shared `f32` scale per
@@ -108,13 +111,13 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
 /// Whether a fused kernel exists for `ggml_type` at this `in_dim`. The
 /// `in_dim` check is not paranoia: a GGUF row is only guaranteed to be a
 /// whole number of blocks, and `Q4_K`/`Q6_K` need 256 | `in_dim` while
-/// `Q8_0`/`Q5_0` need only 32 — a `Qwen2.5-0.5B` is exactly the case that
-/// mixes both (`embedding_length` 896 is 28 blocks of 32 but not a multiple
-/// of 256, which is why its layer weights are `Q5_0` and only its
-/// `256`-divisible `ffn_down` is `Q4_K`/`Q6_K`).
+/// `Q8_0`/`Q5_0`/`IQ4_NL` need only 32 — a `Qwen2.5-0.5B` is exactly the
+/// case that mixes both (`embedding_length` 896 is 28 blocks of 32 but not
+/// a multiple of 256, which is why its layer weights are `Q5_0`/`IQ4_NL`
+/// and only its `256`-divisible `ffn_down` is a K-quant).
 pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
     match ggml_type {
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 => in_dim.is_multiple_of(32),
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => in_dim.is_multiple_of(32),
         GGML_TYPE_Q4_K | GGML_TYPE_Q6_K => in_dim.is_multiple_of(256),
         _ => false,
     }
@@ -204,6 +207,7 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
     match ggml_type {
         GGML_TYPE_Q8_0 => unpack_q8_0(row, out),
         GGML_TYPE_Q5_0 => unpack_q5_0(row, out),
+        GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
         // Unreachable via `supports`, but a wrong answer here would be a
@@ -722,6 +726,23 @@ unsafe fn dot16_sse41(w: &[i8], x: &[i8]) -> i32 {
 // `Q5_0`'s 3.5 ms and `Q6_K`'s 6.3 ms, so intrinsics there would add unsafe
 // code for no gain.
 
+/// Unpacks an `IQ4_NL` block's 32 weights into `w`: nibble `j`'s low half is
+/// element `j` and its high half element `16 + j`, each selecting one of the
+/// 16 non-uniformly spaced levels in [`KVALUES_IQ4NL`].
+///
+/// The table is `i8` already and spans `-127..=113`, so — as with `Q5_0`'s
+/// `-16` bias — the whole value folds into the `int8` weight and no
+/// correction term survives. Scalar rather than NEON for the same reason
+/// `Q4_K`'s unpack is: this is a 16-entry lookup LLVM turns into a
+/// register-resident table, not a bit-shuffle worth intrinsics.
+#[inline(always)]
+fn unpack_block_iq4_nl(qs: &[u8], w: &mut [i8; 32]) {
+    for j in 0..16 {
+        w[j] = KVALUES_IQ4NL[(qs[j] & 0x0F) as usize];
+        w[j + 16] = KVALUES_IQ4NL[(qs[j] >> 4) as usize];
+    }
+}
+
 /// Unpacks a `Q5_0` block's 32 weights into `w`: a nibble from `qs` plus a
 /// 5th bit from `qh`, biased by -16 so the result fits a signed `int8`.
 #[inline(always)]
@@ -861,6 +882,23 @@ fn unpack_q5_0(row: &[u8], out: &mut UnpackedRow) {
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
         let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
         unpack_block_q5_0(qh, &block[6..], w);
+        out.scale[b] = dw;
+        out.min[b] = 0.0;
+    }
+}
+
+// -------------------------------------------------------------- IQ4_NL
+
+/// `block_iq4_nl`: `{ d: f16, qs: [u8; 16] }`, 32 elements — `Q4_0`'s block
+/// shape with a codebook lookup in place of the `- 8`. Symmetric like
+/// `Q5_0`: one scale per 32, no `min` term.
+fn unpack_iq4_nl(row: &[u8], out: &mut UnpackedRow) {
+    const BLOCK_BYTES: usize = 2 + 16;
+    out.has_min = false;
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
+        unpack_block_iq4_nl(&block[2..], w);
         out.scale[b] = dw;
         out.min[b] = 0.0;
     }
@@ -1235,6 +1273,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
     match ggml_type {
         GGML_TYPE_Q8_0 => dot_q8_0::<ISA>(row, act),
         GGML_TYPE_Q5_0 => dot_q5_0::<ISA>(row, act),
+        GGML_TYPE_IQ4_NL => dot_iq4_nl::<ISA>(row, act),
         GGML_TYPE_Q4_K => dot_q4_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
         other => panic!("vecdot::dot_row called for unsupported ggml_type {other}"),
@@ -1255,6 +1294,20 @@ fn dot_q8_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
         let dw = read_f16(block, 0);
         let w: &[i8] = bytemuck::cast_slice(&block[2..]);
         total += dw * act.d[b] * dot32::<ISA>(w, &act.q[b * 32..]) as f32;
+    }
+    total
+}
+
+/// `block_iq4_nl`, 32 elements: low nibbles then high nibbles, each a
+/// codebook index rather than a signed integer.
+fn dot_iq4_nl<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 16;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        unpack_block_iq4_nl(&block[2..], &mut w);
+        total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
     }
     total
 }
@@ -1368,6 +1421,7 @@ mod tests {
         let (block_bytes, block_elems) = match ggml_type {
             GGML_TYPE_Q8_0 => (34, 32),
             GGML_TYPE_Q5_0 => (22, 32),
+            GGML_TYPE_IQ4_NL => (18, 32),
             GGML_TYPE_Q4_K => (144, 256),
             GGML_TYPE_Q6_K => (210, 256),
             other => panic!("unhandled {other}"),
@@ -1380,7 +1434,9 @@ mod tests {
         // and leave the quant payload random.
         for block in row.chunks_exact_mut(block_bytes) {
             match ggml_type {
-                GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => {
+                    block[0..2].copy_from_slice(&[0x00, 0x30])
+                }
                 GGML_TYPE_Q4_K => {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
                     block[2..4].copy_from_slice(&[0x00, 0x2c]);
@@ -1442,8 +1498,12 @@ mod tests {
         let in_dim = 896;
         // Deliberately not a multiple of TOKEN_TILE, to exercise the tail.
         for n_tokens in [1usize, 3, 4, 7, 8, 17] {
-            for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0] {
-                let block_bytes = if ggml_type == GGML_TYPE_Q8_0 { 34 } else { 22 };
+            for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
+                let block_bytes = match ggml_type {
+                    GGML_TYPE_Q8_0 => 34,
+                    GGML_TYPE_Q5_0 => 22,
+                    _ => 18,
+                };
                 let mut row = pseudo_bytes(in_dim / 32 * block_bytes, 5);
                 for block in row.chunks_exact_mut(block_bytes) {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
@@ -1476,12 +1536,14 @@ mod tests {
         for ggml_type in [
             GGML_TYPE_Q8_0,
             GGML_TYPE_Q5_0,
+            GGML_TYPE_IQ4_NL,
             GGML_TYPE_Q4_K,
             GGML_TYPE_Q6_K,
         ] {
             let (block_bytes, block_elems) = match ggml_type {
                 GGML_TYPE_Q8_0 => (34, 32),
                 GGML_TYPE_Q5_0 => (22, 32),
+                GGML_TYPE_IQ4_NL => (18, 32),
                 GGML_TYPE_Q4_K => (144, 256),
                 _ => (210, 256),
             };
@@ -1490,7 +1552,7 @@ mod tests {
                 let mut row = pseudo_bytes(in_dim / block_elems * block_bytes, seed);
                 for block in row.chunks_exact_mut(block_bytes) {
                     match ggml_type {
-                        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 => {
+                        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => {
                             block[0..2].copy_from_slice(&[0x00, 0x30])
                         }
                         GGML_TYPE_Q4_K => {
@@ -1531,6 +1593,18 @@ mod tests {
         }
     }
 
+    /// 896 and 4864 are `Qwen2.5-Coder-0.5B`'s own two row widths, and 896
+    /// is the one that matters: it is not a multiple of 256, which is why
+    /// its rows carry `IQ4_NL` rather than the `Q2_K`/`Q3_K` the file name
+    /// advertises.
+    #[test]
+    fn iq4_nl_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_IQ4_NL, 896, seed);
+            check(GGML_TYPE_IQ4_NL, 4864, seed);
+        }
+    }
+
     #[test]
     fn q4_k_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
@@ -1554,6 +1628,8 @@ mod tests {
         // kernel.
         assert!(supports(GGML_TYPE_Q5_0, 896));
         assert!(supports(GGML_TYPE_Q8_0, 896));
+        assert!(supports(GGML_TYPE_IQ4_NL, 896));
+        assert!(!supports(GGML_TYPE_IQ4_NL, 24));
         assert!(!supports(GGML_TYPE_Q4_K, 896));
         assert!(!supports(GGML_TYPE_Q6_K, 896));
         // And types with no fused kernel stay on the old path regardless.

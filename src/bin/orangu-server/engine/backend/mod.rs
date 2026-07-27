@@ -97,4 +97,102 @@ pub trait Backend: Send + Sync {
     fn as_vulkan(&self) -> Option<&VulkanBackend> {
         None
     }
+
+    /// Whether this backend has a kernel for `ggml_type`.
+    ///
+    /// `CpuBackend` goes straight through `quant::dequantize`, so it covers
+    /// everything `quant::supports_type` does and keeps this default. Every
+    /// GPU backend has to compile a kernel per type and covers less —
+    /// `VulkanBackend` lacks the three lowest-bit `IQ*` types,
+    /// `CudaBackend`/`RocmBackend`/`OpenClBackend` lack all the
+    /// codebook-indexed ones (see their `SUPPORTED_TYPES`).
+    ///
+    /// This exists so that gap is reported by
+    /// [`unsupported_tensor_types`] as a startup error naming the type and
+    /// the backend, instead of surfacing as a panic from inside `matmul`
+    /// partway through the first request — which is what it did while every
+    /// GPU backend was assumed to be at parity with the CPU path.
+    fn supports_type(&self, _ggml_type: u32) -> bool {
+        true
+    }
+}
+
+/// Every distinct tensor type in `tensors` that `backend` has no kernel
+/// for, as type names sorted for a stable message — empty when the backend
+/// can run every tensor.
+///
+/// Takes `(name, ggml_type)` pairs rather than a `GgufFile` so the caller
+/// can pass `LoadedModel::tensor_types`, which spans every shard; a split
+/// model's `GgufFile` is only shard 1, and a type that appears solely in a
+/// later shard would slip through. Reports the whole set rather than the
+/// first hit because the pairs arrive in hash order, and because a mixed
+/// low-bit file usually carries more than one type a backend lacks —
+/// naming all of them means one restart, not one per type.
+///
+/// Reads the tensor *directory* only, never the data, so this is as cheap
+/// as reading the header. Runs after `quant::supports_type`'s own check
+/// (`loader::model_load_support`), so a type reported here is one this
+/// build *can* read on the CPU but not on the selected device.
+pub fn unsupported_tensor_types<'a>(
+    tensors: impl Iterator<Item = (&'a str, u32)>,
+    backend: &dyn Backend,
+) -> Vec<String> {
+    let mut names: Vec<String> = tensors
+        .filter(|(_, ggml_type)| !backend.supports_type(*ggml_type))
+        .map(|(_, ggml_type)| orangu::gguf::ggml_type_name(ggml_type))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL};
+
+    /// A backend that accepts everything except the listed types, standing
+    /// in for a real GPU backend's `SUPPORTED_TYPES` gap without needing a
+    /// device.
+    struct Picky<'a>(&'a [u32]);
+
+    impl Backend for Picky<'_> {
+        fn matmul(&self, _x: &[f32], _n_tokens: usize, _w: &QuantMatrix) -> Vec<f32> {
+            unreachable!("supports_type is the only thing under test here")
+        }
+        fn supports_type(&self, ggml_type: u32) -> bool {
+            !self.0.contains(&ggml_type)
+        }
+    }
+
+    /// A backend missing two types must name both, deduped and sorted, and
+    /// must not name the ones it does support. Sorted so the message doesn't
+    /// change between runs — `LoadedModel::tensor_types` iterates a
+    /// `HashMap`.
+    #[test]
+    fn unsupported_tensor_types_reports_every_missing_type_once() {
+        let tensors = [
+            ("output_norm.weight", GGML_TYPE_F32),
+            ("blk.0.attn_k.weight", GGML_TYPE_IQ4_NL),
+            ("blk.0.attn_q.weight", GGML_TYPE_IQ1_S),
+            ("blk.1.attn_k.weight", GGML_TYPE_IQ4_NL),
+        ];
+        let found = unsupported_tensor_types(
+            tensors.iter().copied(),
+            &Picky(&[GGML_TYPE_IQ4_NL, GGML_TYPE_IQ1_S]),
+        );
+        assert_eq!(found, vec!["IQ1_S".to_string(), "IQ4_NL".to_string()]);
+    }
+
+    /// `CpuBackend` keeps the permissive default, so a file it can decode
+    /// never trips this check — which is what keeps the startup gate from
+    /// rejecting models that previously ran.
+    #[test]
+    fn unsupported_tensor_types_passes_a_backend_that_covers_everything() {
+        let tensors = [
+            ("blk.0.attn_k.weight", GGML_TYPE_IQ4_NL),
+            ("blk.0.attn_q.weight", GGML_TYPE_IQ1_S),
+        ];
+        assert!(unsupported_tensor_types(tensors.iter().copied(), &CpuBackend).is_empty());
+    }
 }

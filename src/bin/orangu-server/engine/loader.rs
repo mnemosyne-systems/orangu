@@ -469,6 +469,16 @@ fn shard_paths(path: &Path, gguf: &GgufFile) -> Result<Vec<std::path::PathBuf>> 
 }
 
 impl LoadedModel {
+    /// Every tensor's `(name, ggml_type)`, across **every** shard — unlike
+    /// walking a single [`GgufFile`]'s directory, which for a split model
+    /// only sees shard 1. Used by `engine::backend::unsupported_tensor_types`
+    /// to decide whether the selected backend can run this model at all.
+    pub fn tensor_types(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.tensors
+            .iter()
+            .map(|(name, loc)| (name.as_str(), loc.ggml_type))
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let gguf = GgufFile::open(path)?;
         let architecture = metadata_string(&gguf, "general.architecture")

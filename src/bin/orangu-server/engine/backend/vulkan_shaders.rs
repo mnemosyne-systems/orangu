@@ -47,9 +47,9 @@
 
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
-    GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -1704,6 +1704,26 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_iq4_nl`: mirrors `quant::dequantize_iq4_nl` — `Q4_0`'s 18-byte
+/// block and low/high-nibble split, with the nibble selecting one of the 16
+/// non-uniformly spaced levels in `iq_kvalue` instead of being read as a
+/// signed integer offset by 8. The one `IQ*` type whose block is 32
+/// elements rather than 256.
+const IQ4_NL_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 32u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let byte = read_u8(byte_offset + 2u + (k % 16u));
+    var nib: u32 = byte & 0xFu;
+    if (k >= 16u) {
+        nib = byte >> 4u;
+    }
+    return d * iq_kvalue(nib);
+}
+"#;
+
 /// `block_iq4_xs`: mirrors `quant::dequantize_iq4_xs`. The only new type
 /// with no codebook of lattice points — a nibble selects one of 16
 /// non-uniformly spaced levels. Its 6-bit group scale is split across
@@ -1761,6 +1781,7 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ2_S => IQ2_S_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ3_XXS => IQ3_XXS_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ3_S => IQ3_S_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ4_NL => IQ4_NL_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
         _ => return None,
     })
@@ -1773,6 +1794,7 @@ fn needs_iq_grids(ggml_type: u32) -> bool {
         || ggml_type == GGML_TYPE_IQ2_S
         || ggml_type == GGML_TYPE_IQ3_XXS
         || ggml_type == GGML_TYPE_IQ3_S
+        || ggml_type == GGML_TYPE_IQ4_NL
         || ggml_type == GGML_TYPE_IQ4_XS
 }
 

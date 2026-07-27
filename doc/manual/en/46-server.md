@@ -654,12 +654,40 @@ e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
 width read from `attention.key_length` rather than derived from
 `n_embd / n_head`, and an attention temperature scale) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
-`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
+`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
 across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
 shard — the shard count comes from the `split.count` metadata key, and each
 shard is mapped separately.
+
+A quantization label names the file's *dominant* type, not its only one. A
+K-quant block is 256 elements wide, so every tensor it covers needs a row
+length divisible by 256; where a model's rows aren't, upstream's quantizer
+substitutes a narrower type row by row. `unsloth/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q2_K`
+is the common case — its `embedding_length` is 896, which is 28 blocks of 32
+but not a multiple of 256, so the file that download produces is mostly
+`IQ4_NL` and `Q5_0`, with `Q3_K` only on the 4864-wide `ffn_down` rows and
+`Q8_0` on the embedding table. Every one of those types is read, so the model
+loads and runs; what the label predicts is the size, not a single tensor type.
+
+Type coverage differs by backend. Only `cpu` reads every type listed above.
+`vulkan` covers all of them except `IQ1_S`, `IQ1_M`, and `IQ2_XXS`; `cuda`,
+`opencl`, and `rocm` cover the float types, the legacy quants,
+`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and `IQ4_NL`. What's missing in each case
+is the `IQ*` types that index a lattice codebook the backend has no uploaded
+buffer for. A model carrying a type the selected backend lacks is refused at
+startup, naming each missing type, rather than failing partway through the
+first request.
+
+Three `ggml_type`s are refused on purpose: `Q4_0_4_4`, `Q4_0_4_8`, and
+`Q4_0_8_8` (and the `IQ4_NL_*` equivalents). These were ARM-SIMD
+pre-repacked layouts that ggml **removed** — upstream `llama.cpp` cannot
+read such a file either ("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime
+repacking"), since repacking now happens at load time from the plain type.
+Many 2024-era repos still serve all three next to the files that work, so
+the error names the type and points at the `Q4_0` upload in the same
+repository rather than reading as a missing feature.
 
 Not yet built, and out of scope for now: multimodal input, `/infill`,
 `/rerank`, LoRA hot-swap, and slot save/restore.

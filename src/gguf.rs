@@ -379,53 +379,96 @@ impl<R: Read> Reader<R> {
 }
 
 /// `ggml_type` id -> canonical name, per
-/// <https://github.com/ggml-org/ggml/blob/master/include/ggml.h>. Slots that
-/// were removed from the format (their numeric id is retired, never reused)
-/// are `None`; ids beyond the table are types added after this was written.
+/// <https://github.com/ggml-org/ggml/blob/master/include/ggml.h>.
+///
+/// Ids that ggml has since **deleted** still get their historical name here
+/// rather than a `None` placeholder, because real files carrying them are
+/// still served (every `bartowski/*-GGUF` repo from 2024 has a
+/// `Q4_0_4_4`/`Q4_0_4_8`/`Q4_0_8_8` upload). Printing `reserved(31)` for one
+/// tells a user nothing; printing `Q4_0_4_4` and letting
+/// [`removed_ggml_type`] explain what happened to it tells them what to
+/// download instead. A retired id is never reused, so the name stays
+/// unambiguous. Ids beyond the table are types added after this was
+/// written.
 const GGML_TYPE_NAMES: &[Option<&str>] = &[
-    Some("F32"),     // 0
-    Some("F16"),     // 1
-    Some("Q4_0"),    // 2
-    Some("Q4_1"),    // 3
-    None,            // 4 (Q4_2, removed)
-    None,            // 5 (Q4_3, removed)
-    Some("Q5_0"),    // 6
-    Some("Q5_1"),    // 7
-    Some("Q8_0"),    // 8
-    Some("Q8_1"),    // 9
-    Some("Q2_K"),    // 10
-    Some("Q3_K"),    // 11
-    Some("Q4_K"),    // 12
-    Some("Q5_K"),    // 13
-    Some("Q6_K"),    // 14
-    Some("Q8_K"),    // 15
-    Some("IQ2_XXS"), // 16
-    Some("IQ2_XS"),  // 17
-    Some("IQ3_XXS"), // 18
-    Some("IQ1_S"),   // 19
-    Some("IQ4_NL"),  // 20
-    Some("IQ3_S"),   // 21
-    Some("IQ2_S"),   // 22
-    Some("IQ4_XS"),  // 23
-    Some("I8"),      // 24
-    Some("I16"),     // 25
-    Some("I32"),     // 26
-    Some("I64"),     // 27
-    Some("F64"),     // 28
-    Some("IQ1_M"),   // 29
-    Some("BF16"),    // 30
-    None,            // 31 (Q4_0_4_4, removed)
-    None,            // 32 (Q4_0_4_8, removed)
-    None,            // 33 (Q4_0_8_8, removed)
-    Some("TQ1_0"),   // 34
-    Some("TQ2_0"),   // 35
-    None,            // 36 (IQ4_NL_4_4, removed)
-    None,            // 37 (IQ4_NL_4_8, removed)
-    None,            // 38 (IQ4_NL_8_8, removed)
-    Some("MXFP4"),   // 39
-    Some("NVFP4"),   // 40
-    Some("Q1_0"),    // 41
+    Some("F32"),        // 0
+    Some("F16"),        // 1
+    Some("Q4_0"),       // 2
+    Some("Q4_1"),       // 3
+    Some("Q4_2"),       // 4  (removed from ggml)
+    Some("Q4_3"),       // 5  (removed from ggml)
+    Some("Q5_0"),       // 6
+    Some("Q5_1"),       // 7
+    Some("Q8_0"),       // 8
+    Some("Q8_1"),       // 9
+    Some("Q2_K"),       // 10
+    Some("Q3_K"),       // 11
+    Some("Q4_K"),       // 12
+    Some("Q5_K"),       // 13
+    Some("Q6_K"),       // 14
+    Some("Q8_K"),       // 15
+    Some("IQ2_XXS"),    // 16
+    Some("IQ2_XS"),     // 17
+    Some("IQ3_XXS"),    // 18
+    Some("IQ1_S"),      // 19
+    Some("IQ4_NL"),     // 20
+    Some("IQ3_S"),      // 21
+    Some("IQ2_S"),      // 22
+    Some("IQ4_XS"),     // 23
+    Some("I8"),         // 24
+    Some("I16"),        // 25
+    Some("I32"),        // 26
+    Some("I64"),        // 27
+    Some("F64"),        // 28
+    Some("IQ1_M"),      // 29
+    Some("BF16"),       // 30
+    Some("Q4_0_4_4"),   // 31 (removed from ggml)
+    Some("Q4_0_4_8"),   // 32 (removed from ggml)
+    Some("Q4_0_8_8"),   // 33 (removed from ggml)
+    Some("TQ1_0"),      // 34
+    Some("TQ2_0"),      // 35
+    Some("IQ4_NL_4_4"), // 36 (removed from ggml)
+    Some("IQ4_NL_4_8"), // 37 (removed from ggml)
+    Some("IQ4_NL_8_8"), // 38 (removed from ggml)
+    Some("MXFP4"),      // 39
+    Some("NVFP4"),      // 40
+    Some("Q1_0"),       // 41
 ];
+
+/// `ggml_type` ids ggml itself has **deleted**, paired with the type that
+/// superseded them — `None` where nothing did.
+///
+/// These are not "not yet implemented": upstream `llama.cpp` cannot read a
+/// file carrying one either (`ggml.h` keeps them only as commented-out enum
+/// slots, "support has been removed from gguf files"). The `*_4_4`/`*_4_8`/
+/// `*_8_8` triples were ARM-SIMD *pre-repacked* layouts of `Q4_0`/`IQ4_NL`,
+/// dropped once llama.cpp started repacking at load time from the plain
+/// type — so the plain file in the same repo is the direct replacement, not
+/// a downgrade. `Q4_2`/`Q4_3` predate the K-quants and have no successor.
+///
+/// Worth naming rather than rejecting generically because the files are
+/// still up: every `bartowski/*-GGUF` repo published in 2024 still carries
+/// all three `Q4_0_*` uploads next to the ones that work.
+const REMOVED_GGML_TYPES: &[(u32, Option<&str>)] = &[
+    (4, None),
+    (5, None),
+    (31, Some("Q4_0")),
+    (32, Some("Q4_0")),
+    (33, Some("Q4_0")),
+    (36, Some("IQ4_NL")),
+    (37, Some("IQ4_NL")),
+    (38, Some("IQ4_NL")),
+];
+
+/// `Some(replacement)` when `ggml_type` is one ggml has removed — see
+/// [`REMOVED_GGML_TYPES`]. The outer `Option` distinguishes "not a removed
+/// type" from the inner "removed, with no successor".
+pub fn removed_ggml_type(ggml_type: u32) -> Option<Option<&'static str>> {
+    REMOVED_GGML_TYPES
+        .iter()
+        .find(|(id, _)| *id == ggml_type)
+        .map(|(_, replacement)| *replacement)
+}
 
 pub fn ggml_type_name(ggml_type: u32) -> String {
     match GGML_TYPE_NAMES.get(ggml_type as usize) {
@@ -504,6 +547,25 @@ mod tests {
             .map(|(_, value)| value)
             .unwrap();
         assert!(matches!(tokens, GgufValue::Array(items) if items.len() == 3));
+    }
+
+    /// The removed ids must still name themselves — a real `bartowski`
+    /// repo serves files carrying 31/32/33, and `list`'s `SUPPORTED` column
+    /// prints this name, so `reserved(31)` there tells a user nothing about
+    /// which file to fetch instead. Ids past the table stay `unknown(N)`:
+    /// those are types newer than this build, not retired ones.
+    #[test]
+    fn removed_ggml_types_are_named_and_carry_their_replacement() {
+        assert_eq!(ggml_type_name(31), "Q4_0_4_4");
+        assert_eq!(ggml_type_name(33), "Q4_0_8_8");
+        assert_eq!(ggml_type_name(36), "IQ4_NL_4_4");
+        assert_eq!(removed_ggml_type(31), Some(Some("Q4_0")));
+        assert_eq!(removed_ggml_type(37), Some(Some("IQ4_NL")));
+        assert_eq!(removed_ggml_type(4), Some(None));
+        // Live types must not be mistaken for retired ones.
+        assert_eq!(removed_ggml_type(2), None);
+        assert_eq!(removed_ggml_type(20), None);
+        assert_eq!(ggml_type_name(255), "unknown(255)");
     }
 
     #[test]

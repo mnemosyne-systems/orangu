@@ -24,9 +24,9 @@
 //! K-quant family
 //! (`Q2_K` through `Q6_K`), and the `IQ*` codebook quants a mixed
 //! "dynamic" release reaches for at the low end (`IQ2_XS`, `IQ2_S`,
-//! `IQ3_XXS`, `IQ3_S`, `IQ4_XS`). Anything else fails with a clear "not yet
-//! supported" error naming the type, rather than silently misreading the
-//! bytes.
+//! `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`). Anything else fails with a
+//! clear "not yet supported" error naming the type, rather than silently
+//! misreading the bytes.
 //!
 //! Both families are worth reading as a pair, because the `IQ*` ones are
 //! shaped quite differently: a K-quant block stores its weights, an `IQ*`
@@ -36,7 +36,7 @@
 use anyhow::{Result, bail};
 use half::f16;
 
-use orangu::gguf::ggml_type_name;
+use orangu::gguf::{ggml_type_name, removed_ggml_type};
 
 use crate::engine::iq_grids::{
     IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
@@ -62,6 +62,13 @@ pub(crate) const GGML_TYPE_IQ2_XXS: u32 = 16;
 pub(crate) const GGML_TYPE_IQ2_XS: u32 = 17;
 pub(crate) const GGML_TYPE_IQ3_XXS: u32 = 18;
 pub(crate) const GGML_TYPE_IQ1_S: u32 = 19;
+/// `IQ4_NL` is the one `IQ*` type that blocks at 32 rather than 256, which
+/// is why it turns up in files whose *name* promises a pure K-quant: a
+/// K-quant block needs 256 | `ne[0]`, so upstream's quantizer substitutes
+/// `IQ4_NL` row by row when a tensor's row length isn't a multiple of 256
+/// (`llama.cpp`'s `llama_tensor_get_type`). Qwen2.5-0.5B's 896-wide rows
+/// are the common case — a `Q2_K` download of one is mostly `IQ4_NL`.
+pub(crate) const GGML_TYPE_IQ4_NL: u32 = 20;
 pub(crate) const GGML_TYPE_IQ3_S: u32 = 21;
 pub(crate) const GGML_TYPE_IQ2_S: u32 = 22;
 pub(crate) const GGML_TYPE_IQ4_XS: u32 = 23;
@@ -75,6 +82,7 @@ const QK4_1: usize = 32;
 const QK5_0: usize = 32;
 const QK5_1: usize = 32;
 const QK8_0: usize = 32;
+const QK4_NL: usize = 32;
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
 
@@ -102,6 +110,7 @@ fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_IQ2_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 32, QK_K)),
         GGML_TYPE_IQ3_XXS => Some((2 + 3 * (QK_K / 8), QK_K)),
         GGML_TYPE_IQ3_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64, QK_K)),
+        GGML_TYPE_IQ4_NL => Some((2 + QK4_NL / 2, QK4_NL)),
         GGML_TYPE_IQ4_XS => Some((2 + 2 + QK_K / 64 + QK_K / 2, QK_K)),
         _ => None,
     }
@@ -120,14 +129,36 @@ pub fn supports_type(ggml_type: u32) -> bool {
     block_layout(ggml_type).is_some()
 }
 
+/// The error for a `ggml_type` this build can't read, phrased by *why*.
+///
+/// A type ggml itself removed is a different situation from one this engine
+/// hasn't implemented, and the difference is the whole of what the reader
+/// should do next: waiting for orangu to add `Q4_0_4_4` is waiting forever,
+/// because upstream `llama.cpp` dropped it too and the plain `Q4_0` upload
+/// sitting next to it in the same repo is the intended replacement. Saying
+/// "not yet supported" for both sends them to the wrong place.
+fn unsupported_type_error(ggml_type: u32) -> anyhow::Error {
+    let name = ggml_type_name(ggml_type);
+    match removed_ggml_type(ggml_type) {
+        Some(Some(replacement)) => anyhow::anyhow!(
+            "tensor type {name} was removed from ggml itself — upstream llama.cpp cannot read \
+             this file either. It was a pre-repacked layout of {replacement}, now done at load \
+             time instead, so download the {replacement} file from the same repository."
+        ),
+        Some(None) => anyhow::anyhow!(
+            "tensor type {name} was removed from ggml itself — upstream llama.cpp cannot read \
+             this file either. It predates the K-quants and has no direct replacement; \
+             re-quantize from the source weights."
+        ),
+        None => anyhow::anyhow!("tensor type {name} is not yet supported by orangu-server"),
+    }
+}
+
 /// The exact byte length a tensor with `element_count` elements of
 /// `ggml_type` occupies in the GGUF file's data section.
 pub fn tensor_byte_size(ggml_type: u32, element_count: u64) -> Result<u64> {
     let Some((block_bytes, block_elems)) = block_layout(ggml_type) else {
-        bail!(
-            "tensor type {} is not yet supported by orangu-server",
-            ggml_type_name(ggml_type)
-        );
+        return Err(unsupported_type_error(ggml_type));
     };
     if !(element_count as usize).is_multiple_of(block_elems) {
         bail!(
@@ -178,11 +209,9 @@ pub fn dequantize(ggml_type: u32, bytes: &[u8], element_count: usize) -> Result<
         GGML_TYPE_IQ2_S => Ok(dequantize_iq2_s(bytes, element_count)),
         GGML_TYPE_IQ3_XXS => Ok(dequantize_iq3_xxs(bytes, element_count)),
         GGML_TYPE_IQ3_S => Ok(dequantize_iq3_s(bytes, element_count)),
+        GGML_TYPE_IQ4_NL => Ok(dequantize_iq4_nl(bytes, element_count)),
         GGML_TYPE_IQ4_XS => Ok(dequantize_iq4_xs(bytes, element_count)),
-        _ => bail!(
-            "tensor type {} is not yet supported by orangu-server",
-            ggml_type_name(ggml_type)
-        ),
+        _ => Err(unsupported_type_error(ggml_type)),
     }
 }
 
@@ -900,6 +929,34 @@ fn dequantize_iq3_s(bytes: &[u8], element_count: usize) -> Vec<f32> {
     out
 }
 
+/// `block_iq4_nl`: `{ d: f16, qs: [u8; 16] }`, 32 elements — mirrors ggml's
+/// `dequantize_row_iq4_nl`.
+///
+/// Structurally this is `Q4_0` with the linear `nibble - 8` replaced by a
+/// lookup into [`KVALUES_IQ4NL`], the same 16 non-uniformly spaced levels
+/// `IQ4_XS` uses; it carries no codebook of lattice points and no
+/// sub-block scales, just one `f16` per 32 weights. The 16 low nibbles are
+/// the first 16 weights and the high nibbles the next 16 — split halves,
+/// not interleaved, as in [`dequantize_q4_0`].
+fn dequantize_iq4_nl(bytes: &[u8], element_count: usize) -> Vec<f32> {
+    const BLOCK_BYTES: usize = 2 + QK4_NL / 2;
+    let mut out = Vec::with_capacity(element_count);
+    for block in bytes.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let qs = &block[2..];
+        let mut lo = [0f32; QK4_NL / 2];
+        let mut hi = [0f32; QK4_NL / 2];
+        for (j, &byte) in qs.iter().enumerate() {
+            lo[j] = d * KVALUES_IQ4NL[(byte & 0x0F) as usize] as f32;
+            hi[j] = d * KVALUES_IQ4NL[(byte >> 4) as usize] as f32;
+        }
+        out.extend_from_slice(&lo);
+        out.extend_from_slice(&hi);
+    }
+    out.truncate(element_count);
+    out
+}
+
 /// `block_iq4_xs`: `{ d: f16, scales_h: u16, scales_l: [u8; 4],
 /// qs: [u8; 128] }`, 256 elements as 8 groups of 32 — mirrors ggml's
 /// `dequantize_row_iq4_xs`.
@@ -1042,7 +1099,7 @@ mod tests {
         let Some(cases) = ggml_reference_cases() else {
             return;
         };
-        assert_eq!(cases.len(), 15, "fixture should cover 15 types");
+        assert_eq!(cases.len(), 16, "fixture should cover 16 types");
 
         for (ggml_type, block_elems, raw, want) in cases {
             let name = ggml_type_name(ggml_type);
@@ -1147,6 +1204,11 @@ mod tests {
         assert_eq!(tensor_byte_size(GGML_TYPE_Q4_K, 256).unwrap(), 144);
         assert_eq!(tensor_byte_size(GGML_TYPE_Q5_K, 256).unwrap(), 176);
         assert_eq!(tensor_byte_size(GGML_TYPE_Q6_K, 256).unwrap(), 210);
+        // The one `IQ*` type that blocks at 32, not 256 — same 18 bytes as
+        // `Q4_0`. Pinned here because assuming `IQ* => QK_K` is exactly the
+        // mistake that would misread every row of an `IQ4_NL` tensor.
+        assert_eq!(tensor_byte_size(GGML_TYPE_IQ4_NL, 32).unwrap(), 18);
+        assert!(tensor_byte_size(GGML_TYPE_IQ4_NL, 896).is_ok());
     }
 
     #[test]
@@ -1203,6 +1265,33 @@ mod tests {
         let out = dequantize(GGML_TYPE_Q4_0, &block, 32).unwrap();
         assert_eq!(out.len(), 32);
         assert!(out.iter().all(|&v| v == -8.0));
+    }
+
+    /// `IQ4_NL` looks exactly like `Q4_0` on the wire — `f16` scale, 16
+    /// nibble-pair bytes — so the failure mode to guard against is decoding
+    /// it *as* `Q4_0`. All-zero nibbles at `d=1.0` are the cleanest
+    /// separator: the codebook says `-127.0`, the linear path would say
+    /// `-8.0`. The ascending nibbles then check that the lookup is by index
+    /// rather than a rescaled arithmetic sequence — `KVALUES_IQ4NL` is
+    /// non-uniformly spaced, so its successive gaps differ.
+    #[test]
+    fn dequantize_iq4_nl_uses_the_codebook_not_a_linear_offset() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        block.extend_from_slice(&[0u8; 16]);
+        let out = dequantize(GGML_TYPE_IQ4_NL, &block, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        assert!(out.iter().all(|&v| v == -127.0), "{out:?}");
+
+        // Byte `j` holds low nibble `j` and high nibble `j`, so the low half
+        // is levels 0..16 in order and the high half repeats them.
+        let mut block = Vec::new();
+        block.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+        block.extend((0..16u8).map(|j| j | (j << 4)));
+        let out = dequantize(GGML_TYPE_IQ4_NL, &block, 32).unwrap();
+        let want: Vec<f32> = KVALUES_IQ4NL.iter().map(|&v| v as f32).collect();
+        assert_eq!(out[..16], want[..], "low nibbles");
+        assert_eq!(out[16..], want[..], "high nibbles");
     }
 
     /// All-zero nibbles and all-zero high bits at `d=1.0` must dequantize
@@ -1317,5 +1406,25 @@ mod tests {
     fn dequantize_rejects_unsupported_types() {
         let err = dequantize(99, &[], 0).unwrap_err();
         assert!(err.to_string().contains("not yet supported"));
+    }
+
+    /// `Q4_0_4_4` (31) and its two siblings are the ones a user actually
+    /// meets — every 2024-era `bartowski/*-GGUF` repo still serves all
+    /// three. The message must name the type, say the removal was ggml's
+    /// rather than this build's, and point at the `Q4_0` file in the same
+    /// repo; "not yet supported" would imply waiting is the fix.
+    #[test]
+    fn removed_ggml_types_explain_themselves_rather_than_reading_as_unimplemented() {
+        for (ggml_type, name) in [(31u32, "Q4_0_4_4"), (32, "Q4_0_4_8"), (33, "Q4_0_8_8")] {
+            let err = dequantize(ggml_type, &[], 0).unwrap_err().to_string();
+            assert!(err.contains(name), "{err}");
+            assert!(err.contains("removed from ggml itself"), "{err}");
+            assert!(err.contains("download the Q4_0 file"), "{err}");
+            assert!(!err.contains("not yet supported"), "{err}");
+            // `tensor_byte_size` is the other door into the same rejection —
+            // it is what `loader` calls first — so it must say the same thing.
+            let sized = tensor_byte_size(ggml_type, 32).unwrap_err().to_string();
+            assert!(sized.contains("removed from ggml itself"), "{sized}");
+        }
     }
 }

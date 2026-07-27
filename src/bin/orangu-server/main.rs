@@ -422,6 +422,20 @@ fn prepare(args: Args) -> Result<Prepared> {
 
     let loaded = LoadedModel::open(&path).context("loading model weights")?;
     let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(conf.backend)?;
+    // Every GPU backend covers fewer `ggml_type`s than `engine::quant` reads
+    // on the CPU, so a file this build can decode can still be one the
+    // selected device has no kernel for. Caught here, against the tensor
+    // directory alone, rather than as a panic from inside `matmul` partway
+    // through the first request.
+    let unsupported = engine::backend::unsupported_tensor_types(loaded.tensor_types(), &*backend);
+    if !unsupported.is_empty() {
+        bail!(
+            "backend {backend_label} has no kernel for tensor type(s) {}; only backend = cpu \
+             reads every type this build supports, so re-run with that (or pick a \
+             quantization of this model without those types)",
+            unsupported.join(", ")
+        );
+    }
     let architecture = loaded.config.architecture.clone();
     let model: Arc<dyn ModelForward> = match engine::loader::resolve_arch_family(&architecture)? {
         ArchFamily::LlamaStyle => Arc::new(

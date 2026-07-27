@@ -443,6 +443,14 @@ done
 | `Q6_K` | 6.6 | Near-lossless, for when VRAM allows it |
 | `Q8_0` | 8.5 | Effectively lossless; `orangu-server`'s second-choice default |
 
+A `Q*_K` name is the target, not a guarantee for every tensor. K-quant blocks
+are 256 elements wide, so `llama-quantize` can only use one on a tensor whose
+row length divides by 256; on rows that don't, it falls back per tensor —
+usually to `IQ4_NL` or `Q5_0`, both of which block at 32. A model with an
+`embedding_length` like Qwen2.5-0.5B's 896 therefore produces a genuinely
+mixed file from a single `Q2_K` run. `orangu-server show --tensors` prints
+each tensor's actual type if you want to see what a build really produced.
+
 ### Run it in orangu
 
 ```sh

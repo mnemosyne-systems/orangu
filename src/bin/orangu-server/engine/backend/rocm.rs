@@ -63,14 +63,21 @@ use cubecl_hip_sys::{
 
 use crate::engine::loader::QuantMatrix;
 use crate::engine::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 use super::{Backend, MatmulOp};
 
-/// The `ggml_type`s a kernel exists for — the same set `engine::quant`
-/// supports on the CPU path.
+/// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
+/// `engine::quant` reads on the CPU path: the remaining `IQ*` types
+/// (`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS`)
+/// index lattice codebooks that would each need their own uploaded buffer,
+/// which `VulkanBackend` has (`IQ_GRID_PRELUDE`) and this backend does not.
+/// `IQ4_NL` is here because it is the exception — a 16-entry level table
+/// small enough to inline into the kernel source. Anything absent is
+/// rejected by `Backend::supports_type` at startup rather than reaching
+/// `matmul`.
 const SUPPORTED_TYPES: &[u32] = &[
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -78,9 +85,12 @@ const SUPPORTED_TYPES: &[u32] = &[
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K,
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
+    GGML_TYPE_IQ4_NL,
 ];
 
 const KERNEL_NAME: &str = "matmul_reduce";
@@ -408,6 +418,84 @@ extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int
 }
 "#
         }
+        t if t == GGML_TYPE_Q2_K => {
+            r#"
+const unsigned int BLOCK_BYTES = 84u;
+const unsigned int BLOCK_ELEMS = 256u;
+extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
+    unsigned int scales_off = byte_offset;
+    unsigned int qs_off = byte_offset + 16u;
+    float d = orangu_half_to_float((unsigned short)w[byte_offset + 80] | ((unsigned short)w[byte_offset + 81] << 8));
+    float dmin = orangu_half_to_float((unsigned short)w[byte_offset + 82] | ((unsigned short)w[byte_offset + 83] << 8));
+    unsigned int n = k / 128u;
+    unsigned int r = k % 128u;
+    unsigned int s = r / 32u;
+    unsigned int h = (r % 32u) / 16u;
+    unsigned int l = r % 16u;
+    unsigned char sc = w[scales_off + n * 8u + s * 2u + h];
+    float dl = d * (float)(sc & 0xFu);
+    float ml = dmin * (float)(sc >> 4);
+    unsigned char byte = w[qs_off + n * 32u + h * 16u + l];
+    return dl * (float)((byte >> (2u * s)) & 3u) - ml;
+}
+"#
+        }
+        t if t == GGML_TYPE_Q3_K => {
+            r#"
+const unsigned int BLOCK_BYTES = 110u;
+const unsigned int BLOCK_ELEMS = 256u;
+// Q3_K's `i`th 6-bit sub-block scale (0..16), still biased by 32, out of the
+// 12 bytes at `base`. Mirrors `quant::unpack_q3_k_scales` for one index.
+extern "C" __device__ unsigned int orangu_q3k_scale(const unsigned char *w, unsigned int base, unsigned int i) {
+    unsigned int low;
+    if (i < 8u) {
+        low = w[base + i] & 0xFu;
+    } else {
+        low = w[base + i - 8u] >> 4;
+    }
+    unsigned int high = (w[base + 8u + (i % 4u)] >> (2u * (i / 4u))) & 3u;
+    return low | (high << 4);
+}
+extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
+    unsigned int hmask_off = byte_offset;
+    unsigned int qs_off = byte_offset + 32u;
+    unsigned int scales_off = byte_offset + 96u;
+    float d_all = orangu_half_to_float((unsigned short)w[byte_offset + 108] | ((unsigned short)w[byte_offset + 109] << 8));
+    unsigned int n = k / 128u;
+    unsigned int r = k % 128u;
+    unsigned int s = r / 32u;
+    unsigned int h = (r % 32u) / 16u;
+    unsigned int l = r % 16u;
+    unsigned int idx = h * 16u + l;
+    unsigned int m = 1u << (n * 4u + s);
+    float dl = d_all * (float)((int)orangu_q3k_scale(w, scales_off, n * 8u + s * 2u + h) - 32);
+    int hi = 4;
+    if ((w[hmask_off + idx] & m) != 0u) {
+        hi = 0;
+    }
+    unsigned int q = (w[qs_off + n * 32u + idx] >> (2u * s)) & 3u;
+    return dl * (float)((int)q - hi);
+}
+"#
+        }
+        t if t == GGML_TYPE_IQ4_NL => {
+            r#"
+const unsigned int BLOCK_BYTES = 18u;
+const unsigned int BLOCK_ELEMS = 32u;
+// The 16 non-uniformly spaced levels an IQ4_NL nibble selects between —
+// `engine::iq_grids::KVALUES_IQ4NL`, transcribed. Small enough to inline
+// per kernel, unlike the `IQ*` lattice codebooks (which is why this is the
+// one `IQ*` type here at all).
+__device__ const signed char ORANGU_KVALUES_IQ4NL[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
+    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
+    unsigned char byte = w[byte_offset + 2u + (k % 16u)];
+    unsigned int nib = (k < 16u) ? (unsigned int)(byte & 0xFu) : (unsigned int)(byte >> 4);
+    return d * (float)ORANGU_KVALUES_IQ4NL[nib];
+}
+"#
+        }
         _ => return None,
     })
 }
@@ -569,6 +657,10 @@ impl RocmBackend {
 }
 
 impl Backend for RocmBackend {
+    fn supports_type(&self, ggml_type: u32) -> bool {
+        SUPPORTED_TYPES.contains(&ggml_type)
+    }
+
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
@@ -705,8 +797,9 @@ mod tests {
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K,
-        GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
     /// One `RocmBackend`, lazily built and shared across every test in this
@@ -737,9 +830,12 @@ mod tests {
             t if t == GGML_TYPE_Q4_0 => 18,
             t if t == GGML_TYPE_Q5_0 => 22,
             t if t == GGML_TYPE_Q8_0 => 34,
+            t if t == GGML_TYPE_Q2_K => 84,
+            t if t == GGML_TYPE_Q3_K => 110,
             t if t == GGML_TYPE_Q4_K => 144,
             t if t == GGML_TYPE_Q5_K => 176,
             t if t == GGML_TYPE_Q6_K => 210,
+            t if t == GGML_TYPE_IQ4_NL => 18,
             _ => unreachable!(),
         }
     }
@@ -747,7 +843,16 @@ mod tests {
     fn block_elems_for(ggml_type: u32) -> usize {
         match ggml_type {
             t if t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 1,
-            t if t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 => 32,
+            // `IQ4_NL` belongs with the 32-element legacy quants, not the
+            // 256 default: it is the one `IQ*` type that does not block at
+            // `QK_K`.
+            t if t == GGML_TYPE_Q4_0
+                || t == GGML_TYPE_Q5_0
+                || t == GGML_TYPE_Q8_0
+                || t == GGML_TYPE_IQ4_NL =>
+            {
+                32
+            }
             _ => 256,
         }
     }
@@ -820,6 +925,25 @@ mod tests {
     #[test]
     fn matmul_matches_cpu_backend_for_q6_k() {
         cross_check(GGML_TYPE_Q6_K, 256, 6, 1);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q2_k() {
+        cross_check(GGML_TYPE_Q2_K, 256, 6, 1);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q3_k() {
+        cross_check(GGML_TYPE_Q3_K, 256, 6, 1);
+    }
+
+    /// `in_dim = 896` because that is the width that makes `IQ4_NL` appear
+    /// in the first place: a K-quant needs 256 | `in_dim`, so upstream
+    /// substitutes `IQ4_NL` on rows like this one. A 256-wide check would
+    /// not distinguish a correct block stride from one that assumed `QK_K`.
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq4_nl() {
+        cross_check(GGML_TYPE_IQ4_NL, 896, 6, 1);
     }
 
     #[test]

@@ -2204,6 +2204,7 @@ const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ2_S,
     crate::engine::quant::GGML_TYPE_IQ3_XXS,
     crate::engine::quant::GGML_TYPE_IQ3_S,
+    crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
 ];
 
@@ -3274,6 +3275,10 @@ impl VulkanBackend {
 }
 
 impl Backend for VulkanBackend {
+    fn supports_type(&self, ggml_type: u32) -> bool {
+        SUPPORTED_TYPES.contains(&ggml_type)
+    }
+
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
         if self.q4_k_mmvq && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K {
             return self.matmul_mmvq(x, n_tokens, w);
@@ -11976,9 +11981,9 @@ mod tests {
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
         GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-        GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-        GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+        GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
     /// One `VulkanBackend` shared by every test in this module, rather
@@ -13432,11 +13437,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 out.extend(next_bytes(seed, 4));
                 out.extend(next_bytes(seed, 128));
             }
+            t if t == GGML_TYPE_IQ4_NL => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 16));
+            }
             other => panic!("build_block: unhandled ggml_type {other}"),
         }
         out
     }
 
+    /// `IQ4_NL` is in the 32 arm, not the 256 default: it is the one `IQ*`
+    /// type that blocks at 32, so the otherwise-safe "`IQ*` means `QK_K`"
+    /// reading would build every fixture row at 8× the right length here.
     fn block_elems(ggml_type: u32) -> usize {
         match ggml_type {
             t if t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 1,
@@ -13444,7 +13456,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 || t == GGML_TYPE_Q4_1
                 || t == GGML_TYPE_Q5_0
                 || t == GGML_TYPE_Q5_1
-                || t == GGML_TYPE_Q8_0 =>
+                || t == GGML_TYPE_Q8_0
+                || t == GGML_TYPE_IQ4_NL =>
             {
                 32
             }
@@ -13787,6 +13800,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cross_check(GGML_TYPE_IQ4_XS, 512, 5);
     }
 
+    /// `in_dim = 896`, not the 512 its siblings use, because 896 is
+    /// deliberately *not* a multiple of 256: a row this wide is the reason
+    /// `IQ4_NL` appears in these files at all (upstream substitutes it where
+    /// a K-quant's 256-element block won't divide the row), so it is the
+    /// shape a wrong `QK_K` assumption anywhere in the block-offset math
+    /// would fail on and 512 would not.
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq4_nl() {
+        cross_check(GGML_TYPE_IQ4_NL, 896, 5);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_cooperative_path_f32() {
         cross_check_n_tokens(GGML_TYPE_F32, 64, 17, 130);
@@ -13870,6 +13894,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn matmul_matches_cpu_backend_cooperative_path_iq4_xs() {
         cross_check_n_tokens(GGML_TYPE_IQ4_XS, 512, 5, 130);
+    }
+
+    /// The cooperative-tiled path over an `IQ4_NL` weight at a real row
+    /// width, with `out_dim` past one 32-row output tile so the staged
+    /// `fill_w_run` is exercised on more than a partial tile.
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq4_nl() {
+        cross_check_n_tokens(GGML_TYPE_IQ4_NL, 896, 64, 130);
     }
 
     /// The cooperative tiled kernel past its own `COOP_TILE_ROWS = 32` output

@@ -753,9 +753,30 @@ footprint stays close to its file size.
 directly from ggml's own `ggml-common.h`/`ggml-quants.c`
 (`dequantize_row_*`), not reimplemented from a description, so the CPU
 path is bit-for-bit compatible with what llama.cpp itself reads. Supported
-types: `F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`
-— any other `ggml_type` fails to load with a clear "not yet supported"
-error rather than misreading it.
+types: the floats (`F32`, `F16`, `BF16`), the legacy quants (`Q4_0`,
+`Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole K-quant family (`Q2_K` through
+`Q6_K`), and the `IQ*` codebook quants (`IQ1_S`, `IQ1_M`, `IQ2_XXS`,
+`IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`) — any other
+`ggml_type` fails to load with a clear "not yet supported" error rather
+than misreading it.
+
+`IQ4_NL` is worth calling out because it turns up in files whose *name*
+promises a pure K-quant. It is the one `IQ*` type that blocks at 32
+elements rather than 256, and a K-quant needs 256 to divide the row, so
+upstream's `llama_tensor_get_type` substitutes it per tensor wherever a
+row is too narrow — every 896-wide row of a `Qwen2.5-0.5B`, for instance.
+Any code that reads "`IQ*`" as "`QK_K`-blocked" gets its stride wrong for
+this one type alone; `quant::block_layout`, `vecdot::supports`, and every
+backend's block-size table each place it with the 32-element quants
+deliberately.
+
+Correctness is pinned by `testdata/ggml-dequant-reference.bin`: random
+blocks of every quantized type paired with the `f32`s ggml's own
+`ggml_get_type_traits(t)->to_float` produced from them, compared
+bit-for-bit. Regenerate it with `testdata/ggml-dequant-reference.c` (see
+`quant.rs`'s `read_ggml_reference` for the command) when adding a type —
+appending to that file's type list leaves every existing entry
+byte-identical.
 
 ### Model forward passes
 
@@ -1039,6 +1060,24 @@ kernel math matching `engine::quant`'s already-verified dequant code
 line-for-line, plus the same CPU cross-check test pattern `vulkan.rs`
 uses (which, like those tests, skips gracefully rather than fails when no
 matching device is found).
+
+Their `ggml_type` coverage is a subset of what `engine::quant` reads on the
+CPU, and each backend's `SUPPORTED_TYPES` is the authority: the float types,
+the legacy quants, `Q2_K` through `Q6_K`, and `IQ4_NL`. The remaining `IQ*`
+types are absent because each indexes a lattice codebook that would need its
+own uploaded buffer — `VulkanBackend` has one (`vulkan_shaders`'s
+`IQ_GRID_PRELUDE`, bound at `@binding(4)`) and these three do not. `IQ4_NL`
+is the exception that fits: a 16-entry level table, small enough to inline
+into the kernel source, and the reason a `Q2_K` download of a model whose
+rows aren't 256-divisible (see the Scope section of the server chapter) is
+runnable here at all.
+
+`VulkanBackend`'s own coverage is a subset too — it has no shader for
+`IQ1_S`, `IQ1_M`, or `IQ2_XXS`. Every GPU backend therefore overrides
+`Backend::supports_type`, and `engine::backend::unsupported_tensor_types`
+walks every shard's tensor directory once at startup so a gap is reported as
+an error naming each missing type. Before that check existed, the gap
+surfaced as a panic from inside `matmul` partway through the first request.
 
 `cudarc` and the resolved `opencl3` version both dlopen their vendor
 library (`libcuda.so`/`libnvrtc.so`, `libOpenCL.so`) at runtime and return
