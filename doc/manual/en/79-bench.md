@@ -140,6 +140,12 @@ Options:
       --label <LABEL>      Series name recorded in the history file
       --chart <CHART>      Render the history file to this SVG after measuring
       --chart-only         Only render the chart from an existing history file; measure nothing
+      --flamegraph <FILE>  Record a CPU flamegraph of the server over the measured window
+      --flamegraph-pid <PID>          Process to profile (default: the server's own, else the URL port's owner)
+      --flamegraph-freq <HZ>          Sampling frequency in Hz for --flamegraph [default: 999]
+      --flamegraph-call-graph <MODE>  Call-graph mode for --flamegraph: fp or dwarf [default: fp]
+      --flamegraph-png                Also render a PNG beside the flamegraph SVG
+      --compare-profiles <FILES>      Compare already-collapsed .folded profiles side by side; measure nothing
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -149,6 +155,179 @@ Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
 best (fastest) run with mean ± standard deviation alongside; warmup (one short
 generation) is on unless `--no-warmup`; `--json` emits one JSON object per depth
 instead of the table.
+
+### Profiling what was measured (`--flamegraph`)
+
+A rate says *how* slow something is and never *where* the time went. Both
+questions get asked together during performance work, and they used to be
+answered by two different procedures: this tool for the number, a hand-assembled
+`perf record` pipeline for the profile. The profile then routinely covered a
+different workload than the number it was supposed to explain — a different
+prompt length, the warmup included, or a window that opened before the server
+was busy.
+
+`--flamegraph FILE.svg` records a CPU profile of the server **over exactly the
+measured window**: sampling starts after warmup and stops when the last
+repetition finishes, so the flamegraph and the tok/s printed above it describe
+the same seconds of the same process. `llama-server` goes through the same path,
+so the two engines' profiles are as comparable as their two rates.
+
+Collapsing and rendering are done **in this binary**, so `perf` is the only
+external program involved. The rendered SVG is interactive on its own: click a
+frame to zoom into it, click the title to reset, Ctrl-F to highlight every frame
+matching a substring and report what share of samples matched.
+
+```sh
+# orangu-server, decode: one profile of the 512-token generation that was timed
+orangu-bench --url http://127.0.0.1:8100 --depths 0 --gen 512 --reps 2 \
+             --flamegraph perf/gemma-orangu-decode.svg --flamegraph-png
+
+# llama-server, the same workload through the same harness
+orangu-bench --url http://127.0.0.1:8300 --depths 0 --gen 512 --reps 2 \
+             --flamegraph perf/gemma-llama-decode.svg --flamegraph-png
+```
+
+Three files come out of one `--flamegraph out.svg`:
+
+| file | what it is |
+| :-- | :-- |
+| `out.svg` | the flamegraph, interactive (click to zoom, Ctrl-F to search) |
+| `out.folded` | the collapsed stacks — a text file that diffs, and re-renders without re-running |
+| `out.meta.json` | pid, sampling frequency, duration, samples, cores busy |
+| `out.png` | a raster copy, with `--flamegraph-png`, for documents that cannot embed an SVG |
+
+The transient `perf.data` is removed once collapsed: it is the largest artifact
+by an order of magnitude and nothing downstream reads it. The `.folded` file is
+the durable one.
+
+Beside the files the tool prints what the stacks say, so the common case needs
+no SVG viewer at all:
+
+```text
+  profile  perf/gemma-orangu-decode.svg (24140 samples over 25s)
+           perf/gemma-orangu-decode.folded
+           kernel        33.5%
+           app/other     22.5%
+           kernel:gpu    16.3%
+           libc/alloc     9.4%
+           radv/vulkan    9.1%
+           wgpu           9.1%
+           top self-time frames:
+             5.0%  __memset_avx2_unaligned_erms
+             1.8%  amdgpu_vm_bo_update_[k]
+             …
+```
+
+Attribution is by **leaf frame** — a stack's whole count is charged to the
+function that was actually executing, which is what a flamegraph's plateau
+widths show. Kernel-mode frames carry a `_[k]` mark, taken from the **object
+file** `perf` reports rather than guessed from the symbol name, so `amdgpu_*`
+reached through an ioctl is never confused with the userspace `radv_*` that runs
+on the calling thread — and so `read_hpet`, an ordinary-looking symbol that
+lives in the kernel, is not filed as application code.
+Everything below that line is a heuristic over symbol names, and anything it
+cannot name stays visible as `app/other` rather than being dropped — which is
+what the leaf table beside it is for: a residual you can read is a claim you can
+check.
+
+### Comparing two profiles (`--compare-profiles`)
+
+A flamegraph is normalised to its own total, so two of them side by side cannot
+be read against each other: the wider plateau belongs to whichever engine
+happened to be sampled more. `--compare-profiles` reads the `.folded` files back
+and puts them in one table — the `--chart-only` of profiling, no server and no
+re-run:
+
+```sh
+orangu-bench --compare-profiles perf/gemma-orangu-decode.folded,perf/gemma-llama-decode.folded
+```
+
+```text
+bucket         | gemma-orangu-decode | gemma-llama-decode
+------------------------------------------------------------
+app/other      |               22.5% |              66.2%
+kernel         |               33.5% |              10.4%
+kernel:gpu     |               16.3% |               3.9%
+ggml           |                0.0% |              14.5%
+radv/vulkan    |                9.1% |               4.4%
+libc/alloc     |                9.4% |               0.6%
+wgpu           |                9.1% |               0.0%
+samples        |                3288 |               1659
+gpu-wait       |                6.7% |              60.0%
+pool-idle      |               32.2% |               1.3%
+working        |               61.2% |              38.8%
+cores busy     |                0.47 |               0.42
+— working      |                0.29 |               0.16
+```
+
+**`cores busy` is the row that makes the rest of the table mean anything.** It
+is `samples / (freq × seconds)`: the mean number of the server's threads that
+were on a CPU. Every other row is a share of *that* engine's own CPU time, so
+without it "33.5% here against 10.4% there" compares two different totals. It is
+read from the `.meta.json` written beside the profile; a `.folded` carried off
+the machine alone shows `?`.
+
+**`gpu-wait` and `pool-idle` are why an occupancy number was needed at all.**
+The two engines wait for the GPU in different ways — `llama-server` spins on
+`_mm_pause`, `orangu-server` blocks — and a blocked thread produces no samples
+while a spinning one produces them at full rate. Read naively, that makes the
+engine wasting a whole core look busy with useful work and the one yielding it
+look idle. Both are therefore detected from the **stack**, not the leaf, and
+subtracted: `— working` is the cores actually spent on the model.
+
+`pool-idle` is kept separate from `gpu-wait` because they have different
+remedies. Time under `wait_until_out_of_work` is a thread pool waking more
+workers than there is work for; time under a fence is the device owing an
+answer. Merging them would charge a threading problem to the GPU.
+
+**Requirements.** `perf` — and, for the SVG, nothing else.
+
+- `perf`, with `kernel.perf_event_paranoid` low enough to attach to a process
+  you own (`-1` on this project's rig). It is the one piece that cannot be
+  replaced: it reads the kernel's perf events.
+- Collapsing and rendering are **in-process** (`src/bin/orangu-bench/
+  flamegraph.rs`). There is no dependency on `stackcollapse-perf.pl`,
+  `stackcollapse-recursive.pl` or `flamegraph.pl`, and nothing to install or
+  point at. The rendered SVG is self-contained: no external stylesheet, script,
+  font or image.
+- `rsvg-convert`, **only** for the optional `--flamegraph-png`. Missing, the SVG
+  is still written and the run still succeeds.
+- **Frame pointers in the profiled binary.** `--call-graph fp` is the default
+  and needs them; a stock `--release` build of `orangu-server` drops them and
+  loses the call chain for most samples in the hot leaf, which renders as a
+  flamegraph of a process doing nothing. Build the server being profiled with:
+  ```sh
+  CARGO_TARGET_DIR=target-fp RUSTFLAGS="-C force-frame-pointers=yes" \
+    cargo build --profile release-with-debug --bin orangu-server
+  ```
+  A binary you do not control needs `--flamegraph-call-graph dwarf` instead.
+  (`llama-server` as packaged happens to keep frame pointers, so `fp` works for
+  it too — worth checking rather than assuming, since a broken unwind looks like
+  a real result.)
+
+`--flamegraph-pid` is only needed when neither route to the pid works. The tool
+asks the server for its own pid first (`orangu-server` reports one), and
+otherwise asks the operating system which process owns the port under test —
+both of which identify the process that *answered these requests*, rather than
+one that merely has a matching name.
+
+### The clock the run actually reached
+
+The header's `gpu … sclk` line is read once, before the workload starts, and on
+an idle laptop dGPU that is its sleep state: `card1 sclk 0Mhz (high)` is what a
+*correctly* pinned card looks like between requests, and it reads exactly like a
+misconfigured one.
+
+So every run also samples each card's core clock **while measuring** and prints
+the peak underneath the results:
+
+```text
+  gpu peak card1 1700Mhz  card2 0Mhz (while measuring)
+```
+
+That is the line to check. A card that stayed parked at 300 MHz through a whole
+sweep produces entirely plausible numbers, and this is the only place that says
+so.
 
 ### Tracking throughput over time (`--history`, `--chart`)
 

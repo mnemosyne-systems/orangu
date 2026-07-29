@@ -241,7 +241,6 @@ impl LlamaModel {
         let n_head = cfg.n_head;
         let n_head_kv = cfg.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
-        let group_size = n_head / n_head_kv;
 
         // Embedding lookup: x[t, :] = tok_embeddings[token[t], :].
         let mut x = vec![0f32; n_tokens * n_embd];
@@ -250,6 +249,10 @@ impl LlamaModel {
             anyhow::ensure!(tok < cfg.n_vocab, "token id {tok} is out of vocab range");
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
+
+        // Grown once and reused across layers rather than allocated per layer:
+        // at prefill widths this is megabytes a layer.
+        let mut attn_out: Vec<f32> = Vec::new();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let mut normed = x.clone();
@@ -335,17 +338,24 @@ impl LlamaModel {
 
             // Causal attention: token t (now at absolute position
             // start_pos+t) attends to every cached position up to and
-            // including its own.
-            let mut attn_out = vec![0f32; n_tokens * n_head * head_dim];
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            crate::engine::attention::multi_head_attention(
+            // including its own. `engine::attention` decides whether that runs
+            // on the GPU or as the CPU loop; the closure is the CPU window and
+            // `causal`/`n_swa` describe the same range to the kernel.
+            crate::engine::attention::attention(
                 &mut attn_out,
                 &q,
                 layer_cache,
-                n_head,
-                group_size,
-                head_dim,
-                scale,
+                &crate::engine::attention::Params {
+                    backend: self.backend.as_ref(),
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    causal: true,
+                    n_swa: 0,
+                    start_pos,
+                    n_tokens,
+                },
                 |t| (0, start_pos + t),
             );
 

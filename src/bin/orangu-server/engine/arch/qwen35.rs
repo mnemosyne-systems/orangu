@@ -368,7 +368,6 @@ impl Qwen35Model {
         let n_head = self.n_head;
         let n_head_kv = self.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
-        let group_size = n_head / n_head_kv;
 
         let mut normed = x.to_vec();
         tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
@@ -447,16 +446,24 @@ impl Qwen35Model {
             );
         }
 
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_out = vec![0f32; n_tokens * n_head * head_dim];
-        crate::engine::attention::multi_head_attention(
+        // Plain causal attention, on the GPU when the batch is wide enough --
+        // `engine::attention` owns that choice for every architecture.
+        let mut attn_out: Vec<f32> = Vec::new();
+        crate::engine::attention::attention(
             &mut attn_out,
             &q,
             layer_cache,
-            n_head,
-            group_size,
-            head_dim,
-            scale,
+            &crate::engine::attention::Params {
+                backend: self.backend.as_ref(),
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                causal: true,
+                n_swa: 0,
+                start_pos,
+                n_tokens,
+            },
             |t| (0, start_pos + t),
         );
         // Gate the attention output (sigmoid), then project.

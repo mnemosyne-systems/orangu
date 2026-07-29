@@ -1004,7 +1004,6 @@ impl GemmaModel {
                 .then_some(self.rope_freqs.as_deref())
                 .flatten();
             let cache_index = layer.kv_donor;
-            let group_size = self.n_head / layer.n_head_kv;
 
             normed.clear();
             normed.extend_from_slice(&x);
@@ -1189,62 +1188,41 @@ impl GemmaModel {
                 // model's attention window can freely include positions *after*
                 // `pos`, not just up to it — see `Self::attention_window`.
                 let t0 = Instant::now();
-                // One dispatch for the whole prompt's attention — each query
-                // derives its own window in the shader. The CPU loop below stays
-                // as the reference implementation and the non-Vulkan path; the two
-                // are cross-checked against each other for every window shape
-                // (`gpu_attention_prefill_matches_cpu_reference_*`).
-                let gpu_attn = self
-                    .backend
-                    .as_vulkan()
-                    .filter(|vulkan| vulkan.prefill_attention_enabled())
-                    .map(|vulkan| {
-                        vulkan.gpu_attention_prefill(
-                            &q,
-                            &mut cache.layers[cache_index],
-                            start_pos,
-                            n_tokens,
-                            self.n_head,
-                            layer.n_head_kv,
-                            head_dim,
-                            if layer.is_swa { self.n_swa } else { 0 },
-                            self.causal,
-                            self.attention_scale,
-                        )
-                    });
-                if let Some(out) = gpu_attn {
-                    attn_out = out;
-                    if prefill_trace {
-                        eprintln!(
-                            "orangu-server: [prefill-trace] layer {il} gpu_attention \
-                             n_tokens={n_tokens}: {:.1}ms",
-                            t0.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
-                } else {
-                    attn_out.clear();
-                    attn_out.resize(n_tokens * self.n_head * head_dim, 0.0);
-                    // Prefill attention is O(n_tokens²) and is the largest CPU cost
-                    // here — see `engine::attention` for the loop order and why it is
-                    // shared with every other architecture rather than copied.
-                    let is_swa = layer.is_swa;
-                    crate::engine::attention::multi_head_attention(
-                        &mut attn_out,
-                        &q,
-                        &cache.layers[cache_index],
-                        self.n_head,
-                        group_size,
+                // The GPU/CPU choice lives in `engine::attention`, not here.
+                // It used to live here, and that was the whole finding of
+                // `PERF-GAP.md`: this block was the only one in the engine, so
+                // the four other architectures ran every prefill's attention on
+                // the CPU. Prefill attention is O(n_tokens²) and the largest CPU
+                // cost in the pass, so it is worth exactly one implementation of
+                // *and* one decision about.
+                let is_swa = layer.is_swa;
+                let ran = crate::engine::attention::attention(
+                    &mut attn_out,
+                    &q,
+                    &mut cache.layers[cache_index],
+                    &crate::engine::attention::Params {
+                        backend: self.backend.as_ref(),
+                        n_head: self.n_head,
+                        n_head_kv: layer.n_head_kv,
                         head_dim,
-                        self.attention_scale,
-                        |t| self.attention_window(is_swa, start_pos + t, n_tokens),
-                    );
-                    if prefill_trace {
-                        eprintln!(
-                            "orangu-server: [prefill-trace] layer {il} cpu_attention \
+                        scale: self.attention_scale,
+                        causal: self.causal,
+                        n_swa: if is_swa { self.n_swa } else { 0 },
+                        start_pos,
+                        n_tokens,
+                    },
+                    |t| self.attention_window(is_swa, start_pos + t, n_tokens),
+                );
+                if prefill_trace {
+                    let where_ = match ran {
+                        crate::engine::attention::Ran::OnGpu => "gpu_attention",
+                        crate::engine::attention::Ran::OnCpu => "cpu_attention",
+                    };
+                    eprintln!(
+                        "orangu-server: [prefill-trace] layer {il} {where_} \
                          n_tokens={n_tokens}: {:.1}ms",
-                            t0.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
             }
 

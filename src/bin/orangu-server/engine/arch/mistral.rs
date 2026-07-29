@@ -276,7 +276,6 @@ impl MistralModel {
         let n_head = cfg.n_head;
         let n_head_kv = cfg.n_head_kv;
         let kv_dim = self.kv_dim();
-        let group_size = n_head / n_head_kv;
         let q_dim = n_head * head_dim;
 
         let mut x = vec![0f32; n_tokens * n_embd];
@@ -344,16 +343,24 @@ impl MistralModel {
                 );
             }
 
-            let mut attn_out = vec![0f32; n_tokens * q_dim];
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            crate::engine::attention::multi_head_attention(
+            // Plain causal attention, on the GPU when the batch is wide enough --
+            // `engine::attention` owns that choice for every architecture.
+            let mut attn_out: Vec<f32> = Vec::new();
+            crate::engine::attention::attention(
                 &mut attn_out,
                 &q,
                 layer_cache,
-                n_head,
-                group_size,
-                head_dim,
-                scale,
+                &crate::engine::attention::Params {
+                    backend: self.backend.as_ref(),
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    causal: true,
+                    n_swa: 0,
+                    start_pos,
+                    n_tokens,
+                },
                 |t| (0, start_pos + t),
             );
 

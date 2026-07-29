@@ -49,7 +49,9 @@ use std::time::Instant;
 use clap::Parser;
 
 mod chart;
+mod flamegraph;
 mod history;
+mod profile;
 
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
@@ -124,6 +126,68 @@ struct Args {
     /// Only render the chart from an existing history file; measure nothing.
     #[arg(long, default_value_t = false)]
     chart_only: bool,
+
+    /// Record a CPU flamegraph of the server over the measured window.
+    #[arg(long)]
+    flamegraph: Option<String>,
+
+    /// Process to profile (default: the server's own, else the URL port's owner).
+    #[arg(long)]
+    flamegraph_pid: Option<u32>,
+
+    /// Sampling frequency in Hz for `--flamegraph`.
+    #[arg(long, default_value_t = 999)]
+    flamegraph_freq: u32,
+
+    /// Call-graph mode for `--flamegraph`: `fp` or `dwarf`.
+    #[arg(long, default_value = "fp")]
+    flamegraph_call_graph: String,
+
+    /// Also render a PNG beside the flamegraph SVG.
+    #[arg(long, default_value_t = false)]
+    flamegraph_png: bool,
+
+    /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
+    #[arg(long, value_delimiter = ',')]
+    compare_profiles: Vec<String>,
+}
+
+/// POST `body` to `endpoint`, retrying once on a connection-level failure.
+///
+/// Not defensive programming — a specific, reproduced failure. `llama-server`
+/// closes an idle keep-alive connection on its own schedule, and a client that
+/// reuses it at the wrong moment gets a reset. In a long sweep that surfaces as
+/// one lost measurement out of hundreds, aborting the run: four of eight models'
+/// prefill profiles were lost to it, and every one of them succeeded on the
+/// first retry against the *same still-running server*.
+///
+/// Exactly one retry, and only for `send` failing — a refused connection retried
+/// forever would turn "the server is not up" into a hang, and an HTTP error
+/// status is a real answer that must not be papered over. The retry is announced
+/// so a run that needed one is never mistaken for a clean one.
+fn post_with_one_retry(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<reqwest::blocking::Response> {
+    match client.post(endpoint).json(body).send() {
+        Ok(resp) => Ok(resp),
+        Err(first) => {
+            eprintln!("orangu-bench: retrying after a failed send ({first})");
+            // Long enough for a server that is closing connections in a batch
+            // to finish, short enough not to distort a timed run that recovers.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            client
+                .post(endpoint)
+                .json(body)
+                .send()
+                // Carry reqwest's own reason. "Error sending request" on its own
+                // cannot distinguish a server that was never up from one that
+                // dropped a connection mid-sweep, and those need different
+                // responses — the difference cost an afternoon once.
+                .map_err(|e| anyhow::anyhow!("Error sending request to url ({endpoint}): {e}"))
+        }
+    }
 }
 
 /// One decode measurement: how many tokens streamed, time-to-first-token,
@@ -231,11 +295,7 @@ fn run_prefill_once(
 
     let endpoint = format!("{url}/v1/completions");
     let t0 = Instant::now();
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
+    let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
         anyhow::bail!("server returned HTTP {}", resp.status());
     }
@@ -334,11 +394,7 @@ fn run_once(
 
     let endpoint = format!("{url}/v1/completions");
     let t0 = Instant::now();
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
+    let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
         anyhow::bail!("server returned HTTP {}", resp.status());
     }
@@ -416,6 +472,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
         return write_chart(args, &[]);
     }
 
+    // Same shape as `--chart-only`: reads artifacts, touches no server.
+    if !args.compare_profiles.is_empty() {
+        return compare_profiles(args);
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
@@ -434,19 +495,59 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     report_environment(&client, args);
 
+    // Started here — after warmup, after the environment probe — so the profile
+    // covers the timed workload and nothing else. Anything before this point is
+    // load, allocation and HTTP that the reported rate already excludes, and a
+    // flamegraph that included it would attribute time the number does not.
+    let recorder = match &args.flamegraph {
+        Some(path) => Some(start_profile(&client, args, path, &label)?),
+        None => None,
+    };
+
+    let clocks = ClockWatch::start();
+    let measured = measure(&client, args, &label);
+    report_clocks(&clocks.stop(), args);
+
+    if let Some(recorder) = recorder {
+        match recorder.finish() {
+            Ok(summary) => report_profile(&summary, args),
+            // The rate is the deliverable; a profile that failed to render is
+            // reported and does not discard the measurement that just ran.
+            Err(e) => eprintln!("orangu-bench: flamegraph not written: {e}"),
+        }
+    }
+
+    record_and_chart(args, &measured?)
+}
+
+/// The timed part of a run, split out so [`run`] can bracket exactly this with
+/// the profiler.
+fn measure(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
     if !args.pp.is_empty() {
-        let records = run_pp(&client, args, &label)?;
-        return record_and_chart(args, &records);
+        return run_pp(client, args, label);
     }
 
     if args.curve > 0 {
         // Curve mode reports one generation bucketed by position, not a rate at
         // a named workload; there is no series for it to extend, so it is not
         // recorded. A chart requested alongside it still redraws the file.
-        run_curve(&client, args)?;
-        return record_and_chart(args, &[]);
+        run_curve(client, args)?;
+        return Ok(Vec::new());
     }
 
+    run_tg(client, args, label)
+}
+
+/// The decode sweep: one row per requested context depth.
+fn run_tg(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
     let mut records = Vec::new();
 
     if !args.json {
@@ -462,7 +563,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         let mut rates = Vec::new();
         let mut last_sample: Option<Sample> = None;
         for _ in 0..args.reps.max(1) {
-            let s = run_once(&client, &args.url, &prompt, args.n_gen, &args.model)?;
+            let s = run_once(client, &args.url, &prompt, args.n_gen, &args.model)?;
             rates.push(s.tok_per_s());
             last_sample = Some(s);
         }
@@ -494,7 +595,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
         records.push(history::Record {
             date: history::today(),
-            label: label.clone(),
+            label: label.to_string(),
             mode: "tg".to_string(),
             n: depth,
             best,
@@ -503,7 +604,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         });
     }
 
-    record_and_chart(args, &records)
+    Ok(records)
 }
 
 /// Append this run's points to `--history` (when given) and redraw `--chart`
@@ -571,6 +672,241 @@ fn server_label(client: &reqwest::blocking::Client, args: &Args) -> String {
                 .map(std::string::ToString::to_string)
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Print `--compare-profiles` as one table: buckets down the side, one column
+/// per collapsed profile, then each profile's heaviest leaves.
+///
+/// The comparison is in *shares*, not sample counts, and the counts are printed
+/// so nobody reads a share as an absolute. Two engines on the same workload
+/// produce different sample totals — the faster one finishes sooner and is
+/// sampled for less wall-clock — so "36% here against 12% there" is a statement
+/// about how each engine divides its own CPU time, and the rate printed by the
+/// run that produced each file is what converts it back to seconds.
+fn compare_profiles(args: &Args) -> anyhow::Result<()> {
+    let paths: Vec<std::path::PathBuf> = args
+        .compare_profiles
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let profiles = profile::read_profiles(&paths)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "profile_comparison",
+                "profiles": profiles.iter().map(|p| serde_json::json!({
+                    "name": p.name,
+                    "samples": p.samples,
+                    "cores_busy": p.cores_busy,
+                    "gpu_wait_pct": p.gpu_wait,
+                    "pool_idle_pct": p.pool_idle,
+                    "buckets": p.buckets.iter().map(|(k, v)| serde_json::json!({"bucket": k, "pct": v})).collect::<Vec<_>>(),
+                    "leaves": p.leaves.iter().map(|(k, v)| serde_json::json!({"frame": k, "pct": v})).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    let width = profiles
+        .iter()
+        .map(|p| p.name.chars().count().max(9))
+        .collect::<Vec<_>>();
+    print!("{:<14}", "bucket");
+    for (p, w) in profiles.iter().zip(&width) {
+        print!(" | {:>w$}", p.name, w = w);
+    }
+    println!();
+    println!(
+        "{}",
+        "-".repeat(14 + width.iter().map(|w| w + 3).sum::<usize>())
+    );
+    for bucket in profile::bucket_union(&profiles) {
+        print!("{bucket:<14}");
+        for (p, w) in profiles.iter().zip(&width) {
+            let pct = p
+                .buckets
+                .iter()
+                .find(|(b, _)| *b == bucket)
+                .map_or(0.0, |(_, v)| *v);
+            print!(" | {:>w$}", format!("{pct:.1}%"), w = w);
+        }
+        println!();
+    }
+    print!("{:<14}", "samples");
+    for (p, w) in profiles.iter().zip(&width) {
+        print!(" | {:>w$}", p.samples, w = w);
+    }
+    println!();
+    // The row that stops the shares above being read as work: an engine that
+    // blocks in the kernel is sampled less than one that spins, whatever each
+    // is doing with the time.
+    // Shares first: they come from the collapsed file itself, so they survive
+    // a `.folded` carried off the machine on its own. Occupancy needs the
+    // sidecar and is printed as `?` without it rather than guessed at.
+    type ShareRow = (&'static str, fn(&profile::Profile) -> f64);
+    let share: [ShareRow; 3] = [
+        ("gpu-wait", |p| p.gpu_wait),
+        ("pool-idle", |p| p.pool_idle),
+        ("working", |p| 100.0 - p.gpu_wait - p.pool_idle),
+    ];
+    for (row, share) in share {
+        print!("{row:<14}");
+        for (p, w) in profiles.iter().zip(&width) {
+            print!(" | {:>w$}", format!("{:.1}%", share(p)), w = w);
+        }
+        println!();
+    }
+    for (row, share) in [("cores busy", None), ("— working", Some(()))] {
+        print!("{row:<14}");
+        for (p, w) in profiles.iter().zip(&width) {
+            let cell = p.cores_busy.map_or_else(
+                || "?".to_string(),
+                |c| match share {
+                    None => format!("{c:.2}"),
+                    Some(()) => format!("{:.2}", c * (100.0 - p.gpu_wait - p.pool_idle) / 100.0),
+                },
+            );
+            print!(" | {:>w$}", cell, w = w);
+        }
+        println!();
+    }
+    println!();
+
+    for p in &profiles {
+        println!("{} — heaviest self-time frames:", p.name);
+        for (frame, pct) in p.leaves.iter().take(12) {
+            let short: String = frame.chars().take(72).collect();
+            println!("  {pct:>5.1}%  {short}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Begin a flamegraph capture of whichever process is answering `--url`.
+fn start_profile(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    svg: &str,
+    label: &str,
+) -> anyhow::Result<profile::Recorder> {
+    let pid = match args.flamegraph_pid {
+        Some(pid) => pid,
+        None => resolve_server_pid(client, args)?,
+    };
+    if !args.json {
+        println!("  profiling pid {pid} at {} Hz", args.flamegraph_freq);
+    }
+    profile::Recorder::start(profile::Options {
+        svg: std::path::PathBuf::from(svg),
+        pid,
+        freq: args.flamegraph_freq,
+        call_graph: args.flamegraph_call_graph.clone(),
+        png: args.flamegraph_png,
+        title: format!("{label} · {}", workload_name(args)),
+    })
+}
+
+/// Which process to sample: the one the server names, else the one the
+/// operating system says owns the port under test.
+///
+/// The second route is not a fallback for tidiness — `llama-server` reports no
+/// pid at all, and it is half of every comparison this tool exists to make.
+/// Both routes identify the process that *answered these requests*, which is
+/// the only definition that cannot profile the wrong binary.
+fn resolve_server_pid(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<u32> {
+    let reported = client
+        .get(format!("{}/props", args.url))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|p| p.get("pid").and_then(serde_json::Value::as_u64))
+        .map(|p| p as u32);
+    if let Some(pid) = reported {
+        return Ok(pid);
+    }
+
+    let port = url_port(&args.url)
+        .ok_or_else(|| anyhow::anyhow!("could not read a port out of --url {}", args.url))?;
+    profile::pid_listening_on(port).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the server did not report a pid and nothing owns port {port} that this user \
+             can see — pass --flamegraph-pid <PID>"
+        )
+    })
+}
+
+/// The port in a `scheme://host:port/…` URL.
+fn url_port(url: &str) -> Option<u16> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?']).next()?;
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
+/// A short name for what was measured, drawn on the flamegraph so the SVG
+/// carries its own workload rather than depending on its filename.
+fn workload_name(args: &Args) -> String {
+    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    if !args.pp.is_empty() {
+        format!("prefill pp {}", list(&args.pp))
+    } else if args.curve > 0 {
+        format!("decode curve {}", args.curve)
+    } else {
+        format!("decode gen {} at depth {}", args.n_gen, list(&args.depths))
+    }
+}
+
+/// What the profile says, printed under the rate it explains.
+fn report_profile(s: &profile::Summary, args: &Args) {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "profile",
+                "svg": s.svg,
+                "folded": s.folded,
+                "png": s.png,
+                "samples": s.samples,
+                "seconds": s.seconds,
+                "cores_busy": s.cores_busy,
+                "gpu_wait_pct": s.gpu_wait,
+                "pool_idle_pct": s.pool_idle,
+                "buckets": s.buckets.iter().map(|(k, v)| serde_json::json!({"bucket": k, "pct": v})).collect::<Vec<_>>(),
+                "leaves": s.leaves.iter().map(|(k, v)| serde_json::json!({"frame": k, "pct": v})).collect::<Vec<_>>(),
+            })
+        );
+        return;
+    }
+    println!(
+        "  profile  {} ({} samples over {:.0}s — {:.2} cores busy)",
+        s.svg.display(),
+        s.samples,
+        s.seconds,
+        s.cores_busy
+    );
+    println!(
+        "           {:.2} gpu-wait  {:.2} pool-idle  {:.2} working (cores)",
+        s.cores_busy * s.gpu_wait / 100.0,
+        s.cores_busy * s.pool_idle / 100.0,
+        s.cores_busy * (100.0 - s.gpu_wait - s.pool_idle) / 100.0,
+    );
+    println!("           {}", s.folded.display());
+    if let Some(png) = &s.png {
+        println!("           {}", png.display());
+    }
+    for (bucket, pct) in &s.buckets {
+        println!("           {bucket:<12} {pct:>5.1}%");
+    }
+    println!("           top self-time frames:");
+    for (frame, pct) in s.leaves.iter().take(10) {
+        // Long Rust and C++ symbols would wrap and destroy the column; the SVG
+        // and the collapsed file carry the untruncated name.
+        let short: String = frame.chars().take(64).collect();
+        println!("           {pct:>5.1}%  {short}");
+    }
 }
 
 /// Prefill mode: for each requested prompt length, time prompt processing at
@@ -781,6 +1117,86 @@ fn gpu_clock_states() -> Vec<GpuClock> {
     out
 }
 
+/// The core clock each GPU actually reached while the workload ran.
+///
+/// The header line reports the clock at the moment the run *starts*, which on an
+/// idle laptop dGPU is its sleep state: `card1 sclk 0Mhz (high)` is what a
+/// correctly pinned card looks like between requests, and it reads exactly like
+/// a misconfigured one. Worse, it is evidence about a second when nothing was
+/// being measured. Sampling through the run answers the question the header line
+/// was added to answer — did the card reach its top level *for this
+/// measurement* — and it is the check that catches a card that quietly stayed
+/// parked while a whole sweep was recorded against it.
+struct ClockWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sampler: Option<std::thread::JoinHandle<Vec<(String, u32)>>>,
+}
+
+impl ClockWatch {
+    fn start() -> ClockWatch {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let sampler = std::thread::spawn(move || {
+            let mut peak: std::collections::BTreeMap<String, u32> =
+                std::collections::BTreeMap::new();
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                for gpu in gpu_clock_states() {
+                    let mhz = parse_mhz(&gpu.sclk).unwrap_or(0);
+                    let slot = peak.entry(gpu.card).or_default();
+                    *slot = (*slot).max(mhz);
+                }
+                // Fast enough to catch the ramp on a short run, slow enough
+                // that reading sysfs is not itself part of the measurement.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            peak.into_iter().collect()
+        });
+        ClockWatch {
+            stop,
+            sampler: Some(sampler),
+        }
+    }
+
+    fn stop(mut self) -> Vec<(String, u32)> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.sampler
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+/// `1700Mhz` → `1700`. Anything else — including the `0Mhz` sleep level, which
+/// parses fine — is left to the caller to interpret.
+fn parse_mhz(sclk: &str) -> Option<u32> {
+    let digits: String = sclk.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Peak clocks, printed under the numbers they qualify.
+fn report_clocks(peaks: &[(String, u32)], args: &Args) {
+    if peaks.is_empty() {
+        return;
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "clock_peaks",
+                "peaks": peaks.iter().map(|(c, m)| serde_json::json!({"card": c, "peak_mhz": m}))
+                    .collect::<Vec<_>>(),
+            })
+        );
+        return;
+    }
+    let line = peaks
+        .iter()
+        .map(|(card, mhz)| format!("{card} {mhz}Mhz"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  gpu peak {line} (while measuring)");
+}
+
 /// Curve mode: one generation of `args.curve` tokens, timestamping each streamed
 /// token, then reporting the instantaneous decode rate per `args.bucket`-token
 /// context window. Measures decode-vs-context scaling directly — no prompt
@@ -801,11 +1217,7 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
         body["model"] = serde_json::Value::String(m.clone());
     }
 
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
+    let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
         anyhow::bail!("server returned HTTP {}", resp.status());
     }

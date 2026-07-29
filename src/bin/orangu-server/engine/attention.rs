@@ -13,21 +13,193 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! CPU multi-head attention over a populated [`LayerCache`], shared by every
-//! architecture.
+//! Multi-head attention over a populated [`LayerCache`], shared by every
+//! architecture — [`attention`] picks the GPU kernel or the CPU loop,
+//! [`multi_head_attention`] is the CPU loop itself.
 //!
-//! Each of the four arches used to carry its own copy of this loop, and they
-//! had drifted: one was parallelised across tokens and three were not, one
-//! supported a sliding window and three assumed causal-to-`pos`, and all four
-//! were head-outer — which on a grouped-query model re-reads the same K and V
-//! once per query head. Attention is the largest CPU cost in a prefill and the
-//! only one that grows quadratically with prompt length, so it is worth having
+//! Each of the arches used to carry its own copy of the CPU loop, and they had
+//! drifted: one was parallelised across tokens and three were not, one
+//! supported a sliding window and three assumed causal-to-`pos`, and all were
+//! head-outer — which on a grouped-query model re-reads the same K and V once
+//! per query head. Attention is the largest CPU cost in a prefill and the only
+//! one that grows quadratically with prompt length, so it is worth having
 //! exactly one of it.
+//!
+//! **The same argument applies one level up, and had not been acted on.** The
+//! choice of *where* attention runs was also per-architecture, and only
+//! `gemma.rs` had ever made it: measured across eight models, the other
+//! architectures spent **70–78% of their prefill CPU** in the loop below while
+//! gemma spent 0.0%, because gemma alone reached for
+//! `VulkanBackend::gpu_attention_prefill`. Nothing in that kernel is
+//! gemma-specific — it takes head counts, a window and a scale — so the
+//! selection belongs here, once, next to the fallback it selects against.
 
 use rayon::prelude::*;
 
+use crate::engine::backend::Backend;
 use crate::engine::kv_cache::LayerCache;
 use crate::engine::tensor;
+
+/// Shapes and flags [`attention`] needs that are not the query or the cache.
+///
+/// A struct rather than eleven positional parameters because the GPU and CPU
+/// paths must agree on every one of them, and a transposed pair in a call this
+/// wide is a wrong answer rather than a compile error.
+pub struct Params<'a> {
+    pub backend: &'a dyn Backend,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    /// Whether a query may attend to positions after its own. The GPU kernel
+    /// derives each query's window from this and `n_swa`; the CPU path takes
+    /// the `window` closure instead, and the caller is responsible for the two
+    /// describing the same thing.
+    pub causal: bool,
+    /// Sliding-window width, or `0` for none.
+    pub n_swa: usize,
+    pub start_pos: usize,
+    pub n_tokens: usize,
+}
+
+/// Token count at or above which attention goes to the GPU.
+///
+/// Not a safety margin — a measured crossover. The GPU path uploads this
+/// layer's Q and reads its output back once per layer, and that cost does not
+/// shrink with the prompt, so below some width the CPU loop wins outright.
+/// Sweepable as `ORANGU_ATTENTION_MIN_TOKENS`; see `PERF-GAP.md` for the sweep.
+/// A single-token decode step is far below it, which is what keeps decode on
+/// the CPU loop where its window is one row and a round trip would dominate.
+const DEFAULT_MIN_GPU_TOKENS: usize = 32;
+
+fn min_gpu_tokens() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ORANGU_ATTENTION_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MIN_GPU_TOKENS)
+    })
+}
+
+/// The window the **GPU kernel** will use for token `t`, in Rust.
+///
+/// A transcription of `ATTENTION_MULTI_QUERY_SETUP` in
+/// `engine::backend::vulkan_shaders`. It exists to be compared against the
+/// caller's own closure, so the two descriptions of one window cannot drift
+/// apart silently; if that shader's rule changes, this must change with it and
+/// the arch tests will say so.
+fn derived_window(params: &Params<'_>, t: usize) -> (usize, usize) {
+    let pos = params.start_pos + t;
+    if !params.causal {
+        return if params.n_swa > 0 {
+            let half = params.n_swa / 2;
+            (
+                pos.saturating_sub(half),
+                (pos + half).min(params.n_tokens - 1),
+            )
+        } else {
+            (0, params.n_tokens - 1)
+        };
+    }
+    if params.n_swa > 0 {
+        (pos.saturating_sub(params.n_swa - 1), pos)
+    } else {
+        (0, pos)
+    }
+}
+
+/// Which path [`attention`] took. Returned rather than logged here so a
+/// per-layer trace stays the caller's business, and so a test can assert the
+/// selection rather than infer it from a timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ran {
+    OnGpu,
+    OnCpu,
+}
+
+/// Multi-head attention, on whichever processor is faster for this shape.
+///
+/// `out` is resized and fully written. `cache` must already hold every position
+/// the window can reach, including this call's own tokens — both paths have
+/// that precondition, since a prompt's later queries attend to its earlier
+/// tokens.
+///
+/// `window(t)` is the CPU path's window and the authority on correctness: the
+/// GPU kernel re-derives the same range from `causal`/`n_swa`, and the two are
+/// cross-checked against each other for every window shape
+/// (`gpu_attention_prefill_matches_cpu_reference_*`). An architecture whose
+/// window cannot be expressed as `causal` plus `n_swa` must therefore *not* set
+/// those fields to something approximate — it would get a silently different
+/// answer on a Vulkan build than on a CPU one.
+pub fn attention(
+    out: &mut Vec<f32>,
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Ran {
+    let Params {
+        n_head,
+        n_head_kv,
+        head_dim,
+        n_tokens,
+        ..
+    } = *params;
+
+    // The two paths take the window two different ways — the CPU one from the
+    // closure, the GPU one re-derived in the shader from `causal`/`n_swa`. If a
+    // caller sets those inconsistently with its closure the result is not a
+    // crash or a wrong shape; it is a *different answer on a Vulkan build than
+    // on a CPU one*, which no cross-check between the two kernels can catch,
+    // because both kernels are right. So check the caller instead, on every
+    // token, in every debug build — which is every test run.
+    debug_assert!(
+        (0..n_tokens).all(|t| window(t) == derived_window(params, t)),
+        "attention window disagrees with causal={} n_swa={} at start_pos={} \
+         n_tokens={n_tokens}: closure {:?} against derived {:?}",
+        params.causal,
+        params.n_swa,
+        params.start_pos,
+        (0..n_tokens).map(&window).collect::<Vec<_>>(),
+        (0..n_tokens)
+            .map(|t| derived_window(params, t))
+            .collect::<Vec<_>>(),
+    );
+
+    if n_tokens >= min_gpu_tokens()
+        && let Some(vulkan) = params.backend.as_vulkan()
+        && vulkan.prefill_attention_enabled()
+    {
+        *out = vulkan.gpu_attention_prefill(
+            q,
+            cache,
+            params.start_pos,
+            n_tokens,
+            n_head,
+            n_head_kv,
+            head_dim,
+            params.n_swa,
+            params.causal,
+            params.scale,
+        );
+        return Ran::OnGpu;
+    }
+
+    out.clear();
+    out.resize(n_tokens * n_head * head_dim, 0.0);
+    multi_head_attention(
+        out,
+        q,
+        cache,
+        n_head,
+        n_head.div_ceil(n_head_kv),
+        head_dim,
+        params.scale,
+        window,
+    );
+    Ran::OnCpu
+}
 
 /// Multi-head attention for `n_tokens` queries against `cache`, writing
 /// `[n_tokens, n_head * head_dim]` into `out`.
@@ -131,6 +303,122 @@ pub fn multi_head_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window rule the shader implements, restated independently of
+    /// [`derived_window`] so the two are not the same code checking itself:
+    /// this one is written from the *specification* (causal means "up to and
+    /// including my own position"; a sliding window of `w` means "the `w`
+    /// positions ending at mine"), not transcribed from the WGSL.
+    fn spec_window(
+        causal: bool,
+        n_swa: usize,
+        start_pos: usize,
+        n_tokens: usize,
+        t: usize,
+    ) -> (usize, usize) {
+        let pos = start_pos + t;
+        match (causal, n_swa) {
+            (true, 0) => (0, pos),
+            (true, w) => (pos + 1 - w.min(pos + 1), pos),
+            (false, 0) => (0, n_tokens - 1),
+            (false, w) => {
+                let half = w / 2;
+                (pos.saturating_sub(half), (pos + half).min(n_tokens - 1))
+            }
+        }
+    }
+
+    #[test]
+    fn the_derived_window_matches_the_specification_for_every_shape() {
+        for &causal in &[true, false] {
+            for &n_swa in &[0usize, 1, 2, 5, 8] {
+                for &start_pos in &[0usize, 1, 7] {
+                    let n_tokens = 9;
+                    let params = Params {
+                        backend: &crate::engine::backend::CpuBackend,
+                        n_head: 2,
+                        n_head_kv: 1,
+                        head_dim: 4,
+                        scale: 1.0,
+                        causal,
+                        n_swa,
+                        start_pos,
+                        n_tokens,
+                    };
+                    for t in 0..n_tokens {
+                        assert_eq!(
+                            derived_window(&params, t),
+                            spec_window(causal, n_swa, start_pos, n_tokens, t),
+                            "causal={causal} n_swa={n_swa} start_pos={start_pos} t={t}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "attention window disagrees")]
+    fn a_caller_whose_closure_disagrees_with_its_flags_is_caught() {
+        // The hazard this guard exists for: `n_swa: 0` says "attend to
+        // everything up to my position" while the closure says "the last four".
+        // On a CPU build the closure wins; on a Vulkan build the flags do. Both
+        // kernels are correct and no cross-check between them can see it.
+        let backend = crate::engine::backend::CpuBackend;
+        let mut cache = crate::engine::kv_cache::KvCache::new_with_dims(16, &[4]);
+        for _ in 0..8 {
+            cache.layers[0].push(&[0.0; 4], &[0.0; 4]);
+        }
+        let params = Params {
+            backend: &backend,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            scale: 1.0,
+            causal: true,
+            n_swa: 0,
+            start_pos: 0,
+            n_tokens: 8,
+        };
+        let mut out = Vec::new();
+        attention(&mut out, &[0.0; 32], &mut cache.layers[0], &params, |t| {
+            (t.saturating_sub(3), t)
+        });
+    }
+
+    #[test]
+    fn a_matching_caller_passes_the_guard_and_gets_the_cpu_answer() {
+        let backend = crate::engine::backend::CpuBackend;
+        let mut cache = crate::engine::kv_cache::KvCache::new_with_dims(16, &[4]);
+        let mut seed = 1u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 16) as f32 / 32768.0 - 1.0
+        };
+        for _ in 0..8 {
+            let k: Vec<f32> = (0..4).map(|_| next()).collect();
+            let v: Vec<f32> = (0..4).map(|_| next()).collect();
+            cache.layers[0].push(&k, &v);
+        }
+        let q: Vec<f32> = (0..32).map(|_| next()).collect();
+        let params = Params {
+            backend: &backend,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            scale: 0.5,
+            causal: true,
+            n_swa: 0,
+            start_pos: 0,
+            n_tokens: 8,
+        };
+        let mut got = Vec::new();
+        attention(&mut got, &q, &mut cache.layers[0], &params, |t| (0, t));
+
+        let mut want = vec![0f32; 32];
+        multi_head_attention(&mut want, &q, &cache.layers[0], 1, 1, 4, 0.5, |t| (0, t));
+        assert_eq!(got, want);
+    }
 
     /// The head-outer, token-serial form every architecture carried before
     /// this module existed — kept verbatim as the reference the shared
