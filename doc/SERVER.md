@@ -70,11 +70,16 @@ model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
 role [all]: 
 ```
 
-On startup, `orangu-server` prints the same CPU/GPU report `system` does
-(so a startup log alone is enough to see what hardware the process actually
-has to work with), followed by the model/UI/API/workspace summary:
+On startup, `orangu-server` prints the same OS/CPU/GPU report `system`
+does (so a startup log alone is enough to see what machine, and what OS,
+the process actually has to work with), followed by the model/UI/API/
+workspace summary:
 
 ```
+OS
+  Name             : Fedora Linux
+  ...
+
 CPU
   Model            : AMD Ryzen 7 4800H with Radeon Graphics
   ...
@@ -156,13 +161,29 @@ Not supported (out of scope for a first version): downloading a `--mtp`
 companion file alongside the model, `preset.ini`-based repos, and Docker
 registry sources.
 
-### `system`: CPU and GPU inventory
+### `system`: OS, CPU and GPU inventory
 
 ```sh
 orangu-server system
 ```
 
 ```
+OS
+  Name             : Fedora Linux
+  Version          : 44
+  Kernel           : 7.1.3-200.fc44.x86_64
+  Distribution     : fedora
+  Machine          : Micro-Star International Co., Ltd. Bravo 15 A4DDR
+  Hostname         : orangu
+  Uptime           : 20d 07h
+  Load average     : 4.80, 4.09, 3.25
+  Swap total       : 16.00 GiB
+  Swap used        : 13.23 GiB
+  Huge pages       : madvise
+  Page size        : 4.00 KiB
+  Open files       : 1048576 (max 1048576)
+  Built for        : x86_64-linux-gnu
+
 CPU
   Model            : AMD Ryzen 7 4800H with Radeon Graphics
   Vendor           : AuthenticAMD
@@ -172,6 +193,9 @@ CPU
   Frequency        : 4.29 GHz
   Memory total     : 62.19 GiB
   Memory available : 36.19 GiB
+  SSE4.2           : Yes
+  AVX2             : Yes
+  AVX512           : No
 
 GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
@@ -191,8 +215,36 @@ This is the same report printed at the top of every attached (non-daemon)
 `orangu-server` startup (see **Quick start** above) — `system` is that
 report on its own, with no model involved.
 
+The `OS` section comes first because it frames how the two below it should
+be read: a 16 KiB page size or a swapped-out machine says more about what a
+model will do there than its core count does.
+
+Every field is best-effort and read through a Rust API — [`sysinfo`](https://docs.rs/sysinfo)
+for the portable ones, `libc` for the POSIX ones, plain `procfs`/`sysfs`
+file reads on Linux. Nothing here shells out to `uname`, `sysctl` or
+PowerShell. A field the running platform can't answer gets no line at all
+rather than a line saying `unknown`:
+
+| Field | What it is | Linux | macOS | Windows |
+|---|---|---|---|---|
+| `Name`, `Version` | Distribution or OS name and release | ✅ | ✅ | ✅ |
+| `Full name` | The verbose name, printed only when it adds something the two above don't — the macOS codename (`MacOS 15.1 Sequoia`) or the Windows edition (`Windows 11 Pro`) | — | ✅ | ✅ |
+| `Kernel` | Kernel release; the build number on Windows | ✅ | ✅ | ✅ |
+| `Distribution` | `/etc/os-release`'s `ID`, the spelling other tooling keys on. Omitted where it would only repeat `Name` | ✅ | — | — |
+| `Machine` | The physical machine's vendor and product, from SMBIOS/DMI (`/sys/class/dmi/id`) or `hw.model` | ✅ | ✅ | — |
+| `Hostname` | | ✅ | ✅ | ✅ |
+| `Uptime` | Time since boot, as its two largest units | ✅ | ✅ | ✅ |
+| `Load average` | 1/5/15-minute run-queue averages | ✅ | ✅ | — |
+| `Swap total`, `Swap used` | Omitted entirely on a machine with no swap configured | ✅ | ✅ | ✅ |
+| `Huge pages` | The transparent-hugepage policy (`always`/`madvise`/`never`), which decides whether a mapped model's weights get 2 MiB pages or 4 KiB ones | ✅ | — | — |
+| `Page size` | `sysconf(_SC_PAGESIZE)` — 4 KiB on most machines, 16 KiB on Apple Silicon | ✅ | ✅ | — |
+| `Open files` | `RLIMIT_NOFILE`, soft and hard. A server holding a listener, every accepted connection and one mapping per model shard runs into this one first | ✅ | ✅ | — |
+| `Built for` | The target this binary was *built* for, which isn't always the machine it runs on: an `x86_64` build on an `aarch64` Mac is running under Rosetta | ✅ | ✅ | ✅ |
+
 CPU statistics (model, vendor, architecture, physical/logical core counts,
-frequency, total/available system RAM) come from [`sysinfo`](https://docs.rs/sysinfo).
+frequency, total/available system RAM) come from `sysinfo` too; the SIMD
+feature lines are run-time CPUID checks, so a binary built on one machine
+reports accurately on whatever machine it actually runs on.
 
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources and reports whatever they find — a card no source
@@ -266,23 +318,23 @@ Suggested model size (Dedicated)
   128K     -                  -                    -
   256K     -                  -                    -
 
-Suggested model size (Combined)
-  Estimated budget : 66.17 GiB
+Suggested model size (Total)
+  Estimated budget : 62.19 GiB
 
   Context  Suggestion (Q2_K)  Suggestion (Q4_K_M)  Suggestion (Q8_0)
   -------  -----------------  -------------------  -----------------
-  1K       ~120B parameters   ~110B parameters     ~65B parameters
-  2K       ~120B parameters   ~110B parameters     ~65B parameters
-  4K       ~120B parameters   ~110B parameters     ~34B parameters
-  8K       ~120B parameters   ~110B parameters     ~34B parameters
+  1K       ~120B parameters   ~70B parameters      ~34B parameters
+  2K       ~120B parameters   ~70B parameters      ~34B parameters
+  4K       ~120B parameters   ~70B parameters      ~34B parameters
+  8K       ~120B parameters   ~70B parameters      ~34B parameters
   16K      ~120B parameters   ~70B parameters      ~34B parameters
   32K      ~120B parameters   ~70B parameters      ~34B parameters
   64K      ~120B parameters   ~70B parameters      ~34B parameters
-  128K     ~70B parameters    ~34B parameters      ~32B parameters
-  256K     ~34B parameters    ~30B parameters      ~14B parameters
+  128K     ~70B parameters    ~34B parameters      ~30B parameters
+  256K     ~34B parameters    ~27B parameters      ~14B parameters
 ```
 
-Prints the same CPU/GPU report `system` does, then estimates how large a
+Prints the same OS/CPU/GPU report `system` does, then estimates how large a
 model (in parameters) is likely to run comfortably — as a table, one row per
 context length (1K to 256K tokens) and one column per quantization (`Q2_K`,
 `Q4_K_M` — the same default `download` already assumes — and `Q8_0`). Not a
@@ -290,19 +342,27 @@ specific model recommendation yet — just a size class to aim `download` at.
 
 Two such tables are printed, sized against two different budgets:
 
-- **Dedicated**: the sum of every **dedicated** GPU's VRAM alone (multiple
-  dedicated cards add up) — everything fits in real VRAM, no spillover.
-  Skipped entirely when the machine has no dedicated GPU at all — a 0 B
-  budget would only print a useless table of `-` in every cell.
-- **Combined**: the sum of *every* GPU's own reported total, dedicated and
-  shared alike (a shared/integrated GPU's is already the system's total RAM,
-  per the note above) — the more permissive figure, representing every
-  device this server could spread layers across at once. Falls back to the
-  CPU's own total RAM when there's no GPU detected at all. Inherently
-  optimistic: the shared part of the pool is the same RAM the OS and
-  everything else on the machine live in, so treat it as a hardware
-  ceiling, not a promise — with dedicated VRAM added on top it can even
-  exceed the machine's total RAM.
+- **Dedicated**: the largest **dedicated** GPU's VRAM alone — everything
+  fits in real VRAM, no spillover. Skipped entirely when the machine has no
+  dedicated GPU at all — a 0 B budget would only print a useless table of
+  `-` in every cell. The largest card, not every card added up: a model is
+  loaded onto one device and nothing splits its tensors across two, so two
+  24 GiB cards run the models one 24 GiB card runs.
+- **Total**: the **largest single memory pool** on the machine — the biggest
+  eligible GPU's own total, or the CPU's total RAM, whichever is larger
+  (a shared/integrated GPU's total is already the system's RAM, per the note
+  above). Dedicated VRAM is one of the candidates, so this budget is never
+  smaller than the one above it: the `Dedicated` table is the *fast* subset
+  of this one, not a different machine.
+
+  The largest pool, deliberately **not** the sum of every pool. A model runs
+  on exactly one backend, and there is no partial-offload split of layers
+  between a GPU and the CPU, so no single run can ever draw on a discrete
+  card's VRAM *and* system RAM at once — adding them would put a budget on
+  the table that nothing on the machine can reach (on the laptop above, a
+  3.98 GiB card beside 62.19 GiB of RAM would suggest a ~110B model that
+  neither pool can hold). Still a hardware ceiling rather than a promise:
+  the RAM in it is the same RAM the OS and everything else live in.
 
 The memory-estimation formula mirrors [Sam McLeod's GGUF VRAM
 Estimator](https://smcleod.net/vram-estimator/) (read directly from its

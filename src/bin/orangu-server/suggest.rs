@@ -39,6 +39,7 @@
 
 use orangu::format::format_bytes;
 use orangu::hardware::{self as system, CpuInfo, GpuInfo, MemoryKind};
+use orangu::os::OsInfo;
 
 /// Fixed CUDA/runtime overhead added on top of model weights — matches
 /// smcleod's `CUDA_SIZE` constant (500 MiB) exactly.
@@ -161,29 +162,34 @@ fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
             && gpu.vram_total_bytes.unwrap_or(0) >= WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES)
 }
 
-/// Whether `gpu` counts toward the permissive, every-device budget:
-/// `Dedicated` or `Shared` on Linux/macOS; on Windows, also an `Unknown`-kind
-/// GPU above [`WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`] (a below-threshold
-/// one is excluded here too — like a genuine `Shared` GPU, its real ceiling
-/// is system RAM, which `combined_gpu_budget_bytes`'s own fallback already
-/// supplies whenever nothing else in the sum counts it).
+/// Whether `gpu`'s own memory pool counts as a candidate for the
+/// whole-machine budget: `Dedicated` or `Shared` on Linux/macOS; on Windows,
+/// also an `Unknown`-kind GPU above
+/// [`WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`] (a below-threshold one is
+/// excluded here too — like a genuine `Shared` GPU, its real ceiling is
+/// system RAM, which [`total_budget_bytes`] already considers on its own).
 #[cfg(not(target_os = "windows"))]
-fn is_combined_budget_eligible(gpu: &GpuInfo) -> bool {
+fn is_total_budget_eligible(gpu: &GpuInfo) -> bool {
     matches!(gpu.memory_kind, MemoryKind::Dedicated | MemoryKind::Shared)
 }
 
 #[cfg(target_os = "windows")]
-fn is_combined_budget_eligible(gpu: &GpuInfo) -> bool {
+fn is_total_budget_eligible(gpu: &GpuInfo) -> bool {
     matches!(gpu.memory_kind, MemoryKind::Dedicated | MemoryKind::Shared)
         || (gpu.memory_kind == MemoryKind::Unknown
             && gpu.vram_total_bytes.unwrap_or(0) >= WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES)
 }
 
-/// The sum of every dedicated GPU's `vram_total_bytes` (multi-GPU
-/// tensor-split across every dedicated device found), `0` when there's
-/// none at all (see [`is_dedicated_for_budget`] for what counts as dedicated
-/// per platform). The conservative, GPU-only budget: everything fits in real
-/// VRAM, no spillover to a shared pool or system RAM.
+/// The largest dedicated GPU's `vram_total_bytes`, `0` when there's no
+/// dedicated GPU at all (see [`is_dedicated_for_budget`] for what counts as
+/// dedicated per platform). The conservative, GPU-only budget: everything
+/// fits in real VRAM, no spillover to a shared pool or system RAM.
+///
+/// The largest card, not the sum of every card: a model is loaded onto one
+/// device, and nothing here splits a model's tensors across two of them, so
+/// two 24 GiB cards run the same models one 24 GiB card does — summing them
+/// would budget 48 GiB of VRAM that no single run can address. Same reason
+/// [`total_budget_bytes`] takes a maximum.
 ///
 /// Deliberately *not* reduced by `vram_used_bytes`: `suggest` estimates the
 /// hardware's own capability (`suggest.rs`'s module doc — "likely to run
@@ -195,32 +201,39 @@ fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
     gpus.iter()
         .filter(|g| is_dedicated_for_budget(g))
         .filter_map(|g| g.vram_total_bytes)
-        .sum()
+        .max()
+        .unwrap_or(0)
 }
 
-/// The sum of every GPU's own reported `vram_total_bytes` that counts as
-/// budget-eligible per platform (see [`is_combined_budget_eligible`]) —
-/// `Dedicated` and `Shared` alike (a `Shared` GPU's is already the system
-/// RAM total, via `system::apply_shared_memory_total`) — the more permissive
-/// budget, representing every device `--fit on` could spread layers across
-/// at once. Falls back to the CPU's own total RAM when that sum is `0` (no
-/// GPU detected at all). Like [`dedicated_vram_budget_bytes`], deliberately
-/// not reduced by currently-used memory — see its doc for why. A combined
-/// figure is inherently optimistic: the shared part of the pool is the same
-/// RAM the OS and everything else on the machine live in, so it's a
-/// hardware ceiling, not a promise — it can even exceed the machine's total
-/// RAM when dedicated VRAM is added on top.
-fn combined_gpu_budget_bytes(cpu: &CpuInfo, gpus: &[GpuInfo]) -> u64 {
-    let total: u64 = gpus
-        .iter()
-        .filter(|g| is_combined_budget_eligible(g))
+/// The largest single memory pool a model can actually be run in on this
+/// machine: the biggest budget-eligible GPU's own `vram_total_bytes` (see
+/// [`is_total_budget_eligible`]), or the CPU's total RAM, whichever is
+/// larger. System RAM is always a candidate — the CPU backend needs no GPU
+/// at all — which is also what covers a machine with no GPU detected, and a
+/// `Shared` GPU (whose `vram_total_bytes` is already the system RAM total,
+/// via `system::apply_shared_memory_total`).
+///
+/// The largest pool, deliberately *not* the sum of every pool. A model runs
+/// on exactly one backend — `main.rs`'s `select_backend` picks one, and
+/// there is no partial-offload split of layers between a GPU and the CPU —
+/// so no single run can ever draw on a dedicated card's VRAM *and* system
+/// RAM together. Summing them would put a budget on the table that nothing
+/// on this machine can reach: on a 4 GiB discrete card beside 62 GiB of RAM,
+/// a 66 GiB sum recommends a model that neither pool can hold.
+///
+/// Dedicated VRAM is one of the candidates here, so this budget is never
+/// smaller than [`dedicated_vram_budget_bytes`]'s — the dedicated table is
+/// the *fast* subset of this one, not a separate machine. Like that budget,
+/// deliberately not reduced by currently-used memory — see its doc for why —
+/// so it stays a hardware ceiling rather than a promise: the RAM in it is
+/// the same RAM the OS and everything else on the machine live in.
+fn total_budget_bytes(cpu: &CpuInfo, gpus: &[GpuInfo]) -> u64 {
+    gpus.iter()
+        .filter(|g| is_total_budget_eligible(g))
         .filter_map(|g| g.vram_total_bytes)
-        .sum();
-    if total > 0 {
-        total
-    } else {
-        cpu.total_memory_bytes
-    }
+        .max()
+        .unwrap_or(0)
+        .max(cpu.total_memory_bytes)
 }
 
 /// `~14B` for a whole number of billions, `~4.8B` otherwise.
@@ -275,12 +288,12 @@ fn push_suggestion_block(out: &mut String, label: &str, budget: u64) {
     }
 }
 
-/// Formats `suggest`'s full report: the same CPU/GPU inventory `system`
+/// Formats `suggest`'s full report: the same OS/CPU/GPU inventory `system`
 /// prints, followed by two model-size suggestions — one sized against
-/// dedicated GPU VRAM alone, one against every GPU's memory combined (which,
-/// for a shared/integrated GPU, already means system RAM).
-pub fn format_suggestion(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
-    let mut out = system::format_report(cpu, gpus);
+/// dedicated GPU VRAM alone (the fast path), one against the largest memory
+/// pool on the machine, GPU or system RAM (see [`total_budget_bytes`]).
+pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
+    let mut out = system::format_report(os, cpu, gpus);
 
     // A "Dedicated" budget of 0 (no GPU with real, hard-ceiling VRAM at
     // all) would just print an estimated budget of 0 B and a table of
@@ -295,8 +308,8 @@ pub fn format_suggestion(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
     }
     push_suggestion_block(
         &mut out,
-        "Suggested model size (Combined)",
-        combined_gpu_budget_bytes(cpu, gpus),
+        "Suggested model size (Total)",
+        total_budget_bytes(cpu, gpus),
     );
 
     out
@@ -396,12 +409,21 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_vram_budget_bytes_sums_multiple_dedicated_gpus() {
+    fn dedicated_vram_budget_bytes_takes_the_largest_of_several_gpus() {
+        // Two cards run the models one card runs — nothing splits a model's
+        // tensors across devices, so the budget is 24 GiB, not 48.
         let gpus = vec![
             gpu(MemoryKind::Dedicated, Some(24 * GIB)),
             gpu(MemoryKind::Dedicated, Some(24 * GIB)),
         ];
-        assert_eq!(dedicated_vram_budget_bytes(&gpus), 48 * GIB);
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 24 * GIB);
+
+        // ...and it's the biggest one that counts, not the first found.
+        let mixed = vec![
+            gpu(MemoryKind::Dedicated, Some(8 * GIB)),
+            gpu(MemoryKind::Dedicated, Some(24 * GIB)),
+        ];
+        assert_eq!(dedicated_vram_budget_bytes(&mixed), 24 * GIB);
     }
 
     #[test]
@@ -433,30 +455,25 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn dedicated_vram_budget_bytes_trusts_unknown_above_threshold_on_windows() {
+        // The `Unknown` card is the larger of the two, so it can only be the
+        // answer if it counted as dedicated at all.
         let gpus = vec![
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
-            gpu(
-                MemoryKind::Unknown,
-                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES),
-            ),
+            gpu(MemoryKind::Unknown, Some(16 * GIB)),
         ];
-        assert_eq!(
-            dedicated_vram_budget_bytes(&gpus),
-            4 * GIB + WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES
-        );
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 16 * GIB);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn dedicated_vram_budget_bytes_ignores_unknown_below_threshold_on_windows() {
-        let gpus = vec![
-            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
-            gpu(
-                MemoryKind::Unknown,
-                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES - 1),
-            ),
-        ];
-        assert_eq!(dedicated_vram_budget_bytes(&gpus), 4 * GIB);
+        // Nothing else in the list, so a below-threshold `Unknown` GPU
+        // counting would show up as a non-zero budget.
+        let gpus = vec![gpu(
+            MemoryKind::Unknown,
+            Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES - 1),
+        )];
+        assert_eq!(dedicated_vram_budget_bytes(&gpus), 0);
     }
 
     #[test]
@@ -466,57 +483,77 @@ mod tests {
         assert_eq!(dedicated_vram_budget_bytes(&[]), 0);
     }
 
+    /// The whole point of the total budget: a model runs on one backend, so
+    /// the budget is the largest pool it could run in — never dedicated VRAM
+    /// *plus* the system RAM beside it, a figure no single run could reach.
     #[test]
-    fn combined_gpu_budget_bytes_sums_dedicated_and_shared() {
+    fn total_budget_bytes_takes_the_largest_pool_not_their_sum() {
         let gpus = vec![
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
             gpu(MemoryKind::Shared, Some(64 * GIB)),
         ];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 68 * GIB);
+        assert_eq!(total_budget_bytes(&cpu(64 * GIB), &gpus), 64 * GIB);
+    }
+
+    /// This machine's own shape, and the case that made the sum visibly
+    /// wrong: a small discrete card beside a lot of system RAM. The budget
+    /// is the RAM, not RAM + VRAM.
+    #[test]
+    fn total_budget_bytes_never_exceeds_the_machines_own_memory() {
+        let gpus = vec![
+            gpu(MemoryKind::Dedicated, Some(4 * GIB)),
+            gpu(MemoryKind::Shared, Some(62 * GIB)),
+        ];
+        let budget = total_budget_bytes(&cpu(62 * GIB), &gpus);
+        assert_eq!(budget, 62 * GIB);
+        assert!(budget < 62 * GIB + 4 * GIB);
+    }
+
+    /// A dedicated card bigger than the machine's RAM wins instead — the
+    /// dedicated budget is a subset of this one, never larger than it.
+    #[test]
+    fn total_budget_bytes_prefers_a_dedicated_gpu_larger_than_system_ram() {
+        let gpus = vec![gpu(MemoryKind::Dedicated, Some(24 * GIB))];
+        assert_eq!(total_budget_bytes(&cpu(16 * GIB), &gpus), 24 * GIB);
+        assert!(total_budget_bytes(&cpu(16 * GIB), &gpus) >= dedicated_vram_budget_bytes(&gpus));
     }
 
     #[test]
-    fn combined_gpu_budget_bytes_ignores_currently_used_vram() {
+    fn total_budget_bytes_ignores_currently_used_vram() {
         let gpus = vec![GpuInfo {
             vendor: "Test".to_string(),
             name: "Test GPU 1".to_string(),
-            vram_total_bytes: Some(4 * GIB),
+            vram_total_bytes: Some(80 * GIB),
             vram_used_bytes: Some(GIB),
             driver: None,
             memory_kind: MemoryKind::Dedicated,
         }];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 4 * GIB);
+        assert_eq!(total_budget_bytes(&cpu(64 * GIB), &gpus), 80 * GIB);
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn combined_gpu_budget_bytes_ignores_unknown_gpus() {
+    fn total_budget_bytes_ignores_unknown_gpus() {
         let gpus = vec![
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
             gpu(MemoryKind::Unknown, Some(999 * GIB)),
         ];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus), 4 * GIB);
+        assert_eq!(total_budget_bytes(&cpu(64 * GIB), &gpus), 64 * GIB);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn combined_gpu_budget_bytes_includes_unknown_above_threshold_on_windows() {
+    fn total_budget_bytes_includes_unknown_above_threshold_on_windows() {
         let gpus = vec![
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
-            gpu(
-                MemoryKind::Unknown,
-                Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES),
-            ),
+            gpu(MemoryKind::Unknown, Some(80 * GIB)),
         ];
-        assert_eq!(
-            combined_gpu_budget_bytes(&cpu(64 * GIB), &gpus),
-            4 * GIB + WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES
-        );
+        assert_eq!(total_budget_bytes(&cpu(64 * GIB), &gpus), 80 * GIB);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn combined_gpu_budget_bytes_falls_back_to_system_ram_below_threshold_on_windows() {
+    fn total_budget_bytes_falls_back_to_system_ram_below_threshold_on_windows() {
         // A below-threshold `Unknown` GPU (likely an integrated APU's small
         // BIOS carve-out) shouldn't count at face value — its real ceiling
         // is system RAM, same as a genuine `Shared` GPU.
@@ -524,12 +561,12 @@ mod tests {
             MemoryKind::Unknown,
             Some(WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES - 1),
         )];
-        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &gpus), 16 * GIB);
+        assert_eq!(total_budget_bytes(&cpu(16 * GIB), &gpus), 16 * GIB);
     }
 
     #[test]
-    fn combined_gpu_budget_bytes_falls_back_to_system_ram_without_any_gpu() {
-        assert_eq!(combined_gpu_budget_bytes(&cpu(16 * GIB), &[]), 16 * GIB);
+    fn total_budget_bytes_falls_back_to_system_ram_without_any_gpu() {
+        assert_eq!(total_budget_bytes(&cpu(16 * GIB), &[]), 16 * GIB);
     }
 
     #[test]
@@ -544,23 +581,32 @@ mod tests {
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
             gpu(MemoryKind::Shared, Some(64 * GIB)),
         ];
-        let report = format_suggestion(&cpu(64 * GIB), &gpus);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
         assert!(report.contains("CPU"));
         assert!(report.contains("GPU"));
         assert!(report.contains("Suggested model size (Dedicated)"));
-        assert!(report.contains("Suggested model size (Combined)"));
+        assert!(report.contains("Suggested model size (Total)"));
         assert!(report.contains("Suggestion (Q2_K)"));
         assert!(report.contains("Suggestion (Q4_K_M)"));
         assert!(report.contains("Suggestion (Q8_0)"));
 
-        // The dedicated-only budget (4 GiB) and the combined budget (68 GiB)
-        // should recommend different, larger sizes for the combined one.
+        // Each table states the budget it was sized against: 4 GiB of real
+        // VRAM for the dedicated one, and 64 GiB — the largest single pool,
+        // not the 68 GiB the two of them add up to — for the total.
         let dedicated_section = report
             .split("(Dedicated)")
             .nth(1)
-            .and_then(|rest| rest.split("(Combined)").next())
+            .and_then(|rest| rest.split("(Total)").next())
             .unwrap();
-        assert!(dedicated_section.contains("4.00 GiB"));
+        assert!(
+            dedicated_section.contains("4.00 GiB"),
+            "{dedicated_section}"
+        );
+        let total_section = report.split("(Total)").nth(1).unwrap();
+        assert!(
+            total_section.contains("Estimated budget : 64.00 GiB"),
+            "{total_section}"
+        );
     }
 
     #[test]
@@ -569,12 +615,12 @@ mod tests {
             ("shared-only", vec![gpu(MemoryKind::Shared, Some(64 * GIB))]),
             ("no gpus", Vec::new()),
         ] {
-            let report = format_suggestion(&cpu(64 * GIB), &gpus);
+            let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
             assert!(
                 !report.contains("Suggested model size (Dedicated)"),
                 "unexpected Dedicated table for case: {case}"
             );
-            assert!(report.contains("Suggested model size (Combined)"));
+            assert!(report.contains("Suggested model size (Total)"));
         }
     }
 
@@ -583,10 +629,10 @@ mod tests {
     /// with its own blank line, so the report doesn't run together.
     #[test]
     fn format_suggestion_has_no_gpu_section_without_a_gpu() {
-        let report = format_suggestion(&cpu(64 * GIB), &[]);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &[]);
         assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
         assert!(
-            report.contains("\n\nSuggested model size (Combined)\n"),
+            report.contains("\n\nSuggested model size (Total)\n"),
             "report:\n{report}"
         );
     }

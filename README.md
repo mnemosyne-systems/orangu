@@ -150,7 +150,7 @@ See [Core tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manua
 
 **Built-in web console.** Set `web` in the config for a browser chat UI on its own port: a streaming transcript with server-rendered markdown and syntax highlighting, LaTeX, live tokens/second, a Stop button, persistent chat history across restarts, file attachments (text/code, PDF, and Office/OpenDocument documents extracted to text), and a downloadable debug report. Plain server-rendered HTML/CSS/JS from the same binary — no build step, no WASM, no external assets.
 
-**Model inventory.** The same binary manages the machine's models: `list`, `show`, `download` (from Hugging Face, sharded models included), `delete`, `prune`, `suggest` (a size recommendation from the detected hardware), and `system` (a CPU/GPU/memory report). See the [Inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md) chapter.
+**Model inventory.** The same binary manages the machine's models: `list`, `show`, `download` (from Hugging Face, sharded models included), `delete`, `prune`, `suggest` (a size recommendation from the detected hardware), and `system` (an OS/CPU/GPU/memory report). See the [Inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md) chapter.
 
 ## orangu vs. a cloud coding assistant
 

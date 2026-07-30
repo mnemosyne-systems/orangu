@@ -70,7 +70,8 @@ of the workspace rather than binary-local ones: `orangu::gguf` (the GGUF
 binary-format reader), `orangu::model_spec` (directory scan, shard
 grouping, and the Hugging Face repo-id/quant-tag reconstruction behind
 `list`'s `MODEL` column), `orangu::model_download` (`download`'s fetch
-logic), and `orangu::hardware` (CPU/GPU detection). Living in `src/`
+logic), `orangu::os` (OS detection) and `orangu::hardware` (CPU/GPU
+detection). Living in `src/`
 alongside `orangu`'s and `orangu-coordinator`'s own shared code, rather
 than nested under `src/bin/orangu-server/`, is what let `orangu-server`
 absorb these subcommands from the now-removed `orangu-gguf` binary without
@@ -512,13 +513,54 @@ columns those scripts read. This is the same renderer the interactive
 serve-time picker (`select_model_interactively`) and the `show`/`delete`
 pickers use, so all four tables carry the column consistently.
 
+### OS detection (`orangu::os`)
+
+`orangu::os::detect` gathers the `OS` section `orangu::hardware::
+format_report` prints first, and `orangu::os::format_section` formats it —
+the report's other two sections stay in `orangu::hardware`, so neither
+module has to know how the other's fields are gathered. `OsInfo` is a flat
+struct of `Option` fields precisely because platform coverage is uneven:
+`format_section` skips any field that came back `None`, which is what lets
+one formatter serve three platforms without a `cfg` in it.
+
+Nothing here runs a subprocess. Every field comes from a Rust API:
+
+- **Portable** (`sysinfo`, all three platforms): name, version, long
+  version, kernel version, distribution id, hostname, uptime, swap
+  total/used, and — everywhere but Windows, where `sysinfo` documents it as
+  not working — load average.
+- **POSIX** (`libc`, Linux and macOS): `sysconf(_SC_PAGESIZE)` for the page
+  size and `getrlimit(RLIMIT_NOFILE)` for the open-file limit. The `as u64`
+  casts on `rlim_cur`/`rlim_max` carry an
+  `#[allow(clippy::unnecessary_cast)]`: `rlim_t` is `u64` on Linux and
+  macOS, where clippy sees a no-op, but it's `i64` on the BSDs and
+  `c_ulong` on some 32-bit targets that `#[cfg(unix)]` also covers.
+- **Linux** (plain file reads): `/sys/class/dmi/id/sys_vendor` and
+  `product_name` for `Machine` (world-readable, unlike the serial/UUID
+  attributes beside them, which are root-only and not read), and
+  `/sys/kernel/mm/transparent_hugepage/enabled` for the hugepage policy
+  (`parse_selected_option` returns the bracketed entry out of
+  `always [madvise] never`).
+- **macOS** (`libc::sysctlbyname`, wrapped in `sysctl_string`): `hw.model`
+  for `Machine`. The wrapper makes the usual two calls — a null buffer to
+  learn the length, then one of that length — and trims the trailing NUL.
+
+`is_redundant_long_version` decides whether the `Full name` line is worth
+printing. `sysinfo`'s long version is `Linux (Fedora Linux 44)` on Linux —
+`Name` and `Version` rearranged, plus the kernel name and punctuation —
+but `MacOS 15.1 Sequoia` and `Windows 11 Pro` on the other two, where the
+codename and edition appear nowhere else. Comparing word by word (ignoring
+punctuation, and treating `linux` as already-known) drops the first and
+keeps the other two, without a `cfg` deciding it per platform.
+
 ### CPU/GPU detection (`orangu::hardware`)
 
 CPU statistics (brand, vendor, architecture, physical/logical core counts,
 peak frequency, total/available RAM) come from
 [`sysinfo`](https://docs.rs/sysinfo), used with only its `system` feature
 (no `disk`/`network`/`component`/`user`) to keep the dependency footprint
-minimal.
+minimal — the same dependency, and the same feature, `orangu::os` uses
+above.
 
 GPU detection has no single cross-platform API, so `detect_gpus` layers
 several best-effort, independent sources and concatenates whatever each
@@ -614,13 +656,13 @@ figure from the override, unlike the total.
 
 ### Hardware-based model-size suggestion (`suggest.rs`)
 
-`main.rs`'s `Command::Suggest` arm calls the same `orangu::hardware::
-detect_cpu`/`detect_gpus` pair `Command::System` does, then passes the
-result to `suggest::format_suggestion`, which appends two size-suggestion
-tables after `orangu::hardware::format_report`'s own CPU/GPU listing (via
-the shared `push_suggestion_block` helper). There is no separate detection
-path — `suggest` is purely a second interpretation of the same hardware
-inventory `system` already knows how to gather (and the same report
+`main.rs`'s `Command::Suggest` arm calls the same `orangu::os::detect` and
+`orangu::hardware::detect_cpu`/`detect_gpus` trio `Command::System` does,
+then passes the result to `suggest::format_suggestion`, which appends two
+size-suggestion tables after `orangu::hardware::format_report`'s own
+OS/CPU/GPU listing (via the shared `push_suggestion_block` helper). There
+is no separate detection path — `suggest` is purely a second interpretation
+of the same inventory `system` already knows how to gather (and the same report
 printed at the top of every attached `orangu-server` startup — see the
 Inference server chapter's Quick start section).
 
@@ -675,8 +717,8 @@ even the smallest rung (1B) doesn't (rendered as `-`).
 
 **Two budgets, (up to) two tables.** `format_suggestion` computes two
 separate budgets and prints a labeled `push_suggestion_block` for each,
-`"Suggested model size (Dedicated)"` and `"Suggested model size
-(Combined)"`. Both sum each eligible GPU's own `vram_total_bytes` —
+`"Suggested model size (Dedicated)"` and `"Suggested model size (Total)"`.
+Both read each eligible GPU's own `vram_total_bytes` —
 deliberately *not* reduced by `vram_used_bytes`, since `suggest` estimates
 the hardware's own capability (this file's module doc — "likely to run
 comfortably on this machine", picked before any model is chosen), not how
@@ -684,24 +726,36 @@ much happens to be free at the exact moment it runs; whatever else is
 transiently using VRAM (a compositor, a browser, an already-running
 `orangu-server`) shouldn't shrink a hardware-based estimate:
 
-- `dedicated_vram_budget_bytes` sums every GPU `is_dedicated_for_budget`
-  accepts (multiple dedicated cards add up) — `0` when there's none at
-  all. The `Dedicated` block itself is skipped in that case
+- `dedicated_vram_budget_bytes` takes the maximum over every GPU
+  `is_dedicated_for_budget` accepts — `0` when there's none at all. The
+  maximum rather than the sum for the same reason `total_budget_bytes`
+  uses one: a model is loaded onto a single device, and nothing here
+  splits its tensors across two, so two 24 GiB cards are a 24 GiB budget.
+  The `Dedicated` block itself is skipped in the `0` case
   (`gpus.iter().any(is_dedicated_for_budget)` gates the call to
   `push_suggestion_block`), rather than printing a `0 B` budget and a
   table where `suggest_param_count` correctly, but uselessly, reports
   nothing on the ladder fitting for every single cell.
-- `combined_gpu_budget_bytes` sums every GPU `is_combined_budget_eligible`
-  accepts (a `Shared` GPU's `vram_total_bytes` is already the system RAM
-  total via `apply_shared_memory_total`, described above) — the more
-  permissive figure, representing every device this server could spread
-  layers across at once. Falls back to the CPU's own `total_memory_bytes`
-  when that sum is `0` (no GPU detected at all). Always printed, even
-  when it just reduces to system RAM alone — unlike `Dedicated`, this
-  budget is never literally `0` on a real machine.
+- `total_budget_bytes` takes the **maximum** of every GPU
+  `is_total_budget_eligible` accepts (a `Shared` GPU's `vram_total_bytes`
+  is already the system RAM total via `apply_shared_memory_total`,
+  described above) and the CPU's own `total_memory_bytes` — the largest
+  single pool a run could use. System RAM being a candidate rather than a
+  fallback is what covers a machine with no GPU at all, and it makes this
+  budget a superset of `dedicated_vram_budget_bytes`: the `Dedicated`
+  table is the fast subset of this one. Always printed, even when it just
+  reduces to system RAM alone — unlike `Dedicated`, this budget is never
+  literally `0` on a real machine.
+
+  The maximum, **not** the sum: `select_backend` picks one backend for the
+  whole model and there is no partial-offload split of layers between a
+  GPU and the CPU, so no single run can draw on a discrete card's VRAM
+  *and* system RAM together. Summing them printed budgets nothing could
+  reach — on a 3.98 GiB card beside 62.19 GiB of RAM, a 66.17 GiB sum
+  suggested a ~110B model needing 62.69 GiB, which neither pool holds.
 
 **`Unknown`-kind GPUs: a Windows-specific path.** On Linux/macOS,
-`is_dedicated_for_budget`/`is_combined_budget_eligible` only ever see
+`is_dedicated_for_budget`/`is_total_budget_eligible` only ever see
 `Dedicated`/`Shared` GPUs — `MemoryKind` is already reliably known there (see
 above), so both functions have a plain, `cfg`-free body for those targets.
 Windows is different: `windows_memory_kind` classifies *any* AMD adapter
@@ -715,8 +769,7 @@ none (undercounts a real discrete Radeon card), the `#[cfg(target_os =
 (1 GiB — comfortably above a typical integrated carve-out, comfortably below
 any real discrete card). Below the threshold it's treated like a `Shared`
 GPU: excluded from both budgets, since its real ceiling is system RAM, which
-`combined_gpu_budget_bytes`'s own `total_memory_bytes` fallback already
-supplies once nothing else in the sum counts it.
+`total_budget_bytes` already considers on its own.
 
 ### Shell completions (`shell.rs`)
 

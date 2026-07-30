@@ -670,9 +670,10 @@ async fn serve(prepared: Prepared) -> Result<()> {
     let app = http::build_router(state);
 
     if !daemon {
+        let os = orangu::os::detect();
         let cpu = orangu::hardware::detect_cpu();
         let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-        print!("{}", orangu::hardware::format_report(&cpu, &gpus));
+        print!("{}", orangu::hardware::format_report(&os, &cpu, &gpus));
         println!();
         println!(
             "Model      {model_display} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
@@ -818,15 +819,17 @@ fn model_support(
 fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
     match command {
         Command::System => {
+            let os = orangu::os::detect();
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            print!("{}", orangu::hardware::format_report(&cpu, &gpus));
+            print!("{}", orangu::hardware::format_report(&os, &cpu, &gpus));
             Ok(())
         }
         Command::Suggest => {
+            let os = orangu::os::detect();
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            print!("{}", suggest::format_suggestion(&cpu, &gpus));
+            print!("{}", suggest::format_suggestion(&os, &cpu, &gpus));
             Ok(())
         }
         Command::List => {

@@ -32,6 +32,7 @@ pub mod hardware;
 pub mod llm;
 pub mod model_download;
 pub mod model_spec;
+pub mod os;
 
 pub mod session;
 pub mod shell;

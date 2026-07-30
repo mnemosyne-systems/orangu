@@ -72,10 +72,14 @@ model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
 role [all]: 
 ```
 
-On startup, `orangu-server` prints the same CPU/GPU report `system` does,
-followed by the model/UI/API/workspace summary:
+On startup, `orangu-server` prints the same OS/CPU/GPU report `system`
+does, followed by the model/UI/API/workspace summary:
 
 ```
+OS
+  Name             : Fedora Linux
+  ...
+
 CPU
   Model            : AMD Ryzen 7 4800H with Radeon Graphics
   ...
@@ -138,15 +142,31 @@ downloads concurrently rather than one at a time; an interrupted download
 resumes from where it left off next time. Set `HF_TOKEN` in the environment
 for a private or gated repository.
 
-**`system`** detects the machine's CPU and GPU(s) — the same report printed
-at the top of every attached `orangu-server` startup (see **Quick start**
-above):
+**`system`** detects the machine's operating system, CPU and GPU(s) — the
+same report printed at the top of every attached `orangu-server` startup
+(see **Quick start** above):
 
 ```sh
 orangu-server system
 ```
 
 ```
+OS
+  Name             : Fedora Linux
+  Version          : 44
+  Kernel           : 7.1.3-200.fc44.x86_64
+  Distribution     : fedora
+  Machine          : Micro-Star International Co., Ltd. Bravo 15 A4DDR
+  Hostname         : orangu
+  Uptime           : 20d 07h
+  Load average     : 4.80, 4.09, 3.25
+  Swap total       : 16.00 GiB
+  Swap used        : 13.23 GiB
+  Huge pages       : madvise
+  Page size        : 4.00 KiB
+  Open files       : 1048576 (max 1048576)
+  Built for        : x86_64-linux-gnu
+
 CPU
   Model            : AMD Ryzen 7 4800H with Radeon Graphics
   Vendor           : AuthenticAMD
@@ -156,6 +176,9 @@ CPU
   Frequency        : 4.29 GHz
   Memory total     : 62.19 GiB
   Memory available : 36.19 GiB
+  SSE4.2           : Yes
+  AVX2             : Yes
+  AVX512           : No
 
 GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
@@ -164,6 +187,23 @@ GPU
       VRAM used    : 3.71 GiB
       Driver       : amdgpu
 ```
+
+The `OS` section leads: which OS this is frames how everything under it
+should be read. It reports the distribution/OS name and version, the
+kernel, the machine's own vendor and product, hostname, uptime, load
+average, swap, the transparent-hugepage policy, page size, the open-file
+limit (`RLIMIT_NOFILE`, soft and hard), and the target this binary was
+built for — which isn't always the machine it runs on, an
+`x86_64` build on an `aarch64` Mac being under Rosetta.
+
+Every field is best-effort and every platform answers a different subset;
+whatever the running platform can't answer simply gets no line rather than
+a line saying `unknown`. Linux answers all of them, macOS all but the
+hugepage line (a Linux concept), and Windows the portable ones — name,
+edition, build, hostname, uptime, swap. Nothing here shells out: the
+portable fields come from [`sysinfo`](https://docs.rs/sysinfo), the POSIX
+ones from `libc`, and the Linux-specific ones from plain `procfs`/`sysfs`
+file reads.
 
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
@@ -182,7 +222,8 @@ specific model yet) likely to run comfortably on this machine, printed as a
 table — one row per context length, one column per quantization — sized
 against two budgets: dedicated GPU VRAM alone (its table is skipped
 entirely on a machine with no dedicated GPU at all, rather than printing a
-useless 0 B budget of nothing but `-`), and every GPU's memory combined:
+useless 0 B budget of nothing but `-`), and the machine's total — the
+largest single memory pool on it, GPU or system RAM:
 
 ```sh
 orangu-server suggest
@@ -198,10 +239,20 @@ Suggested model size (Dedicated)
   ...
 ```
 
+Both budgets are a **largest single pool**, never a sum of pools: a model
+is loaded onto one device and runs on one backend, with no tensor split
+across two GPUs and no partial-offload split of layers between a GPU and
+the CPU, so no run can draw on a discrete card's VRAM *and* system RAM (or
+on two cards) at once. Dedicated VRAM is one of the
+candidates for it, which makes the `Dedicated` table above the *fast*
+subset of this one rather than a separate machine.
+
 The memory-estimation formula mirrors [Sam McLeod's GGUF VRAM
 Estimator](https://smcleod.net/vram-estimator/): model weight bytes scale
 as parameters × bits-per-weight ÷ 8, KV cache bytes scale with context
-length × layers × hidden size, plus a small fixed runtime overhead.
+length × layers × hidden size, plus a small fixed runtime overhead. Both
+budgets are sized against total memory rather than what happens to be free
+right now, so treat them as hardware ceilings, not promises.
 
 **`list`** recursively scans the configured `models` directory for `.gguf`
 files and prints one row per model (a multi-shard model collapses into a

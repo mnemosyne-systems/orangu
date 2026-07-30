@@ -16,7 +16,8 @@
 //! Machine hardware inventory: the CPU (model, core counts, frequency,
 //! system RAM) and any GPUs (vendor, model, VRAM) — the two things that
 //! decide how a GGUF model can actually be run (how many layers fit in
-//! VRAM, how much has to fall back to CPU/RAM).
+//! VRAM, how much has to fall back to CPU/RAM). The OS the machine runs
+//! lives in [`crate::os`]; [`format_report`] prints both as one report.
 //!
 //! GPU detection has no single cross-platform API, so it layers several
 //! best-effort sources: `nvidia-smi` for NVIDIA (installed alongside any
@@ -28,6 +29,7 @@
 //! else `orangu-server` does.
 
 use crate::format::format_bytes;
+use crate::os::OsInfo;
 use std::process::Command;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
@@ -603,8 +605,15 @@ pub fn performance_advisories() -> Vec<String> {
     Vec::new()
 }
 
-pub fn format_report(cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
-    let mut out = String::new();
+/// The whole `orangu-server system` report: the OS section (formatted by
+/// [`crate::os::format_section`], which owns everything OS-level), then this
+/// module's CPU and GPU inventory. The OS comes first because it frames how
+/// the two below it should be read — a container memory limit or a WSL2
+/// kernel says more about what a model will do on this machine than its core
+/// count does.
+pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
+    let mut out = crate::os::format_section(os);
+    out.push('\n');
     out.push_str("CPU\n");
     out.push_str(&format!("  Model            : {}\n", cpu.brand));
     if !cpu.vendor.is_empty() {
@@ -729,15 +738,30 @@ mod tests {
     }
 
     /// A machine with no GPU gets no GPU section at all — not a heading over
-    /// a "none found" line. The CPU inventory is the whole report there, so
-    /// it also ends without a trailing blank line.
+    /// a "none found" line. The OS and CPU inventories are the whole report
+    /// there, so it also ends without a trailing blank line.
     #[test]
     fn the_gpu_section_is_omitted_when_no_gpu_was_detected() {
-        let report = format_report(&cpu(), &[]);
-        assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
-        assert!(report.starts_with("CPU\n"), "report:\n{report}");
+        let report = format_report(&crate::os::detect(), &cpu(), &[]);
+        assert!(
+            !report.contains("\nGPU\n"),
+            "unexpected GPU section:\n{report}"
+        );
+        assert!(report.contains("\nCPU\n"), "report:\n{report}");
         assert!(
             report.ends_with("AVX512           : No\n"),
+            "report:\n{report}"
+        );
+    }
+
+    /// The OS section leads the report — what this machine runs frames how
+    /// the CPU and GPU inventories under it should be read.
+    #[test]
+    fn the_os_section_comes_first() {
+        let report = format_report(&crate::os::detect(), &cpu(), &[]);
+        assert!(report.starts_with("OS\n"), "report:\n{report}");
+        assert!(
+            report.find("\nCPU\n") < report.find("\nGPU\n").or(Some(usize::MAX)),
             "report:\n{report}"
         );
     }
@@ -747,6 +771,7 @@ mod tests {
     #[test]
     fn the_gpu_section_is_kept_when_a_gpu_was_detected() {
         let report = format_report(
+            &crate::os::detect(),
             &cpu(),
             &[gpu(MemoryKind::Dedicated, Some(4 * 1024 * 1024 * 1024))],
         );

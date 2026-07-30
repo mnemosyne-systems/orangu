@@ -245,6 +245,7 @@ async fn asset_version_handler() -> impl IntoResponse {
 /// use — are exactly the parts most useful to know at the moment a
 /// request just failed, not at server startup.
 async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    let os = orangu::os::detect();
     let cpu = orangu::hardware::detect_cpu();
     let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
     let mut report = format!(
@@ -255,7 +256,7 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
         state.backend_label,
         state.workspace.display(),
     );
-    report.push_str(&orangu::hardware::format_report(&cpu, &gpus));
+    report.push_str(&orangu::hardware::format_report(&os, &cpu, &gpus));
     (
         StatusCode::OK,
         [
