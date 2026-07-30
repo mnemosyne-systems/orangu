@@ -105,6 +105,123 @@ only)`, carrying wall-clock time-to-first-token instead. That figure includes
 queueing and the first decode step, so it is not comparable with the rest — the
 row says so rather than quietly printing a smaller number.
 
+### Continuation-prefill mode (`--pp-continue`) — the narrow-batch regime
+
+`--pp` cannot reach small batch widths. It sends whole prompts with
+`cache_prompt: false`, and a whole prompt carrying a chat template is hundreds
+of tokens before any user text, so every `--pp` row exercises a *wide* batch.
+Real multi-turn chat does the opposite: the prefix cache supplies everything but
+the newest message, and the server prefills a handful of tokens. That is a
+different point on the batch-width curve, and it is the one that batch-width
+thresholds actually govern.
+
+`--pp-continue` takes comma-separated **added** token counts. For each, it
+primes a base prompt (`--pp-continue-base`, default 512 tokens), then sends
+base + extension and reports the rate over the tokens the server says it
+actually processed:
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --pp-continue 8,16,32,64,128
+```
+
+```
+   added |   n_tok |  cached | processed | prompt_ms |     best |        mean ± sd
+----------------------------------------------------------------------------------
+       8 |     582 |     572 |        10 |     275.9 |    36.24 |    34.74 ±  1.37
+      16 |     590 |     572 |        18 |     410.6 |    43.84 |    41.89 ±  1.38
+      32 |     606 |     572 |        34 |     616.1 |    55.32 |    54.94 ±  0.44
+      64 |     638 |     572 |        66 |     794.9 |    83.03 |    80.70 ±  1.67
+     128 |     702 |     572 |       130 |    1213.8 |   107.10 |   105.47 ±  1.20
+```
+
+This mode is the one place the tool sends `cache_prompt: true`, because a cache
+hit is the entire point. Two things keep that from becoming a lie:
+
+- **`processed`** (= `n_tok` − `cached`) is what the rate is computed from.
+  Dividing by `n_tok` would credit the cached prefix with work nobody did and
+  inflate every row by the cache ratio.
+- **Each rep's extension differs from the last in its *first* token.** A prefix
+  cache matches on the longest common token prefix, so two reps that extended
+  the base with the same words would let the cache swallow the extension too,
+  and the run would time a lookup instead of a prefill.
+
+A row whose `cached` column reads `0` is **dropped with a note** rather than
+recorded: no cache hit means the whole prompt was prefilled, which is an
+ordinary wide `--pp` row wearing a continuation's label, and averaging the two
+together would be meaningless.
+
+Because the token counts are approximate (the tool has no tokenizer), `added`
+is a target and `processed` is the truth — history rows are recorded against
+`processed`.
+
+### Decode CPU per token (`--decode-cpu`)
+
+Reports the **server's own CPU time per generated token**, read from
+`/proc/<pid>/stat`, with prefill excluded. Useful when a change is expected to
+remove CPU work rather than wall-clock time — a throughput number can be too
+noisy to show a few percent, while CPU seconds are counted by the kernel.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --depths 0,512,1024 --gen 192 --decode-cpu
+```
+
+```
+   depth |   n_tok | prefilled |  cpu_ms/token |    tok/s
+----------------------------------------------------------
+       0 |      33 |         1 | 14.427 ± 0.052 |    22.06
+     512 |     572 |         1 | 15.313 ± 0.208 |    21.51
+    1024 |    1118 |         1 | 15.703 ± 0.286 |    21.46
+```
+
+**Why each depth is measured twice.** The obvious implementation — read the CPU
+counter around a whole `--depths N` run and divide by the tokens generated — is
+wrong, because that run *prefills N tokens first*. Prefilling 1024 tokens costs
+several CPU-seconds, and charging them to the generated tokens makes decode CPU
+appear to grow 58% with depth when the real figure is under 9%. The growth is
+the prefill's, and it scales with depth because the prefill does.
+
+So the first request pays the prefill and leaves it in the prefix cache, the
+counter is read after it, and the second request's prefill is a cache hit. The
+**`prefilled` column is the check**: it must read `1` (the one token the cache
+deliberately re-processes). If it ever shows the whole prompt, the cache did not
+hit and the row is measuring prefill again.
+
+This needs the server to be a local process, since it reads `/proc` —
+`--flamegraph-pid` overrides the pid if the tool cannot work it out.
+
+Rows are recorded under a third history mode, `cpu`, and charted on their own
+panel: the unit is milliseconds and **lower is better**, so putting them on a
+tok/s axis would read as a collapse.
+
+Throughput does not need this treatment — the depth sweep already times from the
+first streamed token to the last, so prefill is outside its window either way.
+
+### A sweep can contaminate its own later rows
+
+One measured caveat that applies to `--pp` and `--pp-continue` alike: the rows
+in a single invocation are **not** independent. They run against one long-lived
+server process, and what that process has already been asked to do can change
+what a later row measures.
+
+The reproducible case: a 130-token prefill measured 360 tok/s on a fresh server
+and on a server that had only seen wide widths, but **94 tok/s** on a server
+that had just been swept across eight narrow widths — the identical request,
+four runs out of four. The cause is not established (an arena-pressure
+hypothesis was implemented and measured neutral, see `PERF-GAP.md`).
+
+What to do about it:
+
+- **Comparisons within one sweep order are still valid.** If both arms of an
+  A/B sweep the same widths in the same order, whatever the effect is applies
+  to both, and the ratio survives. This is why the A/Bs in `PERF-GAP.md` pin
+  the width list across arms.
+- **A single absolute number is not.** If a specific width's rate is the
+  result, measure that width on a fresh server rather than reading it off the
+  end of a long sweep.
+- **Restart between arms**, which the harness scripts do — and if an arm can
+  drift (thermals, clocks, a cold first run), interleave the arms rather than
+  running all of one and then all of the other.
+
 ### What was measured
 
 Every run opens with the server's model and backend (from `GET /props`) and,
@@ -128,6 +245,10 @@ Options:
       --url <URL>          Base URL of the server [default: http://127.0.0.1:8100]
       --depths <DEPTHS>    Comma-separated context depths to sweep [default: 0]
       --pp <PP>            Prefill mode: comma-separated prompt lengths to sweep, reporting prompt-processing throughput
+      --pp-continue <LENS> Continuation-prefill mode: comma-separated *added* token counts to sweep
+      --decode-cpu         Report the server's CPU time per generated token, with prefill excluded
+      --streams <N>        Concurrency mode: comma-separated stream counts; reports aggregate tok/s
+      --pp-continue-base <N>  Prompt length (tokens) to prime the prefix cache with for --pp-continue [default: 512]
       --gen <N_GEN>        Number of tokens to generate per timed run [default: 128]
       --curve <CURVE>      Curve mode: ONE generation of this many tokens, decode rate bucketed by context [default: 0]
       --bucket <BUCKET>    Bucket width (in context tokens) for --curve [default: 256]
@@ -140,6 +261,10 @@ Options:
       --label <LABEL>      Series name recorded in the history file
       --chart <CHART>      Render the history file to this SVG after measuring
       --chart-only         Only render the chart from an existing history file; measure nothing
+      --chart-png          Also render a PNG beside the chart SVG
+      --chart-scale <MIN:MAX>  Pin the chart's tok/s axis so a pair of charts compare
+      --chart-y-label <TEXT>   Label for the chart's y-axis [default: tok/s (log)]
+      --chart-x-label <TEXT>   Label for the chart's x-axis
       --flamegraph <FILE>  Record a CPU flamegraph of the server over the measured window
       --flamegraph-pid <PID>          Process to profile (default: the server's own, else the URL port's owner)
       --flamegraph-freq <HZ>          Sampling frequency in Hz for --flamegraph [default: 999]
@@ -180,11 +305,11 @@ matching a substring and report what share of samples matched.
 ```sh
 # orangu-server, decode: one profile of the 512-token generation that was timed
 orangu-bench --url http://127.0.0.1:8100 --depths 0 --gen 512 --reps 2 \
-             --flamegraph perf/gemma-orangu-decode.svg --flamegraph-png
+             --flamegraph perf/gemma4-e2b-orangu-decode.svg --flamegraph-png
 
 # llama-server, the same workload through the same harness
 orangu-bench --url http://127.0.0.1:8300 --depths 0 --gen 512 --reps 2 \
-             --flamegraph perf/gemma-llama-decode.svg --flamegraph-png
+             --flamegraph perf/gemma4-e2b-llama-decode.svg --flamegraph-png
 ```
 
 Three files come out of one `--flamegraph out.svg`:
@@ -204,8 +329,8 @@ Beside the files the tool prints what the stacks say, so the common case needs
 no SVG viewer at all:
 
 ```text
-  profile  perf/gemma-orangu-decode.svg (24140 samples over 25s)
-           perf/gemma-orangu-decode.folded
+  profile  perf/gemma4-e2b-orangu-decode.svg (24140 samples over 25s)
+           perf/gemma4-e2b-orangu-decode.folded
            kernel        33.5%
            app/other     22.5%
            kernel:gpu    16.3%
@@ -230,6 +355,42 @@ cannot name stays visible as `app/other` rather than being dropped — which is
 what the leaf table beside it is for: a residual you can read is a claim you can
 check.
 
+### Why `--flamegraph` needs the warmup
+
+`--flamegraph` is **refused** together with `--no-warmup`, and the reason is
+worth knowing because it applies to profiling any server this way.
+
+`perf record -p PID` attaches to the threads that exist at the moment it
+attaches. It does not pick up threads created afterwards. A server builds its
+compute threads lazily, on its first request — and this tool deliberately starts
+the profiler *after* the warmup and *before* the timed window, so that the
+profile covers the measurement and nothing else. With no warmup, the profiler
+attaches while the server is idle and never sees a single compute thread.
+
+The failure is silent and plausible. It does not error; it produces a
+well-formed flamegraph, entirely of the HTTP thread doing TCP reads and futex
+waits, with a confident `cores busy` under it. Measured here: **0.02 cores
+reported against 0.44 actually used.**
+
+So there are two guards:
+
+- The flag combination is rejected outright, with that explanation.
+- Every profile reads the target's CPU time from `/proc/<pid>/stat` at both ends
+  of its own window and compares. If the samples account for less than half of
+  the CPU the kernel says was used, the run prints:
+
+```text
+  WARNING: the profile accounts for 0.02 cores but /proc says the
+           process used 0.44. `perf record -p` does not follow threads
+           created after it attached — run a warmup before profiling so the
+           workload's threads already exist. This profile is not trustworthy.
+```
+
+The `/proc` figure is also stored in the `.meta.json` sidecar as
+`cores_from_proc`, so a saved profile carries the evidence for whether to trust
+itself. The kernel's accounting cannot miss a thread, which is exactly what
+makes it the right thing to check sampling against.
+
 ### Comparing two profiles (`--compare-profiles`)
 
 A flamegraph is normalised to its own total, so two of them side by side cannot
@@ -239,7 +400,7 @@ and puts them in one table — the `--chart-only` of profiling, no server and no
 re-run:
 
 ```sh
-orangu-bench --compare-profiles perf/gemma-orangu-decode.folded,perf/gemma-llama-decode.folded
+orangu-bench --compare-profiles perf/gemma4-e2b-orangu-decode.folded,perf/gemma4-e2b-llama-decode.folded
 ```
 
 ```text
@@ -310,6 +471,71 @@ asks the server for its own pid first (`orangu-server` reports one), and
 otherwise asks the operating system which process owns the port under test —
 both of which identify the process that *answered these requests*, rather than
 one that merely has a matching name.
+
+### Can the engine fill the device? (`--streams`)
+
+Sweeps the number of **concurrent** decode streams and reports the aggregate
+tok/s across them — what a server's capacity actually is, which no single-stream
+number shows.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --streams 1,2,4,8 --gen 160
+```
+
+```
+ streams |    aggregate |  per-stream |   tokens
+------------------------------------------------
+       1 |  37.76 ± 0.00 |       37.76 |      160
+       2 |  40.21 ± 0.00 |       20.10 |      320
+       8 |  45.02 ± 0.00 |        5.63 |     1280
+  gpu busy card1 engine 98%  memory 30% (mean while measuring)
+```
+
+Read it together with the `gpu busy` line, because there are two very different
+reasons the aggregate can stop rising:
+
+- **aggregate flat, engine at ~100%** — the device is full. This is the good
+  case; per-stream falling as 1/n is just fair sharing of a saturated GPU.
+- **aggregate flat, engine well under 100%** — the engine cannot be filled. The
+  work is serialising somewhere the extra requests cannot bypass, and there is
+  capacity being left on the table.
+
+Measured on this rig, the two decode paths in this engine land on opposite sides
+of that: one reaches 98–99% engine occupancy with two streams, the other never
+passes 66% with eight. Same device.
+
+Each stream gets a distinct prompt so no two share a prefix-cache entry and get a
+free ride.
+
+### Was it memory-bound? (`engine` and `memory` busy)
+
+On Linux with an AMD card, every run also reports the mean occupancy of the two
+resources a kernel can run out of, sampled over the measured window from
+`amdgpu`'s `gpu_busy_percent` and `mem_busy_percent`:
+
+```text
+  gpu peak card1 1700Mhz  card2 1600Mhz (while measuring)
+  gpu busy card1 engine 64%  memory 21% (mean while measuring)
+```
+
+This is printed beside the rate because a rate that looks low means completely
+different things at 20% memory occupancy and at 90%:
+
+- **memory high, engine lower** — bandwidth-bound. The kernel is moving as many
+  bytes as the card will give it, and the only lever is moving fewer.
+- **both moderate** — *stalled*. Neither resource is exhausted; the work is
+  waiting on latency, on a dependency chain, or on dispatches too small to fill
+  the machine. Adding bytes or arithmetic will not show up.
+- **engine high, memory low** — compute-bound.
+
+For reference on the rig these docs were written on: a trivial coalesced
+streaming kernel at 204 GB/s reads `memory 84%`; `orangu-server`'s decode reads
+`engine 62% memory 20%`, and its prefill `engine 85% memory 14%`. Neither phase
+is bandwidth-bound, which took a separate experiment to establish every time
+before this line existed.
+
+Counters come from `/sys/class/drm/<card>/device/`; the line is omitted on
+hardware or kernels that do not publish them, rather than printing a zero.
 
 ### The clock the run actually reached
 

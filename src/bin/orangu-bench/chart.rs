@@ -87,7 +87,42 @@ struct Chart {
 /// date collapse to their best, matching how a single run reports its own
 /// repetitions: the chart is read for what a build can do, and a slower rerun
 /// on the same day is the machine being busy, not the build regressing.
-pub fn render(all_records: &[Record], subtitle: &str) -> String {
+/// `scale` pins the tok/s axis instead of fitting it to the data.
+///
+/// Needed the moment a *pair* of charts is drawn — a "before" and an "after" as
+/// two images rather than two lines. Each fitted to its own data, the two look
+/// almost identical however far apart the numbers are, because each fills its
+/// own frame: the reader compares shapes and the axis quietly rescales
+/// underneath them. This is the same failure two flamegraphs have side by side,
+/// and it has the same fix — make the two share a denominator.
+///
+/// Both panels take the same range, so a point at the same height means the
+/// same rate whichever image it is in. `None` fits the axis to the data, which
+/// is right for a single self-contained chart.
+/// Axis labels. Defaulted to this tool's own units, overridable because the
+/// history format is deliberately hand-editable and a two-series file is a
+/// perfectly good way to plot something that is *not* a rate — but a chart that
+/// says "tok/s" over data that is not tok/s is worse than no chart.
+pub struct Labels {
+    pub y: String,
+    pub x: Option<String>,
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Labels {
+            y: "tok/s (log)".to_string(),
+            x: None,
+        }
+    }
+}
+
+pub fn render_labelled(
+    all_records: &[Record],
+    subtitle: &str,
+    scale: Option<(f64, f64)>,
+    axes: Labels,
+) -> String {
     // Current state only: the newest date present, per the module docs.
     let newest_date = all_records
         .iter()
@@ -113,9 +148,21 @@ pub fn render(all_records: &[Record], subtitle: &str) -> String {
         (
             "pp",
             "Prefill — prompt processing",
-            "prompt length (tokens)",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
         ),
-        ("tg", "Decode — token generation", "context length (tokens)"),
+        (
+            "tg",
+            "Decode — token generation",
+            axes.x.as_deref().unwrap_or("context length (tokens)"),
+        ),
+        // `--decode-cpu`'s rows. A third mode rather than reusing `tg`, because
+        // the unit is milliseconds of CPU per token and *lower is better* — put
+        // on the same panel as a tok/s series it would read as a collapse.
+        (
+            "cpu",
+            "Decode — CPU per generated token",
+            axes.x.as_deref().unwrap_or("context depth (tokens)"),
+        ),
     ] {
         // `(label, date) -> context -> best`.
         let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
@@ -236,14 +283,20 @@ pub fn render(all_records: &[Record], subtitle: &str) -> String {
     }
 
     for (idx, chart) in charts.iter().enumerate() {
-        render_chart(&mut s, chart, head_h + legend_h + idx as f64 * PANEL_H);
+        render_chart(
+            &mut s,
+            chart,
+            head_h + legend_h + idx as f64 * PANEL_H,
+            scale,
+            &axes.y,
+        );
     }
 
     s.push_str("</svg>\n");
     s
 }
 
-fn render_chart(s: &mut String, chart: &Chart, oy: f64) {
+fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)>, y_label: &str) {
     let plot_w = WIDTH - PAD_L - PAD_R;
     let plot_h = PANEL_H - PAD_T - PAD_B;
     let x0 = PAD_L;
@@ -259,8 +312,13 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64) {
     let v_max = all.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
     // Decade-aligned bounds, so every gridline is a round number and the ratio
     // between two curves can be read off the axis.
-    let lo = axis_floor(v_min.max(1e-6));
-    let hi = axis_ceil(v_max.max(lo * 1.5));
+    let (lo, hi) = match scale {
+        Some((lo, hi)) => (axis_floor(lo.max(1e-6)), axis_ceil(hi.max(lo * 1.5))),
+        None => {
+            let lo = axis_floor(v_min.max(1e-6));
+            (lo, axis_ceil(v_max.max(lo * 1.5)))
+        }
+    };
 
     // Context starts at 0 (a decode depth really is 0), so the x-axis is linear
     // from zero rather than from the smallest measured length.
@@ -309,11 +367,12 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64) {
     s.push('\n');
     let _ = write!(
         s,
-        r#"<text class="ink-2" x="{:.1}" y="{:.1}" font-size="10" transform="rotate(-90 {:.1} {:.1})" text-anchor="middle">tok/s (log)</text>"#,
+        r#"<text class="ink-2" x="{:.1}" y="{:.1}" font-size="10" transform="rotate(-90 {:.1} {:.1})" text-anchor="middle">{}</text>"#,
         x0 - 46.0,
         y0 + plot_h / 2.0,
         x0 - 46.0,
-        y0 + plot_h / 2.0
+        y0 + plot_h / 2.0,
+        esc(y_label)
     );
     s.push('\n');
 
@@ -377,7 +436,7 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64) {
         for (n, v) in &line.points {
             let _ = write!(
                 s,
-                r#"<circle class="f{ci} mark-ring" cx="{:.1}" cy="{:.1}" r="4"><title>{} · {} · {n} tok · {v:.2} tok/s</title></circle>"#,
+                r#"<circle class="f{ci} mark-ring" cx="{:.1}" cy="{:.1}" r="4"><title>{} · {} · n={n} · {v:.2}</title></circle>"#,
                 px(*n),
                 py(*v),
                 esc(&line.label),
@@ -455,6 +514,29 @@ fn esc(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A mode the chart does not know about is silently dropped — every row is
+    /// filtered by `r.mode == mode`, so an unrecognised one renders a header and
+    /// an empty page. That is exactly what happened when `--decode-cpu` first
+    /// wrote `mode: "cpu"` rows: a chart with a legend and no plot.
+    #[test]
+    fn the_cpu_mode_is_plotted_rather_than_filtered_away() {
+        let recs = [
+            rec("2026-07-29", "decode CPU", "cpu", 0, 14.4),
+            rec("2026-07-29", "decode CPU", "cpu", 1024, 15.7),
+        ];
+        let svg = render_labelled(&recs, "test", None, Labels::default());
+        assert!(
+            svg.contains("CPU per generated token"),
+            "the cpu panel is missing from the SVG"
+        );
+        // Two points means a path with a line in it, not just axes.
+        assert!(
+            svg.matches("<circle").count() >= 2,
+            "expected a marker per point, got {}",
+            svg.matches("<circle").count()
+        );
+    }
+
     fn rec(date: &str, label: &str, mode: &str, n: u32, best: f64) -> Record {
         Record {
             date: date.into(),
@@ -468,8 +550,45 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_axis_puts_the_same_rate_at_the_same_height_in_two_charts() {
+        // The reason `--chart-scale` exists: a "before" chart and an "after"
+        // chart fitted independently each fill their own frame, so two very
+        // different sets of numbers draw almost the same picture. Pinned, a
+        // point's height means the same rate in both.
+        let before = [rec("2026-07-25", "orangu", "pp", 158, 90.0)];
+        let after = [rec("2026-07-25", "orangu", "pp", 158, 450.0)];
+        let scale = Some((50.0, 500.0));
+
+        // The *last* circle, not the first: the legend swatch is a circle too,
+        // and it sits at a fixed height in the header regardless of the data.
+        let y = |svg: &str| -> f64 {
+            let at = svg.rfind("<circle").expect("a data point");
+            let cy = svg[at..].find("cy=\"").expect("cy") + at + 4;
+            svg[cy..].split('"').next().unwrap().parse().unwrap()
+        };
+        let pinned = y(&render_labelled(&before, "t", scale, Labels::default()))
+            - y(&render_labelled(&after, "t", scale, Labels::default()));
+        assert!(
+            pinned > 20.0,
+            "pinned: the 5× faster run must sit visibly higher, got {pinned}px"
+        );
+
+        // Unpinned, each chart's axis re-fits to its own decade, so a 5×
+        // difference all but disappears — the two points land within a few
+        // pixels of each other. That is the failure mode, quantified.
+        let fitted = (y(&render_labelled(&before, "t", None, Labels::default()))
+            - y(&render_labelled(&after, "t", None, Labels::default())))
+        .abs();
+        assert!(
+            fitted < pinned / 10.0,
+            "unpinned should collapse the difference (got {fitted}px against \
+             {pinned}px pinned) — that collapse is what --chart-scale exists to stop"
+        );
+    }
+
+    #[test]
     fn there_are_exactly_two_charts_prefill_and_decode() {
-        let svg = render(
+        let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 158, 89.0),
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
@@ -477,6 +596,8 @@ mod tests {
                 rec("2026-07-25", "orangu", "tg", 1024, 29.0),
             ],
             "test",
+            None,
+            Labels::default(),
         );
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>\n"));
         assert_eq!(svg.matches("Prefill — prompt processing").count(), 1);
@@ -487,13 +608,15 @@ mod tests {
 
     #[test]
     fn a_series_across_contexts_is_one_line_not_scattered_points() {
-        let svg = render(
+        let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 158, 89.0),
                 rec("2026-07-25", "orangu", "pp", 574, 114.0),
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
             ],
             "t",
+            None,
+            Labels::default(),
         );
         // One polyline through all three contexts.
         assert_eq!(svg.matches("<polyline").count(), 1);
@@ -502,7 +625,7 @@ mod tests {
 
     #[test]
     fn each_engine_gets_its_own_line_in_its_own_colour() {
-        let svg = render(
+        let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 158, 89.0),
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
@@ -510,6 +633,8 @@ mod tests {
                 rec("2026-07-25", "llama.cpp", "pp", 1120, 1062.0),
             ],
             "t",
+            None,
+            Labels::default(),
         );
         assert_eq!(svg.matches("<polyline").count(), 2);
         assert!(svg.contains("#2a78d6") && svg.contains("#eb6834"));
@@ -535,7 +660,7 @@ mod tests {
     /// when one of them no longer exists.
     #[test]
     fn only_the_newest_date_is_drawn() {
-        let svg = render(
+        let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 158, 60.0),
                 rec("2026-07-25", "orangu", "pp", 1120, 80.0),
@@ -545,6 +670,8 @@ mod tests {
                 rec("2026-08-01", "orangu", "pp", 1120, 112.0),
             ],
             "t",
+            None,
+            Labels::default(),
         );
         // One series, one line — not three.
         assert_eq!(svg.matches("<polyline").count(), 1);
@@ -560,12 +687,14 @@ mod tests {
 
     #[test]
     fn the_log_axis_covers_both_engines_with_round_gridlines() {
-        let svg = render(
+        let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
                 rec("2026-07-25", "llama.cpp", "pp", 1120, 1062.0),
             ],
             "t",
+            None,
+            Labels::default(),
         );
         assert!(svg.contains("tok/s (log)"));
         // 1/2/5 bounds hugging 112..1062, not a whole decade either side.
@@ -578,7 +707,12 @@ mod tests {
 
     #[test]
     fn markup_from_a_label_is_escaped_not_emitted() {
-        let svg = render(&[rec("2026-07-25", "a<b>&\"c", "pp", 8, 1.0)], "t");
+        let svg = render_labelled(
+            &[rec("2026-07-25", "a<b>&\"c", "pp", 8, 1.0)],
+            "t",
+            None,
+            Labels::default(),
+        );
         assert!(!svg.contains("a<b>"));
         assert!(svg.contains("a&lt;b&gt;&amp;&quot;c"));
     }
@@ -589,7 +723,7 @@ mod tests {
         for i in 0..SERIES_COLORS.len() + 2 {
             recs.push(rec("2026-07-25", &format!("build{i}"), "pp", 1024, 10.0));
         }
-        let svg = render(&recs, "t");
+        let svg = render_labelled(&recs, "t", None, Labels::default());
         assert!(!svg.contains(&format!(">build{}<", SERIES_COLORS.len() + 1)));
         assert!(svg.contains(">build0<"));
     }

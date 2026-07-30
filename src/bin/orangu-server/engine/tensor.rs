@@ -452,6 +452,40 @@ impl Default for RopeParams {
     }
 }
 
+impl RopeParams {
+    /// The three per-call YaRN constants — the `[corr_lo, corr_hi]` ramp band
+    /// and ggml's `mscale` — that depend on the hyperparameters alone and not
+    /// on the position, the head or the pair.
+    ///
+    /// Split out of [`rope_apply_params_inplace`] so the GPU shaders can be
+    /// handed the *same* values rather than re-deriving them: they must agree
+    /// bit-for-bit with this function for the cross-check tests to mean
+    /// anything, and a second transcription of `ggml_rope_yarn_corr_dims` is
+    /// exactly the kind that agrees on the models under test and diverges on
+    /// the next one.
+    ///
+    /// With `ext_factor == 0` (every non-YaRN model) this is
+    /// `(0.0, 0.0, attn_factor)`, which disables the ramp and leaves the
+    /// magnitude scale as whatever the file asked for.
+    pub fn yarn_terms(&self) -> (f32, f32, f32) {
+        if self.ext_factor == 0.0 {
+            return (0.0, 0.0, self.attn_factor);
+        }
+        let (lo, hi) = yarn_corr_dims(
+            self.rope_dim,
+            self.n_ctx_orig,
+            self.freq_base,
+            self.beta_fast,
+            self.beta_slow,
+        );
+        (
+            lo,
+            hi,
+            self.attn_factor * (1.0 + 0.1 * (1.0 / self.freq_scale).ln()),
+        )
+    }
+}
+
 /// ggml's `ggml_rope_yarn_corr_dim` — the pair index at which a rotation of
 /// `n_rot` full turns fits inside the original context.
 fn yarn_corr_dim(n_dims: usize, n_ctx_orig: usize, n_rot: f32, base: f32) -> f32 {
@@ -487,46 +521,45 @@ pub fn rope_apply_params_inplace(
     debug_assert_eq!(x.len(), n_head * head_dim);
     let rope_dim = params.rope_dim;
     let half = rope_dim / 2;
-    let (corr_lo, corr_hi) = if params.ext_factor != 0.0 {
-        yarn_corr_dims(
-            rope_dim,
-            params.n_ctx_orig,
-            params.freq_base,
-            params.beta_fast,
-            params.beta_slow,
-        )
-    } else {
-        (0.0, 0.0)
-    };
-    // ggml folds this correction into mscale once per call, not per pair,
-    // and only when the YaRN ramp is active.
-    let mscale = if params.ext_factor != 0.0 {
-        params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
-    } else {
-        params.attn_factor
-    };
+    // ggml folds the mscale correction in once per call, not per pair, and
+    // only when the YaRN ramp is active — see [`RopeParams::yarn_terms`],
+    // which the GPU shaders are handed the results of.
+    let (corr_lo, corr_hi, mscale) = params.yarn_terms();
+
+    // The rotation for pair `i` depends on `i` and `pos` — **not** on the head.
+    // Computed inside the head loop it is a `powf` and a `sin_cos` per
+    // (head, pair) when only `half` of each are distinct: 24x redundant on
+    // Llama-3.2-3B's Q, 8x on its K, and identical again for every layer at the
+    // same position. It showed up as `__sincosf_fma` in decode profiles.
+    //
+    // Built once here and read by the head loop below, which keeps that loop's
+    // sequential access to `x` — computing per-pair and applying across heads
+    // would remove the same redundancy but stride through `x` instead.
+    let mut rot = Vec::with_capacity(half);
+    for i in 0..half {
+        let mut freq = params.freq_base.powf(-2.0 * i as f32 / rope_dim as f32);
+        if let Some(ff) = freq_factors {
+            freq /= ff[i];
+        }
+        let theta_extrap = pos as f32 * freq;
+        let theta = if params.ext_factor != 0.0 {
+            // `rope_yarn_ramp`: 1 at the low end of the band (pure
+            // interpolation) falling to 0 above it.
+            let y = (i as f32 - corr_lo) / (corr_hi - corr_lo).max(0.001);
+            let ramp = 1.0 - y.clamp(0.0, 1.0);
+            let mix = ramp * params.ext_factor;
+            let theta_interp = params.freq_scale * theta_extrap;
+            theta_interp * (1.0 - mix) + theta_extrap * mix
+        } else {
+            params.freq_scale * theta_extrap
+        };
+        let (sin, cos) = theta.sin_cos();
+        rot.push((sin * mscale, cos * mscale));
+    }
 
     for h in 0..n_head {
         let head = &mut x[h * head_dim..(h + 1) * head_dim];
-        for i in 0..half {
-            let mut freq = params.freq_base.powf(-2.0 * i as f32 / rope_dim as f32);
-            if let Some(ff) = freq_factors {
-                freq /= ff[i];
-            }
-            let theta_extrap = pos as f32 * freq;
-            let theta = if params.ext_factor != 0.0 {
-                // `rope_yarn_ramp`: 1 at the low end of the band (pure
-                // interpolation) falling to 0 above it.
-                let y = (i as f32 - corr_lo) / (corr_hi - corr_lo).max(0.001);
-                let ramp = 1.0 - y.clamp(0.0, 1.0);
-                let mix = ramp * params.ext_factor;
-                let theta_interp = params.freq_scale * theta_extrap;
-                theta_interp * (1.0 - mix) + theta_extrap * mix
-            } else {
-                params.freq_scale * theta_extrap
-            };
-            let (sin, cos) = theta.sin_cos();
-            let (sin, cos) = (sin * mscale, cos * mscale);
+        for (i, &(sin, cos)) in rot.iter().enumerate() {
             // NEOX rotates `i` against `i + rope_dim/2`; NORM rotates the
             // consecutive pair `2i`/`2i+1`.
             let (lo, hi) = match params.layout {

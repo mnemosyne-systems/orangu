@@ -52,6 +52,25 @@
 //! Weight matrices stay `mmap`-backed and are dequantized one row at a time
 //! via `QuantMatrix`, exactly as in `arch::llama`; only the small per-element
 //! norm tensors are eagerly dequantized.
+//!
+//! **The chained decode path.** [`PhiModel::record_decode_forward`] records a
+//! whole decode step as one GPU submission, the same shape `arch::llama` and
+//! `arch::mistral` use. None of the four differences above stops it:
+//!
+//! - (3) and (4) are *parameters* of the fused chain — it takes `rope_dim` and
+//!   `freq_factors`, and carries a RoPE magnitude scale via `vulkan::RopeYarn`,
+//!   which `attn_factor` reaches as the `ext_factor == 0` case.
+//! - (1) and (2) are one blocker twice, and it is a **naming** problem rather
+//!   than a data one: the chain wants `wq`/`wk`/`wv` and `ffn_gate`/`ffn_up`
+//!   separately, and this architecture stores each group concatenated. The
+//!   bytes are already laid out correctly — rows are fixed-size and
+//!   self-contained — so `QuantMatrix::rows` names the halves without copying
+//!   any of them. See [`PhiLayer::qkv_views`] and [`PhiLayer::ffn_gate_up`].
+//!
+//! What that required first was widening `QuantMatrix::cache_key`, which was
+//! `(mmap_ptr, start)` and so could not distinguish a view of the leading rows
+//! from the whole tensor — every backend cache addressed by it would have
+//! handed the view the parent's buffers.
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -84,6 +103,37 @@ struct PhiLayer {
     /// there is no separate `ffn_gate.weight` for this architecture.
     w_up: QuantMatrix,
     w_down: QuantMatrix,
+}
+
+impl PhiLayer {
+    /// Q, K and V as three separate matrices, whichever way the checkpoint
+    /// stored them — row-range views over the fused `attn_qkv.weight`, or the
+    /// already-separate tensors.
+    ///
+    /// The offsets are upstream's (`build_qkv`'s three `ggml_view_3d` calls):
+    /// Q at `0`, K at `n_embd`, V at `n_embd + kv_dim`. Applying them to the
+    /// *weight* rather than to the projection's output is what lets prefill and
+    /// decode share one set of matrices, and drops a whole-batch CPU copy.
+    fn qkv_views(&self, n_embd: usize, kv_dim: usize) -> (QuantMatrix, QuantMatrix, QuantMatrix) {
+        match &self.qkv {
+            QkvProjection::Fused(wqkv) => (
+                wqkv.rows(0, n_embd),
+                wqkv.rows(n_embd, kv_dim),
+                wqkv.rows(n_embd + kv_dim, kv_dim),
+            ),
+            QkvProjection::Split { wq, wk, wv } => (wq.clone(), wk.clone(), wv.clone()),
+        }
+    }
+
+    /// The gate and up halves of `ffn_up.weight` as separate matrices.
+    ///
+    /// **Gate is the first half.** ggml's `ggml_vec_swiglu_f32` with
+    /// `swapped = 0` activates the row start and multiplies by `+nc`; swapping
+    /// these produces fluent-looking but wrong text, not a crash.
+    fn ffn_gate_up(&self) -> (QuantMatrix, QuantMatrix) {
+        let n_ff = self.w_up.out_dim / 2;
+        (self.w_up.rows(0, n_ff), self.w_up.rows(n_ff, n_ff))
+    }
 }
 
 pub struct PhiModel {
@@ -287,6 +337,151 @@ impl PhiModel {
     /// Runs every transformer layer and returns the pre-final-norm hidden
     /// state for every token (`[n_tokens, n_embd]`) — shared by next-token
     /// prediction and pooled embeddings, as in `arch::llama`.
+    /// This architecture's RoPE as the fused chain's terms.
+    ///
+    /// `phi3` sets no YaRN ramp — `ext_factor` stays 0, which disables the
+    /// interpolation band — but it does set `rope.scaling.attn_factor`, a
+    /// magnitude scale on cos/sin. That is the `ext_factor == 0` case of the
+    /// same `RopeYarn` the chain gained for `arch::mistral`, so it is built
+    /// through the shared `RopeParams` rather than assembled by hand.
+    fn rope_yarn(&self) -> crate::engine::backend::vulkan::RopeYarn {
+        crate::engine::backend::vulkan::RopeYarn::from_params(&tensor::RopeParams {
+            rope_dim: self.config.rope_dim,
+            freq_base: self.config.rope_freq_base,
+            attn_factor: self.rope_attn_factor,
+            layout: tensor::RopeLayout::Neox,
+            ..tensor::RopeParams::default()
+        })
+    }
+
+    /// One decode step as a single GPU submission, or `None` when this model or
+    /// this step is not one the fused chain can describe.
+    ///
+    /// The two tensors this architecture concatenates — `attn_qkv.weight` and
+    /// `ffn_up.weight` — reach the chain as row-range views
+    /// ([`PhiLayer::qkv_views`], [`PhiLayer::ffn_gate_up`]), so nothing is
+    /// copied and the chain sees the five separate matrices it expects.
+    fn record_decode_forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::engine::backend::vulkan::{
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput,
+        };
+
+        if tokens.len() != 1
+            || crate::engine::arch::llama::no_fused_qkv()
+            || crate::engine::arch::llama::no_fused_post_attention()
+        {
+            return None;
+        }
+        let vulkan = self.backend.as_vulkan()?;
+        if !vulkan.prefill_attention_enabled() {
+            return None;
+        }
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let head_dim = self.head_dim();
+        let kv_dim = self.kv_dim();
+        let tok = tokens[0] as usize;
+        if tok >= cfg.n_vocab {
+            return None;
+        }
+        let x0 = self.tok_embeddings.row(tok).to_vec();
+        let yarn = self.rope_yarn();
+
+        let mut encoder = vulkan.new_encoder("orangu-server phi decode");
+        // The views must outlive the recording that borrows them, so they are
+        // built into a vector alongside the output buffers rather than inside
+        // the loop body.
+        let views: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
+            .collect();
+        let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
+        for (il, layer) in self.layers.iter().enumerate() {
+            let ((wq, wk, wv), (ffn_gate, ffn_up)) = &views[il];
+            let x_input = match bufs.last() {
+                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                None => GpuInput::Cpu(&x0),
+            };
+            let out = vulkan.record_fused_layer(
+                &mut encoder,
+                FusedLayerInput {
+                    x: x_input,
+                    // Partial NEOX RoPE: only the leading `rope_dim` of each
+                    // head rotates, which the chain takes as a parameter.
+                    pairing: tensor::RopeLayout::Neox,
+                    yarn,
+                    // SwiGLU, no per-head Q/K norms, no post-norms, no
+                    // projection biases, and V is not normalized.
+                    activation: FfnActivation::Swiglu,
+                    normalize_v: false,
+                    attn_norm: &layer.attn_norm,
+                    wq,
+                    q_bias: None,
+                    q_norm: None,
+                    kv: Some(FusedAttnProjection {
+                        wk,
+                        wv: Some(wv),
+                        k_bias: None,
+                        v_bias: None,
+                        k_norm: None,
+                    }),
+                    n_head: cfg.n_head,
+                    n_head_kv: cfg.n_head_kv,
+                    head_dim,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    // LongRoPE's per-pair divisor, chosen once at load time.
+                    freq_factors: self.rope_freq_factors.as_deref(),
+                    eps: cfg.rms_eps,
+                    pos: start_pos,
+                    // Plain causal attention — upstream disables SWA for this
+                    // architecture, and so does this module.
+                    window_start: 0,
+                    window: None,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    cache: &mut cache.layers[il],
+                    wo: &layer.wo,
+                    attn_post_norm: None,
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down: &layer.w_down,
+                    ffn_post_norm: None,
+                    ple: None,
+                    layer_output_scale: None,
+                    batch_slot: slot_id,
+                    attn_ts: None,
+                },
+            );
+            bufs.push(out);
+        }
+
+        let (last_buf, last_offset) = bufs.last()?;
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            GpuInput::Gpu(last_buf, (*last_offset / 4) as usize),
+            &self.output_norm,
+            cfg.rms_eps,
+            n_embd,
+        );
+        // `slot_id + 1`: op resources are keyed by `(weight, batch_slot)`, and
+        // the vocab projection must not share a slot with the layer chain.
+        vulkan.record_full_matmul(
+            &mut encoder,
+            GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
+    }
+
     fn run_layers(
         &self,
         cache: &mut KvCache,
@@ -312,37 +507,45 @@ impl PhiModel {
             let mut normed = x.clone();
             tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
 
-            let (mut q, mut k, v) = match &layer.qkv {
-                QkvProjection::Fused(wqkv) => {
-                    let qkv = self.backend.matmul(&normed, n_tokens, wqkv);
-                    split_qkv(&qkv, n_tokens, n_embd, kv_dim)
-                }
-                QkvProjection::Split { wq, wk, wv } => {
-                    // Independent given the same normed input — one batched
-                    // dispatch rather than three round-trips, matching
-                    // `arch::llama`.
-                    let mut out = self.backend.matmul_batch(&[
-                        MatmulOp {
-                            x: &normed,
-                            n_tokens,
-                            w: wq,
-                        },
-                        MatmulOp {
-                            x: &normed,
-                            n_tokens,
-                            w: wk,
-                        },
-                        MatmulOp {
-                            x: &normed,
-                            n_tokens,
-                            w: wv,
-                        },
-                    ]);
-                    let v = out.pop().unwrap();
-                    let k = out.pop().unwrap();
-                    let q = out.pop().unwrap();
-                    (q, k, v)
-                }
+            // Q/K/V as three matrices whichever way the checkpoint stored
+            // them, then one batched dispatch — independent given the same
+            // normed input — rather than three round trips, matching
+            // `arch::llama`.
+            //
+            // For a fused checkpoint these are row *views*, so this both drops
+            // `split_qkv`'s whole-batch CPU copy and — the reason it matters
+            // more — keeps prefill and decode addressing the **same** weight
+            // bytes. Uploading the fused tensor here and its views in the
+            // decode chain would leave the GPU holding two copies of the
+            // largest weights in the model.
+            let (wq, wk, wv) = layer.qkv_views(n_embd, kv_dim);
+
+            // Deliberately *not* `fused_attention_prefill`, which this shape is
+            // eligible for and which `arch::llama` does use: measured neutral
+            // here (−0.6% on Phi-4-mini) and a clear loss on the sibling this
+            // was ported alongside. See PERF-GAP.md item 10.
+            let (mut q, mut k, v) = {
+                let mut out = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &wq,
+                    },
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &wk,
+                    },
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &wv,
+                    },
+                ]);
+                let v = out.pop().unwrap();
+                let k = out.pop().unwrap();
+                let q = out.pop().unwrap();
+                (q, k, v)
             };
 
             let layer_cache = &mut cache.layers[layer_idx];
@@ -374,8 +577,8 @@ impl PhiModel {
                 );
             }
 
-            // Plain causal attention -- no sliding window, matching upstream's own
-            // disabling of it for this architecture (see the module doc).
+            // Plain causal attention -- no sliding window, matching
+            // upstream's own disabling of it for this architecture.
             let mut attn_out: Vec<f32> = Vec::new();
             crate::engine::attention::attention(
                 &mut attn_out,
@@ -394,6 +597,39 @@ impl PhiModel {
                 },
                 |t| (0, start_pos + t),
             );
+
+            // One submission for `wo` → residual → FFN norm → gate/up → SwiGLU
+            // → `down` → residual, instead of three blocking round trips.
+            //
+            // The chain wants gate and up as separate matrices, which is what
+            // `ffn_gate_up`'s row views name — the same halves the `else`
+            // branch below splits out of the *result*, and the sequence that
+            // branch runs is what the chain is cross-checked against.
+            let (w_gate, w_up_half) = layer.ffn_gate_up();
+            let fused = self
+                .backend
+                .as_vulkan()
+                .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
+                .and_then(|vulkan| {
+                    vulkan.fused_post_attention_prefill(
+                        crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                        &x,
+                        n_tokens,
+                        &layer.wo,
+                        None,
+                        &layer.ffn_norm,
+                        &w_gate,
+                        &w_up_half,
+                        &layer.w_down,
+                        None,
+                        cfg.rms_eps,
+                        crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                    )
+                });
+            if let Some(out) = fused {
+                x = out;
+                continue;
+            }
 
             let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
             tensor::add_inplace(&mut x, &attn_proj);
@@ -421,34 +657,11 @@ impl PhiModel {
     }
 }
 
-/// Splits a fused `[n_tokens, n_embd + 2*kv_dim]` QKV projection into
-/// separate, per-token-contiguous `q`/`k`/`v` buffers.
-///
-/// The offsets are upstream's (`build_qkv`'s three `ggml_view_3d` calls): Q
-/// first at `0`, then K at `n_embd`, then V at `n_embd + kv_dim`. The
-/// resulting layout is what the rest of this module — RoPE, the KV cache
-/// push, `multi_head_attention` — already expects from a split projection,
-/// so nothing downstream needs to know which path produced it.
-fn split_qkv(
-    qkv: &[f32],
-    n_tokens: usize,
-    n_embd: usize,
-    kv_dim: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let stride = n_embd + 2 * kv_dim;
-    debug_assert_eq!(qkv.len(), n_tokens * stride);
-    let mut q = Vec::with_capacity(n_tokens * n_embd);
-    let mut k = Vec::with_capacity(n_tokens * kv_dim);
-    let mut v = Vec::with_capacity(n_tokens * kv_dim);
-    for row in qkv.chunks_exact(stride) {
-        q.extend_from_slice(&row[..n_embd]);
-        k.extend_from_slice(&row[n_embd..n_embd + kv_dim]);
-        v.extend_from_slice(&row[n_embd + kv_dim..]);
-    }
-    (q, k, v)
-}
-
 impl ModelForward for PhiModel {
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_vulkan()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }
@@ -462,8 +675,13 @@ impl ModelForward for PhiModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
+        // A single-token step the fused chain can describe goes through
+        // `record_decode_forward`; `None` falls through to the path below.
+        if let Some(logits) = self.record_decode_forward(cache, tokens, start_pos, slot_id) {
+            return Ok(logits);
+        }
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
@@ -497,24 +715,77 @@ mod tests {
     /// every element names its own (token, section, index) — so a swapped
     /// K/V, an off-by-`kv_dim` offset, or a row-vs-column transposition each
     /// produce a visibly wrong value rather than a plausible one.
+    /// The offsets `qkv_views` cuts at are upstream's (`build_qkv`'s three
+    /// `ggml_view_3d` calls): Q first at `0`, then K at `n_embd`, then V at
+    /// `n_embd + kv_dim`. Getting them wrong slices every head at the wrong
+    /// place and produces confidently wrong text, not an error.
     #[test]
-    fn split_qkv_slices_q_then_k_then_v() {
-        let (n_tokens, n_embd, kv_dim) = (2, 4, 2);
-        let stride = n_embd + 2 * kv_dim;
-        // Token t's row: q = 100*t + 0..4, k = 100*t + 10..12, v = 100*t + 20..22.
-        let mut qkv = Vec::new();
-        for t in 0..n_tokens {
-            let base = 100.0 * t as f32;
-            qkv.extend((0..n_embd).map(|i| base + i as f32));
-            qkv.extend((0..kv_dim).map(|i| base + 10.0 + i as f32));
-            qkv.extend((0..kv_dim).map(|i| base + 20.0 + i as f32));
+    fn qkv_views_slice_q_then_k_then_v() {
+        use crate::engine::loader::test_quant_matrix;
+        let (n_embd, kv_dim, in_dim) = (4usize, 2usize, 64usize);
+        let out_dim = n_embd + 2 * kv_dim;
+        // Q8_0: 32 weights per block, 2 scale bytes + 32 value bytes. Row `r`
+        // is filled with the byte `r + 1`, so a view's first row names itself.
+        let row_bytes = in_dim / 32 * 34;
+        let mut bytes = vec![0u8; row_bytes * out_dim];
+        for r in 0..out_dim {
+            for b in &mut bytes[r * row_bytes..(r + 1) * row_bytes] {
+                *b = (r + 1) as u8;
+            }
         }
-        assert_eq!(qkv.len(), n_tokens * stride);
+        let layer = PhiLayer {
+            attn_norm: Vec::new(),
+            qkv: QkvProjection::Fused(test_quant_matrix(&bytes, 8, in_dim, out_dim)),
+            wo: test_quant_matrix(&bytes, 8, in_dim, out_dim),
+            ffn_norm: Vec::new(),
+            w_up: test_quant_matrix(&bytes, 8, in_dim, out_dim),
+            w_down: test_quant_matrix(&bytes, 8, in_dim, out_dim),
+        };
 
-        let (q, k, v) = split_qkv(&qkv, n_tokens, n_embd, kv_dim);
-        assert_eq!(q, vec![0.0, 1.0, 2.0, 3.0, 100.0, 101.0, 102.0, 103.0]);
-        assert_eq!(k, vec![10.0, 11.0, 110.0, 111.0]);
-        assert_eq!(v, vec![20.0, 21.0, 120.0, 121.0]);
+        let (wq, wk, wv) = layer.qkv_views(n_embd, kv_dim);
+        assert_eq!(
+            (wq.out_dim, wk.out_dim, wv.out_dim),
+            (n_embd, kv_dim, kv_dim)
+        );
+        // Each view's first row is the row at its offset in the fused tensor.
+        assert_eq!(wq.raw_bytes()[0], 1);
+        assert_eq!(wk.raw_bytes()[0], (n_embd + 1) as u8);
+        assert_eq!(wv.raw_bytes()[0], (n_embd + kv_dim + 1) as u8);
+        // And the three name disjoint byte ranges, so no backend cache can
+        // confuse them for each other or for the tensor they came from.
+        let keys = [wq.cache_key(), wk.cache_key(), wv.cache_key()];
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+    }
+
+    /// Gate is the **first** half of `ffn_up.weight`: ggml's
+    /// `ggml_vec_swiglu_f32` with `swapped = 0` activates the row start.
+    /// Swapping these produces fluent-looking but wrong text, not a crash.
+    #[test]
+    fn ffn_gate_up_puts_gate_first() {
+        use crate::engine::loader::test_quant_matrix;
+        let (in_dim, n_ff) = (64usize, 3usize);
+        let row_bytes = in_dim / 32 * 34;
+        let mut bytes = vec![0u8; row_bytes * 2 * n_ff];
+        for r in 0..2 * n_ff {
+            for b in &mut bytes[r * row_bytes..(r + 1) * row_bytes] {
+                *b = (r + 1) as u8;
+            }
+        }
+        let layer = PhiLayer {
+            attn_norm: Vec::new(),
+            qkv: QkvProjection::Fused(test_quant_matrix(&bytes, 8, in_dim, 2 * n_ff)),
+            wo: test_quant_matrix(&bytes, 8, in_dim, 2 * n_ff),
+            ffn_norm: Vec::new(),
+            w_up: test_quant_matrix(&bytes, 8, in_dim, 2 * n_ff),
+            w_down: test_quant_matrix(&bytes, 8, in_dim, 2 * n_ff),
+        };
+        let (gate, up) = layer.ffn_gate_up();
+        assert_eq!((gate.out_dim, up.out_dim), (n_ff, n_ff));
+        assert_eq!(gate.raw_bytes()[0], 1, "gate must be the first half");
+        assert_eq!(up.raw_bytes()[0], (n_ff + 1) as u8);
     }
 }
 

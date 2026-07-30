@@ -494,7 +494,20 @@ fn run(
                 recent_tokens: &history[recent_start..],
                 repeat_penalty: sampler.repeat_penalty(),
             });
-            match model.forward_maybe_sampling(
+            // GPU submissions for this one decode step. `gemma.rs` had this
+            // instrumentation privately; it belongs here, because the number it
+            // reports is *the* difference between the two decode paths and
+            // cannot be compared across architectures from inside one of them.
+            // A decode step that is one submission lets concurrent requests
+            // interleave on the GPU; one that is two hundred does not, and
+            // `PERF-GAP.md` G3 measures that as a 2x aggregate-throughput
+            // ceiling. Costs a cached env read and one atomic load when the
+            // flag is on, nothing when it is off.
+            let submissions_before = gpu_trace()
+                .then(|| model.vulkan_backend())
+                .flatten()
+                .map(|v| v.submission_count());
+            let outcome = model.forward_maybe_sampling(
                 cache
                     .as_mut()
                     .expect("cache is always Some between iterations"),
@@ -502,7 +515,16 @@ fn run(
                 start_pos,
                 greedy_sample,
                 guard.id(),
-            ) {
+            );
+            if let Some(before) = submissions_before
+                && let Some(v) = model.vulkan_backend()
+            {
+                eprintln!(
+                    "orangu-server: [gpu-trace] {} GPU submissions for this decode step (pos {start_pos})",
+                    v.submission_count() - before
+                );
+            }
+            match outcome {
                 Ok(ForwardOutcome::Token(t)) => t,
                 Ok(ForwardOutcome::Logits(l)) => sampler.sample(&l, &history),
                 Err(err) => {
@@ -574,6 +596,14 @@ fn run(
 /// many trailing tokens must match a earlier spot in the context to trigger a
 /// draft, and `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from
 /// there. See `Self::speculative_next`.
+/// Whether `ORANGU_GPU_TRACE` is set, cached.
+///
+/// Read once — this sits in the decode loop, which runs once per token.
+fn gpu_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("ORANGU_GPU_TRACE").is_some())
+}
+
 fn speculative_config() -> Option<(usize, usize)> {
     if std::env::var("ORANGU_SPECULATIVE").is_err() {
         return None;

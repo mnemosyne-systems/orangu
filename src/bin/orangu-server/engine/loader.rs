@@ -311,13 +311,56 @@ impl QuantMatrix {
         &self.bytes[self.start..self.start + self.row_bytes * self.out_dim]
     }
 
+    /// A row-range **view** — the same bytes, no copy, describing `count`
+    /// output units starting at row `first`.
+    ///
+    /// This is what lets an architecture whose checkpoint concatenates several
+    /// projections into one tensor (`phi3`'s `attn_qkv.weight`, and its
+    /// `ffn_up.weight` holding gate and up together) hand the rest of the
+    /// engine the separate matrices it expects. Rows are fixed-size and
+    /// self-contained — `row_bytes` covers a whole number of quantization
+    /// blocks, since blocks run along `in_dim` — so a row boundary is always a
+    /// valid place to cut.
+    ///
+    /// Panics rather than truncates on an out-of-range range: every caller
+    /// derives it from a validated tensor shape, so a bad range is a loader
+    /// bug, and silently returning fewer rows would surface as wrong output
+    /// rather than as an error.
+    pub fn rows(&self, first: usize, count: usize) -> QuantMatrix {
+        assert!(
+            first + count <= self.out_dim,
+            "row range {first}..{} exceeds out_dim {}",
+            first + count,
+            self.out_dim,
+        );
+        QuantMatrix {
+            bytes: self.bytes.clone(),
+            ggml_type: self.ggml_type,
+            start: self.start + first * self.row_bytes,
+            row_bytes: self.row_bytes,
+            in_dim: self.in_dim,
+            out_dim: count,
+        }
+    }
+
     /// A stable identity for this tensor's byte range, valid for as long as
     /// the underlying `mmap` is kept alive (the model's whole lifetime) —
     /// lets a GPU backend cache an uploaded copy of this matrix keyed by
     /// identity, so a weight already on the GPU isn't re-uploaded on every
     /// `matmul` call (every decode step reuses the same weight tensors).
+    ///
+    /// `(absolute start address, byte length)`, **not** `(mmap base, start)`.
+    /// The two are equivalent for whole tensors and differ for the row-range
+    /// views [`QuantMatrix::rows`] returns: a view of the leading rows shares
+    /// its parent's `start`, so a key that omitted the length would hand the
+    /// view every cache entry belonging to the whole tensor — the same buffer,
+    /// the same bind groups, the wrong output width. Including the length makes
+    /// the key a complete description of the range it names.
     pub fn cache_key(&self) -> (usize, usize) {
-        (self.bytes.as_ptr() as usize, self.start)
+        (
+            self.bytes.as_ptr() as usize + self.start,
+            self.row_bytes * self.out_dim,
+        )
     }
 }
 
@@ -857,6 +900,66 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[in_dim, out_dim]` Q8_0 matrix whose row `r` is filled with the
+    /// byte `r + 1`, so a view can be checked to start where it claims.
+    fn patterned_matrix(in_dim: usize, out_dim: usize) -> QuantMatrix {
+        // Q8_0: 32 weights per block, 2 scale bytes + 32 value bytes.
+        let row_bytes = in_dim / 32 * 34;
+        let mut bytes = vec![0u8; row_bytes * out_dim];
+        for r in 0..out_dim {
+            for b in &mut bytes[r * row_bytes..(r + 1) * row_bytes] {
+                *b = (r + 1) as u8;
+            }
+        }
+        test_quant_matrix(&bytes, 8, in_dim, out_dim)
+    }
+
+    #[test]
+    fn rows_view_starts_where_it_says_and_keeps_the_row_width() {
+        let m = patterned_matrix(64, 8);
+        let tail = m.rows(3, 5);
+        assert_eq!(tail.out_dim, 5);
+        assert_eq!(tail.in_dim, m.in_dim);
+        assert_eq!(tail.row_bytes(), m.row_bytes());
+        // The view's row 0 must be the parent's row 3, byte for byte.
+        assert_eq!(
+            tail.raw_bytes()[..tail.row_bytes()],
+            m.raw_bytes()[3 * m.row_bytes()..4 * m.row_bytes()],
+        );
+        assert_eq!(tail.raw_bytes().len(), 5 * m.row_bytes());
+    }
+
+    /// The regression test for the reason [`QuantMatrix::cache_key`] carries a
+    /// length. A view of the *leading* rows shares its parent's start address,
+    /// so a key of `(mmap base, start)` — what this returned before row views
+    /// existed — cannot tell the two apart, and every backend cache addressed
+    /// by it would hand the view the whole tensor's buffers and bind groups.
+    #[test]
+    fn cache_key_distinguishes_a_leading_row_view_from_the_whole_tensor() {
+        let m = patterned_matrix(64, 8);
+        let head = m.rows(0, 4);
+        assert_eq!(
+            head.cache_key().0,
+            m.cache_key().0,
+            "a leading view does start at the same address — which is the trap",
+        );
+        assert_ne!(
+            head.cache_key(),
+            m.cache_key(),
+            "leading view and whole tensor must not share a cache key",
+        );
+        // And the two halves of a split must differ from each other.
+        assert_ne!(m.rows(0, 4).cache_key(), m.rows(4, 4).cache_key());
+        // A view spanning everything *is* the tensor, and may share its key.
+        assert_eq!(m.rows(0, 8).cache_key(), m.cache_key());
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds out_dim")]
+    fn rows_view_rejects_a_range_past_the_end() {
+        patterned_matrix(64, 8).rows(6, 4);
+    }
 
     #[test]
     fn resolve_arch_family_accepts_llama_style_architectures() {

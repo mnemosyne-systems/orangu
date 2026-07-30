@@ -160,7 +160,7 @@ struct Meta {
 }
 
 /// `ElemMeta` in `vulkan_shaders::ELEM_META` — `#[repr(C)]` so its layout
-/// matches WGSL's `struct ElemMeta { len: u32, _pad0: u32, extra: f32,
+/// matches WGSL's `struct ElemMeta { len: u32, aux: u32, extra: f32,
 /// out_scale: f32 }` field-for-field. `extra` is `eps` for the RMSNorm
 /// pipeline, the multiplier for the scale pipeline, and unused (left `0.0`) for
 /// add/mul/gelu. `out_scale` is `layer_output_scale` for the
@@ -171,7 +171,12 @@ struct Meta {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ElemMeta {
     len: u32,
-    _pad0: u32,
+    /// A second integer whose meaning is the shader's: the KV-cast shader
+    /// reads it as a destination `offset`, the bias-add shader as the `row`
+    /// width to broadcast along. `0` and unread everywhere else. Shared rather
+    /// than grown into per-shader structs because the binding layout is what
+    /// costs, and these three agree on everything except this word.
+    aux: u32,
     extra: f32,
     out_scale: f32,
 }
@@ -232,11 +237,64 @@ struct AttnReduceMeta {
     _pad1: u32,
 }
 
+/// The YaRN tail both [`RopeMeta`] and [`FusedNormRopeMeta`] carry — five
+/// `f32`s plus padding to a 16-byte multiple, matching the fields
+/// `vulkan_shaders::ROPE_YARN_WGSL` documents in each WGSL struct.
+///
+/// Nested here rather than spelled out twice because a rope kernel that
+/// disagrees with its fused twin is silent: same shapes, same magnitudes,
+/// wrong angle.
+///
+/// `#[repr(C)]` with only 4-byte members, so nesting it costs no padding and
+/// the bytes land exactly where the inlined WGSL fields expect them.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RopeYarn {
+    freq_scale: f32,
+    ext_factor: f32,
+    /// ggml's `mscale`, already folded with `attn_factor`.
+    mscale: f32,
+    corr_lo: f32,
+    corr_hi: f32,
+    _pad: [u32; 3],
+}
+
+impl RopeYarn {
+    /// The unscaled rope every non-YaRN model uses: `freq_scale * theta` with
+    /// `freq_scale == 1.0` and `sin/cos * 1.0`, both exact in IEEE 754, so a
+    /// shader carrying this is bit-identical to one with no YaRN terms at all.
+    pub const IDENTITY: Self = Self {
+        freq_scale: 1.0,
+        ext_factor: 0.0,
+        mscale: 1.0,
+        corr_lo: 0.0,
+        corr_hi: 0.0,
+        _pad: [0; 3],
+    };
+
+    /// The GPU form of a CPU [`crate::engine::tensor::RopeParams`], taking the
+    /// derived constants from [`crate::engine::tensor::RopeParams::yarn_terms`]
+    /// rather than recomputing them.
+    pub fn from_params(params: &crate::engine::tensor::RopeParams) -> Self {
+        let (corr_lo, corr_hi, mscale) = params.yarn_terms();
+        Self {
+            freq_scale: params.freq_scale,
+            ext_factor: params.ext_factor,
+            mscale,
+            corr_lo,
+            corr_hi,
+            _pad: [0; 3],
+        }
+    }
+}
+
 /// `RopeMeta` in `vulkan_shaders::ROPE_SHADER` — `#[repr(C)]` so its
 /// layout matches WGSL's `struct RopeMeta { n_head: u32, head_dim: u32,
-/// rope_dim: u32, pos: u32, freq_base: f32, n_tokens: u32, _pad1: u32,
-/// _pad2: u32 }` field-for-field. `n_head` is heads *per token* and
-/// `n_tokens` the rows in the batch; `pos` is the first row's position.
+/// rope_dim: u32, pos: u32, freq_base: f32, n_tokens: u32, pairing: u32,
+/// _pad2: u32, <RopeYarn> }` field-for-field. `n_head` is heads *per token*
+/// and `n_tokens` the rows in the batch; `pos` is the first row's position.
+/// `layout` is `0` for NEOX pairing and `1` for NORM — see
+/// [`rope_layout_code`].
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RopeMeta {
@@ -246,8 +304,21 @@ struct RopeMeta {
     pos: u32,
     freq_base: f32,
     n_tokens: u32,
-    _pad1: u32,
+    /// `0` = NEOX, `1` = NORM. Named `pairing` rather than `layout` because
+    /// WGSL reserves the latter.
+    pairing: u32,
     _pad2: u32,
+    yarn: RopeYarn,
+}
+
+/// The `RopeMeta::layout` code for a CPU-side [`crate::engine::tensor::
+/// RopeLayout`], so the two descriptions of one convention live next to each
+/// other instead of as a bare `0`/`1` at each call site.
+pub fn rope_layout_code(layout: crate::engine::tensor::RopeLayout) -> u32 {
+    match layout {
+        crate::engine::tensor::RopeLayout::Neox => 0,
+        crate::engine::tensor::RopeLayout::Norm => 1,
+    }
 }
 
 /// `PerHeadNormMeta` in `vulkan_shaders::PERHEAD_RMSNORM_SHADER`/
@@ -266,8 +337,8 @@ struct PerHeadNormMeta {
 /// `FusedNormRopeMeta` in `vulkan_shaders::FUSED_NORM_ROPE_SHADER` —
 /// `#[repr(C)]` so its layout matches WGSL's `struct FusedNormRopeMeta {
 /// n_head: u32, head_dim: u32, rope_dim: u32, pos: u32, freq_base: f32,
-/// eps: f32, _pad0: u32, _pad1: u32 }` field-for-field. The union of
-/// `RopeMeta`'s and `PerHeadNormMeta`'s own fields (`n_head` is common to
+/// eps: f32, _pad0: u32, _pad1: u32, <RopeYarn> }` field-for-field. The union
+/// of `RopeMeta`'s and `PerHeadNormMeta`'s own fields (`n_head` is common to
 /// both, so this has one copy, not two).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -278,8 +349,11 @@ struct FusedNormRopeMeta {
     pos: u32,
     freq_base: f32,
     eps: f32,
-    _pad0: u32,
+    /// `0` = NEOX, `1` = NORM — see [`rope_layout_code`]. Named to match
+    /// `RopeMeta::pairing`; WGSL reserves `layout`.
+    pairing: u32,
     _pad1: u32,
+    yarn: RopeYarn,
 }
 
 /// `SampleMeta` in `vulkan_shaders::ARGMAX_PENALTY_SHADER` —
@@ -1063,6 +1137,14 @@ pub struct VulkanBackend {
     /// Fused GELU+multiply (`shader_source_gelu_mul`) — one dispatch replacing
     /// `gelu_pipeline` then `mul_pipeline` on the FFN (and PLE) path.
     gelu_mul_pipeline: wgpu::ComputePipeline,
+    /// The SwiGLU twin of [`Self::gelu_mul_pipeline`], for the
+    /// Llama/Qwen2/Mistral/Phi families. Same bindings and same workgroup
+    /// size, so [`Self::ffn_activation_pipeline`] selects between them and
+    /// nothing else in a fused chain changes.
+    silu_mul_pipeline: wgpu::ComputePipeline,
+    /// `y[i] += bias[i % row]` — Qwen2's Q/K/V projection biases inside the
+    /// fused chain (`shader_source_bias_add`).
+    bias_add_pipeline: wgpu::ComputePipeline,
     gelu_pipeline: wgpu::ComputePipeline,
     scale_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
@@ -1764,12 +1846,20 @@ impl CachedOpResources {
 /// Below this many tokens, the regular per-`(row, token)` dispatch (one
 /// thread per output element, full occupancy) beats the cooperative
 /// dispatch (one workgroup per row, only `n_tokens` of its 64 threads
-/// active) — 64 is where the cooperative path's workgroups are first
-/// fully occupied too, so it's the natural crossover: below it, the
-/// occupancy loss isn't repaid by the redundant-dequant savings; at or
-/// above it, both the occupancy and the dequant-sharing favor the
-/// cooperative path.
-const COOP_MIN_N_TOKENS: usize = 64;
+/// active): the occupancy loss isn't repaid by the redundant-dequant
+/// savings.
+///
+/// **Measured, not derived.** The value was 64 on the argument that 64 is
+/// where the cooperative workgroups first fill — a statement about occupancy
+/// alone, which turns out to be the smaller of the two effects. Sweeping it
+/// against batch width puts the real crossover here instead: the coop path is
+/// still behind just below this width and clearly ahead just above it, because
+/// the dequant sharing starts paying long before the workgroups fill. Between
+/// this value and the old one the default was leaving a large fraction on the
+/// table for every narrow batch.
+///
+/// Sweepable as `ORANGU_COOP_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
+const COOP_MIN_N_TOKENS: usize = 24;
 
 /// The most tokens `Backend::matmul_batch` will ever put in one GPU
 /// submission — a prefill call with more tokens than this gets split into
@@ -1823,9 +1913,14 @@ fn max_matmul_tokens_per_submission() -> usize {
 /// *compute*: the kernel already computes a full `COOP_TILE_TOKENS`-wide tile
 /// for a partial one and discards the overhang. The padded rows are real
 /// dispatched work only when the tail crosses a tile boundary, and their
-/// results are sliced off by the caller. Stripes narrower than one tile are
-/// left alone — a 3-token prompt must not be widened into the cooperative
-/// path's regime.
+/// results are sliced off by the caller.
+///
+/// Stripes narrower than one tile are left alone — a 3-token prompt must not be
+/// widened into the cooperative path's regime. Quantizing those widths to cut
+/// the number of distinct shapes was tried and reverted: it is measured neutral
+/// on throughput on both a 0.5B and a 3B model, and the arena pressure that
+/// motivated it does not appear for sub-tile widths, whose regions are sized by
+/// the width and so are a fraction of a full stripe's.
 fn padded_stripe_len(len: usize, total: usize) -> usize {
     let tile = vulkan_shaders::coop_geom().tile_tokens() as usize;
     if total < tile {
@@ -2064,9 +2159,30 @@ fn fpa_repeat() -> usize {
     })
 }
 
-/// Milliseconds elapsed since `t`, the unit every trace line here reports in.
-fn ms_since(t: std::time::Instant) -> f64 {
-    t.elapsed().as_secs_f64() * 1000.0
+/// A stopwatch that only reads the clock when the trace consuming it is on.
+///
+/// Not micro-optimisation. `clock_gettime` is a vDSO read on a machine whose
+/// clocksource is `tsc` — tens of nanoseconds, genuinely free — but a *syscall
+/// reading an MMIO timer* on one stuck on `hpet`, which is roughly a
+/// microsecond. These sites sit per-matmul per-layer, so the unconditional
+/// version cost on the order of a thousand syscalls per decode token, for
+/// numbers that are only ever printed when `ORANGU_PREFILL_TRACE` is set. It
+/// showed up as `read_hpet` at 6.0% of decode CPU in a profile.
+///
+/// `ms()` returns `0.0` when the trace is off, which is what the disabled
+/// `eprintln!` would have ignored anyway.
+#[derive(Clone, Copy)]
+struct TraceClock(Option<std::time::Instant>);
+
+impl TraceClock {
+    /// Reads the clock only if `ORANGU_PREFILL_TRACE` is set.
+    fn start() -> Self {
+        Self(ple_trace().then(std::time::Instant::now))
+    }
+
+    fn ms(self) -> f64 {
+        self.0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+    }
 }
 
 /// Where the wall clock went inside one
@@ -2673,6 +2789,14 @@ impl VulkanBackend {
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_gelu_mul(),
         );
+        let silu_mul_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_silu_mul(),
+        );
+        let bias_add_pipeline = build_elem_pipeline(
+            &elem3_pipeline_layout,
+            vulkan_shaders::shader_source_bias_add(),
+        );
         let rmsnorm_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm(subgroup_reduce, norm_wg()),
@@ -3115,6 +3239,8 @@ impl VulkanBackend {
             add_pipeline,
             mul_pipeline,
             gelu_mul_pipeline,
+            silu_mul_pipeline,
+            bias_add_pipeline,
             gelu_pipeline,
             scale_pipeline,
             rmsnorm_pipeline,
@@ -3203,9 +3329,9 @@ impl VulkanBackend {
     /// comment for why this packs many tensors into few chunk buffers
     /// instead of allocating one `wgpu::Buffer` per tensor.
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
-        let (ptr, start) = w.cache_key();
+        let (waddr, wlen) = w.cache_key();
         let bytes = w.raw_bytes();
-        let key = (ptr, start, w.ggml_type(), bytes.len());
+        let key = (waddr, wlen, w.ggml_type(), bytes.len());
         let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
         if let Some(&(chunk, offset, size)) = arena.slots.get(&key) {
             return (arena.chunks[chunk].clone(), offset, size);
@@ -3743,9 +3869,9 @@ impl VulkanBackend {
         // instead of failing loudly — so check for it explicitly instead.
         let mut seen_keys = HashSet::with_capacity(ops.len());
         for op in ops {
-            let (ptr, start) = op.w.cache_key();
+            let (waddr, wlen) = op.w.cache_key();
             assert!(
-                seen_keys.insert((ptr, start, op.n_tokens)),
+                seen_keys.insert((waddr, wlen, op.n_tokens)),
                 "matmul_batch called with the same (weight, n_tokens) op twice in one batch \
                  — would deadlock locking its cached resources twice"
             );
@@ -4185,10 +4311,10 @@ impl VulkanBackend {
         batch_slot: usize,
         region_slot: usize,
     ) -> Arc<Mutex<CachedOpResources>> {
-        let (ptr, start) = op.w.cache_key();
+        let (waddr, wlen) = op.w.cache_key();
         let key: OpCacheKey = (
-            ptr,
-            start,
+            waddr,
+            wlen,
             op.w.ggml_type(),
             op.w.in_dim,
             op.w.out_dim,
@@ -4658,18 +4784,42 @@ pub enum GpuInput<'a> {
 /// `matmul`/`matmul_batch` round trips (`wo`, `gate`/`up`, `down`, and
 /// PLE's `gate`/`proj` when present) the step-by-step CPU-orchestrated path
 /// pays.
+/// Which gated-FFN activation a fused chain uses.
+///
+/// The families this engine serves split cleanly in two: gemma is GEGLU, and
+/// Llama/Qwen2/Mistral/Phi are SwiGLU. It is a pipeline swap inside an
+/// otherwise identical chain — the two kernels have the same bindings, the same
+/// workgroup size and the same dispatch count — so it is a parameter rather
+/// than a second copy of the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfnActivation {
+    /// `gelu(gate) * up` — gemma.
+    Geglu,
+    /// `silu(gate) * up` — Llama, Qwen2, Mistral, Phi.
+    Swiglu,
+}
+
 pub struct FusedPostAttentionInput<'a> {
     /// Attention's output, `[n_embd]`.
     pub attn_out: GpuInput<'a>,
     /// `x` from before this sub-layer's residual adds.
     pub residual: GpuInput<'a>,
     pub wo: &'a QuantMatrix,
-    pub attn_post_norm: &'a [f32],
+    /// `None` on an architecture with no post-norm on the attention residual
+    /// (`llama`/`qwen2`/`mistral`/`phi`). Not the same as a norm with weights of
+    /// one — that would still normalize.
+    pub attn_post_norm: Option<&'a [f32]>,
     pub ffn_norm: &'a [f32],
     pub ffn_gate: &'a QuantMatrix,
     pub ffn_up: &'a QuantMatrix,
     pub ffn_down: &'a QuantMatrix,
-    pub ffn_post_norm: &'a [f32],
+    /// `None` on an architecture with no post-norm on the FFN residual — see
+    /// [`Self::attn_post_norm`].
+    pub ffn_post_norm: Option<&'a [f32]>,
+    /// Which gated activation sits between gate/up and `down` — GEGLU for
+    /// gemma, SwiGLU for the llama family. The prefill chain has taken this as
+    /// a parameter since G2's first increment; the decode chain assumed GEGLU.
+    pub activation: FfnActivation,
     pub eps: f32,
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
@@ -4718,6 +4868,14 @@ pub struct GpuRopeInput<'a> {
     pub pos: usize,
     pub freq_base: f32,
     pub freq_factors: Option<&'a [f32]>,
+    /// Which two elements of a head each rotation pairs. `llama` and `mistral`
+    /// are [`crate::engine::tensor::RopeLayout::Norm`]; everything else this
+    /// engine serves is `Neox`. Getting it wrong does not fail loudly — Q
+    /// matches upstream to five significant figures *before* RoPE and reads
+    /// −354.6 against 6.66 after (`arch::llama::rope_layout_for`).
+    pub layout: crate::engine::tensor::RopeLayout,
+    /// YaRN RoPE scaling, or [`RopeYarn::IDENTITY`] for the unscaled rope.
+    pub yarn: RopeYarn,
 }
 
 /// [`VulkanBackend::gpu_fused_norm_rope`]'s parameters — see
@@ -4739,6 +4897,11 @@ pub struct GpuFusedNormRopeInput<'a> {
     pub freq_base: f32,
     pub freq_factors: Option<&'a [f32]>,
     pub eps: f32,
+    /// See [`FusedAttnPrefillInput::pairing`] — this is the kernel the QKV
+    /// fusion reaches, so it needs the convention as much as `gpu_rope` does.
+    pub pairing: crate::engine::tensor::RopeLayout,
+    /// YaRN RoPE scaling, or [`RopeYarn::IDENTITY`] for the unscaled rope.
+    pub yarn: RopeYarn,
 }
 
 /// This layer's own K/V projection for [`VulkanBackend::fused_attention_prefill`].
@@ -4747,8 +4910,14 @@ pub struct GpuFusedNormRopeInput<'a> {
 #[derive(Clone, Copy)]
 pub struct FusedAttnPrefillKv<'a> {
     pub wk: &'a QuantMatrix,
-    /// `[head_dim]` — the same vector for every KV head.
-    pub k_norm: &'a [f32],
+    /// `attn_k.bias` / `attn_v.bias`, added to the projection before the norm
+    /// and RoPE. Qwen2 has them; Llama, Mistral and gemma do not.
+    pub k_bias: Option<&'a [f32]>,
+    pub v_bias: Option<&'a [f32]>,
+    /// `[head_dim]` — the same vector for every KV head. `None` on the
+    /// architectures without a per-head K norm (`llama`, `qwen2`, `mistral`),
+    /// where the stage is RoPE alone rather than a norm fused with it.
+    pub k_norm: Option<&'a [f32]>,
     pub wv: Option<&'a QuantMatrix>,
 }
 
@@ -4762,8 +4931,9 @@ pub struct FusedAttnPrefillInput<'a> {
     pub n_tokens: usize,
     pub start_pos: usize,
     pub wq: &'a QuantMatrix,
-    /// `[head_dim]` — the same vector for every Q head.
-    pub q_norm: &'a [f32],
+    /// `[head_dim]` — the same vector for every Q head. `None` where the
+    /// architecture has none; see [`FusedAttnPrefillKv::k_norm`].
+    pub q_norm: Option<&'a [f32]>,
     /// `None` for a cross-layer KV-donor layer, which reads a cache an earlier
     /// layer already filled and skips the whole K/V sub-chain.
     pub kv: Option<FusedAttnPrefillKv<'a>>,
@@ -4772,6 +4942,13 @@ pub struct FusedAttnPrefillInput<'a> {
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_freq_base: f32,
+    /// YaRN RoPE scaling, or [`RopeYarn::IDENTITY`] for the unscaled rope
+    /// every non-YaRN model uses.
+    ///
+    /// Carried explicitly rather than defaulted: a chain handed the identity
+    /// for a checkpoint that wanted YaRN produces no wrong shape and no
+    /// assertion, only rotations by the unscaled angle.
+    pub yarn: RopeYarn,
     pub freq_factors: Option<&'a [f32]>,
     pub eps: f32,
     /// The layer's sliding-window size, or `0` for full attention.
@@ -4782,6 +4959,26 @@ pub struct FusedAttnPrefillInput<'a> {
     /// GPU. Only a caller that cannot consume `attn_out_buf` needs this — it is
     /// the single largest transfer in the layer.
     pub want_attn_out_host: bool,
+    /// Which two elements of a head each rotation pairs. `llama` and `mistral`
+    /// are [`crate::engine::tensor::RopeLayout::Norm`]; gemma and the Qwen
+    /// families are `Neox`. The fused chain reaches RoPE through
+    /// `fused_norm_rope_pipeline`, a *different* kernel from the standalone
+    /// `gpu_rope`, so both had to learn the convention — fixing one and
+    /// assuming the other would have left this path silently NEOX.
+    pub pairing: crate::engine::tensor::RopeLayout,
+    /// `attn_q.bias`, added to Q before its norm and RoPE — see
+    /// [`FusedAttnPrefillKv::k_bias`].
+    pub q_bias: Option<&'a [f32]>,
+    /// Whether V takes a per-head weightless RMSNorm before it enters the
+    /// cache. **gemma does; `llama`/`qwen2`/`mistral` do not.**
+    ///
+    /// The third convention this chain bakes in, and the one that was found
+    /// last and the hard way: with the Q and K norms made optional, the no-norm
+    /// cross-check still disagreed with its reference by ~5700× — which is the
+    /// RMS of a V row, because the kernel was still normalizing V while the
+    /// reference was not. Shapes matched throughout; only the semantics
+    /// differed.
+    pub normalize_v: bool,
 }
 
 impl<'a> FusedAttnPrefillInput<'a> {
@@ -4850,6 +5047,12 @@ enum PrefillKNormRope {
         bg: wgpu::BindGroup,
         _meta: wgpu::Buffer,
     },
+    /// No per-head norm on this architecture — RoPE alone, through the
+    /// standalone kernel and its `elem3` binding.
+    RopeOnly {
+        bg: wgpu::BindGroup,
+        _meta: wgpu::Buffer,
+    },
     Split {
         norm_bg: wgpu::BindGroup,
         _norm_meta: wgpu::Buffer,
@@ -4863,7 +5066,12 @@ enum PrefillKNormRope {
 pub struct FusedAttnProjection<'a> {
     pub wk: &'a QuantMatrix,
     /// `[head_dim]` — the same vector for every KV head.
-    pub k_norm: &'a [f32],
+    /// `[kv_dim]` projection biases, added before anything reads K or V.
+    pub k_bias: Option<&'a [f32]>,
+    pub v_bias: Option<&'a [f32]>,
+    /// `None` on an architecture with no per-head K norm
+    /// (`llama`/`qwen2`/`mistral`/`phi`) — RoPE then runs on its own.
+    pub k_norm: Option<&'a [f32]>,
     /// `None` when this layer doesn't own its own V projection (V is a
     /// copy of K's post-norm output instead — see `fused_attention`'s
     /// doc comment for why that's still correct here).
@@ -4875,8 +5083,43 @@ pub struct FusedAttnInput<'a> {
     /// `attn_norm`'s output, `[n_embd]`.
     pub normed: GpuInput<'a>,
     pub wq: &'a QuantMatrix,
-    /// `[head_dim]` — the same vector for every Q head.
-    pub q_norm: &'a [f32],
+    /// `[n_head * head_dim]` projection bias, added before the norm or RoPE
+    /// reads Q. Qwen2 has one; the rest of this family does not.
+    pub q_bias: Option<&'a [f32]>,
+    /// **The chain's RoPE carries YaRN** — see [`RopeYarn`] and the `yarn`
+    /// field below. It was plain-RoPE-only until `arch::mistral` needed the
+    /// chain: a rotary width, a frequency base, an optional per-pair divisor
+    /// and a pairing, with no `freq_scale`, `ext_factor` or `attn_factor`
+    /// anywhere. That was the eighth convention, found the way LESSONS §68 says
+    /// to look for them — by diffing what a sibling takes as a parameter
+    /// against what this hard-codes — and unlike the others it was fixed rather
+    /// than flagged, because one bounded shader change served two waiting
+    /// architectures.
+    ///
+    /// What the chain still does **not** carry is a temperature applied to Q
+    /// after RoPE (`<arch>.attention.temperature_scale`). `arch::mistral` gates
+    /// its use of this chain on that being the identity rather than dropping
+    /// the term.
+    ///
+    /// Whether V gets gemma's per-head **weightless** RMSNorm before it is
+    /// written to the cache.
+    ///
+    /// The third convention, and the one that is invisible from every shape:
+    /// gemma normalizes V, the llama family does not. The prefill chain has
+    /// taken this as a flag since G2's third increment — where assuming it cost
+    /// a ~5700x cross-check failure — and the decode chain applied it
+    /// unconditionally until now, which is correct for its only caller and
+    /// silently wrong for any other.
+    pub normalize_v: bool,
+    /// `[head_dim]` — the same vector for every Q head. `None` on an
+    /// architecture with no per-head Q norm (`llama`/`qwen2`/`mistral`/`phi`),
+    /// where RoPE runs on its own through the standalone kernel.
+    pub q_norm: Option<&'a [f32]>,
+    /// Which pairs RoPE rotates — NEOX (`i` against `i + rope_dim/2`) or NORM
+    /// (`2i` against `2i+1`). `llama`/`mistral` are NORM, everything else NEOX;
+    /// getting it wrong is not a crash but a silently different answer, which is
+    /// why it is a field rather than the constant it used to be.
+    pub pairing: crate::engine::tensor::RopeLayout,
     /// `Some` iff this layer owns a KV cache of its own (`layer.has_kv`);
     /// `None` for gemma4's cross-layer KV-donor layers, which skip the
     /// whole K/V projection/norm/RoPE/write sub-chain and read straight
@@ -4888,6 +5131,13 @@ pub struct FusedAttnInput<'a> {
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_freq_base: f32,
+    /// YaRN RoPE scaling, or [`RopeYarn::IDENTITY`] for the unscaled rope
+    /// every non-YaRN model uses.
+    ///
+    /// Carried explicitly rather than defaulted: a chain handed the identity
+    /// for a checkpoint that wanted YaRN produces no wrong shape and no
+    /// assertion, only rotations by the unscaled angle.
+    pub yarn: RopeYarn,
     /// Gemma4's proportional-RoPE divisor, full-attention layers only —
     /// `None` for SWA layers, matching the CPU path exactly.
     pub freq_factors: Option<&'a [f32]>,
@@ -4935,13 +5185,30 @@ pub struct FusedLayerInput<'a> {
     pub x: GpuInput<'a>,
     pub attn_norm: &'a [f32],
     pub wq: &'a QuantMatrix,
-    pub q_norm: &'a [f32],
+    /// See [`FusedAttnInput::q_bias`].
+    pub q_bias: Option<&'a [f32]>,
+    /// See [`FusedAttnInput::normalize_v`].
+    pub normalize_v: bool,
+    /// See [`FusedAttnInput::q_norm`].
+    pub q_norm: Option<&'a [f32]>,
+    /// Which pairs RoPE rotates — NEOX (`i` against `i + rope_dim/2`) or NORM
+    /// (`2i` against `2i+1`). `llama`/`mistral` are NORM, everything else NEOX;
+    /// getting it wrong is not a crash but a silently different answer, which
+    /// is why it is a field rather than a constant.
+    pub pairing: crate::engine::tensor::RopeLayout,
     pub kv: Option<FusedAttnProjection<'a>>,
     pub n_head: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_freq_base: f32,
+    /// YaRN RoPE scaling, or [`RopeYarn::IDENTITY`] for the unscaled rope
+    /// every non-YaRN model uses.
+    ///
+    /// Carried explicitly rather than defaulted: a chain handed the identity
+    /// for a checkpoint that wanted YaRN produces no wrong shape and no
+    /// assertion, only rotations by the unscaled angle.
+    pub yarn: RopeYarn,
     pub freq_factors: Option<&'a [f32]>,
     pub eps: f32,
     pub pos: usize,
@@ -4952,12 +5219,14 @@ pub struct FusedLayerInput<'a> {
     pub scale: f32,
     pub cache: &'a mut crate::engine::kv_cache::LayerCache,
     pub wo: &'a QuantMatrix,
-    pub attn_post_norm: &'a [f32],
+    pub attn_post_norm: Option<&'a [f32]>,
     pub ffn_norm: &'a [f32],
     pub ffn_gate: &'a QuantMatrix,
     pub ffn_up: &'a QuantMatrix,
     pub ffn_down: &'a QuantMatrix,
-    pub ffn_post_norm: &'a [f32],
+    pub ffn_post_norm: Option<&'a [f32]>,
+    /// See [`FusedPostAttentionInput::activation`].
+    pub activation: FfnActivation,
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
     /// See [`FusedAttnInput::batch_slot`]'s own doc comment — threaded
@@ -4970,6 +5239,14 @@ pub struct FusedLayerInput<'a> {
 }
 
 impl VulkanBackend {
+    /// The gated-FFN activation kernel for `act`.
+    fn ffn_activation_pipeline(&self, act: FfnActivation) -> &wgpu::ComputePipeline {
+        match act {
+            FfnActivation::Geglu => &self.gelu_mul_pipeline,
+            FfnActivation::Swiglu => &self.silu_mul_pipeline,
+        }
+    }
+
     /// Places one small meta *uniform* struct in the shared `uniform_arena`,
     /// writes its bytes, and returns `(chunk, offset, size)` for a
     /// `BindSrc::Slice` sub-range binding — the uniform counterpart of
@@ -5031,10 +5308,30 @@ impl VulkanBackend {
         buffer
     }
 
+    /// Meta for the bias-add shader: total elements plus the row width the
+    /// bias is broadcast along.
+    fn bias_meta_buffer(&self, len: u32, row: u32) -> wgpu::Buffer {
+        let meta = ElemMeta {
+            len,
+            aux: row,
+            extra: 0.0,
+            out_scale: 0.0,
+        };
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server bias meta"),
+            size: std::mem::size_of::<ElemMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::bytes_of(&meta));
+        buffer
+    }
+
     fn elem_meta_buffer(&self, len: u32, extra: f32) -> wgpu::Buffer {
         let meta = ElemMeta {
             len,
-            _pad0: 0,
+            aux: 0,
             extra,
             out_scale: 0.0,
         };
@@ -5056,7 +5353,7 @@ impl VulkanBackend {
     fn elem_meta_buffer_scaled(&self, len: u32, extra: f32, out_scale: f32) -> wgpu::Buffer {
         let meta = ElemMeta {
             len,
-            _pad0: 0,
+            aux: 0,
             extra,
             out_scale,
         };
@@ -5078,7 +5375,7 @@ impl VulkanBackend {
     fn cast_meta_buffer(&self, len: u32, offset: u32) -> wgpu::Buffer {
         let meta = ElemMeta {
             len,
-            _pad0: offset,
+            aux: offset,
             extra: 0.0,
             out_scale: 0.0,
         };
@@ -5261,24 +5558,24 @@ impl VulkanBackend {
         len_f32: usize,
     ) -> (Vec<f32>, ReadbackSplit) {
         let byte_len = (len_f32 as u64) * 4;
-        let t_alloc = std::time::Instant::now();
+        let t_alloc = TraceClock::start();
         let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server generic readback"),
             size: byte_len,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let alloc_ms = ms_since(t_alloc);
-        let t_submit = std::time::Instant::now();
+        let alloc_ms = t_alloc.ms();
+        let t_submit = TraceClock::start();
         encoder.copy_buffer_to_buffer(src, src_offset, &readback_buffer, 0, byte_len);
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let submit_ms = ms_since(t_submit);
+        let submit_ms = t_submit.ms();
         // The same map + wait as `submit_and_readback_u32`, sharing
         // `wait_mapped` so this readback is not left carrying the single-poll
         // race that method's doc comment describes.
-        let t_wait = std::time::Instant::now();
+        let t_wait = TraceClock::start();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_cb = done.clone();
         readback_buffer
@@ -5288,8 +5585,8 @@ impl VulkanBackend {
                 done_cb.store(true, std::sync::atomic::Ordering::Release);
             });
         self.wait_mapped(&done);
-        let wait_ms = ms_since(t_wait);
-        let t_copy = std::time::Instant::now();
+        let wait_ms = t_wait.ms();
+        let t_copy = TraceClock::start();
         let data = readback_buffer
             .slice(..)
             .get_mapped_range()
@@ -5297,7 +5594,7 @@ impl VulkanBackend {
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         readback_buffer.unmap();
-        let copy_ms = ms_since(t_copy);
+        let copy_ms = t_copy.ms();
         (
             result,
             ReadbackSplit {
@@ -5467,6 +5764,8 @@ impl VulkanBackend {
             pos,
             freq_base,
             freq_factors,
+            layout,
+            yarn,
         } = input;
         debug_assert_eq!(x.len(), n_head * head_dim);
         let half = rope_dim / 2;
@@ -5489,8 +5788,9 @@ impl VulkanBackend {
             pos: pos as u32,
             freq_base,
             n_tokens: 1,
-            _pad1: 0,
+            pairing: rope_layout_code(layout),
             _pad2: 0,
+            yarn,
         };
         let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server rope meta"),
@@ -5543,6 +5843,8 @@ impl VulkanBackend {
             freq_base,
             freq_factors,
             eps,
+            pairing,
+            yarn,
         } = input;
         debug_assert_eq!(x.len(), n_tokens * n_head * head_dim);
         debug_assert_eq!(weight.len(), head_dim);
@@ -5567,6 +5869,8 @@ impl VulkanBackend {
             pos as u32,
             freq_base,
             eps,
+            pairing,
+            yarn,
         );
         let bind_group = self.elem4_bind_group(&w_buf, &ff_buf, &x_buf, &meta_buf);
 
@@ -5706,6 +6010,8 @@ impl VulkanBackend {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn rope_meta_buffer(
         &self,
         n_head: u32,
@@ -5714,6 +6020,8 @@ impl VulkanBackend {
         rope_dim: u32,
         pos: u32,
         freq_base: f32,
+        pairing: crate::engine::tensor::RopeLayout,
+        yarn: RopeYarn,
     ) -> wgpu::Buffer {
         let meta = RopeMeta {
             n_head,
@@ -5722,8 +6030,9 @@ impl VulkanBackend {
             pos,
             freq_base,
             n_tokens,
-            _pad1: 0,
+            pairing: rope_layout_code(pairing),
             _pad2: 0,
+            yarn,
         };
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server rope meta (fused)"),
@@ -5742,6 +6051,7 @@ impl VulkanBackend {
     /// `fn_head` shared array is sized to exactly that bound, and a
     /// larger `head_dim` would silently write past it on the GPU rather
     /// than fail loudly, so this is asserted here instead.
+    #[allow(clippy::too_many_arguments)]
     fn fused_norm_rope_meta_buffer(
         &self,
         n_head: u32,
@@ -5750,6 +6060,8 @@ impl VulkanBackend {
         pos: u32,
         freq_base: f32,
         eps: f32,
+        pairing: crate::engine::tensor::RopeLayout,
+        yarn: RopeYarn,
     ) -> wgpu::Buffer {
         assert!(
             (head_dim as usize) <= vulkan_shaders::FUSED_NORM_ROPE_MAX_HEAD_DIM,
@@ -5763,8 +6075,9 @@ impl VulkanBackend {
             pos,
             freq_base,
             eps,
-            _pad0: 0,
+            pairing: rope_layout_code(pairing),
             _pad1: 0,
+            yarn,
         };
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server fused norm+rope meta"),
@@ -6334,9 +6647,9 @@ impl VulkanBackend {
                 "orangu-server fused x2 arena chunk",
             );
 
-        let attn_post_norm_w = self.upload_new(input.attn_post_norm);
+        let attn_post_norm_w = input.attn_post_norm.map(|w| self.upload_new(w));
         let ffn_norm_w = self.upload_new(input.ffn_norm);
-        let ffn_post_norm_w = self.upload_new(input.ffn_post_norm);
+        let ffn_post_norm_w = input.ffn_post_norm.map(|w| self.upload_new(w));
         let meta_embd_eps = self.elem_meta_buffer(n_embd as u32, input.eps);
         let meta_ffn_plain = self.elem_meta_buffer(ffn_len as u32, 0.0);
 
@@ -6346,13 +6659,30 @@ impl VulkanBackend {
         // why this is safe (both were already single-workgroup, whole-row
         // operations) and what it deliberately doesn't attempt (folding
         // the matmul itself in too).
-        let bg_attn_post_norm_add = self.elem5_bind_group(
-            wo_g.output_src(),
-            &attn_post_norm_w,
-            BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
-            BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
-            &meta_embd_eps,
-        );
+        //
+        // Two shapes, as on the prefill side: with a post-norm it is
+        // `rmsnorm_add` over `elem5` (wo_out, weight, residual, out, meta);
+        // without one it is a plain `add` over `elem4` (wo_out, residual, out,
+        // meta). No norm is *not* a norm with weights of one — that would still
+        // normalize.
+        let bg_attn_post_norm_add = attn_post_norm_w.as_ref().map(|w| {
+            self.elem5_bind_group(
+                wo_g.output_src(),
+                w,
+                BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
+                BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                &meta_embd_eps,
+            )
+        });
+        let meta_embd_plain = self.elem_meta_buffer(n_embd as u32, 0.0);
+        let bg_attn_add = attn_post_norm_w.is_none().then(|| {
+            self.elem4_bind_group(
+                wo_g.output_src(),
+                BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
+                BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                &meta_embd_plain,
+            )
+        });
         let bg_ffn_norm = self.elem4_bind_group(
             BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
             &ffn_norm_w,
@@ -6426,13 +6756,23 @@ impl VulkanBackend {
         // `ffn_down`'s own post-matmul norm+add, same fusion — the residual
         // here is `x1` (this sub-layer's own pre-FFN residual stream), not
         // `residual_buf` (that's `bg_attn_post_norm_add`'s own residual).
-        let bg_ffn_post_norm_add = self.elem5_bind_group(
-            down_g.output_src(),
-            &ffn_post_norm_w,
-            BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
-            BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
-            &meta_embd_eps,
-        );
+        let bg_ffn_post_norm_add = ffn_post_norm_w.as_ref().map(|w| {
+            self.elem5_bind_group(
+                down_g.output_src(),
+                w,
+                BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
+                &meta_embd_eps,
+            )
+        });
+        let bg_ffn_add = ffn_post_norm_w.is_none().then(|| {
+            self.elem4_bind_group(
+                down_g.output_src(),
+                BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
+                &meta_embd_plain,
+            )
+        });
 
         // Fold `layer_output_scale` into the PLE post-projection `rmsnorm_add`
         // (which writes the layer's final buffer `x3`) when both are present and
@@ -6509,6 +6849,9 @@ impl VulkanBackend {
             bg_mul,
             bg_gelu_mul,
             bg_ffn_post_norm_add,
+            bg_attn_add,
+            bg_ffn_add,
+            meta_embd_plain,
             attn_post_norm_w,
             ffn_norm_w,
             ffn_post_norm_w,
@@ -6535,11 +6878,19 @@ impl VulkanBackend {
         down_g: &CachedOpResources,
         ple_g: Option<(&CachedOpResources, &CachedOpResources)>,
     ) -> Arc<FusedResources> {
-        let (ptr, start) = input.wo.cache_key();
+        let (waddr, wlen) = input.wo.cache_key();
         let per_layer_dim = input.ple.as_ref().map_or(0, |p| p.per_layer_dim);
+        // NOTE: this key does **not** include whether the post-norms are
+        // present or which activation is used, though both change the bind
+        // groups the cached resources hold. It does not bite today because
+        // every layer has its own `wo`, so no two configurations can collide on
+        // one key — but a caller that reused a weight under two configurations
+        // would silently get the first one's dispatch shapes. Worth closing
+        // when the llama-family decode arms land; see the `#[ignore]`d
+        // `fused_layer_llama_shaped_*` cross-checks.
         let key: FusedCacheKey = (
-            ptr,
-            start,
+            waddr,
+            wlen,
             input.ffn_gate.out_dim,
             per_layer_dim,
             input.layer_output_scale.is_some(),
@@ -6649,9 +7000,19 @@ impl VulkanBackend {
             });
             self.record_matmul(&mut pass, input.wo, &wo_g);
 
-            pass.set_pipeline(&self.rmsnorm_add_pipeline);
-            pass.set_bind_group(0, &res.bg_attn_post_norm_add, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            match (&res.bg_attn_post_norm_add, &res.bg_attn_add) {
+                (Some(bg), _) => {
+                    pass.set_pipeline(&self.rmsnorm_add_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                (None, Some(bg)) => {
+                    pass.set_pipeline(&self.add_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups((n_embd as u32).div_ceil(64), 1, 1);
+                }
+                (None, None) => unreachable!("one of the two shapes is always built"),
+            }
 
             pass.set_pipeline(&self.rmsnorm_pipeline);
             pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
@@ -6660,31 +7021,37 @@ impl VulkanBackend {
         {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
             let nb4 = (n_embd as u64) * 4;
-            self.capture_push(|| {
-                static_capture_step(
-                    vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
-                    &[
-                        (
-                            0,
-                            Storage,
-                            wo_g.output_buffer.clone(),
-                            wo_g.output_offset,
-                            nb4,
-                        ),
-                        (1, Storage, res.attn_post_norm_w.clone(), 0, nb4),
-                        (
-                            2,
-                            Storage,
-                            res.residual_buf.clone(),
-                            res.residual_buf_offset,
-                            nb4,
-                        ),
-                        (3, Storage, res.x1.clone(), res.x1_offset, nb4),
-                        (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
-                    ],
-                    [1, 1, 1],
-                )
-            });
+            // Capture describes the norm+add shape. On an architecture without
+            // the post-norm the dispatch above is a plain `add` instead, which
+            // the replay path has never covered — so nothing is pushed rather
+            // than a step that misdescribes what ran.
+            if let Some(w) = res.attn_post_norm_w.clone() {
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                        &[
+                            (
+                                0,
+                                Storage,
+                                wo_g.output_buffer.clone(),
+                                wo_g.output_offset,
+                                nb4,
+                            ),
+                            (1, Storage, w, 0, nb4),
+                            (
+                                2,
+                                Storage,
+                                res.residual_buf.clone(),
+                                res.residual_buf_offset,
+                                nb4,
+                            ),
+                            (3, Storage, res.x1.clone(), res.x1_offset, nb4),
+                            (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                        ],
+                        [1, 1, 1],
+                    )
+                });
+            }
             self.capture_push(|| {
                 static_capture_step(
                     vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
@@ -6779,10 +7146,23 @@ impl VulkanBackend {
             }
 
             if let Some(bg_gelu_mul) = &res.bg_gelu_mul {
-                pass.set_pipeline(&self.gelu_mul_pipeline);
+                // The fused activation+multiply. `ffn_activation_pipeline`
+                // picks GEGLU or SwiGLU; the bind group is the same shape
+                // either way, which is why only the pipeline varies.
+                pass.set_pipeline(self.ffn_activation_pipeline(input.activation));
                 pass.set_bind_group(0, bg_gelu_mul, &[]);
                 pass.dispatch_workgroups(res.ffn_wg, 1, 1);
             } else {
+                // The split form exists only for the GEGLU shape, which is the
+                // only one that ever takes this branch — gemma's. A SwiGLU
+                // layer always builds `bg_gelu_mul`, so this is unreachable for
+                // it rather than silently applying the wrong activation.
+                debug_assert!(
+                    matches!(input.activation, FfnActivation::Geglu),
+                    "the split activation path is GEGLU-only; {:?} needs the \
+                     fused gate/up bind group",
+                    input.activation
+                );
                 pass.set_pipeline(&self.gelu_pipeline);
                 pass.set_bind_group(0, &res.bg_gelu, &[]);
                 pass.dispatch_workgroups(res.ffn_wg, 1, 1);
@@ -6877,32 +7257,44 @@ impl VulkanBackend {
             });
             self.record_matmul(&mut pass, input.ffn_down, &down_g);
 
-            pass.set_pipeline(&self.rmsnorm_add_pipeline);
-            pass.set_bind_group(0, &res.bg_ffn_post_norm_add, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            match (&res.bg_ffn_post_norm_add, &res.bg_ffn_add) {
+                (Some(bg), _) => {
+                    pass.set_pipeline(&self.rmsnorm_add_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                (None, Some(bg)) => {
+                    pass.set_pipeline(&self.add_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups((n_embd as u32).div_ceil(64), 1, 1);
+                }
+                (None, None) => unreachable!("one of the two shapes is always built"),
+            }
         }
         {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
             let nb4 = (n_embd as u64) * 4;
-            self.capture_push(|| {
-                static_capture_step(
-                    vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
-                    &[
-                        (
-                            0,
-                            Storage,
-                            down_g.output_buffer.clone(),
-                            down_g.output_offset,
-                            nb4,
-                        ),
-                        (1, Storage, res.ffn_post_norm_w.clone(), 0, nb4),
-                        (2, Storage, res.x1.clone(), res.x1_offset, nb4),
-                        (3, Storage, res.x2.clone(), res.x2_offset, nb4),
-                        (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
-                    ],
-                    [1, 1, 1],
-                )
-            });
+            if let Some(w) = res.ffn_post_norm_w.clone() {
+                self.capture_push(|| {
+                    static_capture_step(
+                        vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                        &[
+                            (
+                                0,
+                                Storage,
+                                down_g.output_buffer.clone(),
+                                down_g.output_offset,
+                                nb4,
+                            ),
+                            (1, Storage, w, 0, nb4),
+                            (2, Storage, res.x1.clone(), res.x1_offset, nb4),
+                            (3, Storage, res.x2.clone(), res.x2_offset, nb4),
+                            (4, Uniform, res.meta_embd_eps.clone(), 0, 16),
+                        ],
+                        [1, 1, 1],
+                    )
+                });
+            }
         }
 
         let mut final_buf: (&wgpu::Buffer, u64) = (&res.x2, res.x2_offset);
@@ -7644,6 +8036,9 @@ impl VulkanBackend {
         out_row: usize,
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let FusedAttnPrefillInput {
+            pairing,
+            normalize_v,
+            q_bias,
             normed,
             n_tokens,
             start_pos,
@@ -7655,6 +8050,7 @@ impl VulkanBackend {
             head_dim,
             rope_dim,
             rope_freq_base,
+            yarn,
             freq_factors,
             eps,
             n_swa,
@@ -7679,6 +8075,12 @@ impl VulkanBackend {
                 // rows would be written into the KV cache as real positions.
                 let (a, k, v) = self.record_attention_prefill(
                     &FusedAttnPrefillInput {
+                        // Only the per-stripe fields are overridden here;
+                        // everything else — the RoPE pairing, whether V is
+                        // normalized, the head counts — comes from
+                        // `..input.reborrow()` and must *not* be restated, or a
+                        // striped prompt silently runs a different
+                        // configuration from an unstriped one.
                         normed: &normed[start * n_embd..end * n_embd],
                         n_tokens: len,
                         start_pos: start_pos + start,
@@ -7761,17 +8163,48 @@ impl VulkanBackend {
             (k_g, v_g)
         });
 
-        let q_norm_w = self.upload_new(q_norm);
         let ff_buf = self.upload_new(ff);
-        let q_meta = self.fused_norm_rope_meta_buffer(
-            n_head as u32,
-            head_dim as u32,
-            rope_dim as u32,
-            start_pos as u32,
-            rope_freq_base,
-            eps,
-        );
-        let q_bg = self.elem4_bind_group(&q_norm_w, &ff_buf, q_g.output_src(), &q_meta);
+        // Projection biases, applied before anything reads the projections.
+        let q_bias_bg = q_bias.map(|b| {
+            let w = self.upload_new(b);
+            let meta = self.bias_meta_buffer((n_tokens * n_head * head_dim) as u32, b.len() as u32);
+            let bg = self.elem3_bind_group(&w, q_g.output_src(), &meta);
+            (bg, w, meta)
+        });
+        // With a per-head norm this is one fused dispatch; without one it is
+        // the plain RoPE kernel. Not a norm with weights of one — that would
+        // still normalize, and `llama`/`qwen2`/`mistral` do not.
+        let q_stage = match q_norm {
+            Some(w) => {
+                let norm_w = self.upload_new(w);
+                let meta = self.fused_norm_rope_meta_buffer(
+                    n_head as u32,
+                    head_dim as u32,
+                    rope_dim as u32,
+                    start_pos as u32,
+                    rope_freq_base,
+                    eps,
+                    pairing,
+                    yarn,
+                );
+                let bg = self.elem4_bind_group(&norm_w, &ff_buf, q_g.output_src(), &meta);
+                PrefillKNormRope::Fused { bg, _meta: meta }
+            }
+            None => {
+                let meta = self.rope_meta_buffer(
+                    n_head as u32,
+                    n_tokens as u32,
+                    head_dim as u32,
+                    rope_dim as u32,
+                    start_pos as u32,
+                    rope_freq_base,
+                    pairing,
+                    yarn,
+                );
+                let bg = self.elem3_bind_group(&ff_buf, q_g.output_src(), &meta);
+                PrefillKNormRope::RopeOnly { bg, _meta: meta }
+            }
+        };
 
         // Attention writes into this stripe's slice of the caller's buffer.
         let out_byte_off = (out_row * n_head * head_dim) as u64 * 4;
@@ -7840,12 +8273,28 @@ impl VulkanBackend {
         });
 
         // K/V-side resources, when this layer owns a KV projection.
+        // A ten-element tuple with patterns counted from *both* ends, which is
+        // as fragile as it sounds: appending the two bias entries silently
+        // re-bound `k_stage` to a bind group until the type checker caught it.
+        // Worth turning into a named struct the next time it grows.
         let kv_side = kv
             .as_ref()
             .zip(kv_guards.as_ref())
             .map(|(proj, (k_g, v_g))| {
                 let owns_v = v_g.is_some();
-                let k_norm_w = self.upload_new(proj.k_norm);
+                let k_norm_w = proj.k_norm.map(|w| self.upload_new(w));
+                let k_bias_bg = proj.k_bias.map(|b| {
+                    let w = self.upload_new(b);
+                    let meta = self.bias_meta_buffer((n_tokens * kv_dim) as u32, b.len() as u32);
+                    let bg = self.elem3_bind_group(&w, k_g.output_src(), &meta);
+                    (bg, w, meta)
+                });
+                let v_bias_bg = proj.v_bias.zip(v_g.as_ref()).map(|(b, g)| {
+                    let w = self.upload_new(b);
+                    let meta = self.bias_meta_buffer((n_tokens * kv_dim) as u32, b.len() as u32);
+                    let bg = self.elem3_bind_group(&w, g.output_src(), &meta);
+                    (bg, w, meta)
+                });
                 let v_scratch = (!owns_v).then(|| self.scratch_buffer(n_tokens * kv_dim));
                 let v_target: BindSrc<'_> = match v_g {
                     Some(g) => g.output_src(),
@@ -7857,7 +8306,20 @@ impl VulkanBackend {
                     eps,
                 );
                 let v_norm_bg = self.elem2_bind_group(v_target, &v_norm_meta);
-                let k_stage = if owns_v {
+                let k_stage = if let (true, None) = (owns_v, proj.k_norm) {
+                    let meta = self.rope_meta_buffer(
+                        n_head_kv as u32,
+                        n_tokens as u32,
+                        head_dim as u32,
+                        rope_dim as u32,
+                        start_pos as u32,
+                        rope_freq_base,
+                        pairing,
+                        yarn,
+                    );
+                    let bg = self.elem3_bind_group(&ff_buf, k_g.output_src(), &meta);
+                    PrefillKNormRope::RopeOnly { bg, _meta: meta }
+                } else if owns_v {
                     let meta = self.fused_norm_rope_meta_buffer(
                         n_head_kv as u32,
                         head_dim as u32,
@@ -7865,8 +8327,11 @@ impl VulkanBackend {
                         start_pos as u32,
                         rope_freq_base,
                         eps,
+                        pairing,
+                        yarn,
                     );
-                    let bg = self.elem4_bind_group(&k_norm_w, &ff_buf, k_g.output_src(), &meta);
+                    let norm_w = k_norm_w.as_ref().expect("norm branch has a weight");
+                    let bg = self.elem4_bind_group(norm_w, &ff_buf, k_g.output_src(), &meta);
                     PrefillKNormRope::Fused { bg, _meta: meta }
                 } else {
                     let norm_meta = self.perhead_norm_meta_buffer(
@@ -7874,7 +8339,10 @@ impl VulkanBackend {
                         head_dim as u32,
                         eps,
                     );
-                    let norm_bg = self.elem3_bind_group(&k_norm_w, k_g.output_src(), &norm_meta);
+                    let norm_w = k_norm_w
+                        .as_ref()
+                        .expect("the split branch is only reached with a K norm");
+                    let norm_bg = self.elem3_bind_group(norm_w, k_g.output_src(), &norm_meta);
                     let rope_meta = self.rope_meta_buffer(
                         n_head_kv as u32,
                         n_tokens as u32,
@@ -7882,6 +8350,8 @@ impl VulkanBackend {
                         rope_dim as u32,
                         start_pos as u32,
                         rope_freq_base,
+                        pairing,
+                        yarn,
                     );
                     let rope_bg = self.elem3_bind_group(&ff_buf, k_g.output_src(), &rope_meta);
                     PrefillKNormRope::Split {
@@ -7927,6 +8397,8 @@ impl VulkanBackend {
                     v_norm_meta,
                     k_stage,
                     cast,
+                    k_bias_bg,
+                    v_bias_bg,
                 )
             });
 
@@ -7993,16 +8465,59 @@ impl VulkanBackend {
                 }
             }
 
-            // Q's norm+RoPE is independent of the whole K/V side.
-            pass.set_pipeline(&self.fused_norm_rope_pipeline);
-            pass.set_bind_group(0, &q_bg, &[]);
-            pass.dispatch_workgroups(n_head as u32, n_tokens as u32, 1);
+            // Biases land on the projections before the norm, the RoPE or the
+            // KV write read them. Recorded into the same pass, which is ordered.
+            let mut bias = |bg: &wgpu::BindGroup, len: usize| {
+                pass.set_pipeline(&self.bias_add_pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups((len as u32).div_ceil(64), 1, 1);
+            };
+            if let Some((bg, ..)) = &q_bias_bg {
+                bias(bg, n_tokens * n_head * head_dim);
+            }
+            if let Some((.., k_bias_bg, v_bias_bg)) = &kv_side {
+                if let Some((bg, ..)) = k_bias_bg {
+                    bias(bg, n_tokens * kv_dim);
+                }
+                if let Some((bg, ..)) = v_bias_bg {
+                    bias(bg, n_tokens * kv_dim);
+                }
+            }
 
-            if let Some((.., k_stage, _)) = &kv_side {
+            // Q's norm+RoPE is independent of the whole K/V side. The
+            // no-norm form dispatches over elements, not heads×tokens — the
+            // two kernels index differently, and a shared grid would be wrong.
+            match &q_stage {
+                PrefillKNormRope::Fused { bg, .. } => {
+                    pass.set_pipeline(&self.fused_norm_rope_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(n_head as u32, n_tokens as u32, 1);
+                }
+                PrefillKNormRope::RopeOnly { bg, .. } => {
+                    pass.set_pipeline(&self.rope_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(
+                        ((n_tokens * n_head * (rope_dim / 2)) as u32).div_ceil(64),
+                        1,
+                        1,
+                    );
+                }
+                PrefillKNormRope::Split { .. } => unreachable!("Q never splits"),
+            }
+
+            if let Some((.., k_stage, _, _, _)) = &kv_side {
                 if let PrefillKNormRope::Fused { bg, .. } = k_stage {
                     pass.set_pipeline(&self.fused_norm_rope_pipeline);
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(n_head_kv as u32, n_tokens as u32, 1);
+                } else if let PrefillKNormRope::RopeOnly { bg, .. } = k_stage {
+                    pass.set_pipeline(&self.rope_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(
+                        ((n_tokens * n_head_kv * (rope_dim / 2)) as u32).div_ceil(64),
+                        1,
+                        1,
+                    );
                 } else if let PrefillKNormRope::Split { norm_bg, .. } = k_stage {
                     pass.set_pipeline(&self.perhead_rmsnorm_pipeline);
                     pass.set_bind_group(0, norm_bg, &[]);
@@ -8029,10 +8544,12 @@ impl VulkanBackend {
                 label: Some("orangu-server fused prefill kv pass"),
                 timestamp_writes: None,
             });
-            if let Some((.., v_norm_bg, _, k_stage, cast)) = &kv_side {
-                pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
-                pass.set_bind_group(0, v_norm_bg, &[]);
-                pass.dispatch_workgroups((n_tokens * n_head_kv) as u32, 1, 1);
+            if let Some((.., v_norm_bg, _, k_stage, cast, _, _)) = &kv_side {
+                if normalize_v {
+                    pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
+                    pass.set_bind_group(0, v_norm_bg, &[]);
+                    pass.dispatch_workgroups((n_tokens * n_head_kv) as u32, 1, 1);
+                }
 
                 // Only now does K get rotated — V never does.
                 if let PrefillKNormRope::Split { rope_bg, .. } = k_stage {
@@ -8177,13 +8694,14 @@ impl VulkanBackend {
         residual: &[f32],
         n_tokens: usize,
         wo: &QuantMatrix,
-        attn_post_norm: &[f32],
+        attn_post_norm: Option<&[f32]>,
         ffn_norm: &[f32],
         gate: &QuantMatrix,
         up: &QuantMatrix,
         down: &QuantMatrix,
-        ffn_post_norm: &[f32],
+        ffn_post_norm: Option<&[f32]>,
         eps: f32,
+        activation: FfnActivation,
     ) -> Option<Vec<f32>> {
         if self.q4_k_mmvq {
             return None;
@@ -8231,6 +8749,7 @@ impl VulkanBackend {
                     down,
                     ffn_post_norm,
                     eps,
+                    activation,
                 )?;
                 stripe.truncate(len * n_embd);
                 out.extend(stripe);
@@ -8266,7 +8785,7 @@ impl VulkanBackend {
             w: down,
         };
         let trace = ple_trace();
-        let t_entry = std::time::Instant::now();
+        let t_entry = TraceClock::start();
         let _region_guard = self.prefill_region_guard();
         let wo_entry = self.op_entry_at(&wo_op, 0, ROLE_POST_ATTN);
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_POST_ATTN + 1);
@@ -8276,19 +8795,23 @@ impl VulkanBackend {
         let gate_g = gate_entry.lock().expect("op cache entry poisoned");
         let up_g = up_entry.lock().expect("op cache entry poisoned");
         let down_g = down_entry.lock().expect("op cache entry poisoned");
-        let entry_ms = ms_since(t_entry);
+        let entry_ms = t_entry.ms();
 
-        let t_upload = std::time::Instant::now();
+        let t_upload = TraceClock::start();
         if let AttnOutSrc::Host(a) = attn_out {
             self.queue
                 .write_buffer(&wo_g.x_buffer, wo_g.x_offset, bytemuck::cast_slice(a));
         }
         let residual_buf = self.upload_new(residual);
-        let attn_post_norm_w = self.upload_new(attn_post_norm);
+        // An architecture without post-norms (Llama, Qwen2, Mistral, Phi) is
+        // not a norm with weights of one — that would still normalize. It is
+        // *no norm*: the residual add runs on its own. So there is no weight to
+        // upload, and the bind group below is built for a different pipeline.
+        let attn_post_norm_w = attn_post_norm.map(|w| self.upload_new(w));
         let ffn_norm_w = self.upload_new(ffn_norm);
-        let ffn_post_norm_w = self.upload_new(ffn_post_norm);
-        let upload_ms = ms_since(t_upload);
-        let t_bind = std::time::Instant::now();
+        let ffn_post_norm_w = ffn_post_norm.map(|w| self.upload_new(w));
+        let upload_ms = t_upload.ms();
+        let t_bind = TraceClock::start();
         // `x1` is the layer's value after the attention residual; it is both
         // the FFN norm's input and the FFN residual's addend, so it has to
         // outlive the FFN block rather than be written over by it.
@@ -8297,13 +8820,18 @@ impl VulkanBackend {
         let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
         let meta_ffn = self.elem_meta_buffer((n_tokens * ffn_len) as u32, 0.0);
 
-        let bg_attn_resid = self.elem5_bind_group(
-            wo_g.output_src(),
-            &attn_post_norm_w,
-            &residual_buf,
-            &x1,
-            &meta_embd,
-        );
+        // Two shapes for the same step. With a post-norm it is
+        // `rmsnorm_add_rows` over `elem5` (wo_out, weight, residual, out,
+        // meta); without one it is a plain elementwise `add` over `elem4`
+        // (wo_out, residual, out, meta). The meta differs too: the row kernel
+        // is dispatched per row and needs the row width, the elementwise one is
+        // dispatched over the whole tensor and needs its length.
+        let meta_row_elems = self.elem_meta_buffer(row_elems as u32, 0.0);
+        let bg_attn_resid = attn_post_norm_w
+            .as_ref()
+            .map(|w| self.elem5_bind_group(wo_g.output_src(), w, &residual_buf, &x1, &meta_embd));
+        let bg_attn_add = (attn_post_norm_w.is_none())
+            .then(|| self.elem4_bind_group(wo_g.output_src(), &residual_buf, &x1, &meta_row_elems));
         // The FFN norm writes here, and the result is then copied into both
         // projections' own input regions. The copies are recorded into the
         // encoder (unlike `queue.write_buffer`, which is ordered against
@@ -8321,16 +8849,14 @@ impl VulkanBackend {
             ),
             &meta_ffn,
         );
-        let bg_ffn_resid = self.elem5_bind_group(
-            down_g.output_src(),
-            &ffn_post_norm_w,
-            &x1,
-            &out_buf,
-            &meta_embd,
-        );
-        let bind_ms = ms_since(t_bind);
+        let bg_ffn_add = (ffn_post_norm_w.is_none())
+            .then(|| self.elem4_bind_group(down_g.output_src(), &x1, &out_buf, &meta_row_elems));
+        let bg_ffn_resid = ffn_post_norm_w
+            .as_ref()
+            .map(|w| self.elem5_bind_group(down_g.output_src(), w, &x1, &out_buf, &meta_embd));
+        let bind_ms = t_bind.ms();
 
-        let t_record = std::time::Instant::now();
+        let t_record = TraceClock::start();
         let mut encoder = self.new_encoder("orangu-server fused prefill layer encoder");
         // Device-to-device when attention left its output on the GPU. Recorded
         // rather than a `queue.write_buffer`, so it is ordered against the
@@ -8362,9 +8888,19 @@ impl VulkanBackend {
                 });
                 self.record_matmul(&mut pass, wo, &wo_g);
 
-                pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
-                pass.set_bind_group(0, &bg_attn_resid, &[]);
-                pass.dispatch_workgroups(rows, 1, 1);
+                match (&bg_attn_resid, &bg_attn_add) {
+                    (Some(bg), _) => {
+                        pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(rows, 1, 1);
+                    }
+                    (None, Some(bg)) => {
+                        pass.set_pipeline(&self.add_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups((row_elems as u32).div_ceil(64), 1, 1);
+                    }
+                    (None, None) => unreachable!("one of the two shapes is always built"),
+                }
 
                 pass.set_pipeline(&self.rmsnorm_rows_pipeline);
                 pass.set_bind_group(0, &bg_ffn_norm, &[]);
@@ -8392,18 +8928,28 @@ impl VulkanBackend {
                 self.record_matmul(&mut pass, gate, &gate_g);
                 self.record_matmul(&mut pass, up, &up_g);
 
-                pass.set_pipeline(&self.gelu_mul_pipeline);
+                pass.set_pipeline(self.ffn_activation_pipeline(activation));
                 pass.set_bind_group(0, &bg_gelu_mul, &[]);
                 pass.dispatch_workgroups(((n_tokens * ffn_len) as u32).div_ceil(64), 1, 1);
 
                 self.record_matmul(&mut pass, down, &down_g);
 
-                pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
-                pass.set_bind_group(0, &bg_ffn_resid, &[]);
-                pass.dispatch_workgroups(rows, 1, 1);
+                match (&bg_ffn_resid, &bg_ffn_add) {
+                    (Some(bg), _) => {
+                        pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(rows, 1, 1);
+                    }
+                    (None, Some(bg)) => {
+                        pass.set_pipeline(&self.add_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups((row_elems as u32).div_ceil(64), 1, 1);
+                    }
+                    (None, None) => unreachable!("one of the two shapes is always built"),
+                }
             }
         }
-        let record_ms = ms_since(t_record);
+        let record_ms = t_record.ms();
         let (out, rb) = self.submit_and_readback_split(encoder, &out_buf, 0, row_elems);
         if trace {
             eprintln!(
@@ -8482,22 +9028,22 @@ impl VulkanBackend {
             w: proj,
         };
         let trace = ple_trace();
-        let t_bind = std::time::Instant::now();
+        let t_bind = TraceClock::start();
         let _region_guard = self.prefill_region_guard();
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_PLE);
         let proj_entry = self.op_entry_at(&proj_op, 0, ROLE_PLE + 1);
         let gate_g = gate_entry.lock().expect("op cache entry poisoned");
         let proj_g = proj_entry.lock().expect("op cache entry poisoned");
-        let entry_ms = ms_since(t_bind);
+        let entry_ms = t_bind.ms();
 
-        let t_upload = std::time::Instant::now();
+        let t_upload = TraceClock::start();
         self.queue
             .write_buffer(&gate_g.x_buffer, gate_g.x_offset, bytemuck::cast_slice(x));
         // The multiply's second operand is the only extra upload this needs.
         let per_layer_buf = self.upload_new(per_layer);
-        let upload_ms = ms_since(t_upload);
+        let upload_ms = t_upload.ms();
 
-        let t_bg = std::time::Instant::now();
+        let t_bg = TraceClock::start();
         let elems = n_tokens * per_layer_dim;
         let meta = self.elem_meta_buffer(elems as u32, 0.0);
         let bg_gelu_mul = self.elem4_bind_group(
@@ -8506,9 +9052,9 @@ impl VulkanBackend {
             BindSrc::Slice(&proj_g.x_buffer, proj_g.x_offset, (elems as u64) * 4),
             &meta,
         );
-        let bind_ms = ms_since(t_bg);
+        let bind_ms = t_bg.ms();
 
-        let t_record = std::time::Instant::now();
+        let t_record = TraceClock::start();
         let mut encoder = self.new_encoder("orangu-server fused prefill PLE encoder");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -8533,7 +9079,7 @@ impl VulkanBackend {
                 self.record_matmul(&mut pass, proj, &proj_g);
             }
         }
-        let record_ms = ms_since(t_record);
+        let record_ms = t_record.ms();
         let (out, rb) = self.submit_and_readback_split(
             encoder,
             &proj_g.output_buffer,
@@ -8693,8 +9239,92 @@ impl VulkanBackend {
     /// [`Self::record_fused_attention`] has its own standalone, directly
     /// testable entry point — `gpu_attention`'s own tests only ever
     /// exercised the un-split kernel.
-    #[cfg(test)]
+    ///
+    /// It is also the decode-attention path for every architecture without a
+    /// fused decode graph (`engine::attention::attention` at `n_tokens == 1`).
+    /// Splitting over KV positions is what that case needs: there is exactly
+    /// one query to parallelise over, so the un-split kernel would leave the
+    /// device almost idle while the window it has to walk is the whole
+    /// conversation. Formerly `#[cfg(test)]`; the four cross-checks that made
+    /// it testable are now covering a shipping path.
+    /// [`Self::record_attention_split`], then submit and read the result back.
+    ///
+    /// The round-trip form, for callers that need the vector on the host —
+    /// `engine::attention`'s decode path, and the cross-checks. A caller that is
+    /// already building an encoder should use the recording form instead and
+    /// keep the result on the device: on the generic decode path this call is
+    /// **one of the two GPU submissions per layer**, and `PERF-GAP.md` G3
+    /// measures that submission count as what decides whether concurrent
+    /// requests can fill the device at all.
     pub fn gpu_attention_split(&self, input: GpuAttentionInput<'_>) -> Vec<f32> {
+        let n_out = input.n_head * input.head_dim;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server attention split encoder"),
+            });
+        let out_buf = self.record_attention_split(&mut encoder, input);
+        let (result, _) = self.submit_and_readback_split(encoder, &out_buf, 0, n_out);
+        result
+    }
+
+    /// Reads `len` `f32`s back from `buf`.
+    ///
+    /// The escape hatch for [`Self::gpu_attention_split_on_device`]: its whole
+    /// point is that the caller hands the buffer to another GPU chain instead of
+    /// bringing it to the host, but that chain can decline (`q4_k_mmvq`,
+    /// `ORANGU_NO_FUSED_POST_ATTN`), and then the CPU sequence needs the vector
+    /// after all. Without this the fallback would read an untouched host buffer
+    /// — zeros, silently, with no wrong shape to catch it.
+    pub fn read_buffer_f32(&self, buf: &wgpu::Buffer, len: usize) -> Vec<f32> {
+        let encoder = self.new_encoder("orangu-server buffer readback encoder");
+        let (out, _) = self.submit_and_readback_split(encoder, buf, 0, len);
+        out
+    }
+
+    /// [`Self::record_attention_split`], submitted but **not** read back — the
+    /// result stays in the returned device buffer.
+    ///
+    /// The point is the *absence* of the readback. On the generic decode path a
+    /// layer currently pays two blocking waits: attention submits and blocks to
+    /// bring `[n_head * head_dim]` floats to the host, and the `wo`/FFN chain
+    /// then uploads the same vector straight back and blocks again. Handing the
+    /// buffer to that chain as [`AttnOutSrc::Gpu`] — which it already knows how
+    /// to consume, with a device-to-device copy ordered against the matmul that
+    /// reads it — removes one of the two waits per layer and the round trip of
+    /// the vector with it.
+    ///
+    /// Still one submission, so the `2·layers + 1` submission count
+    /// `PERF-GAP.md` G3 measures does not move; what moves is how much of each
+    /// layer the host spends blocked.
+    ///
+    /// Two submissions on one queue execute in order, so the copy in the next
+    /// encoder is guaranteed to see this one's output without a host fence.
+    pub fn gpu_attention_split_on_device(&self, input: GpuAttentionInput<'_>) -> wgpu::Buffer {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server attention split encoder"),
+            });
+        let out_buf = self.record_attention_split(&mut encoder, input);
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        out_buf
+    }
+
+    /// Records the split ("flash-decode") attention for one query into
+    /// `encoder` and returns the buffer its `[n_head * head_dim]` output lands
+    /// in. Submits nothing.
+    ///
+    /// Separated from [`Self::gpu_attention_split`] so a decode layer can put
+    /// this and the `wo`/FFN chain in **one** encoder rather than two, which is
+    /// the difference between two GPU submissions per layer and one.
+    pub fn record_attention_split(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: GpuAttentionInput<'_>,
+    ) -> wgpu::Buffer {
         let GpuAttentionInput {
             q,
             cache,
@@ -8784,11 +9414,6 @@ impl VulkanBackend {
         let reduce_bind_group =
             self.elem4_bind_group(&partial_ml, &partial_acc, &out_buf, &reduce_meta_buf);
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("orangu-server attention split encoder"),
-            });
         let group = (n_head / n_head_kv).max(1);
         let split_pipeline = self.attn_split_pipeline_for(head_dim, group);
         let phase1_x = if self.attn_gqa && group > 1 {
@@ -8808,33 +9433,7 @@ impl VulkanBackend {
             pass.set_bind_group(0, &reduce_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
-        let readback_len = (n_head * head_dim) as u64 * 4;
-        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server attention split readback"),
-            size: readback_len,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &readback_buffer, 0, readback_len);
-
-        self.queue.submit(Some(encoder.finish()));
-        self.submission_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
-                result.expect("mapping the attention split readback buffer failed");
-            });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling the device for the attention split readback failed");
-        let data = readback_buffer.slice(..).get_mapped_range().expect(
-            "attention split readback buffer was not mapped after a successful map_async + poll",
-        );
-        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        readback_buffer.unmap();
-        result
+        out_buf
     }
 
     /// Builds (never cached itself — callers cache the whole
@@ -8858,72 +9457,153 @@ impl VulkanBackend {
             }
         };
 
-        let q_norm_w = self.upload_new(input.q_norm);
+        // Projection biases, added before the norm or RoPE reads the
+        // projection. Same broadcast kernel the prefill chain uses — `y[i] +=
+        // bias[i % row]` over an `elem3` binding — with the row width in the
+        // meta's `aux`.
+        let q_bias_bg = input.q_bias.map(|b| {
+            let w = self.upload_new(b);
+            let meta =
+                self.bias_meta_buffer((input.n_head * input.head_dim) as u32, b.len() as u32);
+            let bg = self.elem3_bind_group(&w, wq_g.output_src(), &meta);
+            (bg, w, meta)
+        });
+
         let q_ff = self.upload_new(ff);
-        let q_norm_rope_meta_buf = self.fused_norm_rope_meta_buffer(
-            input.n_head as u32,
-            input.head_dim as u32,
-            input.rope_dim as u32,
-            input.pos as u32,
-            input.rope_freq_base,
-            input.eps,
-        );
-        let q_norm_rope_bg =
-            self.elem4_bind_group(&q_norm_w, &q_ff, wq_g.output_src(), &q_norm_rope_meta_buf);
-        let q_norm_rope_wg = input.n_head as u32;
+        // Two shapes, as on the prefill side. With a per-head Q norm it is the
+        // fused norm+RoPE kernel over `elem4` (weight, freq-factors, q, meta),
+        // dispatched one workgroup per head. Without one it is the standalone
+        // RoPE kernel over `elem3` (freq-factors, q, meta), dispatched over
+        // pairs. No norm is *not* a norm with weights of one.
+        let (q_norm_w, q_norm_rope_meta_buf, q_norm_rope_bg, q_norm_rope_wg, q_rope_only) =
+            match input.q_norm {
+                Some(w) => {
+                    let q_norm_w = self.upload_new(w);
+                    let meta = self.fused_norm_rope_meta_buffer(
+                        input.n_head as u32,
+                        input.head_dim as u32,
+                        input.rope_dim as u32,
+                        input.pos as u32,
+                        input.rope_freq_base,
+                        input.eps,
+                        input.pairing,
+                        input.yarn,
+                    );
+                    let bg = self.elem4_bind_group(&q_norm_w, &q_ff, wq_g.output_src(), &meta);
+                    (Some(q_norm_w), meta, bg, input.n_head as u32, false)
+                }
+                None => {
+                    let meta = self.rope_meta_buffer(
+                        input.n_head as u32,
+                        1,
+                        input.head_dim as u32,
+                        input.rope_dim as u32,
+                        input.pos as u32,
+                        input.rope_freq_base,
+                        input.pairing,
+                        input.yarn,
+                    );
+                    let bg = self.elem3_bind_group(&q_ff, wq_g.output_src(), &meta);
+                    let wg = ((input.n_head * (input.rope_dim / 2)) as u32).div_ceil(64);
+                    (None, meta, bg, wg.max(1), true)
+                }
+            };
 
         let kv = if let (Some(proj), Some(wk_guard)) = (&input.kv, wk_g) {
             // See `KNormRope`'s own doc comment for why this specific
             // condition decides fused vs. split.
             let owns_v = wv_g.is_some();
 
-            let k_norm_rope = if owns_v {
-                let k_norm_w = self.upload_new(proj.k_norm);
-                let k_ff = self.upload_new(ff);
-                let meta_buf = self.fused_norm_rope_meta_buffer(
-                    input.n_head_kv as u32,
-                    input.head_dim as u32,
-                    input.rope_dim as u32,
-                    input.pos as u32,
-                    input.rope_freq_base,
-                    input.eps,
-                );
-                let bg = self.elem4_bind_group(&k_norm_w, &k_ff, wk_guard.output_src(), &meta_buf);
-                KNormRope::Fused {
-                    bg,
-                    meta_buf,
-                    wg: input.n_head_kv as u32,
-                    k_norm_w,
-                    k_ff,
+            let k_bias_bg = proj.k_bias.map(|b| {
+                let w = self.upload_new(b);
+                let meta = self
+                    .bias_meta_buffer((input.n_head_kv * input.head_dim) as u32, b.len() as u32);
+                let bg = self.elem3_bind_group(&w, wk_guard.output_src(), &meta);
+                (bg, w, meta)
+            });
+            let v_bias_bg = proj.v_bias.zip(wv_g).map(|(b, g)| {
+                let w = self.upload_new(b);
+                let meta = self
+                    .bias_meta_buffer((input.n_head_kv * input.head_dim) as u32, b.len() as u32);
+                let bg = self.elem3_bind_group(&w, g.output_src(), &meta);
+                (bg, w, meta)
+            });
+
+            let k_norm_rope = if let Some(k_norm) = proj.k_norm {
+                if owns_v {
+                    let k_norm_w = self.upload_new(k_norm);
+                    let k_ff = self.upload_new(ff);
+                    let meta_buf = self.fused_norm_rope_meta_buffer(
+                        input.n_head_kv as u32,
+                        input.head_dim as u32,
+                        input.rope_dim as u32,
+                        input.pos as u32,
+                        input.rope_freq_base,
+                        input.eps,
+                        input.pairing,
+                        input.yarn,
+                    );
+                    let bg =
+                        self.elem4_bind_group(&k_norm_w, &k_ff, wk_guard.output_src(), &meta_buf);
+                    KNormRope::Fused {
+                        bg,
+                        meta_buf,
+                        wg: input.n_head_kv as u32,
+                        k_norm_w,
+                        k_ff,
+                    }
+                } else {
+                    let k_norm_w = self.upload_new(k_norm);
+                    let k_norm_meta = self.perhead_norm_meta_buffer(
+                        input.n_head_kv as u32,
+                        input.head_dim as u32,
+                        input.eps,
+                    );
+                    let k_norm_bg =
+                        self.elem3_bind_group(&k_norm_w, wk_guard.output_src(), &k_norm_meta);
+
+                    let k_ff = self.upload_new(ff);
+                    let k_rope_meta_buf = self.rope_meta_buffer(
+                        input.n_head_kv as u32,
+                        1,
+                        input.head_dim as u32,
+                        input.rope_dim as u32,
+                        input.pos as u32,
+                        input.rope_freq_base,
+                        input.pairing,
+                        input.yarn,
+                    );
+                    let k_rope_bg =
+                        self.elem3_bind_group(&k_ff, wk_guard.output_src(), &k_rope_meta_buf);
+
+                    KNormRope::Split {
+                        k_norm_bg,
+                        k_norm_wg: input.n_head_kv as u32,
+                        k_rope_bg,
+                        k_rope_meta_buf,
+                        k_rope_wg: ((input.n_head_kv * half) as u32).div_ceil(64).max(1),
+                    }
                 }
             } else {
-                let k_norm_w = self.upload_new(proj.k_norm);
-                let k_norm_meta = self.perhead_norm_meta_buffer(
-                    input.n_head_kv as u32,
-                    input.head_dim as u32,
-                    input.eps,
-                );
-                let k_norm_bg =
-                    self.elem3_bind_group(&k_norm_w, wk_guard.output_src(), &k_norm_meta);
-
+                // No per-head K norm: RoPE alone, on the standalone kernel's
+                // `elem3` binding and dispatched over pairs rather than heads.
                 let k_ff = self.upload_new(ff);
-                let k_rope_meta_buf = self.rope_meta_buffer(
+                let meta = self.rope_meta_buffer(
                     input.n_head_kv as u32,
                     1,
                     input.head_dim as u32,
                     input.rope_dim as u32,
                     input.pos as u32,
                     input.rope_freq_base,
+                    input.pairing,
+                    input.yarn,
                 );
-                let k_rope_bg =
-                    self.elem3_bind_group(&k_ff, wk_guard.output_src(), &k_rope_meta_buf);
-
-                KNormRope::Split {
-                    k_norm_bg,
-                    k_norm_wg: input.n_head_kv as u32,
-                    k_rope_bg,
-                    k_rope_meta_buf,
-                    k_rope_wg: ((input.n_head_kv * half) as u32).div_ceil(64).max(1),
+                let bg = self.elem3_bind_group(&k_ff, wk_guard.output_src(), &meta);
+                KNormRope::RopeOnly {
+                    bg,
+                    _meta: meta,
+                    wg: ((input.n_head_kv * half) as u32).div_ceil(64).max(1),
+                    k_ff,
                 }
             };
 
@@ -8945,6 +9625,8 @@ impl VulkanBackend {
 
             Some(FusedAttnKvLayerResources {
                 k_norm_rope,
+                k_bias_bg,
+                v_bias_bg,
                 v_scratch,
                 v_norm_bg,
                 v_norm_meta,
@@ -8989,6 +9671,8 @@ impl VulkanBackend {
             bg_wk_matmul,
             bg_wv_matmul,
             q_norm_rope_bg,
+            q_rope_only,
+            q_bias_bg,
             q_norm_rope_meta_buf,
             q_norm_rope_wg,
             q_norm_w,
@@ -9006,10 +9690,10 @@ impl VulkanBackend {
         wk_g: Option<&CachedOpResources>,
         wv_g: Option<&CachedOpResources>,
     ) -> Arc<FusedAttnLayerResources> {
-        let (ptr, start) = input.wq.cache_key();
+        let (waddr, wlen) = input.wq.cache_key();
         let key: FusedAttnLayerCacheKey = (
-            ptr,
-            start,
+            waddr,
+            wlen,
             input.n_head,
             input.n_head_kv,
             input.head_dim,
@@ -9321,6 +10005,9 @@ impl VulkanBackend {
         // again, so the rest of this function works with owned fields
         // directly instead of going back through `input.*`.
         let FusedAttnInput {
+            pairing,
+            normalize_v,
+            q_bias: _,
             normed: _,
             wq,
             q_norm: _,
@@ -9330,6 +10017,7 @@ impl VulkanBackend {
             head_dim,
             rope_dim,
             rope_freq_base,
+            yarn,
             freq_factors: _,
             eps,
             pos,
@@ -9343,20 +10031,48 @@ impl VulkanBackend {
 
         // `pos` is the one field in these cached meta buffers that
         // genuinely changes every call.
-        self.queue.write_buffer(
-            &layer.q_norm_rope_meta_buf,
-            0,
-            bytemuck::bytes_of(&FusedNormRopeMeta {
-                n_head: n_head as u32,
-                head_dim: head_dim as u32,
-                rope_dim: rope_dim as u32,
-                pos: pos as u32,
-                freq_base: rope_freq_base,
-                eps,
-                _pad0: 0,
-                _pad1: 0,
-            }),
-        );
+        //
+        // **Which struct is written depends on Q's stage.** With a per-head Q
+        // norm the buffer holds a `FusedNormRopeMeta`; without one it holds a
+        // `RopeMeta`, which is a different layout — writing the wrong one puts
+        // `eps` where `n_tokens` belongs and rotates by garbage. The two shapes
+        // were added together with the stage itself, and this rewrite was not
+        // updated with them: it is the defect
+        // `fused_attention_decode_matches_cpu_on_the_llama_shape` was written
+        // to find.
+        if layer.q_rope_only {
+            self.queue.write_buffer(
+                &layer.q_norm_rope_meta_buf,
+                0,
+                bytemuck::bytes_of(&RopeMeta {
+                    n_head: n_head as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    pos: pos as u32,
+                    freq_base: rope_freq_base,
+                    n_tokens: 1,
+                    pairing: rope_layout_code(pairing),
+                    _pad2: 0,
+                    yarn,
+                }),
+            );
+        } else {
+            self.queue.write_buffer(
+                &layer.q_norm_rope_meta_buf,
+                0,
+                bytemuck::bytes_of(&FusedNormRopeMeta {
+                    n_head: n_head as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    pos: pos as u32,
+                    freq_base: rope_freq_base,
+                    eps,
+                    pairing: rope_layout_code(pairing),
+                    _pad1: 0,
+                    yarn,
+                }),
+            );
+        }
         if let Some(kv_res) = &layer.kv {
             match &kv_res.k_norm_rope {
                 KNormRope::Fused { meta_buf, .. } => {
@@ -9370,8 +10086,9 @@ impl VulkanBackend {
                             pos: pos as u32,
                             freq_base: rope_freq_base,
                             eps,
-                            _pad0: 0,
+                            pairing: rope_layout_code(pairing),
                             _pad1: 0,
+                            yarn,
                         }),
                     );
                 }
@@ -9388,8 +10105,26 @@ impl VulkanBackend {
                             pos: pos as u32,
                             freq_base: rope_freq_base,
                             n_tokens: 1,
-                            _pad1: 0,
+                            pairing: rope_layout_code(pairing),
                             _pad2: 0,
+                            yarn,
+                        }),
+                    );
+                }
+                KNormRope::RopeOnly { _meta, .. } => {
+                    self.queue.write_buffer(
+                        _meta,
+                        0,
+                        bytemuck::bytes_of(&RopeMeta {
+                            n_head: n_head_kv as u32,
+                            head_dim: head_dim as u32,
+                            rope_dim: rope_dim as u32,
+                            pos: pos as u32,
+                            freq_base: rope_freq_base,
+                            n_tokens: 1,
+                            pairing: rope_layout_code(pairing),
+                            _pad2: 0,
+                            yarn,
                         }),
                     );
                 }
@@ -9698,24 +10433,58 @@ impl VulkanBackend {
                 }
             }
 
-            pass.set_pipeline(&self.fused_norm_rope_pipeline);
+            // Biases first: the norm, the RoPE and the KV write all read the
+            // projections, so they must land before any of them. Same pass,
+            // which is ordered.
+            {
+                let mut bias = |bg: &wgpu::BindGroup, len: usize| {
+                    pass.set_pipeline(&self.bias_add_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups((len as u32).div_ceil(64), 1, 1);
+                };
+                if let Some((bg, ..)) = &layer.q_bias_bg {
+                    bias(bg, n_head * head_dim);
+                }
+                if let Some(kv_res) = &layer.kv {
+                    if let Some((bg, ..)) = &kv_res.k_bias_bg {
+                        bias(bg, n_head_kv * head_dim);
+                    }
+                    if let Some((bg, ..)) = &kv_res.v_bias_bg {
+                        bias(bg, n_head_kv * head_dim);
+                    }
+                }
+            }
+
+            pass.set_pipeline(if layer.q_rope_only {
+                &self.rope_pipeline
+            } else {
+                &self.fused_norm_rope_pipeline
+            });
             pass.set_bind_group(0, &layer.q_norm_rope_bg, &[]);
             pass.dispatch_workgroups(layer.q_norm_rope_wg, 1, 1);
-            self.capture_push(|| {
-                fused_norm_rope_capture_step(
-                    &layer.q_norm_w,
-                    &layer.q_ff,
-                    &wq_g.output_buffer,
-                    wq_g.output_offset,
-                    n_head,
-                    head_dim,
-                    rope_dim,
-                    pos,
-                    rope_freq_base,
-                    eps,
-                    layer.q_norm_rope_wg,
-                )
-            });
+            // The capture describes the *fused* norm+RoPE step. Without a Q
+            // norm the dispatch above is the standalone RoPE kernel on a
+            // different binding, which the replay path has never covered — so
+            // nothing is pushed rather than a step that misdescribes what ran.
+            if let Some(q_norm_w) = layer.q_norm_w.as_ref() {
+                self.capture_push(|| {
+                    fused_norm_rope_capture_step(
+                        q_norm_w,
+                        &layer.q_ff,
+                        &wq_g.output_buffer,
+                        wq_g.output_offset,
+                        n_head,
+                        head_dim,
+                        rope_dim,
+                        pos,
+                        rope_freq_base,
+                        eps,
+                        pairing,
+                        yarn,
+                        layer.q_norm_rope_wg,
+                    )
+                });
+            }
 
             // K's own norm(+RoPE, when fused — `KNormRope::Fused` is only
             // reachable when this layer owns its own V projection, so
@@ -9747,6 +10516,8 @@ impl VulkanBackend {
                                     pos,
                                     rope_freq_base,
                                     eps,
+                                    pairing,
+                                    yarn,
                                     *wg,
                                 )
                             });
@@ -9760,6 +10531,16 @@ impl VulkanBackend {
                         pass.set_pipeline(&self.perhead_rmsnorm_pipeline);
                         pass.set_bind_group(0, k_norm_bg, &[]);
                         pass.dispatch_workgroups(*k_norm_wg, 1, 1);
+                    }
+                    // No K norm: RoPE alone, here in pass A. The `Split` case
+                    // has to defer its RoPE to pass B because a V-copy reads
+                    // K's post-norm, pre-RoPE value in between; with no norm
+                    // there is no such intermediate to preserve, and a layer
+                    // without a K norm always owns its own V projection anyway.
+                    KNormRope::RopeOnly { bg, wg, .. } => {
+                        pass.set_pipeline(&self.rope_pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(*wg, 1, 1);
                     }
                 }
             }
@@ -9790,9 +10571,11 @@ impl VulkanBackend {
                 label: Some("orangu-server fused attention vnorm+krope pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
-            pass.set_bind_group(0, &kv_res.v_norm_bg, &[]);
-            pass.dispatch_workgroups(kv_res.v_norm_wg, 1, 1);
+            if normalize_v {
+                pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
+                pass.set_bind_group(0, &kv_res.v_norm_bg, &[]);
+                pass.dispatch_workgroups(kv_res.v_norm_wg, 1, 1);
+            }
             self.capture_push(|| {
                 use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
                 // elem2: b0 = V projection (in-place), b1 = PerHeadNormMeta.
@@ -9851,7 +10634,7 @@ impl VulkanBackend {
                     let offset = (write_pos * kv_dim) as u32;
                     let cast_meta = ElemMeta {
                         len: kv_dim as u32,
-                        _pad0: offset,
+                        aux: offset,
                         extra: 0.0,
                         out_scale: 0.0,
                     };
@@ -9908,7 +10691,7 @@ impl VulkanBackend {
                     let dst_block_offset = (write_pos as u32) * n_blocks;
                     let quant_meta = ElemMeta {
                         len: n_blocks,
-                        _pad0: dst_block_offset,
+                        aux: dst_block_offset,
                         extra: 0.0,
                         out_scale: 0.0,
                     };
@@ -10200,10 +10983,10 @@ impl VulkanBackend {
         eps: f32,
         batch_slot: usize,
     ) -> Arc<FusedLayerResources> {
-        let (ptr, start) = wq.cache_key();
+        let (waddr, wlen) = wq.cache_key();
         let key: FusedLayerCacheKey = (
-            ptr,
-            start,
+            waddr,
+            wlen,
             n_embd,
             eps.to_bits(),
             attn_norm.as_ptr() as usize,
@@ -10261,6 +11044,10 @@ impl VulkanBackend {
 
         let FusedLayerInput {
             x,
+            pairing,
+            activation,
+            normalize_v,
+            q_bias,
             attn_norm: _,
             wq,
             q_norm,
@@ -10270,6 +11057,7 @@ impl VulkanBackend {
             head_dim,
             rope_dim,
             rope_freq_base,
+            yarn,
             freq_factors,
             eps,
             pos,
@@ -10344,6 +11132,9 @@ impl VulkanBackend {
         let attn_out_buf = self.record_fused_attention(
             encoder,
             FusedAttnInput {
+                normalize_v,
+                q_bias,
+                pairing,
                 normed: GpuInput::Gpu(
                     &layer_res.normed_buf,
                     (layer_res.normed_buf_offset / 4) as usize,
@@ -10356,6 +11147,7 @@ impl VulkanBackend {
                 head_dim,
                 rope_dim,
                 rope_freq_base,
+                yarn,
                 freq_factors,
                 eps,
                 pos,
@@ -10371,6 +11163,7 @@ impl VulkanBackend {
         self.record_fused_post_attention(
             encoder,
             FusedPostAttentionInput {
+                activation,
                 attn_out: GpuInput::Gpu(&attn_out_buf, 0),
                 residual: GpuInput::Gpu(&layer_res.x_buf, (layer_res.x_buf_offset / 4) as usize),
                 wo,
@@ -11392,6 +12185,12 @@ struct FusedScaleResources {
 /// freq-factors, b2 = the projection buffer (RoPE'd in place), b3 = a per-token
 /// `FusedNormRopeMeta` whose only per-token field is `pos` (byte 12). `n_head`
 /// is this dispatch's head count (`n_head` for Q, `n_head_kv` for K).
+///
+/// The uniform's initial bytes come from a real [`FusedNormRopeMeta`] rather
+/// than a hand-packed image. The hand-packed one silently stopped describing
+/// the struct the moment a field was added: it left `pairing` at zero — NEOX
+/// for a NORM model — and, once the YaRN tail arrived, a zeroed `freq_scale`
+/// and `mscale` that rotate by nothing and scale to nothing.
 #[allow(clippy::too_many_arguments)]
 fn fused_norm_rope_capture_step(
     norm_w: &wgpu::Buffer,
@@ -11404,19 +12203,24 @@ fn fused_norm_rope_capture_step(
     pos: usize,
     freq_base: f32,
     eps: f32,
+    pairing: crate::engine::tensor::RopeLayout,
+    yarn: RopeYarn,
     wg: u32,
 ) -> vulkan_replay::CaptureStep {
     use vulkan_replay::{
         CaptureBinding, CaptureStep, DescriptorKind, PerTokenBinding, PerTokenField,
     };
-    // FusedNormRopeMeta { n_head, head_dim, rope_dim, pos, freq_base, eps, _, _ }.
-    let mut meta = [0u8; 32];
-    meta[0..4].copy_from_slice(&(n_head as u32).to_ne_bytes());
-    meta[4..8].copy_from_slice(&(head_dim as u32).to_ne_bytes());
-    meta[8..12].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
-    meta[12..16].copy_from_slice(&(pos as u32).to_ne_bytes());
-    meta[16..20].copy_from_slice(&freq_base.to_ne_bytes());
-    meta[20..24].copy_from_slice(&eps.to_ne_bytes());
+    let meta = FusedNormRopeMeta {
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        rope_dim: rope_dim as u32,
+        pos: pos as u32,
+        freq_base,
+        eps,
+        pairing: rope_layout_code(pairing),
+        _pad1: 0,
+        yarn,
+    };
     CaptureStep::Dispatch {
         wgsl: vulkan_shaders::shader_source_fused_norm_rope(),
         bindings: vec![
@@ -11444,7 +12248,7 @@ fn fused_norm_rope_capture_step(
         ],
         per_token: vec![PerTokenBinding {
             binding: 3,
-            init_bytes: meta.to_vec(),
+            init_bytes: bytemuck::bytes_of(&meta).to_vec(),
             fields: vec![PerTokenField::Pos { byte_offset: 12 }],
         }],
         groups: [wg, 1, 1],
@@ -11674,11 +12478,18 @@ struct FusedAttnLayerResources {
     q_norm_rope_bg: wgpu::BindGroup,
     q_norm_rope_meta_buf: wgpu::Buffer,
     q_norm_rope_wg: u32,
+    /// Whether Q's stage is the standalone RoPE kernel (no per-head Q norm)
+    /// rather than the fused norm+RoPE one. The two take different bindings and
+    /// different dispatch shapes, so the flag travels with the bind group.
+    q_rope_only: bool,
+    /// See [`FusedAttnKvLayerResources::k_bias_bg`].
+    #[allow(dead_code)]
+    q_bias_bg: Option<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)>,
     /// The static Q-norm weight and freq-factor buffers bound by
     /// `q_norm_rope_bg` — exposed for the raw-Vulkan replay capture (the bind
     /// group already keeps them alive). Only read by the replay path.
     #[allow(dead_code)]
-    q_norm_w: wgpu::Buffer,
+    q_norm_w: Option<wgpu::Buffer>,
     #[allow(dead_code)]
     q_ff: wgpu::Buffer,
     kv: Option<FusedAttnKvLayerResources>,
@@ -11695,6 +12506,13 @@ struct FusedAttnLayerResources {
 /// their own K/V projection.
 struct FusedAttnKvLayerResources {
     k_norm_rope: KNormRope,
+    /// `(bind group, weight buffer, meta buffer)` for a projection bias, when
+    /// this layer has one. The last two are kept only so the bind group's
+    /// resources outlive it.
+    #[allow(dead_code)]
+    k_bias_bg: Option<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)>,
+    #[allow(dead_code)]
+    v_bias_bg: Option<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)>,
     /// `Some` only when this layer doesn't own its own V projection (V
     /// is a copy of K's post-norm output instead) — the same condition
     /// [`KNormRope::Split`] is chosen under, since it's the same
@@ -11739,6 +12557,16 @@ enum KNormRope {
         /// for the raw-Vulkan replay capture. Only read by the replay path.
         #[allow(dead_code)]
         k_norm_w: wgpu::Buffer,
+        #[allow(dead_code)]
+        k_ff: wgpu::Buffer,
+    },
+    /// No per-head K norm on this architecture — RoPE alone, through the
+    /// standalone kernel and its `elem3` binding. The prefill enum has had this
+    /// variant since G2's third increment; this one assumed a norm.
+    RopeOnly {
+        bg: wgpu::BindGroup,
+        _meta: wgpu::Buffer,
+        wg: u32,
         #[allow(dead_code)]
         k_ff: wgpu::Buffer,
     },
@@ -11816,7 +12644,7 @@ struct FusedResources {
     /// `normed2` intermediate.
     x2: wgpu::Buffer,
     x2_offset: u64,
-    bg_attn_post_norm_add: wgpu::BindGroup,
+    bg_attn_post_norm_add: Option<wgpu::BindGroup>,
     bg_ffn_norm: wgpu::BindGroup,
     /// Copy elimination: shared-input matmul bind groups for the FFN
     /// gate/up projections that read `ffn_normed` **directly** (read-only)
@@ -11833,14 +12661,20 @@ struct FusedResources {
     /// `record_fused_post_attention` runs one dispatch instead of `bg_gelu` then
     /// `bg_mul`.
     bg_gelu_mul: Option<wgpu::BindGroup>,
-    bg_ffn_post_norm_add: wgpu::BindGroup,
+    bg_ffn_post_norm_add: Option<wgpu::BindGroup>,
+    /// The no-post-norm shapes: a plain elementwise add instead of the fused
+    /// `rmsnorm_add`. Exactly one of each pair is `Some`.
+    bg_attn_add: Option<wgpu::BindGroup>,
+    bg_ffn_add: Option<wgpu::BindGroup>,
+    #[allow(dead_code)]
+    meta_embd_plain: wgpu::Buffer,
     /// Static weights / meta uniforms + arena offsets bound by the five
     /// post-attention dispatches — exposed so the raw-Vulkan replay capture can
     /// enumerate the exact buffers they bind (the bind groups already keep them
     /// alive). Read only by the capture path.
-    attn_post_norm_w: wgpu::Buffer,
+    attn_post_norm_w: Option<wgpu::Buffer>,
     ffn_norm_w: wgpu::Buffer,
-    ffn_post_norm_w: wgpu::Buffer,
+    ffn_post_norm_w: Option<wgpu::Buffer>,
     meta_embd_eps: wgpu::Buffer,
     meta_ffn_plain: wgpu::Buffer,
     x1_offset: u64,
@@ -14402,13 +15236,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                         &c.residual,
                         n_tokens,
                         &c.wo,
-                        &c.attn_post_norm,
+                        Some(&c.attn_post_norm),
                         &c.ffn_norm,
                         &c.gate,
                         &c.up,
                         &c.down,
-                        &c.ffn_post_norm,
+                        Some(&c.ffn_post_norm),
                         eps,
+                        FfnActivation::Geglu,
                     )
                     .expect("fused post-attention available without MMVQ")
             },
@@ -14475,14 +15310,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 vulkan
                     .fused_attention_prefill(
                         FusedAttnPrefillInput {
+                            yarn: RopeYarn::IDENTITY,
+                            q_bias: None,
+                            pairing: crate::engine::tensor::RopeLayout::Neox,
+                            normalize_v: true,
                             normed: &c.normed,
                             n_tokens,
                             start_pos: 0,
                             wq: &c.wq,
-                            q_norm: &c.q_norm,
+                            q_norm: Some(&c.q_norm),
                             kv: Some(FusedAttnPrefillKv {
+                                k_bias: None,
+                                v_bias: None,
                                 wk: &c.wk,
-                                k_norm: &c.k_norm,
+                                k_norm: Some(&c.k_norm),
                                 wv: Some(&c.wv),
                             }),
                             n_head,
@@ -15088,15 +15929,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let expected = x;
 
         let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+            activation: FfnActivation::Geglu,
             attn_out: GpuInput::Cpu(&attn_out),
             residual: GpuInput::Cpu(&residual),
             wo: &wo,
-            attn_post_norm: &attn_post_norm,
+            attn_post_norm: Some(&attn_post_norm),
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
             ffn_down: &ffn_down,
-            ffn_post_norm: &ffn_post_norm,
+            ffn_post_norm: Some(&ffn_post_norm),
             eps,
             ple: Some(FusedPle {
                 gate_w: &ple_gate_w,
@@ -15184,15 +16026,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let expected = x;
 
         let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+            activation: FfnActivation::Geglu,
             attn_out: GpuInput::Cpu(&attn_out),
             residual: GpuInput::Cpu(&residual),
             wo: &wo,
-            attn_post_norm: &attn_post_norm,
+            attn_post_norm: Some(&attn_post_norm),
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
             ffn_down: &ffn_down,
-            ffn_post_norm: &ffn_post_norm,
+            ffn_post_norm: Some(&ffn_post_norm),
             eps,
             ple: None,
             layer_output_scale: None,
@@ -15310,15 +16153,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
             let expected = cpu_reference(&attn_out, &residual, &per_layer_slice);
             let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+                activation: FfnActivation::Geglu,
                 attn_out: GpuInput::Cpu(&attn_out),
                 residual: GpuInput::Cpu(&residual),
                 wo: &wo,
-                attn_post_norm: &attn_post_norm,
+                attn_post_norm: Some(&attn_post_norm),
                 ffn_norm: &ffn_norm,
                 ffn_gate: &ffn_gate,
                 ffn_up: &ffn_up,
                 ffn_down: &ffn_down,
-                ffn_post_norm: &ffn_post_norm,
+                ffn_post_norm: Some(&ffn_post_norm),
                 eps,
                 ple: Some(FusedPle {
                     gate_w: &ple_gate_w,
@@ -15892,6 +16736,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         );
 
         let got = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::IDENTITY,
             x: &x,
             n_head,
             head_dim,
@@ -15899,6 +16744,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             pos,
             freq_base,
             freq_factors: None,
+            layout: crate::engine::tensor::RopeLayout::Neox,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -15914,6 +16760,323 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// Like the above, but with `freq_factors` set (Gemma4's proportional
     /// RoPE, full-attention layers) and a partial-rope shape (`head_dim >
     /// rope_dim`, so the tail of each head must pass through untouched).
+    /// The `llama`/`mistral` pairing. A separate test rather than a parameter
+    /// on the existing ones because the failure it guards is not a tolerance
+    /// question: NEOX and NORM rotate *different pairs of elements*, so the
+    /// wrong one is not a slightly wrong answer, it is a different tensor. The
+    /// reference is `engine::tensor`'s own CPU RoPE, which shares nothing with
+    /// the shader.
+    #[test]
+    fn gpu_rope_matches_cpu_reference_with_norm_pairing() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let (n_head, head_dim, rope_dim, pos, freq_base) =
+            (4usize, 32usize, 32usize, 7usize, 1e4f32);
+        let mut st = 0x1234_5678u64;
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((st >> 33) as f32 / 2f32.powi(31)) - 1.0
+                })
+                .collect()
+        };
+        let x = rand_vec(n_head * head_dim);
+
+        let params = crate::engine::tensor::RopeParams {
+            rope_dim,
+            freq_base,
+            layout: crate::engine::tensor::RopeLayout::Norm,
+            ..crate::engine::tensor::RopeParams::default()
+        };
+        let mut expected = x.clone();
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut expected,
+            n_head,
+            head_dim,
+            pos,
+            None,
+            &params,
+        );
+
+        let got = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            x: &x,
+            n_head,
+            head_dim,
+            rope_dim,
+            pos,
+            freq_base,
+            freq_factors: None,
+            layout: crate::engine::tensor::RopeLayout::Norm,
+        });
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * a.abs().max(1.0),
+                "mismatch at {i}: cpu={a} gpu={b}"
+            );
+        }
+        // And the two layouts must not agree with each other, or this test
+        // would pass against a shader that ignored `layout` entirely.
+        let neox = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            x: &x,
+            n_head,
+            head_dim,
+            rope_dim,
+            pos,
+            freq_base,
+            freq_factors: None,
+            layout: crate::engine::tensor::RopeLayout::Neox,
+        });
+        assert!(
+            neox.iter()
+                .zip(got.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "NEOX and NORM produced the same tensor — `pairing` is being ignored"
+        );
+    }
+
+    /// Ministral-3-3B's own RoPE hyperparameters, read from the checkpoint:
+    /// `scaling.type = yarn`, `factor = 16`, `beta_fast/slow = 32/1`,
+    /// `original_context_length = 16384`, `freq_base = 1e6`, `head_dim = 128`,
+    /// NORM pairing.
+    fn ministral_yarn_params() -> crate::engine::tensor::RopeParams {
+        crate::engine::tensor::RopeParams {
+            rope_dim: 128,
+            freq_base: 1.0e6,
+            freq_scale: 1.0 / 16.0,
+            ext_factor: 1.0,
+            attn_factor: 1.0 / (1.0 + 0.1 * 16.0f32.ln()),
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            n_ctx_orig: 16384,
+            layout: crate::engine::tensor::RopeLayout::Norm,
+        }
+    }
+
+    /// RoPE's angle is `pos * freq`, and `sin`/`cos` of a large argument lose
+    /// precision differently on the CPU and on the GPU. This measures that
+    /// divergence rather than asserting it away, because it bounds how strict
+    /// every other RoPE cross-check in this file can be — and it is a property
+    /// of plain RoPE, present long before any scaling was added.
+    ///
+    /// The bound is loose on purpose: it exists to catch a *change* in the
+    /// characteristic, not to pin a specific adapter's `sin` implementation.
+    #[test]
+    fn gpu_rope_argument_reduction_diverges_with_position() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let params = crate::engine::tensor::RopeParams {
+            rope_dim: 128,
+            freq_base: 1.0e6,
+            layout: crate::engine::tensor::RopeLayout::Norm,
+            ..crate::engine::tensor::RopeParams::default()
+        };
+        let (n_head, head_dim) = (4usize, 128usize);
+        let x: Vec<f32> = (0..n_head * head_dim)
+            .map(|i| ((i % 17) as f32 / 17.0) - 0.5)
+            .collect();
+        // Position, and the error budget it justifies.
+        for (pos, bound) in [(8usize, 1e-6f32), (1_000, 1e-4), (20_000, 4e-3)] {
+            let mut expected = x.clone();
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut expected,
+                n_head,
+                head_dim,
+                pos,
+                None,
+                &params,
+            );
+            let got = vulkan.gpu_rope(GpuRopeInput {
+                yarn: RopeYarn::IDENTITY,
+                x: &x,
+                n_head,
+                head_dim,
+                rope_dim: params.rope_dim,
+                pos,
+                freq_base: params.freq_base,
+                freq_factors: None,
+                layout: params.layout,
+            });
+            let err = expected
+                .iter()
+                .zip(got.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(err < bound, "pos={pos}: max abs err {err} exceeds {bound}");
+        }
+    }
+
+    #[test]
+    fn gpu_rope_matches_cpu_reference_with_yarn_scaling() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+
+        let params = ministral_yarn_params();
+        // `pos` is squeezed from both sides. Too large and `sin`/`cos` of a
+        // big argument diverges between CPU and GPU by more than the tolerance
+        // below, for reasons that have nothing to do with scaling — measured in
+        // `gpu_rope_argument_reduction_diverges_with_position`. Too small and
+        // YaRN's own effect shrinks with it (every angle is proportional to
+        // `pos`) until the "and they must differ" guard cannot see it: at
+        // `pos = 8` the largest divergence across the whole ramp band is under
+        // 1e-2. 512 clears both by an order of magnitude.
+        let (n_head, head_dim, pos) = (4usize, 128usize, 512usize);
+        let mut st = 0x0BAD_F00Du64;
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((st >> 33) as f32 / 2f32.powi(31)) - 1.0
+                })
+                .collect()
+        };
+        let x = rand_vec(n_head * head_dim);
+
+        let mut expected = x.clone();
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut expected,
+            n_head,
+            head_dim,
+            pos,
+            None,
+            &params,
+        );
+
+        let got = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::from_params(&params),
+            x: &x,
+            n_head,
+            head_dim,
+            rope_dim: params.rope_dim,
+            pos,
+            freq_base: params.freq_base,
+            freq_factors: None,
+            layout: params.layout,
+        });
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * a.abs().max(1.0),
+                "mismatch at {i}: cpu={a} gpu={b}"
+            );
+        }
+        // The guard that makes the above mean something: with the identity
+        // tail the shader computes the *unscaled* rope, and at `pos` well past
+        // `n_ctx_orig` the two must be nowhere near each other. Without this a
+        // shader that dropped every YaRN term would still pass — the failure
+        // mode this whole change exists to avoid.
+        let unscaled = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            x: &x,
+            n_head,
+            head_dim,
+            rope_dim: params.rope_dim,
+            pos,
+            freq_base: params.freq_base,
+            freq_factors: None,
+            layout: params.layout,
+        });
+        assert!(
+            unscaled
+                .iter()
+                .zip(got.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-2),
+            "YaRN and unscaled RoPE produced the same tensor — the terms are being ignored"
+        );
+    }
+
+    #[test]
+    fn gpu_fused_norm_rope_matches_cpu_reference_with_yarn_scaling() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+
+        let params = ministral_yarn_params();
+        // `pos` chosen the same way, and for the same two reasons, as the
+        // `gpu_rope` YaRN test above.
+        let (n_head, head_dim, pos, eps) = (4usize, 128usize, 512usize, 1e-5f32);
+        let mut st = 0xFEED_BEEFu64;
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((st >> 33) as f32 / 2f32.powi(31)) - 1.0
+                })
+                .collect()
+        };
+        let x = rand_vec(n_head * head_dim);
+        let weight = rand_vec(head_dim);
+
+        let mut expected = x.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut expected, &weight, n_head, head_dim, eps);
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut expected,
+            n_head,
+            head_dim,
+            pos,
+            None,
+            &params,
+        );
+
+        let got = vulkan.gpu_fused_norm_rope(GpuFusedNormRopeInput {
+            yarn: RopeYarn::from_params(&params),
+            x: &x,
+            weight: &weight,
+            n_tokens: 1,
+            n_head,
+            head_dim,
+            rope_dim: params.rope_dim,
+            pos,
+            freq_base: params.freq_base,
+            freq_factors: None,
+            eps,
+            pairing: params.layout,
+        });
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * a.abs().max(1.0),
+                "mismatch at {i}: cpu={a} gpu={b}"
+            );
+        }
+        // The fused kernel is a *different* kernel from `gpu_rope`, so it needs
+        // its own proof that the terms reach it — see `ROPE_YARN_WGSL`.
+        let unscaled = vulkan.gpu_fused_norm_rope(GpuFusedNormRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            x: &x,
+            weight: &weight,
+            n_tokens: 1,
+            n_head,
+            head_dim,
+            rope_dim: params.rope_dim,
+            pos,
+            freq_base: params.freq_base,
+            freq_factors: None,
+            eps,
+            pairing: params.layout,
+        });
+        assert!(
+            unscaled
+                .iter()
+                .zip(got.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-2),
+            "YaRN and unscaled RoPE produced the same tensor — the terms are being ignored"
+        );
+    }
+
     #[test]
     fn gpu_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
         let Some(vulkan) = shared_vulkan() else {
@@ -15947,6 +17110,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         );
 
         let got = vulkan.gpu_rope(GpuRopeInput {
+            yarn: RopeYarn::IDENTITY,
             x: &x,
             n_head,
             head_dim,
@@ -15954,6 +17118,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             pos,
             freq_base,
             freq_factors: Some(&freq_factors),
+            layout: crate::engine::tensor::RopeLayout::Neox,
         });
 
         assert_eq!(expected.len(), got.len());
@@ -16047,6 +17212,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         );
 
         let got = vulkan.gpu_fused_norm_rope(GpuFusedNormRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             x: &x,
             weight: &weight,
             n_tokens: 1,
@@ -16112,6 +17279,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         );
 
         let got = vulkan.gpu_fused_norm_rope(GpuFusedNormRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             x: &x,
             weight: &weight,
             n_tokens: 1,
@@ -16146,6 +17315,84 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// are both set so the batch case covers the partial-rope tail and the
     /// proportional-RoPE divisor at the same time, since the full-attention
     /// layers this will serve have both.
+    /// The `llama`/`mistral` pairing through the **fused** norm+rope kernel.
+    ///
+    /// A separate test from `gpu_rope_matches_cpu_reference_with_norm_pairing`
+    /// because these are two different shaders: `ROPE_SHADER` is the standalone
+    /// one, `FUSED_NORM_ROPE_SHADER` is what the QKV fusion actually reaches.
+    /// Teaching one the convention and assuming the other would have left the
+    /// path that matters silently NEOX — which is how this was nearly shipped.
+    #[test]
+    fn gpu_fused_norm_rope_matches_cpu_reference_with_norm_pairing() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let (n_head, head_dim, rope_dim, pos, freq_base, eps) =
+            (3usize, 32usize, 32usize, 5usize, 1e4f32, 1e-6f32);
+        let mut st = 0x9E37_79B9u64;
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((st >> 33) as f32 / 2f32.powi(31)) - 1.0
+                })
+                .collect()
+        };
+        let x = rand_vec(n_head * head_dim);
+        let weight: Vec<f32> = rand_vec(head_dim).iter().map(|v| 1.0 + v * 0.1).collect();
+
+        // Reference: the CPU per-head RMSNorm followed by the CPU NORM-pairing
+        // RoPE — two functions that share nothing with this shader.
+        let mut expected = x.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut expected, &weight, n_head, head_dim, eps);
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut expected,
+            n_head,
+            head_dim,
+            pos,
+            None,
+            &crate::engine::tensor::RopeParams {
+                rope_dim,
+                freq_base,
+                layout: crate::engine::tensor::RopeLayout::Norm,
+                ..crate::engine::tensor::RopeParams::default()
+            },
+        );
+
+        let mk = |pairing| GpuFusedNormRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            x: &x,
+            weight: &weight,
+            n_tokens: 1,
+            n_head,
+            head_dim,
+            rope_dim,
+            pos,
+            freq_base,
+            freq_factors: None,
+            eps,
+            pairing,
+        };
+        let got = vulkan.gpu_fused_norm_rope(mk(crate::engine::tensor::RopeLayout::Norm));
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 2e-4 * a.abs().max(1.0),
+                "mismatch at {i}: cpu={a} gpu={b}"
+            );
+        }
+        // And the two conventions must differ, or this passes against a shader
+        // that ignores `pairing`.
+        let neox = vulkan.gpu_fused_norm_rope(mk(crate::engine::tensor::RopeLayout::Neox));
+        assert!(
+            neox.iter()
+                .zip(got.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "NEOX and NORM produced the same tensor — `pairing` is being ignored"
+        );
+    }
+
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_over_a_token_batch() {
         let Some(vulkan) = shared_vulkan() else {
@@ -16194,6 +17441,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         }
 
         let got = vulkan.gpu_fused_norm_rope(GpuFusedNormRopeInput {
+            yarn: RopeYarn::IDENTITY,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             x: &x,
             weight: &weight,
             n_tokens,
@@ -16622,12 +17871,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             }
 
             let got = vulkan.fused_attention(FusedAttnInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: true,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
                 normed: GpuInput::Cpu(&normed),
                 wq: &wq,
-                q_norm: &q_norm,
+                q_norm: Some(&q_norm),
                 kv: Some(FusedAttnProjection {
+                    k_bias: None,
+                    v_bias: None,
                     wk: &wk,
-                    k_norm: &k_norm,
+                    k_norm: Some(&k_norm),
                     wv: Some(&wv),
                 }),
                 n_head,
@@ -16783,12 +18038,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             }
 
             let got = vulkan.fused_attention(FusedAttnInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: true,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
                 normed: GpuInput::Cpu(&normed),
                 wq: &wq,
-                q_norm: &q_norm,
+                q_norm: Some(&q_norm),
                 kv: Some(FusedAttnProjection {
+                    k_bias: None,
+                    v_bias: None,
                     wk: &wk,
-                    k_norm: &k_norm,
+                    k_norm: Some(&k_norm),
                     wv: Some(&wv),
                 }),
                 n_head,
@@ -16938,12 +18199,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         }
 
         let got = vulkan.fused_attention(FusedAttnInput {
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: true,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
             wq: &wq,
-            q_norm: &q_norm,
+            q_norm: Some(&q_norm),
             kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
                 wk: &wk,
-                k_norm: &k_norm,
+                k_norm: Some(&k_norm),
                 wv: None,
             }),
             n_head,
@@ -17104,12 +18371,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let q_a = cpu_q(&wq_a, &q_norm_a, &normed_a, 0);
         let expected_a = expected_attn(&q_a, &reference_cache);
         let got_a = vulkan.fused_attention(FusedAttnInput {
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: true,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed_a),
             wq: &wq_a,
-            q_norm: &q_norm_a,
+            q_norm: Some(&q_norm_a),
             kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
                 wk: &wk,
-                k_norm: &k_norm,
+                k_norm: Some(&k_norm),
                 wv: None,
             }),
             n_head,
@@ -17149,9 +18422,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let q_b = cpu_q(&wq_b, &q_norm_b, &normed_b, 0);
         let expected_b = expected_attn(&q_b, &reference_cache);
         let got_b = vulkan.fused_attention(FusedAttnInput {
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: true,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed_b),
             wq: &wq_b,
-            q_norm: &q_norm_b,
+            q_norm: Some(&q_norm_b),
             kv: None,
             n_head,
             n_head_kv,
@@ -17479,14 +18756,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let got = vulkan
             .fused_attention_prefill(
                 FusedAttnPrefillInput {
+                    yarn: RopeYarn::IDENTITY,
+                    q_bias: None,
+                    pairing: crate::engine::tensor::RopeLayout::Neox,
+                    normalize_v: true,
                     normed: &normed,
                     n_tokens,
                     start_pos,
                     wq: &wq,
-                    q_norm: &q_norm,
+                    q_norm: Some(&q_norm),
                     kv: Some(FusedAttnPrefillKv {
+                        k_bias: None,
+                        v_bias: None,
                         wk: &wk,
-                        k_norm: &k_norm,
+                        k_norm: Some(&k_norm),
                         wv: wv.as_ref(),
                     }),
                     n_head,
@@ -17521,6 +18804,273 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cmp("k_rows", &k, &got.k_rows);
         cmp("v_rows", &v, &got.v_rows);
         assert_eq!(cache.layers[0].len, ref_cache.layers[0].len);
+    }
+
+    /// The `llama`/`mistral` shape through the same fused chain: **no** per-head
+    /// Q or K norm, and NORM rope pairing rather than NEOX. Both differ from
+    /// gemma's, both are load-bearing, and neither is visible from the
+    /// signature — which is why this is its own case rather than a parameter
+    /// tweak of the gemma one.
+    ///
+    /// The reference is built from `engine::tensor`'s CPU RoPE and the CPU
+    /// attention, sharing no kernel with the chain under test.
+    fn cross_check_fused_attention_prefill_no_norms(n_tokens: usize, start_pos: usize) {
+        cross_check_fused_attention_prefill_shaped(n_tokens, start_pos, "");
+    }
+
+    /// `biases` selects which projection biases to give the layer — `""` for
+    /// none, `"qkv"` for Qwen2's shape. Split per-projection because that is
+    /// how the bug was found: Q and K agree with the reference and V does not.
+    fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize, biases: &str) {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        if vulkan.q4_k_mmvq {
+            eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+            return;
+        }
+
+        let (n_embd, n_head, n_head_kv, head_dim) = (256usize, 4usize, 2usize, 64usize);
+        let (rope_dim, rope_freq_base, eps) = (64usize, 10000.0f32, 1e-6f32);
+        let kv_dim = n_head_kv * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut seed = 0x0FA5_7ADD_u64;
+        let mut build = |in_dim: usize, out_dim: usize| {
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim {
+                for _ in 0..(in_dim / 256) {
+                    bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+                }
+            }
+            test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+        };
+        let wq = build(n_embd, n_head * head_dim);
+        let wk = build(n_embd, kv_dim);
+        let wv = build(n_embd, kv_dim);
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect()
+        };
+        // Scaled so the *projections* land near unit magnitude, which is where
+        // a real layer's do — its input has just been through `attn_norm`.
+        // Left unscaled, Q and K reach the hundreds, attention scores reach
+        // 1e6, and softmax becomes a hard argmax: the two paths then agree on
+        // every token until a 1-ULP difference flips which position wins, and
+        // the test reports a "mismatch" that is really a knife-edge. The fix is
+        // to condition the input, not to loosen the assertion.
+        let normed: Vec<f32> = rand_vec(n_tokens * n_embd)
+            .into_iter()
+            .map(|v| v * 0.02)
+            .collect();
+
+        let rope = crate::engine::tensor::RopeParams {
+            rope_dim,
+            freq_base: rope_freq_base,
+            layout: crate::engine::tensor::RopeLayout::Norm,
+            ..crate::engine::tensor::RopeParams::default()
+        };
+
+        // Scaled to the same magnitude the *projections* land at, for the
+        // reason the `normed` comment above gives. A real Q/K bias is
+        // comparable to its projection; left at `rand_vec`'s full range these
+        // are several times larger, and since one bias vector is added to
+        // every token, it puts a large constant into every q.k score. Softmax
+        // then becomes a hard argmax and a 1-ULP difference flips which
+        // position wins — a knife-edge that shows up as a huge output diff at
+        // some token counts and not others. Condition the input, not the
+        // assertion.
+        let mut bias_vec =
+            |n: usize| -> Vec<f32> { rand_vec(n).into_iter().map(|v| v * 0.25).collect() };
+        let (q_bias, k_bias, v_bias) = (
+            biases.contains('q').then(|| bias_vec(n_head * head_dim)),
+            biases.contains('k').then(|| bias_vec(kv_dim)),
+            biases.contains('v').then(|| bias_vec(kv_dim)),
+        );
+
+        // Reference: project, add biases, RoPE (no norms), fill the cache, attend.
+        let mut q = vulkan.matmul(&normed, n_tokens, &wq);
+        let mut k = vulkan.matmul(&normed, n_tokens, &wk);
+        let mut v = vulkan.matmul(&normed, n_tokens, &wv);
+        if let Some(b) = &q_bias {
+            crate::engine::tensor::add_bias_per_row(&mut q, b, n_tokens);
+        }
+        if let Some(b) = &k_bias {
+            crate::engine::tensor::add_bias_per_row(&mut k, b, n_tokens);
+        }
+        if let Some(b) = &v_bias {
+            crate::engine::tensor::add_bias_per_row(&mut v, b, n_tokens);
+        }
+        let mut cache_ref =
+            crate::engine::kv_cache::KvCache::new_with_dims(start_pos + n_tokens + 8, &[kv_dim]);
+        for _ in 0..start_pos {
+            cache_ref.layers[0].push(&vec![0.0; kv_dim], &vec![0.0; kv_dim]);
+        }
+        for t in 0..n_tokens {
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
+                n_head,
+                head_dim,
+                start_pos + t,
+                None,
+                &rope,
+            );
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut k[t * kv_dim..(t + 1) * kv_dim],
+                n_head_kv,
+                head_dim,
+                start_pos + t,
+                None,
+                &rope,
+            );
+            cache_ref.layers[0].push(
+                &k[t * kv_dim..(t + 1) * kv_dim],
+                &v[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
+        let mut expected = vec![0f32; n_tokens * n_head * head_dim];
+        crate::engine::attention::multi_head_attention(
+            &mut expected,
+            &q,
+            &cache_ref.layers[0],
+            n_head,
+            n_head / n_head_kv,
+            head_dim,
+            scale,
+            |t| (0, start_pos + t),
+        );
+
+        let mut cache =
+            crate::engine::kv_cache::KvCache::new_with_dims(start_pos + n_tokens + 8, &[kv_dim]);
+        for _ in 0..start_pos {
+            cache.layers[0].push(&vec![0.0; kv_dim], &vec![0.0; kv_dim]);
+        }
+        let out = vulkan
+            .fused_attention_prefill(
+                FusedAttnPrefillInput {
+                    yarn: RopeYarn::IDENTITY,
+                    // The whole point of this helper: the reference above
+                    // applies these, so the fused call has to be given them.
+                    // They were `None` here while the reference was biased,
+                    // which is what made three of these cases "fail" — the
+                    // comparison was biased-reference against unbiased-fused,
+                    // and the diff it reported was the bias itself.
+                    q_bias: q_bias.as_deref(),
+                    pairing: crate::engine::tensor::RopeLayout::Norm,
+                    normalize_v: false,
+                    normed: &normed,
+                    n_tokens,
+                    start_pos,
+                    wq: &wq,
+                    q_norm: None,
+                    kv: Some(FusedAttnPrefillKv {
+                        k_bias: k_bias.as_deref(),
+                        v_bias: v_bias.as_deref(),
+                        wk: &wk,
+                        k_norm: None,
+                        wv: Some(&wv),
+                    }),
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    rope_dim,
+                    rope_freq_base,
+                    freq_factors: None,
+                    eps,
+                    n_swa: 0,
+                    causal: true,
+                    scale,
+                    want_attn_out_host: true,
+                },
+                &mut cache.layers[0],
+            )
+            .expect("fused path available without MMVQ");
+
+        // The K and V rows the chain wrote, checked *before* attention gets a
+        // chance to hide them. A K or V bias only reaches `attn_out` through
+        // the softmax, which at small token counts barely moves the weighted
+        // average — dropping the K and V bias dispatches entirely still passed
+        // the 9-token attention check. These do not: they compare the rows
+        // themselves, so a missing bias is a direct mismatch.
+        let check = |label: &str, want: &[f32], got: &[f32]| {
+            assert_eq!(want.len(), got.len(), "n_tokens={n_tokens}: {label} length");
+            for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                    "n_tokens={n_tokens} start_pos={start_pos} biases={biases:?}: \
+                     {label} mismatch at {i}: unfused={a} fused={b}"
+                );
+            }
+        };
+        check("k_rows", &k, &out.k_rows);
+        check("v_rows", &v, &out.v_rows);
+
+        assert_eq!(out.attn_out.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(out.attn_out.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                "n_tokens={n_tokens} start_pos={start_pos}: mismatch at {i}: \
+                 unfused={a} fused={b}"
+            );
+        }
+    }
+
+    /// This failed by **~5700×** when first written (`unfused=-2095.5` against
+    /// `fused=-0.369`), with the Q and K norms already made optional. The ratio
+    /// was the RMS of a V row: the chain still applied gemma's per-head
+    /// weightless norm to V, which the llama family does not. Three
+    /// conventions, not two, and only the third was invisible from the
+    /// signature — every shape matched throughout.
+    #[test]
+    fn fused_attention_prefill_matches_the_unfused_sequence_without_norms() {
+        cross_check_fused_attention_prefill_no_norms(7, 0);
+    }
+
+    /// See [`fused_attention_prefill_matches_the_unfused_sequence_without_norms`].
+    #[test]
+    fn fused_attention_prefill_without_norms_matches_at_a_nonzero_start_pos() {
+        cross_check_fused_attention_prefill_no_norms(9, 5);
+    }
+
+    /// Past `MAX_MATMUL_TOKENS_PER_SUBMISSION` (128) the chain *stripes*, and
+    /// that path had its own bug: the per-stripe recursion restated `pairing`
+    /// and `normalize_v` instead of inheriting them through
+    /// `..input.reborrow()`, so a striped prompt silently ran a different
+    /// configuration from an unstriped one. Llama-3.2-3B answered 6- and
+    /// 47-token prompts correctly and returned token soup at 207.
+    ///
+    /// The 7- and 9-token cases above never reached it. This one does.
+    #[test]
+    fn fused_attention_prefill_without_norms_matches_across_a_stripe_boundary() {
+        cross_check_fused_attention_prefill_no_norms(192, 0);
+    }
+
+    /// Qwen2's shape: a bias on all three projections.
+    ///
+    /// The K and V biases are caught by the `k_rows`/`v_rows` checks rather
+    /// than by `attn_out` — verified by deleting each dispatch in turn.
+    #[test]
+    fn fused_attention_prefill_with_qkv_biases_matches_the_unfused_sequence() {
+        cross_check_fused_attention_prefill_shaped(9, 0, "qkv");
+    }
+
+    /// The same three biases past `MAX_MATMUL_TOKENS_PER_SUBMISSION`, so the
+    /// per-stripe recursion has to carry them. It does — they are per-row
+    /// constants and need no slicing — but this was believed for a while to be
+    /// broken, so it is pinned.
+    #[test]
+    fn fused_attention_prefill_with_qkv_biases_matches_across_a_stripe_boundary() {
+        cross_check_fused_attention_prefill_shaped(192, 0, "qkv");
+    }
+
+    /// V's bias alone — the case that was `#[ignore]`d as "V's bias never
+    /// reaches attention at all". It reaches it correctly; the helper was
+    /// building a *biased* reference and then calling the fused path with
+    /// `v_bias: None`, so the difference it reported was the bias itself.
+    #[test]
+    fn fused_attention_prefill_with_a_v_bias_matches_the_unfused_sequence() {
+        cross_check_fused_attention_prefill_shaped(9, 0, "v");
     }
 
     #[test]
@@ -17633,11 +19183,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let got = vulkan
             .fused_attention_prefill(
                 FusedAttnPrefillInput {
+                    yarn: RopeYarn::IDENTITY,
+                    q_bias: None,
+                    pairing: crate::engine::tensor::RopeLayout::Neox,
+                    normalize_v: true,
                     normed: &normed,
                     n_tokens,
                     start_pos,
                     wq: &wq,
-                    q_norm: &q_norm,
+                    q_norm: Some(&q_norm),
                     kv: None,
                     n_head,
                     n_head_kv,
@@ -17727,14 +19281,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let n3: Vec<f32> = rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.1).collect();
 
         let attn_input = |want_host: bool| FusedAttnPrefillInput {
+            yarn: RopeYarn::IDENTITY,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
+            normalize_v: true,
             normed: &normed,
             n_tokens,
             start_pos: 0,
             wq: &wq,
-            q_norm: &q_norm,
+            q_norm: Some(&q_norm),
             kv: Some(FusedAttnPrefillKv {
+                k_bias: None,
+                v_bias: None,
                 wk: &wk,
-                k_norm: &k_norm,
+                k_norm: Some(&k_norm),
                 wv: Some(&wv),
             }),
             n_head,
@@ -17752,7 +19312,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let post = |src: AttnOutSrc<'_>| {
             vulkan
                 .fused_post_attention_prefill(
-                    src, &residual, n_tokens, &wo, &n1, &n2, &gate, &up, &down, &n3, eps,
+                    src,
+                    &residual,
+                    n_tokens,
+                    &wo,
+                    Some(&n1),
+                    &n2,
+                    &gate,
+                    &up,
+                    &down,
+                    Some(&n3),
+                    eps,
+                    FfnActivation::Geglu,
                 )
                 .expect("fused post-attention returned None on a supported path")
         };
@@ -17801,6 +19372,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         attn_dim: usize,
         ffn_len: usize,
     ) {
+        cross_check_fused_post_attention_shaped(n_tokens, n_embd, attn_dim, ffn_len, true);
+    }
+
+    /// `gemma_shaped` picks which of the two architectures' chains is under
+    /// test: gemma has a post-norm on both residual adds and a GEGLU gate;
+    /// Llama/Qwen2/Mistral/Phi have neither post-norm and a SwiGLU gate. Both
+    /// go through the *same* fused function, and both are compared against a
+    /// sequence built from unfused `matmul` calls and CPU tensor ops — a
+    /// reference that shares no kernel with the fused chain (LESSONS §1).
+    #[allow(clippy::too_many_arguments)]
+    fn cross_check_fused_post_attention_shaped(
+        n_tokens: usize,
+        n_embd: usize,
+        attn_dim: usize,
+        ffn_len: usize,
+        gemma_shaped: bool,
+    ) {
         let Some(vulkan) = shared_vulkan() else {
             eprintln!("skipping: no Vulkan adapter available in this environment");
             return;
@@ -17841,16 +19429,32 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         // The unfused sequence.
         let mut x1 = vulkan.matmul(&attn_out, n_tokens, &wo);
-        crate::engine::tensor::rmsnorm_inplace(&mut x1, &attn_post_norm, n_tokens, n_embd, eps);
+        if gemma_shaped {
+            crate::engine::tensor::rmsnorm_inplace(&mut x1, &attn_post_norm, n_tokens, n_embd, eps);
+        }
         crate::engine::tensor::add_inplace(&mut x1, &residual);
         let mut ffn_normed = x1.clone();
         crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, n_tokens, n_embd, eps);
         let mut g = vulkan.matmul(&ffn_normed, n_tokens, &gate);
         let u = vulkan.matmul(&ffn_normed, n_tokens, &up);
-        crate::engine::tensor::gelu_inplace(&mut g);
+        if gemma_shaped {
+            crate::engine::tensor::gelu_inplace(&mut g);
+        } else {
+            for v in g.iter_mut() {
+                *v = crate::engine::tensor::silu(*v);
+            }
+        }
         crate::engine::tensor::mul_inplace(&mut g, &u);
         let mut ffn_out = vulkan.matmul(&g, n_tokens, &down);
-        crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, n_tokens, n_embd, eps);
+        if gemma_shaped {
+            crate::engine::tensor::rmsnorm_inplace(
+                &mut ffn_out,
+                &ffn_post_norm,
+                n_tokens,
+                n_embd,
+                eps,
+            );
+        }
         crate::engine::tensor::add_inplace(&mut ffn_out, &x1);
         let expected = ffn_out;
 
@@ -17860,13 +19464,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 &residual,
                 n_tokens,
                 &wo,
-                &attn_post_norm,
+                gemma_shaped.then_some(attn_post_norm.as_slice()),
                 &ffn_norm,
                 &gate,
                 &up,
                 &down,
-                &ffn_post_norm,
+                gemma_shaped.then_some(ffn_post_norm.as_slice()),
                 eps,
+                if gemma_shaped {
+                    FfnActivation::Geglu
+                } else {
+                    FfnActivation::Swiglu
+                },
             )
             .expect("fused path available without MMVQ");
 
@@ -17889,6 +19498,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_prefill_matches_the_unfused_sequence_multi_chunk() {
         cross_check_fused_post_attention_prefill(192);
+    }
+
+    /// The Llama/Qwen2/Mistral/Phi shape: SwiGLU, and **no** post-norm on
+    /// either residual add. Both differences are load-bearing — a post-norm
+    /// left in place normalizes a tensor that must not be normalized, and GEGLU
+    /// against SwiGLU is a different function entirely — so this is a separate
+    /// case rather than a variation of the gemma one.
+    #[test]
+    fn fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_no_post_norms() {
+        cross_check_fused_post_attention_shaped(3, 256, 512, 512, false);
+    }
+
+    #[test]
+    fn fused_post_attention_prefill_swiglu_matches_across_a_stripe_boundary() {
+        cross_check_fused_post_attention_shaped(192, 256, 512, 512, false);
+    }
+
+    #[test]
+    fn fused_post_attention_prefill_swiglu_matches_at_model_shaped_dims() {
+        cross_check_fused_post_attention_shaped(91, 1536, 2048, 6144, false);
     }
 
     /// Zero-padding a prefill stripe up to [`padded_stripe_len`] must not
@@ -18167,6 +19796,478 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// real `E2B` model actually uses). Also runs it twice against the
     /// same `LayerCache` (simulating two decode steps) to catch any
     /// staleness in the per-layer caches this introduces.
+    /// The **llama-family** shape of a fused decode layer, against the
+    /// step-by-step CPU sequence: no per-head Q/K norms, no post-norm on either
+    /// residual, SwiGLU rather than GEGLU, NORM rather than NEOX rope pairing,
+    /// and optionally Q/K/V projection biases.
+    ///
+    /// Every one of those is a branch the decode chain grew for this family and
+    /// that **nothing executed** until this test. The existing full-layer check
+    /// above takes the other arm of each: gemma passes `Some(...)` for every
+    /// norm and `None` for every bias, so "gemma is byte-identical" — the check
+    /// each of those six changes was landed against — proves only that the new
+    /// arms do not disturb the old path. It never enters one. See LESSONS §64;
+    /// the first caller of these arms produced token soup, and this is the test
+    /// that should have existed before it.
+    fn cross_check_fused_layer_llama_shaped(biases: &str) {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+
+        let n_embd = 24;
+        let n_head = 4;
+        let n_head_kv = 2;
+        let head_dim = 6;
+        let rope_dim = 6;
+        let ffn_len = 16;
+        let kv_dim = n_head_kv * head_dim;
+        let capacity = 64;
+        let eps = 1e-6;
+        let rope_freq_base = 10000.0;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let pairing = crate::engine::tensor::RopeLayout::Norm;
+        let rope = crate::engine::tensor::RopeParams {
+            rope_dim,
+            freq_base: rope_freq_base,
+            layout: pairing,
+            ..crate::engine::tensor::RopeParams::default()
+        };
+
+        let mut seed = 0x11A3_A0DE_u64;
+        let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim {
+                for _ in 0..in_dim {
+                    bytes.extend(build_block(GGML_TYPE_F32, seed));
+                }
+            }
+            test_quant_matrix(&bytes, GGML_TYPE_F32, in_dim, out_dim)
+        };
+        let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+            (0..len)
+                .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+                .collect()
+        };
+
+        let attn_norm = rand_vec(n_embd, &mut seed);
+        let wq = build(n_embd, n_head * head_dim, &mut seed);
+        let wk = build(n_embd, kv_dim, &mut seed);
+        let wv = build(n_embd, kv_dim, &mut seed);
+        let wo = build(n_head * head_dim, n_embd, &mut seed);
+        let ffn_norm = rand_vec(n_embd, &mut seed);
+        let ffn_gate = build(n_embd, ffn_len, &mut seed);
+        let ffn_up = build(n_embd, ffn_len, &mut seed);
+        let ffn_down = build(ffn_len, n_embd, &mut seed);
+        // Scaled the way the prefill bias check scales its own, for the reason
+        // that check documents: an unscaled bias dominates the projections and
+        // turns softmax into a hard argmax, and the mismatch that reports is a
+        // knife-edge rather than a defect.
+        let bias_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+            rand_vec(len, seed).into_iter().map(|v| v * 0.25).collect()
+        };
+        let q_bias = biases
+            .contains('q')
+            .then(|| bias_vec(n_head * head_dim, &mut seed));
+        let k_bias = biases.contains('k').then(|| bias_vec(kv_dim, &mut seed));
+        let v_bias = biases.contains('v').then(|| bias_vec(kv_dim, &mut seed));
+
+        let mut kv_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+        let mut reference_cache =
+            crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+        for _ in 0..3 {
+            let k = rand_vec(kv_dim, &mut seed);
+            let v = rand_vec(kv_dim, &mut seed);
+            kv_cache.layers[0].push(&k, &v);
+            reference_cache.layers[0].push(&k, &v);
+        }
+
+        for step in 0..8 {
+            let pos = kv_cache.layers[0].len;
+            let x = rand_vec(n_embd, &mut seed);
+
+            // CPU reference: exactly `LlamaModel::run_layers`' statement order.
+            let mut normed = x.clone();
+            crate::engine::tensor::rmsnorm_inplace(&mut normed, &attn_norm, 1, n_embd, eps);
+
+            let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
+            let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
+            let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
+            if let Some(b) = &q_bias {
+                crate::engine::tensor::add_bias_per_row(&mut q, b, 1);
+            }
+            if let Some(b) = &k_bias {
+                crate::engine::tensor::add_bias_per_row(&mut k, b, 1);
+            }
+            if let Some(b) = &v_bias {
+                crate::engine::tensor::add_bias_per_row(&mut v, b, 1);
+            }
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut q, n_head, head_dim, pos, None, &rope,
+            );
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut k, n_head_kv, head_dim, pos, None, &rope,
+            );
+            reference_cache.layers[0].push(&k, &v);
+
+            let mut attn = vec![0f32; n_head * head_dim];
+            crate::engine::attention::multi_head_attention(
+                &mut attn,
+                &q,
+                &reference_cache.layers[0],
+                n_head,
+                n_head / n_head_kv,
+                head_dim,
+                scale,
+                |_| (0, pos),
+            );
+
+            // No post-norm on either residual — a plain add, not a norm with
+            // weights of one.
+            let mut xr = x.clone();
+            let attn_proj = CpuBackend.matmul_dequant(&attn, 1, &wo);
+            crate::engine::tensor::add_inplace(&mut xr, &attn_proj);
+
+            let mut normed2 = xr.clone();
+            crate::engine::tensor::rmsnorm_inplace(&mut normed2, &ffn_norm, 1, n_embd, eps);
+            let gate = CpuBackend.matmul_dequant(&normed2, 1, &ffn_gate);
+            let up = CpuBackend.matmul_dequant(&normed2, 1, &ffn_up);
+            let mut act: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+                .collect();
+            act = CpuBackend.matmul_dequant(&act, 1, &ffn_down);
+            crate::engine::tensor::add_inplace(&mut xr, &act);
+            let expected = xr;
+
+            let got = vulkan.fused_layer(FusedLayerInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: false, // llama does not normalize V
+                q_bias: q_bias.as_deref(),
+                pairing,
+                activation: FfnActivation::Swiglu,
+                x: GpuInput::Cpu(&x),
+                attn_norm: &attn_norm,
+                wq: &wq,
+                q_norm: None,
+                kv: Some(FusedAttnProjection {
+                    k_bias: k_bias.as_deref(),
+                    v_bias: v_bias.as_deref(),
+                    wk: &wk,
+                    k_norm: None,
+                    wv: Some(&wv),
+                }),
+                n_head,
+                n_head_kv,
+                head_dim,
+                rope_dim,
+                rope_freq_base,
+                freq_factors: None,
+                eps,
+                pos,
+                window_start: 0,
+                window: None,
+                scale,
+                cache: &mut kv_cache.layers[0],
+                wo: &wo,
+                attn_post_norm: None,
+                ffn_norm: &ffn_norm,
+                ffn_gate: &ffn_gate,
+                ffn_up: &ffn_up,
+                ffn_down: &ffn_down,
+                ffn_post_norm: None,
+                ple: None,
+                layer_output_scale: None,
+                batch_slot: 0,
+                attn_ts: None,
+            });
+
+            assert_eq!(got.len(), expected.len());
+            for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                    "biases={biases:?} step={step} pos={pos}: mismatch at {i}: \
+                     cpu={a} fused={b}"
+                );
+            }
+        }
+    }
+
+    /// The **decode** attention half on the llama shape — no per-head Q/K
+    /// norms, NORM pairing — against a step-by-step CPU sequence.
+    ///
+    /// **This test's own reference is not yet right, so nothing may be
+    /// concluded from its failure.** Run it with the *gemma* shape — real
+    /// per-head Q/K norms, at `pos = 3` with a populated cache — and it still
+    /// fails, while `fused_layer_matches_cpu_reference_full_layer_with_ple`
+    /// exercises that exact configuration through the full layer and passes. A
+    /// check that rejects a configuration known to be correct is measuring its
+    /// own reference, not the engine.
+    ///
+    /// So the earlier reading — "the defect is in the attention half, and the
+    /// `RopeOnly` stages are where it lives" — is **withdrawn**. What survives
+    /// is only what a *passing* test established:
+    /// `fused_post_attention_decode_matches_prefill_on_the_llama_shape` shows
+    /// the post-attention half correct for this shape, so items 4 and 5 are
+    /// clear. Items 1, 2, 3 and 6 are unattributed again.
+    ///
+    /// Fixing this test is the next step, and it comes before any further
+    /// attribution. The likely suspects in the reference, none yet checked:
+    /// whether `fused_attention`'s standalone wrapper returns the same quantity
+    /// this computes; whether the KV cast (`kv_storage` may be `F16`/`Q8_0`)
+    /// makes an exact-`f32` reference the wrong comparison; and whether the
+    /// window closure here matches what the chain derives internally.
+    ///
+    /// The `pos = 0` empty-cache case is a separate matter and probably a real
+    /// engine bug: there the reference is not in doubt, because attention over
+    /// one position is V by definition, and the fused path returns a constant
+    /// 3.013x less than V for *both* shapes. Production never reaches it — a
+    /// decode step always follows a prefill — so it is filed, not urgent.
+    #[test]
+    fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let n_embd = 24;
+        let n_head = 4;
+        let n_head_kv = 2;
+        let head_dim = 6;
+        let rope_dim = 6;
+        let kv_dim = n_head_kv * head_dim;
+        let eps = 1e-6;
+        let rope_freq_base = 10000.0;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let pairing = crate::engine::tensor::RopeLayout::Norm;
+        let rope = crate::engine::tensor::RopeParams {
+            rope_dim,
+            freq_base: rope_freq_base,
+            layout: pairing,
+            ..crate::engine::tensor::RopeParams::default()
+        };
+        let mut seed = 0xA77E_4711_u64;
+        let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim {
+                for _ in 0..in_dim {
+                    bytes.extend(build_block(GGML_TYPE_F32, seed));
+                }
+            }
+            test_quant_matrix(&bytes, GGML_TYPE_F32, in_dim, out_dim)
+        };
+        let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+            (0..len)
+                .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+                .collect()
+        };
+        let wq = build(n_embd, n_head * head_dim, &mut seed);
+        let wk = build(n_embd, kv_dim, &mut seed);
+        let wv = build(n_embd, kv_dim, &mut seed);
+        let attn_norm = rand_vec(n_embd, &mut seed);
+
+        let mut kv_cache = crate::engine::kv_cache::KvCache::new_with_dims(64, &[kv_dim]);
+        let mut ref_cache = crate::engine::kv_cache::KvCache::new_with_dims(64, &[kv_dim]);
+        for _ in 0..3 {
+            let k = rand_vec(kv_dim, &mut seed);
+            let v = rand_vec(kv_dim, &mut seed);
+            kv_cache.layers[0].push(&k, &v);
+            ref_cache.layers[0].push(&k, &v);
+        }
+        let x = rand_vec(n_embd, &mut seed);
+        let pos = kv_cache.layers[0].len;
+
+        let mut normed = x.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut normed, &attn_norm, 1, n_embd, eps);
+        let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
+        let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
+        let v = CpuBackend.matmul_dequant(&normed, 1, &wv);
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut q, n_head, head_dim, pos, None, &rope,
+        );
+        crate::engine::tensor::rope_apply_params_inplace(
+            &mut k, n_head_kv, head_dim, pos, None, &rope,
+        );
+        ref_cache.layers[0].push(&k, &v);
+        let mut expected = vec![0f32; n_head * head_dim];
+        crate::engine::attention::multi_head_attention(
+            &mut expected,
+            &q,
+            &ref_cache.layers[0],
+            n_head,
+            n_head / n_head_kv,
+            head_dim,
+            scale,
+            |_| (0, pos),
+        );
+
+        let got = vulkan.fused_attention(FusedAttnInput {
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: false, // llama does not normalize V
+            q_bias: None,
+            pairing,
+            normed: GpuInput::Cpu(&normed),
+            wq: &wq,
+            q_norm: None,
+            kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
+                wk: &wk,
+                k_norm: None,
+                wv: Some(&wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            rope_freq_base,
+            freq_factors: None,
+            eps,
+            pos,
+            window_start: 0,
+            window: None,
+            scale,
+            cache: &mut kv_cache.layers[0],
+            batch_slot: 0,
+            attn_ts: None,
+        });
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                "mismatch at {i}: cpu={a} fused={b}"
+            );
+        }
+    }
+
+    /// The **decode** post-attention chain against the **prefill** one, on the
+    /// llama shape, at one token.
+    ///
+    /// The tightest possible repro for the `fused_layer_llama_shaped_*` failure:
+    /// the prefill chain has taken optional post-norms and a SwiGLU switch since
+    /// G2's first increment and is what `llama.rs` runs in production, so it is
+    /// a known-good reference for exactly this configuration. Anything the
+    /// decode chain does differently here is the decode chain's bug, with no
+    /// attention, no RoPE and no KV cache in the way.
+    #[test]
+    fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("skipping: no Vulkan adapter available in this environment");
+            return;
+        };
+        let n_embd = 24;
+        let ffn_len = 16;
+        let eps = 1e-6;
+        let mut seed = 0x5EED_B00C_u64;
+        let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim {
+                for _ in 0..in_dim {
+                    bytes.extend(build_block(GGML_TYPE_F32, seed));
+                }
+            }
+            test_quant_matrix(&bytes, GGML_TYPE_F32, in_dim, out_dim)
+        };
+        let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+            (0..len)
+                .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+                .collect()
+        };
+        let wo = build(n_embd, n_embd, &mut seed);
+        let ffn_norm = rand_vec(n_embd, &mut seed);
+        let ffn_gate = build(n_embd, ffn_len, &mut seed);
+        let ffn_up = build(n_embd, ffn_len, &mut seed);
+        let ffn_down = build(ffn_len, n_embd, &mut seed);
+        let attn_out = rand_vec(n_embd, &mut seed);
+        let residual = rand_vec(n_embd, &mut seed);
+
+        let reference = vulkan
+            .fused_post_attention_prefill(
+                AttnOutSrc::Host(&attn_out),
+                &residual,
+                1,
+                &wo,
+                None,
+                &ffn_norm,
+                &ffn_gate,
+                &ffn_up,
+                &ffn_down,
+                None,
+                eps,
+                FfnActivation::Swiglu,
+            )
+            .expect("the prefill chain handles this shape");
+
+        let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+            activation: FfnActivation::Swiglu,
+            attn_out: GpuInput::Cpu(&attn_out),
+            residual: GpuInput::Cpu(&residual),
+            wo: &wo,
+            attn_post_norm: None,
+            ffn_norm: &ffn_norm,
+            ffn_gate: &ffn_gate,
+            ffn_up: &ffn_up,
+            ffn_down: &ffn_down,
+            ffn_post_norm: None,
+            eps,
+            ple: None,
+            layer_output_scale: None,
+            batch_slot: 0,
+        });
+
+        assert_eq!(got.len(), reference.len());
+        for (i, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-3 * a.abs().max(1.0),
+                "mismatch at {i}: prefill={a} decode={b}"
+            );
+        }
+    }
+
+    /// **Failing and `#[ignore]`d — this is the specification, not a passing
+    /// check.** It is the test that should have existed before the decode chain
+    /// grew its llama-family arms; written after the first caller of those arms
+    /// produced token soup (LESSONS §64).
+    ///
+    /// **Localised to the attention half**, by checking each half against its
+    /// own reference rather than by varying the configuration:
+    ///
+    /// - `fused_post_attention_decode_matches_prefill_on_the_llama_shape`
+    ///   **passes** — the decode post-attention chain agrees with the prefill
+    ///   one, which has taken optional post-norms and a SwiGLU switch since
+    ///   G2's first increment and is what `llama.rs` runs in production. So the
+    ///   no-post-norm residual arms and the activation switch are *correct*.
+    /// - `fused_attention_decode_matches_cpu_on_the_llama_shape` **fails**. The
+    ///   defect is in the attention half, which is where the two `RopeOnly`
+    ///   stages live.
+    ///
+    /// An earlier bisection of this test pointed at the residual arms instead —
+    /// restoring the post-norms dropped the error from 45.0 to 0.20 — and that
+    /// was **wrong**. A post-norm *normalizes away* the magnitude of whatever
+    /// reaches it, so restoring one masks an upstream error rather than
+    /// implicating its own absence. Varying a configuration only localises a
+    /// defect when the varied step cannot hide the others.
+    ///
+    /// Checked and excluded: the `add` shader's contract (`y[i] = a[i] + b[i]`
+    /// over `elem4`, guarded by `em.len`) matches the bind group's
+    /// `(a, b, y, meta)` order; the RoPE pairing is irrelevant (the failure is
+    /// byte-identical under NEOX); and it is not resource-cache reuse (the
+    /// failure reproduces with this test running alone on one thread).
+    #[test]
+    fn fused_layer_llama_shaped_matches_cpu_reference() {
+        cross_check_fused_layer_llama_shaped("");
+    }
+
+    /// See [`fused_layer_llama_shaped_matches_cpu_reference`] — same defect,
+    /// with Qwen2's projection biases on top. Kept separate so that when the
+    /// residual arm is fixed this says whether the bias arm is also right,
+    /// rather than the two failing as one.
+    #[test]
+    fn fused_layer_llama_shaped_with_qkv_biases_matches_cpu_reference() {
+        cross_check_fused_layer_llama_shaped("qkv");
+    }
+
     #[test]
     fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
         let Some(vulkan) = shared_vulkan() else {
@@ -18331,13 +20432,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             let expected = xr;
 
             let got = vulkan.fused_layer(FusedLayerInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: true,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
+                activation: FfnActivation::Geglu,
                 x: GpuInput::Cpu(&x),
                 attn_norm: &attn_norm,
                 wq: &wq,
-                q_norm: &q_norm,
+                q_norm: Some(&q_norm),
                 kv: Some(FusedAttnProjection {
+                    k_bias: None,
+                    v_bias: None,
                     wk: &wk,
-                    k_norm: &k_norm,
+                    k_norm: Some(&k_norm),
                     wv: Some(&wv),
                 }),
                 n_head,
@@ -18353,12 +20461,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &wo,
-                attn_post_norm: &attn_post_norm,
+                attn_post_norm: Some(&attn_post_norm),
                 ffn_norm: &ffn_norm,
                 ffn_gate: &ffn_gate,
                 ffn_up: &ffn_up,
                 ffn_down: &ffn_down,
-                ffn_post_norm: &ffn_post_norm,
+                ffn_post_norm: Some(&ffn_post_norm),
                 ple: Some(FusedPle {
                     gate_w: &ple_gate_w,
                     proj_w: &ple_proj_w,
@@ -18615,13 +20723,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             );
 
             let got0 = vulkan.fused_layer(FusedLayerInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: true,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
+                activation: FfnActivation::Geglu,
                 x: GpuInput::Cpu(&x0),
                 attn_norm: &l0.attn_norm,
                 wq: &l0.wq,
-                q_norm: &l0.q_norm,
+                q_norm: Some(&l0.q_norm),
                 kv: Some(FusedAttnProjection {
+                    k_bias: None,
+                    v_bias: None,
                     wk: &wk,
-                    k_norm: &k_norm,
+                    k_norm: Some(&k_norm),
                     wv: Some(&wv),
                 }),
                 n_head,
@@ -18637,12 +20752,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &l0.wo,
-                attn_post_norm: &l0.attn_post_norm,
+                attn_post_norm: Some(&l0.attn_post_norm),
                 ffn_norm: &l0.ffn_norm,
                 ffn_gate: &l0.ffn_gate,
                 ffn_up: &l0.ffn_up,
                 ffn_down: &l0.ffn_down,
-                ffn_post_norm: &l0.ffn_post_norm,
+                ffn_post_norm: Some(&l0.ffn_post_norm),
                 ple: None,
                 layer_output_scale: None,
                 batch_slot: 0,
@@ -18658,10 +20773,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             }
 
             let got1 = vulkan.fused_layer(FusedLayerInput {
+                yarn: RopeYarn::IDENTITY,
+                normalize_v: true,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
+                activation: FfnActivation::Geglu,
                 x: GpuInput::Cpu(&x1),
                 attn_norm: &l1.attn_norm,
                 wq: &l1.wq,
-                q_norm: &l1.q_norm,
+                q_norm: Some(&l1.q_norm),
                 kv: None,
                 n_head,
                 n_head_kv,
@@ -18676,12 +20796,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 scale,
                 cache: &mut kv_cache.layers[0],
                 wo: &l1.wo,
-                attn_post_norm: &l1.attn_post_norm,
+                attn_post_norm: Some(&l1.attn_post_norm),
                 ffn_norm: &l1.ffn_norm,
                 ffn_gate: &l1.ffn_gate,
                 ffn_up: &l1.ffn_up,
                 ffn_down: &l1.ffn_down,
-                ffn_post_norm: &l1.ffn_post_norm,
+                ffn_post_norm: Some(&l1.ffn_post_norm),
                 ple: None,
                 layer_output_scale: None,
                 batch_slot: 0,

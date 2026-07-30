@@ -343,6 +343,10 @@ impl Qwen35MoeModel {
 }
 
 impl ModelForward for Qwen35MoeModel {
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_vulkan()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

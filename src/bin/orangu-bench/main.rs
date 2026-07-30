@@ -76,6 +76,22 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     pp: Vec<u32>,
 
+    /// Continuation-prefill mode: comma-separated *added* token counts to sweep.
+    #[arg(long, value_delimiter = ',')]
+    pp_continue: Vec<u32>,
+
+    /// Report the server's CPU time per generated token, with prefill excluded.
+    #[arg(long, default_value_t = false)]
+    decode_cpu: bool,
+
+    /// Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s.
+    #[arg(long, value_delimiter = ',')]
+    streams: Vec<u32>,
+
+    /// Prompt length (tokens) to prime the prefix cache with for `--pp-continue`.
+    #[arg(long, default_value_t = 512)]
+    pp_continue_base: u32,
+
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128)]
     n_gen: u32,
@@ -126,6 +142,22 @@ struct Args {
     /// Only render the chart from an existing history file; measure nothing.
     #[arg(long, default_value_t = false)]
     chart_only: bool,
+
+    /// Also render a PNG beside the chart SVG.
+    #[arg(long, default_value_t = false)]
+    chart_png: bool,
+
+    /// Pin the chart's tok/s axis to `MIN:MAX` so a pair of charts compare.
+    #[arg(long)]
+    chart_scale: Option<String>,
+
+    /// Label for the chart's y-axis.
+    #[arg(long, default_value = "tok/s (log)")]
+    chart_y_label: String,
+
+    /// Label for the chart's x-axis.
+    #[arg(long)]
+    chart_x_label: Option<String>,
 
     /// Record a CPU flamegraph of the server over the measured window.
     #[arg(long)]
@@ -242,6 +274,45 @@ fn build_prompt(depth: u32) -> String {
     s
 }
 
+/// Build the *added* half of a continuation prompt: text that extends a cached
+/// base by roughly `added` tokens and that differs from every other rep's
+/// extension in its **first** token.
+///
+/// Both properties are load-bearing. A prefix cache matches on the longest
+/// common token prefix, so if two reps extended the base with the same words,
+/// the second rep would find its whole prompt cached and prefill nothing —
+/// the measurement would silently become a cache lookup. Varying the opening
+/// word per rep keeps the shared prefix at exactly the base.
+fn build_continuation(added: u32, rep: usize) -> String {
+    // Distinct openers, one per rep, so rep N's extension diverges from rep
+    // N-1's immediately rather than sharing a prefix with it.
+    const OPENERS: [&str; 8] = [
+        "Meanwhile",
+        "Afterwards",
+        "Elsewhere",
+        "Nevertheless",
+        "Consequently",
+        "Regardless",
+        "Furthermore",
+        "Eventually",
+    ];
+    // Word-granular, not sentence-granular: this sweep's whole subject is the
+    // 1..64-token range, where a 22-token sentence is the entire axis. Common
+    // words are ~1 BPE token each, so word count tracks token count closely
+    // enough for a threshold sweep — and `processed` reports the truth anyway.
+    const WORDS: [&str; 16] = [
+        "the", "river", "narrowed", "between", "cliffs", "and", "crew", "counted", "their",
+        "stores", "before", "long", "crossing", "began", "in", "earnest",
+    ];
+    let mut s = String::with_capacity(added as usize * 8 + 32);
+    s.push_str(OPENERS[rep % OPENERS.len()]);
+    for i in 0..added.max(1) as usize {
+        s.push(' ');
+        s.push_str(WORDS[i % WORDS.len()]);
+    }
+    s
+}
+
 /// One prefill measurement, as the server reported it.
 struct PrefillSample {
     prompt_tokens: u32,
@@ -261,20 +332,44 @@ impl PrefillSample {
             0.0
         }
     }
+
+    /// Tokens that actually went through a forward pass — the prompt minus
+    /// whatever the prefix cache supplied.
+    fn processed_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_sub(self.cached_tokens)
+    }
+
+    /// Prefill rate for a *continuation*: only the uncached tokens were
+    /// forwarded, so they are the only ones `prompt_ms` paid for. Dividing by
+    /// the full prompt length instead (what [`tok_per_s`](Self::tok_per_s)
+    /// does) would credit the cached prefix with work nobody did.
+    fn continuation_tok_per_s(&self) -> f64 {
+        if self.prompt_ms > 0.0 {
+            self.processed_tokens() as f64 / (self.prompt_ms / 1000.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Send one prompt, generate a single token, and report what prefill cost.
 ///
-/// `cache_prompt: false` is what keeps this honest: without it the second and
-/// later reps would find their prompt already in the server's prefix cache and
-/// report the speed of a cache lookup. Both `orangu-server` and `llama-server`
-/// honour it; the `cached` column the caller prints is the check that whatever
-/// server answered actually did.
+/// `cache_prompt: false` is what keeps the plain sweep honest: without it the
+/// second and later reps would find their prompt already in the server's prefix
+/// cache and report the speed of a cache lookup. Both `orangu-server` and
+/// `llama-server` honour it; the `cached` column the caller prints is the check
+/// that whatever server answered actually did.
+///
+/// `--pp-continue` passes `true` instead, because a cache hit is precisely what
+/// it is trying to produce — there the `cached` column is read as a
+/// *requirement* rather than as a warning, and the rate is computed from the
+/// uncached remainder.
 fn run_prefill_once(
     client: &reqwest::blocking::Client,
     url: &str,
     prompt: &str,
     model: &Option<String>,
+    cache_prompt: bool,
 ) -> anyhow::Result<PrefillSample> {
     let mut body = serde_json::json!({
         "prompt": prompt,
@@ -284,7 +379,10 @@ fn run_prefill_once(
         "n_predict": 1,
         "temperature": 0,
         "stream": true,
-        "cache_prompt": false,
+        // `false` for the plain sweep, where a cache hit would be a lie; `true`
+        // only for `--pp-continue`, whose whole subject is the prefill that
+        // happens *after* a hit.
+        "cache_prompt": cache_prompt,
         // llama-server only attaches `timings` to its OpenAI-compatible
         // responses when asked; orangu-server always sends them.
         "timings_per_token": true,
@@ -392,9 +490,22 @@ fn run_once(
         body["model"] = serde_json::Value::String(m.clone());
     }
 
+    stream_and_time(client, url, &body)
+}
+
+/// Send one streaming completion and time the decode window: from the first
+/// streamed token to the last, so prefill and time-to-first-token are excluded.
+///
+/// Split out of [`run_once`] so `--decode-cpu`'s cache-enabled variant times the
+/// window exactly the same way rather than keeping a second copy of the loop.
+fn stream_and_time(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<Sample> {
     let endpoint = format!("{url}/v1/completions");
     let t0 = Instant::now();
-    let resp = post_with_one_retry(client, &endpoint, &body)?;
+    let resp = post_with_one_retry(client, &endpoint, body)?;
     if !resp.status().is_success() {
         anyhow::bail!("server returned HTTP {}", resp.status());
     }
@@ -481,6 +592,24 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
 
+    // `perf record -p` attaches to the threads that exist at that instant and
+    // never picks up ones created later. A server builds its compute threads
+    // lazily, on its first request — so profiling with no warmup samples almost
+    // nothing while still producing a well-formed flamegraph and a confident
+    // `cores_busy`. Measured: 0.02 cores reported against 0.44 actually used.
+    //
+    // The warmup is what makes those threads exist first, so the two flags are
+    // refused together rather than silently producing a bad profile. (The
+    // profiler also cross-checks itself against `/proc` and warns, which covers
+    // the causes this cannot see.)
+    if args.no_warmup && args.flamegraph.is_some() {
+        anyhow::bail!(
+            "--flamegraph cannot be combined with --no-warmup: `perf record -p` does not \
+             follow threads created after it attaches, and a server creates its compute \
+             threads on the first request, so the profile would miss nearly all of them"
+        );
+    }
+
     // Warmup first (it also validates the connection), so a failure here prints
     // just the clean error above rather than a header followed by an error.
     if !args.no_warmup {
@@ -529,6 +658,18 @@ fn measure(
 ) -> anyhow::Result<Vec<history::Record>> {
     if !args.pp.is_empty() {
         return run_pp(client, args, label);
+    }
+
+    if !args.pp_continue.is_empty() {
+        return run_pp_continue(client, args, label);
+    }
+
+    if args.decode_cpu {
+        return run_decode_cpu(client, args, label);
+    }
+
+    if !args.streams.is_empty() {
+        return run_streams(client, args, label);
     }
 
     if args.curve > 0 {
@@ -651,9 +792,47 @@ fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
         args.history.as_deref().unwrap_or("this run"),
         history::today()
     );
-    std::fs::write(chart_path, chart::render(&records, &subtitle))?;
+    // A pinned axis is what makes two separately-rendered charts comparable;
+    // see `chart::render_with_scale`. Parsed here rather than in the renderer so
+    // a typo is a clean error before anything is drawn.
+    let scale = match &args.chart_scale {
+        Some(spec) => {
+            let (lo, hi) = spec
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--chart-scale wants MIN:MAX, got {spec:?}"))?;
+            Some((
+                lo.trim()
+                    .parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("--chart-scale MIN: {e}"))?,
+                hi.trim()
+                    .parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("--chart-scale MAX: {e}"))?,
+            ))
+        }
+        None => None,
+    };
+    std::fs::write(
+        chart_path,
+        chart::render_labelled(
+            &records,
+            &subtitle,
+            scale,
+            chart::Labels {
+                y: args.chart_y_label.clone(),
+                x: args.chart_x_label.clone(),
+            },
+        ),
+    )?;
     if !args.json {
         println!("  chart    {chart_path}");
+    }
+    // A raster twin for documents that cannot embed an SVG. The SVG stays the
+    // canonical artifact; this is derived from it, so the two cannot disagree.
+    if args.chart_png {
+        let png = profile::render_png(std::path::Path::new(chart_path))?;
+        if let (Some(png), false) = (png, args.json) {
+            println!("  chart    {}", png.display());
+        }
     }
     Ok(())
 }
@@ -852,6 +1031,12 @@ fn workload_name(args: &Args) -> String {
     let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     if !args.pp.is_empty() {
         format!("prefill pp {}", list(&args.pp))
+    } else if !args.pp_continue.is_empty() {
+        format!(
+            "prefill +{} on {} cached",
+            list(&args.pp_continue),
+            args.pp_continue_base
+        )
     } else if args.curve > 0 {
         format!("decode curve {}", args.curve)
     } else {
@@ -881,11 +1066,19 @@ fn report_profile(s: &profile::Summary, args: &Args) {
         return;
     }
     println!(
-        "  profile  {} ({} samples over {:.0}s — {:.2} cores busy)",
+        "  profile  {} ({} samples over {:.0}s — {:.2} cores busy{})",
         s.svg.display(),
         s.samples,
         s.seconds,
-        s.cores_busy
+        s.cores_busy,
+        // The independent check, printed beside the number it validates rather
+        // than only in the sidecar: sampling can miss threads, `/proc` cannot,
+        // and a reader comparing the two sees at a glance whether this profile
+        // describes the process or a corner of it.
+        match s.cores_from_proc {
+            Some(actual) => format!(", {actual:.2} per /proc"),
+            None => String::new(),
+        }
     );
     println!(
         "           {:.2} gpu-wait  {:.2} pool-idle  {:.2} working (cores)",
@@ -931,7 +1124,7 @@ fn run_pp(
         let mut rates = Vec::new();
         let mut last: Option<PrefillSample> = None;
         for _ in 0..args.reps.max(1) {
-            let s = run_prefill_once(client, &args.url, &prompt, &args.model)?;
+            let s = run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
             rates.push(s.tok_per_s());
             last = Some(s);
         }
@@ -983,6 +1176,344 @@ fn run_pp(
                 sd,
             });
         }
+    }
+    Ok(records)
+}
+
+/// Concurrency mode: aggregate decode throughput against the number of
+/// concurrent streams.
+///
+/// The question this answers is whether the engine can *fill* the device, which
+/// is not visible from any single-stream number. A decode step is a chain of
+/// dependent dispatches, each too small to occupy the GPU on its own; whether
+/// independent requests can interleave into the gaps depends on whether the
+/// engine blocks the host between those dispatches.
+///
+/// Measured on this rig: an architecture whose decode is one GPU submission per
+/// token goes 27.5 → 47.9 aggregate tok/s from one stream to two and pins the
+/// engine at 99%, while one that round-trips per dispatch goes 21.3 → 24.5 and
+/// never passes 66% however many streams are offered. Same device, same driver.
+///
+/// Reports the aggregate — the sum across streams, which is what a server's
+/// capacity actually is — and the per-stream share beside it, since a rate that
+/// is flat in aggregate and falling as 1/n means the streams are taking turns.
+/// Pair it with the `gpu busy` line: aggregate that stops rising while the
+/// engine is *not* at 100% is the interesting case.
+fn run_streams(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    if !args.json {
+        println!(
+            "{:>8} | {:>12} | {:>11} | {:>8}",
+            "streams", "aggregate", "per-stream", "tokens"
+        );
+        println!("{}", "-".repeat(48));
+    }
+
+    for &n in &args.streams {
+        let n = n.max(1);
+        let mut aggregate = Vec::new();
+        let mut total_tokens = 0u32;
+        for _ in 0..args.reps.max(1) {
+            let start = Instant::now();
+            // One thread per stream, each its own request. Scoped threads so no
+            // clones of the client are needed and no task can outlive the run.
+            let results: Vec<Sample> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..n)
+                    .map(|i| {
+                        scope.spawn(move || {
+                            // Distinct prompts, so no two streams share a prefix
+                            // cache entry and get a free ride.
+                            let prompt =
+                                format!("Stream {i}: tell a long, continuous story, do not stop:");
+                            run_once(client, &args.url, &prompt, args.n_gen, &args.model)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().and_then(Result::ok))
+                    .collect()
+            });
+            let wall = start.elapsed().as_secs_f64();
+            let tokens: u32 = results.iter().map(|s| s.gen_tokens).sum();
+            if tokens == 0 || wall <= 0.0 {
+                anyhow::bail!("no tokens generated across {n} streams");
+            }
+            aggregate.push(f64::from(tokens) / wall);
+            total_tokens = tokens;
+        }
+        let best = aggregate.iter().cloned().fold(0.0_f64, f64::max);
+        let mean = aggregate.iter().sum::<f64>() / aggregate.len() as f64;
+        let var =
+            aggregate.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / aggregate.len() as f64;
+        let sd = var.sqrt();
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "streams": n,
+                    "aggregate_tok_per_s_best": best,
+                    "aggregate_tok_per_s_mean": mean,
+                    "aggregate_tok_per_s_sd": sd,
+                    "per_stream_tok_per_s": mean / f64::from(n),
+                    "tokens": total_tokens,
+                })
+            );
+        } else {
+            println!(
+                "{:>8} | {:>6.2} ± {:>4.2} | {:>11.2} | {:>8}",
+                n,
+                mean,
+                sd,
+                mean / f64::from(n),
+                total_tokens
+            );
+        }
+
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "tg".to_string(),
+            n,
+            best,
+            mean,
+            sd,
+        });
+    }
+    Ok(records)
+}
+
+/// Decode-CPU mode: the server's own CPU time per **generated** token, with
+/// prefill excluded.
+///
+/// Exists because the obvious way to get this number is wrong. Reading the
+/// server's CPU over a whole `--depths N` run and dividing by the tokens
+/// generated attributes the cost of prefilling N tokens to decode — and prefill
+/// at depth 1024 is several CPU-seconds. Done that way, decode CPU per token
+/// appears to grow 58% from depth 0 to 1024 on Llama-3.2-3B. Measured properly
+/// it grows 17% over a 94x context increase: most of the "growth" was the
+/// prefill, and it scaled with depth because the prefill did.
+///
+/// So each depth is measured twice. The first request pays the prefill and puts
+/// it in the prefix cache; the CPU counter is read *after* that, and the second
+/// request's prefill is a cache hit. What lands between the two readings is
+/// decode and nothing else — which the printed `prefilled` column proves, by
+/// reading 1 (the cache deliberately leaves one token to re-process).
+///
+/// Throughput is unaffected by the confound and is reported by the ordinary
+/// depth sweep: that timing already starts at the first streamed token. This is
+/// specifically for the CPU number, where nothing was excluding prefill.
+fn run_decode_cpu(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    // Same resolution the profiler uses, and for the same reason: this reads
+    // `/proc/<pid>/stat`, so the server has to be a local process.
+    let pid = match args.flamegraph_pid {
+        Some(pid) => pid,
+        None => resolve_server_pid(client, args)?,
+    };
+
+    let mut records = Vec::new();
+    if !args.json {
+        println!(
+            "{:>8} | {:>7} | {:>9} | {:>13} | {:>8}",
+            "depth", "n_tok", "prefilled", "cpu_ms/token", "tok/s"
+        );
+        println!("{}", "-".repeat(58));
+    }
+
+    for &depth in &args.depths {
+        let prompt = build_prompt(depth);
+        let mut per_token = Vec::new();
+        let mut rate = 0.0;
+        let mut reported = (0u32, 0u32);
+        for _ in 0..args.reps.max(1) {
+            // Pay the prefill and leave it in the prefix cache.
+            let primed = run_prefill_once(client, &args.url, &prompt, &args.model, true)?;
+            let before = profile::proc_cpu_seconds(pid)
+                .ok_or_else(|| anyhow::anyhow!("could not read /proc/{pid}/stat"))?;
+            let s = run_once_cached(client, &args.url, &prompt, args.n_gen, &args.model)?;
+            let after = profile::proc_cpu_seconds(pid)
+                .ok_or_else(|| anyhow::anyhow!("could not read /proc/{pid}/stat"))?;
+            if s.gen_tokens == 0 {
+                anyhow::bail!("no tokens generated at depth {depth}; cannot divide by zero");
+            }
+            per_token.push((after - before).max(0.0) / f64::from(s.gen_tokens) * 1000.0);
+            rate = s.tok_per_s();
+            reported = (primed.prompt_tokens, primed.processed_tokens());
+        }
+        let best = per_token.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mean = per_token.iter().sum::<f64>() / per_token.len() as f64;
+        let var =
+            per_token.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / per_token.len() as f64;
+        let sd = var.sqrt();
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "depth": depth,
+                    "prompt_tokens": reported.0,
+                    "prefilled_tokens": reported.1,
+                    "cpu_ms_per_token_best": best,
+                    "cpu_ms_per_token_mean": mean,
+                    "cpu_ms_per_token_sd": sd,
+                    "tok_per_s": rate,
+                })
+            );
+        } else {
+            println!(
+                "{:>8} | {:>7} | {:>9} | {:>6.3} ± {:>4.3} | {:>8.2}",
+                depth, reported.0, reported.1, mean, sd, rate
+            );
+        }
+
+        // Recorded as its own mode: this is milliseconds of CPU, not tok/s, and
+        // charting it on the same axis as a throughput series would be a
+        // category error.
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "cpu".to_string(),
+            n: reported.0,
+            best,
+            mean,
+            sd,
+        });
+    }
+    Ok(records)
+}
+
+/// [`run_once`] with the prefix cache **enabled**, so an already-primed prompt
+/// costs no prefill. Only `--decode-cpu` wants this; every other mode sends
+/// `cache_prompt: false` on purpose.
+fn run_once_cached(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    prompt: &str,
+    n_gen: u32,
+    model: &Option<String>,
+) -> anyhow::Result<Sample> {
+    let mut body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": n_gen,
+        "n_predict": n_gen,
+        "temperature": 0,
+        "stream": true,
+        "cache_prompt": true,
+        "ignore_eos": true,
+    });
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.clone());
+    }
+    stream_and_time(client, url, &body)
+}
+
+/// Continuation-prefill mode: time the prefill of a *small addition* to an
+/// already-cached prompt.
+///
+/// `--pp` cannot reach this regime. It sends whole prompts with
+/// `cache_prompt: false`, and a whole prompt carrying a chat template is
+/// hundreds of tokens before any user text — so every `--pp` row exercises a
+/// wide batch. Real multi-turn chat does the opposite: the prefix cache
+/// supplies everything but the newest message, and the server prefills a
+/// handful of tokens. That is a different point on the batch-width curve, and
+/// it is the one a batch-width threshold actually governs.
+///
+/// Each rep primes the base prompt, then sends base + extension and reads what
+/// the server says it processed. The extension's first token differs per rep so
+/// the cache can only ever match the base.
+fn run_pp_continue(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    if !args.json {
+        println!(
+            "{:>8} | {:>7} | {:>7} | {:>9} | {:>9} | {:>8} | {:>16}",
+            "added", "n_tok", "cached", "processed", "prompt_ms", "best", "mean ± sd"
+        );
+        println!("{}", "-".repeat(82));
+    }
+
+    let base = build_prompt(args.pp_continue_base);
+    for &added in &args.pp_continue {
+        let mut rates = Vec::new();
+        let mut last: Option<PrefillSample> = None;
+        for rep in 0..args.reps.max(1) as usize {
+            // Prime: put the base in the prefix cache. Its own cost is not
+            // timed — only the extension that follows it is.
+            run_prefill_once(client, &args.url, &base, &args.model, true)?;
+            let prompt = format!("{base}{}", build_continuation(added, rep));
+            let s = run_prefill_once(client, &args.url, &prompt, &args.model, true)?;
+            rates.push(s.continuation_tok_per_s());
+            last = Some(s);
+        }
+        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
+        let sd = var.sqrt();
+        let s = last.expect("at least one rep ran");
+        let processed = s.processed_tokens();
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "added": added,
+                    "prompt_tokens": s.prompt_tokens,
+                    "cached_tokens": s.cached_tokens,
+                    "processed_tokens": processed,
+                    "prompt_ms": s.prompt_ms,
+                    "tok_per_s_best": best,
+                    "tok_per_s_mean": mean,
+                    "tok_per_s_sd": sd,
+                    "server_reported": s.server_reported,
+                })
+            );
+        } else if s.server_reported {
+            println!(
+                "{:>8} | {:>7} | {:>7} | {:>9} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
+                added, s.prompt_tokens, s.cached_tokens, processed, s.prompt_ms, best, mean, sd
+            );
+        } else {
+            println!(
+                "{:>8} | {:>7} | {:>7} | {:>9} | {:>9.1} | {:>8} | no server timings",
+                added, "?", s.cached_tokens, "?", s.prompt_ms, "-"
+            );
+        }
+
+        // Two ways this row can be meaningless, and both are silent unless
+        // checked: no server timings at all, or a cache that supplied nothing
+        // (so `processed` is the whole prompt and this is an ordinary wide
+        // prefill wearing a continuation's label).
+        if !s.server_reported {
+            continue;
+        }
+        if s.cached_tokens == 0 {
+            eprintln!(
+                "  note: added={added} processed the whole prompt — no cache hit, \
+                 so this is not a continuation; row dropped"
+            );
+            continue;
+        }
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "pp".to_string(),
+            n: processed,
+            best,
+            mean,
+            sd,
+        });
     }
     Ok(records)
 }
@@ -1127,9 +1658,28 @@ fn gpu_clock_states() -> Vec<GpuClock> {
 /// was added to answer — did the card reach its top level *for this
 /// measurement* — and it is the check that catches a card that quietly stayed
 /// parked while a whole sweep was recorded against it.
+/// Peak core clock and mean engine/memory occupancy per card, over the measured
+/// window.
+pub struct GpuActivity {
+    pub card: String,
+    pub peak_mhz: u32,
+    /// Mean `gpu_busy_percent` — the graphics engine.
+    pub gpu_busy: Option<f64>,
+    /// Mean `mem_busy_percent` — the **memory controller**.
+    ///
+    /// The one number that separates "this kernel is bandwidth-bound" from
+    /// "this kernel is stalled". A workload at the card's streaming ceiling
+    /// drives this to ~85%; orangu's decode sits at ~20% while delivering
+    /// 48 GB/s, which says the memory system has four to five times the
+    /// headroom the kernel is asking for. Getting this number was the blocking
+    /// item on G3, and it had been assumed to require `RadeonGPUProfiler` and a
+    /// display; `amdgpu` publishes it in sysfs.
+    pub mem_busy: Option<f64>,
+}
+
 struct ClockWatch {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    sampler: Option<std::thread::JoinHandle<Vec<(String, u32)>>>,
+    sampler: Option<std::thread::JoinHandle<Vec<GpuActivity>>>,
 }
 
 impl ClockWatch {
@@ -1137,19 +1687,36 @@ impl ClockWatch {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let sampler = std::thread::spawn(move || {
-            let mut peak: std::collections::BTreeMap<String, u32> =
+            // `(peak mhz, gpu_busy sum, mem_busy sum, samples)` per card.
+            let mut acc: std::collections::BTreeMap<String, (u32, u64, u64, u64)> =
                 std::collections::BTreeMap::new();
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 for gpu in gpu_clock_states() {
                     let mhz = parse_mhz(&gpu.sclk).unwrap_or(0);
-                    let slot = peak.entry(gpu.card).or_default();
-                    *slot = (*slot).max(mhz);
+                    let g = read_busy_percent(&gpu.card, "gpu_busy_percent");
+                    let m = read_busy_percent(&gpu.card, "mem_busy_percent");
+                    let slot = acc.entry(gpu.card).or_default();
+                    slot.0 = slot.0.max(mhz);
+                    // Only count a sample when both counters read, so the mean
+                    // has one denominator rather than two.
+                    if let (Some(g), Some(m)) = (g, m) {
+                        slot.1 += u64::from(g);
+                        slot.2 += u64::from(m);
+                        slot.3 += 1;
+                    }
                 }
                 // Fast enough to catch the ramp on a short run, slow enough
                 // that reading sysfs is not itself part of the measurement.
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
-            peak.into_iter().collect()
+            acc.into_iter()
+                .map(|(card, (peak_mhz, gsum, msum, n))| GpuActivity {
+                    card,
+                    peak_mhz,
+                    gpu_busy: (n > 0).then(|| gsum as f64 / n as f64),
+                    mem_busy: (n > 0).then(|| msum as f64 / n as f64),
+                })
+                .collect()
         });
         ClockWatch {
             stop,
@@ -1157,13 +1724,25 @@ impl ClockWatch {
         }
     }
 
-    fn stop(mut self) -> Vec<(String, u32)> {
+    fn stop(mut self) -> Vec<GpuActivity> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.sampler
             .take()
             .and_then(|h| h.join().ok())
             .unwrap_or_default()
     }
+}
+
+/// One of `amdgpu`'s occupancy counters for `card`, as a percentage.
+///
+/// `None` on a non-AMD card, an older kernel, or anything that does not publish
+/// the file — the caller prints what it has rather than claiming a zero.
+fn read_busy_percent(card: &str, file: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/drm/{card}/device/{file}"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// `1700Mhz` → `1700`. Anything else — including the `0Mhz` sleep level, which
@@ -1174,27 +1753,46 @@ fn parse_mhz(sclk: &str) -> Option<u32> {
 }
 
 /// Peak clocks, printed under the numbers they qualify.
-fn report_clocks(peaks: &[(String, u32)], args: &Args) {
-    if peaks.is_empty() {
+fn report_clocks(activity: &[GpuActivity], args: &Args) {
+    if activity.is_empty() {
         return;
     }
     if args.json {
         println!(
             "{}",
             serde_json::json!({
-                "type": "clock_peaks",
-                "peaks": peaks.iter().map(|(c, m)| serde_json::json!({"card": c, "peak_mhz": m}))
-                    .collect::<Vec<_>>(),
+                "type": "gpu_activity",
+                "cards": activity.iter().map(|a| serde_json::json!({
+                    "card": a.card,
+                    "peak_mhz": a.peak_mhz,
+                    "gpu_busy_pct": a.gpu_busy,
+                    "mem_busy_pct": a.mem_busy,
+                })).collect::<Vec<_>>(),
             })
         );
         return;
     }
-    let line = peaks
+    let line = activity
         .iter()
-        .map(|(card, mhz)| format!("{card} {mhz}Mhz"))
+        .map(|a| format!("{} {}Mhz", a.card, a.peak_mhz))
         .collect::<Vec<_>>()
         .join("  ");
     println!("  gpu peak {line} (while measuring)");
+
+    // Printed next to the rate it explains. A rate that looks low is a very
+    // different problem depending on whether the memory controller was at 20%
+    // or 90% while producing it, and until this line existed the answer took a
+    // separate experiment every time.
+    let busy = activity
+        .iter()
+        .filter_map(|a| {
+            let (g, m) = (a.gpu_busy?, a.mem_busy?);
+            Some(format!("{} engine {g:.0}%  memory {m:.0}%", a.card))
+        })
+        .collect::<Vec<_>>();
+    if !busy.is_empty() {
+        println!("  gpu busy {} (mean while measuring)", busy.join("  "));
+    }
 }
 
 /// Curve mode: one generation of `args.curve` tokens, timestamping each streamed
@@ -1290,4 +1888,72 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
         lo = hi;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one thing `--pp-continue` must get right. A prefix cache matches on
+    /// the longest common token prefix, so two reps whose extensions began with
+    /// the same word would share more than the base — and in the limit the
+    /// second rep would find everything cached and time a lookup instead of a
+    /// prefill. Diverging at the first character is what bounds the match to
+    /// the base.
+    #[test]
+    fn continuations_for_different_reps_diverge_at_the_first_word() {
+        let a = build_continuation(64, 0);
+        let b = build_continuation(64, 1);
+        assert_ne!(a, b);
+        let first = |s: &str| s.split_whitespace().next().unwrap().to_string();
+        assert_ne!(first(&a), first(&b));
+        // ...and the shared prefix is empty, not merely short.
+        assert_ne!(a.as_bytes()[0], b.as_bytes()[0]);
+    }
+
+    /// Reps beyond the opener list wrap around, which is fine — but adjacent
+    /// reps must never collide, since a cache holds the immediately preceding
+    /// prompt.
+    #[test]
+    fn adjacent_reps_never_share_an_opener() {
+        for rep in 0..20 {
+            assert_ne!(
+                build_continuation(32, rep),
+                build_continuation(32, rep + 1),
+                "reps {rep} and {} collided",
+                rep + 1
+            );
+        }
+    }
+
+    /// A longer request must actually produce more text; otherwise every row of
+    /// the sweep would measure the same batch width under different labels.
+    #[test]
+    fn a_larger_addition_produces_a_longer_continuation() {
+        let small = build_continuation(32, 0);
+        let large = build_continuation(256, 0);
+        assert!(
+            large.len() > small.len() * 2,
+            "32 -> {} bytes, 256 -> {} bytes",
+            small.len(),
+            large.len()
+        );
+    }
+
+    /// The rate must come from the tokens that were forwarded, not from the
+    /// whole prompt. Getting this wrong inflates a continuation's rate by the
+    /// cache ratio — here 8x — which would look like a spectacular result.
+    #[test]
+    fn a_continuation_rate_counts_only_the_uncached_tokens() {
+        let s = PrefillSample {
+            prompt_tokens: 512,
+            cached_tokens: 448,
+            prompt_ms: 1000.0,
+            server_reported: true,
+        };
+        assert_eq!(s.processed_tokens(), 64);
+        assert!((s.continuation_tok_per_s() - 64.0).abs() < 1e-9);
+        // What the plain sweep would have reported for the same response.
+        assert!((s.tok_per_s() - 512.0).abs() < 1e-9);
+    }
 }

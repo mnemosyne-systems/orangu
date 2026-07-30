@@ -116,6 +116,18 @@ pub struct BatchDecodeItem<'a> {
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
 
+    /// This model's Vulkan backend, when it has one.
+    ///
+    /// Exists for cross-architecture *instrumentation* rather than for work:
+    /// `engine::generate` counts GPU submissions per decode step, and that
+    /// number is only interesting compared **between** architectures — which
+    /// nothing inside a single arch module can do. Defaults to `None` so a
+    /// CPU-only or not-yet-converted arch needs no change and simply reports
+    /// nothing.
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        None
+    }
+
     /// A fresh KV cache sized for `capacity` positions, for a new sequence.
     fn new_kv_cache(&self, capacity: usize) -> KvCache;
 

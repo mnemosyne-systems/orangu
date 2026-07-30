@@ -3937,11 +3937,42 @@ pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
 const ELEM_META: &str = r#"
 struct ElemMeta {
     len: u32,
-    _pad0: u32,
+    /// A second integer whose meaning is the shader's: a destination offset for
+    /// the KV cast, the row width to broadcast along for `BIAS_ADD_SHADER_BODY`.
+    aux: u32,
     extra: f32,
     out_scale: f32,
 }
 "#;
+
+/// `y[i] += bias[i % row]` — a projection bias broadcast down the rows of a
+/// `[n_tokens, row]` tensor.
+///
+/// Qwen2 carries `attn_q/k/v.bias`; Llama, Mistral and gemma do not. Until this
+/// existed the fused Q/K/V chain had nowhere to put them, so a Qwen2 layer had
+/// to stay on the step-by-step path — the bias was the last of four conventions
+/// separating the two families.
+///
+/// Same `elem3` binding shape as the per-head norm (read storage, read-write
+/// storage, uniform), so it reuses that layout rather than needing its own.
+const BIAS_ADD_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> bias: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= em.len) {
+        return;
+    }
+    y[i] = y[i] + bias[i % em.aux];
+}
+"#;
+
+pub fn shader_source_bias_add() -> String {
+    format!("{ELEM_META}\n{BIAS_ADD_SHADER_BODY}")
+}
 
 /// `y[i] = a[i] + b[i]`, e.g. a residual add.
 const ADD_SHADER_BODY: &str = r#"
@@ -4189,6 +4220,39 @@ pub fn shader_source_mul() -> String {
 
 pub fn shader_source_gelu() -> String {
     format!("{ELEM_META}\n{GELU_SHADER_BODY}")
+}
+
+/// Fused SiLU+multiply — the SwiGLU counterpart of [`GELU_MUL_SHADER_BODY`],
+/// for the Llama/Qwen2/Mistral/Phi families, whose FFN gate is
+/// `silu(gate) * up` rather than gemma's `gelu(gate) * up`.
+///
+/// Line-for-line the same shape as the GELU twin (same bindings, same
+/// `elem4_bind_group`, same workgroup size), so selecting between them is a
+/// pipeline swap and nothing else. `silu(v) = v * sigmoid(v)`, written as
+/// `v / (1 + exp(-v))` to match `engine::tensor::silu` exactly rather than
+/// approximately — this kernel is cross-checked against that CPU function, and
+/// an algebraically-equal-but-differently-rounded form would make the tolerance
+/// carry a difference that is not the one being tested.
+const SILU_MUL_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= em.len) {
+        return;
+    }
+    let v = a[i];
+    let g = v / (1.0 + exp(-v));
+    y[i] = g * b[i];
+}
+"#;
+
+pub fn shader_source_silu_mul() -> String {
+    format!("{ELEM_META}\n{SILU_MUL_SHADER_BODY}")
 }
 
 pub fn shader_source_gelu_mul() -> String {
@@ -6449,8 +6513,10 @@ pub fn shader_source_kv_quantize_q8_0() -> String {
     KV_QUANTIZE_Q8_0_SHADER.to_string()
 }
 
-/// Line-for-line port of `engine::tensor::rope_apply_scaled_inplace`
-/// (NEOX-style pairing: element `i` pairs with `i + rope_dim/2`, only the
+/// Line-for-line port of `engine::tensor::rope_apply_params_inplace`, both
+/// pairings (`RopeMeta::layout`: NEOX pairs element `i` with `i + rope_dim/2`,
+/// NORM pairs `2i` with `2i+1` — `llama` and `mistral` are NORM, everything
+/// else here is NEOX). Only the
 /// leading `rope_dim` elements of each head rotate, any remainder passes
 /// through untouched since this shader never touches it) — modifies `rx`
 /// in place. `rff` (the proportional-RoPE per-frequency divisor,
@@ -6462,6 +6528,45 @@ pub fn shader_source_kv_quantize_q8_0() -> String {
 /// (read-only storage, read-write storage, uniform) deliberately matches
 /// `elem3_bind_group_layout`'s shape so this reuses the same layout/
 /// pipeline layout as `gelu`/`scale` rather than needing a new one.
+/// ggml's `rope_yarn` angle, shared verbatim by [`ROPE_SHADER`] and
+/// [`FUSED_NORM_ROPE_SHADER`] — prepended to both sources rather than
+/// duplicated, because the two kernels rotating by *different* angles is
+/// exactly the failure `RopeMeta::pairing`'s own comment records: a wrong
+/// answer that matches to five significant figures before RoPE and not at all
+/// after.
+///
+/// `corr_lo`/`corr_hi` (ggml's `ggml_rope_yarn_corr_dims`) and `mscale` (its
+/// `rope_yarn` magnitude correction) are computed host-side in
+/// [`super::vulkan::RopeYarn::from_params`]: they depend only on constants, so
+/// deriving them per thread would burn a `log` to reach an answer that must
+/// agree bit-for-bit with the CPU reference anyway.
+///
+/// With `ext_factor == 0` this returns `freq_scale * theta_extrap`, and every
+/// non-YaRN caller passes `freq_scale = 1.0`, so the result is
+/// `1.0 * theta_extrap` — exact in IEEE 754, hence bit-identical to the plain
+/// rope these shaders computed before.
+const ROPE_YARN_WGSL: &str = r#"
+fn rope_yarn_theta(
+    i: f32,
+    theta_extrap: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    corr_lo: f32,
+    corr_hi: f32,
+) -> f32 {
+    let theta_interp = freq_scale * theta_extrap;
+    if (ext_factor == 0.0) {
+        return theta_interp;
+    }
+    // `rope_yarn_ramp`: 1 at the low end of the band (pure interpolation)
+    // falling to 0 above it.
+    let y = (i - corr_lo) / max(0.001, corr_hi - corr_lo);
+    let ramp = 1.0 - clamp(y, 0.0, 1.0);
+    let mix = ramp * ext_factor;
+    return theta_interp * (1.0 - mix) + theta_extrap * mix;
+}
+"#;
+
 const ROPE_SHADER: &str = r#"
 struct RopeMeta {
     n_head: u32,
@@ -6470,8 +6575,28 @@ struct RopeMeta {
     pos: u32,
     freq_base: f32,
     n_tokens: u32,
-    _pad1: u32,
+    /// `0` = NEOX (element `i` pairs with `i + rope_dim/2`), `1` = NORM
+    /// (element `2i` pairs with `2i+1`). A uniform rather than a second
+    /// pipeline: the two differ only in which two indices a thread touches,
+    /// the branch is uniform across the whole dispatch, and a wrong answer
+    /// here is the kind that matches upstream to five significant figures
+    /// *before* RoPE and reads −354.6 against 6.66 after.
+    ///
+    /// Not named `layout`: that is a reserved word in WGSL, and naga rejects
+    /// the module with `name \`layout\` is a reserved keyword`.
+    pairing: u32,
     _pad2: u32,
+    /// YaRN, all identity-valued for a model that does not use it — see
+    /// `ROPE_YARN_WGSL`.
+    freq_scale: f32,
+    ext_factor: f32,
+    /// ggml's `mscale`, already folded with `attn_factor` host-side.
+    mscale: f32,
+    corr_lo: f32,
+    corr_hi: f32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
 @group(0) @binding(0) var<storage, read> rff: array<f32>;
@@ -6495,18 +6620,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = hg / rm.n_head;
     let base = hg * rm.head_dim;
     let freq = pow(rm.freq_base, -2.0 * f32(i) / f32(rm.rope_dim)) / rff[i];
-    let theta = f32(rm.pos + t) * freq;
-    let s = sin(theta);
-    let c = cos(theta);
-    let a = rx[base + i];
-    let b = rx[base + i + half];
-    rx[base + i] = a * c - b * s;
-    rx[base + i + half] = a * s + b * c;
+    let theta_extrap = f32(rm.pos + t) * freq;
+    let theta = rope_yarn_theta(
+        f32(i), theta_extrap, rm.freq_scale, rm.ext_factor, rm.corr_lo, rm.corr_hi);
+    let s = sin(theta) * rm.mscale;
+    let c = cos(theta) * rm.mscale;
+    // NEOX rotates `i` against `i + half`; NORM rotates the consecutive pair
+    // `2i`/`2i+1`. Line-for-line the same choice `engine::tensor`'s
+    // `RopeLayout` makes on the CPU.
+    var lo = i;
+    var hi = i + half;
+    if (rm.pairing == 1u) {
+        lo = 2u * i;
+        hi = 2u * i + 1u;
+    }
+    let a = rx[base + lo];
+    let b = rx[base + hi];
+    rx[base + lo] = a * c - b * s;
+    rx[base + hi] = a * s + b * c;
 }
 "#;
 
 pub fn shader_source_rope() -> String {
-    ROPE_SHADER.to_string()
+    format!("{ROPE_YARN_WGSL}{ROPE_SHADER}")
 }
 
 /// Per-head weighted RMSNorm — Q-norm/K-norm applied independently to
@@ -6847,8 +6983,24 @@ struct FusedNormRopeMeta {
     pos: u32,
     freq_base: f32,
     eps: f32,
-    _pad0: u32,
+    /// `0` = NEOX pairing, `1` = NORM. Same convention and same reason as
+    /// `RopeMeta::pairing`: the QKV fusion serves `llama` and `mistral`, which
+    /// are NORM, and this is the RoPE they actually reach — the standalone
+    /// `ROPE_SHADER` is a different kernel and fixing that one alone would have
+    /// left the fused path silently NEOX.
+    pairing: u32,
     _pad1: u32,
+    /// YaRN, all identity-valued for a model that does not use it — see
+    /// `ROPE_YARN_WGSL`.
+    freq_scale: f32,
+    ext_factor: f32,
+    /// ggml's `mscale`, already folded with `attn_factor` host-side.
+    mscale: f32,
+    corr_lo: f32,
+    corr_hi: f32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 }
 
 @group(0) @binding(0) var<storage, read> fnw: array<f32>;
@@ -6926,13 +7078,21 @@ fn main(
             break;
         }
         let freq = pow(fnm.freq_base, -2.0 * f32(k) / f32(fnm.rope_dim)) / fnff[k];
-        let theta = f32(pos) * freq;
-        let s = sin(theta);
-        let c = cos(theta);
-        let a = fn_head[k];
-        let b = fn_head[k + half];
-        fn_head[k] = a * c - b * s;
-        fn_head[k + half] = a * s + b * c;
+        let theta_extrap = f32(pos) * freq;
+        let theta = rope_yarn_theta(
+            f32(k), theta_extrap, fnm.freq_scale, fnm.ext_factor, fnm.corr_lo, fnm.corr_hi);
+        let s = sin(theta) * fnm.mscale;
+        let c = cos(theta) * fnm.mscale;
+        var lo = k;
+        var hi = k + half;
+        if (fnm.pairing == 1u) {
+            lo = 2u * k;
+            hi = 2u * k + 1u;
+        }
+        let a = fn_head[lo];
+        let b = fn_head[hi];
+        fn_head[lo] = a * c - b * s;
+        fn_head[hi] = a * s + b * c;
         k = k + 64u;
     }
     workgroupBarrier();
@@ -6957,7 +7117,7 @@ fn main(
 pub const FUSED_NORM_ROPE_MAX_HEAD_DIM: usize = 1024;
 
 pub fn shader_source_fused_norm_rope() -> String {
-    FUSED_NORM_ROPE_SHADER.to_string()
+    format!("{ROPE_YARN_WGSL}{FUSED_NORM_ROPE_SHADER}")
 }
 
 /// Greedy (argmax) decode with repeat penalty, entirely on-GPU, so a

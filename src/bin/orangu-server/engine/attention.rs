@@ -62,23 +62,67 @@ pub struct Params<'a> {
     pub n_tokens: usize,
 }
 
-/// Token count at or above which attention goes to the GPU.
+/// Token count at or above which a **multi-token** attention call goes to the
+/// GPU.
 ///
 /// Not a safety margin — a measured crossover. The GPU path uploads this
 /// layer's Q and reads its output back once per layer, and that cost does not
 /// shrink with the prompt, so below some width the CPU loop wins outright.
-/// Sweepable as `ORANGU_ATTENTION_MIN_TOKENS`; see `PERF-GAP.md` for the sweep.
-/// A single-token decode step is far below it, which is what keeps decode on
-/// the CPU loop where its window is one row and a round trip would dominate.
-const DEFAULT_MIN_GPU_TOKENS: usize = 32;
+///
+/// **Measured, not argued.** This governs the *unfused* path only — where
+/// attention is a round trip of its own, with no fused chain to amortise it.
+/// Swept against batch width, the CPU loop stays ahead well past the previous
+/// value of 32, so that value sent a whole band of widths to the slower path.
+///
+/// A caller that fuses attention into a longer chain has a different crossover
+/// and does not consult this — see `arch::llama`'s own fusion width.
+///
+/// Sweepable as `ORANGU_ATTENTION_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
+const DEFAULT_MIN_GPU_TOKENS: usize = 64;
 
-fn min_gpu_tokens() -> usize {
+/// Window length at or above which a **single-token** (decode) attention call
+/// goes to the GPU.
+///
+/// A decode step has one query, so token count is the wrong axis entirely: the
+/// work is the *window*, and it grows with the conversation. The CPU loop reads
+/// the whole window once per layer per token, which is what makes decode on
+/// this path fall away with context while gemma — whose decode attention is on
+/// the GPU — stays nearly flat. Below this length the round trip costs more
+/// than the walk it saves.
+///
+/// **Measured, and 256 is measured to be the right value — not merely the
+/// original one.** On a 3B model, pinning both paths on and off across context
+/// makes the GPU path look flat while the CPU loop falls away, which argues for
+/// a low threshold; but lowering it to 64 measured *neutral* there, because the
+/// CPU loop's collapse happens further out, where both settings already use the
+/// GPU. On a 360M model the same value is a **10.7% regression** at shallow
+/// context: a small model's CPU attention loop is cheap (few heads, narrow
+/// `kv_dim`) so it stays ahead much longer, while the GPU round trip costs the
+/// same as it does for a large one.
+///
+/// So this threshold is genuinely model-dependent, and 256 is the value that is
+/// no worse than the alternative on a large model and clearly better on a small
+/// one. Sweepable as `ORANGU_DECODE_ATTENTION_MIN_POS` for a deployment that
+/// wants to tune it per model; `PERF-GAP.md` has both sweeps.
+const DEFAULT_MIN_GPU_DECODE_POS: usize = 256;
+
+pub fn min_gpu_tokens() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("ORANGU_ATTENTION_MIN_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_GPU_TOKENS)
+    })
+}
+
+fn min_gpu_decode_pos() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ORANGU_DECODE_ATTENTION_MIN_POS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MIN_GPU_DECODE_POS)
     })
 }
 
@@ -116,6 +160,59 @@ fn derived_window(params: &Params<'_>, t: usize) -> (usize, usize) {
 pub enum Ran {
     OnGpu,
     OnCpu,
+}
+
+/// Decode attention that leaves its result **on the device**, when the GPU path
+/// is the one this shape would have taken anyway.
+///
+/// Same decision as [`attention`]'s decode branch — the split kernel, the same
+/// `ORANGU_DECODE_ATTENTION_MIN_POS` threshold, the same window — differing only
+/// in that the `[n_head * head_dim]` output is returned as a buffer rather than
+/// copied to the host. `None` means this shape does not take the GPU path and
+/// the caller should use [`attention`] as before; it is not a failure.
+///
+/// Exists so a caller that is about to hand attention's output to another GPU
+/// chain does not pay a readback and an upload to do it. The decision stays here
+/// rather than in the architecture module, for the reason this module exists at
+/// all: there must be exactly one place that decides where attention runs.
+pub fn attention_decode_on_device(
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Option<wgpu::Buffer> {
+    if params.n_tokens != 1 || std::env::var_os("ORANGU_NO_ATTN_ON_DEVICE").is_some() {
+        return None;
+    }
+    // The same guard `attention` applies, so the two cannot disagree about the
+    // window for a shape they both accept.
+    debug_assert!(
+        window(0) == derived_window(params, 0),
+        "attention window disagrees with causal={} n_swa={} at start_pos={}",
+        params.causal,
+        params.n_swa,
+        params.start_pos,
+    );
+    let vulkan = params.backend.as_vulkan()?;
+    if !vulkan.prefill_attention_enabled() {
+        return None;
+    }
+    let (window_start, window_end) = window(0);
+    if window_end < window_start || window_end + 1 - window_start < min_gpu_decode_pos() {
+        return None;
+    }
+    Some(
+        vulkan.gpu_attention_split_on_device(crate::engine::backend::vulkan::GpuAttentionInput {
+            q,
+            cache,
+            pos: window_end,
+            window_start,
+            n_head: params.n_head,
+            n_head_kv: params.n_head_kv,
+            head_dim: params.head_dim,
+            scale: params.scale,
+        }),
+    )
 }
 
 /// Multi-head attention, on whichever processor is faster for this shape.
@@ -166,6 +263,34 @@ pub fn attention(
             .map(|t| derived_window(params, t))
             .collect::<Vec<_>>(),
     );
+
+    // A single query with a long window is a different kernel from a wide
+    // batch with short ones, and the split ("flash-decode") shader is the one
+    // shaped for it: it parallelises over *positions* rather than over queries,
+    // and at `n_tokens == 1` there is exactly one query to parallelise over.
+    if n_tokens == 1
+        && let Some(vulkan) = params.backend.as_vulkan()
+        && vulkan.prefill_attention_enabled()
+    {
+        let (window_start, window_end) = window(0);
+        if window_end >= window_start && window_end + 1 - window_start >= min_gpu_decode_pos() {
+            out.clear();
+            out.resize(n_head * head_dim, 0.0);
+            let got =
+                vulkan.gpu_attention_split(crate::engine::backend::vulkan::GpuAttentionInput {
+                    q,
+                    cache,
+                    pos: window_end,
+                    window_start,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale: params.scale,
+                });
+            out.copy_from_slice(&got);
+            return Ran::OnGpu;
+        }
+    }
 
     if n_tokens >= min_gpu_tokens()
         && let Some(vulkan) = params.backend.as_vulkan()

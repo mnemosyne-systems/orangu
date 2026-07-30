@@ -84,6 +84,9 @@ pub struct Recorder {
     stderr_log: PathBuf,
     opts: Options,
     started: Instant,
+    /// The target's own CPU time when sampling began, from
+    /// `/proc/<pid>/stat`. The check it enables is in [`Recorder::finish`].
+    cpu_at_start: Option<f64>,
 }
 
 /// What the collapsed stacks say, once. Printed under the measurement it
@@ -110,6 +113,10 @@ pub struct Summary {
     pub gpu_wait: f64,
     /// Share of samples on a parked or work-stealing thread.
     pub pool_idle: f64,
+    /// Cores the target actually used over the window, from `/proc`, or `None`
+    /// where that could not be read. Compared against `cores_busy` to catch a
+    /// profile that missed most of the process — see [`Recorder::finish`].
+    pub cores_from_proc: Option<f64>,
     /// Self-time share per bucket, largest first.
     pub buckets: Vec<(&'static str, f64)>,
     /// The heaviest individual leaf frames, largest first: `(frame, share)`.
@@ -147,12 +154,14 @@ impl Recorder {
             .spawn()
             .map_err(|e| anyhow::anyhow!("could not run `perf record`: {e}"))?;
 
+        let cpu_at_start = proc_cpu_seconds(opts.pid);
         let mut rec = Recorder {
             perf,
             data,
             stderr_log,
             opts,
             started: Instant::now(),
+            cpu_at_start,
         };
 
         // `perf` fails asynchronously — a bad pid or a paranoid setting is
@@ -173,6 +182,12 @@ impl Recorder {
     /// Stop sampling and render. Returns what the profile says.
     pub fn finish(mut self) -> anyhow::Result<Summary> {
         let seconds = self.started.elapsed().as_secs_f64();
+        // Read before `perf` is asked to stop, so the window matches.
+        let cores_from_proc = self
+            .cpu_at_start
+            .zip(proc_cpu_seconds(self.opts.pid))
+            .filter(|_| seconds > 0.0)
+            .map(|(before, after)| (after - before).max(0.0) / seconds);
 
         // SIGINT, not SIGKILL: `perf record` writes its data file while
         // shutting down, and a killed one leaves an unreadable stub.
@@ -211,6 +226,32 @@ impl Recorder {
         let attribution = summarize(&folded);
         let cores_busy = attribution.samples as f64 / (f64::from(self.opts.freq) * seconds);
 
+        // The one check that catches a profile which missed most of the
+        // process. `perf record -p` attaches to the threads that exist *at
+        // that moment* and does not pick up ones created later — so profiling
+        // a server that builds its compute threads lazily, on its first
+        // request, samples almost nothing while still producing a perfectly
+        // well-formed flamegraph and a confident `cores_busy`. Measured here:
+        // 0.02 cores reported against 0.44 actually used, a 20x understatement
+        // that looked like "decode is not CPU-bound".
+        //
+        // `/proc` cannot miss a thread, so disagreeing with it by this much
+        // means the samples are not describing the process. Warn rather than
+        // fail: a profile can legitimately undercount a little (perf's own
+        // startup, threads that exit early), and the numbers are still printed
+        // so the reader can judge.
+        if let Some(actual) = cores_from_proc
+            && actual > 0.05
+            && cores_busy < actual * 0.5
+        {
+            eprintln!(
+                "  WARNING: the profile accounts for {cores_busy:.2} cores but /proc says the \n\
+                 \x20          process used {actual:.2}. `perf record -p` does not follow threads \n\
+                 \x20          created after it attached — run a warmup before profiling so the \n\
+                 \x20          workload's threads already exist. This profile is not trustworthy."
+            );
+        }
+
         // A sidecar rather than a header line inside the collapsed file:
         // `flamegraph.pl` parses every line of its input as `stack count`, and
         // a file that renders is worth more than one that carries its own
@@ -230,6 +271,9 @@ impl Recorder {
                 "pool_idle_pct": attribution.pool_idle,
                 "cores_working": cores_busy
                     * (1.0 - (attribution.gpu_wait + attribution.pool_idle) / 100.0),
+                // The kernel's own accounting for the same window, so a stored
+                // profile carries the evidence for whether to trust itself.
+                "cores_from_proc": cores_from_proc,
             }))
             .unwrap_or_default(),
         );
@@ -241,6 +285,7 @@ impl Recorder {
             samples: attribution.samples,
             seconds,
             cores_busy,
+            cores_from_proc,
             gpu_wait: attribution.gpu_wait,
             pool_idle: attribution.pool_idle,
             buckets: attribution.buckets,
@@ -347,6 +392,37 @@ pub fn bucket_union(profiles: &[Profile]) -> Vec<&'static str> {
 /// `dir/stem.ext`, where `stem` is the SVG's file stem — so one `--flamegraph
 /// out.svg` names `out.folded`, `out.png` and the transient `out.perf.data` as
 /// one set.
+/// CPU seconds (user + system, **all threads**) the process has consumed, from
+/// `/proc/<pid>/stat`.
+///
+/// The kernel's own accounting, which no sampling artefact can distort — which
+/// is exactly why it is worth reading twice and comparing against what the
+/// samples imply.
+///
+/// The `comm` field is an arbitrary string in parentheses and may itself
+/// contain spaces or `)`, so the fields are counted from after the **last**
+/// `)`, never by splitting the whole line.
+pub fn proc_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After `comm`, field 0 is `state`; `utime`/`stime` are stat fields 14/15,
+    // which land at indices 11 and 12 here.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let hz = clock_ticks_per_second();
+    Some((utime + stime) as f64 / hz)
+}
+
+/// `sysconf(_SC_CLK_TCK)`, the unit `/proc/<pid>/stat` reports CPU time in.
+/// Effectively always 100 on Linux; read rather than assumed, and falling back
+/// to 100 if the call is unavailable.
+fn clock_ticks_per_second() -> f64 {
+    // SAFETY: `sysconf` takes an int and returns a long; no pointers involved.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz > 0 { hz as f64 } else { 100.0 }
+}
+
 fn sibling(svg: &Path, ext: &str) -> PathBuf {
     let stem = svg
         .file_stem()
@@ -398,7 +474,11 @@ fn render(folded: &str, opts: &Options, seconds: f64, samples: u64) -> anyhow::R
 /// A raster copy beside the SVG, for documents and diffs that cannot embed one.
 /// Absence of a converter is reported, not fatal — the SVG is already written
 /// and is the better artifact of the two.
-fn render_png(svg: &Path) -> anyhow::Result<Option<PathBuf>> {
+///
+/// Shared with the throughput chart (`--chart-png`): both artifacts want the
+/// same "SVG is canonical, PNG is for embedding" treatment, and both are
+/// useless if a missing rasterizer aborts the run that produced them.
+pub fn render_png(svg: &Path) -> anyhow::Result<Option<PathBuf>> {
     let png = svg.with_extension("png");
     let status = Command::new("rsvg-convert")
         // Wide enough that frame labels survive rasterization; a flamegraph
@@ -726,6 +806,38 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/proc/<pid>/stat`'s `comm` field is an arbitrary string in parens and
+    /// may contain spaces *and* `)`. Counting fields from the start of the line
+    /// then puts `utime`/`stime` at the wrong offsets and silently reports
+    /// nonsense CPU time — which, since this is the check that validates the
+    /// profiler, would break the thing meant to catch breakage.
+    #[test]
+    fn proc_stat_fields_are_counted_from_after_the_last_paren() {
+        // A `comm` with a space and a close-paren in it, which is legal.
+        let line = "1234 (my )evil proc) S 1 1234 1234 0 -1 4194304 100 0 0 0                     250 750 0 0 20 0 24 0 999 0 0";
+        let rest = &line[line.rfind(')').unwrap() + 1..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(f[11], "250", "utime");
+        assert_eq!(f[12], "750", "stime");
+    }
+
+    /// The clock unit must be read, not assumed — the CPU-time comparison is
+    /// only meaningful in the same units as the wall clock.
+    #[test]
+    fn clock_ticks_are_positive() {
+        assert!(clock_ticks_per_second() > 0.0);
+    }
+
+    /// This process is running, so its own CPU time must be readable and
+    /// non-negative; a bogus pid must give `None` rather than a wrong number.
+    #[test]
+    fn proc_cpu_seconds_reads_this_process_and_rejects_a_bogus_pid() {
+        let me = std::process::id();
+        let t = proc_cpu_seconds(me).expect("own /proc/<pid>/stat should be readable");
+        assert!(t >= 0.0 && t.is_finite(), "got {t}");
+        assert!(proc_cpu_seconds(u32::MAX).is_none());
+    }
     use super::*;
 
     #[test]

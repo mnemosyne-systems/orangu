@@ -223,7 +223,186 @@ impl LlamaModel {
     }
 }
 
+/// Whether `ORANGU_NO_FUSED_POST_ATTN` forces the unfused `wo`/FFN sequence.
+///
+/// Exists to be the **control** for the fused chain's A/B: the alternative is
+/// comparing against a different build, and LESSONS §17 is that the control
+/// should be the code the change replaced rather than an approximation of it.
+/// Read once — an env lookup per layer per token would itself be measurable.
+/// Whether `ORANGU_NO_FUSED_QKV` restores the step-by-step Q/K/V, RoPE,
+/// KV-write and attention sequence.
+///
+/// The control for the fused chain's A/B, and the fallback for anything the
+/// chain does not implement. Read once — an env lookup per layer per token
+/// would itself be measurable.
+pub fn no_fused_qkv() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("ORANGU_NO_FUSED_QKV").is_some())
+}
+
+/// Narrowest batch the fused pre-attention chain is worth taking.
+///
+/// The chain's own crossover, and **not** the same question
+/// `engine::attention`'s `ORANGU_ATTENTION_MIN_TOKENS` answers: that one asks
+/// whether GPU attention alone beats the CPU loop, and the answer is "not until
+/// much wider than this". Fusing attention into a single submission with Q/K/V,
+/// RoPE and the KV write changes the trade — the saved round trips pay for GPU
+/// attention well before GPU attention pays for itself — so this threshold sits
+/// far below that one. Two thresholds because there are two crossovers, both
+/// swept; `PERF-GAP.md` has them.
+///
+/// A short continuation of a cached prompt is the shape that lands here, and it
+/// is the common one in multi-turn chat: everything but the newest message
+/// comes from the prefix cache.
+const MIN_FUSED_TOKENS: usize = 24;
+
+/// [`MIN_FUSED_TOKENS`], overridable per run with `ORANGU_FUSED_MIN_TOKENS`.
+///
+/// The knob exists so the A/B for this threshold has the *shipping* code as its
+/// control rather than a rebuild that differs in a constant — LESSONS §17. Read
+/// once; a lookup per layer per token would itself be measurable.
+pub fn min_fused_tokens() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ORANGU_FUSED_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MIN_FUSED_TOKENS)
+    })
+}
+
+pub fn no_fused_post_attention() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("ORANGU_NO_FUSED_POST_ATTN").is_some())
+}
+
 impl LlamaModel {
+    /// One decode step as a single GPU submission, or `None` when this model or
+    /// this step is not one the fused chain can describe.
+    ///
+    /// The hidden state never returns to the host: each layer's output buffer is
+    /// the next layer's input, so depth costs submissions nothing. `PERF-GAP.md`
+    /// G3 measures that as the difference between an engine that can fill the
+    /// device and one that cannot — the generic path costs one GPU round trip
+    /// per layer per chain and never passes 66% engine occupancy however many
+    /// concurrent requests it is given, while this form reaches 98% with two.
+    ///
+    /// `None` is the ordinary answer for anything the chain does not cover, and
+    /// the caller then takes the step-by-step path unchanged.
+    fn record_decode_forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::engine::backend::vulkan::{
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, RopeYarn,
+        };
+
+        if tokens.len() != 1 || no_fused_qkv() || no_fused_post_attention() {
+            return None;
+        }
+        let vulkan = self.backend.as_vulkan()?;
+        if !vulkan.prefill_attention_enabled() {
+            return None;
+        }
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let head_dim = self.head_dim();
+        let tok = tokens[0] as usize;
+        if tok >= cfg.n_vocab {
+            return None;
+        }
+        let x0 = self.tok_embeddings.row(tok).to_vec();
+
+        let mut encoder = vulkan.new_encoder("orangu-server llama decode");
+        // Each layer's output buffer, kept alive until the submission that
+        // reads them is recorded: a layer's `GpuInput` borrows the previous
+        // layer's buffer, so they cannot be dropped inside the loop.
+        let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
+        for (il, layer) in self.layers.iter().enumerate() {
+            let x_input = match bufs.last() {
+                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                None => GpuInput::Cpu(&x0),
+            };
+            let out = vulkan.record_fused_layer(
+                &mut encoder,
+                FusedLayerInput {
+                    x: x_input,
+                    // `llama`/`mistral` are NORM; `qwen2` and the rest NEOX.
+                    pairing: self.rope.layout,
+                    // Derived rather than asserted identity: this family sets
+                    // no YaRN today, and `from_params` keeps the chain correct
+                    // rather than merely lucky if that changes.
+                    yarn: RopeYarn::from_params(&self.rope),
+                    // This family is SwiGLU throughout, has no per-head Q/K
+                    // norms, no post-norm on either residual, and — the
+                    // convention that is invisible from every shape — does not
+                    // normalize V.
+                    activation: FfnActivation::Swiglu,
+                    normalize_v: false,
+                    attn_norm: &layer.attn_norm,
+                    wq: &layer.wq,
+                    q_bias: layer.q_bias.as_deref(),
+                    q_norm: None,
+                    kv: Some(FusedAttnProjection {
+                        wk: &layer.wk,
+                        wv: Some(&layer.wv),
+                        k_bias: layer.k_bias.as_deref(),
+                        v_bias: layer.v_bias.as_deref(),
+                        k_norm: None,
+                    }),
+                    n_head: cfg.n_head,
+                    n_head_kv: cfg.n_head_kv,
+                    head_dim,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    freq_factors: self.rope_freq_factors.as_deref(),
+                    eps: cfg.rms_eps,
+                    pos: start_pos,
+                    // Causal to this position, no sliding window.
+                    window_start: 0,
+                    window: None,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    cache: &mut cache.layers[il],
+                    wo: &layer.wo,
+                    attn_post_norm: None,
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate: &layer.w_gate,
+                    ffn_up: &layer.w_up,
+                    ffn_down: &layer.w_down,
+                    ffn_post_norm: None,
+                    ple: None,
+                    layer_output_scale: None,
+                    batch_slot: slot_id,
+                    attn_ts: None,
+                },
+            );
+            bufs.push(out);
+        }
+
+        let (last_buf, last_offset) = bufs.last()?;
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            GpuInput::Gpu(last_buf, (*last_offset / 4) as usize),
+            &self.output_norm,
+            cfg.rms_eps,
+            n_embd,
+        );
+        // `slot_id + 1`, not `slot_id`: op resources are keyed by
+        // `(weight, batch_slot)`, and the vocab projection must not share a slot
+        // with the layer chain that runs into it. gemma keys its own output
+        // projection the same way.
+        vulkan.record_full_matmul(
+            &mut encoder,
+            GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
+    }
+
     /// Runs every transformer layer and returns the pre-final-norm hidden
     /// state for every token (`[n_tokens, n_embd]`) — the shared core of
     /// both next-token prediction ([`ModelForward::forward`]) and pooled
@@ -255,97 +434,186 @@ impl LlamaModel {
         let mut attn_out: Vec<f32> = Vec::new();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // `Some` when attention left its output in a device buffer; the
+            // post-attention chain then consumes it without a host bounce.
+            let mut attn_on_device: Option<wgpu::Buffer> = None;
             let mut normed = x.clone();
             tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
 
-            // Independent given the same normed input — one batched
-            // dispatch instead of three sequential round-trips (matters
-            // most for a GPU backend; see `Backend::matmul_batch`).
-            let mut qkv = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wq,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wk,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wv,
-                },
-            ]);
-            let mut v = qkv.pop().unwrap();
-            let mut k = qkv.pop().unwrap();
-            let mut q = qkv.pop().unwrap();
-            if let Some(bias) = &layer.q_bias {
-                tensor::add_bias_per_row(&mut q, bias, n_tokens);
-            }
-            if let Some(bias) = &layer.k_bias {
-                tensor::add_bias_per_row(&mut k, bias, n_tokens);
-            }
-            if let Some(bias) = &layer.v_bias {
-                tensor::add_bias_per_row(&mut v, bias, n_tokens);
-            }
-            // Per-head RMSNorm, before RoPE — `Qwen3-VL-Embedding-8B`'s own
-            // `src/models/qwen3vl.cpp` graph runs this immediately after
-            // `build_qkv`, before `ggml_rope_multi`; `None` (Qwen2/Llama/
-            // Mistral) is a no-op.
-            if let Some(q_norm) = &layer.q_norm {
-                tensor::rmsnorm_inplace(&mut q, q_norm, n_tokens * n_head, head_dim, cfg.rms_eps);
-            }
-            if let Some(k_norm) = &layer.k_norm {
-                tensor::rmsnorm_inplace(
-                    &mut k,
-                    k_norm,
-                    n_tokens * n_head_kv,
-                    head_dim,
-                    cfg.rms_eps,
-                );
-            }
+            // The whole pre-attention half — Q/K/V, RoPE, the KV-cache write
+            // and attention itself — as one GPU submission, when this layer's
+            // conventions match what the fused chain implements.
+            //
+            // Three of them, and they are not visible from the signature: the
+            // per-head Q/K norms (Qwen3 has them, this family does not), the
+            // per-head weightless V norm (gemma has it, this family does not),
+            // and the RoPE pairing (`llama`/`mistral` are NORM, everything else
+            // NEOX). Projection **biases** are a fourth, and the chain does
+            // support them — Qwen2 has them and takes this path; they are
+            // cross-checked per projection against the step-by-step sequence.
+            // **Wide prefill only**, and both bounds are measured rather than
+            // assumed.
+            //
+            // Below `MIN_FUSED_TOKENS` the chain loses to the step-by-step
+            // path. It always runs attention on the GPU, and at narrow widths
+            // the CPU loop beats that by more than the fusion's saved round
+            // trips are worth; above it the saving dominates and the chain
+            // wins outright.
+            //
+            // At `n_tokens == 1` it is worse than merely slower: running
+            // attention itself routes a decode step away from the split
+            // ("flash-decode") kernel `engine::attention` would otherwise pick,
+            // and that kernel is what keeps decode flat as context grows. One
+            // submission is not worth the wrong kernel. `MIN_FUSED_TOKENS`
+            // already excludes decode; the width bound and the decode bound are
+            // separate facts, so this does not lean on that coincidence.
+            // Letting a *decode* step take this chain where the split kernel
+            // would not have run was tried and measured neutral (−0.6% at
+            // depth 0, −0.2% at 512): at shallow context the submission count
+            // is unchanged either way, and the CPU work moved to the GPU — one
+            // token's RoPE, one KV row, a short window — is too small to show.
+            // So the bound stays a plain width test.
+            let fusable = n_tokens > 1
+                && n_tokens >= min_fused_tokens()
+                && !no_fused_qkv()
+                && layer.q_norm.is_none()
+                && layer.k_norm.is_none();
+            let fused_qkv = self
+                .backend
+                .as_vulkan()
+                .filter(|_| fusable && !no_fused_post_attention())
+                .and_then(|vulkan| {
+                    vulkan.fused_attention_prefill(
+                        crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                            q_bias: layer.q_bias.as_deref(),
+                            pairing: self.rope.layout,
+                            yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
+                            normalize_v: false,
+                            normed: &normed,
+                            n_tokens,
+                            start_pos,
+                            wq: &layer.wq,
+                            q_norm: None,
+                            kv: Some(crate::engine::backend::vulkan::FusedAttnPrefillKv {
+                                k_bias: layer.k_bias.as_deref(),
+                                v_bias: layer.v_bias.as_deref(),
+                                wk: &layer.wk,
+                                k_norm: None,
+                                wv: Some(&layer.wv),
+                            }),
+                            n_head,
+                            n_head_kv,
+                            head_dim,
+                            rope_dim: cfg.rope_dim,
+                            rope_freq_base: cfg.rope_freq_base,
+                            freq_factors: self.rope_freq_factors.as_deref(),
+                            eps: cfg.rms_eps,
+                            n_swa: 0,
+                            causal: true,
+                            scale: 1.0 / (head_dim as f32).sqrt(),
+                            want_attn_out_host: true,
+                        },
+                        &mut cache.layers[layer_idx],
+                    )
+                });
 
-            // RoPE, then append this token's K/V to the sequence's cache —
-            // one token (one row) at a time, in prompt order, since a later
-            // token's cache entry must exist before an even-later token's
-            // attention can see it.
-            let layer_cache = &mut cache.layers[layer_idx];
-            for t in 0..n_tokens {
-                let pos = start_pos + t;
-                tensor::rope_apply_params_inplace(
-                    &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
-                    n_head,
-                    head_dim,
-                    pos,
-                    self.rope_freq_factors.as_deref(),
-                    &self.rope,
-                );
-                tensor::rope_apply_params_inplace(
-                    &mut k[t * kv_dim..(t + 1) * kv_dim],
-                    n_head_kv,
-                    head_dim,
-                    pos,
-                    self.rope_freq_factors.as_deref(),
-                    &self.rope,
-                );
-                layer_cache.push(
-                    &k[t * kv_dim..(t + 1) * kv_dim],
-                    &v[t * kv_dim..(t + 1) * kv_dim],
-                );
-            }
+            if let Some(fused) = fused_qkv {
+                // The recorder has already committed each stripe's K/V into the
+                // cache — it has to, since a later stripe's attention reads
+                // them — so there is nothing to commit here. Doing it again
+                // pushes every position twice and fills the cache.
+                attn_out = fused.attn_out;
+            } else {
+                // Independent given the same normed input — one batched
+                // dispatch instead of three sequential round-trips (matters
+                // most for a GPU backend; see `Backend::matmul_batch`).
+                let mut qkv = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &layer.wq,
+                    },
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &layer.wk,
+                    },
+                    MatmulOp {
+                        x: &normed,
+                        n_tokens,
+                        w: &layer.wv,
+                    },
+                ]);
+                let mut v = qkv.pop().unwrap();
+                let mut k = qkv.pop().unwrap();
+                let mut q = qkv.pop().unwrap();
+                if let Some(bias) = &layer.q_bias {
+                    tensor::add_bias_per_row(&mut q, bias, n_tokens);
+                }
+                if let Some(bias) = &layer.k_bias {
+                    tensor::add_bias_per_row(&mut k, bias, n_tokens);
+                }
+                if let Some(bias) = &layer.v_bias {
+                    tensor::add_bias_per_row(&mut v, bias, n_tokens);
+                }
+                // Per-head RMSNorm, before RoPE — `Qwen3-VL-Embedding-8B`'s own
+                // `src/models/qwen3vl.cpp` graph runs this immediately after
+                // `build_qkv`, before `ggml_rope_multi`; `None` (Qwen2/Llama/
+                // Mistral) is a no-op.
+                if let Some(q_norm) = &layer.q_norm {
+                    tensor::rmsnorm_inplace(
+                        &mut q,
+                        q_norm,
+                        n_tokens * n_head,
+                        head_dim,
+                        cfg.rms_eps,
+                    );
+                }
+                if let Some(k_norm) = &layer.k_norm {
+                    tensor::rmsnorm_inplace(
+                        &mut k,
+                        k_norm,
+                        n_tokens * n_head_kv,
+                        head_dim,
+                        cfg.rms_eps,
+                    );
+                }
 
-            // Causal attention: token t (now at absolute position
-            // start_pos+t) attends to every cached position up to and
-            // including its own. `engine::attention` decides whether that runs
-            // on the GPU or as the CPU loop; the closure is the CPU window and
-            // `causal`/`n_swa` describe the same range to the kernel.
-            crate::engine::attention::attention(
-                &mut attn_out,
-                &q,
-                layer_cache,
-                &crate::engine::attention::Params {
+                // RoPE, then append this token's K/V to the sequence's cache —
+                // one token (one row) at a time, in prompt order, since a later
+                // token's cache entry must exist before an even-later token's
+                // attention can see it.
+                let layer_cache = &mut cache.layers[layer_idx];
+                for t in 0..n_tokens {
+                    let pos = start_pos + t;
+                    tensor::rope_apply_params_inplace(
+                        &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
+                        n_head,
+                        head_dim,
+                        pos,
+                        self.rope_freq_factors.as_deref(),
+                        &self.rope,
+                    );
+                    tensor::rope_apply_params_inplace(
+                        &mut k[t * kv_dim..(t + 1) * kv_dim],
+                        n_head_kv,
+                        head_dim,
+                        pos,
+                        self.rope_freq_factors.as_deref(),
+                        &self.rope,
+                    );
+                    layer_cache.push(
+                        &k[t * kv_dim..(t + 1) * kv_dim],
+                        &v[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                }
+
+                // Causal attention: token t (now at absolute position
+                // start_pos+t) attends to every cached position up to and
+                // including its own. `engine::attention` decides whether that runs
+                // on the GPU or as the CPU loop; the closure is the CPU window and
+                // `causal`/`n_swa` describe the same range to the kernel.
+                let params = crate::engine::attention::Params {
                     backend: self.backend.as_ref(),
                     n_head,
                     n_head_kv,
@@ -355,35 +623,109 @@ impl LlamaModel {
                     n_swa: 0,
                     start_pos,
                     n_tokens,
-                },
-                |t| (0, start_pos + t),
-            );
-
-            let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
-            tensor::add_inplace(&mut x, &attn_proj);
-
-            let mut normed2 = x.clone();
-            tensor::rmsnorm_inplace(&mut normed2, &layer.ffn_norm, n_tokens, n_embd, cfg.rms_eps);
-            let mut gate_up = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed2,
-                    n_tokens,
-                    w: &layer.w_gate,
-                },
-                MatmulOp {
-                    x: &normed2,
-                    n_tokens,
-                    w: &layer.w_up,
-                },
-            ]);
-            let up = gate_up.pop().unwrap();
-            let mut gate = gate_up.pop().unwrap();
-            for g in gate.iter_mut() {
-                *g = tensor::silu(*g);
+                };
+                // A decode step's attention output goes straight into the
+                // `wo`/FFN chain, which is itself on the GPU — so when the
+                // split kernel runs it, leaving the result on the device saves
+                // reading `[n_head * head_dim]` floats to the host and
+                // uploading them again one statement later. `None` means this
+                // shape did not take the GPU path; the host vector below is
+                // then the only answer, exactly as before.
+                attn_on_device = crate::engine::attention::attention_decode_on_device(
+                    &q,
+                    layer_cache,
+                    &params,
+                    |t| (0, start_pos + t),
+                );
+                if attn_on_device.is_none() {
+                    crate::engine::attention::attention(
+                        &mut attn_out,
+                        &q,
+                        layer_cache,
+                        &params,
+                        |t| (0, start_pos + t),
+                    );
+                }
             }
-            tensor::mul_inplace(&mut gate, &up);
-            let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
-            tensor::add_inplace(&mut x, &down);
+
+            // The whole second half of the layer — `wo`, the residual add, the
+            // FFN norm, gate/up, SwiGLU, `down`, the second residual add — as
+            // **one** GPU submission with nothing in between reaching the host.
+            //
+            // Unfused this is three blocking submit→fence→readback cycles
+            // (`wo`, `gate`/`up`, `down`) out of the five a layer costs, and
+            // `PERF-GAP.md` prices a round trip on this stack at ~260 µs. The
+            // fused chain is cross-checked against exactly the sequence in the
+            // `else` branch below
+            // (`fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_*`).
+            let fused = self
+                .backend
+                .as_vulkan()
+                .filter(|_| !no_fused_post_attention())
+                .and_then(|vulkan| {
+                    vulkan.fused_post_attention_prefill(
+                        match &attn_on_device {
+                            Some(buf) => {
+                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(buf, 0, n_tokens)
+                            }
+                            None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                        },
+                        &x,
+                        n_tokens,
+                        &layer.wo,
+                        // Llama-style has no post-norm on either residual add,
+                        // and no norm is not a norm with weights of one.
+                        None,
+                        &layer.ffn_norm,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                        None,
+                        cfg.rms_eps,
+                        crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                    )
+                });
+            if let Some(out) = fused {
+                x = out;
+            } else {
+                // The fused chain declined after attention had already left its
+                // output on the device, so bring it back — the CPU sequence
+                // below reads `attn_out`, and it would otherwise read zeros.
+                if let (Some(buf), Some(vulkan)) = (&attn_on_device, self.backend.as_vulkan()) {
+                    attn_out = vulkan.read_buffer_f32(buf, n_tokens * n_head * head_dim);
+                }
+                let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                tensor::add_inplace(&mut x, &attn_proj);
+
+                let mut normed2 = x.clone();
+                tensor::rmsnorm_inplace(
+                    &mut normed2,
+                    &layer.ffn_norm,
+                    n_tokens,
+                    n_embd,
+                    cfg.rms_eps,
+                );
+                let mut gate_up = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &normed2,
+                        n_tokens,
+                        w: &layer.w_gate,
+                    },
+                    MatmulOp {
+                        x: &normed2,
+                        n_tokens,
+                        w: &layer.w_up,
+                    },
+                ]);
+                let up = gate_up.pop().unwrap();
+                let mut gate = gate_up.pop().unwrap();
+                for g in gate.iter_mut() {
+                    *g = tensor::silu(*g);
+                }
+                tensor::mul_inplace(&mut gate, &up);
+                let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
+                tensor::add_inplace(&mut x, &down);
+            }
         }
 
         Ok(x)
@@ -391,6 +733,10 @@ impl LlamaModel {
 }
 
 impl ModelForward for LlamaModel {
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_vulkan()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }
@@ -405,11 +751,18 @@ impl ModelForward for LlamaModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
+
+        // A decode step, whole, as one GPU submission. See
+        // `record_decode_forward`; `None` falls through to the path below.
+        if let Some(logits) = self.record_decode_forward(cache, tokens, start_pos, slot_id) {
+            return Ok(logits);
+        }
+
         let x = self.run_layers(cache, tokens, start_pos)?;
 
         // Only the last token's hidden state is needed for next-token
@@ -431,6 +784,46 @@ impl ModelForward for LlamaModel {
             self.config.rms_eps,
         );
         Ok(x)
+    }
+}
+
+#[cfg(test)]
+mod fusion_width_tests {
+    use super::*;
+
+    /// The fused chain must never claim a decode step, and it is gated on two
+    /// independent clauses that both happen to exclude one: `n_tokens > 1` and
+    /// `n_tokens >= MIN_FUSED_TOKENS`. This asserts the second one does the job
+    /// on its own, so deleting the first — which is exactly the edit that
+    /// caused the regression this gate was added for — cannot silently let
+    /// decode back onto the prefill chain.
+    #[test]
+    fn the_width_bound_excludes_decode_without_help_from_the_token_count_clause() {
+        // A `const` block, so this is a *compile* error rather than a test
+        // failure — the constant is known at build time and there is no reason
+        // to let a build that violates the invariant exist at all.
+        const {
+            assert!(
+                MIN_FUSED_TOKENS > 1,
+                "MIN_FUSED_TOKENS would admit a decode step if the \
+                 `n_tokens > 1` clause were ever removed"
+            );
+        }
+    }
+
+    /// The two thresholds answer different questions and were swept
+    /// separately, but their *order* is a measured fact: fusing attention into
+    /// a longer chain pays at a narrower batch than bare GPU attention does.
+    /// If a future sweep inverted them, every width between the two would be
+    /// taking a path neither sweep found best, and nothing else would say so.
+    #[test]
+    fn fusing_pays_off_at_a_narrower_batch_than_bare_gpu_attention() {
+        assert!(
+            MIN_FUSED_TOKENS < crate::engine::attention::min_gpu_tokens(),
+            "fusion width {MIN_FUSED_TOKENS} is not below the bare-attention \
+             threshold {}; one of the two sweeps is stale",
+            crate::engine::attention::min_gpu_tokens()
+        );
     }
 }
 

@@ -830,10 +830,17 @@ impl GemmaModel {
                     .wk
                     .as_ref()
                     .expect("layer has_kv but no attn_k.weight"),
-                k_norm: layer
-                    .attn_k_norm
-                    .as_ref()
-                    .expect("layer has_kv but no attn_k_norm"),
+                // gemma always has a per-head K norm; `Some` states that
+                // rather than relying on the field's old non-optional type.
+                // gemma has no projection biases.
+                k_bias: None,
+                v_bias: None,
+                k_norm: Some(
+                    layer
+                        .attn_k_norm
+                        .as_ref()
+                        .expect("layer has_kv but no attn_k_norm"),
+                ),
                 wv: layer.wv.as_ref(),
             });
             // `il`'s per-layer-embedding slice, read straight out of
@@ -869,16 +876,28 @@ impl GemmaModel {
             let out = vulkan.record_fused_layer(
                 encoder,
                 FusedLayerInput {
+                    q_bias: None,
+                    // gemma normalizes V per head, weightlessly — the third
+                    // convention, which the decode chain used to assume.
+                    normalize_v: true,
+                    // gemma is NEOX with GEGLU, which is what this chain
+                    // assumed before either became a parameter.
+                    pairing: crate::engine::tensor::RopeLayout::Neox,
+                    activation: crate::engine::backend::vulkan::FfnActivation::Geglu,
                     x: x_input,
                     attn_norm: &layer.attn_norm,
                     wq: &layer.wq,
-                    q_norm: &layer.attn_q_norm,
+                    q_norm: Some(&layer.attn_q_norm),
                     kv,
                     n_head: self.n_head,
                     n_head_kv: layer.n_head_kv,
                     head_dim,
                     rope_dim: layer.rope_dim,
                     rope_freq_base: layer.rope_freq_base,
+                    // gemma sets no RoPE scaling of any kind — its long-context
+                    // handling is the SWA/full alternation plus `rope_freqs`,
+                    // both already carried above.
+                    yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
                     freq_factors,
                     eps,
                     pos,
@@ -887,12 +906,12 @@ impl GemmaModel {
                     scale: self.attention_scale,
                     cache: &mut cache.layers[cache_index],
                     wo: &layer.wo,
-                    attn_post_norm: &layer.attn_post_norm,
+                    attn_post_norm: Some(&layer.attn_post_norm),
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: &layer.ffn_gate,
                     ffn_up: &layer.ffn_up,
                     ffn_down: &layer.ffn_down,
-                    ffn_post_norm: &layer.ffn_post_norm,
+                    ffn_post_norm: Some(&layer.ffn_post_norm),
                     ple,
                     layer_output_scale: layer.layer_output_scale,
                     batch_slot,
@@ -1038,17 +1057,28 @@ impl GemmaModel {
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
                         crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                            q_bias: None,
+                            // gemma is NEOX; `arch::llama`'s two NORM
+                            // architectures pass their own.
+                            pairing: crate::engine::tensor::RopeLayout::Neox,
+                            // gemma normalizes V per head; the llama family
+                            // does not.
+                            normalize_v: true,
                             normed: &normed,
                             n_tokens,
                             start_pos,
                             wq: &layer.wq,
-                            q_norm: &layer.attn_q_norm,
+                            q_norm: Some(&layer.attn_q_norm),
                             kv: wk.map(|wk| crate::engine::backend::vulkan::FusedAttnPrefillKv {
+                                k_bias: None,
+                                v_bias: None,
                                 wk,
-                                k_norm: layer
-                                    .attn_k_norm
-                                    .as_ref()
-                                    .expect("layer has_kv but no attn_k_norm"),
+                                k_norm: Some(
+                                    layer
+                                        .attn_k_norm
+                                        .as_ref()
+                                        .expect("layer has_kv but no attn_k_norm"),
+                                ),
                                 wv: owns_v.then(|| layer.wv.as_ref().unwrap()),
                             }),
                             n_head: self.n_head,
@@ -1056,6 +1086,7 @@ impl GemmaModel {
                             head_dim,
                             rope_dim: layer.rope_dim,
                             rope_freq_base: layer.rope_freq_base,
+                            yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
                             freq_factors,
                             eps,
                             n_swa: if layer.is_swa { self.n_swa } else { 0 },
@@ -1244,13 +1275,14 @@ impl GemmaModel {
                         &x,
                         n_tokens,
                         &layer.wo,
-                        &layer.attn_post_norm,
+                        Some(&layer.attn_post_norm),
                         &layer.ffn_norm,
                         &layer.ffn_gate,
                         &layer.ffn_up,
                         &layer.ffn_down,
-                        &layer.ffn_post_norm,
+                        Some(&layer.ffn_post_norm),
                         eps,
+                        crate::engine::backend::vulkan::FfnActivation::Geglu,
                     )
                 })
             } else {
@@ -1812,6 +1844,10 @@ impl GemmaModel {
 }
 
 impl ModelForward for GemmaModel {
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_vulkan()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

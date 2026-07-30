@@ -50,6 +50,26 @@ use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
 
+/// **The chained decode path.**
+///
+/// A Mistral layer is structurally identical to a Llama one — no per-head Q/K
+/// norms, no post-norm on either residual, SwiGLU, no projection biases — so
+/// [`MistralModel::record_decode_forward`] is `arch::llama`'s chain with this
+/// module's own hyperparameters substituted in.
+///
+/// Two of those hyperparameters are not shape, and both had to be dealt with
+/// before the chain could be handed a `mistral3` checkpoint at all:
+///
+/// 1. **YaRN.** This module builds `RopeParams` with a `freq_scale`, an
+///    `attn_factor` and an `ext_factor` ramp whenever the GGUF says
+///    `rope.scaling.type = "yarn"`, which Ministral-3-3B does. The fused
+///    chain's RoPE now carries those terms (`vulkan::RopeYarn`); before it did,
+///    handing it this checkpoint would have rotated by the unscaled angle — no
+///    wrong shape, no assertion, just a quietly wrong answer.
+/// 2. **The attention temperature scale.** The chain has no term for it, so
+///    the path is *gated* on it being the identity rather than taught it. That
+///    is not a compromise here: see [`MistralModel::attn_temperature`], it is
+///    exactly 1.0 for every position below `n_ctx_orig`.
 struct MistralLayer {
     attn_norm: Vec<f32>,
     wq: QuantMatrix,
@@ -261,6 +281,132 @@ impl MistralModel {
         Ok(())
     }
 
+    /// One decode step as a single GPU submission, or `None` when this model or
+    /// this step is not one the fused chain can describe — see this module's
+    /// [`MistralLayer`] note for which hyperparameters that turns on.
+    ///
+    /// The hidden state never returns to the host: each layer's output buffer
+    /// is the next layer's input, so depth costs submissions nothing.
+    fn record_decode_forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::engine::backend::vulkan::{
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, RopeYarn,
+        };
+
+        if tokens.len() != 1
+            || crate::engine::arch::llama::no_fused_qkv()
+            || crate::engine::arch::llama::no_fused_post_attention()
+        {
+            return None;
+        }
+        // The chain applies no temperature to Q. Below `n_ctx_orig` this is
+        // exactly 1.0 and the omission is not an approximation; at or past it
+        // the step-by-step path takes over rather than dropping the term.
+        if self.attn_temperature(start_pos) != 1.0 {
+            return None;
+        }
+        let vulkan = self.backend.as_vulkan()?;
+        if !vulkan.prefill_attention_enabled() {
+            return None;
+        }
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let head_dim = self.head_dim();
+        let tok = tokens[0] as usize;
+        if tok >= cfg.n_vocab {
+            return None;
+        }
+        let x0 = self.tok_embeddings.row(tok).to_vec();
+
+        let mut encoder = vulkan.new_encoder("orangu-server mistral decode");
+        // Each layer's output buffer, kept alive until the submission that
+        // reads them is recorded: a layer's `GpuInput` borrows the previous
+        // layer's buffer, so they cannot be dropped inside the loop.
+        let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
+        for (il, layer) in self.layers.iter().enumerate() {
+            let x_input = match bufs.last() {
+                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                None => GpuInput::Cpu(&x0),
+            };
+            let out = vulkan.record_fused_layer(
+                &mut encoder,
+                FusedLayerInput {
+                    x: x_input,
+                    // `mistral3` sits in upstream's NORM arm.
+                    pairing: self.rope.layout,
+                    yarn: RopeYarn::from_params(&self.rope),
+                    // SwiGLU, no per-head Q/K norms, no post-norm on either
+                    // residual, and — the convention that is invisible from
+                    // every shape — no V normalization.
+                    activation: FfnActivation::Swiglu,
+                    normalize_v: false,
+                    attn_norm: &layer.attn_norm,
+                    wq: &layer.wq,
+                    q_bias: None,
+                    q_norm: None,
+                    kv: Some(FusedAttnProjection {
+                        wk: &layer.wk,
+                        wv: Some(&layer.wv),
+                        k_bias: None,
+                        v_bias: None,
+                        k_norm: None,
+                    }),
+                    n_head: cfg.n_head,
+                    n_head_kv: cfg.n_head_kv,
+                    // Read, not derived — the two disagree for this
+                    // architecture. See [`MistralModel::validate_shapes`].
+                    head_dim,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    freq_factors: None,
+                    eps: cfg.rms_eps,
+                    pos: start_pos,
+                    // Causal to this position, no sliding window.
+                    window_start: 0,
+                    window: None,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    cache: &mut cache.layers[il],
+                    wo: &layer.wo,
+                    attn_post_norm: None,
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate: &layer.w_gate,
+                    ffn_up: &layer.w_up,
+                    ffn_down: &layer.w_down,
+                    ffn_post_norm: None,
+                    ple: None,
+                    layer_output_scale: None,
+                    batch_slot: slot_id,
+                    attn_ts: None,
+                },
+            );
+            bufs.push(out);
+        }
+
+        let (last_buf, last_offset) = bufs.last()?;
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            GpuInput::Gpu(last_buf, (*last_offset / 4) as usize),
+            &self.output_norm,
+            cfg.rms_eps,
+            n_embd,
+        );
+        // `slot_id + 1`, not `slot_id`: op resources are keyed by
+        // `(weight, batch_slot)`, and the vocab projection must not share a
+        // slot with the layer chain that runs into it.
+        vulkan.record_full_matmul(
+            &mut encoder,
+            GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
+    }
+
     /// Runs every transformer layer and returns the pre-final-norm hidden
     /// state for every token (`[n_tokens, n_embd]`).
     fn run_layers(
@@ -289,6 +435,12 @@ impl MistralModel {
             let mut normed = x.clone();
             tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
 
+            // Q/K/V are independent given the same normed input — one batched
+            // dispatch rather than three sequential round trips.
+            //
+            // Deliberately *not* `fused_attention_prefill`, which this shape is
+            // otherwise eligible for: measured at −3.4% on Ministral-3-3B,
+            // losing all three paired reps. See PERF-GAP.md item 10.
             let mut qkv = self.backend.matmul_batch(&[
                 MatmulOp {
                     x: &normed,
@@ -343,8 +495,9 @@ impl MistralModel {
                 );
             }
 
-            // Plain causal attention, on the GPU when the batch is wide enough --
-            // `engine::attention` owns that choice for every architecture.
+            // Plain causal attention, on the GPU when the batch is wide
+            // enough — `engine::attention` owns that choice for every
+            // architecture.
             let mut attn_out: Vec<f32> = Vec::new();
             crate::engine::attention::attention(
                 &mut attn_out,
@@ -364,31 +517,66 @@ impl MistralModel {
                 |t| (0, start_pos + t),
             );
 
-            let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
-            tensor::add_inplace(&mut x, &attn_proj);
+            // One submission for `wo` → residual → FFN norm → gate/up → SwiGLU
+            // → `down` → residual, instead of three blocking round trips. Same
+            // call and same shape as `arch::llama` — this family has no
+            // post-norms and a SwiGLU gate — and the `else` branch below is the
+            // sequence the fused chain is cross-checked against.
+            let fused = self
+                .backend
+                .as_vulkan()
+                .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
+                .and_then(|vulkan| {
+                    vulkan.fused_post_attention_prefill(
+                        crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                        &x,
+                        n_tokens,
+                        &layer.wo,
+                        None,
+                        &layer.ffn_norm,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                        None,
+                        cfg.rms_eps,
+                        crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                    )
+                });
+            if let Some(out) = fused {
+                x = out;
+            } else {
+                let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                tensor::add_inplace(&mut x, &attn_proj);
 
-            let mut normed2 = x.clone();
-            tensor::rmsnorm_inplace(&mut normed2, &layer.ffn_norm, n_tokens, n_embd, cfg.rms_eps);
-            let mut gate_up = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed2,
+                let mut normed2 = x.clone();
+                tensor::rmsnorm_inplace(
+                    &mut normed2,
+                    &layer.ffn_norm,
                     n_tokens,
-                    w: &layer.w_gate,
-                },
-                MatmulOp {
-                    x: &normed2,
-                    n_tokens,
-                    w: &layer.w_up,
-                },
-            ]);
-            let up = gate_up.pop().unwrap();
-            let mut gate = gate_up.pop().unwrap();
-            for g in gate.iter_mut() {
-                *g = tensor::silu(*g);
+                    n_embd,
+                    cfg.rms_eps,
+                );
+                let mut gate_up = self.backend.matmul_batch(&[
+                    MatmulOp {
+                        x: &normed2,
+                        n_tokens,
+                        w: &layer.w_gate,
+                    },
+                    MatmulOp {
+                        x: &normed2,
+                        n_tokens,
+                        w: &layer.w_up,
+                    },
+                ]);
+                let up = gate_up.pop().unwrap();
+                let mut gate = gate_up.pop().unwrap();
+                for g in gate.iter_mut() {
+                    *g = tensor::silu(*g);
+                }
+                tensor::mul_inplace(&mut gate, &up);
+                let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
+                tensor::add_inplace(&mut x, &down);
             }
-            tensor::mul_inplace(&mut gate, &up);
-            let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
-            tensor::add_inplace(&mut x, &down);
         }
 
         Ok(x)
@@ -396,6 +584,10 @@ impl MistralModel {
 }
 
 impl ModelForward for MistralModel {
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_vulkan()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }
@@ -409,8 +601,13 @@ impl ModelForward for MistralModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
+        // A single-token step the fused chain can describe goes through
+        // `record_decode_forward`; `None` falls through to the path below.
+        if let Some(logits) = self.record_decode_forward(cache, tokens, start_pos, slot_id) {
+            return Ok(logits);
+        }
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
