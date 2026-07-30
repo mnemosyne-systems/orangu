@@ -417,10 +417,19 @@ pub fn proc_cpu_seconds(pid: u32) -> Option<f64> {
 /// `sysconf(_SC_CLK_TCK)`, the unit `/proc/<pid>/stat` reports CPU time in.
 /// Effectively always 100 on Linux; read rather than assumed, and falling back
 /// to 100 if the call is unavailable.
+#[cfg(unix)]
 fn clock_ticks_per_second() -> f64 {
     // SAFETY: `sysconf` takes an int and returns a long; no pointers involved.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if hz > 0 { hz as f64 } else { 100.0 }
+}
+
+/// Off Unix there is no `sysconf` — and no `/proc` for it to describe — so the
+/// only caller never gets a reading to convert. The constant keeps the module
+/// compiling on those targets.
+#[cfg(not(unix))]
+fn clock_ticks_per_second() -> f64 {
+    100.0
 }
 
 fn sibling(svg: &Path, ext: &str) -> PathBuf {
@@ -831,7 +840,11 @@ mod tests {
 
     /// This process is running, so its own CPU time must be readable and
     /// non-negative; a bogus pid must give `None` rather than a wrong number.
+    ///
+    /// Only Linux has `/proc/<pid>/stat`; elsewhere every pid reads as `None`,
+    /// which would make the first assertion fail for the wrong reason.
     #[test]
+    #[cfg(target_os = "linux")]
     fn proc_cpu_seconds_reads_this_process_and_rejects_a_bogus_pid() {
         let me = std::process::id();
         let t = proc_cpu_seconds(me).expect("own /proc/<pid>/stat should be readable");
