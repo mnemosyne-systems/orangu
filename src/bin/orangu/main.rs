@@ -164,18 +164,18 @@ struct Args {
     shell_completions: bool,
 }
 
-/// Detect the shell and print its completion script. `-q` silences the script
-/// itself — the detection, and the error when it fails, are what remain.
-fn print_shell_completions(quiet: bool) -> Result<()> {
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let script = if shell.ends_with("/bash") || shell == "bash" {
-        shell::BASH
+/// Pick the completion script for a `$SHELL` value. Separate from printing it
+/// so the detection — including the shell it refuses — can be checked without
+/// a process to read stdout from.
+fn completion_script(shell: &str) -> Result<&'static str> {
+    if shell.ends_with("/bash") || shell == "bash" {
+        Ok(shell::BASH)
     } else if shell.ends_with("/zsh") || shell == "zsh" {
-        shell::ZSH
+        Ok(shell::ZSH)
     } else if shell.ends_with("/fish") || shell == "fish" {
-        shell::FISH
+        Ok(shell::FISH)
     } else {
-        return Err(anyhow!(
+        Err(anyhow!(
             "could not detect shell from $SHELL ({shell:?}).\n\
              Supported shells: bash, zsh, fish.\n\
              \n\
@@ -183,12 +183,41 @@ fn print_shell_completions(quiet: bool) -> Result<()> {
              \x20 bash: eval \"$(orangu -s)\"\n\
              \x20 zsh:  orangu -s > ~/.zsh/completions/_orangu\n\
              \x20 fish: orangu -s > ~/.config/fish/completions/orangu.fish"
-        ));
-    };
+        ))
+    }
+}
+
+/// Detect the shell and print its completion script. `-q` silences the script
+/// itself — the detection, and the error when it fails, are what remain.
+fn print_shell_completions(quiet: bool) -> Result<()> {
+    let script = completion_script(&std::env::var("SHELL").unwrap_or_default())?;
     if !quiet {
         print!("{script}");
     }
     Ok(())
+}
+
+/// `-q` promises to print nothing on success, so it only means something in the
+/// modes that print and exit (`-p`, `-l`, `-s`). Where it would silence nothing,
+/// saying so beats accepting a flag that does nothing. The rule is about the
+/// flags alone, so it is decided here rather than part-way through `run()`.
+fn quiet_refusal(args: &Args) -> Option<&'static str> {
+    if !args.quiet || args.shell_completions || args.list {
+        return None;
+    }
+    if args.init {
+        return Some(
+            "-q/--quiet cannot be combined with -i/--init: creating the configuration \
+             is a dialogue, and its questions are the output",
+        );
+    }
+    if args.prompt.is_none() {
+        return Some(
+            "-q/--quiet applies to the modes that print and exit (-p, -l, -s); \
+             the terminal interface has nothing to silence",
+        );
+    }
+    None
 }
 
 fn main() -> ExitCode {
@@ -217,6 +246,9 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let mut args = Args::parse();
+    if let Some(refusal) = quiet_refusal(&args) {
+        return Err(anyhow!(refusal));
+    }
     if args.shell_completions {
         return print_shell_completions(args.quiet);
     }
@@ -228,22 +260,7 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if args.init {
-        if args.quiet {
-            return Err(anyhow!(
-                "-q/--quiet cannot be combined with -i/--init: creating the configuration \
-                 is a dialogue, and its questions are the output"
-            ));
-        }
         return init::run_init().await;
-    }
-    // Everything below this point either runs one prompt and exits, or opens the
-    // terminal interface. The interface has nothing to silence, so say so rather
-    // than opening it with a flag that does nothing.
-    if args.quiet && args.prompt.is_none() {
-        return Err(anyhow!(
-            "-q/--quiet applies to the modes that print and exit (-p, -l, -s); \
-             the terminal interface has nothing to silence"
-        ));
     }
     let config_path = match args.config.or_else(default_client_config_path) {
         Some(path) => path,
@@ -2528,9 +2545,58 @@ pub fn process_env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
 
-    use super::llm_prompt_block_reason;
+    use super::{Args, completion_script, llm_prompt_block_reason, quiet_refusal};
+    use clap::Parser;
 
     use orangu::tui::{ConnStatus, HeaderStatus};
+
+    fn args(argv: &[&str]) -> Args {
+        Args::parse_from(std::iter::once("orangu").chain(argv.iter().copied()))
+    }
+
+    #[test]
+    fn quiet_is_accepted_by_the_modes_that_print_and_exit() {
+        assert_eq!(quiet_refusal(&args(&["-q", "-p", "/help"])), None);
+        assert_eq!(quiet_refusal(&args(&["-q", "-l"])), None);
+        assert_eq!(quiet_refusal(&args(&["-q", "-s"])), None);
+        // Without -q there is nothing to refuse, whatever the mode.
+        assert_eq!(quiet_refusal(&args(&["-i"])), None);
+        assert_eq!(quiet_refusal(&args(&[])), None);
+    }
+
+    #[test]
+    fn quiet_is_refused_where_there_is_nothing_to_silence() {
+        let interface = quiet_refusal(&args(&["-q"])).expect("-q alone must be refused");
+        assert!(interface.contains("terminal interface"), "{interface}");
+
+        let init = quiet_refusal(&args(&["-q", "-i"])).expect("-q -i must be refused");
+        assert!(init.contains("--init"), "{init}");
+    }
+
+    #[test]
+    fn completion_script_detects_each_supported_shell() {
+        for (shell, marker) in [
+            ("/bin/bash", "bash completion"),
+            ("bash", "bash completion"),
+            ("/usr/bin/zsh", "#compdef"),
+            ("/usr/local/bin/fish", "fish completion"),
+        ] {
+            let script = completion_script(shell).expect(shell);
+            assert!(script.contains(marker), "{shell} -> {marker}");
+        }
+    }
+
+    #[test]
+    fn completion_script_refuses_an_undetectable_shell() {
+        // An undetectable shell is an error whether or not -q silences the
+        // script, so the message has to name what it saw.
+        let err = completion_script("/usr/bin/nonesuch")
+            .expect_err("an unsupported shell must not yield a script")
+            .to_string();
+        assert!(err.contains("nonesuch"), "{err}");
+        assert!(err.contains("bash, zsh, fish"), "{err}");
+        assert!(completion_script("").is_err());
+    }
 
     #[test]
     fn llm_prompt_block_reason_requires_model_connection() {

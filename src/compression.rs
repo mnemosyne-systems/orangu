@@ -1390,4 +1390,151 @@ test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n
         // Should have omission markers
         assert!(compressed.contains("lines omitted"));
     }
+
+    // -----------------------------------------------------------------------
+    // Real-shaped output through the public entry point
+    //
+    // The tests above feed the individual compressors a handful of lines, which
+    // is enough to show a rule but not enough to reach a threshold: at three
+    // tests or two crates there is nothing to omit. These drive
+    // `compress_shell_output` at the sizes that actually arrive from a shell,
+    // where the routing, the thresholds and the reporting all have to agree.
+    // -----------------------------------------------------------------------
+
+    fn cargo_build_with_error() -> String {
+        let mut out = String::new();
+        for i in 0..80 {
+            out.push_str(&format!("   Compiling crate_{i} v0.1.{i}\n"));
+        }
+        out.push_str("error[E0308]: mismatched types\n");
+        out.push_str("  --> src/main.rs:10:5\n");
+        out.push_str("10 |     let x: i32 = \"hello\";\n");
+        out.push_str("error: could not compile `my_crate` due to 1 previous error\n");
+        out
+    }
+
+    #[test]
+    fn cargo_build_at_scale_keeps_the_error_and_drops_the_crates() {
+        let output = cargo_build_with_error();
+        let (compressed, stats) = compress_shell_output_with_stats("cargo build", &output, 20);
+
+        assert_eq!(stats.pattern_matched.as_deref(), Some("cargo_build"));
+        assert!(
+            stats.compressed_lines < stats.original_lines,
+            "80 crates should compress: {stats:?}"
+        );
+        assert_eq!(stats.original_lines, output.lines().count());
+        assert_eq!(stats.compressed_lines, compressed.lines().count());
+
+        // The diagnostic is the reason the command was run.
+        assert!(compressed.contains("error[E0308]: mismatched types"));
+        assert!(compressed.contains("could not compile `my_crate`"));
+        // The 80 individual crate lines are not.
+        assert!(!compressed.contains("Compiling crate_40"));
+        assert!(compressed.contains("compiled 80 packages"));
+    }
+
+    #[test]
+    fn cargo_test_at_scale_keeps_only_the_failures() {
+        let mut output = String::from("running 120 tests\n");
+        for i in 0..118 {
+            output.push_str(&format!("test module::test_{i:03} ... ok\n"));
+        }
+        output.push_str("test module::test_118 ... FAILED\n");
+        output.push_str("test module::test_119 ... FAILED\n");
+        output.push_str("failures:\n");
+        output.push_str("---- module::test_118 stdout ----\n");
+        output.push_str("thread 'main' panicked at 'assertion failed', src/lib.rs:42\n");
+        output.push_str("test result: FAILED. 118 passed; 2 failed; 0 ignored\n");
+
+        let (compressed, stats) = compress_shell_output_with_stats("cargo test", &output, 20);
+
+        assert_eq!(stats.pattern_matched.as_deref(), Some("cargo_test"));
+        assert!(compressed.contains("118 tests passed"));
+        assert!(!compressed.contains("test module::test_042 ... ok"));
+        // Both failures, and the panic that explains one of them, survive.
+        assert!(compressed.contains("test module::test_118 ... FAILED"));
+        assert!(compressed.contains("test module::test_119 ... FAILED"));
+        assert!(compressed.contains("panicked at"));
+    }
+
+    #[test]
+    fn git_diff_at_scale_is_compressed_and_reported() {
+        let mut output = String::from(
+            "diff --git a/src/main.rs b/src/main.rs\n\
+             index abc123..def456 100644\n\
+             --- a/src/main.rs\n\
+             +++ b/src/main.rs\n\
+             @@ -1,10 +1,10 @@\n",
+        );
+        for i in 0..600 {
+            if i % 10 == 0 {
+                output.push_str(&format!("+fn new_fn_{i}() {{\n"));
+            } else {
+                output.push_str(&format!(" fn existing_{i}() {{\n"));
+            }
+        }
+
+        let (compressed, stats) = compress_shell_output_with_stats("git diff HEAD", &output, 20);
+        assert!(
+            stats.compressed_lines < stats.original_lines,
+            "a 600-line diff should compress: {stats:?}"
+        );
+        assert!(compressed.contains("src/main.rs"), "{compressed}");
+    }
+
+    fn git_log(commits: usize) -> String {
+        let mut out = String::new();
+        for i in 0..commits {
+            out.push_str(&format!(
+                "commit {i:040x}\n\
+                 Author: Dev <dev@example.com>\n\
+                 Date:   Mon Jun 22 10:00:00 2026\n\
+                 \n\
+                 \x20   commit message {i}\n\n"
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn git_log_keeps_the_first_fifteen_and_counts_the_rest() {
+        let (compressed, stats) = compress_shell_output_with_stats("git log", &git_log(50), 20);
+
+        assert_eq!(stats.pattern_matched.as_deref(), Some("git_log"));
+        assert!(compressed.contains("commit message 0"));
+        assert!(compressed.contains("commit message 14"));
+        assert!(!compressed.contains("commit message 15"));
+        // 50 commits, 15 kept — the tail is a count, not silence.
+        assert!(compressed.contains("and 35 more commits"), "{compressed}");
+    }
+
+    #[test]
+    fn git_log_below_the_threshold_is_untouched() {
+        // The cutoff is 20 commits; at exactly 20 nothing may be dropped.
+        let output = git_log(20);
+        let (compressed, _) = compress_shell_output_with_stats("git log", &output, 20);
+        assert_eq!(compressed, output);
+        assert!(compressed.contains("commit message 19"));
+    }
+
+    #[test]
+    fn short_output_passes_through_untouched() {
+        // Below every threshold: compression that "helps" here would only lose
+        // the one line the caller wanted, and stats must not claim a saving.
+        let output = "Finished dev [unoptimized] target(s) in 0.42s\n".repeat(5);
+        let (compressed, stats) = compress_shell_output_with_stats("cargo build", &output, 20);
+        assert_eq!(stats.compressed_lines, stats.original_lines, "{stats:?}");
+        assert!(compressed.contains("Finished dev [unoptimized] target(s) in 0.42s"));
+    }
+
+    #[test]
+    fn with_stats_agrees_with_the_plain_call() {
+        // Two entry points, one behaviour: whatever the stats say happened has
+        // to be what the caller without stats gets.
+        let output = cargo_build_with_error();
+        let plain = compress_shell_output("cargo build", &output, 20);
+        let (with_stats, _) = compress_shell_output_with_stats("cargo build", &output, 20);
+        assert_eq!(plain, with_stats);
+    }
 }

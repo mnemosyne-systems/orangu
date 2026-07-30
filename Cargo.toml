@@ -116,13 +116,7 @@ daemonize = "0.5.0"
 libc = "0.2"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.27.0"
-
-[[bench]]
-name = "compression"
-path = "test/benchmarks/compression.rs"
-harness = false
 
 [profile.release-with-debug]
 inherits = "release"
