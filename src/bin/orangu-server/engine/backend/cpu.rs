@@ -17,15 +17,21 @@
 //! rows via `rayon`. Also the fallback when no Vulkan-capable adapter is
 //! found.
 //!
-//! Two paths, picked per weight tensor:
+//! Three paths, picked per weight tensor, in this order:
 //!
 //! * **Fused** (`engine::vecdot`) — for the quantized types that have a
 //!   fused kernel, the weight row's raw quantized bytes are dotted straight
 //!   against `int8`-quantized activations, ggml-style. No dequantize, no
 //!   per-row `Vec<f32>`.
+//! * **Float** (`vecdot::dot_row_f32`) — for `F32`/`F16`/`BF16`, which have
+//!   no `int8` weight form to fuse against. Activations stay `f32`; the
+//!   weights are widened a block at a time into the dot, so this also has
+//!   no dequantize and no per-row `Vec<f32>`.
 //! * **Dequantize** — the original path (`QuantMatrix::row` → a fresh
-//!   `Vec<f32>` → `engine::tensor::dot` with runtime AVX2 dispatch), still
-//!   used for every type `vecdot::supports` declines.
+//!   `Vec<f32>` → `engine::tensor::dot` with runtime AVX2 dispatch), now
+//!   reached only by types neither of the above claims. It stays as the
+//!   full-precision *reference* other backends cross-check against, which is
+//!   why its allocation is left alone rather than optimized in place.
 //!
 //! The fused path exists because a `perf` profile of CPU decode put 95% of
 //! all time in this one function — see `engine::vecdot`'s module doc for the
@@ -278,6 +284,56 @@ impl CpuBackend {
         Some(y)
     }
 
+    /// The float path: `F32`/`F16`/`BF16` weights, widened a block at a time
+    /// straight into the dot. Returns `None` for anything else.
+    ///
+    /// Separate from [`Self::matmul_fused`] because these types have no
+    /// `int8` weight form — quantizing weights the file stores in full
+    /// precision would be an accuracy change ggml does not make, so
+    /// activations stay `f32` here. What it *does* remove is the same two
+    /// costs the fused path removed for the quantized types: the per-row
+    /// `Vec<f32>` and, on aarch64, `tensor::dot`'s single-accumulator scalar
+    /// loop (that function has an AVX2 path and no NEON one).
+    ///
+    /// Reached in practice by `gemma-4`'s `per_layer_model_proj`, the last
+    /// unfused matmul in the model set.
+    fn matmul_float(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Option<Vec<f32>> {
+        let in_dim = w.in_dim;
+        let out_dim = w.out_dim;
+        let ggml_type = w.ggml_type();
+        if !vecdot::supports_float(ggml_type) {
+            return None;
+        }
+        let raw = w.raw_bytes();
+        let row_bytes = w.row_bytes();
+
+        // Transposed accumulation, as `matmul_fused` does: the rayon split is
+        // over output rows, each written exactly once, so no scatter and no
+        // per-row allocation. `matmul_dequant` collects a `Vec<f32>` per row
+        // and scatters afterwards, which is the allocation this avoids.
+        let mut yt = vec![0f32; out_dim * n_tokens];
+        yt.par_chunks_mut(n_tokens)
+            .enumerate()
+            .for_each(|(o, dst)| {
+                let row = &raw[o * row_bytes..(o + 1) * row_bytes];
+                for (t, slot) in dst.iter_mut().enumerate() {
+                    *slot = vecdot::dot_row_f32(ggml_type, row, &x[t * in_dim..(t + 1) * in_dim]);
+                }
+            });
+
+        if n_tokens == 1 {
+            // The transpose is the identity.
+            return Some(yt);
+        }
+        let mut y = vec![0f32; n_tokens * out_dim];
+        for o in 0..out_dim {
+            for t in 0..n_tokens {
+                y[t * out_dim + o] = yt[o * n_tokens + t];
+            }
+        }
+        Some(y)
+    }
+
     /// The dequantize path, on its own: every weight row widened to `f32`
     /// and dotted against the **unquantized** activations.
     ///
@@ -321,12 +377,21 @@ impl Backend for CpuBackend {
         if let Some(y) = self.matmul_fused(x, n_tokens, w) {
             return y;
         }
+        if let Some(y) = self.matmul_float(x, n_tokens, w) {
+            return y;
+        }
         self.matmul_dequant(x, n_tokens, w)
     }
 
     fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
         debug_assert_eq!(x.len(), n_tokens * w.in_dim);
         if let Some(y) = self.matmul_fused_decode(x, n_tokens, w) {
+            return y;
+        }
+        // `matmul_float` needs no decode form of its own: it already dots one
+        // `(row, token)` pair at a time and never materializes a row, so the
+        // GEMV/GEMM split the quantized path makes has nothing to trade off.
+        if let Some(y) = self.matmul_float(x, n_tokens, w) {
             return y;
         }
         // The dequantize path takes every `(row, token)` pair as its own

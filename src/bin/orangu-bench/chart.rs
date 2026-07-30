@@ -163,6 +163,14 @@ pub fn render_labelled(
             "Decode — CPU per generated token",
             axes.x.as_deref().unwrap_or("context depth (tokens)"),
         ),
+        // Its own panel rather than a series on the prefill one: an embedding
+        // forward pass is prompt processing, but of a different model, and
+        // plotting the two together would invite reading one as the other.
+        (
+            "embed",
+            "Embeddings — forward pass",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
     ] {
         // `(label, date) -> context -> best`.
         let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();

@@ -371,6 +371,53 @@ pub fn multi_head_attention(
     scale: f32,
     window: impl Fn(usize) -> (usize, usize) + Sync,
 ) {
+    // One branch per call, not per token: each arm monomorphizes the whole loop
+    // below at a fixed batch width, so nothing is decided inside it. Width 1 is
+    // the pre-batching kernel exactly — one `dot` and one `axpy_inplace` per
+    // position — which makes it the sweep's own control rather than a separate
+    // code path to keep in step.
+    match batch_width() {
+        1 => attention_batched::<1, _>(out, q, cache, n_head, group_size, head_dim, scale, window),
+        2 => attention_batched::<2, _>(out, q, cache, n_head, group_size, head_dim, scale, window),
+        3 => attention_batched::<3, _>(out, q, cache, n_head, group_size, head_dim, scale, window),
+        8 => attention_batched::<8, _>(out, q, cache, n_head, group_size, head_dim, scale, window),
+        _ => attention_batched::<4, _>(out, q, cache, n_head, group_size, head_dim, scale, window),
+    }
+}
+
+/// Positions batched per pass in [`multi_head_attention`]'s inner loops.
+///
+/// `ORANGU_ATTENTION_BATCH` overrides [`tensor::DOT_MULTI`], matching the
+/// `ORANGU_ATTENTION_MIN_TOKENS` knob above: a *sweep* knob, not configuration,
+/// because the right width is a property of the machine's cache and prefetcher
+/// rather than of the model. Read once. Anything other than 1/2/3/4/8 falls back
+/// to 4 rather than failing — a sweep script's typo should not take a server down.
+fn batch_width() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("ORANGU_ATTENTION_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(tensor::DOT_MULTI)
+    })
+}
+
+/// [`multi_head_attention`] at a fixed batch width `N`, so the width is a
+/// compile-time constant inside the loop. Same eight parameters as its caller,
+/// for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn attention_batched<const N: usize, W>(
+    out: &mut [f32],
+    q: &[f32],
+    cache: &LayerCache,
+    n_head: usize,
+    group_size: usize,
+    head_dim: usize,
+    scale: f32,
+    window: W,
+) where
+    W: Fn(usize) -> (usize, usize) + Sync,
+{
     debug_assert_eq!(out.len(), q.len());
     debug_assert!(group_size > 0);
     let row = n_head * head_dim;
@@ -395,7 +442,38 @@ pub fn multi_head_attention(
             // contiguous slice `softmax_inplace` needs.
             scores.clear();
             scores.resize(n_head * n_pos, 0.0);
-            for (offset, p) in (window_start..=window_end).enumerate() {
+            // Positions in groups of `N`, so one query row is loaded per group
+            // instead of per position. Nesting unchanged — still position-outer,
+            // head-inner, for the grouped-query locality reason above — and the
+            // results are bit-identical, because `dot_multi` keeps each output's
+            // accumulators laid out exactly as `dot`'s. The query load was 21.3%
+            // of this kernel against 0.8% for the `fmla`; see `tensor::dot_multi`.
+            //
+            // Blocking the *heads* as well (`tensor::dot_block`, a `G x N` block
+            // sharing both operands) was tried and measured **+0.2% at best and
+            // −1.8% at the shape whose load arithmetic looked strictly better**;
+            // see `doc/perf/attn-batch/`. The position width is what matters here,
+            // not the sharing axis.
+            let mut offset = 0;
+            while offset + N <= n_pos {
+                let p = window_start + offset;
+                for kv_head in 0..n_kv {
+                    let kh: [&[f32]; N] =
+                        std::array::from_fn(|j| cache.key_at(p + j, kv_head, head_dim));
+                    let h_end = ((kv_head + 1) * group_size).min(n_head);
+                    for h in kv_head * group_size..h_end {
+                        let qh = &q_t[h * head_dim..(h + 1) * head_dim];
+                        let got = tensor::dot_multi(qh, kh);
+                        for (j, sc) in got.iter().enumerate() {
+                            scores[h * n_pos + offset + j] = sc * scale;
+                        }
+                    }
+                }
+                offset += N;
+            }
+            // The window's last `N - 1` or fewer positions.
+            while offset < n_pos {
+                let p = window_start + offset;
                 for kv_head in 0..n_kv {
                     let kh = cache.key_at(p, kv_head, head_dim);
                     let h_end = ((kv_head + 1) * group_size).min(n_head);
@@ -404,11 +482,36 @@ pub fn multi_head_attention(
                         scores[h * n_pos + offset] = tensor::dot(qh, kh) * scale;
                     }
                 }
+                offset += 1;
             }
             for h in 0..n_head {
                 tensor::softmax_inplace(&mut scores[h * n_pos..(h + 1) * n_pos]);
             }
-            for (offset, p) in (window_start..=window_end).enumerate() {
+            // Positions in groups of `N` again, mirror reason: the output row is
+            // loaded and stored once per group rather than once per position.
+            // Also bit-identical — every contribution still lands in ascending
+            // position order. See `tensor::axpy_multi`.
+            let mut offset = 0;
+            while offset + N <= n_pos {
+                let p = window_start + offset;
+                for kv_head in 0..n_kv {
+                    let vh: [&[f32]; N] =
+                        std::array::from_fn(|j| cache.value_at(p + j, kv_head, head_dim));
+                    let h_end = ((kv_head + 1) * group_size).min(n_head);
+                    for h in kv_head * group_size..h_end {
+                        let weights: [f32; N] =
+                            std::array::from_fn(|j| scores[h * n_pos + offset + j]);
+                        tensor::axpy_multi(
+                            &mut out_t[h * head_dim..(h + 1) * head_dim],
+                            vh,
+                            weights,
+                        );
+                    }
+                }
+                offset += N;
+            }
+            while offset < n_pos {
+                let p = window_start + offset;
                 for kv_head in 0..n_kv {
                     let vh = cache.value_at(p, kv_head, head_dim);
                     let h_end = ((kv_head + 1) * group_size).min(n_head);
@@ -421,6 +524,7 @@ pub fn multi_head_attention(
                         );
                     }
                 }
+                offset += 1;
             }
         });
 }

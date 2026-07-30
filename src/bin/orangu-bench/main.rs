@@ -92,6 +92,21 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     pp_continue_base: u32,
 
+    /// Embedding mode: comma-separated prompt lengths (in tokens) to sweep
+    /// against `POST /v1/embeddings`, reporting **forward-pass** throughput —
+    /// the embedding-model equivalent of `--pp`, and the only mode that works
+    /// on an embedding-only server at all.
+    ///
+    /// Such a server answers `/v1/completions` with HTTP 501, so both the
+    /// default decode sweep and `--pp` fail outright on it: `embeddinggemma-
+    /// 300M` is a supported, working model that this tool simply could not
+    /// measure. Rates come from the response's `usage.prompt_tokens` — which
+    /// both `orangu-server` and `llama-server` report — so the token count is
+    /// the one the forward pass actually ran, not an estimate from the prompt
+    /// text.
+    #[arg(long, value_delimiter = ',')]
+    embed: Vec<u32>,
+
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128)]
     n_gen: u32,
@@ -462,6 +477,89 @@ fn run_prefill_once(
     }
 }
 
+/// One embedding measurement: how many tokens the server says it embedded,
+/// and how long the whole request took.
+struct EmbedSample {
+    prompt_tokens: u32,
+    wall_ms: f64,
+    /// `false` when the server sent no `usage.prompt_tokens`. There is then no
+    /// token count to divide by — unlike [`PrefillSample`], which can fall
+    /// back to a requested length, an embedding response carries no other
+    /// clue — so the caller prints the latency and records nothing.
+    server_reported: bool,
+}
+
+impl EmbedSample {
+    fn tok_per_s(&self) -> f64 {
+        if self.wall_ms > 0.0 && self.prompt_tokens > 0 {
+            self.prompt_tokens as f64 / (self.wall_ms / 1000.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Embed one prompt and time the round trip.
+///
+/// Wall-clock, not a server-reported figure: `/v1/embeddings` has no
+/// `timings` object on either server, so unlike [`run_prefill_once`] there is
+/// nothing to prefer over the clock. That makes this measurement *inclusive*
+/// of HTTP and JSON encoding of an `n_embd`-long float array, which is real
+/// but small beside a forward pass — and identical on both engines, since the
+/// same client sends both. It is the same trade `doc/perf/embed_bench.sh`
+/// made with `curl`; the difference here is that the token count comes from
+/// the server rather than from a separate `llama-tokenize` run.
+///
+/// No `stream`: neither server streams embeddings, and there is no first
+/// token to time to.
+fn run_embed_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    prompt: &str,
+    model: &Option<String>,
+) -> anyhow::Result<EmbedSample> {
+    let mut body = serde_json::json!({"input": prompt});
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.clone());
+    }
+
+    let endpoint = format!("{url}/v1/embeddings");
+    let t0 = Instant::now();
+    let resp = client
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("server returned HTTP {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json()?;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // A 200 with no embedding in it is a different failure from a non-200 and
+    // would otherwise be reported as a very fast run.
+    anyhow::ensure!(
+        v.get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("embedding"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|e| !e.is_empty()),
+        "response carried no embedding"
+    );
+
+    let prompt_tokens = v
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+
+    Ok(EmbedSample {
+        prompt_tokens,
+        wall_ms,
+        server_reported: prompt_tokens > 0,
+    })
+}
+
 /// Send one streaming completion and time the decode window.
 fn run_once(
     client: &reqwest::blocking::Client,
@@ -614,7 +712,15 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // just the clean error above rather than a header followed by an error.
     if !args.no_warmup {
         let p = build_prompt(0);
-        run_once(&client, &args.url, &p, 8, &args.model)?;
+        // Warm up through the endpoint the run will actually use. An
+        // embedding-only server answers `/v1/completions` with HTTP 501, so
+        // warming up with a completion would fail the run before it started —
+        // which is exactly what kept `--embed`'s models unmeasurable.
+        if args.embed.is_empty() {
+            run_once(&client, &args.url, &p, 8, &args.model)?;
+        } else {
+            run_embed_once(&client, &args.url, &p, &args.model)?;
+        }
     }
 
     let label = args
@@ -656,6 +762,14 @@ fn measure(
     args: &Args,
     label: &str,
 ) -> anyhow::Result<Vec<history::Record>> {
+    // Before `--pp`, and exclusive of it: an embedding-only server can serve
+    // nothing else, and on a generative one the two measure different models'
+    // worth of work, so combining them in a single sweep would produce two
+    // unrelated tables under one header.
+    if !args.embed.is_empty() {
+        return run_embed(client, args, label);
+    }
+
     if !args.pp.is_empty() {
         return run_pp(client, args, label);
     }
@@ -1514,6 +1628,86 @@ fn run_pp_continue(
             mean,
             sd,
         });
+    }
+    Ok(records)
+}
+
+/// The embedding sweep: one row per requested prompt length.
+///
+/// Reported as tok/s so the number lines up with the `pp` column of a
+/// generative model — an embedding forward pass is prompt processing without
+/// the decode that follows it, and that is the comparison worth making
+/// (`embeddinggemma-300M` against `llama-server` on the same file).
+fn run_embed(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    if !args.json {
+        println!(
+            "{:>8} | {:>7} | {:>9} | {:>8} | {:>16}",
+            "embed", "n_tok", "wall_ms", "best", "mean ± sd"
+        );
+        println!("{}", "-".repeat(60));
+    }
+
+    for &len in &args.embed {
+        let prompt = build_prompt(len);
+        let mut rates = Vec::new();
+        let mut last: Option<EmbedSample> = None;
+        for _ in 0..args.reps.max(1) {
+            let s = run_embed_once(client, &args.url, &prompt, &args.model)?;
+            rates.push(s.tok_per_s());
+            last = Some(s);
+        }
+        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
+        let sd = var.sqrt();
+        let s = last.expect("at least one rep ran");
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "embed": len,
+                    "prompt_tokens": s.prompt_tokens,
+                    "wall_ms": s.wall_ms,
+                    "tok_per_s_best": best,
+                    "tok_per_s_mean": mean,
+                    "tok_per_s_sd": sd,
+                    "server_reported": s.server_reported,
+                })
+            );
+        } else if s.server_reported {
+            println!(
+                "{:>8} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
+                len, s.prompt_tokens, s.wall_ms, best, mean, sd
+            );
+        } else {
+            // Same rule as `run_pp`: without the token count there is no rate,
+            // and printing the latency alone is the only honest option.
+            println!(
+                "{:>8} | {:>7} | {:>9.1} | {:>8} | no usage.prompt_tokens (latency only)",
+                len, "?", s.wall_ms, "-"
+            );
+        }
+
+        if s.server_reported {
+            records.push(history::Record {
+                date: history::today(),
+                label: label.to_string(),
+                mode: "embed".to_string(),
+                // The server's count, not the requested length — `build_prompt`
+                // only approximates a token target, and two servers tokenizing
+                // the same text can disagree.
+                n: s.prompt_tokens,
+                best,
+                mean,
+                sd,
+            });
+        }
     }
     Ok(records)
 }

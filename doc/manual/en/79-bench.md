@@ -196,6 +196,42 @@ tok/s axis would read as a collapse.
 Throughput does not need this treatment — the depth sweep already times from the
 first streamed token to the last, so prefill is outside its window either way.
 
+### Embedding mode (`--embed`) — the only mode an embedding model answers
+
+An embedding-only server serves `/v1/embeddings` and answers
+`/v1/completions` with **HTTP 501**, so the decode sweep and `--pp` both fail
+on one outright — warmup included. `--embed` sweeps prompt lengths against
+`/v1/embeddings` and reports forward-pass throughput, which is what `--pp`
+reports for a generative model: an embedding pass is prompt processing without
+the decode that follows it.
+
+```sh
+orangu-server embeddinggemma-300M-Q8_0.gguf --embedding &
+orangu-bench --embed 64,128,256 --reps 15
+orangu-bench --url http://127.0.0.1:8300 --embed 64,128,256 --reps 15  # the reference
+```
+
+```
+   embed |   n_tok |   wall_ms |     best |        mean ± sd
+------------------------------------------------------------
+      64 |      81 |    1163.3 |    70.49 |    68.33 ±  1.64
+     128 |     159 |    2401.3 |    66.21 |    63.99 ±  1.50
+     256 |     289 |    5003.7 |    59.47 |    57.95 ±  1.89
+```
+
+`n_tok` is the count from the response's `usage.prompt_tokens` — the length the
+forward pass actually ran, not the requested target — and both
+`orangu-server` and `llama-server` report it. A server that omits it gets a row
+marked `no usage.prompt_tokens (latency only)`: an embedding response carries
+no other clue to its token count, so there is no rate to print and the row is
+not recorded.
+
+Unlike `--pp`, the time is **wall-clock for the whole request**: neither server
+attaches a `timings` object to `/v1/embeddings`, so there is nothing to prefer
+over the clock. HTTP and the JSON encoding of an `n_embd`-long float array are
+therefore inside the number — small beside a forward pass, and identical on
+both engines, since the same client sends both.
+
 ### A sweep can contaminate its own later rows
 
 One measured caveat that applies to `--pp` and `--pp-continue` alike: the rows
@@ -249,6 +285,7 @@ Options:
       --decode-cpu         Report the server's CPU time per generated token, with prefill excluded
       --streams <N>        Concurrency mode: comma-separated stream counts; reports aggregate tok/s
       --pp-continue-base <N>  Prompt length (tokens) to prime the prefix cache with for --pp-continue [default: 512]
+      --embed <EMBED>      Embedding mode: comma-separated prompt lengths to sweep against /v1/embeddings
       --gen <N_GEN>        Number of tokens to generate per timed run [default: 128]
       --curve <CURVE>      Curve mode: ONE generation of this many tokens, decode rate bucketed by context [default: 0]
       --bucket <BUCKET>    Bucket width (in context tokens) for --curve [default: 256]
@@ -579,8 +616,10 @@ orangu-bench --chart-only --history perf-history.tsv --chart perf-history.svg
 
 The file is plain TSV with a `#` header, so it diffs in review and is
 hand-editable; blank lines, comments and unparseable rows are skipped rather
-than fatal. Each row is `date`, `label`, `mode` (`pp` or `tg`), `n`, and the
-best / mean / sd of the run's repetitions:
+than fatal. Each row is `date`, `label`, `mode` (`pp`, `tg` or `embed` — each
+drawn as its own chart panel, since an embedding pass and a generative
+model's prefill are not the same measurement), `n`, and the best / mean / sd of
+the run's repetitions:
 
 ```text
 #date	label	mode	n	best	mean	sd

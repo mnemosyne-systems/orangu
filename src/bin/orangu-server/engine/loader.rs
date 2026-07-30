@@ -236,6 +236,70 @@ pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
 /// does.
 pub(crate) type TensorBytes = Arc<dyn std::ops::Deref<Target = [u8]> + Send + Sync>;
 
+/// Drops the resident pages behind a mapped byte range that has just been
+/// copied into owned storage, so the data is not resident twice for the rest
+/// of the model's life.
+///
+/// Only the repacked layouts reach this (see [`LoadedModel::open`]), and only
+/// they had the problem: `SmolLM2-360M-Instruct-Q4_0_4_4` held **426 MiB
+/// resident for a 217 MiB file** — 217 mapped and touched by the un-repack,
+/// plus ~210 rewritten — where every other model in `doc/perf/models.tsv`
+/// sits at file size plus 60–110 MiB.
+///
+/// `madvise` rather than dropping the mapping, because the mapping cannot be
+/// dropped: a repacked file may store some tensors un-repacked (that model's
+/// `token_embd` is `Q8_0`) and those still read through it. `MADV_DONTNEED` on
+/// a read-only `MAP_PRIVATE` file mapping frees the page-cache references
+/// without invalidating any address — a later read of the same range would
+/// simply fault it back from the file, unchanged. Nothing does read it again;
+/// the range's only reader was the un-repack that just finished.
+///
+/// Rounded *inward* to whole pages, since a page is the unit `madvise` works
+/// in and a tensor boundary need not be page-aligned. Advising a partial page
+/// would reach into a neighbouring tensor's bytes — harmless in itself (it
+/// would fault back) but not this function's business, and at these sizes the
+/// two skipped pages are noise.
+///
+/// Best-effort by construction: failure means pages stay resident, which is
+/// exactly the status quo this improves on, so there is nothing to report and
+/// nothing a caller could do about it.
+fn release_mapped_range(range: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        // Safety: `sysconf` is a pure query with no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return;
+        }
+        let page = page as usize;
+        let start = range.as_ptr() as usize;
+        let end = start + range.len();
+        let aligned_start = start.next_multiple_of(page);
+        let aligned_end = end - (end % page);
+        if aligned_end <= aligned_start {
+            return;
+        }
+        // Safety: the range is inside a live mapping this crate created
+        // read-only (the caller holds its `Arc` across the call), the pointer
+        // and length are page-aligned as `madvise` requires, and
+        // `MADV_DONTNEED` on a read-only file mapping only discards clean
+        // pages — it cannot lose data or invalidate the address.
+        unsafe {
+            libc::madvise(
+                aligned_start as *mut libc::c_void,
+                aligned_end - aligned_start,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+    // Every other target keeps both copies resident, as this did everywhere
+    // before. `MADV_DONTNEED` is POSIX but its effect on a private file
+    // mapping is not: on some BSDs it is advisory to the point of being a
+    // no-op, and nothing here is measured on one.
+    #[cfg(not(target_os = "linux"))]
+    let _ = range;
+}
+
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
 #[derive(Clone)]
 struct TensorLocation {
@@ -611,6 +675,13 @@ impl LoadedModel {
         // so there is no row-shaped slice to be lazy about. The rewritten
         // tensor is exactly as large as the mapped bytes it replaces, and
         // only these files pay for it.
+        //
+        // Which is why each rewritten range is handed to
+        // [`release_mapped_range`] afterwards: the owned copy and the mapped
+        // original are otherwise both resident for the model's whole life, and
+        // the mapping cannot simply be dropped because any tensor the file
+        // stores *un*-repacked (`SmolLM2-Q4_0_4_4`'s `token_embd`, `Q8_0`)
+        // still reads through it.
         for (name, loc) in tensors.iter_mut() {
             if !quant::is_repacked(loc.ggml_type) {
                 continue;
@@ -629,10 +700,14 @@ impl LoadedModel {
                 loc.dims[1] as usize,
             )
             .with_context(|| format!("tensor '{name}'"))?;
+            // Held past the assignment below on purpose: the range being
+            // released is an address in *this* mapping, so it has to outlive
+            // the `loc.bytes` that pointed at it.
+            let mapped = std::mem::replace(&mut loc.bytes, Arc::new(plain));
+            release_mapped_range(&mapped[loc.start..loc.start + loc.len]);
             loc.ggml_type = base;
             loc.start = 0;
-            loc.len = plain.len();
-            loc.bytes = Arc::new(plain);
+            loc.len = loc.bytes.len();
         }
 
         // `split.tensors.count` is the whole model's tensor count, so this
@@ -959,6 +1034,56 @@ mod tests {
     #[should_panic(expected = "exceeds out_dim")]
     fn rows_view_rejects_a_range_past_the_end() {
         patterned_matrix(64, 8).rows(6, 4);
+    }
+
+    /// The claim [`release_mapped_range`] rests on: `MADV_DONTNEED` over a
+    /// read-only file mapping discards clean pages, so a range that *is* read
+    /// again reads back exactly what it held. Nothing in the loader re-reads a
+    /// released range — that is checked in `doc/perf/` by watching the
+    /// mapping's `smaps` residency stay flat across a benchmark — but if that
+    /// ever stopped being true, the failure has to be a slow re-fault and not
+    /// wrong weights.
+    ///
+    /// Deliberately releases the *middle* of the mapping and asserts the
+    /// untouched ends too, since the real caller releases one tensor's range
+    /// out of many in the same file.
+    #[test]
+    fn releasing_a_mapped_range_does_not_change_what_it_reads_back() {
+        use std::io::Write;
+
+        // Several pages, so there is a whole page strictly inside the released
+        // range after the inward rounding.
+        let len = 64 * 1024;
+        let want: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&want).expect("write");
+        file.flush().expect("flush");
+
+        let mapped = unsafe { Mmap::map(file.as_file()) }.expect("mmap");
+        let mid = len / 4..len * 3 / 4;
+        assert_eq!(&mapped[..], &want[..], "mapping differs before release");
+        release_mapped_range(&mapped[mid.clone()]);
+        assert_eq!(&mapped[mid.clone()], &want[mid], "released range changed");
+        assert_eq!(&mapped[..], &want[..], "mapping changed outside the range");
+    }
+
+    /// A range shorter than a page, or one whose interior rounds away, must be
+    /// a no-op rather than an `madvise` on a rounded-outward — and therefore
+    /// not-ours — address. Reached in practice by a small `F32` tensor sharing
+    /// a page with its neighbours.
+    #[test]
+    fn releasing_a_sub_page_range_is_a_harmless_no_op() {
+        use std::io::Write;
+
+        let want: Vec<u8> = (0..8192u32).map(|i| (i % 97) as u8).collect();
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&want).expect("write");
+        file.flush().expect("flush");
+
+        let mapped = unsafe { Mmap::map(file.as_file()) }.expect("mmap");
+        // 64 bytes starting one byte into the first page: no whole page inside.
+        release_mapped_range(&mapped[1..65]);
+        assert_eq!(&mapped[..], &want[..]);
     }
 
     #[test]

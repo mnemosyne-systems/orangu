@@ -10,3 +10,4 @@ llama.cpp/
 .ci-models/
 src/bin/orangu-server/engine/arch/testdata/
 src/bin/orangu-server/engine/testdata/
+doc/perf/

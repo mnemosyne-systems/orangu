@@ -453,17 +453,52 @@ pub async fn embeddings(
         EmbeddingsInput::Many(v) => v,
     };
     let mut data = Vec::with_capacity(inputs.len());
+    let mut prompt_tokens = 0usize;
     for (index, text) in inputs.into_iter().enumerate() {
         match pooled_embedding(&state, &text).await {
-            Ok(embedding) => data.push(EmbeddingDatum {
-                object: "embedding",
-                embedding,
-                index,
-            }),
+            Ok(pooled) => {
+                prompt_tokens += pooled.prompt_tokens;
+                data.push(EmbeddingDatum {
+                    object: "embedding",
+                    embedding: pooled.embedding,
+                    index,
+                });
+            }
             Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
         }
     }
-    Json(json!({"object": "list", "data": data, "model": state.model_label})).into_response()
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": state.model_label,
+        // OpenAI's embeddings `usage`, which has these two fields and not the
+        // `completion_tokens` of `usage_json` above — there is no completion.
+        // Summed across a batched `input`, as OpenAI's is.
+        //
+        // Not cosmetic: the token count is not recoverable from the response
+        // otherwise, so anything measuring embedding throughput had to
+        // tokenize the input itself with a second tool to learn what it just
+        // paid for. `doc/perf/embed_bench.sh` shelled out to `llama-tokenize`
+        // for exactly this, and `orangu-bench --embed` reads this field
+        // instead — from either server, since llama-server sends it too.
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        },
+    }))
+    .into_response()
+}
+
+/// One embedding and the prompt length that produced it.
+///
+/// The token count is carried out rather than recomputed by the caller
+/// because this is where it is known exactly — `encode_for_embedding` applies
+/// the model's own embedding-specific framing, so a caller re-tokenizing the
+/// same string could easily disagree with the forward pass that was actually
+/// run. It is what `/v1/embeddings` reports as `usage.prompt_tokens`.
+pub(crate) struct PooledEmbedding {
+    pub embedding: Vec<f32>,
+    pub prompt_tokens: usize,
 }
 
 /// Pools a model's per-token final hidden states per its own `<arch>.
@@ -476,8 +511,9 @@ pub async fn embeddings(
 pub(crate) async fn pooled_embedding(
     state: &Arc<AppState>,
     text: &str,
-) -> Result<Vec<f32>, String> {
+) -> Result<PooledEmbedding, String> {
     let tokens = state.engine.tokenizer.encode_for_embedding(text);
+    let prompt_tokens = tokens.len();
     let model = state.engine.model.clone();
     let n_embd = model.config().n_embd;
     let pooling_type = model.config().pooling_type;
@@ -517,7 +553,10 @@ pub(crate) async fn pooled_embedding(
             *v /= norm;
         }
     }
-    Ok(pooled)
+    Ok(PooledEmbedding {
+        embedding: pooled,
+        prompt_tokens,
+    })
 }
 
 #[cfg(test)]

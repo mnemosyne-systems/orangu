@@ -368,7 +368,13 @@ pub async fn embedding(
     Json(req): Json<EmbeddingRequest>,
 ) -> axum::response::Response {
     match super::openai::pooled_embedding(&state, &req.content).await {
-        Ok(embedding) => Json(EmbeddingResponse { embedding }).into_response(),
+        // llama.cpp's native `/embedding` carries the vector and nothing else,
+        // so the token count `PooledEmbedding` also returns is dropped here on
+        // purpose; `/v1/embeddings` is where it surfaces, as `usage`.
+        Ok(pooled) => Json(EmbeddingResponse {
+            embedding: pooled.embedding,
+        })
+        .into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }

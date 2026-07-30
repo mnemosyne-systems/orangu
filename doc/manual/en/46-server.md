@@ -588,7 +588,7 @@ resulting cache is still stored for later requests either way.
 | `GET /v1/models` | |
 | `POST /v1/chat/completions` | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
 | `POST /v1/completions` | legacy OpenAI completion, no chat template needed; disabled under `--embedding` |
-| `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized |
+| `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
 | `GET /health` | |
 | `GET /props` | model + server metadata, including the `backend` and device the model is running on |
 | `GET /slots` | per-slot busy/prompt/generated-token state |

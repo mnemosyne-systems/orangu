@@ -45,7 +45,8 @@
 
 use super::iq_grids::KVALUES_IQ4NL;
 use super::quant::{
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
 };
 
@@ -110,15 +111,44 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
 
 /// Whether a fused kernel exists for `ggml_type` at this `in_dim`. The
 /// `in_dim` check is not paranoia: a GGUF row is only guaranteed to be a
-/// whole number of blocks, and `Q4_K`/`Q6_K` need 256 | `in_dim` while
+/// whole number of blocks, and `Q4_K`/`Q5_K`/`Q6_K` need 256 | `in_dim` while
 /// `Q8_0`/`Q5_0`/`IQ4_NL` need only 32 — a `Qwen2.5-0.5B` is exactly the
 /// case that mixes both (`embedding_length` 896 is 28 blocks of 32 but not
 /// a multiple of 256, which is why its layer weights are `Q5_0`/`IQ4_NL`
 /// and only its `256`-divisible `ffn_down` is a K-quant).
+///
+/// Every quantized type these models actually use is now here. The float
+/// types (`F32`, `F16`, `BF16`) have no int8 weight form and take
+/// [`supports_float`] / [`dot_row_f32`] instead; anything left over falls to
+/// `CpuBackend::matmul_dequant`, which costs far more than its share of a
+/// model's weights suggests — `Q5_K` was 13.9% of `Phi-4-mini`'s bytes and
+/// 48.9% of its decode time before it was added here.
+///
+/// # Adding a type
+///
+/// There are **five** places a type must be registered on the CPU path, and
+/// they are separate dispatches rather than one table — declaring support in
+/// [`supports`] without adding the matching arm elsewhere compiles fine and
+/// panics at the first matmul:
+///
+/// 1. [`supports`] — gates the fused path at all.
+/// 2. [`dot_row_impl`] — decode (`n_tokens == 1`), straight from the bytes.
+/// 3. [`unpack_row`] — the generic prefill GEMM's unpack.
+/// 4. [`supports_k`] + [`unpack_k_row`] — only if it is a 256-element
+///    super-block type that should take the K-quant GEMM.
+/// 5. [`supports_flat`] — only if it is symmetric with per-32 scales.
+///
+/// 4 and 5 are mutually exclusive, and a type may need neither. Adding
+/// `Q5_K` needed 1-4; step 2 was missed on the first attempt and the
+/// `q5_k_matches_dequantize_reference` test is what caught it.
 pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
     match ggml_type {
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => in_dim.is_multiple_of(32),
-        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL => {
+            in_dim.is_multiple_of(32)
+        }
+        GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS => {
+            in_dim.is_multiple_of(256)
+        }
         _ => false,
     }
 }
@@ -207,9 +237,12 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
     match ggml_type {
         GGML_TYPE_Q8_0 => unpack_q8_0(row, out),
         GGML_TYPE_Q5_0 => unpack_q5_0(row, out),
+        GGML_TYPE_Q4_0 => unpack_q4_0(row, out),
+        GGML_TYPE_Q5_1 => unpack_q5_1(row, out),
         GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
         GGML_TYPE_IQ4_XS => unpack_iq4_xs(row, out),
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
+        GGML_TYPE_Q5_K => unpack_q5_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
         // Unreachable via `supports`, but a wrong answer here would be a
         // silently corrupt forward pass, so make it loud instead.
@@ -816,23 +849,53 @@ unsafe fn unpack_block_iq4_nl_ssse3(qs: &[u8], w: &mut [i8; 32]) {
 
 /// Unpacks a `Q5_0` block's 32 weights into `w`: a nibble from `qs` plus a
 /// 5th bit from `qh`, biased by -16 so the result fits a signed `int8`.
+/// `Q4_0` is `Q5_0` with no high-bit plane and a `-8` zero point, and `Q5_1`
+/// is `Q5_0`'s bit extraction with no zero point at all (its offset is the
+/// per-block `m`, applied in `f32` against the activation sum instead). So all
+/// three share one unpack, parameterized by `qh` and `bias`.
+///
+/// `bias` stays a runtime argument rather than a const generic for the reason
+/// given on [`unpack_q6k_run_neon`]: every call site passes a literal and
+/// `#[inline(always)]` lets LLVM fold it, without a second monomorphization.
 #[inline(always)]
-fn unpack_block_q5_0(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+fn unpack_block_q5_bits(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
     #[cfg(target_arch = "aarch64")]
     {
-        // Safety: `qs` is >= 16 bytes (a Q5_0 block's payload) and `w` is
-        // exactly 32; NEON is baseline on aarch64.
-        unsafe { unpack_block_q5_0_neon(qh, qs, w) }
+        // Safety: `qs` is >= 16 bytes and `w` is exactly 32; NEON is
+        // baseline on aarch64.
+        unsafe { unpack_block_q5_bits_neon(qh, qs, bias, w) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         for j in 0..16 {
             let hi_lo = ((qh >> j) << 4) & 0x10;
             let hi_hi = (qh >> (j + 12)) & 0x10;
-            w[j] = (((qs[j] & 0x0F) as u32 | hi_lo) as i32 - 16) as i8;
-            w[16 + j] = (((qs[j] >> 4) as u32 | hi_hi) as i32 - 16) as i8;
+            w[j] = (((qs[j] & 0x0F) as u32 | hi_lo) as i32 - bias as i32) as i8;
+            w[16 + j] = (((qs[j] >> 4) as u32 | hi_hi) as i32 - bias as i32) as i8;
         }
     }
+}
+
+/// `block_q4_0`: `{ d: f16, qs: [u8; 16] }`, 32 elements — the same nibble
+/// layout as `Q5_0` with no `qh` and a `-8` zero point folded into the
+/// `int8`, so it is symmetric and carries no `min` term.
+#[inline(always)]
+fn unpack_block_q4_0(qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits(0, qs, 8, w);
+}
+
+/// `block_q5_1`: `{ d: f16, m: f16, qh: [u8; 4], qs: [u8; 16] }`, 32
+/// elements. Identical bit extraction to `Q5_0`, but the value is
+/// `d*q + m` rather than `d*(q - 16)` — asymmetric, so `m` survives as a
+/// correction term rather than folding into the weight.
+#[inline(always)]
+fn unpack_block_q5_1(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits(qh, qs, 0, w);
+}
+
+#[inline(always)]
+fn unpack_block_q5_0(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits(qh, qs, 16, w);
 }
 
 /// The scalar loop's per-lane `qh >> j` is what defeats autovectorization
@@ -841,13 +904,13 @@ fn unpack_block_q5_0(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
 /// `qh` byte.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn unpack_block_q5_0_neon(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+unsafe fn unpack_block_q5_bits_neon(qh: u32, qs: &[u8], bias_v: i8, w: &mut [i8; 32]) {
     use std::arch::aarch64::*;
     const SH: [i8; 16] = [0, -1, -2, -3, -4, -5, -6, -7, 0, -1, -2, -3, -4, -5, -6, -7];
     unsafe {
         let sh = vld1q_s8(SH.as_ptr());
         let one = vdupq_n_u8(1);
-        let bias = vdupq_n_s8(16);
+        let bias = vdupq_n_s8(bias_v);
         let v = vld1q_u8(qs.as_ptr());
         // The low half takes `qh` bits 0..15 and the high half bits 16..31;
         // within each, lanes 0..7 come from one byte and 8..15 from the next.
@@ -958,6 +1021,45 @@ fn unpack_q5_0(row: &[u8], out: &mut UnpackedRow) {
     }
 }
 
+// ---------------------------------------------------------------- Q4_0
+
+/// `Q4_0` into the generic [`UnpackedRow`] form. Symmetric like `Q5_0` — the
+/// `-8` zero point folds into the `int8` weight — so no `min` survives and it
+/// also qualifies for the flat-activation GEMM.
+fn unpack_q4_0(row: &[u8], out: &mut UnpackedRow) {
+    const BLOCK_BYTES: usize = 2 + 16;
+    out.has_min = false;
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
+        unpack_block_q4_0(&block[2..], w);
+        out.scale[b] = dw;
+        out.min[b] = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------- Q5_1
+
+/// `Q5_1` into the generic [`UnpackedRow`] form.
+///
+/// The one type here whose offset is **added**: ggml's value is `d*q + m`
+/// while [`UnpackedRow`] is defined as `scale*q - min`, so `min` is `-m`.
+/// Getting that sign wrong would not crash — it would bias every weight in
+/// the tensor by `2m` and read as a mildly degraded model.
+fn unpack_q5_1(row: &[u8], out: &mut UnpackedRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + 4 + 16;
+    out.has_min = true;
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        let m = read_f16(block, 2);
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
+        unpack_block_q5_1(qh, &block[8..], w);
+        out.scale[b] = dw;
+        out.min[b] = -m;
+    }
+}
+
 // -------------------------------------------------------------- IQ4_NL
 
 /// `block_iq4_nl`: `{ d: f16, qs: [u8; 16] }`, 32 elements — `Q4_0`'s block
@@ -1032,6 +1134,53 @@ fn unpack_q4_k(row: &[u8], out: &mut UnpackedRow) {
                 let w = &mut out.q[(sb + half) * 32..(sb + half) * 32 + 32];
                 for (j, &byte) in bytes.iter().enumerate() {
                     w[j] = ((byte >> shift) & 0x0F) as i8;
+                }
+                // One scale per 32-element sub-block.
+                out.scale[sb + half] = d * sc as f32;
+                out.min[sb + half] = dmin * m as f32;
+            }
+            sb += 2;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Q5_K
+
+/// `block_q5_K`: `{ d: f16, dmin: f16, scales: [u8; 12], qh: [u8; 32],
+/// qs: [u8; 128] }`, 256 elements.
+///
+/// Byte-for-byte [`unpack_q4_k`]'s block with a 32-byte high-bit plane
+/// inserted before `qs` — the same relationship `Q5_0` has to `Q4_0`. The
+/// packed 6-bit `sc`/`m` pairs are identical and go through the same
+/// [`get_scale_min_k4`], so the value is `sc * (nibble + 16*hi) - dmin*m`
+/// and the shape is unchanged: per-32 scale, per-32 min, asymmetric.
+///
+/// `qh[l]` holds one bit per 32-element sub-block, `l` indexing the *byte*
+/// within the run exactly as `qs` does. Sub-block `sb` of the super-block
+/// reads bit `sb % 8`: the low nibbles of run `g` take bit `2g`, the high
+/// nibbles bit `2g + 1` (ggml's `u1`/`u2`, each shifted left by 2 per run).
+///
+/// The result is `0..=31`, which still fits `i8`, so nothing downstream
+/// widens — this is why `Q5_K` needs no kernel of its own.
+fn unpack_q5_k(row: &[u8], out: &mut UnpackedRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    out.has_min = true;
+    let mut sb = 0usize; // 32-element sub-block index across the whole row
+    for block in row.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let dmin = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..];
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let hi_mask = 1u8 << (g * 2 + half);
+                let w = &mut out.q[(sb + half) * 32..(sb + half) * 32 + 32];
+                for (j, &byte) in bytes.iter().enumerate() {
+                    let hi = if qh[j] & hi_mask != 0 { 16 } else { 0 };
+                    w[j] = (((byte >> shift) & 0x0F) + hi) as i8;
                 }
                 // One scale per 32-element sub-block.
                 out.scale[sb + half] = d * sc as f32;
@@ -1381,7 +1530,7 @@ const Q6K_GROUPS: usize = SUPER_BLOCK / GROUP;
 pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
     matches!(
         ggml_type,
-        GGML_TYPE_Q4_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
+        GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
     ) && in_dim.is_multiple_of(SUPER_BLOCK)
 }
 
@@ -1565,6 +1714,12 @@ pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
             out.resize_for(in_dim, KKind::Q4K);
             unpack_k_q4_k(row, out);
         }
+        // Same loop shape as `Q4_K` — per-32 integer scale and min — so it
+        // shares the kind and therefore `dot_k_pair` unchanged.
+        GGML_TYPE_Q5_K => {
+            out.resize_for(in_dim, KKind::Q4K);
+            unpack_k_q5_k(row, out);
+        }
         GGML_TYPE_Q6_K => {
             out.resize_for(in_dim, KKind::Q6K);
             unpack_k_q6_k(row, out);
@@ -1594,6 +1749,37 @@ fn unpack_k_q4_k(row: &[u8], out: &mut KRow) {
                 let w = &mut out.q[(sb + half) * 32..(sb + half) * 32 + 32];
                 for (j, &byte) in bytes.iter().enumerate() {
                     w[j] = ((byte >> shift) & 0x0F) as i8;
+                }
+                out.sc[sb + half] = sc as i16;
+                out.mins[sb + half] = m as i16;
+            }
+            sb += 2;
+        }
+    }
+}
+
+/// Same bit layout as [`unpack_q5_k`], but `sc`/`m` stay integers and
+/// `d`/`dmin` are kept once per super-block — i.e. [`unpack_k_q4_k`] with the
+/// high-bit plane applied. Fills a [`KKind::Q4K`] row, because that *is* the
+/// shape: per-32 integer scale, per-32 integer min, asymmetric.
+fn unpack_k_q5_k(row: &[u8], out: &mut KRow) {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    let mut sb = 0usize;
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        out.d[s] = read_f16(block, 0);
+        out.dmin[s] = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..];
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let hi_mask = 1u8 << (g * 2 + half);
+                let w = &mut out.q[(sb + half) * 32..(sb + half) * 32 + 32];
+                for (j, &byte) in bytes.iter().enumerate() {
+                    let hi = if qh[j] & hi_mask != 0 { 16 } else { 0 };
+                    w[j] = (((byte >> shift) & 0x0F) + hi) as i8;
                 }
                 out.sc[sb + half] = sc as i16;
                 out.mins[sb + half] = m as i16;
@@ -1944,7 +2130,7 @@ fn store_tile(tl: usize, acc: &[f32; TOKEN_TILE], out: &mut [f32]) {
 pub fn supports_flat(ggml_type: u32, in_dim: usize) -> bool {
     matches!(
         ggml_type,
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_IQ4_NL
     ) && in_dim.is_multiple_of(ACT_BLOCK)
 }
 
@@ -2170,8 +2356,11 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
     match ggml_type {
         GGML_TYPE_Q8_0 => dot_q8_0::<ISA>(row, act),
         GGML_TYPE_Q5_0 => dot_q5_0::<ISA>(row, act),
+        GGML_TYPE_Q4_0 => dot_q4_0::<ISA>(row, act),
+        GGML_TYPE_Q5_1 => dot_q5_1::<ISA>(row, act),
         GGML_TYPE_IQ4_NL => dot_iq4_nl::<ISA>(row, act),
         GGML_TYPE_Q4_K => dot_q4_k::<ISA>(row, act),
+        GGML_TYPE_Q5_K => dot_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
         other => panic!("vecdot::dot_row called for unsupported ggml_type {other}"),
@@ -2182,6 +2371,126 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
 #[inline(always)]
 fn block_sum(act: &ActQ8, b: usize) -> i32 {
     act.sums[b * 2] + act.sums[b * 2 + 1]
+}
+
+// =====================================================================
+// Float weights: widen and FMA, no activation quantization.
+//
+// `F32`, `F16` and `BF16` are the types this module never had a kernel for,
+// and they are a different problem from the quantized ones. There is no
+// int8 form of the weights to dot against, and inventing one would quantize
+// weights that the file stores in full precision — an accuracy change ggml
+// does not make. So these keep `f32` arithmetic and fix the two things that
+// were actually wrong with the fallback:
+//
+// 1. `matmul_dequant` widens each row into a **freshly allocated
+//    `Vec<f32>`** (`QuantMatrix::row` -> `quant::dequantize`). Same defect
+//    the fused path removed long ago; it was never removed here.
+// 2. `tensor::dot` has an AVX2 path and **no NEON path at all**, so on
+//    aarch64 it is `dot_scalar` — one accumulator, which makes the loop a
+//    serial dependency chain of `in_dim` FMAs at ~4 cycles of latency each.
+//
+// Both go away by widening one 16-element block at a time into a stack
+// array and accumulating into eight lanes, which is two independent 4-wide
+// chains. Nothing is materialized to memory and nothing is allocated.
+//
+// This is why `BF16` was the last unfused type: it is 0.9-1.1% of the two
+// `gemma-4` files (`per_layer_model_proj`), and those were the lowest fused
+// decode ratios in the sweep.
+// =====================================================================
+
+/// Elements widened per iteration of the float dot. 16 covers two 4-wide
+/// NEON registers' worth of accumulators with a chain depth of two.
+const FLOAT_BLOCK: usize = 16;
+
+/// Whether [`dot_row_f32`] has a kernel for `ggml_type`.
+///
+/// Unlike [`supports`] there is no `in_dim` condition: these types have no
+/// block structure, so any row length works, tail included.
+///
+/// This is deliberately *not* folded into [`supports`]. That one promises a
+/// kernel taking [`ActQ8`], and these take `&[f32]` — a caller that confused
+/// the two would compile and then quantize activations it must not quantize.
+pub fn supports_float(ggml_type: u32) -> bool {
+    matches!(ggml_type, GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16)
+}
+
+/// `sum_i weight_row[i] * x[i]` for one token, straight from the float
+/// bytes. `ggml_type` must have passed [`supports_float`].
+///
+/// Activations stay `f32`: unlike the quantized kernels above, this adds no
+/// error of its own beyond `f32` summation order.
+pub fn dot_row_f32(ggml_type: u32, row: &[u8], x: &[f32]) -> f32 {
+    match ggml_type {
+        GGML_TYPE_F32 => dot_float::<FKIND_F32>(row, x),
+        GGML_TYPE_F16 => dot_float::<FKIND_F16>(row, x),
+        GGML_TYPE_BF16 => dot_float::<FKIND_BF16>(row, x),
+        other => panic!("vecdot::dot_row_f32 called for unsupported ggml_type {other}"),
+    }
+}
+
+const FKIND_F32: u8 = 0;
+const FKIND_F16: u8 = 1;
+const FKIND_BF16: u8 = 2;
+
+/// Bytes per weight for a float kind.
+#[inline(always)]
+const fn float_stride<const KIND: u8>() -> usize {
+    if KIND == FKIND_F32 { 4 } else { 2 }
+}
+
+/// One weight, widened to `f32`.
+///
+/// `BF16` is the cheap one — it is the *top* 16 bits of the `f32`, so
+/// widening is a shift with no exponent rebiasing, which is why ggml can
+/// convert it with a byte shuffle.
+#[inline(always)]
+fn widen_float<const KIND: u8>(row: &[u8], i: usize) -> f32 {
+    let at = i * float_stride::<KIND>();
+    match KIND {
+        FKIND_F32 => f32::from_le_bytes([row[at], row[at + 1], row[at + 2], row[at + 3]]),
+        FKIND_BF16 => f32::from_bits((u16::from_le_bytes([row[at], row[at + 1]]) as u32) << 16),
+        _ => read_f16(row, at),
+    }
+}
+
+/// Both operands are walked with [`slice::chunks_exact`] so every index the
+/// inner loops perform is provably in bounds and LLVM will vectorize them.
+/// Indexing `row`/`x` against a separately-derived length instead costs a
+/// compare-and-branch per element and blocks the vectorizer outright — the
+/// mistake is easy to make and invisible without `objdump`; `tensor::dot`
+/// documents the same trap after hitting it.
+fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
+    const LANES: usize = 8;
+    let stride = float_stride::<KIND>();
+    debug_assert!(row.len() >= x.len() * stride);
+
+    // Eight lanes, not one: two independent 4-wide chains cover the FMA
+    // latency a single accumulator would serialize on.
+    let mut acc = [0f32; LANES];
+    let mut w = [0f32; FLOAT_BLOCK];
+
+    let mut rows = row[..x.len() * stride].chunks_exact(FLOAT_BLOCK * stride);
+    let mut xs = x.chunks_exact(FLOAT_BLOCK);
+    for (rb, xb) in rows.by_ref().zip(xs.by_ref()) {
+        for (j, slot) in w.iter_mut().enumerate() {
+            *slot = widen_float::<KIND>(rb, j);
+        }
+        for half in 0..FLOAT_BLOCK / LANES {
+            for lane in 0..LANES {
+                acc[lane] += w[half * LANES + lane] * xb[half * LANES + lane];
+            }
+        }
+    }
+
+    let mut total: f32 = acc.iter().sum();
+    // Tail: these types carry no block structure, so `in_dim` need not be a
+    // multiple of anything and a row can end mid-block.
+    let rb = rows.remainder();
+    for (j, xv) in xs.remainder().iter().enumerate() {
+        total += widen_float::<KIND>(rb, j) * xv;
+    }
+    total
 }
 
 /// `block_q8_0`: `{ d: f16, qs: [i8; 32] }` — already `int8`, no unpack at all.
@@ -2225,6 +2534,38 @@ fn dot_q5_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     total
 }
 
+/// `block_q4_0`, 32 elements: low nibbles then high nibbles, biased by -8
+/// into a signed `int8`. Symmetric, so no correction term.
+fn dot_q4_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 16;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        unpack_block_q4_0(&block[2..], &mut w);
+        total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
+    }
+    total
+}
+
+/// `block_q5_1`, 32 elements: `Q5_0`'s bit layout with `value = d*q + m`.
+/// The `+m` is applied against the block's activation sum, the same way
+/// [`dot_q4_k`] applies `-dmin*m` — note the opposite sign.
+fn dot_q5_1<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + 4 + 16;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let dw = read_f16(block, 0);
+        let m = read_f16(block, 2);
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        unpack_block_q5_1(qh, &block[8..], &mut w);
+        let isum = dot32::<ISA>(&w, &act.q[b * 32..]);
+        total += act.d[b] * (dw * isum as f32 + m * block_sum(act, b) as f32);
+    }
+    total
+}
+
 /// `block_q4_K`, 256 elements as eight 32-element sub-blocks. Asymmetric:
 /// `value = d*sc*q - dmin*m`, so the min term is applied against the block's
 /// activation sum rather than folded into the weight.
@@ -2245,6 +2586,41 @@ fn dot_q4_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
                 let mut w = [0i8; 32];
                 for (j, &byte) in bytes.iter().enumerate() {
                     w[j] = ((byte >> shift) & 0x0F) as i8;
+                }
+                let isum = dot32::<ISA>(&w, &act.q[b * 32..]);
+                total += act.d[b]
+                    * (d * sc as f32 * isum as f32 - dmin * m as f32 * block_sum(act, b) as f32);
+            }
+            sb += 2;
+        }
+    }
+    total
+}
+
+/// `block_q5_K`, 256 elements — [`dot_q4_k`] with the 5th bit taken from the
+/// `qh` plane. Same asymmetric form (`value = d*sc*q - dmin*m`), so the min
+/// term is likewise applied against the block's activation sum rather than
+/// folded into the weight; see [`unpack_q5_k`] for the bit mapping.
+fn dot_q5_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    let mut total = 0f32;
+    let mut sb = 0usize;
+    for block in row.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let dmin = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..];
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let hi_mask = 1u8 << (g * 2 + half);
+                let b = sb + half;
+                let mut w = [0i8; 32];
+                for (j, &byte) in bytes.iter().enumerate() {
+                    let hi = if qh[j] & hi_mask != 0 { 16 } else { 0 };
+                    w[j] = (((byte >> shift) & 0x0F) + hi) as i8;
                 }
                 let isum = dot32::<ISA>(&w, &act.q[b * 32..]);
                 total += act.d[b]
@@ -2344,8 +2720,11 @@ mod tests {
         let (block_bytes, block_elems) = match ggml_type {
             GGML_TYPE_Q8_0 => (34, 32),
             GGML_TYPE_Q5_0 => (22, 32),
+            GGML_TYPE_Q4_0 => (18, 32),
+            GGML_TYPE_Q5_1 => (24, 32),
             GGML_TYPE_IQ4_NL => (18, 32),
             GGML_TYPE_Q4_K => (144, 256),
+            GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
             other => panic!("unhandled {other}"),
@@ -2358,10 +2737,16 @@ mod tests {
         // and leave the quant payload random.
         for block in row.chunks_exact_mut(block_bytes) {
             match ggml_type {
-                GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_IQ4_NL => {
+                GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_IQ4_NL => {
                     block[0..2].copy_from_slice(&[0x00, 0x30])
                 }
-                GGML_TYPE_Q4_K => {
+                // `Q5_1` carries `d` then `m`, both `f16`.
+                GGML_TYPE_Q5_1 => {
+                    block[0..2].copy_from_slice(&[0x00, 0x30]);
+                    block[2..4].copy_from_slice(&[0x00, 0x2c]);
+                }
+                // `Q5_K` shares `Q4_K`'s leading `d`/`dmin` pair.
+                GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
                     block[2..4].copy_from_slice(&[0x00, 0x2c]);
                 }
@@ -2412,6 +2797,119 @@ mod tests {
             (via_row - via_unpack).abs() <= 1e-3 * scale.max(1e-6),
             "type {ggml_type} in_dim {in_dim}: dot_row {via_row} vs unpack {via_unpack}"
         );
+    }
+
+    /// A float weight row of `in_dim` elements, from pseudo-random bytes with
+    /// every exponent pinned to 0 so the values land in `±[1, 2)`.
+    ///
+    /// Random bytes in a float field decode to Inf/NaN often enough to make a
+    /// dot-product comparison meaningless — the same reason [`check`] pins the
+    /// `f16` scale of each quantized block. Only the exponent is forced; sign
+    /// and mantissa stay random.
+    fn float_row(ggml_type: u32, in_dim: usize, seed: u32) -> Vec<u8> {
+        let stride = if ggml_type == GGML_TYPE_F32 { 4 } else { 2 };
+        let mut row = pseudo_bytes(in_dim * stride, seed);
+        for e in row.chunks_exact_mut(stride) {
+            match ggml_type {
+                GGML_TYPE_F32 => {
+                    let bits = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                    let pinned = (bits & 0x807F_FFFF) | (127 << 23);
+                    e.copy_from_slice(&pinned.to_le_bytes());
+                }
+                // `f16`: sign 1, exponent 5 (bias 15), mantissa 10.
+                GGML_TYPE_F16 => {
+                    let bits = u16::from_le_bytes([e[0], e[1]]);
+                    let pinned = (bits & 0x83FF) | (15 << 10);
+                    e.copy_from_slice(&pinned.to_le_bytes());
+                }
+                // `bf16`: sign 1, exponent 8 (bias 127), mantissa 7.
+                GGML_TYPE_BF16 => {
+                    let bits = u16::from_le_bytes([e[0], e[1]]);
+                    let pinned = (bits & 0x807F) | (127 << 7);
+                    e.copy_from_slice(&pinned.to_le_bytes());
+                }
+                other => panic!("unhandled {other}"),
+            }
+        }
+        row
+    }
+
+    /// Unlike the quantized kernels, the float path quantizes nothing, so it
+    /// must agree with `dequantize` + an exact `f32` dot to *summation-order*
+    /// precision — three orders of magnitude tighter than [`check`]'s budget.
+    fn check_float(ggml_type: u32, in_dim: usize, seed: u32) {
+        let row = float_row(ggml_type, in_dim, seed);
+        let x = activations(in_dim);
+        let widened = quant::dequantize(ggml_type, &row, in_dim).unwrap();
+        let reference: f32 = widened.iter().zip(&x).map(|(w, v)| w * v).sum();
+        let scale: f32 = widened.iter().zip(&x).map(|(w, v)| (w * v).abs()).sum();
+
+        assert!(supports_float(ggml_type), "type {ggml_type}");
+        let got = dot_row_f32(ggml_type, &row, &x);
+        let err = (got - reference).abs();
+        assert!(
+            err <= 1e-5 * scale.max(1e-6),
+            "type {ggml_type} in_dim {in_dim}: got {got}, want {reference} \
+             (err {err}, term-magnitude {scale})"
+        );
+    }
+
+    #[test]
+    fn float_kernels_match_dequantize_reference() {
+        for &t in &[GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16] {
+            for &n in &[16, 32, 256, 2048] {
+                check_float(t, n, 0x51D5 + t);
+            }
+        }
+    }
+
+    /// `F32`/`F16`/`BF16` rows carry no block structure, so `in_dim` need not
+    /// be a multiple of anything — including of `FLOAT_BLOCK`, which the main
+    /// loop widens 16 at a time. A row shorter than one block, or ending
+    /// mid-block, must still be exact.
+    #[test]
+    fn float_dot_handles_rows_that_are_not_a_whole_block() {
+        for &t in &[GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16] {
+            for &n in &[1, 7, 15, 17, 31, 33, 100] {
+                check_float(t, n, 0x2C0F + t + n as u32);
+            }
+        }
+    }
+
+    /// Widening `bf16` is a pure shift — the top 16 bits of the `f32` — so it
+    /// is exact for every bit pattern, with no rounding to hide a mistake.
+    /// A wrong shift or a byte-order slip would show up here and nowhere else.
+    #[test]
+    fn bf16_widening_is_the_top_half_of_the_f32() {
+        for raw in [0x0000u16, 0x3F80, 0xBF80, 0x4049, 0x7F7F, 0x8000] {
+            let bytes = raw.to_le_bytes();
+            let got = widen_float::<FKIND_BF16>(&bytes, 0);
+            assert_eq!(got.to_bits() >> 16, raw as u32, "bf16 {raw:#06x}");
+        }
+    }
+
+    #[test]
+    fn supports_float_covers_only_the_float_types() {
+        for &t in &[GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16] {
+            assert!(supports_float(t), "type {t}");
+        }
+        // The quantized types have an `int8` weight form and must keep taking
+        // `supports`/`dot_row`; routing one here would silently drop its
+        // scales, since `dot_row_f32` reads the bytes as raw floats.
+        for &t in &[
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q5_0,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_Q5_1,
+            GGML_TYPE_IQ4_NL,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+        ] {
+            assert!(!supports_float(t), "type {t}");
+            assert!(!supports(t, 0) || !supports_float(t), "type {t}");
+        }
     }
 
     /// The tiled multi-token path must agree with calling the single-token
@@ -2576,11 +3074,114 @@ mod tests {
     }
 
     #[test]
+    fn q5_k_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q5_K, 256, seed);
+            check(GGML_TYPE_Q5_K, 3072, seed);
+            check(GGML_TYPE_Q5_K, 4864, seed);
+        }
+    }
+
+    /// The high-bit plane is the only thing separating `Q5_K` from `Q4_K`, and
+    /// getting its bit-to-sub-block mapping wrong is the realistic failure
+    /// mode: it would still produce plausible values, just the wrong ones, in
+    /// six of eight sub-blocks. Pin it directly — every `qh` bit set and every
+    /// nibble zero means every unpacked weight must be exactly 16.
+    #[test]
+    fn q5_k_unpack_applies_the_high_bit_to_every_sub_block() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes()); // d
+        block.extend_from_slice(&half::f16::from_f32(0.0).to_le_bytes()); // dmin
+        block.extend_from_slice(&[1u8, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]); // sc=1, m=0
+        block.extend_from_slice(&[0xFFu8; 32]); // qh: every high bit set
+        block.extend_from_slice(&[0x00u8; 128]); // qs: every nibble 0
+
+        let mut row = UnpackedRow::new();
+        unpack_row(GGML_TYPE_Q5_K, &block, 256, &mut row);
+        assert!(
+            row.q.iter().all(|&q| q == 16),
+            "every weight should be the bare high bit; got {:?}",
+            &row.q[..16]
+        );
+
+        let mut krow = KRow::new();
+        unpack_k_row(GGML_TYPE_Q5_K, &block, 256, &mut krow);
+        assert!(
+            krow.q.iter().all(|&q| q == 16),
+            "K-path disagrees with the GEMV path; got {:?}",
+            &krow.q[..16]
+        );
+        assert_eq!(krow.kind, KKind::Q4K);
+    }
+
+    #[test]
     fn q6_k_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
             check(GGML_TYPE_Q6_K, 256, seed);
             check(GGML_TYPE_Q6_K, 4864, seed);
         }
+    }
+
+    #[test]
+    fn q4_0_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q4_0, 32, seed);
+            check(GGML_TYPE_Q4_0, 896, seed);
+            check(GGML_TYPE_Q4_0, 4864, seed);
+        }
+    }
+
+    #[test]
+    fn q5_1_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q5_1, 32, seed);
+            check(GGML_TYPE_Q5_1, 896, seed);
+            check(GGML_TYPE_Q5_1, 4864, seed);
+        }
+    }
+
+    /// `Q5_1`'s offset is **added** (`d*q + m`) where every other asymmetric
+    /// type here subtracts it, and [`UnpackedRow`] is defined as
+    /// `scale*q - min`. A sign slip would not crash or produce garbage — it
+    /// would bias every weight by `2m` and read as a slightly worse model,
+    /// which is the failure mode this whole document warns about. Pin it:
+    /// `d = 0` makes the quantized term vanish, so every weight is exactly
+    /// `m`.
+    #[test]
+    fn q5_1_min_term_is_added_not_subtracted() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&half::f16::from_f32(0.0).to_le_bytes()); // d
+        block.extend_from_slice(&half::f16::from_f32(2.5).to_le_bytes()); // m
+        block.extend_from_slice(&[0u8; 4]); // qh
+        block.extend_from_slice(&[0u8; 16]); // qs
+
+        let reference = quant::dequantize(GGML_TYPE_Q5_1, &block, 32).unwrap();
+        assert!(
+            reference.iter().all(|&v| (v - 2.5).abs() < 1e-6),
+            "{reference:?}"
+        );
+
+        let mut row = UnpackedRow::new();
+        unpack_row(GGML_TYPE_Q5_1, &block, 32, &mut row);
+        assert!(row.has_min);
+        // `scale*q - min` with q = 0 must give +2.5, so `min` is -2.5.
+        assert!((row.min[0] + 2.5).abs() < 1e-6, "min was {}", row.min[0]);
+    }
+
+    /// `Q4_0` is `Q5_0` with no high-bit plane and a -8 zero point; both go
+    /// through one unpack, so the risk is the shared path applying the wrong
+    /// bias. All-zero nibbles at `d = 1.0` must be exactly -8 (`Q5_0`'s
+    /// answer would be -16).
+    #[test]
+    fn q4_0_uses_its_own_zero_point_not_q5_0s() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        block.extend_from_slice(&[0u8; 16]);
+
+        let mut row = UnpackedRow::new();
+        unpack_row(GGML_TYPE_Q4_0, &block, 32, &mut row);
+        assert!(!row.has_min);
+        assert!(row.q.iter().all(|&q| q == -8), "got {:?}", &row.q[..8]);
     }
 
     #[test]
@@ -2594,9 +3195,14 @@ mod tests {
         assert!(!supports(GGML_TYPE_IQ4_NL, 24));
         assert!(!supports(GGML_TYPE_Q4_K, 896));
         assert!(!supports(GGML_TYPE_Q6_K, 896));
+        assert!(!supports(GGML_TYPE_Q5_K, 896));
+        // `Q4_0`/`Q5_1` are per-32 like `Q5_0`, so 896 is fine for them.
+        assert!(supports(GGML_TYPE_Q4_0, 896));
+        assert!(supports(GGML_TYPE_Q5_1, 896));
+        assert!(!supports(GGML_TYPE_Q4_0, 24));
         // And types with no fused kernel stay on the old path regardless.
         assert!(!supports(quant::GGML_TYPE_F32, 1024));
-        assert!(!supports(quant::GGML_TYPE_Q5_K, 1024));
+        assert!(!supports(quant::GGML_TYPE_BF16, 1024));
     }
 
     #[test]
@@ -2780,6 +3386,12 @@ mod tests {
     fn supports_k_covers_only_the_k_quants() {
         assert!(supports_k(GGML_TYPE_Q4_K, 2048));
         assert!(supports_k(GGML_TYPE_Q6_K, 8192));
+        // `Q5_K` is `Q4_K` plus a high-bit plane: same per-32 scale-and-min
+        // shape, so it takes the same kernel and must never reach the
+        // symmetric flat GEMM.
+        assert!(supports_k(GGML_TYPE_Q5_K, 2048));
+        assert!(!supports_flat(GGML_TYPE_Q5_K, 2048));
+        assert!(!supports_k(GGML_TYPE_Q5_K, 896));
         // `IQ4_XS` is a 256-element super-block type like the other two, and
         // must NOT be claimed by `supports_flat` — its scales are per-32 but
         // it accumulates per-256, which is the K-quant kernel's shape.
@@ -2976,6 +3588,12 @@ mod tests {
         // kernel sees it. Omitting it here would not be wrong, just slow —
         // it would fall back to the generic GEMM this path exists to beat.
         assert!(supports_flat(GGML_TYPE_IQ4_NL, 896));
+        // `Q4_0` is symmetric per-32 and qualifies; `Q5_1` looks identical
+        // on the wire but carries a per-block `m`, which this kernel has no
+        // term for — claiming it here would silently drop the offset from
+        // every weight.
+        assert!(supports_flat(GGML_TYPE_Q4_0, 896));
+        assert!(!supports_flat(GGML_TYPE_Q5_1, 896));
         // The K-quants are routed to `dot_k_pair` before this is consulted,
         // and this kernel has no min correction and no per-GROUP branch, so
         // it must decline them rather than compute them wrongly.

@@ -37,8 +37,8 @@ const PAR_ELEMS_THRESHOLD: usize = 1 << 15;
 /// Dot product of two equal-length `f32` slices, auto-vectorized via
 /// AVX2+FMA where available (`RUSTFLAGS`-independent — checked once per
 /// call site at runtime, not assumed from `.cargo/config.toml`'s
-/// compile-time baseline; see `doc/BUILDING.md`), falling back to a
-/// scalar loop everywhere else.
+/// compile-time baseline; see `doc/BUILDING.md`), falling back to
+/// [`dot_scalar`] everywhere else.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
@@ -53,11 +53,251 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { dot_avx2(a, b) };
         }
     }
+    // No runtime check on aarch64: NEON is mandatory in ARMv8-A, the same
+    // reason `vecdot`'s dispatch table lists `ISA_BASELINE` as always
+    // available. Written as a tail expression rather than an early `return`
+    // because on aarch64 the other arm is `cfg`-ed away entirely and this
+    // block *is* the tail — which `clippy::needless_return` correctly points
+    // out.
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_neon(a, b)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     dot_scalar(a, b)
 }
 
+/// Two `float32x4_t` accumulators and `vfmaq_f32`, for the reason [`dot_avx2`]
+/// gives — this is the aarch64 half of the same argument.
+///
+/// It exists because the portable [`dot_scalar`] below **cannot be coaxed into
+/// full-width NEON from source**. With the accumulator lanes written out LLVM
+/// does vectorize it, but it picks de-interleaving `ld2` loads into four
+/// 2-lane registers and separate `fmul`/`fadd` — correct, half the machine's
+/// width, and twice the instruction count. Writing the accumulators as two
+/// explicit arrays of four changes nothing; the SLP vectorizer canonicalises
+/// both spellings to the same output. Verified by `objdump` across three
+/// spellings before reaching for intrinsics — see
+/// `doc/perf/annotate-dot_scalar.txt`.
+///
+/// Fused multiply-add, unlike `axpy_inplace` next door: an FMA rounds once
+/// where a separate multiply and add round twice, and `dot` is allowed to
+/// differ there because its reference is not a specific scalar loop.
+#[cfg(target_arch = "aarch64")]
+fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len().min(b.len());
+    // Safety: every load below is bounded by `i + 8 <= n <= a.len().min(b.len())`,
+    // and NEON is unconditionally present on this target.
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut i = 0;
+        while i + DOT_LANES <= n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4)));
+            i += DOT_LANES;
+        }
+        let mut total = vaddvq_f32(vaddq_f32(acc0, acc1));
+        while i < n {
+            total += a[i] * b[i];
+            i += 1;
+        }
+        total
+    }
+}
+
+/// Lanes in [`dot_scalar`]'s accumulator. Eight, for the reason spelled out
+/// on [`dot_avx2`]: enough independent chains to cover FMA latency, and
+/// two NEON `float32x4_t` registers' worth on aarch64.
+const DOT_LANES: usize = 8;
+
+/// Default right-hand operands per [`dot_multi`] call, when
+/// `engine::attention` is not told otherwise.
+///
+/// **Four, measured.** Widths interleaved across rounds in one build with width 1
+/// as the in-build control (`doc/perf/attn-batch/`), SmolLM2-360M `Q4_K_S`:
+///
+/// | prompt | width 1 | width 2 | width 4 |
+/// |---|---:|---:|---:|
+/// | 2237 tok, rounds 2-3 | 12.93 / 12.94 | +1.3% / +1.8% | **+1.9% / +1.9%** |
+/// | 4447 tok, 2 rounds | 8.59 / 9.00 | — | **+3.5% / 0.0%** |
+///
+/// Four was never worse than two and never worse than one; two trails it by
+/// 0.2-0.8%, consistently in sign and never by much, so **two is the conservative
+/// choice if a narrower-bus part ever shows trouble** — the numbers do not
+/// separate them sharply.
+///
+/// The trade-off runs both ways, which is why this is measured rather than
+/// chosen. A wider batch amortizes the shared query load, the accumulator zeroing
+/// and the output row's load/store; it also puts that many strided cache rows in
+/// flight per thread, and `PERFORMANCE.md` records four-row blocking in the GEMV
+/// kernel gaining +10% single-threaded and losing 4-10% at four threads for
+/// exactly that reason. Here the two nearly cancel: the instruction shares
+/// predicted ~10% end-to-end and ~2% arrived.
+///
+/// **This box is the worst case for a wide batch** — least bandwidth per core in
+/// the range orangu targets — so the stream penalty is at its largest here while
+/// the issue saving is machine-independent. Expect a wider batch to pay better on
+/// an A76-or-later part, and re-run the sweep there rather than assuming it.
+/// `ORANGU_ATTENTION_BATCH` overrides this without a rebuild.
+pub const DOT_MULTI: usize = 4;
+
+/// `N` dot products sharing one left operand, each **bit-identical** to [`dot`]
+/// of the same pair.
+///
+/// `engine::attention`'s score loop is one `dot` per (query, head, position),
+/// and `perf annotate` on a 2048-token prefill says where that goes: 21.3% of
+/// the kernel is the *query* load `ldp q5, q6, [x0, #-0x10]` and 11.0% the key
+/// load, against **0.8% for the `fmla`**. Not bandwidth — the L1 miss rate over
+/// that window is 1.11%, and 671 M misses in 60 s is 0.72 GB/s against a
+/// 3.40 GB/s bus. Load *issue*: two 128-bit loads per two FMAs, at IPC 1.02 on a
+/// 3-wide core.
+///
+/// The query is the same `head_dim` floats for every position in a window, so
+/// loading it once per `N` positions removes `(N-1)/N` of the larger of those two
+/// lines. Per eight elements this issues 2 query loads and `2N` key loads for
+/// `8N` MACs, against `4N` loads for the same work from `N` separate [`dot`]
+/// calls. What it costs in exchange is `N` strided rows in flight; see
+/// [`DOT_MULTI`].
+///
+/// **Bit-identical, not merely close**, by design: each output keeps its own pair
+/// of accumulators laid out exactly as [`dot_neon`]'s, so lane assignment and
+/// summation order match a single `dot` per output. `engine::attention`'s
+/// bit-identity test against the head-outer reference therefore still holds with
+/// this in the score loop — if it fails, this accumulator structure has drifted
+/// from `dot_neon`'s, which is what it is there to catch.
+///
+/// `#[inline(always)]` because this is called from attention's innermost loop and
+/// is big enough that LLVM declines to inline it unprompted; `engine::vecdot`
+/// marks its per-block kernels the same way for the same reason.
+#[inline(always)]
+pub fn dot_multi<const N: usize>(a: &[f32], b: [&[f32]; N]) -> [f32; N] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_multi_neon(a, b)
+    }
+    // Every other target defers to `dot`, the only way to stay consistent with
+    // it without duplicating `dot_avx2`'s four-accumulator structure here. x86-64
+    // loses the load sharing until someone writes `dot_multi_avx2`; it loses no
+    // accuracy and no correctness.
+    #[cfg(not(target_arch = "aarch64"))]
+    std::array::from_fn(|j| dot(a, b[j]))
+}
+
+/// The aarch64 kernel behind [`dot_multi`]: `2N` accumulators, two per output,
+/// mirroring [`dot_neon`]'s pair exactly.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn dot_multi_neon<const N: usize>(a: &[f32], b: [&[f32]; N]) -> [f32; N] {
+    use std::arch::aarch64::*;
+    let n = b.iter().fold(a.len(), |m, s| m.min(s.len()));
+    // Safety: every load is bounded by `i + 8 <= n`, the minimum length over `a`
+    // and all of `b`. NEON is unconditional on this target.
+    unsafe {
+        let mut acc0 = [vdupq_n_f32(0.0); N];
+        let mut acc1 = [vdupq_n_f32(0.0); N];
+        let pa = a.as_ptr();
+        let pb: [*const f32; N] = std::array::from_fn(|j| b[j].as_ptr());
+        let mut i = 0;
+        while i + DOT_LANES <= n {
+            // Loaded once, used `2N` times: the whole point of the function.
+            let a0 = vld1q_f32(pa.add(i));
+            let a1 = vld1q_f32(pa.add(i + 4));
+            for j in 0..N {
+                acc0[j] = vfmaq_f32(acc0[j], a0, vld1q_f32(pb[j].add(i)));
+                acc1[j] = vfmaq_f32(acc1[j], a1, vld1q_f32(pb[j].add(i + 4)));
+            }
+            i += DOT_LANES;
+        }
+        let mut out = [0f32; N];
+        for j in 0..N {
+            // Same reduction and same scalar tail as `dot_neon`, in the same
+            // order, which is what makes each result bit-identical to it.
+            let mut total = vaddvq_f32(vaddq_f32(acc0[j], acc1[j]));
+            let mut t = i;
+            while t < n {
+                total += a[t] * b[j][t];
+                t += 1;
+            }
+            out[j] = total;
+        }
+        out
+    }
+}
+
+/// The portable path: every target without one of the two vector kernels,
+/// and the reference both of them are tested against.
+///
+/// It is no longer a plain `.sum()`. `dot_avx2` below documents at length why
+/// one accumulator is the wrong shape here: a single running total makes the
+/// loop a dependency chain of `n` FMAs at ~4 cycles of latency each, when the
+/// core can issue two per cycle. That reasoning was never x86-specific, but
+/// for most of this file's life the *implementation* was, so every other
+/// target — including the aarch64 reference box, which has no AVX2 by
+/// construction — silently took the serial form. It matters because of where
+/// `dot` is called from: `engine::attention` runs one per (query, head,
+/// window position).
+///
+/// Rust will not reassociate `f32` addition on its own — that is a
+/// correctness guarantee, not a missed optimization — so the accumulator
+/// lanes have to be written out before LLVM may vectorize at all.
+///
+/// **The `chunks_exact` pairing is load-bearing, not style.** An earlier
+/// version of this loop indexed `a[i + lane]` against a length derived from
+/// `a.len().min(b.len())`, and LLVM could not prove those indices in bounds:
+/// it emitted a compare-and-branch per element and vectorized nothing, so the
+/// rewrite bought eight scalar chains and sixteen bounds checks per iteration
+/// and no vectors at all. `chunks_exact` yields slices whose length is known
+/// at compile time, which eliminates the checks and lets the vectorizer run.
+/// Verified by `objdump`, not assumed — see
+/// `doc/perf/annotate-dot_scalar.txt`.
+///
+/// What it will *not* do is reach full width; that is why [`dot_neon`] exists
+/// above rather than relying on this. Do not delete either vector kernel in
+/// favour of this one on the strength of it "auto-vectorizing".
+///
+/// Summation order changes, exactly as it does on the vector paths, and for
+/// the same reason it is fine there: `dot` has never been the reference for a
+/// bit-exact claim (`axpy_inplace` next door is). Blocked summation is if
+/// anything *more* accurate than a running total, not less.
+///
+/// On aarch64 [`dot_neon`] always wins the dispatch, so outside `cfg(test)`
+/// nothing calls this — hence the narrow `allow`. It is kept, and kept
+/// correct, because the tests check both vector kernels against it. On x86-64
+/// it is live whenever AVX2 or FMA is absent.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    const HALF: usize = DOT_LANES / 2;
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+
+    // Two arrays of `HALF`, not one of `DOT_LANES`. Given a single 8-element
+    // accumulator LLVM keeps eight lanes but reaches them with de-interleaving
+    // `ld2` loads into four 2-lane registers — correct, and half the width the
+    // machine offers. Split explicitly, each half maps to one `float32x4_t`
+    // with contiguous loads. Same eight chains either way.
+    let mut acc0 = [0f32; HALF];
+    let mut acc1 = [0f32; HALF];
+
+    let mut ca = a.chunks_exact(DOT_LANES);
+    let mut cb = b.chunks_exact(DOT_LANES);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        for lane in 0..HALF {
+            acc0[lane] += x[lane] * y[lane];
+            acc1[lane] += x[HALF + lane] * y[HALF + lane];
+        }
+    }
+
+    // Pairwise rather than left-to-right, so the reduction itself does not
+    // reintroduce a chain of `DOT_LANES` adds.
+    let mut total =
+        ((acc0[0] + acc1[0]) + (acc0[1] + acc1[1])) + ((acc0[2] + acc1[2]) + (acc0[3] + acc1[3]));
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        total += x * y;
+    }
+    total
 }
 
 /// Four independent accumulators, not one.
@@ -160,6 +400,73 @@ pub fn axpy_inplace(out: &mut [f32], v: &[f32], scale: f32) {
 fn axpy_scalar(out: &mut [f32], v: &[f32], scale: f32) {
     for (o, vi) in out.iter_mut().zip(v.iter()) {
         *o += scale * vi;
+    }
+}
+
+/// `N` value rows accumulated into one output row in a single pass —
+/// `out[i] += Σⱼ scale[j] · v[j][i]` — **bit-identical** to `N`
+/// [`axpy_inplace`] calls in the same order.
+///
+/// [`dot_multi`]'s counterpart, for attention's other half. `perf annotate` put
+/// 20.4% of the kernel in this half's value load, 4.9% in loading the output row
+/// and 8.0% in storing it again, against 0.8% for the arithmetic. Per position
+/// the output row is loaded, updated and stored; taking `N` positions at once
+/// loads and stores it **once**.
+///
+/// Bit-identical because the per-element sequence is unchanged:
+/// `(((o + s₀v₀) + s₁v₁) + …)`, each multiply and add rounding separately, in
+/// ascending row order. That matters more here than for [`dot`]:
+/// `axpy_inplace`'s documented reference is *the scalar loop it replaced*, so
+/// this inherits that contract rather than getting to pick a new one. No FMA,
+/// for the reason spelled out there.
+#[inline(always)]
+pub fn axpy_multi<const N: usize>(out: &mut [f32], v: [&[f32]; N], scale: [f32; N]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        axpy_multi_neon(out, v, scale);
+    }
+    // Elsewhere, literally the calls this batches — trivially bit-identical.
+    #[cfg(not(target_arch = "aarch64"))]
+    for j in 0..N {
+        axpy_inplace(out, v[j], scale[j]);
+    }
+}
+
+/// The aarch64 kernel behind [`axpy_multi`].
+///
+/// Intrinsics rather than the vectorizer even though [`axpy_scalar`] *is*
+/// auto-vectorized successfully: that loop has one independent output element per
+/// iteration and nothing to reassociate, while this has an `N`-deep dependent
+/// chain per element whose order must not be touched.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn axpy_multi_neon<const N: usize>(out: &mut [f32], v: [&[f32]; N], scale: [f32; N]) {
+    use std::arch::aarch64::*;
+    let n = v.iter().fold(out.len(), |m, s| m.min(s.len()));
+    // Safety: every access is bounded by `n`, the minimum length across `out` and
+    // all of `v`. NEON is unconditional on this target.
+    unsafe {
+        let s: [float32x4_t; N] = std::array::from_fn(|j| vdupq_n_f32(scale[j]));
+        let po = out.as_mut_ptr();
+        let pv: [*const f32; N] = std::array::from_fn(|j| v[j].as_ptr());
+        let mut i = 0;
+        while i + 4 <= n {
+            // One load and one store of the output chunk for all `N` rows.
+            let mut acc = vld1q_f32(po.add(i));
+            for j in 0..N {
+                acc = vaddq_f32(acc, vmulq_f32(s[j], vld1q_f32(pv[j].add(i))));
+            }
+            vst1q_f32(po.add(i), acc);
+            i += 4;
+        }
+        while i < n {
+            let mut acc = *po.add(i);
+            for j in 0..N {
+                acc += scale[j] * *pv[j].add(i);
+            }
+            *po.add(i) = acc;
+            i += 1;
+        }
     }
 }
 
@@ -638,6 +945,145 @@ mod tests {
             let b: Vec<f32> = (0..len).map(|i| (len - i) as f32 * 0.25).collect();
             let expected = dot_scalar(&a, &b);
             assert!((dot(&a, &b) - expected).abs() < 1e-3, "len={len}");
+        }
+    }
+
+    /// [`dot_multi`] and [`axpy_multi`] must equal the calls they batch **to the
+    /// bit**, at every width `engine::attention`'s dispatch can select — the
+    /// property that keeps that module's own bit-identity test meaningful.
+    ///
+    /// Not tolerances. Both kernels exist to preserve lane assignment and
+    /// summation order while restructuring the loads around them; a tolerance
+    /// would admit exactly the drift these catch, and the failure would surface
+    /// later as an attention test nobody could explain.
+    #[test]
+    fn batched_kernels_are_bit_identical_at_every_dispatchable_width() {
+        check_dot_multi::<1>();
+        check_dot_multi::<2>();
+        check_dot_multi::<3>();
+        check_dot_multi::<4>();
+        check_dot_multi::<8>();
+        check_axpy_multi::<1>();
+        check_axpy_multi::<2>();
+        check_axpy_multi::<3>();
+        check_axpy_multi::<4>();
+        check_axpy_multi::<8>();
+    }
+
+    /// Lengths straddle the 8-element step so the shared scalar tail runs; the
+    /// right-hand operands differ from each other so a kernel that paired an
+    /// accumulator with the wrong output would fail.
+    fn check_dot_multi<const N: usize>() {
+        for len in [1, 7, 8, 9, 64, 65, 71, 80, 128, 129, 256] {
+            let a: Vec<f32> = (0..len)
+                .map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.0625)
+                .collect();
+            let b: Vec<Vec<f32>> = (0..N)
+                .map(|j| {
+                    (0..len)
+                        .map(|i| ((i * (7 + j) % 31) as f32 - 15.0) * 0.03125)
+                        .collect()
+                })
+                .collect();
+            let refs: [&[f32]; N] = std::array::from_fn(|j| b[j].as_slice());
+            let got = dot_multi(&a, refs);
+            for j in 0..N {
+                let want = dot(&a, &b[j]);
+                assert_eq!(
+                    got[j].to_bits(),
+                    want.to_bits(),
+                    "N={N} len={len} output {j}: dot_multi {} against dot {want}",
+                    got[j]
+                );
+            }
+        }
+    }
+
+    /// Scales are distinct and none is 1.0 or 0.0: equal scales would pass even
+    /// if a scale were paired with the wrong row, and a 1.0 would hide a missing
+    /// multiply. `out` starts non-zero, so dropping the initial load — precisely
+    /// what this kernel restructures — would show.
+    fn check_axpy_multi<const N: usize>() {
+        for len in [1, 3, 4, 5, 63, 64, 65, 128] {
+            let scale: [f32; N] = std::array::from_fn(|j| 0.375 - 0.8125 * j as f32);
+            let rows: Vec<Vec<f32>> = (0..N)
+                .map(|j| {
+                    (0..len)
+                        .map(|i| ((i * (5 + j) % 23) as f32 - 11.0) * 0.125)
+                        .collect()
+                })
+                .collect();
+            let start: Vec<f32> = (0..len).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
+
+            let mut got = start.clone();
+            let refs: [&[f32]; N] = std::array::from_fn(|j| rows[j].as_slice());
+            axpy_multi(&mut got, refs, scale);
+
+            let mut want = start.clone();
+            for j in 0..N {
+                axpy_inplace(&mut want, &rows[j], scale[j]);
+            }
+            assert_eq!(
+                got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                "N={N} len={len}: axpy_multi is not bit-identical to repeated axpy_inplace"
+            );
+        }
+    }
+
+    /// Whichever vector kernel this target uses must agree with `dot_scalar`
+    /// at the widths attention actually runs — `head_dim` is 64/80/128/256 in
+    /// the model set, and the window loop calls this once per position.
+    ///
+    /// Lengths deliberately straddle the 8-element step in both directions so
+    /// the scalar tail is exercised: a kernel that dropped the tail entirely
+    /// would still pass a multiples-of-8-only test.
+    #[test]
+    fn dot_agrees_with_the_scalar_reference_at_attention_widths() {
+        for len in [64, 65, 71, 80, 127, 128, 129, 256, 260] {
+            let a: Vec<f32> = (0..len)
+                .map(|i| ((i * 31 % 41) as f32 - 20.0) * 0.03125)
+                .collect();
+            let b: Vec<f32> = (0..len)
+                .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.0625)
+                .collect();
+            let want = dot_scalar(&a, &b);
+            let got = dot(&a, &b);
+            // Only summation order and FMA-vs-separate-rounding differ, so the
+            // bound is tight relative to the summed term magnitude.
+            let scale: f32 = a.iter().zip(&b).map(|(x, y)| (x * y).abs()).sum();
+            assert!(
+                (got - want).abs() <= 1e-5 * scale.max(1e-6),
+                "len={len}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// `dot_scalar` accumulates in [`DOT_LANES`] lanes plus a scalar tail, so
+    /// it needs a reference of its own — the test above compares `dot`
+    /// against it, which on a target without AVX2 is comparing it to itself.
+    ///
+    /// Lengths straddle the lane count in both directions: shorter than one
+    /// block (all tail), exactly one block (no tail), and a block plus a
+    /// partial one. An off-by-one in the tail bound would drop or double the
+    /// last few products, which nothing else here would catch.
+    #[test]
+    fn dot_scalar_matches_a_sequential_sum() {
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 64, 129, 256] {
+            let a: Vec<f32> = (0..len)
+                .map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.125)
+                .collect();
+            let b: Vec<f32> = (0..len)
+                .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.25)
+                .collect();
+            let mut want = 0f32;
+            for i in 0..len {
+                want += a[i] * b[i];
+            }
+            let got = dot_scalar(&a, &b);
+            // These inputs are exact binary fractions and the magnitudes are
+            // small, so lane order costs nothing: this can be exact.
+            assert_eq!(got, want, "len={len}");
         }
     }
 
