@@ -5,13 +5,13 @@
 `orangu-server` (`src/bin/orangu-server/`) is a third binary in the same
 Cargo package as `orangu` and `orangu-coordinator`. Besides serving a GGUF
 model, it's also the machine's GGUF inventory tool (`system`/`suggest`/
-`list`/`show`/`download`/`delete`) — stateless between runs for those six:
-every invocation re-detects hardware and re-scans the models directory from
-scratch, so there is no cache, config-reload, or background process to
-reason about for them. `system`/`suggest`/`show`/`delete` stay entirely
-offline; `download` always talks to the Hub, and `list` does too, before
-printing its table, to check each Hugging Face-backed model for a newer
-commit (see `latest_commits` below) — swallowing the lookup silently rather
+`list`/`show`/`download`/`delete`/`refresh`) — stateless between runs for
+those seven: every invocation re-detects hardware and re-scans the models
+directory from scratch, so there is no cache, config-reload, or background
+process to reason about for them. `system`/`suggest`/`show`/`delete` stay
+entirely offline; `download` and `refresh` always talk to the Hub, and
+`list` does too, before printing its table, to check each Hugging
+Face-backed model for a newer commit (see `latest_commits` below) — swallowing the lookup silently rather
 than failing when the Hub can't be reached. It does real tensor computation
 itself for serving — GGUF loading, dequantization, the transformer forward
 pass, sampling, and request scheduling are implemented in Rust with no
@@ -20,14 +20,20 @@ dependency on llama.cpp/ggml's own compiled code.
 ### Module layout
 
 - `main.rs` — CLI parsing (serving plus the `system`/`suggest`/`list`/
-  `show`/`download`/`delete`/`prune` subcommands), model-spec resolution,
-  GPU backend selection (`select_backend`), `format_show`/
+  `show`/`download`/`delete`/`refresh`/`prune` subcommands), model-spec
+  resolution, GPU backend selection (`select_backend`), `format_show`/
   `DEFAULT_ARRAY_PREVIEW` (for `show`), `select_model_for_deletion`/
-  `confirm` (for `delete`, and reused by `prune`), workspace-root
+  `confirm` (for `delete`, and reused by `prune`/`refresh`), the two
+  helpers every table-printing subcommand shares (`check_for_updates`, one
+  Hub lookup per distinct repo; `dimming`, which downgrades a `Dimming`
+  mode to `Dimming::Off` off a terminal), workspace-root
   resolution (`resolve_workspace`, over the shared
   `orangu::workspaces::resolve_workspace_root` that `orangu`'s own
   `-w`/`--workspace` uses), and process wiring
   (Ctrl+C/`SIGINT`/`--daemon`).
+- `refresh.rs` — `refresh`'s own CLI logic: the confirmation, the
+  delete-then-download ordering, and the interactive picker that greys
+  every already-current row; see below.
 - `prune.rs` — `prune`'s own CLI logic (listing, `NR`/id resolution, the
   `all`/interactive/explicit-identifier flows), built on `web::sessions`'s
   activity tracking; see below.
@@ -288,6 +294,55 @@ delete-time counterpart of `main.rs`'s own `select_model_interactively`
 (used to pick a model to *serve*), returning a full `ModelGroup` rather
 than just a path/label pair since that's what `delete_model` needs.
 
+### Refreshing a model (`refresh.rs`)
+
+`refresh` is `delete` followed by `download` of the same spec — the command
+that acts on a `(Refresh)` marker. It is its own module rather than another
+`main.rs` arm because three of its decisions are specific to it:
+
+**Delete first, then download.** The reverse order would be safer against an
+interrupted transfer, but a refresh exists precisely because the repo's files
+changed, so the new revision is a full second copy on disk rather than the
+blob-sharing symlink a re-download of the *same* commit produces. Downloading
+first would mean a 17 GiB model needing 34 GiB free to refresh. The cost —
+an interrupted download leaving the model missing rather than stale — is
+recovered by re-running `refresh` or `download`, which resumes from the
+`.part` file `download_attempt` left behind, and is stated up front in the
+confirmation line rather than discovered afterwards.
+
+**An ambiguous `MODEL` name is an error.**
+`model_spec::resolve_refresh_target` mirrors `resolve_delete_target` (path,
+then `NR`, then `MODEL` label) with exactly one difference: where `delete`
+takes the first of several rows sharing a `MODEL` cell and names the
+quantization it picked in its confirmation line, `refresh` refuses and lists
+the quantizations on disk. It has to — `refresh` deletes what it then
+downloads, so a first-match would refresh the wrong quantization *and* leave
+the one the user meant untouched, which no confirmation line can undo. The
+error only suggests the `<repo>:<quant>` spelling when naming a quantization
+would actually disambiguate (two rows of the same repo *and* the same quant,
+two snapshots deep, can only be told apart by `NR`). A path that resolves to
+no group at all is a companion mmproj sidecar — `delete` synthesizes a
+one-file group for it, but `download` only ever fetches one *alongside* its
+base model, so `refresh` points at that model instead.
+
+**The download spec comes off the filename, not `QUANT`.**
+`ModelGroup::download_spec` rebuilds `<user>/<model>[:tag]` from the
+representative path's own `hf_tag_from_label` tag rather than from
+`quantization`: the `QUANT` column falls back to the dominant ggml type for
+a file whose name carries no tag, and that type names no file in the repo,
+so `select_files_to_download` would reject it as an unknown quant instead of
+re-fetching the model that is actually on disk. A group with no `hf_repo` at
+all has no spec, and `run` bails on it *before* deleting anything — a
+hand-copied `.gguf` has no repo to come back from.
+
+With no argument, `select_model_to_refresh` prints the same `format_groups`
+table `list` does, with `Dimming::UpToDate` and the same
+`check_for_updates` lookup, so the un-greyed rows are exactly the
+`(Refresh)` ones — then prompts for an `NR`, the counterpart of
+`select_model_for_deletion`. An unreachable Hub greys nothing (no row is
+*known* to be behind), which reads correctly: with no update information, no
+row is a better pick than another.
+
 ### Downloading from Hugging Face (`orangu::model_download`)
 
 `download_model` implements `orangu-server download <user>/<model>[:quant]`
@@ -444,12 +499,15 @@ directory. Two pieces make this work:
   command over one lookup (or over having no network at all). An empty
   repo list short-circuits before even building a client.
 
-`main.rs`'s `Command::List` arm wires the two together: `group_models` runs
+`main.rs`'s `Command::List` arm wires the two together through
+`check_for_updates` (which does the dedupe-by-repo and is shared with
+`refresh`, so both commands agree on what's stale): `group_models` runs
 first, its groups' distinct `hf_repo` ids feed `latest_commits`, which
 returns a `repo -> commit` map — not a "these repos are stale" set — and
-`format_groups` (the renderer `format_list` itself now delegates to)
-compares each row's *own* `local_commit` against that map when deciding
-whether to append `  (Refresh)` after `SIZE`. Comparing per row rather than
+`format_groups` (the renderer `format_list` itself now delegates to) asks
+`ModelGroup::is_behind` to compare each row's *own* `local_commit` against
+that map when deciding
+whether to append ` (Refresh)` after `SIZE`. Comparing per row rather than
 per repo matters: a repo can have two `ModelGroup` rows cached at different
 commits (e.g. `:Q4_K_M` downloaded weeks ago, `:Q8_0` downloaded today), and
 only the one actually behind should be marked — a `HashSet` of "stale
@@ -465,7 +523,7 @@ trailing marker.
 per row — so a user sees which models this build can actually load *before*
 selecting one, rather than only discovering it can't once it's loaded.
 `model_spec::format_groups` renders the column (and `format_list`'s
-signature carries the `support`/`colorize` parameters through), but the lib
+signature carries the `support`/`dim` parameters through), but the lib
 deliberately doesn't decide *what* is supported: that judgement lives in
 `orangu-server`, in `engine::loader::model_load_support`. So `main.rs`'s
 `model_support` opens each group's representative file (header only — no
@@ -504,14 +562,20 @@ that one backend refuses runs on `cpu`.
 A `No` row is *greyed* (dim ANSI SGR), not hidden: a user can still pick it
 and will hit the same clear "not yet supported" error `prepare` gives for
 any other unsupported model — the greying just deprioritizes it visually.
-Crucially, the escapes are only emitted when `format_groups`' `colorize`
-flag is set, which every call site derives from
-`std::io::stdout().is_terminal()`. Piped or redirected output — including
-what the shell completion scripts parse with `awk '{print $1; print $2}'` —
-stays escape-free, so an ANSI prefix can never corrupt the `NR`/`MODEL`
-columns those scripts read. This is the same renderer the interactive
-serve-time picker (`select_model_interactively`) and the `show`/`delete`
-pickers use, so all four tables carry the column consistently.
+
+*Which* rows are greyed is `format_groups`' `dim` parameter, a
+`model_spec::Dimming` rather than the boolean it started as, because
+`refresh` wants the same table deprioritizing a different set of rows:
+`Dimming::Unsupported` greys what this build can't load (`list`, `show`,
+`delete`, the serve-time picker), `Dimming::UpToDate` greys what isn't
+behind its repo (`refresh`), and `Dimming::Off` emits no escapes at all.
+Every call site passes its mode through `main.rs`'s `dimming` helper, which
+returns `Dimming::Off` unless `std::io::stdout().is_terminal()`. Piped or
+redirected output — including what the shell completion scripts parse with
+`awk '{print $1; print $2}'` — therefore stays escape-free, so an ANSI
+prefix can never corrupt the `NR`/`MODEL` columns those scripts read. One
+renderer serves every table this binary prints, so they all carry the
+column consistently.
 
 ### OS detection (`orangu::os`)
 
@@ -777,14 +841,14 @@ Mirrors `orangu`'s own `-s`/`--shell-completions` (`src/bin/orangu/
 shell.rs`, `print_shell_completions` in `main.rs`): hand-written bash/zsh/
 fish scripts embedded as `&str` constants, selected by inspecting `$SHELL`,
 rather than clap-generated completions. The positional `model` argument,
-and `show`'s and `delete`'s own arguments, complete the same way `orangu`'s
+and `show`'s, `delete`'s and `refresh`'s own arguments, complete the same way `orangu`'s
 own scripts complete session UUIDs — the shell function shells back out to
 `orangu-server list` itself (`2>/dev/null`, so a missing config yields no
 candidates rather than an error) and reads its first two columns with
 `awk`. This keeps the completion logic entirely in the shell script,
 depending on nothing but `orangu-server` itself being on `$PATH` — no
 dynamic-completion protocol or extra binary flag is needed. The bash and
-fish scripts also list the six subcommand names as literal completion
+fish scripts also list the subcommand names as literal completion
 candidates alongside the dynamic model list at the first argument position;
 the zsh script achieves the same with `_alternative` combining a `_values`
 list (subcommand names) and a `compadd`-based function (model candidates)
@@ -796,8 +860,8 @@ once `orangu`'s own precedent was found, since introducing a genuinely
 unstable (semver-exempt) dependency wasn't warranted when a small,
 self-contained shell script does the same job with zero new dependencies.
 
-`prune`'s own argument completes differently from `model`/`show`/`delete`
-above: directly against `~/.orangu/server/sessions/*` (each entry a UUID
+`prune`'s own argument completes differently from
+`model`/`show`/`delete`/`refresh` above: directly against `~/.orangu/server/sessions/*` (each entry a UUID
 directory) plus the literal `all`, with no process invocation at all — this
 time genuinely the same trick `orangu`'s own `-r`/`--resume` completion
 uses (`_orangu_sessions`/`__orangu_sessions` in `src/bin/orangu/shell.rs`),

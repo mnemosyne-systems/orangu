@@ -15,10 +15,11 @@
 
 //! Hand-written shell completion scripts, mirroring `orangu`'s own
 //! `-s`/`--shell-completions` (`src/bin/orangu/shell.rs`): the positional
-//! `model` argument (and `show`'s own argument) are completed by shelling
-//! back out to `orangu-server list` itself and reading its first two
-//! columns (NR and MODEL). This only ever depends on `orangu-server` itself
-//! being on `$PATH` — no clap-generated completion machinery is involved.
+//! `model` argument (and `show`'s/`delete`'s/`refresh`'s own arguments) are
+//! completed by shelling back out to `orangu-server list` itself and reading
+//! its first two columns (NR and MODEL). This only ever depends on
+//! `orangu-server` itself being on `$PATH` — no clap-generated completion
+//! machinery is involved.
 //!
 //! `prune`'s own argument is completed differently: directly against
 //! `~/.orangu/server/sessions/*` (each entry a UUID directory), newest
@@ -38,8 +39,9 @@ pub const BASH: &str = r#"# bash completion for orangu-server
 # Or write once to the bash-completion drop-in directory:
 #   orangu-server -s > ~/.local/share/bash-completion/completions/orangu-server
 
-# Completes the positional MODEL argument (and `show`'s own argument) with
-# every NR and MODEL from `orangu-server list`'s output.
+# Completes the positional MODEL argument (and `show`'s/`delete`'s/
+# `refresh`'s own arguments) with every NR and MODEL from
+# `orangu-server list`'s output.
 _orangu_server_models() {
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
 }
@@ -61,7 +63,7 @@ _orangu_server() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     COMPREPLY=()
 
-    if [[ "$prev" == "show" || "$prev" == "delete" ]]; then
+    if [[ "$prev" == "show" || "$prev" == "delete" || "$prev" == "refresh" ]]; then
         COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
         return 0
     fi
@@ -92,7 +94,7 @@ _orangu_server() {
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete prune help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete refresh prune help" -- "$cur") )
         return 0
     fi
 }
@@ -110,8 +112,9 @@ pub const ZSH: &str = r#"#compdef orangu-server
 #   orangu-server -s > ~/.zsh/completions/_orangu-server
 #   # ~/.zshrc: fpath=(~/.zsh/completions $fpath) && autoload -Uz compinit && compinit
 
-# Completes the positional MODEL argument (and `show`'s own argument) with
-# every NR and MODEL from `orangu-server list`'s output.
+# Completes the positional MODEL argument (and `show`'s/`delete`'s/
+# `refresh`'s own arguments) with every NR and MODEL from
+# `orangu-server list`'s output.
 _orangu_server_models() {
     local -a candidates
     candidates=( ${(f)"$(orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}')"} )
@@ -136,6 +139,7 @@ _orangu_server_commands() {
         'show[Print a GGUF file'"'"'s full metadata]' \
         'download[Download a GGUF model from Hugging Face]' \
         'delete[Delete a GGUF model from disk]' \
+        'refresh[Delete a GGUF model and download it again]' \
         'prune[Delete chat sessions]' \
         'help[Print this message or the help of the given subcommand(s)]'
 }
@@ -154,7 +158,7 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding)--review[Code review role]' \
         '(--all --code --review --explorer --embedding)--explorer[Exploration role]' \
         '(--all --code --review --explorer --embedding)--embedding[Embeddings-only role]' \
-        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s confirmation prompt]' \
+        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/refresh'"'"'s confirmation prompt]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
         '1: :->command' \
@@ -168,7 +172,7 @@ _orangu_server() {
                 'commands:command:_orangu_server_commands'
             ;;
         arg)
-            [[ ${line[1]} == show || ${line[1]} == delete ]] && _orangu_server_models
+            [[ ${line[1]} == show || ${line[1]} == delete || ${line[1]} == refresh ]] && _orangu_server_models
             [[ ${line[1]} == prune ]] && _orangu_server_sessions
             ;;
     esac
@@ -185,8 +189,9 @@ pub const FISH: &str = r#"# fish completion for orangu-server
 # Or write once to the fish completions directory:
 #   orangu-server -s > ~/.config/fish/completions/orangu-server.fish
 
-# Completes the positional MODEL argument (and `show`'s own argument) with
-# every NR and MODEL from `orangu-server list`'s output.
+# Completes the positional MODEL argument (and `show`'s/`delete`'s/
+# `refresh`'s own arguments) with every NR and MODEL from
+# `orangu-server list`'s output.
 function __orangu_server_models
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
 end
@@ -207,10 +212,12 @@ complete -c orangu-server -n '__fish_use_subcommand' -a list     -d 'List every 
 complete -c orangu-server -n '__fish_use_subcommand' -a show     -d 'Print a GGUF file\'s full metadata'
 complete -c orangu-server -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
 complete -c orangu-server -n '__fish_use_subcommand' -a delete   -d 'Delete a GGUF model from disk'
+complete -c orangu-server -n '__fish_use_subcommand' -a refresh  -d 'Delete a GGUF model and download it again'
 complete -c orangu-server -n '__fish_use_subcommand' -a prune    -d 'Delete chat sessions'
 complete -c orangu-server -n '__fish_use_subcommand' -a help     -d 'Print this message or the help of the given subcommand(s)'
 complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from refresh' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from prune' -a '(__orangu_server_sessions)'
 
 complete -c orangu-server -s c -l config              -r -d 'Path to the configuration file (orangu-server.conf)'
@@ -223,7 +230,7 @@ complete -c orangu-server      -l code                    -d 'Coding role'
 complete -c orangu-server      -l review                  -d 'Code review role'
 complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
-complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s confirmation prompt'
+complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/refresh\'s confirmation prompt'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
 "#;

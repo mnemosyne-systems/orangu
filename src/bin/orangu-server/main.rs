@@ -15,9 +15,10 @@
 
 //! `orangu-server <model>`: loads a GGUF model and serves a llama.cpp-
 //! compatible HTTP API. Also the machine's one-stop GGUF inventory tool —
-//! `system`/`suggest`/`list`/`show`/`download` answer the questions that
-//! matter when *getting* and *choosing* a model to run, before any serving
-//! starts (formerly the separate `orangu-gguf` binary, folded in here so
+//! `system`/`suggest`/`list`/`show`/`download`/`delete`/`refresh` answer the
+//! questions that matter when *getting*, *choosing*, and *keeping current* a
+//! model to run, before any serving starts (formerly the separate
+//! `orangu-gguf` binary, folded in here so
 //! there's one tool, one config file, and one shell-completion script to
 //! keep in sync with the models directory convention both jobs share).
 
@@ -35,6 +36,7 @@ mod http;
 mod init;
 mod panic_capture;
 mod prune;
+mod refresh;
 mod shell;
 mod suggest;
 mod web;
@@ -175,9 +177,9 @@ struct Args {
 /// at all), exactly as before this enum existed, so `orangu-server
 /// <model>` keeps working unchanged. The one collision this admits: a local
 /// `.gguf` file whose bare name is exactly `system`/`suggest`/`list`/
-/// `show`/`download` would be parsed as that subcommand instead of a model
-/// spec — resolvable by passing a path (`./system`) instead of the bare
-/// name.
+/// `show`/`download`/`refresh` would be parsed as that subcommand instead of
+/// a model spec — resolvable by passing a path (`./system`) instead of the
+/// bare name.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Detect the machine's CPU and GPU(s) and print their statistics.
@@ -222,6 +224,17 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Delete a GGUF model and download it again, picking up a newer
+    /// revision of its Hugging Face repo.
+    Refresh {
+        /// An NR from `list`, a MODEL name (with `:QUANT` when the repo has
+        /// more than one on disk), a bare name, or a path. Omit it to pick
+        /// one interactively.
+        model: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Delete chat sessions from ~/.orangu/server/sessions/. Every
     /// invocation, regardless of its own argument, first removes any
     /// non-active session with an empty chat history.
@@ -249,6 +262,7 @@ impl Command {
             Command::Show { .. } => "show",
             Command::Download { .. } => "download",
             Command::Delete { .. } => "delete",
+            Command::Refresh { .. } => "refresh",
             Command::Prune { .. } => "prune",
         }
     }
@@ -829,7 +843,7 @@ fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
 /// lib-side `ModelSupport`
 /// that `format_groups` renders. A file that can't even be opened is reported
 /// unsupported with no architecture.
-fn model_support(
+pub(crate) fn model_support(
     groups: &[orangu::model_spec::ModelGroup],
 ) -> Vec<orangu::model_spec::ModelSupport> {
     groups
@@ -890,13 +904,7 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             let conf = load_config(config_arg, None, false)?;
             let models = orangu::model_spec::scan_models_dir(&conf.models)?;
             let groups = orangu::model_spec::group_models(&models);
-            let repos: Vec<String> = groups
-                .iter()
-                .filter_map(|g| g.hf_repo.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let latest_commits = orangu::model_download::latest_commits(&repos);
+            let latest_commits = check_for_updates(&groups);
             let support = model_support(&groups);
             print!(
                 "{}",
@@ -905,7 +913,7 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
                     &conf.models,
                     &latest_commits,
                     &support,
-                    std::io::stdout().is_terminal(),
+                    dimming(orangu::model_spec::Dimming::Unsupported),
                 )
             );
             Ok(())
@@ -968,7 +976,44 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             );
             Ok(())
         }
+        Command::Refresh { model, yes } => {
+            let conf = load_config(config_arg, None, false)?;
+            refresh::run(&conf.models, model, yes)
+        }
         Command::Prune { identifier, yes } => prune::run(identifier, yes),
+    }
+}
+
+/// The Hub's current `main` commit for every distinct Hugging Face repo
+/// `groups` came from — deduped by repo id, so a repo with several `:quant`
+/// rows costs one lookup, not one per row. Shared by `list` (which marks
+/// every row behind its repo `(Refresh)`) and `refresh` (which greys every
+/// row that isn't), so the two always agree on what's stale. Failures are
+/// swallowed per repo by [`orangu::model_download::latest_commits`] itself:
+/// an unreachable Hub yields an empty map, never an error.
+pub(crate) fn check_for_updates(
+    groups: &[orangu::model_spec::ModelGroup],
+) -> std::collections::HashMap<String, String> {
+    let repos: Vec<String> = groups
+        .iter()
+        .filter_map(|g| g.hf_repo.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    orangu::model_download::latest_commits(&repos)
+}
+
+/// `mode` when stdout is a terminal, [`Dimming::Off`] when it isn't — every
+/// caller that prints `list`'s table wants exactly this. Redirected or piped
+/// output stays escape-free, which is what the shell-completion scripts
+/// parsing it by column depend on.
+///
+/// [`Dimming::Off`]: orangu::model_spec::Dimming::Off
+pub(crate) fn dimming(mode: orangu::model_spec::Dimming) -> orangu::model_spec::Dimming {
+    if std::io::stdout().is_terminal() {
+        mode
+    } else {
+        orangu::model_spec::Dimming::Off
     }
 }
 
@@ -992,7 +1037,7 @@ fn select_model_for_show(models_dir: &Path) -> Result<PathBuf> {
             models_dir,
             &Default::default(),
             &model_support(&groups),
-            std::io::stdout().is_terminal(),
+            dimming(orangu::model_spec::Dimming::Unsupported),
         )
     );
 
@@ -1032,7 +1077,7 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
             models_dir,
             &Default::default(),
             &model_support(&groups),
-            std::io::stdout().is_terminal(),
+            dimming(orangu::model_spec::Dimming::Unsupported),
         )
     );
 
@@ -1148,7 +1193,7 @@ fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
             models_dir,
             &Default::default(),
             &model_support(&groups),
-            std::io::stdout().is_terminal(),
+            dimming(orangu::model_spec::Dimming::Unsupported),
         )
     );
 
@@ -1358,6 +1403,11 @@ mod tests {
             }
             .mode(),
             Command::Delete {
+                model: None,
+                yes: false,
+            }
+            .mode(),
+            Command::Refresh {
                 model: None,
                 yes: false,
             }

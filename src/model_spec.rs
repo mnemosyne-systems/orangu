@@ -245,6 +245,96 @@ pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<Model
         })
 }
 
+/// Resolves whatever `refresh` was given to the full [`ModelGroup`] to
+/// delete and download again, the same way [`resolve_delete_target`] does —
+/// a direct/relative/absolute path or a bare name under `models_dir` first,
+/// then an `NR` from `list`'s first column, then a `MODEL` name from its
+/// second — with two deliberate differences: an ambiguous `MODEL` name is an
+/// error rather than a first-match, and a companion mmproj sidecar (which
+/// `delete` happily removes as a synthetic one-file group) is refused,
+/// since `download` only ever fetches one alongside its base model.
+///
+/// Two quantizations of one repo share a `MODEL` cell (`QUANT` is what tells
+/// them apart), so a bare repo id can name more than one row. `delete` takes
+/// the first and spells out in its confirmation line which quantization that
+/// was; `refresh` can't lean on that, because the copy it deletes is the one
+/// it then re-downloads — silently picking a row would refresh the wrong
+/// quantization *and* leave the one the user meant untouched. So it says
+/// which quantizations are on disk and asks for one, `<repo>:<quant>`.
+pub fn resolve_refresh_target(models_dir: &Path, requested: &str) -> Result<ModelGroup> {
+    let models = scan_models_dir(models_dir)?;
+    let mut groups = group_models(&models);
+
+    if let Ok(path) = resolve_model_path(models_dir, requested) {
+        if let Some(index) = groups.iter().position(|g| g.paths.contains(&path)) {
+            return Ok(groups.swap_remove(index));
+        }
+        // A file that resolves but belongs to no group is a companion
+        // sidecar — an mmproj projector, which `scan_models_dir` deliberately
+        // keeps out of the listing. `delete` synthesizes a one-file group so
+        // it can still be removed on its own; `refresh` can't do the same,
+        // since `download` only ever fetches a sidecar *alongside* the base
+        // model it belongs to.
+        anyhow::bail!(
+            "'{requested}' is a companion file (mmproj), not a model of its own; refresh the model it was downloaded with instead"
+        );
+    }
+
+    if let Ok(nr) = requested.parse::<usize>() {
+        let count = groups.len();
+        return nr
+            .checked_sub(1)
+            .filter(|index| *index < groups.len())
+            .map(|index| groups.swap_remove(index))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no model with NR {nr} ({count} model(s) found under {}; run 'orangu-server list' to see them)",
+                    models_dir.display()
+                )
+            });
+    }
+
+    let matches: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.matches_label(requested))
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!(
+            "'{requested}' was not found as a file, an NR, or a MODEL name; run 'orangu-server list' to see valid values"
+        ),
+        [index] => Ok(groups.swap_remove(*index)),
+        indices => {
+            let quants: Vec<&str> = indices
+                .iter()
+                .map(|index| groups[*index].quantization.as_deref().unwrap_or("-"))
+                .collect();
+            // Naming the quantization only disambiguates when the rows
+            // actually differ by one. Two snapshots of the same repo at the
+            // same quantization (or a request that already carries a
+            // `:quant`) can only be told apart by their `NR`.
+            let distinct = quants
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let hint = if distinct == indices.len() && !requested.contains(':') {
+                format!(
+                    "name the quantization too — '{requested}:{}' — or use an NR from 'orangu-server list'",
+                    quants[0]
+                )
+            } else {
+                "use an NR from 'orangu-server list' to name one".to_string()
+            };
+            anyhow::bail!(
+                "'{requested}' names {} models on disk ({}); {hint}",
+                indices.len(),
+                quants.join(", "),
+            )
+        }
+    }
+}
+
 /// Deletes every path in `group` from disk. When a path is a Hugging Face
 /// hub-cache symlink (`models--<user>--<model>/snapshots/<rev>/<file>`,
 /// pointing into that same repo's `blobs/`), its target blob is deleted too
@@ -420,6 +510,54 @@ impl ModelGroup {
             (Some(repo), Some(quant)) => requested == format!("{repo}:{quant}"),
             _ => false,
         }
+    }
+
+    /// Whether this group's repo has moved on since it was downloaded: its
+    /// own [`local_commit`] differs from the commit `latest_commits` (from
+    /// [`crate::model_download::latest_commits`]) says the Hub's `main`
+    /// resolves to now. Compared per row rather than per repo, so one stale
+    /// `:quant` row doesn't mark a sibling row of the same repo that's
+    /// already current. Always `false` for a model outside the hub-cache
+    /// layout (no repo to compare against) and for a repo the lookup didn't
+    /// reach — an unreachable Hub means "unknown", never "behind".
+    ///
+    /// Both what `list` marks `(Refresh)` and what `refresh` leaves
+    /// un-greyed, so the two always agree on which rows are worth acting on.
+    ///
+    /// [`local_commit`]: ModelGroup::local_commit
+    pub fn is_behind(&self, latest_commits: &HashMap<String, String>) -> bool {
+        self.hf_repo.as_deref().is_some_and(|repo| {
+            latest_commits
+                .get(repo)
+                .is_some_and(|latest| Some(latest.as_str()) != self.local_commit.as_deref())
+        })
+    }
+
+    /// The `<user>/<model>[:tag]` spec that downloads exactly this group's
+    /// file(s) again — what `refresh` hands
+    /// [`crate::model_download::download_model`] after deleting the local
+    /// copy. `None` for a model outside the hub-cache layout, which has no
+    /// repo to re-download from.
+    ///
+    /// The tag is the one this model's own filename carries, read back off
+    /// the file rather than taken from [`quantization`]: `quantization` (the
+    /// `QUANT` column) falls back to a ggml type counted out of the tensors
+    /// for a file whose name says nothing, and that type names no file in
+    /// the repo — `download` would reject it as an unknown quant instead of
+    /// re-fetching the model that is actually here.
+    ///
+    /// [`quantization`]: ModelGroup::quantization
+    pub fn download_spec(&self) -> Option<String> {
+        let repo = self.hf_repo.as_deref()?;
+        let stem = self
+            .representative_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        Some(match hf_tag_from_label(shard_group_label(stem)) {
+            Some(tag) => format!("{repo}:{tag}"),
+            None => repo.to_string(),
+        })
     }
 }
 
@@ -755,13 +893,31 @@ mod support_cell_tests {
     }
 }
 
-/// Dim/grey ANSI SGR codes, used to visually deprioritize a row for a model
-/// whose architecture this build can't load — visible but greyed, not
-/// hidden. Only emitted when the caller asks to colorize (a terminal), so
-/// the plain `list` output that the shell-completion scripts parse by column
-/// stays escape-free.
+/// Dim/grey ANSI SGR codes, used to visually deprioritize a row the caller's
+/// [`Dimming`] mode says isn't what this command is about — visible but
+/// greyed, not hidden. Only emitted when the caller asks for a mode other
+/// than [`Dimming::Off`] (i.e. writing to a terminal), so the plain `list`
+/// output that the shell-completion scripts parse by column stays
+/// escape-free.
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
+
+/// Which rows [`format_groups`] greys out — the same table, deprioritizing
+/// whatever the command asking for it can't act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dimming {
+    /// No escapes at all: every row plain. What a caller writing to a pipe
+    /// or a file passes, since the shell-completion scripts parse `list`'s
+    /// output by column and must never see an ANSI sequence.
+    Off,
+    /// `list`/`show`/`delete`: grey the rows whose architecture this build
+    /// can't load. Needs a non-empty `support` slice to have any effect.
+    Unsupported,
+    /// `refresh`: grey the rows already at their repo's latest commit, so
+    /// only the `NR`s worth refreshing — the ones marked `(Refresh)` — stand
+    /// out. Needs a non-empty `latest_commits` map to have any effect.
+    UpToDate,
+}
 
 /// The `list` table for every `.gguf` model found, with no Hugging Face
 /// update check and no `SUPPORTED` column — the plain, fully offline
@@ -772,7 +928,13 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
     if models.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
-    format_groups(&group_models(models), base, &HashMap::new(), &[], false)
+    format_groups(
+        &group_models(models),
+        base,
+        &HashMap::new(),
+        &[],
+        Dimming::Off,
+    )
 }
 
 /// Renders the `list` table from already-grouped models. `latest_commits`
@@ -787,16 +949,16 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
 ///
 /// `support`, when non-empty, adds a trailing `SUPPORTED` column reading
 /// `Yes (<arch>)`/`No (<arch>)` per row (aligned to `groups` by index — see
-/// [`ModelSupport`]); an empty slice omits the column entirely. When
-/// `colorize` is set, rows for architectures this build can't load are
-/// greyed. Callers pass `colorize` only when writing to a terminal, so piped
-/// output (what the completion scripts parse) never carries ANSI escapes.
+/// [`ModelSupport`]); an empty slice omits the column entirely. `dim` picks
+/// which rows are greyed (see [`Dimming`]); callers pass anything but
+/// [`Dimming::Off`] only when writing to a terminal, so piped output (what
+/// the completion scripts parse) never carries ANSI escapes.
 pub fn format_groups(
     groups: &[ModelGroup],
     base: &Path,
     latest_commits: &HashMap<String, String>,
     support: &[ModelSupport],
-    colorize: bool,
+    dim: Dimming,
 ) -> String {
     if groups.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
@@ -846,20 +1008,27 @@ pub fn format_groups(
     }
     for (index, group) in groups.iter().enumerate() {
         let nr = index + 1;
+        let refresh = group.is_behind(latest_commits);
         if !group.errors.is_empty() {
-            out.push_str(&format!(
-                "{nr:>nr_width$}  {:<model_width$}  error: {}\n",
+            // An error row carries neither `SIZE` nor `SUPPORTED`, so there's
+            // no `(Refresh)` marker to hang off the end of it — but `refresh`
+            // still greys it when it isn't behind, since the row is only
+            // interesting to that command when re-downloading would replace
+            // the file that failed to parse.
+            let row = format!(
+                "{nr:>nr_width$}  {:<model_width$}  error: {}",
                 group.label,
                 group.errors.join("; ")
-            ));
+            );
+            if dim == Dimming::UpToDate && !refresh {
+                out.push_str(&format!("{ANSI_DIM}{row}{ANSI_RESET}\n"));
+            } else {
+                out.push_str(&row);
+                out.push('\n');
+            }
             continue;
         }
-        let refresh = group.hf_repo.as_deref().is_some_and(|repo| {
-            latest_commits
-                .get(repo)
-                .is_some_and(|latest| Some(latest.as_str()) != group.local_commit.as_deref())
-        });
-        let refresh_suffix = if refresh { "  (Refresh)" } else { "" };
+        let refresh_suffix = if refresh { " (Refresh)" } else { "" };
         let row = if show_support {
             format!(
                 "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {}{refresh_suffix}",
@@ -876,8 +1045,12 @@ pub fn format_groups(
                 format_bytes(group.size_bytes),
             )
         };
-        let unsupported = show_support && !support[index].loadable();
-        if unsupported && colorize {
+        let dimmed = match dim {
+            Dimming::Off => false,
+            Dimming::Unsupported => show_support && !support[index].loadable(),
+            Dimming::UpToDate => !refresh,
+        };
+        if dimmed {
             out.push_str(&format!("{ANSI_DIM}{row}{ANSI_RESET}\n"));
         } else {
             out.push_str(&row);
@@ -1426,7 +1599,7 @@ mod tests {
             "rev2".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
 
         let mut lines = output.lines().skip(1); // header
         assert!(lines.next().unwrap().ends_with("(Refresh)"));
@@ -1454,7 +1627,7 @@ mod tests {
             "rev1".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
 
         assert!(!output.lines().nth(1).unwrap().contains("(Refresh)"));
     }
@@ -1493,7 +1666,7 @@ mod tests {
             "rev2".to_string(),
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], false);
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
 
         let mut lines = output.lines().skip(1); // header
         let q4 = lines.next().unwrap(); // Q4_K_M, sorted before Q8_0
@@ -1502,6 +1675,185 @@ mod tests {
         assert!(q4.ends_with("(Refresh)"));
         assert!(q8.contains("Q8_0"));
         assert!(!q8.contains("(Refresh)"));
+    }
+
+    /// The marker is one space off the column before it, like every other
+    /// column separator on the row — not the two it was first written with.
+    #[test]
+    fn the_refresh_marker_is_one_space_off_the_preceding_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        write_minimal_gguf(
+            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let mut latest_commits = HashMap::new();
+        latest_commits.insert(
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            "rev2".to_string(),
+        );
+
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
+
+        let row = output.lines().nth(1).unwrap();
+        assert!(row.ends_with(" (Refresh)"), "unexpected row: {row:?}");
+        assert!(!row.ends_with("  (Refresh)"), "unexpected row: {row:?}");
+    }
+
+    /// `refresh`'s table: the rows worth acting on stay plain, everything
+    /// already current is greyed — the inverse of what `list` greys.
+    #[test]
+    fn up_to_date_dimming_greys_every_row_that_is_not_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&stale).unwrap();
+        write_minimal_gguf(
+            &stale.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+        let current = dir
+            .path()
+            .join("models--ggml-org--gemma-4-12B-it-GGUF/snapshots/rev9");
+        std::fs::create_dir_all(&current).unwrap();
+        write_minimal_gguf(&current.join("gemma-4-12B-it-Q4_K_M.gguf"), "gemma4", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let latest_commits = HashMap::from([
+            (
+                "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+                "rev2".to_string(),
+            ),
+            (
+                "ggml-org/gemma-4-12B-it-GGUF".to_string(),
+                "rev9".to_string(),
+            ),
+        ]);
+
+        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::UpToDate);
+
+        let mut lines = output.lines().skip(1); // header
+        let stale_row = lines.next().unwrap(); // bartowski, sorted first
+        let current_row = lines.next().unwrap();
+        assert!(stale_row.contains("(Refresh)"));
+        assert!(!stale_row.contains(ANSI_DIM), "stale row was greyed");
+        assert!(!current_row.contains("(Refresh)"));
+        assert!(current_row.starts_with(ANSI_DIM), "current row was plain");
+    }
+
+    /// Two quantizations of one repo share a `MODEL` cell. `delete` takes the
+    /// first; `refresh` must not, since it deletes what it then re-downloads.
+    #[test]
+    fn refresh_rejects_a_model_name_naming_more_than_one_quantization() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        write_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            None,
+        );
+        write_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            "llama",
+            None,
+        );
+
+        let err = resolve_refresh_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF")
+            .expect_err("ambiguous");
+        let message = err.to_string();
+        assert!(message.contains("Q4_K_M"), "unexpected error: {message}");
+        assert!(message.contains("Q8_0"), "unexpected error: {message}");
+        assert!(
+            message.contains("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"),
+            "unexpected error: {message}"
+        );
+
+        // The tagged spelling names exactly one of them, and resolves.
+        let group = resolve_refresh_target(dir.path(), "bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0")
+            .unwrap();
+        assert_eq!(group.quantization.as_deref(), Some("Q8_0"));
+        // As does the `NR` `list` printed beside either row.
+        assert_eq!(
+            resolve_refresh_target(dir.path(), "1")
+                .unwrap()
+                .quantization
+                .as_deref(),
+            Some("Q4_K_M")
+        );
+    }
+
+    /// An mmproj sidecar is in no group: `delete` synthesizes a one-file
+    /// group for it, but there's no such thing as downloading one on its own.
+    #[test]
+    fn refresh_rejects_an_mmproj_sidecar_named_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--ggml-org--gemma-4-12B-it-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        write_minimal_gguf(&snapshot.join("gemma-4-12B-it-Q4_K_M.gguf"), "gemma4", None);
+        // `clip` is what marks it a projector — see
+        // `excludes_clip_projector_sidecars_from_the_scan`.
+        let sidecar = snapshot.join("mmproj-gemma-4-12B-it-F16.gguf");
+        write_minimal_gguf(&sidecar, "clip", None);
+
+        let err = resolve_refresh_target(dir.path(), sidecar.to_str().unwrap())
+            .expect_err("companion file");
+        assert!(
+            err.to_string().contains("companion file"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The re-download spec carries the tag the file's *name* has, which is
+    /// what `download` matches against the repo listing — never the `QUANT`
+    /// column's ggml-type fallback, which names no file in the repo.
+    #[test]
+    fn the_download_spec_uses_the_filename_tag_not_the_quant_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--unsloth--gemma-4-E2B-it-GGUF/snapshots/rev1");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        write_minimal_gguf(&snapshot.join("gemma-4-E2B-it-Q4_K_M.gguf"), "gemma4", None);
+        // No quantization tag in the name at all: `QUANT` shows whatever the
+        // tensors say (nothing here), while the spec keeps the `-hf` tag the
+        // name does carry — the one that picked this file the first time.
+        write_minimal_gguf(&snapshot.join("gemma-4-E2B-it.gguf"), "gemma4", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+
+        let tagged = groups
+            .iter()
+            .find(|g| g.quantization.as_deref() == Some("Q4_K_M"))
+            .expect("tagged row");
+        assert_eq!(
+            tagged.download_spec().as_deref(),
+            Some("unsloth/gemma-4-E2B-it-GGUF:Q4_K_M")
+        );
+
+        let untagged = groups
+            .iter()
+            .find(|g| g.representative_path.ends_with("gemma-4-E2B-it.gguf"))
+            .expect("untagged row");
+        assert_eq!(
+            untagged.download_spec().as_deref(),
+            Some("unsloth/gemma-4-E2B-it-GGUF:IT")
+        );
     }
 
     #[test]

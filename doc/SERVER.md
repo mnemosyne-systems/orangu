@@ -15,12 +15,12 @@ that only have the resources to keep one model resident at a time — this
 document covers `orangu-server` itself.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
-`list`/`show`/`download`/`delete` subcommands (below) answer the questions
-that matter when *getting*, *choosing*, and *cleaning up* a model, before
-or after serving. Those six read (or write) GGUF files directly off disk
-and query the local machine, no model loaded and no HTTP listener bound;
-`download` talks to the Hugging Face Hub to fetch a model, and `list` talks
-to it too — before printing its table, to check whether a newer commit
+`list`/`show`/`download`/`delete`/`refresh` subcommands (below) answer the
+questions that matter when *getting*, *choosing*, and *cleaning up* a model,
+before or after serving. Those seven read (or write) GGUF files directly off
+disk and query the local machine, no model loaded and no HTTP listener bound;
+`download` and `refresh` talk to the Hugging Face Hub to fetch a model, and
+`list` talks to it too — before printing its table, to check whether a newer commit
 exists for each Hugging Face-backed model already on disk (see **`list` and
 `show`** below). If the Hub is unreachable, `list` still prints the table;
 it just skips the check silently rather than failing the command.
@@ -111,9 +111,9 @@ orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 
 
 ## GGUF inventory
 
-Six subcommands cover getting, choosing, and cleaning up a model, all
-sharing the same `orangu-server.conf` and its `models` directory (see
-**Configuration** below):
+Seven subcommands cover getting, choosing, keeping current, and cleaning up
+a model, all sharing the same `orangu-server.conf` and its `models`
+directory (see **Configuration** below):
 
 ### `download`: fetching a model from Hugging Face
 
@@ -501,11 +501,13 @@ commit is behind gets a trailing `(Refresh)` marker, after `SIZE`:
 
 ```
 NR  MODEL                                      QUANT   SIZE       SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3)  (Refresh)
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3) (Refresh)
  2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)
 ```
 
-Re-running `orangu-server download` on that repo fetches the newer commit.
+`orangu-server refresh` (below) is what acts on that marker — it deletes the
+local copy and downloads the newer commit in its place.
+
 The check needs the Hub to be reachable; if it isn't (no network, a
 timeout, `HF_TOKEN` rejected, ...), `list` still prints the table — the
 lookup for that repo is simply skipped, silently, rather than failing the
@@ -579,6 +581,71 @@ changing, in which case the cache reuses rather than re-fetches the blob;
 and `models--<user>--<model>/` directories left behind by the last shard
 removed from them are cleaned up too — never anything above the configured
 `models` directory itself.
+
+### `refresh`: downloading a model again
+
+```sh
+orangu-server refresh 3                                        # NR from `list`
+orangu-server refresh unsloth/Qwen3-Coder-Next-GGUF             # MODEL from `list`
+orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K # one quantization of a repo with several on disk
+orangu-server refresh                                           # no argument: prints `list`'s table and prompts for an NR
+```
+
+```
+Refresh 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)? The local copy is deleted first, then downloaded again. [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (4 files, 17.28 GiB)
+Downloaded Qwen3-Coder-30B-A3B-Instruct-Q4_K_M-00001-of-00004.gguf: 100% [4/4]
+Downloaded to /home/you/models/models--unsloth--Qwen3-Coder-Next-GGUF/snapshots/<newcommit>/...
+```
+
+What `list`'s `(Refresh)` marker asks for: the repo has moved on since the
+model was fetched, so the local copy is deleted and the same
+`<user>/<model>:<quant>` spec downloaded again — `delete` and `download` in
+one step, at the newer commit.
+
+The local copy goes first, and the download follows. The point of a refresh
+is that the repo's files have changed, so the new revision is a full second
+copy on disk rather than a cheap blob-sharing snapshot: deleting first means
+a 17 GiB model needs 17 GiB free to refresh, not 34. The trade is that an
+interrupted download leaves the model missing rather than stale — which is
+what the confirmation line says, and what re-running `refresh` (or
+`download`, which resumes from the `.part` file left behind) recovers from.
+
+The argument resolves the way `delete`'s does — `NR`, `MODEL`, bare name, or
+path, always against every shard of the model — with one deliberate
+difference. Two quantizations of one repo share a `MODEL` cell (`QUANT` is
+what tells them apart), and where `delete` takes the first match and spells
+out in its confirmation line which one that was, `refresh` refuses:
+
+```
+$ orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF
+error: 'bartowski/Llama-3.2-1B-Instruct-GGUF' names 2 models on disk (Q4_K_M, Q6_K); name the quantization too — 'bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M' — or use an NR from 'orangu-server list'
+```
+
+It has to: `refresh` deletes what it then downloads, so silently picking a
+row would refresh the wrong quantization *and* leave the one you meant
+untouched. Name it as `<repo>:<quant>`, or use the row's `NR`.
+
+With no argument at all, `refresh` prints the same table `list` does — and
+greys every row that is *already* at its repo's latest commit, the inverse of
+what `list` greys. Only the `NR`s worth refreshing (the `(Refresh)` rows)
+stand out:
+
+```
+NR  MODEL                                      QUANT   SIZE       SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3) (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)     <- greyed
+
+Select a model to refresh (NR):
+```
+
+When nothing is behind (or the Hub is unreachable, in which case nothing is
+*known* to be behind and no row is greyed), it says so before the prompt. As
+with the marker itself, a model outside the Hugging Face hub cache layout has
+no repo to refresh from; naming one is an error, raised before anything is
+deleted.
+
+Confirmation, and `-y`/`--yes` to skip it, work exactly as in `delete`.
 
 ## Configuration
 
@@ -689,9 +756,9 @@ orangu-server -s > ~/.zsh/completions/_orangu-server
 orangu-server -s | source
 ```
 
-Covers every flag above, the six subcommand names, and the positional
-`model` argument plus `show`'s and `delete`'s own arguments — the latter
-three completed by shelling back out to `orangu-server list` itself and
+Covers every flag above, the subcommand names, and the positional
+`model` argument plus `show`'s, `delete`'s and `refresh`'s own arguments —
+those four completed by shelling back out to `orangu-server list` itself and
 reading its first two columns (`NR`/`MODEL`), the same way `orangu`'s own
 shell completions read
 `~/.orangu/sessions` directly rather than needing any extra plumbing in the

@@ -17,12 +17,12 @@ that only have the resources to keep one model resident at a time — this
 chapter covers `orangu-server` itself.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
-`list`/`show`/`download`/`delete` subcommands (below) answer the questions
-that matter when *getting*, *choosing*, and *cleaning up* a model, before
-or after serving. Those six read (or write) GGUF files directly off disk
-and query the local machine, no model loaded and no HTTP listener bound;
-`download` talks to the Hugging Face Hub to fetch a model, and `list` talks
-to it too — before printing its table, to check whether a newer commit
+`list`/`show`/`download`/`delete`/`refresh` subcommands (below) answer the
+questions that matter when *getting*, *choosing*, and *cleaning up* a model,
+before or after serving. Those seven read (or write) GGUF files directly off
+disk and query the local machine, no model loaded and no HTTP listener bound;
+`download` and `refresh` talk to the Hugging Face Hub to fetch a model, and
+`list` talks to it too — before printing its table, to check whether a newer commit
 exists for each Hugging Face-backed model already on disk (see **`list` and
 `show`** below). If the Hub is unreachable, `list` still prints the table;
 it just skips the check silently rather than failing the command.
@@ -111,9 +111,9 @@ orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 
 
 ## GGUF inventory
 
-Six subcommands cover getting, choosing, and cleaning up a model, all
-sharing the same `orangu-server.conf` and its `models` directory (see
-**Configuration** below).
+Seven subcommands cover getting, choosing, keeping current, and cleaning up
+a model, all sharing the same `orangu-server.conf` and its `models`
+directory (see **Configuration** below).
 
 Each of them names itself in the **terminal title** while it runs —
 `orangu-server download`, `orangu-server list`, `orangu-server prune`, and
@@ -373,6 +373,23 @@ so the column tells you that up front. The greying is only emitted to a
 terminal — piped or redirected output stays plain text, so the shell
 completion scripts that read `list` by column keep working.
 
+For every row that names a Hugging Face repo, `list` also checks that repo's
+current `main` commit against the one the local copy was downloaded at, in
+parallel across every distinct repo on the list. A row that's behind gets a
+trailing `(Refresh)` marker after its last column:
+
+```
+NR  MODEL                                      QUANT   SIZE       SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3) (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)
+```
+
+`refresh` (below) is the command that acts on it. The check needs the Hub to
+be reachable: when it isn't, `list` still prints its table and simply skips
+the check, silently, rather than failing or leaving a stale marker. A model
+outside the Hugging Face hub cache layout has no repo to check against and
+never gets a marker.
+
 **`show`** prints a GGUF file's full metadata — every key/value pair in the
 file, not just the well-known keys. Omit the argument entirely to pick one
 interactively (`list`'s own table, then an `NR` prompt):
@@ -416,6 +433,49 @@ its target blob is reclaimed too — but only when no other snapshot left in
 that repo still references it — and any now-empty `snapshots/<rev>/` or
 `models--<user>--<model>/` directory left behind is cleaned up, never
 anything above the configured `models` directory itself.
+
+**`refresh`** downloads a model again at its repo's newer commit — what a
+`(Refresh)` marker in `list` asks for. It is `delete` plus `download` of the
+same `<user>/<model>:<quant>` spec, in one step:
+
+```sh
+orangu-server refresh 3                                        # NR from `list`
+orangu-server refresh unsloth/Qwen3-Coder-Next-GGUF             # MODEL from `list`
+orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K # one quantization of several on disk
+orangu-server refresh                                           # no argument: interactive
+```
+
+```
+Refresh 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)? The local copy is deleted first, then downloaded again. [y/N]: y
+Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (4 files, 17.28 GiB)
+Downloaded to /home/you/models/models--unsloth--Qwen3-Coder-Next-GGUF/snapshots/<newcommit>/...
+```
+
+The local copy really does go first. A changed repo means a full second copy
+on disk, not a cheap blob-sharing snapshot, so deleting first means a 17 GiB
+model needs 17 GiB free to refresh rather than 34 — at the cost that an
+interrupted download leaves the model missing rather than stale. Re-running
+`refresh` (or `download`, which resumes from the `.part` file left behind)
+is what recovers from that.
+
+The argument resolves the way `delete`'s does, with one difference: a `MODEL`
+name that matches more than one row is an error rather than a first-match.
+Since `refresh` deletes what it then downloads, silently picking a row would
+refresh the wrong quantization *and* leave the one you meant untouched:
+
+```
+$ orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF
+error: 'bartowski/Llama-3.2-1B-Instruct-GGUF' names 2 models on disk (Q4_K_M, Q6_K); name the quantization too — 'bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M' — or use an NR from 'orangu-server list'
+```
+
+With no argument, `refresh` prints `list`'s table with every row that is
+*already* current greyed out — the inverse of what `list` greys — so the only
+`NR`s standing out are the ones worth refreshing, and prompts for one. When
+nothing is behind (or the Hub couldn't be reached, so nothing is *known* to
+be behind and nothing is greyed) it says so before the prompt. A model that
+didn't come from Hugging Face has no repo to refresh from; naming one is an
+error, raised before anything is deleted. Confirmation and `-y`/`--yes` work
+exactly as in `delete`.
 
 ## Configuration
 
@@ -495,10 +555,10 @@ both listeners bound, *before* detaching, so a bad config or a port already
 in use is still reported to the invoking terminal rather than silently lost.
 `-h`/`--help` and `-V`/`--version` are also available. `-s`/
 `--shell-completions` prints a bash/zsh/fish completion script for the
-shell detected from `$SHELL` — covering every flag above, the six
-subcommand names, and the positional `model` argument plus `show`'s and
-`delete`'s own arguments, the latter three completed by shelling out to
-`orangu-server list` itself. `-w`/`--workspace` completes directories
+shell detected from `$SHELL` — covering every flag above, the
+subcommand names, and the positional `model` argument plus `show`'s,
+`delete`'s and `refresh`'s own arguments, those four completed by shelling
+out to `orangu-server list` itself. `-w`/`--workspace` completes directories
 (only), and `-c`/`--config` any file, in all three shells.
 
 ## Workspace
