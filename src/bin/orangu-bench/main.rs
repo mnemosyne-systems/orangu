@@ -48,10 +48,12 @@ use std::time::Instant;
 
 use clap::Parser;
 
+mod bundle;
 mod chart;
 mod flamegraph;
 mod history;
 mod profile;
+mod sweep;
 
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
@@ -197,6 +199,32 @@ struct Args {
     /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
     #[arg(long, value_delimiter = ',')]
     compare_profiles: Vec<String>,
+
+    /// Write the whole run — measurements, server configuration, host — to one
+    /// JSON file to carry off this machine.
+    #[arg(long)]
+    bundle: Option<String>,
+
+    /// Read bundles and report them side by side; measure nothing.
+    #[arg(long, value_delimiter = ',')]
+    read_bundle: Vec<String>,
+
+    /// Sweep one tuning variable: `VAR=v1,v2,...`, restarting the server per
+    /// value. Needs `--sweep-cmd`.
+    #[arg(long)]
+    sweep: Option<String>,
+
+    /// Shell command that starts the server, run once per `--sweep` value.
+    #[arg(long)]
+    sweep_cmd: Option<String>,
+
+    /// Environment held constant across every `--sweep` point (repeatable).
+    #[arg(long = "sweep-env")]
+    sweep_env: Vec<String>,
+
+    /// Seconds to wait for a swept server to come up.
+    #[arg(long, default_value_t = 300)]
+    sweep_start_timeout: u64,
 }
 
 /// POST `body` to `endpoint`, retrying once on a connection-level failure.
@@ -279,6 +307,21 @@ fn build_prompt(depth: u32) -> String {
     let sentence = "The travelers pressed on through the valley as the pale morning light \
                     spread over the hills and the road wound slowly toward the distant sea. ";
     let words_per = 24u32; // approximate token count of `sentence`
+    // Below one whole sentence the repeat-and-pad construction cannot get
+    // near the requested length: its preamble and tail alone are ~28 tokens,
+    // so `--pp 8`, `--pp 16` and `--pp 32` all came out as the same ~52-token
+    // prompt. That is not a rounding error, it is three requested lengths
+    // measuring one prefill — and it is why `ORANGU_COOP_MIN_TOKENS`, whose
+    // whole regime is forwards of 2..24 positions, read as having no effect
+    // anywhere below its default.
+    //
+    // So short prompts get their own construction. Every length the old one
+    // could actually produce (`depth >= words_per`, i.e. one sentence or
+    // more) still takes the identical path below and builds a byte-identical
+    // prompt, so no previously-recorded `pp` point moves.
+    if depth < words_per {
+        return short_prompt(sentence, depth);
+    }
     let repeats = (depth / words_per).max(1);
     let mut s = String::with_capacity(repeats as usize * sentence.len() + tail.len() + 64);
     s.push_str("Here is the story so far:\n\n");
@@ -286,6 +329,31 @@ fn build_prompt(depth: u32) -> String {
         s.push_str(sentence);
     }
     s.push_str(tail);
+    s
+}
+
+/// A prompt of roughly `depth` tokens, for `depth` below one sentence.
+///
+/// Just `depth` words of the same sentence, cycled — no preamble and **no
+/// "continue, do not stop" tail**. The tail is ~20 tokens on its own, which is
+/// most of the budget at these lengths, and it earns its place only in the
+/// modes that then *generate*: it stops a greedy model emitting end-of-sequence
+/// immediately. A prompt this short is only useful for `--pp`, which measures
+/// the prefill and generates a single token, so nothing here depends on what
+/// the model would have said next.
+///
+/// Words rather than a truncated sentence so the text stays ordinary prose —
+/// a degenerate repeat is the one thing that provokes the immediate-EOS this
+/// whole builder is shaped around, and it would be just as wrong here.
+fn short_prompt(sentence: &str, depth: u32) -> String {
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    let mut s = String::with_capacity(depth as usize * 8);
+    for i in 0..depth.max(1) as usize {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(words[i % words.len()]);
+    }
     s
 }
 
@@ -686,6 +754,17 @@ fn run(args: &Args) -> anyhow::Result<()> {
         return compare_profiles(args);
     }
 
+    // The other half of `--bundle`: profile there, analyze here.
+    if !args.read_bundle.is_empty() {
+        return compare_bundles(args);
+    }
+
+    // Starts its own servers, so it comes before the client below is pointed
+    // at one that is not up yet.
+    if args.sweep.is_some() {
+        return run_sweep(args);
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
@@ -728,7 +807,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| server_label(&client, args));
 
-    report_environment(&client, args);
+    let env = report_environment(&client, args);
 
     // Started here — after warmup, after the environment probe — so the profile
     // covers the timed workload and nothing else. Anything before this point is
@@ -739,9 +818,15 @@ fn run(args: &Args) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Discarded: drains whatever the warmup accumulated, so what the second
+    // read returns is the measured window and nothing else.
+    let _ = take_gpu_timings(&client, &args.url);
     let clocks = ClockWatch::start();
     let measured = measure(&client, args, &label);
     report_clocks(&clocks.stop(), args);
+    let mut env = env;
+    env.gpu_timings = take_gpu_timings(&client, &args.url);
+    report_gpu_timings(&env.gpu_timings, args);
 
     if let Some(recorder) = recorder {
         match recorder.finish() {
@@ -752,7 +837,385 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
     }
 
-    record_and_chart(args, &measured?)
+    let measured = measured?;
+    write_bundle(args, args.bundle.as_deref(), &env, &measured)?;
+    record_and_chart(args, &measured)
+}
+
+/// Write `--bundle`, if asked for.
+///
+/// After the measurement rather than before, because the bundle's whole point
+/// is to be the run *and* what produced it in one file — a configuration
+/// archived next to no numbers is not evidence of anything.
+/// `path` rather than `args.bundle` because a sweep writes one bundle per
+/// point, each under its own name — see [`bundle_point_path`].
+fn write_bundle(
+    args: &Args,
+    path: Option<&str>,
+    env: &Environment,
+    records: &[history::Record],
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    // How the tool was invoked, so a bundle answers "what workload was this"
+    // without the reader having to infer it from the record shapes.
+    let run = serde_json::json!({
+        "url": args.url,
+        "workload": workload_name(args),
+        "depths": args.depths,
+        "pp": args.pp,
+        "pp_continue": args.pp_continue,
+        "embed": args.embed,
+        "streams": args.streams,
+        "n_gen": args.n_gen,
+        "reps": args.reps,
+        "curve": args.curve,
+    });
+    // The host facts the server does not report. `os`/`arch` are what tell a
+    // later reader that two bundles came off different machines at all —
+    // `props.backend` names the *device*, not the platform, and on a `wgpu`
+    // engine those are separate questions.
+    let host = serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "clocks": env.gpus.iter().map(|g| serde_json::json!({
+            "card": g.card, "sclk": g.sclk, "power_level": g.power_level,
+        })).collect::<Vec<_>>(),
+    });
+    bundle::write(path, &env.props, host, run, &env.gpu_timings, records)?;
+    if !args.json {
+        println!("  bundle   {path} ({} rows)", records.len());
+    }
+    Ok(())
+}
+
+/// `--sweep`: one server per value of one tuning variable, measured in turn.
+///
+/// Every point is a full restart, because nearly every knob worth sweeping is
+/// read once at device init and most are then baked into generated WGSL —
+/// there is no runtime setter that could exist for a workgroup width. See the
+/// `sweep` module for why the launching and stopping is more careful than it
+/// looks like it needs to be.
+///
+/// Each point's records go into `--history` under the label `VAR=value` and,
+/// with `--bundle`, into its own `<stem>-<value>.json` so the sweep leaves the
+/// same artifacts a hand-run A/B would. The comparison table at the end is
+/// against the **first** value, so listing the current default first makes the
+/// percentages read as "what changing it would buy".
+fn run_sweep(args: &Args) -> anyhow::Result<()> {
+    let spec = sweep::Spec::parse(args.sweep.as_deref().expect("checked by the caller"))?;
+    let cmd = args.sweep_cmd.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--sweep needs --sweep-cmd \"<command that starts orangu-server>\": the values \
+             being swept are read once at device init, so each one needs its own server"
+        )
+    })?;
+    let port = url_port(&args.url)
+        .ok_or_else(|| anyhow::anyhow!("could not read a port out of --url {}", args.url))?;
+    let fixed: Vec<(String, String)> = args
+        .sweep_env
+        .iter()
+        .map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("--sweep-env wants K=V, got {kv:?}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let timeout = std::time::Duration::from_secs(args.sweep_start_timeout);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(args.timeout))
+        .build()?;
+
+    let mut all = Vec::new();
+    let mut bundles = Vec::new();
+    for value in &spec.values {
+        let label = spec.label(value);
+        println!("\n=== {label}");
+        // Named after the point, not the run: a sweep that fails at value 3
+        // of 5 must leave the log that explains *that* start, not the last
+        // one's.
+        let log = std::path::PathBuf::from(format!("orangu-sweep-{}.log", slug(&label)));
+        let mut env = fixed.clone();
+        env.push((spec.var.clone(), value.clone()));
+        let server = sweep::start(cmd, &env, port, &log, timeout)?;
+        sweep::wait_until_serving(&client, &args.url, &server, timeout)?;
+
+        if !args.no_warmup {
+            warm_up_for_sweep(&client, args)?;
+        }
+        let mut env_report = report_environment(&client, args);
+        let _ = take_gpu_timings(&client, &args.url);
+        let clocks = ClockWatch::start();
+        let measured = measure(&client, args, &label);
+        report_clocks(&clocks.stop(), args);
+        env_report.gpu_timings = take_gpu_timings(&client, &args.url);
+        report_gpu_timings(&env_report.gpu_timings, args);
+        let measured = measured?;
+
+        if let Some(stem) = &args.bundle {
+            let path = bundle_point_path(stem, &label);
+            write_bundle(args, Some(&path), &env_report, &measured)?;
+            bundles.push(path);
+        }
+        if let Some(path) = &args.history {
+            history::append(path, &measured)?;
+        }
+        all.extend(measured);
+        // Explicit, so the next point's pre-flight port check is not racing
+        // this one's teardown.
+        drop(server);
+    }
+
+    println!(
+        "\nswept {} — mean tok/s, against {}",
+        spec.var,
+        spec.label(&spec.values[0])
+    );
+    print_sweep_table(&spec, &all);
+    if !bundles.is_empty() {
+        println!("\nbundles: {}", bundles.join(" "));
+    }
+    write_chart(args, &all)
+}
+
+/// Warm a freshly-started server on **the workload it is about to be measured
+/// on**, discarding the result.
+///
+/// The single-server path warms up with an eight-token generation, which is
+/// enough to make the compute threads exist (which is what `--flamegraph`
+/// needs) and *not* enough to warm the kernels a prefill sweep then measures.
+/// Measured: a sweep warmed that way put one configuration's first prefill
+/// point 16% below the same configuration's later points, with its own sd an
+/// order of magnitude above theirs. In a comparison table that is
+/// indistinguishable from the swept variable being catastrophic at that value
+/// — and because every point of a sweep starts from a cold process, the
+/// contamination lands on a different configuration each time, which is worse
+/// than a bias that at least cancels.
+///
+/// Two passes at the *longest* requested prompt: the first is the cold one,
+/// the second confirms the path is warm before anything is recorded. Prints
+/// nothing — a discarded pass that printed a table would be mistaken for the
+/// result.
+fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()> {
+    let p = build_prompt(0);
+    // Always: this is what creates the compute threads, and it is the only
+    // warmup an embedding-only server's endpoints allow.
+    if args.embed.is_empty() {
+        run_once(client, &args.url, &p, 8, &args.model)?;
+    } else {
+        run_embed_once(client, &args.url, &p, &args.model)?;
+    }
+    // Then the workload's own path, where there is one to warm.
+    let longest = args.pp.iter().chain(args.embed.iter()).copied().max();
+    if let Some(depth) = longest {
+        let prompt = build_prompt(depth);
+        for _ in 0..2 {
+            if args.embed.is_empty() {
+                // `cache_prompt: false` — a warmup that seeded the prefix
+                // cache would make the first measured rep a cache hit and
+                // report a lookup as a prefill.
+                run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
+            } else {
+                run_embed_once(client, &args.url, &prompt, &args.model)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ORANGU_COOP_MIN_TOKENS=16` → `orangu_coop_min_tokens-16`, for a filename.
+fn slug(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// `perf/coop.json` + `VAR=16` → `perf/coop-var-16.json`, so a sweep's points
+/// sit next to each other and sort in value order rather than overwriting one
+/// file per point.
+fn bundle_point_path(stem: &str, label: &str) -> String {
+    let p = std::path::Path::new(stem);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("json");
+    let base = p.with_extension("");
+    format!("{}-{}.{ext}", base.display(), slug(label))
+}
+
+/// The sweep's answer, as one row per measured point and one column per value.
+fn print_sweep_table(spec: &sweep::Spec, records: &[history::Record]) {
+    let mut points: Vec<(String, u32)> = records.iter().map(|r| (r.mode.clone(), r.n)).collect();
+    points.sort_unstable();
+    points.dedup();
+    let at = |value: &str, mode: &str, n: u32| -> Option<f64> {
+        let label = spec.label(value);
+        records
+            .iter()
+            .find(|r| r.label == label && r.mode == mode && r.n == n)
+            .map(|r| r.mean)
+    };
+    print!("  {:<12}", "point");
+    for v in &spec.values {
+        print!("  {:>18}", if v.is_empty() { "<unset>" } else { v });
+    }
+    println!();
+    for (mode, n) in &points {
+        print!("  {:<12}", format!("{mode} {n}"));
+        let base = at(&spec.values[0], mode, *n);
+        for v in &spec.values {
+            match (at(v, mode, *n), base) {
+                (Some(got), Some(b)) if b > 0.0 => {
+                    print!("  {got:>11.2} {:>+5.1}%", (got / b - 1.0) * 100.0);
+                }
+                (Some(got), _) => print!("  {got:>18.2}"),
+                (None, _) => print!("  {:>18}", "—"),
+            }
+        }
+        println!();
+    }
+}
+
+/// `--read-bundle`: put runs side by side and say what differed between them.
+///
+/// Two tables, in this order on purpose. **What differed** comes first, because
+/// a throughput comparison is only readable once you know whether the two runs
+/// were the same experiment — and across two machines the honest answer is
+/// usually "no, and here is the list". **What it measured** comes second, with
+/// the ratio against the first bundle, which is the number the run was for.
+///
+/// Renders `--chart`/`--chart-png` from the bundles' own records when asked, so
+/// the same command produces the picture that goes in the document.
+fn compare_bundles(args: &Args) -> anyhow::Result<()> {
+    let bundles: Vec<bundle::Bundle> = args
+        .read_bundle
+        .iter()
+        .map(|p| bundle::read(p))
+        .collect::<anyhow::Result<_>>()?;
+    let (first, rest) = bundles
+        .split_first()
+        .expect("caller checked --read-bundle is non-empty");
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "bundles",
+                "bundles": bundles.iter().map(|b| serde_json::json!({
+                    "name": b.name,
+                    "date": b.date,
+                    "label": b.label(),
+                    "props": b.props,
+                    "host": b.host,
+                    "run": b.run,
+                })).collect::<Vec<_>>(),
+                "diffs": rest.iter().map(|b| serde_json::json!({
+                    "against": first.name,
+                    "name": b.name,
+                    "fields": bundle::diff(first, b).into_iter()
+                        .map(|(k, l, r)| serde_json::json!([k, l, r]))
+                        .collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        for b in &bundles {
+            println!("{}  {}  {}", b.name, b.date, b.label());
+        }
+        for b in rest {
+            let fields = bundle::diff(first, b);
+            println!("\nwhat differed: {} → {}", first.name, b.name);
+            if fields.is_empty() {
+                // Worth saying out loud: "same configuration" is a finding,
+                // and an empty table would read as a broken diff.
+                println!("  (nothing — same configuration)");
+            }
+            let width = fields.iter().map(|(k, _, _)| k.len()).max().unwrap_or(0);
+            for (k, l, r) in &fields {
+                println!("  {k:<width$}  {l}  →  {r}");
+            }
+        }
+        // Before the throughput table, because it is the half that answers
+        // *why* — and on a Mac it is the only such answer available, since
+        // `--flamegraph` needs `perf`.
+        let with_timings: Vec<&bundle::Bundle> = bundles
+            .iter()
+            .filter(|b| !b.gpu_timings.is_null())
+            .collect();
+        if !with_timings.is_empty() {
+            println!("\nwhere the GPU time went (ms per decode step)");
+            let stages = ["total", "qkv", "attn", "ffn", "ple", "tail"];
+            print!("  {:<8}", "stage");
+            for b in &with_timings {
+                print!("  {:>18}", b.name);
+            }
+            println!();
+            let at = |b: &bundle::Bundle, stage: &str| {
+                b.gpu_timings
+                    .get("per_step_ms")
+                    .and_then(|m| m.get(stage))
+                    .and_then(serde_json::Value::as_f64)
+            };
+            for stage in stages {
+                print!("  {stage:<8}");
+                let base = at(with_timings[0], stage);
+                for b in &with_timings {
+                    match (at(b, stage), base) {
+                        (Some(v), Some(b0)) if b0 > 0.0 => {
+                            print!("  {v:>11.3} {:>+5.1}%", (v / b0 - 1.0) * 100.0);
+                        }
+                        (Some(v), _) => print!("  {v:>18.3}"),
+                        (None, _) => print!("  {:>18}", "—"),
+                    }
+                }
+                println!();
+            }
+        }
+
+        println!("\nwhat it measured (mean tok/s)");
+        let mut points: Vec<(String, u32)> = bundles
+            .iter()
+            .flat_map(|b| b.by_point().into_keys())
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        let per_bundle: Vec<_> = bundles.iter().map(bundle::Bundle::by_point).collect();
+        print!("  {:<10}", "point");
+        for b in &bundles {
+            print!("  {:>18}", b.name);
+        }
+        println!();
+        for (mode, n) in &points {
+            print!("  {:<10}", format!("{mode} {n}"));
+            let base = per_bundle[0].get(&(mode.clone(), *n)).copied();
+            for got in &per_bundle {
+                match got.get(&(mode.clone(), *n)) {
+                    // The ratio, not just the rate: the comparison is the
+                    // reason two bundles are open at once.
+                    Some(v) => match base {
+                        Some(b0) if b0 > 0.0 => {
+                            print!("  {v:>11.2} {:>+5.1}%", (v / b0 - 1.0) * 100.0)
+                        }
+                        _ => print!("  {v:>18.2}"),
+                    },
+                    None => print!("  {:>18}", "—"),
+                }
+            }
+            println!();
+        }
+    }
+
+    // The records of every bundle, so one chart holds every machine.
+    let records: Vec<history::Record> = bundles.iter().flat_map(|b| b.records.clone()).collect();
+    write_chart(args, &records)
 }
 
 /// The timed part of a run, split out so [`run`] can bracket exactly this with
@@ -1712,6 +2175,40 @@ fn run_embed(
     Ok(records)
 }
 
+/// What the run was taken *on*, captured while it was taken — see
+/// [`report_environment`].
+struct Environment {
+    /// The server's `/props`, `Null` when it did not answer.
+    props: serde_json::Value,
+    /// GPU clock state where the platform exposes it — empty elsewhere.
+    gpus: Vec<GpuClock>,
+    /// The GPU timestamp breakdown for the measured window — see
+    /// [`take_gpu_timings`]. `Null` unless the server reports one.
+    gpu_timings: serde_json::Value,
+}
+
+/// Drain the server's accumulated GPU timestamp breakdown.
+///
+/// `GET /gpu-timings` is read-and-reset, so this is called **twice**: once
+/// before the workload, whose result is thrown away, and once after, whose
+/// result is exactly that window. Without the discard the reported breakdown
+/// would include the warmup — which for a sweep is a whole extra pass of the
+/// same workload, i.e. roughly double, and wrong in a way that looks
+/// plausible.
+///
+/// Silent when the server has no such endpoint: this is the only profiling
+/// instrument that works on a platform without `perf`, but it is still
+/// optional, and llama-server does not have it at all.
+fn take_gpu_timings(client: &reqwest::blocking::Client, url: &str) -> serde_json::Value {
+    client
+        .get(format!("{url}/gpu-timings"))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| v.get("timings").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// What was measured, printed before the numbers: which server process, the
 /// model, the backend, and the GPU's clock state.
 ///
@@ -1729,7 +2226,11 @@ fn run_embed(
 /// as a credible "no change" result rather than as the broken measurement it
 /// is. A pid that does not change between runs, or an uptime far longer than
 /// this run, says so immediately.
-fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
+///
+/// Returns what it read as well as printing it, so [`write_bundle`] archives
+/// the configuration that was live *during* the measurement. Re-fetching it
+/// afterwards would usually agree and would occasionally, silently, not.
+fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Environment {
     let props: Option<serde_json::Value> = client
         .get(format!("{}/props", args.url))
         .send()
@@ -1754,6 +2255,9 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
     let pid = num("pid");
     let uptime = num("uptime_seconds");
     let gpus = gpu_clock_states();
+    // `null` from llama-server and from orangu-server on a non-`wgpu`
+    // backend; a full `VulkanBackend::tuning_report` otherwise.
+    let gpu_tuning = props.as_ref().and_then(|p| p.get("gpu")).cloned();
 
     if args.json {
         println!(
@@ -1766,12 +2270,20 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
                 "pid": pid,
                 "uptime_seconds": uptime,
                 "gpus": gpus,
+                // Verbatim, not summarized: the JSON stream is what gets
+                // archived next to a throughput number, and a run measured
+                // six months ago is only re-interpretable if the whole
+                // configuration travelled with it.
+                "gpu_tuning": gpu_tuning,
             })
         );
     } else {
         println!("orangu-bench → {}", args.url);
         println!("  model    {model}");
         println!("  backend  {backend}");
+        for line in format_gpu_tuning(gpu_tuning.as_ref()) {
+            println!("  {line}");
+        }
         // Only for a server that reports them; llama-server does not, and a
         // missing field is not worth a line of output.
         if pid.is_some() || uptime.is_some() {
@@ -1784,7 +2296,161 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) {
                 gpu.card, gpu.sclk, gpu.power_level
             );
         }
+        // Say that the clock is unknown, rather than printing nothing and
+        // letting the absence read as "clocks were fine". `gpu_clock_states`
+        // reads amdgpu's sysfs, which exists on no other platform — on macOS
+        // in particular there is no unprivileged equivalent, so a Metal run's
+        // numbers carry no evidence either way about whether the GPU stayed
+        // at its boost clock while they were taken. That is a real limit on
+        // what a Mac A/B can conclude and it belongs in the header, not in
+        // the reader's memory. (Same reasoning as `ORANGU_GPU_TIMESTAMPS`'s
+        // own "this adapter can't" warning: a diagnostic that silently does
+        // nothing invites the conclusion that what it measures costs zero.)
+        if gpus.is_empty() && !backend.starts_with("CPU") {
+            println!("  gpu      clocks unreadable on this platform — no drift evidence");
+        }
     }
+    Environment {
+        props: props.unwrap_or(serde_json::Value::Null),
+        gpus,
+        // Filled in by the caller after the workload — this function runs
+        // before it. Reported here as `Null` rather than as an absent field so
+        // a bundle's shape does not depend on whether timestamps were on.
+        gpu_timings: serde_json::Value::Null,
+    }
+}
+
+/// The `gpu` block of `/props` (`VulkanBackend::tuning_report`) as header
+/// lines, or nothing at all when the server did not report one — llama-server
+/// never does, and neither does orangu-server on a CPU/CUDA/OpenCL/ROCm
+/// backend.
+///
+/// Every A/B in this project's history has at some point been confounded by a
+/// server that was not running the kernels the experimenter believed it was —
+/// a stale binary, an `ORANGU_*` var left set in a different shell, an
+/// adapter that quietly declined a feature. The `--json` stream carries the
+/// whole report for the archive; these lines are the subset worth reading
+/// *before* trusting the run: which quantized matmul kernel is live, which
+/// attention path, and the geometry constants that were swept on one AMD card
+/// and inherited everywhere else.
+fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(gpu) = gpu.filter(|g| !g.is_null()) else {
+        return Vec::new();
+    };
+    let get = |path: [&str; 2]| -> Option<&serde_json::Value> {
+        gpu.get(path[0]).and_then(|v| v.get(path[1]))
+    };
+    let show = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => "?".to_string(),
+    };
+    let mut out = Vec::new();
+    out.push(format!(
+        "api      {} · {}",
+        show(gpu.get("api")),
+        show(gpu.get("adapter"))
+    ));
+    // Q4_K and Q6_K specifically: between them they are `ffn_down`/`attn_v`
+    // and everything else on the models this is benchmarked against, and they
+    // are the two types with more than one kernel competing for them.
+    let decode = gpu.get("kernels").and_then(|k| k.get("decode"));
+    let prefill = gpu.get("kernels").and_then(|k| k.get("prefill"));
+    let kernel = |m: Option<&serde_json::Value>, ty: &str| {
+        show(m.and_then(|m: &serde_json::Value| m.get(ty)))
+    };
+    out.push(format!(
+        "kernels  decode q4_k {} q6_k {} · prefill q4_k {}",
+        kernel(decode, "Q4_K"),
+        kernel(decode, "Q6_K"),
+        kernel(prefill, "Q4_K"),
+    ));
+    // `coop_vec4_tiles` was one flag before the two tiles were answered
+    // separately; a bundle or a server from before that split still reports
+    // it, and reading a run against an older build is the ordinary case
+    // during a bisect. Fall back rather than printing `?/?`.
+    let tiles = match (
+        get(["flags", "coop_vec4_tile_w"]),
+        get(["flags", "coop_vec4_tile_x"]),
+    ) {
+        (Some(w), Some(x)) => format!("w {} x {}", show(Some(w)), show(Some(x))),
+        _ => show(get(["flags", "coop_vec4_tiles"])),
+    };
+    out.push(format!(
+        "gpu      kv {} · coop-tiles {tiles} · attn-coop {} · flash {} · f16 {} · subgroup {}",
+        show(get(["flags", "kv_storage"])),
+        show(get(["flags", "attn_coop"])),
+        show(get(["flags", "flash_attn"])),
+        show(get(["features", "shader_f16"])),
+        show(get(["features", "subgroup"])),
+    ));
+    out.push(format!(
+        "tuning   coop≥{} tok · n_rows {} · {} · split_k {} · geom {} · lds {} B",
+        show(get(["tuning", "coop_min_n_tokens"])),
+        show(get(["tuning", "reduce_n_rows"])),
+        // `norm_wg` became a rule over row width rather than one constant,
+        // so report what it answers at a representative width — and say when
+        // `ORANGU_NORM_WG` has pinned it, which is what a sweep needs to see.
+        {
+            let at_3072 = show(
+                gpu.get("tuning")
+                    .and_then(|t| t.get("norm_wg_by_n_embd"))
+                    .and_then(|m| m.get("3072")),
+            );
+            match show(get(["tuning", "norm_wg_pinned"])).as_str() {
+                "true" => format!("norm_wg {at_3072} (pinned)"),
+                // A server from before the rule existed still reports the flat
+                // key; fall back to it rather than printing `?`.
+                "?" => format!("norm_wg {}", show(get(["tuning", "norm_wg"]))),
+                _ => format!("norm_wg {at_3072}@3072"),
+            }
+        },
+        show(get(["tuning", "attn_split_k"])),
+        show(get(["tuning", "coop_geom"])),
+        show(get(["limits", "max_compute_workgroup_storage_size"])),
+    ));
+    out
+}
+
+/// The GPU timestamp breakdown, as one line under the numbers it explains.
+///
+/// Per-step means rather than window totals: a window's totals depend on how
+/// many tokens were generated in it, so two configurations measured with
+/// different `--gen` would look different for a reason that has nothing to do
+/// with either. The mean is the comparable figure.
+///
+/// Nothing at all when the server reports no timings — llama-server has no
+/// such endpoint, and orangu-server has none unless `ORANGU_GPU_TIMESTAMPS=1`
+/// is set and the adapter has the query. That absence is why the "steps" count
+/// is printed: zero steps says "not measured", which is a different statement
+/// from zero milliseconds.
+fn report_gpu_timings(timings: &serde_json::Value, args: &Args) {
+    if args.json || timings.is_null() {
+        return;
+    }
+    let per = |k: &str| {
+        timings
+            .get("per_step_ms")
+            .and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    let steps = timings
+        .get("steps")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if steps == 0 {
+        return;
+    }
+    println!(
+        "  gpu ms/step  total {:.3}  qkv {:.3}  attn {:.3}  ffn {:.3}  ple {:.3}  tail {:.3}  ({steps} steps)",
+        per("total"),
+        per("qkv"),
+        per("attn"),
+        per("ffn"),
+        per("ple"),
+        per("tail"),
+    );
 }
 
 /// One GPU's current core clock and power-management mode, read from sysfs.
@@ -2087,6 +2753,94 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that reports no `gpu` block gets no header lines — not a row
+    /// of `?`s. llama-server is the case that matters: this tool is pointed at
+    /// it for every cross-implementation comparison, and four lines of unknowns
+    /// under its name would read as "orangu-server's kernels, unreadable"
+    /// rather than "a different server, which has none of these".
+    #[test]
+    fn no_gpu_block_prints_no_gpu_lines() {
+        assert!(format_gpu_tuning(None).is_empty());
+        assert!(format_gpu_tuning(Some(&serde_json::Value::Null)).is_empty());
+    }
+
+    /// A report that *is* present must survive missing sub-keys — an older
+    /// server on the far end of the socket is the ordinary case during a
+    /// bisect, and the header is a diagnostic, not something worth aborting a
+    /// benchmark over. Every value it does carry must still appear.
+    #[test]
+    fn gpu_lines_report_what_is_present_and_tolerate_what_is_not() {
+        let gpu = serde_json::json!({
+            "api": "Metal",
+            "adapter": "Apple M3 Max (Metal)",
+            "flags": { "kv_storage": "F16", "coop_vec4_tile_w": false, "coop_vec4_tile_x": true },
+            "kernels": { "decode": { "Q4_K": "q4_k-light" } },
+        });
+        let lines = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(lines.contains("Metal"), "{lines}");
+        assert!(lines.contains("Apple M3 Max"), "{lines}");
+        assert!(lines.contains("q4_k-light"), "{lines}");
+        assert!(lines.contains("F16"), "{lines}");
+        assert!(lines.contains("w false x true"), "{lines}");
+        // The absent ones degrade to `?` rather than panicking or vanishing:
+        // a blank where a kernel name belongs is indistinguishable from a
+        // kernel actually named nothing.
+        assert!(lines.contains('?'), "{lines}");
+    }
+
+    /// Short prompts must actually be short, and must differ from each other
+    /// by roughly the amount asked for.
+    ///
+    /// The bug this pins: the repeat-and-pad builder's preamble and tail are
+    /// ~28 tokens before a single word of content, so every requested length
+    /// below one sentence produced the *same* ~52-token prompt. Three
+    /// `--pp` values measuring one prefill is not a small inaccuracy — it made
+    /// a whole knob (`ORANGU_COOP_MIN_TOKENS`, whose regime is forwards of
+    /// 2..24 positions) read as having no effect below its default, because
+    /// every value below it was the same configuration by construction.
+    #[test]
+    fn short_prompts_are_short_and_distinct() {
+        let words = |s: &str| s.split_whitespace().count();
+        // Monotone, and near the requested count rather than 40 tokens above.
+        for depth in [1u32, 4, 8, 16, 23] {
+            let got = words(&build_prompt(depth));
+            assert_eq!(got, depth as usize, "--pp {depth} should be ~{depth} words");
+        }
+        assert_ne!(build_prompt(8), build_prompt(16));
+        // No "continue, do not stop" tail down here: it is ~20 tokens, it only
+        // matters to modes that generate, and at these lengths it *is* the
+        // prompt.
+        assert!(!build_prompt(8).contains("do not stop"));
+    }
+
+    /// ...and every length the old builder could really produce is untouched,
+    /// so no `pp` point already in a history file moves under it.
+    #[test]
+    fn prompts_of_a_sentence_or_more_keep_the_original_construction() {
+        for depth in [24u32, 48, 256, 1024, 2048] {
+            let p = build_prompt(depth);
+            assert!(
+                p.starts_with("Here is the story so far:"),
+                "--pp {depth} must keep the padded construction"
+            );
+            assert!(p.contains("do not stop"), "--pp {depth} must keep the tail");
+        }
+    }
+
+    /// A bundle or server from before the tile flag was split in two still
+    /// reports the single `coop_vec4_tiles`, and reading an old run against a
+    /// new build is the ordinary case during a bisect. The header must show
+    /// what it says rather than two question marks.
+    #[test]
+    fn the_pre_split_tile_flag_is_still_read() {
+        let gpu = serde_json::json!({
+            "api": "Vulkan",
+            "flags": { "coop_vec4_tiles": true },
+        });
+        let lines = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(lines.contains("coop-tiles true"), "{lines}");
+    }
 
     /// The one thing `--pp-continue` must get right. A prefix cache matches on
     /// the longest common token prefix, so two reps whose extensions began with

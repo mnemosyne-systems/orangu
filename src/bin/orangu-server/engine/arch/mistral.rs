@@ -287,13 +287,24 @@ impl MistralModel {
     ///
     /// The hidden state never returns to the host: each layer's output buffer
     /// is the next layer's input, so depth costs submissions nothing.
-    fn record_decode_forward(
+    /// The whole decode step recorded into one encoder, **not submitted** —
+    /// the caller decides what else joins the submission.
+    ///
+    /// Split out from [`Self::record_decode_forward`] so
+    /// [`Self::forward_maybe_sampling`] can append the GPU argmax to this same
+    /// encoder. Reading the `[n_vocab]` logits back to sample on the CPU is a
+    /// second round trip and, for a 128k-vocab model, half a megabyte of
+    /// transfer per token.
+    ///
+    /// Returns the encoder plus the logits buffer and its **byte** offset.
+    fn record_decode_chain(
         &self,
+        vulkan: &crate::engine::backend::VulkanBackend,
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
         slot_id: usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         use crate::engine::backend::vulkan::{
             FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, RopeYarn,
         };
@@ -310,7 +321,6 @@ impl MistralModel {
         if self.attn_temperature(start_pos) != 1.0 {
             return None;
         }
-        let vulkan = self.backend.as_wgpu()?;
         if !vulkan.prefill_attention_enabled() {
             return None;
         }
@@ -324,6 +334,12 @@ impl MistralModel {
         let x0 = self.tok_embeddings.row(tok).to_vec();
 
         let mut encoder = vulkan.new_encoder("orangu-server mistral decode");
+        // Per-stage GPU timing for this step, when `ORANGU_GPU_TIMESTAMPS=1`
+        // and the adapter has the query; inert otherwise. See
+        // `VulkanBackend::begin_step_timestamps` for why the slot arithmetic
+        // lives there rather than here.
+        let n_layer = self.layers.len();
+        let ts = vulkan.begin_step_timestamps(&mut encoder, n_layer);
         // Each layer's output buffer, kept alive until the submission that
         // reads them is recorded: a layer's `GpuInput` borrows the previous
         // layer's buffer, so they cannot be dropped inside the loop.
@@ -381,9 +397,10 @@ impl MistralModel {
                     ple: None,
                     layer_output_scale: None,
                     batch_slot: slot_id,
-                    attn_ts: None,
+                    attn_ts: ts.attn_slot(il, n_layer),
                 },
             );
+            ts.after_layer(&mut encoder, il);
             bufs.push(out);
         }
 
@@ -398,13 +415,34 @@ impl MistralModel {
         // `slot_id + 1`, not `slot_id`: op resources are keyed by
         // `(weight, batch_slot)`, and the vocab projection must not share a
         // slot with the layer chain that runs into it.
-        vulkan.record_full_matmul(
+        let (logits_buf, logits_offset) = vulkan.record_full_matmul(
             &mut encoder,
             GpuInput::Gpu(&normed, 0),
             &self.output_weight,
             slot_id + 1,
         );
-        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
+        ts.finish(vulkan, &mut encoder, n_layer);
+        Some((encoder, logits_buf, logits_offset))
+    }
+
+    /// A decode step as one GPU submission, returning the full `[n_vocab]`
+    /// logits — the path taken when the caller is not greedy-sampling. See
+    /// [`Self::forward_maybe_sampling`] for the one that is.
+    fn record_decode_forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        let vulkan = self.backend.as_wgpu()?;
+        let (encoder, _, _) =
+            self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)?;
+        let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
+        if vulkan.gpu_timestamps() {
+            vulkan.report_timestamps(start_pos, self.layers.len());
+        }
+        Some(logits)
     }
 
     /// Runs every transformer layer and returns the pre-final-norm hidden
@@ -584,6 +622,64 @@ impl MistralModel {
 }
 
 impl ModelForward for MistralModel {
+    /// A greedy decode step that never transfers the logits.
+    ///
+    /// The default implementation returns `[n_vocab]` logits for the caller to
+    /// sample on the CPU. That is a second round trip on every token plus, for
+    /// this family's larger vocabularies, half a megabyte of transfer — and it
+    /// was measured at **+17.7% throughput** on the one architecture that
+    /// already avoided it, once the quantized decode kernels stopped dominating
+    /// the step. Here the argmax joins the same encoder as the forward, and a
+    /// single `u32` comes back.
+    ///
+    /// Falls through to the logits path whenever the fast path does not apply —
+    /// no `wgpu` backend, not greedy, more than one token, or `gpu_sample`
+    /// turned off — so behaviour is unchanged wherever it cannot help.
+    fn forward_maybe_sampling(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        greedy_sample: Option<super::GreedySampleParams<'_>>,
+        slot_id: usize,
+    ) -> Result<super::ForwardOutcome> {
+        if tokens.len() == 1
+            && let Some(params) = &greedy_sample
+            && let Some(vulkan) = self.backend.as_wgpu()
+            && vulkan.gpu_sample()
+            && let Some((mut encoder, logits_buf, logits_offset)) =
+                self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)
+        {
+            let sample_buf = vulkan.record_argmax_sample(
+                &mut encoder,
+                crate::engine::backend::vulkan::GpuArgmaxSampleInput {
+                    // `GpuInput::Gpu`'s offset is in elements; the arena aligns
+                    // every output to at least 4 bytes, so this divides evenly.
+                    logits: crate::engine::backend::vulkan::GpuInput::Gpu(
+                        &logits_buf,
+                        (logits_offset / 4) as usize,
+                    ),
+                    n_vocab: self.output_weight.out_dim,
+                    recent_tokens: params.recent_tokens,
+                    repeat_penalty: params.repeat_penalty,
+                    // This family has no final-logit softcap.
+                    logit_softcap: None,
+                },
+                // Per-slot, so two concurrently-decoding sequences never share
+                // the cached sample scratch — same reason the op cache keys on
+                // `slot_id + 1` just above.
+                slot_id + 1,
+            );
+            let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
+            if vulkan.gpu_timestamps() {
+                vulkan.report_timestamps(start_pos, self.layers.len());
+            }
+            return Ok(super::ForwardOutcome::Token(next));
+        }
+        self.forward(cache, tokens, start_pos, slot_id)
+            .map(super::ForwardOutcome::Logits)
+    }
+
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
         self.backend.as_wgpu()
     }

@@ -415,6 +415,16 @@ struct Prepared {
     quantization: Option<String>,
     architecture: String,
     backend_label: String,
+    /// The GPU kernel/tuning selection this device came up with, and its
+    /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
+    /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
+    /// such selection to report. Captured in [`prepare`], where the concrete
+    /// backend is still in hand rather than a `dyn Backend`.
+    gpu_tuning: Option<serde_json::Value>,
+    gpu_tuning_summary: Option<String>,
+    /// The backend, when it is the `wgpu` engine — see
+    /// [`http::AppState::wgpu_backend`].
+    wgpu_backend: Option<Arc<dyn Backend>>,
     /// Absolute, normalized root directory the server operates in — from
     /// `-w`/`--workspace`, else the current working directory. Resolved in
     /// [`prepare`], i.e. *before* `--daemon` detaches (daemonizing moves the
@@ -492,6 +502,25 @@ fn prepare(args: Args) -> Result<Prepared> {
 
     let loaded = LoadedModel::open(&path).context("loading model weights")?;
     let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(conf.backend)?;
+    // Captured here, while the concrete backend is still in hand, because the
+    // `wgpu` engine is the only thing that knows which of its kernels feature
+    // negotiation and the `ORANGU_*` flags actually left live — and that
+    // answer travels with every benchmark result through `/props`. `None` for
+    // the CPU/CUDA/OpenCL/ROCm backends, which have no such selection to
+    // report. See `VulkanBackend::tuning_report`.
+    let gpu_tuning = backend
+        .as_wgpu()
+        .map(engine::backend::VulkanBackend::tuning_report);
+    let gpu_tuning_summary = backend
+        .as_wgpu()
+        .map(engine::backend::VulkanBackend::tuning_summary);
+    // The backend itself, when it is a `wgpu` one, so `/gpu-timings` can drain
+    // its accumulated timestamp breakdown. Kept as the `dyn Backend` the state
+    // already holds rather than a second concrete handle: `as_wgpu` is how
+    // every other GPU-specific path reaches through, and one way in is easier
+    // to keep honest than two.
+    let wgpu_backend: Option<Arc<dyn Backend>> =
+        backend.as_wgpu().is_some().then(|| backend.clone());
     // Every GPU backend covers fewer `ggml_type`s than `engine::quant` reads
     // on the CPU, so a file this build can decode can still be one the
     // selected device has no kernel for. Caught here, against the tensor
@@ -631,6 +660,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         quantization,
         architecture,
         backend_label,
+        gpu_tuning,
+        gpu_tuning_summary,
+        wgpu_backend,
         workspace,
         api_listener,
         web_listener,
@@ -698,6 +730,9 @@ async fn serve(prepared: Prepared) -> Result<()> {
         quantization,
         architecture,
         backend_label,
+        gpu_tuning,
+        gpu_tuning_summary,
+        wgpu_backend,
         workspace,
         api_listener,
         web_listener,
@@ -731,6 +766,8 @@ async fn serve(prepared: Prepared) -> Result<()> {
         engine: engine.clone(),
         model_label: model_label.clone(),
         backend_label: backend_label.clone(),
+        gpu_tuning,
+        wgpu_backend: wgpu_backend.clone(),
         workspace: workspace.clone(),
         started_at: std::time::Instant::now(),
         shutdown_tx,
@@ -748,6 +785,15 @@ async fn serve(prepared: Prepared) -> Result<()> {
             engine.model.config().n_layer,
             engine.model.config().n_ctx_train,
         );
+        // Which kernels the device actually got, on the line under the device
+        // that got them. A decode number is only comparable against another
+        // one taken with the same kernels, and on a GPU whose defaults were
+        // tuned elsewhere that is not something to assume — see
+        // `VulkanBackend::tuning_report` for the full picture `/props`
+        // carries.
+        if let Some(summary) = &gpu_tuning_summary {
+            println!("Kernels    {summary}");
+        }
         match &web_listener {
             Some(l) => println!("UI         http://{}", l.local_addr()?),
             None => println!("UI         disabled"),

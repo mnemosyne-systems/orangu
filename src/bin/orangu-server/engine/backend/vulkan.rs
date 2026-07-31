@@ -1168,7 +1168,7 @@ pub struct VulkanBackend {
     bias_add_pipeline: wgpu::ComputePipeline,
     gelu_pipeline: wgpu::ComputePipeline,
     scale_pipeline: wgpu::ComputePipeline,
-    rmsnorm_pipeline: wgpu::ComputePipeline,
+    rmsnorm_pipeline: NormPipelines,
     /// Row-strided (`n_tokens` workgroups) norms, used only by the fused
     /// prefill chain — see `vulkan_shaders::RMSNORM_ROWS_SHADER_BODY`.
     rmsnorm_rows_pipeline: wgpu::ComputePipeline,
@@ -1181,14 +1181,14 @@ pub struct VulkanBackend {
     /// Used at `wo`'s and `ffn_down`'s own post-matmul norm+add call sites
     /// (`Self::build_fused_resources`), replacing what were two separate
     /// dispatches (`rmsnorm_pipeline` then `add_pipeline`) with one.
-    rmsnorm_add_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_pipeline: NormPipelines,
     /// `rmsnorm_add_pipeline` with the trailing write multiplied by
     /// `layer_output_scale` — see
     /// `vulkan_shaders::shader_source_rmsnorm_add_scale`. Folds the separate
     /// post-norm `scale_pipeline` dispatch into the norm+add, at the PLE
     /// post-projection norm (`build_ple_resources`); gated by
     /// `ORANGU_NO_FUSED_SCALE`.
-    rmsnorm_add_scale_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_scale_pipeline: NormPipelines,
     /// Every buffer/bind group `fused_post_attention` needs *except* the
     /// three that genuinely change contents every call (`wo`'s own
     /// `x_buffer`, already covered by `op_cache`; the residual snapshot;
@@ -1484,6 +1484,37 @@ pub struct VulkanBackend {
     /// `array<vec4<f32>>` — the shared matmul bind group is unchanged.
     /// Same `REDUCE_N_ROWS`-batched dispatch as the dual kernel.
     q4_k_light_pipeline: Option<wgpu::ComputePipeline>,
+    /// The **light** `Q5_K` decode kernel
+    /// (`vulkan_shaders::shader_source_reduce_q5k_light`) — the `Q4_K` light
+    /// kernel's mapping applied to `Q5_K`'s 176-byte block, with the fifth bit
+    /// added from the `qh` plane. **On by default** (`Some` unless
+    /// `ORANGU_NO_Q5K_LIGHT=1`), and selected ahead of the block-unroll for
+    /// `Q5_K` decode.
+    ///
+    /// `Q5_K` was the one K-quant with no kernel of its own. Measured across
+    /// five quantizations of one model as effective weight-streaming bandwidth
+    /// (file size × decode tok/s), `Q4_K` on its light kernel and `Q8_0` on
+    /// the *generic* reduce both reached ~50 GiB/s while `Q5_K` on the
+    /// block-unroll managed 33.6 — a third short of the formats either side of
+    /// it, which is not something a bit width explains. Same
+    /// `REDUCE_N_ROWS`-batched dispatch and 6-binding layout as every other
+    /// reduce kernel, so it needs no dispatch or bind-group special case.
+    q5_k_light_pipeline: Option<wgpu::ComputePipeline>,
+    /// The **light** `Q6_K` decode kernel
+    /// (`vulkan_shaders::shader_source_reduce_q6k_light`) — the same
+    /// 16-threads-per-super-block mapping as its `Q4_K`/`Q5_K` twins, applied
+    /// to `Q6_K`'s 210-byte block. **On by default** (`Some` unless
+    /// `ORANGU_NO_Q6K_LIGHT=1`), selected ahead of `q6_k_dual_pipeline`, which
+    /// stays built as the A/B fallback.
+    ///
+    /// `Q6_K` was the slowest K-quant once `Q5_K` had a kernel of its own:
+    /// 36.1 GiB/s of effective weight streaming against 48–58 for the light
+    /// kernels. It matters beyond pure-`Q6_K` files because every
+    /// `_M`-suffixed mixed quantization stores `attn_v`/`ffn_down` as `Q6_K`,
+    /// so the slow kernel is on the critical path of the most commonly used
+    /// files. The dual kernel it replaces reads `ql`/`qh` a byte at a time and
+    /// re-reads a scale byte per element.
+    q6_k_light_pipeline: Option<wgpu::ComputePipeline>,
     /// The **glslc-compiled** `Q4_K` decode kernel
     /// (`backend/shaders/q4k_gemv.comp` → SPIR-V), a line-for-line twin of the
     /// light WGSL kernel loaded via `create_shader_module_passthrough` so RADV
@@ -1648,10 +1679,20 @@ pub struct VulkanBackend {
     /// split-k phase-1 kernel (`shader_source_attention_split_coop`): a 32-lane
     /// subgroup splits each KV position's `head_dim` dot across its lanes
     /// (coalesced K/V reads, `subgroupAdd` score, no per-tile barrier), instead
-    /// of one thread running the whole serial dot. **Opt-in
-    /// (`ORANGU_ATTN_COOP=1`), needs subgroup support and `head_dim % 32 == 0`.**
-    /// Not byte-identical (subgroup reduces the dot in a different order) —
-    /// An attempt at the long-context attention lever.
+    /// of one thread running the whole serial dot. **On by default wherever
+    /// the adapter supports subgroups; opt out with `ORANGU_NO_ATTN_COOP=1`.**
+    /// Falls back to the classic split kernel per-layer when
+    /// `head_dim % 32 != 0`. Not byte-identical (the subgroup reduces the dot
+    /// in a different order). The large long-context decode win.
+    ///
+    /// This comment used to say "opt-in (`ORANGU_ATTN_COOP=1`)", which the
+    /// construction site in `try_init` has contradicted since the flag
+    /// flipped. **`ORANGU_ATTN_COOP` is not read anywhere** — it never
+    /// existed as anything but this sentence. That mattered because the
+    /// person most likely to read this field is the one tuning attention on
+    /// an unfamiliar device, who would spend a sweep setting a variable that
+    /// does nothing, measure the default four times, and conclude the kernel
+    /// is not the lever.
     attn_coop: bool,
     /// Effective decode-attention split-k factor (phase-1's `(n_head, k_num, 1)`
     /// grid + the partial-`(m,l,acc)` buffer sizes + phase-2's merge count).
@@ -1668,6 +1709,9 @@ pub struct VulkanBackend {
     /// comment for why this needs both `TIMESTAMP_QUERY` and
     /// `TIMESTAMP_QUERY_INSIDE_ENCODERS`, and why it's opt-in.
     gpu_timestamps: bool,
+    /// Running totals of every GPU-timestamped decode step, so the breakdown
+    /// can be *collected* and not only printed — see [`GpuTimings`].
+    timing_totals: Mutex<GpuTimings>,
     /// Lazily built on the first decode step (`Self::timestamp_query_set`)
     /// once the model's own layer count is known — `VulkanBackend` exists
     /// before any model is loaded, so this can't be sized at construction
@@ -1694,6 +1738,89 @@ thread_local! {
     /// normal wgpu path pays effectively nothing.
     static DECODE_CAPTURE: std::cell::RefCell<Option<Vec<vulkan_replay::CaptureStep>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Where a GPU-timestamped decode step's time went, summed over every step
+/// since the last reset.
+///
+/// # Why this is a struct and not just the `eprintln!` it used to be
+///
+/// `ORANGU_GPU_TIMESTAMPS=1` already produced this breakdown; it produced it
+/// as a formatted line on the server's stderr, once per decode step. That is
+/// perfectly usable on a machine you are sitting at, and useless on one you
+/// are not — which is the machine that needs it most. `--flamegraph` shells
+/// out to `perf`, so on macOS there is no CPU profile at all; the GPU
+/// timestamp path is the *only* instrument that answers "which dispatch got
+/// slower" there, and until now its output could not be collected, only read.
+///
+/// Accumulated rather than sampled: a single decode step's numbers are
+/// dominated by whatever else the queue was doing, and the question a
+/// benchmark asks is about a window, not an instant. `steps` is carried so a
+/// consumer can divide back to a per-step mean and so a window with no
+/// timestamped steps in it is distinguishable from one where everything took
+/// zero.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GpuTimings {
+    /// Timestamped decode steps summed into these totals.
+    pub steps: u64,
+    /// Per-layer-embedding projection.
+    pub ple_ms: f64,
+    /// Everything from a layer's `attn_norm` up to its attention dispatch:
+    /// Q/K/V matmuls, norm/RoPE, the KV write. Matmul-heavy.
+    pub qkv_ms: f64,
+    /// Split-k attention itself. The one clean, non-matmul, context-growing
+    /// number, and so the one worth watching as KV grows.
+    pub attn_ms: f64,
+    /// The whole post-attention chain: `wo`/gate/up/down matmuls, their
+    /// norms, GELU/mul, PLE, scale, staging copies. Matmul-heavy.
+    pub ffn_ms: f64,
+    /// `output_norm` + `lm_head`.
+    pub tail_ms: f64,
+    /// Whole-step total, from the encoder's first timestamp to its last.
+    /// Not the sum of the parts: the parts are bracketed segments and this is
+    /// the span containing them, so the difference is what the brackets miss.
+    pub total_ms: f64,
+}
+
+impl GpuTimings {
+    fn add(&mut self, other: GpuTimings) {
+        self.steps += other.steps;
+        self.ple_ms += other.ple_ms;
+        self.qkv_ms += other.qkv_ms;
+        self.attn_ms += other.attn_ms;
+        self.ffn_ms += other.ffn_ms;
+        self.tail_ms += other.tail_ms;
+        self.total_ms += other.total_ms;
+    }
+
+    /// The totals as JSON, plus per-step means so a reader does not have to
+    /// divide by `steps` to compare two windows of different lengths.
+    pub fn to_json(self) -> serde_json::Value {
+        let per_step = |v: f64| {
+            if self.steps == 0 {
+                0.0
+            } else {
+                v / self.steps as f64
+            }
+        };
+        serde_json::json!({
+            "steps": self.steps,
+            "total_ms": self.total_ms,
+            "ple_ms": self.ple_ms,
+            "qkv_ms": self.qkv_ms,
+            "attn_ms": self.attn_ms,
+            "ffn_ms": self.ffn_ms,
+            "tail_ms": self.tail_ms,
+            "per_step_ms": {
+                "total": per_step(self.total_ms),
+                "ple": per_step(self.ple_ms),
+                "qkv": per_step(self.qkv_ms),
+                "attn": per_step(self.attn_ms),
+                "ffn": per_step(self.ffn_ms),
+                "tail": per_step(self.tail_ms),
+            },
+        })
+    }
 }
 
 /// The query set + resolve/readback buffers `Self::timestamp_query_set`
@@ -2081,11 +2208,12 @@ static Q4K_GLSL_GEMV_SPIRV: &[u8] = include_bytes!("shaders/q4k_gemv.spv");
 fn reduce_n_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_REDUCE_N_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| (1..=16).contains(&n))
-            .unwrap_or(REDUCE_N_ROWS_DEFAULT)
+        super::env_tuning_value(
+            "ORANGU_REDUCE_N_ROWS",
+            REDUCE_N_ROWS_DEFAULT,
+            "an integer in 1..=16",
+            |n| (1..=16).contains(&n),
+        )
     })
 }
 
@@ -2100,12 +2228,129 @@ fn norm_wg() -> usize {
     const NORM_WG_DEFAULT: usize = 128;
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_NORM_WG")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| matches!(n, 64 | 128 | 256))
-            .unwrap_or(NORM_WG_DEFAULT)
+        super::env_tuning_value(
+            "ORANGU_NORM_WG",
+            NORM_WG_DEFAULT,
+            "one of 64, 128, 256",
+            |n| matches!(n, 64 | 128 | 256),
+        )
     })
+}
+
+/// One decode step's GPU timestamp slots, or nothing when timestamps are off.
+///
+/// # Why this exists rather than each architecture writing its own slots
+///
+/// The slot layout is an index arithmetic contract between whoever writes the
+/// marks and `VulkanBackend::report_timestamps`, which reads them: slot 0 is
+/// the step start, slot 1 closes the per-layer-embedding segment, slots
+/// `2..=n_layer+1` close each layer, slot `n_layer+2` closes the output/
+/// `lm_head` tail, and `n_layer+3 + 2*il` is where a layer's attention bracket
+/// begins. Get one of those wrong and the report does not fail — it attributes
+/// time to the wrong stage, which is worse, because the number still looks
+/// like a measurement.
+///
+/// gemma spelled that arithmetic out inline, and it was the only architecture
+/// that did: a decode step on llama, mistral or phi reported `steps: 0`, which
+/// [`GpuTimings`] correctly renders as "not measured" but which still means
+/// the models most people actually run were unprofilable. Three more copies of
+/// the index arithmetic is three more chances to get it silently wrong, so it
+/// lives here once.
+pub struct StepTimestamps {
+    set: Option<wgpu::QuerySet>,
+}
+
+impl StepTimestamps {
+    /// What to hand `FusedLayerInput::attn_ts` for layer `il`, so the layer's
+    /// time splits into qkv-side, attention and ffn-side rather than arriving
+    /// as one opaque total.
+    pub fn attn_slot(&self, il: usize, n_layer: usize) -> Option<(&wgpu::QuerySet, u32)> {
+        self.set
+            .as_ref()
+            .map(|s| (s, (n_layer + 3 + 2 * il) as u32))
+    }
+
+    /// Close layer `il`.
+    pub fn after_layer(&self, encoder: &mut wgpu::CommandEncoder, il: usize) {
+        if let Some(s) = &self.set {
+            encoder.write_timestamp(s, (2 + il) as u32);
+        }
+    }
+
+    /// Close the output/`lm_head` tail and resolve the query set into the
+    /// readback buffer. Must be called on the same encoder, before submit.
+    pub fn finish(
+        &self,
+        backend: &VulkanBackend,
+        encoder: &mut wgpu::CommandEncoder,
+        n_layer: usize,
+    ) {
+        if let Some(s) = &self.set {
+            encoder.write_timestamp(s, (2 + n_layer) as u32);
+            backend.finish_timestamps(encoder);
+        }
+    }
+}
+
+/// The workgroup widths the RMSNorm kernels are compiled for, in the order
+/// [`NormPipelines`] indexes them.
+const NORM_WGS: [usize; 3] = [64, 128, 256];
+
+/// One RMSNorm-family kernel compiled at each of [`NORM_WGS`], selected per
+/// dispatch by the row width — see [`norm_wg_for`].
+///
+/// Three pipelines instead of one, built eagerly at device init, rather than a
+/// lazily-built cache keyed on `n_embd`: the whole set costs six extra shader
+/// compilations against the ~30 this backend already builds, and it keeps the
+/// dispatch path a plain array index instead of a lock taken while a compute
+/// pass is being recorded.
+type NormPipelines = [wgpu::ComputePipeline; NORM_WGS.len()];
+
+/// The RMSNorm workgroup width for a row of `n_embd` elements.
+///
+/// These kernels run **one** `dispatch_workgroups(1, 1, 1)` workgroup over the
+/// whole row in a grid-stride loop, so the quantity that decides the right
+/// width is not `n_embd` itself but `n_embd / wg` — how many elements each
+/// thread walks. Too few and the thread does less work than the reduction and
+/// launch around it cost; too many and the loop is serial where it could be
+/// parallel.
+///
+/// Measured on three model widths (decode, 5 reps, two context depths each),
+/// against the previous fixed 128:
+///
+/// | `n_embd` | 64 | 128 | 256 |
+/// | ---: | ---: | ---: | ---: |
+/// | 960 | −2.9% / −2.0% | *best* | −1.7% / +0.4% |
+/// | 2048 | −3.1% / −2.6% | — | *best*, +1.3% / +2.1% |
+/// | 3072 | −3.9% / −3.4% | — | *best*, +2.6% / +3.2% |
+///
+/// A single constant cannot hold that: 256 is worth ~3% at 3072 and costs
+/// ~1.7% at 960. The rule below picks **the widest kernel that still leaves
+/// each thread at least seven elements**, which reproduces every measured
+/// best. Seven rather than eight because 960 with a 128-wide group is 7.5
+/// elements per thread and measures best there — the constant is calibrated on
+/// that one crossover, and the crossover itself is only bounded to
+/// `(960, 2048]`. A width outside that range is an extrapolation of the
+/// mechanism, not of the data.
+///
+/// `ORANGU_NORM_WG` still overrides, and still applies to every row width —
+/// it is a sweep knob, and a sweep wants the variable pinned.
+fn norm_wg_for(n_embd: usize) -> usize {
+    if std::env::var_os("ORANGU_NORM_WG").is_some() {
+        return norm_wg();
+    }
+    NORM_WGS
+        .iter()
+        .copied()
+        .filter(|&wg| n_embd >= wg * 7)
+        .max()
+        .unwrap_or(NORM_WGS[0])
+}
+
+/// Index into a [`NormPipelines`] for `n_embd`.
+fn norm_wg_index(n_embd: usize) -> usize {
+    let wg = norm_wg_for(n_embd);
+    NORM_WGS.iter().position(|&w| w == wg).unwrap_or(1)
 }
 
 /// How many workgroups split-k attention
@@ -2234,7 +2479,7 @@ struct ReadbackSplit {
 fn dump_shaders_if_requested(
     subgroup: bool,
     kv_storage: vulkan_shaders::KvStorage,
-    vec4_tiles: bool,
+    vec4_tiles: vulkan_shaders::CoopVec4Tiles,
 ) {
     let Some(dir) = std::env::var_os("ORANGU_DUMP_SHADERS") else {
         return;
@@ -2245,7 +2490,6 @@ fn dump_shaders_if_requested(
         return;
     }
     let n = reduce_n_rows();
-    let wg = norm_wg();
     let shaders: Vec<(String, String)> = vec![
         (
             "q4k_matmul_dual.wgsl".into(),
@@ -2260,14 +2504,6 @@ fn dump_shaders_if_requested(
             vulkan_shaders::shader_source_reduce_q6k_dual(n, subgroup),
         ),
         (
-            "rmsnorm.wgsl".into(),
-            vulkan_shaders::shader_source_rmsnorm(subgroup, wg),
-        ),
-        (
-            "rmsnorm_add.wgsl".into(),
-            vulkan_shaders::shader_source_rmsnorm_add(subgroup, wg),
-        ),
-        (
             "attention_split_headdim256.wgsl".into(),
             vulkan_shaders::shader_source_attention_split(kv_storage, subgroup, 256),
         ),
@@ -2277,6 +2513,20 @@ fn dump_shaders_if_requested(
         ),
     ];
     let mut shaders = shaders;
+    // One file per compiled workgroup width. There are three of each RMSNorm
+    // kernel now — `norm_wg_for` picks between them by row width — so dumping
+    // a single representative one would hide the two a given model might
+    // actually be running.
+    for wg in NORM_WGS {
+        shaders.push((
+            format!("rmsnorm_wg{wg}.wgsl"),
+            vulkan_shaders::shader_source_rmsnorm(subgroup, wg),
+        ));
+        shaders.push((
+            format!("rmsnorm_add_wg{wg}.wgsl"),
+            vulkan_shaders::shader_source_rmsnorm_add(subgroup, wg),
+        ));
+    }
     // The tiled prefill GEMM. This is where prefill spends most of its time,
     // so it is the kernel most often being read in a disassembler — and the
     // one whose weight-staging loop only shows its true load count in the ISA.
@@ -2364,6 +2614,221 @@ impl VulkanBackend {
     /// not depend on the answer.
     pub fn wgpu_backend(&self) -> wgpu::Backend {
         self.wgpu_backend
+    }
+
+    /// Open the timestamp slots for one decode step, writing the step-start
+    /// mark — see [`StepTimestamps`]. Cheap and inert (`None` inside) unless
+    /// `ORANGU_GPU_TIMESTAMPS=1` and the adapter has the query.
+    pub fn begin_step_timestamps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        n_layer: usize,
+    ) -> StepTimestamps {
+        if !self.gpu_timestamps() {
+            return StepTimestamps { set: None };
+        }
+        let set = self.timestamp_query_set(n_layer);
+        encoder.write_timestamp(&set, 0);
+        // Slot 1 closes the per-layer-embedding segment. gemma projects there;
+        // every other architecture has no PLE, so the segment is empty and
+        // reports as ~0 rather than as a hole in the accounting.
+        encoder.write_timestamp(&set, 1);
+        StepTimestamps { set: Some(set) }
+    }
+
+    /// The RMSNorm kernel for a row of `n_embd` — see [`norm_wg_for`].
+    fn rmsnorm_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        &self.rmsnorm_pipeline[norm_wg_index(n_embd)]
+    }
+
+    /// The fused RMSNorm+add kernel for a row of `n_embd`.
+    fn rmsnorm_add_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        &self.rmsnorm_add_pipeline[norm_wg_index(n_embd)]
+    }
+
+    /// The fused RMSNorm+add+scale kernel for a row of `n_embd`.
+    fn rmsnorm_add_scale_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        &self.rmsnorm_add_scale_pipeline[norm_wg_index(n_embd)]
+    }
+
+    /// Everything about *this* device's kernel selection that a throughput
+    /// number is meaningless without — the API, the adapter, the negotiated
+    /// features and the device limits that gate them, every tuning constant
+    /// in force, and (the part no amount of reading the source can supply)
+    /// the name of the matmul kernel actually chosen for each quant type at a
+    /// decode and at a prefill shape.
+    ///
+    /// # Why this exists rather than "read the flags in the source"
+    ///
+    /// Which kernel runs is decided by three things that are all invisible
+    /// from a build tree: a dozen `ORANGU_*` env vars, the adapter's own
+    /// feature bits (`SHADER_F16`, `SUBGROUP`, `PASSTHROUGH_SHADERS`), and
+    /// `wgpu_backend` itself (`vulkan_shaders::coop_vec4_tiles`). Every
+    /// default in this module was chosen by sweeping it on one device. Once
+    /// the same kernels come up on a second API (see
+    /// `engine::backend::metal`), the interesting question about a given GPU
+    /// stops being "is the code there" — it is the same code — and becomes
+    /// "which of it did feature negotiation actually turn on, and were these
+    /// constants ever right for *this* device". Only the machine in question
+    /// can answer that, which is what this is for: it travels with a
+    /// benchmark result through `/props`, so a measurement taken on a device
+    /// nobody can reproduce locally is still attributable to a configuration
+    /// rather than to a guess about one.
+    ///
+    /// The kernel names come from [`Self::pipeline_for_named`] — the
+    /// selecting function itself, not a transcription of it.
+    ///
+    /// `in_dim`/`n_tokens` for the probe are representative rather than
+    /// exhaustive: a decode step (`n_tokens = 1`) and the smallest batch that
+    /// clears the tiled-GEMM crossover (`coop_min_n_tokens`), both at an
+    /// `in_dim` of 4096. The one selection that varies with `in_dim` beyond
+    /// that is the thin-tile kernel, whose own threshold is reported.
+    pub fn tuning_report(&self) -> serde_json::Value {
+        let features = self.device.features();
+        let limits = self.device.limits();
+        let has = |f: wgpu::Features| features.contains(f);
+        // The probe shape. 4096 is a real `in_dim` for the attention and
+        // gate/up projections of every model this runs today, and sits below
+        // `thin_tile_min_k`'s 5120 default, so the thin-tile kernel does not
+        // mask whatever the ordinary decode selection would have been.
+        const PROBE_IN_DIM: usize = 4096;
+        let kernels = |n_tokens: usize| -> serde_json::Value {
+            SUPPORTED_TYPES
+                .iter()
+                .map(|&ty| {
+                    (
+                        orangu::gguf::ggml_type_name(ty),
+                        serde_json::Value::from(
+                            self.pipeline_for_named(ty, PROBE_IN_DIM, n_tokens).1,
+                        ),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        let geom = vulkan_shaders::coop_geom();
+        // Hoisted: `json!` parses a leading `[` as a JSON array and cannot
+        // take the method chain that follows it.
+        let norm_wg_by_n_embd = [960usize, 2048, 3072, 4096]
+            .iter()
+            .map(|&n| (n.to_string(), serde_json::Value::from(norm_wg_for(n))))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({
+            "api": format!("{:?}", self.wgpu_backend),
+            "adapter": self.adapter_name,
+            "features": {
+                "shader_f16": has(wgpu::Features::SHADER_F16),
+                "subgroup": has(wgpu::Features::SUBGROUP),
+                "timestamp_query": has(wgpu::Features::TIMESTAMP_QUERY),
+                "pipeline_cache": has(wgpu::Features::PIPELINE_CACHE),
+                "passthrough_shaders": has(wgpu::Features::PASSTHROUGH_SHADERS),
+            },
+            "limits": {
+                // The shared-memory ceiling decides whether a kernel can be
+                // created at all, and it varies by a factor of two across the
+                // APIs this engine runs on. The flash-attention K tile is
+                // sized from a fixed LDS budget that assumes the larger one,
+                // so this is the number that says whether
+                // `ORANGU_FLASH_ATTN=1` could even build here.
+                "max_compute_workgroup_storage_size": limits.max_compute_workgroup_storage_size,
+                "max_compute_invocations_per_workgroup": limits.max_compute_invocations_per_workgroup,
+                "max_storage_buffer_binding_size": limits.max_storage_buffer_binding_size,
+                "max_compute_workgroup_size_x": limits.max_compute_workgroup_size_x,
+                // No subgroup *size* here: `wgpu` 30 does not expose one at
+                // all, on any backend. That absence is why every
+                // subgroup-reduce kernel in `vulkan_shaders` reduces across
+                // `num_subgroups` partials instead of assuming the subgroup
+                // spans the workgroup — and it is why "is the 32-thread
+                // decode kernel really one SIMD group here" is a question
+                // only a measurement on the device can answer.
+            },
+            "flags": {
+                "kv_storage": format!("{:?}", self.kv_storage),
+                "wide_unroll": self.wide_unroll,
+                "wide_load": self.wide_load,
+                "tiled_prefill": self.tiled_prefill,
+                // Per tile, because the answer is per tile — the activation
+                // tile's fill writes whole vectors and needs no gate, the
+                // weight tile's does not. See `vulkan_shaders::
+                // coop_vec4_tiles`.
+                "coop_vec4_tile_w": vulkan_shaders::coop_vec4_tiles(self.wgpu_backend).w,
+                "coop_vec4_tile_x": vulkan_shaders::coop_vec4_tiles(self.wgpu_backend).x,
+                "thin_tile": self.thin_tile,
+                "subgroup_reduce": self.subgroup_reduce,
+                "attn_split": self.attn_split,
+                "attn_coop": self.attn_coop,
+                "attn_gqa": self.attn_gqa,
+                "flash_attn": self.flash_attn,
+                "prefill_attn": self.prefill_attn,
+                "prefill_gqa": self.prefill_gqa,
+                "gpu_sample": self.gpu_sample,
+                "gpu_timestamps": self.gpu_timestamps,
+                "q4_k_light": self.q4_k_light_pipeline.is_some(),
+                "q5_k_light": self.q5_k_light_pipeline.is_some(),
+                "q6_k_light": self.q6_k_light_pipeline.is_some(),
+                "q4_k_dual_nibble": self.q4_k_dual_pipeline.is_some(),
+                "q4_k_contig": self.q4_k_contig_pipeline.is_some(),
+                "q4_k_glsl": self.q4_k_glsl_pipeline.is_some(),
+                "q4_k_mmvq": self.q4_k_mmvq,
+                "q6_k_dual": self.q6_k_dual_pipeline.is_some(),
+                "packed_dot_f16": self.packed_dot_f16,
+            },
+            "tuning": {
+                "coop_min_n_tokens": self.coop_min_n_tokens,
+                "reduce_n_rows": reduce_n_rows(),
+                // Not one number any more: the RMSNorm width is chosen per
+                // row width (`norm_wg_for`), so report what the rule answers
+                // at the widths models actually have. `pinned` says whether
+                // `ORANGU_NORM_WG` overrode it, which is the thing a sweep
+                // needs to be able to see.
+                "norm_wg_pinned": std::env::var_os("ORANGU_NORM_WG").is_some(),
+                "norm_wg_by_n_embd": norm_wg_by_n_embd,
+                "attn_split_k": self.attn_split_k,
+                "attn_split_k_pinned": self.attn_split_k_pinned,
+                "thin_tile_size": self.thin_tile_size,
+                "thin_tile_min_k": self.thin_tile_min_k,
+                "coop_geom": format!(
+                    "{}:{}:{}:{}:{}",
+                    geom.threads_y, geom.threads_x, geom.reg_rows, geom.reg_tokens, geom.chunk
+                ),
+            },
+            "kernels": {
+                "probe_in_dim": PROBE_IN_DIM,
+                "decode": kernels(1),
+                "prefill": kernels(self.coop_min_n_tokens),
+            },
+        })
+    }
+
+    /// One line for the startup banner: the kernels that decide decode
+    /// throughput, plus the flags most likely to differ from the machine the
+    /// defaults were tuned on. The full picture is [`Self::tuning_report`]
+    /// (`/props`); this is what fits on a terminal line and is enough to spot
+    /// "that is not the kernel I meant to measure" before a run rather than
+    /// after it.
+    pub fn tuning_summary(&self) -> String {
+        let q = |ty: u32| self.pipeline_for_named(ty, 4096, 1).1;
+        let tiles = vulkan_shaders::coop_vec4_tiles(self.wgpu_backend);
+        format!(
+            "q4_k {} · q6_k {} · kv {:?} · coop-tiles {} · attn {} · prefill≥{} tok",
+            q(crate::engine::quant::GGML_TYPE_Q4_K),
+            q(crate::engine::quant::GGML_TYPE_Q6_K),
+            self.kv_storage,
+            // `w/x` rather than one word: the two tiles can differ, and which
+            // one is on the scalar form is exactly the thing worth noticing.
+            match (tiles.w, tiles.x) {
+                (true, true) => "vec4",
+                (false, true) => "w-scalar",
+                (true, false) => "x-scalar",
+                (false, false) => "scalar",
+            },
+            match (self.attn_coop, self.attn_split) {
+                (true, _) => "coop",
+                (false, true) => "split-k",
+                (false, false) => "single",
+            },
+            self.coop_min_n_tokens,
+        )
     }
 
     /// [`Self::try_init`] against an arbitrary `wgpu` API set, so the same
@@ -2470,22 +2935,24 @@ impl VulkanBackend {
         // See `Self::coop_min_n_tokens`'s own doc comment. Read once, clamped
         // to at least 1 (a `0` would divide by zero in the reduce dispatch
         // math); a malformed value falls back to the compile-time default.
-        let coop_min_n_tokens = std::env::var("ORANGU_COOP_MIN_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(COOP_MIN_N_TOKENS);
+        let coop_min_n_tokens = super::env_tuning_value(
+            "ORANGU_COOP_MIN_TOKENS",
+            COOP_MIN_N_TOKENS,
+            "an integer >= 1",
+            |n| n >= 1,
+        );
         // Thin-tile multi-position reduce kernel (see `Self::thin_tile`).
         // Opt-in; tile width from
         // `ORANGU_THIN_TILE_SIZE` (default 8, clamped to `2..=16` so the
         // `n_rows * tile` shared-memory partials and register pressure stay
         // bounded).
         let thin_tile = std::env::var("ORANGU_THIN_TILE").is_ok_and(|v| v != "0");
-        let thin_tile_size = std::env::var("ORANGU_THIN_TILE_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.clamp(2, 16))
-            .unwrap_or(8);
+        let thin_tile_size = super::env_tuning_value(
+            "ORANGU_THIN_TILE_SIZE",
+            8usize,
+            "an integer in 2..=16",
+            |n| (2..=16).contains(&n),
+        );
         // The thin-tile kernel only *wins* on long-`in_dim` matmuls, where
         // amortizing the (K-quant-expensive) `dequant_element` across the
         // token tile outweighs its tree-reduce combine and lower token-tile
@@ -2494,10 +2961,8 @@ impl VulkanBackend {
         // `in_dim ≤ 4096` matmuls (`gate_up`/`qkv`/`wo`). So it is gated on
         // `in_dim >= thin_tile_min_k` (default 5120, between `wo`'s 4096 and
         // `ffn_down`'s 6144); `ORANGU_THIN_TILE_MIN_K` tunes the crossover.
-        let thin_tile_min_k = std::env::var("ORANGU_THIN_TILE_MIN_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(5120);
+        let thin_tile_min_k =
+            super::env_tuning_value("ORANGU_THIN_TILE_MIN_K", 5120usize, "an integer", |_| true);
         // See `Self::wide_load`'s own
         // doc comment. No `supports_f16` gate, unlike `kv_f16`/
         // `packed_dot_f16` above — these kernels only use core-WGSL
@@ -2587,10 +3052,18 @@ impl VulkanBackend {
         // per split — wants more splits than the classic kernel to shorten that
         // serial chain (measured sweet spot ~32 at ctx 512–2048), while the
         // classic kernel stays at its own default.
-        let attn_split_k_override = std::env::var("ORANGU_ATTN_SPLIT_K")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32));
+        // `0` stands in for "unset" so the shared helper can report a
+        // rejected value: every real split count is a power of two in
+        // `1..=32`, so it cannot collide with one.
+        let attn_split_k_override = match super::env_tuning_value(
+            "ORANGU_ATTN_SPLIT_K",
+            0u32,
+            "one of 1, 2, 4, 8, 16, 32",
+            |n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32),
+        ) {
+            0 => None,
+            n => Some(n),
+        };
         // An explicit override pins `k_num` (no per-token adaptation); otherwise
         // the cap is coop-aware and `adaptive_split_k` tunes down at short KV.
         let attn_split_k_pinned = attn_split_k_override.is_some();
@@ -2858,14 +3331,18 @@ impl VulkanBackend {
             &elem3_pipeline_layout,
             vulkan_shaders::shader_source_bias_add(),
         );
-        let rmsnorm_pipeline = build_elem_pipeline(
-            &elem4_pipeline_layout,
-            vulkan_shaders::shader_source_rmsnorm(subgroup_reduce, norm_wg()),
-        );
-        let rmsnorm_add_pipeline = build_elem_pipeline(
-            &elem5_pipeline_layout,
-            vulkan_shaders::shader_source_rmsnorm_add(subgroup_reduce, norm_wg()),
-        );
+        let rmsnorm_pipeline = NORM_WGS.map(|wg| {
+            build_elem_pipeline(
+                &elem4_pipeline_layout,
+                vulkan_shaders::shader_source_rmsnorm(subgroup_reduce, wg),
+            )
+        });
+        let rmsnorm_add_pipeline = NORM_WGS.map(|wg| {
+            build_elem_pipeline(
+                &elem5_pipeline_layout,
+                vulkan_shaders::shader_source_rmsnorm_add(subgroup_reduce, wg),
+            )
+        });
         let rmsnorm_rows_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_rows(),
@@ -2874,10 +3351,12 @@ impl VulkanBackend {
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_rows(),
         );
-        let rmsnorm_add_scale_pipeline = build_elem_pipeline(
-            &elem5_pipeline_layout,
-            vulkan_shaders::shader_source_rmsnorm_add_scale(subgroup_reduce, norm_wg()),
-        );
+        let rmsnorm_add_scale_pipeline = NORM_WGS.map(|wg| {
+            build_elem_pipeline(
+                &elem5_pipeline_layout,
+                vulkan_shaders::shader_source_rmsnorm_add_scale(subgroup_reduce, wg),
+            )
+        });
         let gelu_pipeline =
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_gelu());
         let scale_pipeline = build_elem_pipeline(
@@ -3127,6 +3606,29 @@ impl VulkanBackend {
                 ))
             });
 
+        // See `Self::q5_k_light_pipeline`. **On by default** (opt out with
+        // `ORANGU_NO_Q5K_LIGHT=1`), same convention as the `Q4_K` twin, and
+        // gated on the block-unroll it replaces being on at all. The
+        // block-unroll pipeline stays built as the A/B fallback.
+        let q5k_light = std::env::var_os("ORANGU_NO_Q5K_LIGHT").is_none();
+        let q5_k_light_pipeline = (wide_unroll && q5k_light).then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q5k_light(
+                reduce_n_rows(),
+                supports_subgroup,
+            ))
+        });
+
+        // See `Self::q6_k_light_pipeline`. **On by default** (opt out with
+        // `ORANGU_NO_Q6K_LIGHT=1`), same convention and gating as the `Q5_K`
+        // twin.
+        let q6k_light = std::env::var_os("ORANGU_NO_Q6K_LIGHT").is_none();
+        let q6_k_light_pipeline = (wide_unroll && q6k_light).then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q6k_light(
+                reduce_n_rows(),
+                supports_subgroup,
+            ))
+        });
+
         // See `Self::q4_k_glsl_pipeline`. glslc-compiled twin of the
         // light kernel, handed to RADV via SPIR-V passthrough — same algorithm
         // and bind group, only the SPIR-V producer differs (glslc vs naga). The
@@ -3262,6 +3764,7 @@ impl VulkanBackend {
         Some(Self {
             device,
             queue,
+            timing_totals: Mutex::new(GpuTimings::default()),
             bind_group_layout,
             iq_grid_buffer,
             pipelines,
@@ -3345,6 +3848,8 @@ impl VulkanBackend {
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
             q4_k_light_pipeline,
+            q5_k_light_pipeline,
+            q6_k_light_pipeline,
             q4_k_glsl_pipeline,
             q4_k_contig_pipeline,
             q6_k_dual_pipeline,
@@ -4113,6 +4618,25 @@ impl VulkanBackend {
         in_dim: usize,
         n_tokens: usize,
     ) -> &wgpu::ComputePipeline {
+        self.pipeline_for_named(ggml_type, in_dim, n_tokens).0
+    }
+
+    /// [`Self::pipeline_for`] plus the *name* of the kernel it picked.
+    ///
+    /// The name exists for [`Self::tuning_report`], which answers "which
+    /// matmul kernel is actually live on this device" — the first thing worth
+    /// knowing about a machine whose numbers you cannot reproduce locally,
+    /// and which a dozen interacting env flags and adapter-feature gates
+    /// otherwise make guesswork. Reporting it from the *same* function that
+    /// does the selecting, rather than from a second copy of this branch
+    /// ladder, is what keeps the report from drifting away from the truth the
+    /// moment a branch is added here.
+    fn pipeline_for_named(
+        &self,
+        ggml_type: u32,
+        in_dim: usize,
+        n_tokens: usize,
+    ) -> (&wgpu::ComputePipeline, &'static str) {
         // Thin-tile multi-position kernel — checked *first* so a long-`in_dim`
         // 2..coop_min token forward (speculative / small-chunk prefill) takes
         // the dequant-amortizing path instead of the per-token reduce kernel.
@@ -4121,7 +4645,7 @@ impl VulkanBackend {
         if self.uses_thin_tile(ggml_type, in_dim, n_tokens)
             && let Some(pipeline) = self.thin_tile_pipelines.get(&ggml_type)
         {
-            return pipeline;
+            return (pipeline, "thin-tile");
         }
         // glslc-compiled `Q4_K` decode kernel — checked *first* when
         // built (`ORANGU_Q4K_GLSL`), ahead of the WGSL light/contig/dual
@@ -4131,7 +4655,7 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_glsl_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-glsl");
         }
         // Light `Q4_K` decode kernel — the default decode path (see
         // `Self::q4_k_light_pipeline`); the contig and dual variants below are
@@ -4143,25 +4667,37 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_light_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-light");
         }
         if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_contig_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-contig");
         }
         if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_dual_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-dual-nibble");
+        }
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q5_K
+            && n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = &self.q5_k_light_pipeline
+        {
+            return (pipeline, "q5_k-light");
+        }
+        if ggml_type == crate::engine::quant::GGML_TYPE_Q6_K
+            && n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = &self.q6_k_light_pipeline
+        {
+            return (pipeline, "q6_k-light");
         }
         if ggml_type == crate::engine::quant::GGML_TYPE_Q6_K
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q6_k_dual_pipeline
         {
-            return pipeline;
+            return (pipeline, "q6_k-dual");
         }
         // Checked *before* every other decode special case below, so the
         // default-on memory-level-parallelism block-unroll (opt out
@@ -4180,12 +4716,12 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_unroll_packed_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-block-unroll-packed-f16");
         }
         if self.selects_wide_unroll(ggml_type, n_tokens)
             && let Some(pipeline) = self.wide_unroll_pipelines.get(&ggml_type)
         {
-            return pipeline;
+            return (pipeline, "block-unroll");
         }
         // Checked *first*, so
         // `ORANGU_WIDE_LOAD=1 ORANGU_PACKED_DOT=1` together select the
@@ -4198,7 +4734,7 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.wide_packed_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-wide-load-packed-f16");
         }
         // Checked *before* the
         // packed-`f16` dot below, so setting `ORANGU_WIDE_LOAD=1` alone
@@ -4211,7 +4747,7 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = self.wide_load_pipelines.get(&ggml_type)
         {
-            return pipeline;
+            return (pipeline, "wide-load");
         }
         // Only the
         // `Q4_K` reduce (decode, `n_tokens < COOP_MIN_N_TOKENS`) path has a
@@ -4223,14 +4759,14 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && let Some(pipeline) = &self.q4_k_packed_f16_pipeline
         {
-            return pipeline;
+            return (pipeline, "q4_k-packed-f16");
         }
-        let map = if self.use_tiled_coop(n_tokens) {
-            &self.pipelines_coop_tiled
+        let (map, name) = if self.use_tiled_coop(n_tokens) {
+            (&self.pipelines_coop_tiled, "coop-tiled")
         } else if n_tokens >= self.coop_min_n_tokens {
-            &self.pipelines_coop
+            (&self.pipelines_coop, "coop")
         } else {
-            &self.pipelines
+            (&self.pipelines, "reduce")
         };
         // Load-time validation (`quant::dequantize`, exercised for every
         // tensor when the model loads) already rejects any `ggml_type`
@@ -4239,13 +4775,14 @@ impl VulkanBackend {
         // mean a *GPU* shader gap for an otherwise supported type, which
         // doesn't exist today (see `SUPPORTED_TYPES`), but fail loudly
         // rather than silently returning zeros if that ever changes.
-        map.get(&ggml_type).unwrap_or_else(|| {
+        let pipeline = map.get(&ggml_type).unwrap_or_else(|| {
             panic!(
                 "VulkanBackend has no compute shader for ggml_type {ggml_type} — this is a \
                  bug, not a data problem (engine::quant already validated this tensor at load \
                  time)"
             )
-        })
+        });
+        (pipeline, name)
     }
 
     /// Returns the cached GPU resources for `op`'s `(weight, n_tokens)`
@@ -7064,7 +7601,7 @@ impl VulkanBackend {
 
             match (&res.bg_attn_post_norm_add, &res.bg_attn_add) {
                 (Some(bg), _) => {
-                    pass.set_pipeline(&self.rmsnorm_add_pipeline);
+                    pass.set_pipeline(self.rmsnorm_add_for(n_embd));
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
                 }
@@ -7076,7 +7613,7 @@ impl VulkanBackend {
                 (None, None) => unreachable!("one of the two shapes is always built"),
             }
 
-            pass.set_pipeline(&self.rmsnorm_pipeline);
+            pass.set_pipeline(self.rmsnorm_for(n_embd));
             pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
@@ -7090,7 +7627,10 @@ impl VulkanBackend {
             if let Some(w) = res.attn_post_norm_w.clone() {
                 self.capture_push(|| {
                     static_capture_step(
-                        vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                        vulkan_shaders::shader_source_rmsnorm_add(
+                            self.subgroup_reduce,
+                            norm_wg_for(n_embd),
+                        ),
                         &[
                             (
                                 0,
@@ -7116,7 +7656,10 @@ impl VulkanBackend {
             }
             self.capture_push(|| {
                 static_capture_step(
-                    vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                    vulkan_shaders::shader_source_rmsnorm(
+                        self.subgroup_reduce,
+                        norm_wg_for(n_embd),
+                    ),
                     &[
                         (0, Storage, res.x1.clone(), res.x1_offset, nb4),
                         (1, Storage, res.ffn_norm_w.clone(), 0, nb4),
@@ -7321,7 +7864,7 @@ impl VulkanBackend {
 
             match (&res.bg_ffn_post_norm_add, &res.bg_ffn_add) {
                 (Some(bg), _) => {
-                    pass.set_pipeline(&self.rmsnorm_add_pipeline);
+                    pass.set_pipeline(self.rmsnorm_add_for(n_embd));
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
                 }
@@ -7339,7 +7882,10 @@ impl VulkanBackend {
             if let Some(w) = res.ffn_post_norm_w.clone() {
                 self.capture_push(|| {
                     static_capture_step(
-                        vulkan_shaders::shader_source_rmsnorm_add(self.subgroup_reduce, norm_wg()),
+                        vulkan_shaders::shader_source_rmsnorm_add(
+                            self.subgroup_reduce,
+                            norm_wg_for(n_embd),
+                        ),
                         &[
                             (
                                 0,
@@ -7559,16 +8105,16 @@ impl VulkanBackend {
                 match &pres.bg_post_norm_add {
                     Some(bg) => {
                         let pipeline = if pres.post_norm_add_scaled {
-                            &self.rmsnorm_add_scale_pipeline
+                            self.rmsnorm_add_scale_for(n_embd)
                         } else {
-                            &self.rmsnorm_add_pipeline
+                            self.rmsnorm_add_for(n_embd)
                         };
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(1, 1, 1);
                     }
                     None => {
-                        pass.set_pipeline(&self.rmsnorm_pipeline);
+                        pass.set_pipeline(self.rmsnorm_for(n_embd));
                         pass.set_bind_group(
                             0,
                             pres.bg_post_norm
@@ -7600,7 +8146,7 @@ impl VulkanBackend {
                         (
                             vulkan_shaders::shader_source_rmsnorm_add_scale(
                                 self.subgroup_reduce,
-                                norm_wg(),
+                                norm_wg_for(n_embd),
                             ),
                             pres.meta_post_norm_scaled
                                 .clone()
@@ -7610,7 +8156,7 @@ impl VulkanBackend {
                         (
                             vulkan_shaders::shader_source_rmsnorm_add(
                                 self.subgroup_reduce,
-                                norm_wg(),
+                                norm_wg_for(n_embd),
                             ),
                             res.meta_embd_eps.clone(),
                         )
@@ -7639,7 +8185,10 @@ impl VulkanBackend {
                     let normed2 = normed.clone();
                     self.capture_push(|| {
                         static_capture_step(
-                            vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                            vulkan_shaders::shader_source_rmsnorm(
+                                self.subgroup_reduce,
+                                norm_wg_for(n_embd),
+                            ),
                             &[
                                 (
                                     0,
@@ -9933,6 +10482,11 @@ impl VulkanBackend {
                 self.kv_storage,
                 self.subgroup_reduce,
                 hd,
+                // The device's own ceiling, not a constant: this kernel's K
+                // tile is the largest shared-memory allocation in the engine,
+                // and the limit it has to fit under differs by a factor of two
+                // across the APIs this same code runs on.
+                self.device.limits().max_compute_workgroup_storage_size,
             )
         } else {
             vulkan_shaders::shader_source_attention_split(self.kv_storage, self.subgroup_reduce, hd)
@@ -11147,7 +11701,7 @@ impl VulkanBackend {
                 label: Some("orangu-server fused layer attn_norm pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.rmsnorm_pipeline);
+            pass.set_pipeline(self.rmsnorm_for(n_embd));
             pass.set_bind_group(0, &layer_res.attn_norm_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
@@ -11155,7 +11709,10 @@ impl VulkanBackend {
             use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
             let nb = (n_embd as u64) * 4;
             CaptureStep::Dispatch {
-                wgsl: vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                wgsl: vulkan_shaders::shader_source_rmsnorm(
+                    self.subgroup_reduce,
+                    norm_wg_for(n_embd),
+                ),
                 bindings: vec![
                     CaptureBinding {
                         binding: 0,
@@ -11304,7 +11861,7 @@ impl VulkanBackend {
             label: Some("orangu-server output_norm pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.rmsnorm_pipeline);
+        pass.set_pipeline(self.rmsnorm_for(n_embd));
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
@@ -11312,7 +11869,7 @@ impl VulkanBackend {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
             let nb4 = (n_embd as u64) * 4;
             static_capture_step(
-                vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg()),
+                vulkan_shaders::shader_source_rmsnorm(self.subgroup_reduce, norm_wg_for(n_embd)),
                 &[
                     (0, Storage, x_buf.clone(), 0, nb4),
                     (1, Storage, weight_buf.clone(), 0, nb4),
@@ -11740,6 +12297,41 @@ impl VulkanBackend {
              output+lm_head={tail_ms:.3}ms; layers sum {:.3}ms)",
             qkv_ms + attn_ms + ffn_ms,
         );
+
+        // Accumulated as well as printed, so a benchmark on a machine nobody
+        // can watch the stderr of can still collect this — see `GpuTimings`.
+        self.timing_totals
+            .lock()
+            .expect("gpu timing totals poisoned")
+            .add(GpuTimings {
+                steps: 1,
+                ple_ms,
+                qkv_ms,
+                attn_ms,
+                ffn_ms,
+                tail_ms,
+                total_ms,
+            });
+    }
+
+    /// The accumulated GPU timing breakdown, and reset the totals.
+    ///
+    /// **Read-and-reset**, so a caller can bracket a window: read once before
+    /// the workload to discard whatever warmup left behind, run it, read again
+    /// to get exactly that window's totals. The alternative — monotonic
+    /// counters the caller subtracts — puts the same arithmetic in every
+    /// consumer and gets it wrong the first time somebody forgets the "before"
+    /// read and reports a benchmark's numbers plus its warmup's.
+    ///
+    /// Empty (`steps: 0`) unless `ORANGU_GPU_TIMESTAMPS=1` and the adapter
+    /// supports the query, which is what makes "no data" distinguishable from
+    /// "no time spent".
+    pub fn take_timings(&self) -> GpuTimings {
+        let mut totals = self
+            .timing_totals
+            .lock()
+            .expect("gpu timing totals poisoned");
+        std::mem::take(&mut *totals)
     }
 
     /// Records gemma4's per-layer-embedding (PLE) *input* projection —
@@ -12911,6 +13503,72 @@ mod tests {
         GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
         GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
+
+    /// The RMSNorm width rule must reproduce every width it was measured at,
+    /// and stay inside the set of kernels that actually get compiled.
+    ///
+    /// The three measured points are the whole justification for the rule
+    /// existing at all — a single constant cannot be right at both 960 and
+    /// 3072 — so a change that stopped reproducing them would have removed the
+    /// reason for the complexity while keeping the complexity.
+    #[test]
+    fn the_norm_width_rule_reproduces_every_measured_best() {
+        // Measured: decode, 5 reps, two context depths, against a fixed 128.
+        for (n_embd, want) in [(960usize, 128usize), (2048, 256), (3072, 256)] {
+            assert_eq!(
+                norm_wg_for(n_embd),
+                want,
+                "n_embd {n_embd} measured best at {want}"
+            );
+        }
+        // Extrapolations of the mechanism, not of the data — but they still
+        // have to name a kernel that exists, and stay monotone in width.
+        let mut last = 0;
+        for n_embd in [64usize, 256, 512, 1024, 4096, 16384] {
+            let wg = norm_wg_for(n_embd);
+            assert!(NORM_WGS.contains(&wg), "n_embd {n_embd} chose {wg}");
+            assert!(wg >= last, "wider rows must not choose a narrower kernel");
+            last = wg;
+            assert!(norm_wg_index(n_embd) < NORM_WGS.len());
+        }
+    }
+
+    /// An out-of-range tuning value must fall back to the default **and be
+    /// rejected out loud**.
+    ///
+    /// The silent half is the one that costs something. A sweep sets
+    /// `ORANGU_NORM_WG=32`, the server runs 128, and the benchmark records a
+    /// second copy of the default under the name `32` — two identical
+    /// configurations reported as two distinct points, which reads as "this
+    /// knob does nothing down there" rather than "that value was never tried".
+    /// That happened, on the first sweep run through this code.
+    ///
+    /// The variable is set and removed inside this one test rather than
+    /// through the real `norm_wg`/`reduce_n_rows`, which memoize in a
+    /// `OnceLock` and so can only be observed once per process.
+    #[test]
+    fn a_rejected_tuning_value_falls_back_and_says_so() {
+        const VAR: &str = "ORANGU_TEST_TUNING_VALUE";
+        let read = || {
+            super::super::env_tuning_value(VAR, 128usize, "one of 64, 128, 256", |n| {
+                matches!(n, 64 | 128 | 256)
+            })
+        };
+        // SAFETY: this variable is named for this test and read by nothing
+        // else; no other thread in the binary looks at it.
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(read(), 128, "unset means the default");
+        unsafe { std::env::set_var(VAR, "256") };
+        assert_eq!(read(), 256, "an accepted value is used");
+        unsafe { std::env::set_var(VAR, " 64 ") };
+        assert_eq!(read(), 64, "surrounding whitespace is not a rejection");
+        // Parses fine, is not a value the kernel has — the case a sweep hits.
+        unsafe { std::env::set_var(VAR, "32") };
+        assert_eq!(read(), 128, "an out-of-range value falls back");
+        unsafe { std::env::set_var(VAR, "banana") };
+        assert_eq!(read(), 128, "an unparseable value falls back");
+        unsafe { std::env::remove_var(VAR) };
+    }
 
     /// One `VulkanBackend` shared by every test in this module, rather
     /// than each test creating (and racing to create) its own. This
@@ -14626,24 +15284,92 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let got = run_probe_kernel(vulkan, SRC, 64, 64);
         let want: Vec<f32> = (0..64).map(|i| i as f32 + 1.0).collect();
         let component_stores_work = got == want;
-        if vulkan_shaders::coop_vec4_tiles(vulkan.wgpu_backend()) {
+        // Only `tile_w` is asserted against this probe. `tile_x`'s fill was
+        // rearranged so every thread writes a whole vector (`store_x4`), which
+        // this probe says nothing about — its control twin,
+        // `shared_vec4_whole_stores_survive_a_barrier`, is the one that covers it,
+        // and `tile_x_vec4_fill_writes_whole_vectors` is what holds the
+        // generated fill to actually being that shape.
+        if vulkan_shaders::coop_vec4_tiles(vulkan.wgpu_backend()).w {
             assert!(
                 component_stores_work,
-                "{} builds the tiled GEMM with vec4 tiles, but component-wise \
-                 stores into shared vec4 memory do not survive a barrier there \
-                 — every tiled-path result on this device is wrong. Got {got:?}",
+                "{} builds the tiled GEMM's weight tile as vec4, but \
+                 component-wise stores into shared vec4 memory do not survive a \
+                 barrier there — every tiled-path result on this device is \
+                 wrong. Got {got:?}",
                 vulkan.adapter_name
             );
         } else if component_stores_work {
             // Not a failure — the scalar form is always correct — but worth
             // saying, since it is the one measurement that would justify
-            // turning `vec4` tiles on for this backend.
+            // turning `vec4` weight tiles on for this backend.
             eprintln!(
-                "note: {} passes the component-store probe but is on scalar \
-                 tiles; vec4 tiles may be worth measuring here",
+                "note: {} passes the component-store probe but is on a scalar \
+                 weight tile; vec4 tile_w may be worth measuring here",
                 vulkan.adapter_name
             );
         }
+    }
+
+    /// [`VulkanBackend::tuning_report`] must name a kernel for every
+    /// [`SUPPORTED_TYPES`] entry at both probe shapes, and must agree with
+    /// [`VulkanBackend::pipeline_for`] about which one.
+    ///
+    /// The agreement half is what gives the report its value. A report that
+    /// merely *described* the selection would be a second copy of
+    /// `pipeline_for`'s branch ladder, and a stale copy is worse than no
+    /// report at all: it would send a reader hunting for a regression in a
+    /// kernel that never ran. `pipeline_for` delegating to
+    /// `pipeline_for_named` makes them the same code, and this holds them to
+    /// it by pointer identity — the named pipeline must be the *same object*
+    /// the dispatch path would have bound.
+    ///
+    /// The completeness half catches the other failure: a type whose
+    /// selection falls through every branch to a map that has no entry for it
+    /// would panic inside `matmul` on the first request. Building the report
+    /// walks every type at startup, so this test finds that gap on a device
+    /// rather than a user finding it mid-generation.
+    #[test]
+    fn tuning_report_names_the_kernel_the_dispatch_would_use() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        let report = vulkan.tuning_report();
+        for (shape, n_tokens) in [("decode", 1), ("prefill", vulkan.coop_min_n_tokens)] {
+            let named = report["kernels"][shape]
+                .as_object()
+                .unwrap_or_else(|| panic!("tuning_report has no {shape} kernel map"));
+            assert_eq!(
+                named.len(),
+                SUPPORTED_TYPES.len(),
+                "{shape} kernel map covers {} of {} supported types",
+                named.len(),
+                SUPPORTED_TYPES.len()
+            );
+            for &ty in SUPPORTED_TYPES {
+                let name = orangu::gguf::ggml_type_name(ty);
+                let reported = named[&name].as_str().expect("kernel name is a string");
+                let (dispatched, from_selector) = vulkan.pipeline_for_named(ty, 4096, n_tokens);
+                assert_eq!(
+                    reported, from_selector,
+                    "{name} {shape}: report and selector disagree"
+                );
+                assert!(
+                    std::ptr::eq(dispatched, vulkan.pipeline_for(ty, 4096, n_tokens)),
+                    "{name} {shape}: pipeline_for_named named {reported} but \
+                     pipeline_for would bind a different pipeline"
+                );
+            }
+        }
+        // The banner line is built from the same selector, so it can't
+        // disagree either — but it is what a reader actually sees, so prove
+        // it is populated rather than an empty format string.
+        let summary = vulkan.tuning_summary();
+        assert!(
+            summary.contains("q4_k") && summary.contains("kv "),
+            "tuning_summary is not the banner line it claims to be: {summary}"
+        );
     }
 
     /// The control for [`coop_tiles_are_vec4_only_where_component_stores_work`]:
@@ -14914,6 +15640,40 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn matmul_matches_cpu_backend_for_q6_k_multi_group() {
         cross_check_n_tokens(GGML_TYPE_Q6_K, 1536, 40, 3);
+    }
+
+    /// `Q5_K` at the shape a model actually has, because the light kernel is
+    /// where an indexing mistake would hide.
+    ///
+    /// The other `Q5_K` checks run `in_dim` 512 or 1536 against `out_dim` 5 or
+    /// 40 — two or six super-blocks per row, and fewer output rows than one
+    /// workgroup covers. The light kernel's thread mapping folds `tid` through
+    /// `itid`/`il`/`ir`/`v_im`/`v_in` into byte offsets within a 176-byte
+    /// block, and its block loop strides by two; an error in either could
+    /// still come out right on a couple of blocks and a handful of rows and be
+    /// wrong on 8 blocks × 2048 rows, which is what an `ffn_down` is. So:
+    /// `in_dim = 2048` (8 super-blocks), `out_dim = 2048`.
+    ///
+    /// Prompted by the measurement rather than by suspicion — the kernel came
+    /// out 78% faster than the block-unroll it replaced, which is a large
+    /// enough jump to be worth ruling out "it is fast because it is skipping
+    /// something" before believing it.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q5_k_model_shaped() {
+        cross_check_n_tokens(GGML_TYPE_Q5_K, 2048, 2048, 1);
+    }
+
+    /// The `Q6_K` twin, and it carries more weight than the `Q5_K` one: this
+    /// format's 210-byte block is **not 4-byte aligned**, so the light kernel
+    /// reads every weight word through the two-load unaligned path and the
+    /// alignment *alternates with the block index*. A kernel that got that
+    /// wrong would still be right on the even blocks. `in_dim = 2048` is eight
+    /// super-blocks per row, so both parities are exercised many times over,
+    /// and 2048 output rows put every one of the 16 thread mappings against
+    /// every parity.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q6_k_model_shaped() {
+        cross_check_n_tokens(GGML_TYPE_Q6_K, 2048, 2048, 1);
     }
 
     #[test]

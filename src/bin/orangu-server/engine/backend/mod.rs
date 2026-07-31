@@ -62,6 +62,53 @@ pub use vulkan::VulkanBackend;
 
 use super::loader::QuantMatrix;
 
+/// One tuning knob's value from the environment, **saying so when it is
+/// rejected** rather than quietly falling back.
+///
+/// The silence is what makes this worth a helper. A benchmark sweep sets the
+/// variable, the backend declines the value and runs the default, and the
+/// sweep records a duplicate of the default *under the rejected value's
+/// name* — two identical configurations reported as two distinct points,
+/// which reads as "this knob does nothing in that range" rather than "that
+/// value was never tried". It costs a whole sweep to notice, and only if
+/// someone reads the startup tuning line closely enough to see the value did
+/// not change. That happened, on the first sweep run through this code.
+///
+/// Same precedent as `VulkanBackend::try_init`'s `ORANGU_GPU_TIMESTAMPS`
+/// warning and `vulkan_shaders::coop_geom`'s malformed-spec one: a knob that
+/// silently does nothing is worse than one that is absent, because it invites
+/// the reader to conclude the thing it controls does not matter.
+///
+/// Lives here, above both `vulkan` and `vulkan_shaders`, because the knobs
+/// that need it are split across the two — the ones that pick a dispatch
+/// threshold and the ones that get baked into generated WGSL.
+pub(crate) fn env_tuning_value<T>(
+    var: &str,
+    default: T,
+    expected: &str,
+    valid: impl Fn(T) -> bool,
+) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    let Ok(raw) = std::env::var(var) else {
+        return default;
+    };
+    match raw.trim().parse::<T>() {
+        Ok(v) if valid(v) => v,
+        // Both arms, not just the parse failure: `ORANGU_NORM_WG=32` parses
+        // perfectly and is still not a value that kernel has, and that is the
+        // case a sweep actually hits.
+        _ => {
+            eprintln!(
+                "orangu-server: {var}={raw:?} is not {expected} — using {default}. \
+                 This run measures the default, not the value you asked for."
+            );
+            default
+        }
+    }
+}
+
 /// One `matmul` call's operands, for [`Backend::matmul_batch`] — a slice of
 /// these describes several matmuls that don't depend on each other's
 /// results (e.g. a transformer layer's Q/K/V projections, all reading the

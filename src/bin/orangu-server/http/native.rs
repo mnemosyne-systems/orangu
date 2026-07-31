@@ -43,6 +43,9 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "model": state.model_label,
         "backend": state.backend_label,
+        // `null` on a backend with no kernel selection to report — see
+        // `AppState::gpu_tuning`.
+        "gpu": state.gpu_tuning,
         "architecture": cfg.architecture,
         "n_ctx": cfg.n_ctx_train,
         "n_vocab": state.engine.tokenizer.vocab_size(),
@@ -57,6 +60,42 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // run — see `orangu-bench`'s `report_environment`.
         "pid": std::process::id(),
     }))
+}
+
+/// `GET /gpu-timings` — the accumulated GPU timestamp breakdown since the last
+/// call, and **reset**.
+///
+/// Read-and-reset so a client can bracket a window: read once before the
+/// workload to discard whatever the warmup left, run it, read again to get
+/// exactly that window. See `VulkanBackend::take_timings`.
+///
+/// This is the answer to "where did the time go" on a platform with no
+/// `perf` — which is every macOS machine, and so every machine the Metal
+/// backend is interesting on. `steps: 0` means no timestamped decode step
+/// happened in the window: either `ORANGU_GPU_TIMESTAMPS=1` is not set, or
+/// this adapter has no timestamp query. Reported as zero steps rather than
+/// zero milliseconds so "not measured" cannot be read as "took no time".
+pub async fn gpu_timings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let timings = state
+        .wgpu_backend
+        .as_deref()
+        .and_then(orangu_backend_as_wgpu)
+        .map(|v| v.take_timings().to_json());
+    Json(serde_json::json!({
+        "enabled": timings.is_some(),
+        "timings": timings,
+    }))
+}
+
+/// `&dyn Backend` → the `wgpu` engine behind it, if it is one.
+///
+/// A free function rather than an inline closure only because
+/// `Backend::as_wgpu` returns a borrow tied to the trait object, and naming
+/// the lifetime relationship is clearer here than at the call site.
+fn orangu_backend_as_wgpu(
+    backend: &dyn crate::engine::backend::Backend,
+) -> Option<&crate::engine::backend::VulkanBackend> {
+    backend.as_wgpu()
 }
 
 pub async fn slots(State(state): State<Arc<AppState>>) -> impl IntoResponse {

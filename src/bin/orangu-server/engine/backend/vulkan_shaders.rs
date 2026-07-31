@@ -606,6 +606,22 @@ impl CoopGeom {
                 self.chunk
             ));
         }
+        // `coop_tiled_x_fill` hands each thread whole four-token quads of the
+        // token tile — one shared-memory vector per store, which is what
+        // makes the fill portable to a backend without component-granular
+        // shared stores (see `coop_vec4_tiles`). The quads have to divide
+        // evenly among the `COOP_THREADS / chunk` threads that share a k
+        // column, or some thread gets a partial quad and the store is no
+        // longer whole.
+        let x_threads_per_k = COOP_THREADS / self.chunk;
+        if !(self.tile_tokens() / 4).is_multiple_of(x_threads_per_k) {
+            return Err(format!(
+                "chunk {} leaves {x_threads_per_k} threads per k column, which does not \
+                 divide the token tile's {} four-token quads",
+                self.chunk,
+                self.tile_tokens() / 4
+            ));
+        }
         let run = self.run();
         if run == 0 || !self.chunk.is_multiple_of(run) {
             return Err(format!(
@@ -704,39 +720,125 @@ pub fn coop_f16_tiles() -> bool {
     *F.get_or_init(|| std::env::var_os("ORANGU_COOP_F16_TILES").is_some())
 }
 
-/// Whether the tiled GEMM may hold its shared tiles as `vec4` — **a
+/// Which of the tiled GEMM's two shared tiles may be held as `vec4` — see
+/// [`coop_vec4_tiles`], which is where the reasoning lives.
+///
+/// Two flags rather than one because the two tiles are filled by different
+/// code under different constraints, and only one of them has the hazard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoopVec4Tiles {
+    /// `tile_w`, the weight tile.
+    pub w: bool,
+    /// `tile_x`, the activation tile.
+    pub x: bool,
+}
+
+/// Whether the tiled GEMM may hold each of its shared tiles as `vec4` — **a
 /// correctness question, not a tuning one**.
+///
+/// # The hazard
 ///
 /// The tiled kernel is the only one that fills shared memory by having many
 /// threads each write a single dynamically-indexed *component* of a shared
-/// vector (`store_w`/`store_x`; four different threads write the four
-/// components of each `vec4`). On Vulkan/RADV that lowers to a 4-byte
-/// store and the reads can then take four values per load, which is what
-/// the `vec4` tiles are for.
+/// vector — four different threads writing the four components of one
+/// `vec4`. On Vulkan that lowers to a 4-byte store, and the reads can then
+/// take four values per load, which is what the `vec4` tiles are for.
 ///
-/// On `wgpu`'s Metal backend it does not. Measured on a real device (CI's
-/// macOS runner, Apple Paravirtual): of each `vec4`, exactly one
-/// component survived the barrier and the other three read back as their
-/// initial value — the signature of a read-modify-write of the whole
-/// 16-byte vector, with the four writing threads clobbering one another.
-/// Every tiled-path cross-check disagreed with the CPU backend there,
-/// including plain `f32`, while the scalar-shared-memory reduce kernels
-/// all passed. `tests::shared_vec4_component_stores_survive_a_barrier` is
-/// that finding reduced to one kernel, and
-/// `tests::coop_tiles_are_vec4_only_where_component_stores_work` is what
-/// ties this function to it.
+/// On `wgpu`'s Metal backend it does not. Measured on a real device: of each
+/// `vec4`, exactly one component survived the barrier and the other three
+/// read back as their initial value — the signature of a read-modify-write of
+/// the whole 16-byte vector, with the four writing threads clobbering one
+/// another. Every tiled-path cross-check disagreed with the CPU backend
+/// there, including plain `f32`, while the scalar-shared-memory reduce
+/// kernels all passed. `vulkan::tests::coop_tiles_are_vec4_only_where_component_stores_work`
+/// is that finding reduced to one kernel;
+/// `vulkan::tests::shared_vec4_whole_stores_survive_a_barrier` is the control
+/// that pins the
+/// fault to the *component* store rather than to shared `vec4` memory, the
+/// barrier, or the readback.
 ///
-/// So `vec4` tiles are enabled only where they are known-correct, and
-/// anything else gets the scalar form: four loads where the `vec4` form
-/// takes one, same arithmetic, same tile layout, same results. Defaulting
-/// an unrecognized backend to the safe form is the deliberate direction —
-/// a new backend that silently computed wrong numbers would be far worse
-/// than one that is a little slower until someone runs the probe on it.
+/// # Why that is a per-tile answer, not a per-backend one
 ///
-/// `ORANGU_COOP_SCALAR_TILES=1` forces the scalar form on for an A/B on a
-/// backend that does not need it.
-pub fn coop_vec4_tiles(backend: wgpu::Backend) -> bool {
-    backend == wgpu::Backend::Vulkan && std::env::var_os("ORANGU_COOP_SCALAR_TILES").is_none()
+/// The control is the interesting half: **whole-vector stores are fine
+/// everywhere**. A tile whose fill can be arranged so each thread writes a
+/// complete `vec4` therefore needs no gate at all.
+///
+/// - `tile_x` **can** be arranged that way, and is (`coop_tiled_x_fill`
+///   stages four consecutive tokens per store). The tile is k-major, so four
+///   consecutive tokens at one `k` are four consecutive slots — one vector.
+///   Giving a thread that quad instead of four tokens a stride apart is a
+///   pure permutation of which thread stages which element: same addresses,
+///   same coalescing, same values, bit-identical output. So `x` is `true`
+///   everywhere.
+/// - `tile_w` **cannot**, not without giving something else up. A thread
+///   stages a run of consecutive `k` from *one* row, because that is what
+///   lets the quantized block's scale/min pair be derived once per run
+///   instead of once per element (`coop_tiled_run_fill`). In a k-major tile
+///   those values land `TILE_ROWS` apart — never one vector. Making them
+///   contiguous means either a row-major tile (which moves the problem into
+///   the register block's read, where it costs more) or a thread staging four
+///   rows at once (which multiplies the per-run dequant setup by four). Both
+///   are real designs; neither is a fallback. So `w` stays gated on the
+///   store's actual behaviour.
+///
+/// The one exception is the `ORANGU_NO_TILE_X_STRAIGHT` control, which
+/// restores the *old* per-element `tile_x` fill verbatim so the straightened
+/// one can be A/B'd against the code it replaced. That fill writes
+/// components, so on a backend where components clobber, asking for it also
+/// drops `tile_x` back to scalar — the alternative is a control that silently
+/// computes the wrong answer.
+///
+/// Defaulting an unrecognized backend to the safe form is the deliberate
+/// direction: a new backend that silently computed wrong numbers would be far
+/// worse than one that is a little slower until someone runs the probe on it.
+///
+/// # Forcing it
+///
+/// `ORANGU_COOP_SCALAR_TILES` forces the scalar form on: `w` or `x` for one
+/// tile, anything else non-empty (`1`) for both.
+///
+/// Naming a single tile is what makes the combination a backend without
+/// component stores runs — scalar `tile_w`, `vec4` `tile_x` — reachable on a
+/// backend that *has* them. The generated WGSL is what differs between the
+/// two, not the driver, so `ORANGU_COOP_SCALAR_TILES=w` puts the whole
+/// cross-check suite over the code path an Apple GPU takes, on hardware that
+/// is actually to hand. It is also the honest way to A/B the two tiles
+/// separately: whichever one is worth converting, the measurement should say
+/// which.
+pub fn coop_vec4_tiles(backend: wgpu::Backend) -> CoopVec4Tiles {
+    let (force_w, force_x) =
+        forced_scalar_tiles(&std::env::var("ORANGU_COOP_SCALAR_TILES").unwrap_or_default());
+    let component_stores_work = backend == wgpu::Backend::Vulkan;
+    CoopVec4Tiles {
+        w: component_stores_work && !force_w,
+        // Whole-vector stores everywhere, so no gate — unless the fill that
+        // makes them whole has been swapped out for the per-element control.
+        x: (component_stores_work || !rolled_x_fill()) && !force_x,
+    }
+}
+
+/// `(force_w, force_x)` from an `ORANGU_COOP_SCALAR_TILES` value — see
+/// [`coop_vec4_tiles`]. Split out so the parse is testable without setting a
+/// process-global variable that a concurrently-running test could observe.
+///
+/// An unrecognized value forces both tiles scalar rather than being ignored:
+/// `=1` is what this variable meant before it could name a tile, and a typo
+/// should land on the conservative form rather than quietly leaving on the
+/// one the operator was trying to rule out.
+fn forced_scalar_tiles(spec: &str) -> (bool, bool) {
+    match spec.trim() {
+        "" => (false, false),
+        "w" => (true, false),
+        "x" => (false, true),
+        _ => (true, true),
+    }
+}
+
+/// Whether `ORANGU_NO_TILE_X_STRAIGHT=1` asked for the pre-straightening
+/// per-element activation fill — see [`ROLLED_X_FILL`] for what it restores
+/// and [`coop_vec4_tiles`] for why the answer also decides `tile_x`'s form.
+fn rolled_x_fill() -> bool {
+    std::env::var_os("ORANGU_NO_TILE_X_STRAIGHT").is_some()
 }
 
 /// The geometry in force, read once from `ORANGU_COOP_GEOM`.
@@ -845,6 +947,9 @@ const REG_TOKENS: u32 = %REG_TOKENS%u;
 const RUN: u32 = %RUN%u;
 const RUNS_PER_ROW: u32 = CHUNK / RUN;
 const THREADS: u32 = %THREADS%u;
+// Four-token quads in the token tile — the unit `store_x4` writes, and so the
+// unit `coop_tiled_x_fill` hands out.
+const X_QUADS: u32 = TILE_TOKENS / 4u;
 
 %TILE_DECL%
 
@@ -865,9 +970,25 @@ fn store_w(rr: u32, kk: u32, v: f32) {
 // `tile_x` is k-major too (`k * TILE_TOKENS + token`), same reason as
 // `tile_w`: the values one thread reads per `k` end up in consecutive
 // shared-memory addresses.
+//
+// One element at a time — only the pre-straightening control fill
+// (`ORANGU_NO_TILE_X_STRAIGHT`) still writes this way, and only where a
+// component store into a shared vector is a component-sized store. Everything
+// else goes through `store_x4`.
 fn store_x(tt: u32, kk: u32, v: f32) {
     let xidx = kk * TILE_TOKENS + tt;
 %STORE_X%
+}
+
+// A whole four-token quad at one `k`. Because `tile_x` is k-major those four
+// tokens are four consecutive slots, so this is a single **whole**-vector
+// store — no thread ever writes a component of a vector another thread is
+// also writing. That is what makes the activation tile's `vec4` form portable
+// to a backend whose shared-vector component store is a read-modify-write of
+// the whole 16 bytes; see `coop_vec4_tiles`.
+fn store_x4(tt0: u32, kk: u32, v: vec4<f32>) {
+    let xidx = kk * TILE_TOKENS + tt0;
+%STORE_X4%
 }
 
 %RUN_FILL%
@@ -945,7 +1066,7 @@ fn main(
 fn coop_tiled_register_block(
     g: CoopGeom,
     f16_tiles: bool,
-    vec4_tiles: bool,
+    vec4_tiles: CoopVec4Tiles,
 ) -> (String, String, String, usize) {
     let reg_rows = g.reg_rows as usize;
     let reg_tokens = g.reg_tokens as usize;
@@ -974,15 +1095,10 @@ fn coop_tiled_register_block(
     // an unrolled step before the first FMA consumes one.
     let mut inner = String::new();
     for u in 0..k_unroll {
-        if vec4_tiles {
+        if vec4_tiles.w {
             for i in 0..reg_rows.div_ceil(4) {
                 inner.push_str(&format!(
                     "            let wv{u}_{i} = tile_w[((k + {u}u) * TILE_ROWS + w_base) / 4u + {i}u];\n"
-                ));
-            }
-            for j in 0..reg_tokens.div_ceil(4) {
-                inner.push_str(&format!(
-                    "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
                 ));
             }
         } else {
@@ -991,6 +1107,14 @@ fn coop_tiled_register_block(
                     "            let wv{u}_{i} = tile_w[(k + {u}u) * TILE_ROWS + w_base + {i}u];\n"
                 ));
             }
+        }
+        if vec4_tiles.x {
+            for j in 0..reg_tokens.div_ceil(4) {
+                inner.push_str(&format!(
+                    "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
+                ));
+            }
+        } else {
             for j in 0..reg_tokens {
                 inner.push_str(&format!(
                     "            let xv{u}_{j} = tile_x[(k + {u}u) * TILE_TOKENS + x_base + {j}u];\n"
@@ -1001,13 +1125,15 @@ fn coop_tiled_register_block(
     for u in 0..k_unroll {
         for i in 0..reg_rows {
             for j in 0..reg_tokens {
-                let (w, x) = if vec4_tiles {
-                    (
-                        format!("wv{u}_{}[{}]", i / 4, i % 4),
-                        format!("xv{u}_{}[{}]", j / 4, j % 4),
-                    )
+                let w = if vec4_tiles.w {
+                    format!("wv{u}_{}[{}]", i / 4, i % 4)
                 } else {
-                    (format!("wv{u}_{i}"), format!("xv{u}_{j}"))
+                    format!("wv{u}_{i}")
+                };
+                let x = if vec4_tiles.x {
+                    format!("xv{u}_{}[{}]", j / 4, j % 4)
+                } else {
+                    format!("xv{u}_{j}")
                 };
                 let (w, x) = if f16_tiles {
                     (format!("f32({w})"), format!("f32({x})"))
@@ -1164,44 +1290,104 @@ const ROLLED_X_FILL: &str = r#"        var fj: u32 = local;
 /// against 1 in the decode GEMV, and this loop is where they were.
 ///
 /// Written out, the loads land in distinct registers with no branch between
-/// them and drain with counted `vmcnt(N)`. The addresses are unchanged — thread
-/// `local` still reads `k = chunk_start + local % CHUNK` for tokens
-/// `local / CHUNK` stepping by `THREADS / CHUNK` — so a subgroup still reads
-/// `CHUNK` consecutive floats of one token's row per step, exactly as coalesced
-/// as before.
+/// them and drain with counted `vmcnt(N)`.
 ///
 /// The bounds check is hoisted to a whole-tile test rather than being paid per
 /// element: both conditions are uniform across the workgroup, so the fast path
-/// takes no divergent branch at all. The edge keeps the original rolled,
-/// per-element form.
+/// takes no divergent branch at all. The edge takes a rolled, bounds-checked
+/// path.
+///
+/// # One thread, one quad
+///
+/// Each thread stages **four consecutive tokens** at its `k` per store, and
+/// writes them as one vector through `store_x4`. It used to stage four tokens
+/// a `THREADS / CHUNK` stride apart, which put its four values four *separate*
+/// slots apart in the k-major tile — so four different threads ended up
+/// writing the four components of each shared `vec4`, which is the pattern
+/// `coop_vec4_tiles` exists to talk about. Handing a thread the quad instead
+/// makes every shared store a whole-vector store, and that is the difference
+/// between a `vec4` activation tile that works on one API and one that works
+/// on both.
+///
+/// It changes nothing else. The set of loads is identical — the same
+/// `TILE_TOKENS * CHUNK` elements, the same addresses, the same count per
+/// thread — only permuted across threads, so the tile ends up holding exactly
+/// the same values and the output is bit-identical. Coalescing is unchanged
+/// too: for any one of a thread's loads, the `CHUNK` threads sharing a token
+/// row still read `CHUNK` consecutive floats of it.
 fn coop_tiled_x_fill(g: CoopGeom) -> String {
     // `ORANGU_NO_TILE_X_STRAIGHT=1` restores the rolled loop verbatim, so the
     // change can be A/B'd in one binary against the code it replaced rather
-    // than against an approximation of it (LESSONS §17).
-    if std::env::var_os("ORANGU_NO_TILE_X_STRAIGHT").is_some() {
+    // than against an approximation of it (LESSONS §17). `coop_vec4_tiles`
+    // drops `tile_x` to scalar alongside it where that matters.
+    if rolled_x_fill() {
         return ROLLED_X_FILL.to_string();
     }
-    let run = (g.tile_tokens() * g.chunk) / COOP_THREADS;
-    let step = COOP_THREADS / g.chunk;
+    // Threads sharing a k column, and the four-token quads each one stages.
+    // `CoopGeom::check` has already established that the second divides the
+    // first evenly, which is what keeps every store whole.
+    let threads_per_k = COOP_THREADS / g.chunk;
+    let quads_per_thread = (g.tile_tokens() / 4) / threads_per_k;
     let mut s = String::from(
-        "        // Straight-line, loads-before-stores — see `coop_tiled_x_fill`.\n                 let x_kk = local % CHUNK;\n                 let x_tt0 = local / CHUNK;\n                 let x_k = chunk_start + x_kk;\n                 if (token_start + TILE_TOKENS <= params.n_tokens && chunk_start + CHUNK <= in_dim) {\n                     let x_base = (token_start + x_tt0) * in_dim + x_k;\n",
+        "        // Straight-line, loads-before-stores — see `coop_tiled_x_fill`.\n\
+        \x20        let x_kk = local % CHUNK;\n\
+        \x20        let x_tt0 = (local / CHUNK) * 4u;\n\
+        \x20        let x_k = chunk_start + x_kk;\n\
+        \x20        if (token_start + TILE_TOKENS <= params.n_tokens && chunk_start + CHUNK <= in_dim) {\n\
+        \x20            let x_base = (token_start + x_tt0) * in_dim + x_k;\n",
     );
-    for i in 0..run {
+    // Every load first, then every store: the whole point of the straightened
+    // form. A quad's four tokens are adjacent rows of `x`, hence `in_dim`
+    // apart; consecutive quads of one thread are `threads_per_k` quads apart.
+    let quad_token = |i: u32| i * threads_per_k * 4;
+    for i in 0..quads_per_thread {
+        for c in 0..4 {
+            s.push_str(&format!(
+                "            let xv{i}_{c} = x[x_base + {}u * in_dim];\n",
+                quad_token(i) + c
+            ));
+        }
+    }
+    for i in 0..quads_per_thread {
         s.push_str(&format!(
-            "            let xv{i} = x[x_base + {}u * in_dim];
-",
-            i * step
+            "            store_x4(x_tt0 + {}u, x_kk, vec4<f32>(xv{i}_0, xv{i}_1, xv{i}_2, xv{i}_3));\n",
+            quad_token(i)
         ));
     }
-    for i in 0..run {
-        s.push_str(&format!(
-            "            store_x(x_tt0 + {}u, x_kk, xv{i});
-",
-            i * step
-        ));
-    }
+    // The edge. Also quad-at-a-time, for the same whole-store reason — it is
+    // the last row/token tile of a matmul, not a rare path, so it has to be
+    // correct on every backend rather than merely reachable on one.
     s.push_str(
-        "        } else {\n                     var fj: u32 = local;\n                     loop {\n                         if (fj >= TILE_TOKENS * CHUNK) {\n                             break;\n                         }\n                         let tt = fj / CHUNK;\n                         let kk = fj % CHUNK;\n                         let token_idx = token_start + tt;\n                         let k_global = chunk_start + kk;\n                         var v: f32 = 0.0;\n                         if (token_idx < params.n_tokens && k_global < in_dim) {\n                             v = x[token_idx * in_dim + k_global];\n                         }\n                         store_x(tt, kk, v);\n                         fj = fj + THREADS;\n                     }\n                 }\n",
+        "        } else {\n\
+        \x20            var fj: u32 = local;\n\
+        \x20            loop {\n\
+        \x20                if (fj >= X_QUADS * CHUNK) {\n\
+        \x20                    break;\n\
+        \x20                }\n\
+        \x20                let kk = fj / X_QUADS;\n\
+        \x20                let tt0 = (fj % X_QUADS) * 4u;\n\
+        \x20                let k_global = chunk_start + kk;\n\
+        \x20                let in_k = k_global < in_dim;\n\
+        \x20                var q0: f32 = 0.0;\n\
+        \x20                var q1: f32 = 0.0;\n\
+        \x20                var q2: f32 = 0.0;\n\
+        \x20                var q3: f32 = 0.0;\n\
+        \x20                if (in_k && token_start + tt0 + 0u < params.n_tokens) {\n\
+        \x20                    q0 = x[(token_start + tt0 + 0u) * in_dim + k_global];\n\
+        \x20                }\n\
+        \x20                if (in_k && token_start + tt0 + 1u < params.n_tokens) {\n\
+        \x20                    q1 = x[(token_start + tt0 + 1u) * in_dim + k_global];\n\
+        \x20                }\n\
+        \x20                if (in_k && token_start + tt0 + 2u < params.n_tokens) {\n\
+        \x20                    q2 = x[(token_start + tt0 + 2u) * in_dim + k_global];\n\
+        \x20                }\n\
+        \x20                if (in_k && token_start + tt0 + 3u < params.n_tokens) {\n\
+        \x20                    q3 = x[(token_start + tt0 + 3u) * in_dim + k_global];\n\
+        \x20                }\n\
+        \x20                store_x4(tt0, kk, vec4<f32>(q0, q1, q2, q3));\n\
+        \x20                fj = fj + THREADS;\n\
+        \x20            }\n\
+        \x20        }\n",
     );
     s
 }
@@ -3175,6 +3361,401 @@ fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im
 }
 "#;
 
+/// The `Q5_K` twin of [`Q4K_LIGHT_PRELUDE`].
+///
+/// `Q5_K` is `Q4_K` plus a fifth bit per weight: the block grows from 144 to
+/// 176 bytes, a 32-byte `qh` plane is inserted between the scales and the
+/// quants (so `qs` starts at 48 rather than 16), and each 4-bit nibble gains
+/// `+16` when its `qh` bit is set. Everything else — the `d`/`dmin` header, the
+/// 12-byte packed scale/min region and its `get_scale_min_k4` unpacking, the
+/// thread-to-element mapping, the four `vec4` activation reads — is identical,
+/// so this is that kernel with one extra `u32` load and four masked adds.
+///
+/// # Why not llama.cpp's own `l0`
+///
+/// The reference `mul_mat_vec_q5_k.comp` uses `l0 = 4*ir + 2*v_in`, which puts
+/// a thread's elements at `{0,1,16,17,32,33,48,49}` — eight *pairs*, read there
+/// as `vec2`. This engine binds activations as `array<vec4<f32>>`, and those
+/// offsets are not 4-aligned, so the `vec2` layout would cost eight scalar
+/// loads where four `vec4` loads do. `Q4_K`'s own `l0 = 4*(2*ir + v_in)` gives
+/// four contiguous runs of four instead, which is exactly one `vec4` each. The
+/// `qs`/`qh` bit extraction is rewritten to match that mapping rather than the
+/// reference's; the arithmetic per element is the same either way.
+const Q5K_LIGHT_PRELUDE: &str = r#"
+struct Meta {
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> xv: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn f16_to_f32(bits: u32) -> f32 {
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+
+fn vec4_word(v: vec4<u32>, i: u32) -> u32 {
+    return v[i];
+}
+
+// 4-byte-aligned u32 read from the vec4<u32>-bound weight buffer.
+fn read_word_v4(byte_offset: u32) -> u32 {
+    return weights[byte_offset / 16u][(byte_offset % 16u) / 4u];
+}
+
+fn unpack4_f(w: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32(w & 0xFFu),
+        f32((w >> 8u) & 0xFFu),
+        f32((w >> 16u) & 0xFFu),
+        f32((w >> 24u) & 0xFFu),
+    );
+}
+
+// One of the six little-endian u16s of the 12-byte scales region (bytes 4..16
+// of the block, i.e. header.y/.z/.w). Identical to Q4_K's — the scale/min
+// encoding does not change between the two formats.
+fn scale_u16(header: vec4<u32>, k: u32) -> u32 {
+    let word = vec4_word(header, (k / 2u) + 1u);
+    return select(word >> 16u, word & 0xFFFFu, (k & 1u) == 0u);
+}
+
+// Contribution of super-block `i` of one output row, computed by the 16
+// threads that own it. `block_byte_off` is the block's byte offset in
+// `weights` (row_base + i*176); `x_block_elem` is the element offset of the
+// block's activations in `xv` (t*in_dim + i*256).
+fn sb(block_byte_off: u32, x_block_elem: u32, y_offset: u32, q_offset: u32, v_im: u32, l0: u32) -> f32 {
+    let header = weights[block_byte_off / 16u];
+    let d = f16_to_f32(header.x & 0xFFFFu);
+    let dmin = f16_to_f32(header.x >> 16u);
+
+    let scale0_u32 = scale_u16(header, v_im);
+    let scale4_u32 = scale_u16(header, v_im + 2u);
+    let scale8_u32 = scale_u16(header, v_im + 4u);
+    let scale_0_4_l = (scale4_u32 << 16u) | scale0_u32;
+    let scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2u;
+    let sc_l = unpack4_f(scale_0_4_l & 0x3F3F3F3Fu);
+    let sc_8 = unpack4_f((((scale8_u32 << 12u) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h);
+    let sc0 = sc_l.x; let sc1 = sc_l.y; let sc2 = sc_l.z; let sc3 = sc_l.w;
+    let sc4 = sc_8.x; let sc5 = sc_8.y; let sc6 = sc_8.z; let sc7 = sc_8.w;
+
+    // `qs` starts 32 bytes later than in Q4_K: the `qh` plane sits between the
+    // scales and the quants.
+    let qs0 = read_word_v4(block_byte_off + 48u + q_offset);
+    let qs64 = read_word_v4(block_byte_off + 48u + q_offset + 64u);
+    // The four `qh` bytes covering this thread's four element positions. `l0`
+    // is 4-aligned (see the type doc), so this is one aligned word.
+    let qh = read_word_v4(block_byte_off + 16u + l0);
+
+    // Which bit of each `qh` byte carries the fifth bit depends only on which
+    // 64-element quarter the element sits in: quarter `v_im` uses bits
+    // `2*v_im` (low 32) and `2*v_im + 1` (high 32), quarter `v_im + 2` — the
+    // `+128` half — uses bits `2*v_im + 4` and `2*v_im + 5`. Shifted down to
+    // bit 0 of each byte and scaled to 16, this is a masked add per group.
+    let qhs = qh >> (2u * v_im);
+    let hi0 = (qhs & 0x01010101u) << 4u;         // elements +0..3
+    let hi32 = (qhs & 0x02020202u) << 3u;        // elements +32..35
+    let hi128 = qhs & 0x10101010u;               // elements +128..131
+    let hi160 = (qhs & 0x20202020u) >> 1u;       // elements +160..163
+
+    let y1 = (x_block_elem + y_offset) / 4u;
+    let y2 = (x_block_elem + y_offset + 128u) / 4u;
+    let ones = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+
+    var main_sum: f32 = 0.0;
+    var min_sum: f32 = 0.0;
+    {
+        let by = xv[y1];
+        let q = unpack4_f((qs0 & 0x0F0F0F0Fu) + hi0);
+        main_sum = main_sum + sc0 * dot(by, q);
+        min_sum = min_sum + sc2 * dot(by, ones);
+    }
+    {
+        let by = xv[y1 + 8u];
+        let q = unpack4_f(((qs0 >> 4u) & 0x0F0F0F0Fu) + hi32);
+        main_sum = main_sum + sc1 * dot(by, q);
+        min_sum = min_sum + sc3 * dot(by, ones);
+    }
+    {
+        let by = xv[y2];
+        let q = unpack4_f((qs64 & 0x0F0F0F0Fu) + hi128);
+        main_sum = main_sum + sc4 * dot(by, q);
+        min_sum = min_sum + sc6 * dot(by, ones);
+    }
+    {
+        let by = xv[y2 + 8u];
+        let q = unpack4_f(((qs64 >> 4u) & 0x0F0F0F0Fu) + hi160);
+        main_sum = main_sum + sc5 * dot(by, q);
+        min_sum = min_sum + sc7 * dot(by, ones);
+    }
+    return d * main_sum - dmin * min_sum;
+}
+"#;
+
+/// The **light** `Q5_K` decode matmul-vec kernel — [`Q5K_LIGHT_PRELUDE`]
+/// wrapped in the same 32-thread, `n_rows`-batched dispatch as
+/// [`shader_source_reduce_q4k_light`].
+///
+/// `Q5_K` was the only K-quant with no kernel of its own: it fell through to
+/// the generic block-unroll, and it showed. Measured on one model across five
+/// quantizations, as effective weight-streaming bandwidth (file size ×
+/// decode tok/s), `Q4_K` on its light kernel and `Q8_0` on the *generic*
+/// reduce both reached ~50 GiB/s while `Q5_K` managed 33.6 — a third short of
+/// formats either side of it, which is not a bit-width effect.
+///
+/// Not bit-identical against `CpuBackend` (it reorders the float adds, exactly
+/// as the `Q4_K` twin does), so it cross-checks within tolerance.
+pub fn shader_source_reduce_q5k_light(n_rows: usize, subgroup: bool) -> String {
+    let mut s = String::from(Q5K_LIGHT_PRELUDE);
+    s.push_str(&format!(
+        "\nvar<workgroup> psums: array<f32, {}>;\n\n",
+        n_rows * 32
+    ));
+    s.push_str("@compute @workgroup_size(32)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    // Identical thread mapping to the Q4_K light kernel — see
+    // `Q5K_LIGHT_PRELUDE`'s doc for why this rather than the reference's.
+    s.push_str("    let tid = lid.x;\n    let itid = tid % 16u;\n    let ix = tid / 16u;\n");
+    s.push_str("    let il = itid / 4u;\n    let ir = itid % 4u;\n    let v_im = il / 2u;\n    let v_in = il % 2u;\n    let l0 = 4u * (2u * ir + v_in);\n    let q_offset = 32u * v_im + l0;\n    let y_offset = 64u * v_im + l0;\n");
+    s.push_str("    let num_blocks = params.in_dim / 256u;\n    let x_tok = t * params.in_dim;\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var acc{i}: f32 = 0.0;\n"));
+    }
+    // 176-byte blocks, two super-blocks per 32-thread workgroup iteration.
+    s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n        let xrb = x_tok + i * 256u;\n");
+    for r in 0..n_rows {
+        s.push_str(&format!(
+            "        acc{r} = acc{r} + sb(o{r} * params.row_bytes + i * 176u, xrb, y_offset, q_offset, v_im, l0);\n"
+        ));
+    }
+    s.push_str("        i = i + 2u;\n    }\n");
+    for r in 0..n_rows {
+        if subgroup {
+            s.push_str(&format!(
+                "    let sg{r} = subgroupAdd(acc{r});\n    if (sg_lane == 0u && o{r} < params.out_dim) {{\n        y[t * params.out_dim + o{r}] = sg{r};\n    }}\n"
+            ));
+        } else {
+            s.push_str(&format!("    psums[tid * {n_rows}u + {r}u] = acc{r};\n"));
+        }
+    }
+    if !subgroup {
+        s.push_str("    workgroupBarrier();\n    var stride: u32 = 16u;\n    loop {\n        if (stride == 0u) {\n            break;\n        }\n        if (tid < stride) {\n");
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "            psums[tid * {n_rows}u + {r}u] = psums[tid * {n_rows}u + {r}u] + psums[(tid + stride) * {n_rows}u + {r}u];\n"
+            ));
+        }
+        s.push_str("        }\n        workgroupBarrier();\n        stride = stride / 2u;\n    }\n    if (tid == 0u) {\n");
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "        if (o{r} < params.out_dim) {{\n            y[t * params.out_dim + o{r}] = psums[{r}u];\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// The `Q6_K` twin of [`Q4K_LIGHT_PRELUDE`] / [`Q5K_LIGHT_PRELUDE`].
+///
+/// `Q6_K`'s block is a different shape from the other two K-quants: 210 bytes
+/// of `ql` (128) + `qh` (64) + sixteen **signed 8-bit** scales (16) + `d` (2),
+/// with no `dmin` and so no min-sum term at all. Two bits per weight come from
+/// the `qh` plane rather than one, and the scale is per-16-elements rather than
+/// per-32.
+///
+/// # Alignment
+///
+/// 210 is not a multiple of 4, so a block's fields land at an offset whose
+/// alignment alternates with the block index — unlike `Q4_K`'s 144 and
+/// `Q5_K`'s 176, where every block starts 16-byte aligned and every field read
+/// is naturally aligned. Every weight read here therefore goes through
+/// `read_word_unaligned_v4`, which costs a second aligned load on the odd
+/// blocks. That is still far cheaper than what it replaces: the dual kernel
+/// reads `ql`/`qh` a **byte** at a time and re-reads a scale byte *per
+/// element*, ~28 byte-granular loads per 16 elements against this kernel's
+/// three `u32`s plus one for the scales.
+const Q6K_LIGHT_PRELUDE: &str = r#"
+struct Meta {
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> xv: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn f16_to_f32(bits: u32) -> f32 {
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+
+fn read_word_v4(byte_offset: u32) -> u32 {
+    return weights[byte_offset / 16u][(byte_offset % 16u) / 4u];
+}
+
+// See the type doc: Q6_K blocks are 210 bytes, so nothing here is reliably
+// 4-byte aligned.
+fn read_word_u(byte_offset: u32) -> u32 {
+    let shift = (byte_offset % 4u) * 8u;
+    let aligned = byte_offset - (byte_offset % 4u);
+    if (shift == 0u) {
+        return read_word_v4(aligned);
+    }
+    let lo = read_word_v4(aligned);
+    let hi = read_word_v4(aligned + 4u);
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+fn read_byte_u(byte_offset: u32) -> u32 {
+    let word = read_word_v4(byte_offset - (byte_offset % 4u));
+    return (word >> (8u * (byte_offset % 4u))) & 0xFFu;
+}
+
+// The four bytes of a u32 as floats, each biased by -32: Q6_K stores its
+// 6-bit weights unsigned and the dequant is `d * scale * (q - 32)`.
+fn unpack4_f_bias32(w: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32(w & 0xFFu) - 32.0,
+        f32((w >> 8u) & 0xFFu) - 32.0,
+        f32((w >> 16u) & 0xFFu) - 32.0,
+        f32((w >> 24u) & 0xFFu) - 32.0,
+    );
+}
+
+// One of the sixteen **signed** 8-bit scales.
+fn scale_i8(sc_off: u32, i: u32) -> f32 {
+    let b = read_byte_u(sc_off + i);
+    return f32(i32(b << 24u) >> 24u);
+}
+
+// Contribution of super-block `i` of one output row, computed by the 16
+// threads that own it. Faithful to llama.cpp's `mul_mat_vec_q6_k.comp`
+// `calc_superblock`, minus its shared-memory scale cache: a thread needs only
+// four of the sixteen scales, so it reads those four directly rather than
+// staging all sixteen through LDS and a barrier.
+fn sb(block_byte_off: u32, x_block_elem: u32, ql_offset: u32, qh_offset: u32,
+      s_offset: u32, y_offset: u32) -> f32 {
+    let ql_off = block_byte_off;
+    let qh_off = block_byte_off + 128u;
+    let sc_off = block_byte_off + 192u;
+    let d = f16_to_f32(read_word_u(block_byte_off + 208u) & 0xFFFFu);
+
+    let ql0 = read_word_u(ql_off + ql_offset);
+    let ql32 = read_word_u(ql_off + ql_offset + 32u);
+    let qh = read_word_u(qh_off + qh_offset);
+
+    // Two bits per weight, four weights per qh byte: bits 0-1 feed the
+    // elements at +0, bits 2-3 those at +32, bits 4-5 at +64, bits 6-7 at
+    // +96 — shifted into position 4 of the 6-bit quant.
+    let q0 = (ql0 & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4u);
+    let q1 = (ql32 & 0x0F0F0F0Fu) | ((qh & 0x0C0C0C0Cu) << 2u);
+    let q2 = ((ql0 >> 4u) & 0x0F0F0F0Fu) | (qh & 0x30303030u);
+    let q3 = ((ql32 >> 4u) & 0x0F0F0F0Fu) | ((qh & 0xC0C0C0C0u) >> 2u);
+
+    let y0 = (x_block_elem + y_offset) / 4u;
+    var sum: f32 = 0.0;
+    sum = sum + scale_i8(sc_off, s_offset) * dot(xv[y0], unpack4_f_bias32(q0));
+    sum = sum + scale_i8(sc_off, s_offset + 2u) * dot(xv[y0 + 8u], unpack4_f_bias32(q1));
+    sum = sum + scale_i8(sc_off, s_offset + 4u) * dot(xv[y0 + 16u], unpack4_f_bias32(q2));
+    sum = sum + scale_i8(sc_off, s_offset + 6u) * dot(xv[y0 + 24u], unpack4_f_bias32(q3));
+    return d * sum;
+}
+"#;
+
+/// The **light** `Q6_K` decode matmul-vec kernel — [`Q6K_LIGHT_PRELUDE`] in
+/// the same 32-thread, `n_rows`-batched dispatch as the `Q4_K`/`Q5_K` twins.
+///
+/// `Q6_K` was the slowest K-quant after `Q5_K` got its own kernel: 36.1 GiB/s
+/// of effective weight streaming against 48–58 for the light kernels. It drags
+/// every `_M`-suffixed mixed quantization down with it, since those store
+/// `attn_v`/`ffn_down` as `Q6_K`.
+///
+/// Not bit-identical against `CpuBackend` (it reorders the float adds), so it
+/// cross-checks within tolerance.
+pub fn shader_source_reduce_q6k_light(n_rows: usize, subgroup: bool) -> String {
+    let mut s = String::from(Q6K_LIGHT_PRELUDE);
+    s.push_str(&format!(
+        "\nvar<workgroup> psums: array<f32, {}>;\n\n",
+        n_rows * 32
+    ));
+    s.push_str("@compute @workgroup_size(32)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    // `Q6_K`'s own mapping, not `Q4_K`'s: 16 threads split the super-block into
+    // two 128-element halves (`v_im`), each thread taking a 4-element run
+    // (`l0`). Every offset it produces is 4-aligned, so the activation reads
+    // are `vec4` without further work.
+    s.push_str("    let tid = lid.x;\n    let itid = tid % 16u;\n    let ix = tid / 16u;\n");
+    s.push_str("    let v_im = itid / 8u;\n    let v_in = itid % 8u;\n    let l0 = 4u * v_in;\n    let is = v_in / 4u;\n");
+    s.push_str("    let ql_offset = 64u * v_im + l0;\n    let qh_offset = 32u * v_im + l0;\n    let s_offset = 8u * v_im + is;\n    let y_offset = 128u * v_im + l0;\n");
+    s.push_str("    let num_blocks = params.in_dim / 256u;\n    let x_tok = t * params.in_dim;\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var acc{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n        let xrb = x_tok + i * 256u;\n");
+    for r in 0..n_rows {
+        s.push_str(&format!(
+            "        acc{r} = acc{r} + sb(o{r} * params.row_bytes + i * 210u, xrb, ql_offset, qh_offset, s_offset, y_offset);\n"
+        ));
+    }
+    s.push_str("        i = i + 2u;\n    }\n");
+    for r in 0..n_rows {
+        if subgroup {
+            s.push_str(&format!(
+                "    let sg{r} = subgroupAdd(acc{r});\n    if (sg_lane == 0u && o{r} < params.out_dim) {{\n        y[t * params.out_dim + o{r}] = sg{r};\n    }}\n"
+            ));
+        } else {
+            s.push_str(&format!("    psums[tid * {n_rows}u + {r}u] = acc{r};\n"));
+        }
+    }
+    if !subgroup {
+        s.push_str("    workgroupBarrier();\n    var stride: u32 = 16u;\n    loop {\n        if (stride == 0u) {\n            break;\n        }\n        if (tid < stride) {\n");
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "            psums[tid * {n_rows}u + {r}u] = psums[tid * {n_rows}u + {r}u] + psums[(tid + stride) * {n_rows}u + {r}u];\n"
+            ));
+        }
+        s.push_str("        }\n        workgroupBarrier();\n        stride = stride / 2u;\n    }\n    if (tid == 0u) {\n");
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "        if (o{r} < params.out_dim) {{\n            y[t * params.out_dim + o{r}] = psums[{r}u];\n        }}\n"
+            ));
+        }
+        s.push_str("    }\n");
+    }
+    s.push_str("}\n");
+    s
+}
+
 /// The **light** `Q4_K` decode matmul-vec kernel (`ORANGU_Q4K_LIGHT`): a WGSL
 /// port of llama.cpp's `mul_mat_vec_q4_k.comp`, targeting register pressure /
 /// occupancy rather than load count (which earlier experiments showed is a null
@@ -3327,11 +3908,12 @@ pub fn shader_source_reduce_q4k_light(n_rows: usize, subgroup: bool) -> String {
 fn reduce_block_unroll() -> usize {
     static U: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *U.get_or_init(|| {
-        std::env::var("ORANGU_REDUCE_UNROLL")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&u| (1..=8).contains(&u))
-            .unwrap_or(REDUCE_BLOCK_UNROLL_DEFAULT)
+        super::env_tuning_value(
+            "ORANGU_REDUCE_UNROLL",
+            REDUCE_BLOCK_UNROLL_DEFAULT,
+            "an integer in 1..=8",
+            |u| (1..=8).contains(&u),
+        )
     })
 }
 
@@ -3953,30 +4535,46 @@ pub fn shader_source_coop(ggml_type: u32) -> Option<String> {
 /// alternative to [`shader_source_coop`] — see `MAIN_COOP_TILED_SUFFIX`'s
 /// own doc comment for the design, and `MAIN_COOP_SUFFIX`'s for why this
 /// is the default now.
-pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: bool) -> Option<String> {
+pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: CoopVec4Tiles) -> Option<String> {
     let middle = coop_middle(ggml_type)?;
     let prelude = prelude_for(ggml_type);
     let g = coop_geom();
     let f16_tiles = coop_f16_tiles();
     let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block(g, f16_tiles, vec4_tiles);
-    // The two shared tiles, and the one line each `store_w`/`store_x` needs
-    // to write into them. See [`vec4_tiles_supported`] for what decides
-    // which form a backend gets.
-    let (tile_decl, store_w, store_x) = if vec4_tiles {
+    // Each tile's declaration and the body of the `store_*` helper that writes
+    // into it — chosen per tile, since `coop_vec4_tiles` answers per tile.
+    let (tile_w_decl, store_w) = if vec4_tiles.w {
         (
-            "var<workgroup> tile_w: array<vec4<%TILE_T%>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;\n\
-             var<workgroup> tile_x: array<vec4<%TILE_T%>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;",
+            "var<workgroup> tile_w: array<vec4<%TILE_T%>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;",
             "    tile_w[widx >> 2u][widx & 3u] = %TILE_T%(v);",
-            "    tile_x[xidx >> 2u][xidx & 3u] = %TILE_T%(v);",
         )
     } else {
         (
-            "var<workgroup> tile_w: array<%TILE_T%, %TILE_ROWS%u * %CHUNK%u>;\n\
-             var<workgroup> tile_x: array<%TILE_T%, %TILE_TOKENS%u * %CHUNK%u>;",
+            "var<workgroup> tile_w: array<%TILE_T%, %TILE_ROWS%u * %CHUNK%u>;",
             "    tile_w[widx] = %TILE_T%(v);",
-            "    tile_x[xidx] = %TILE_T%(v);",
         )
     };
+    // `store_x4` writes a whole quad either way — as one vector store into a
+    // `vec4` tile, or as four independent element stores into a scalar one.
+    // Neither is a component store, so the fill that calls it is the same
+    // code in both forms and the tile's shape stays a pure layout choice.
+    let (tile_x_decl, store_x, store_x4) = if vec4_tiles.x {
+        (
+            "var<workgroup> tile_x: array<vec4<%TILE_T%>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;",
+            "    tile_x[xidx >> 2u][xidx & 3u] = %TILE_T%(v);",
+            "    tile_x[xidx >> 2u] = vec4<%TILE_T%>(v);",
+        )
+    } else {
+        (
+            "var<workgroup> tile_x: array<%TILE_T%, %TILE_TOKENS%u * %CHUNK%u>;",
+            "    tile_x[xidx] = %TILE_T%(v);",
+            "    tile_x[xidx] = %TILE_T%(v.x);\n    \
+             tile_x[xidx + 1u] = %TILE_T%(v.y);\n    \
+             tile_x[xidx + 2u] = %TILE_T%(v.z);\n    \
+             tile_x[xidx + 3u] = %TILE_T%(v.w);",
+        )
+    };
+    let tile_decl = format!("{tile_w_decl}\n{tile_x_decl}");
     let run = coop_tiled_run_len(g);
     // `ORANGU_NO_TILE_DEQUANT_RUN=1` restores the per-element fill this
     // replaced, so the two can be A/B'd in one build. Same output either way —
@@ -3984,8 +4582,9 @@ pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: bool) -> Option<Stri
     let amortized = std::env::var_os("ORANGU_NO_TILE_DEQUANT_RUN").is_none();
     let (w_fill, run_fill) = coop_tiled_weight_fill(ggml_type, run, amortized);
     let suffix = MAIN_COOP_TILED_SUFFIX
-        .replace("%TILE_DECL%", tile_decl)
+        .replace("%TILE_DECL%", &tile_decl)
         .replace("%STORE_W%", store_w)
+        .replace("%STORE_X4%", store_x4)
         .replace("%STORE_X%", store_x)
         .replace("%TILE_T%", if f16_tiles { "f16" } else { "f32" })
         .replace("%THREADS_Y%", &g.threads_y.to_string())
@@ -5448,7 +6047,8 @@ pub fn shader_source_attention_split(
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
 }
 
-/// **Cooperative-reduction** split-k phase 1 (`ORANGU_ATTN_COOP=1`). A
+/// **Cooperative-reduction** split-k phase 1 — on by default wherever the
+/// adapter supports subgroups, opt out with `ORANGU_NO_ATTN_COOP=1`. A
 /// from-scratch rewrite that targets the real bottleneck — the default
 /// split kernel's *serial* per-thread `head_dim` dot product (one thread does
 /// all `head_dim` MACs for one KV position, with the wave's 32 lanes reading K
@@ -5959,26 +6559,65 @@ pub fn shader_source_attention_prefill_coop(kv_storage: KvStorage, head_dim: u32
         .replace("%KV_READ_FNS%", &kv_read_fns)
 }
 
+/// Bytes the flash kernel's *other* workgroup arrays occupy, beside
+/// `k_shmem`: `shared_reduce` and `tile_probs` (64 `f32` each) plus `acc`,
+/// which is sized to this layer's `head_dim`.
+///
+/// Subtracted from the device's shared-memory limit rather than absorbed into
+/// a round-number budget, because on a device whose limit is tight the
+/// difference between "the tile fits" and "pipeline creation fails" is
+/// exactly these three kilobytes.
+fn flash_fixed_lds_bytes(head_dim: u32) -> u32 {
+    (64 + 64 + head_dim) * 4
+}
+
 /// Positions per K-tile the **flash** split kernel
-/// ([`ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE`]) stages into LDS, chosen so the
-/// padded `f16` `k_shmem` (`tile_pos * (head_dim + 1) * 2` bytes) stays within a
-/// conservative ~34 KB LDS budget — leaving room for `acc`/`shared_reduce`/
-/// `tile_probs` and one resident workgroup per SIMD. Clamped to a power of two
-/// in `8..=64`. The workgroup is always 64 threads, so `tile_pos < 64` (only for
-/// large `head_dim`, e.g. gemma's `512` full-attention layers) simply leaves the
-/// high lanes idle during the *score* phase; they still cooperate on the
-/// coalesced staging and the `head_dim`-strided `acc`/V loops.
-fn flash_tile_positions(head_dim: u32) -> u32 {
+/// ([`ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE`]) stages into LDS: as many as the
+/// padded `f16` `k_shmem` (`tile_pos * (head_dim + 1) * 2` bytes) can have
+/// without the workgroup's total shared memory exceeding `lds_limit`. Clamped
+/// to a power of two in `8..=64`. The workgroup is always 64 threads, so
+/// `tile_pos < 64` (only for large `head_dim`, e.g. gemma's `512`
+/// full-attention layers) simply leaves the high lanes idle during the *score*
+/// phase; they still cooperate on the coalesced staging and the
+/// `head_dim`-strided `acc`/V loops.
+///
+/// # The limit is the device's, not a constant
+///
+/// This used to size the tile against a fixed ~34 KB budget. That is a
+/// perfectly good number on a device with 64 KiB of shared memory per
+/// workgroup and an impossible one on a device with 32 KiB — where the tile it
+/// picks for `head_dim = 512` is over the ceiling before `acc` is even
+/// counted, so the pipeline cannot be created at all. The flag would not be
+/// slow there; it would fail.
+///
+/// A hardcoded budget also silently wastes headroom in the other direction, on
+/// any device with more. Taking the number from
+/// `wgpu::Limits::max_compute_workgroup_storage_size` makes the kernel fit
+/// whatever it is actually running on, which is the only version of this that
+/// is portable rather than tuned-for-one-machine.
+///
+/// `ORANGU_FLASH_LDS_KB` still overrides, to trade tile size for occupancy (a
+/// full budget leaves one workgroup resident per SIMD, ~8 KB leaves ~7). A
+/// smaller tile means more tiles and more barriers but higher occupancy. An
+/// override *above* the device limit is clamped rather than obeyed — the
+/// alternative is a flag whose effect is a failed pipeline.
+fn flash_tile_positions(head_dim: u32, lds_limit: u32) -> u32 {
     let stride = head_dim + 1;
-    // ~34 KB / 2 bytes per f16 by default; `ORANGU_FLASH_LDS_KB` overrides the
-    // k_shmem budget to trade tile size for occupancy (34 KB → 1 workgroup/SIMD;
-    // ~8 KB → ~7). A smaller tile means more tiles/barriers but higher occupancy.
-    let budget_elems = std::env::var("ORANGU_FLASH_LDS_KB")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .map(|kb| kb * 512)
-        .unwrap_or(17_000u32);
-    let max_pos = (budget_elems / stride).max(1);
+    let fixed = flash_fixed_lds_bytes(head_dim);
+    let device_budget = lds_limit.saturating_sub(fixed);
+    let requested =
+        super::env_tuning_value("ORANGU_FLASH_LDS_KB", 0u32, "a positive integer", |kb| {
+            kb > 0
+        })
+        .saturating_mul(1024);
+    // `0` is the "unset" stand-in for the helper, so "no override" means the
+    // whole device budget.
+    let budget_bytes = if requested == 0 {
+        device_budget
+    } else {
+        requested.min(device_budget)
+    };
+    let max_pos = (budget_bytes / 2 / stride).max(1);
     let mut tp = 64u32;
     while tp > max_pos && tp > 8 {
         tp /= 2;
@@ -6187,6 +6826,7 @@ pub fn shader_source_attention_split_flash(
     kv_storage: KvStorage,
     subgroup: bool,
     head_dim: u32,
+    lds_limit: u32,
 ) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
@@ -6199,7 +6839,7 @@ pub fn shader_source_attention_split_flash(
         ""
     };
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
-    let tile_pos = flash_tile_positions(head_dim);
+    let tile_pos = flash_tile_positions(head_dim, lds_limit);
     let stride = head_dim + 1;
     let shmem_len = tile_pos * stride;
     ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE
@@ -7473,6 +8113,79 @@ pub fn shader_source_argmax_reduce() -> String {
 }
 
 #[cfg(test)]
+mod flash_lds_tests {
+    use super::*;
+
+    /// Shared memory per workgroup on the two APIs this engine runs on.
+    const LDS_64K: u32 = 64 * 1024;
+    const LDS_32K: u32 = 32 * 1024;
+
+    /// Total shared memory the flash kernel declares at a given tile size.
+    fn total_lds(head_dim: u32, tile_pos: u32) -> u32 {
+        tile_pos * (head_dim + 1) * 2 + flash_fixed_lds_bytes(head_dim)
+    }
+
+    /// **The whole point of taking the limit from the device.** The tile has to
+    /// fit under whatever ceiling it is actually running on, including the one
+    /// that is half the size the old fixed ~34 KB budget assumed.
+    ///
+    /// Under that budget, `head_dim = 512` produced a 32-position tile: 32 832
+    /// bytes of `k_shmem` alone, over a 32 KiB ceiling before `acc` was
+    /// counted. On such a device `ORANGU_FLASH_ATTN=1` did not run slowly, it
+    /// failed to create the pipeline.
+    #[test]
+    fn the_tile_fits_the_devices_shared_memory_not_a_constant() {
+        for head_dim in [128u32, 256, 512] {
+            for limit in [LDS_32K, LDS_64K] {
+                let tp = flash_tile_positions(head_dim, limit);
+                assert!(
+                    total_lds(head_dim, tp) <= limit,
+                    "head_dim {head_dim} at a {limit} B limit picked {tp} positions, \
+                     needing {} B",
+                    total_lds(head_dim, tp)
+                );
+                assert!((8..=64).contains(&tp), "tile {tp} outside 8..=64");
+                assert!(tp.is_power_of_two(), "tile {tp} is not a power of two");
+            }
+        }
+    }
+
+    /// A smaller ceiling must actually cost tile size where the tile is the
+    /// thing that does not fit — otherwise the limit is being read and
+    /// ignored. At `head_dim = 512` a 64 KiB device gets the full 32-position
+    /// tile and a 32 KiB one cannot.
+    #[test]
+    fn a_tighter_limit_gives_a_smaller_tile() {
+        let big = flash_tile_positions(512, LDS_64K);
+        let small = flash_tile_positions(512, LDS_32K);
+        assert!(
+            small < big,
+            "a 32 KiB device should stage fewer positions than a 64 KiB one, got {small} vs {big}"
+        );
+        // ...and where the tile fits either way, both get the maximum, so the
+        // change is not a blanket shrink.
+        assert_eq!(
+            flash_tile_positions(128, LDS_32K),
+            flash_tile_positions(128, LDS_64K)
+        );
+    }
+
+    /// The `8..=64` clamp has a floor, so a head_dim large enough would return
+    /// a tile that does not fit however tight the budget. Flash is only built
+    /// for `head_dim == 512` (see `attn_split_pipeline_for`), where the floor
+    /// is nowhere near binding — this pins that assumption so enabling the
+    /// kernel for a wider head would fail here rather than at pipeline
+    /// creation on someone's machine.
+    #[test]
+    fn the_tile_floor_is_not_binding_for_any_head_dim_flash_is_built_for() {
+        assert!(
+            total_lds(512, 8) <= LDS_32K,
+            "the minimum tile must fit the tightest device at the head_dim flash uses"
+        );
+    }
+}
+
+#[cfg(test)]
 mod coop_geom_tests {
     use super::*;
 
@@ -7576,5 +8289,153 @@ mod coop_geom_tests {
         };
         assert!(huge.lds_bytes() > 32 * 1024);
         assert!(huge.check().is_err());
+    }
+
+    /// The activation fill hands out four-token quads, so the threads sharing
+    /// a k column have to divide the tile's quads evenly — otherwise some
+    /// thread owns part of a quad and its store stops being a whole-vector
+    /// store, which is the entire property that makes `tile_x`'s `vec4` form
+    /// portable (see [`coop_vec4_tiles`]).
+    #[test]
+    fn a_geometry_that_splits_a_token_quad_across_threads_is_rejected() {
+        // chunk 2 leaves 32 threads sharing each k column, against 16 quads.
+        let g = CoopGeom {
+            chunk: 2,
+            ..COOP_GEOM_DEFAULT
+        };
+        let err = g.check().expect_err("chunk 2 must be rejected");
+        assert!(err.contains("quad"), "reason should name the quad: {err}");
+        // 4 and up divide evenly and stay valid.
+        for chunk in [4u32, 8, 16, 32] {
+            let g = CoopGeom {
+                chunk,
+                ..COOP_GEOM_DEFAULT
+            };
+            assert_eq!(g.check(), Ok(()), "chunk {chunk} should be valid");
+        }
+    }
+}
+
+#[cfg(test)]
+mod coop_tiled_fill_tests {
+    use super::*;
+
+    /// The straight-line activation fill, as the offsets it actually emits.
+    ///
+    /// Parsed out of the generated WGSL rather than re-derived from
+    /// [`CoopGeom`], because a re-derivation would agree with a wrong
+    /// generator by construction — the point is to check the text the driver
+    /// is handed.
+    fn emitted_quad_offsets(src: &str) -> Vec<u32> {
+        src.lines()
+            .filter_map(|l| l.trim().strip_prefix("store_x4(x_tt0 + "))
+            .filter_map(|rest| rest.split_once('u'))
+            .filter_map(|(n, _)| n.parse::<u32>().ok())
+            .collect()
+    }
+
+    fn tiled_source(tiles: CoopVec4Tiles) -> String {
+        shader_source_coop_tiled(crate::engine::quant::GGML_TYPE_F32, tiles)
+            .expect("f32 has a tiled kernel")
+    }
+
+    /// Every token of the tile is staged exactly once.
+    ///
+    /// A thread's quads are `x_tt0 + <emitted offset>`, where `x_tt0` is
+    /// `(local / CHUNK) * 4` and so ranges over `0, 4, .., (threads_per_k-1)*4`.
+    /// Union those and the result has to be precisely the tile's quad starts —
+    /// no token staged twice (one thread's write silently losing to another's)
+    /// and none left holding whatever the previous k-chunk put there, which is
+    /// the failure an off-by-one in the offsets produces and which no
+    /// bounds-check would catch.
+    #[test]
+    fn the_activation_fill_stages_every_token_exactly_once() {
+        let g = COOP_GEOM_DEFAULT;
+        let offsets = emitted_quad_offsets(&tiled_source(CoopVec4Tiles { w: true, x: true }));
+        let threads_per_k = COOP_THREADS / g.chunk;
+        assert_eq!(
+            offsets.len() as u32,
+            (g.tile_tokens() / 4) / threads_per_k,
+            "one store per quad the thread owns"
+        );
+        let mut covered: Vec<u32> = offsets
+            .iter()
+            .flat_map(|&off| (0..threads_per_k).map(move |grp| off + grp * 4))
+            .collect();
+        covered.sort_unstable();
+        let want: Vec<u32> = (0..g.tile_tokens()).step_by(4).collect();
+        assert_eq!(
+            covered, want,
+            "the fill must cover every four-token quad of the tile exactly once"
+        );
+    }
+
+    /// **The invariant the Metal path depends on.** In the straightened fill,
+    /// nothing writes a *component* of `tile_x` — every store goes through
+    /// `store_x4`, which writes a whole vector (or, for a scalar tile, four
+    /// independent elements). A backend whose shared-vector component store is
+    /// a read-modify-write of all 16 bytes then computes the same answer as
+    /// one whose is not.
+    ///
+    /// Checked on the generated text for every tile-form combination, since
+    /// the `vec4`/scalar choice is per tile and only one of the four
+    /// combinations is what any given device runs.
+    #[test]
+    fn the_activation_fill_never_writes_a_component_of_a_shared_vector() {
+        for (w, x) in [(true, true), (false, true), (true, false), (false, false)] {
+            let src = tiled_source(CoopVec4Tiles { w, x });
+            let fill = src
+                .split_once("// Straight-line, loads-before-stores")
+                .expect("the straightened fill is in the generated source")
+                .1
+                .split_once("workgroupBarrier()")
+                .expect("the fill ends at the barrier")
+                .0;
+            assert!(
+                !fill.contains("store_x("),
+                "tile_x vec4={x}: the fill still calls the per-element store_x, \
+                 which writes one component of a shared vector"
+            );
+            assert!(
+                fill.contains("store_x4("),
+                "tile_x vec4={x}: the fill should write whole quads"
+            );
+            // And the helper it calls is a whole-vector store, not a
+            // component one. The shape that breaks is a *double* index on the
+            // left — array element, then vector component (`[i][c] =`); one
+            // index is a whole element of whichever array shape the tile has,
+            // which is always safe.
+            let helper = src
+                .split_once("fn store_x4(")
+                .expect("store_x4 is generated")
+                .1
+                .split_once('}')
+                .expect("store_x4 has a body")
+                .0;
+            assert!(
+                !helper.contains("]["),
+                "tile_w vec4={w}, tile_x vec4={x}: store_x4's body writes a \
+                 vector component: {helper}"
+            );
+        }
+    }
+
+    /// `ORANGU_COOP_SCALAR_TILES` has to be able to name one tile, because the
+    /// combination a backend without component stores runs — scalar `tile_w`,
+    /// `vec4` `tile_x` — is otherwise unreachable on a backend that has them,
+    /// and so untestable on the hardware that is to hand.
+    ///
+    /// An unrecognized value forces both, deliberately: `=1` is what the
+    /// variable meant before it could name a tile, and a typo should give the
+    /// conservative answer rather than silently leaving a tile on the form
+    /// the operator was trying to rule out.
+    #[test]
+    fn the_scalar_tile_override_can_name_one_tile() {
+        assert_eq!(forced_scalar_tiles(""), (false, false));
+        assert_eq!(forced_scalar_tiles("  "), (false, false));
+        assert_eq!(forced_scalar_tiles("w"), (true, false));
+        assert_eq!(forced_scalar_tiles("x"), (false, true));
+        assert_eq!(forced_scalar_tiles("1"), (true, true));
+        assert_eq!(forced_scalar_tiles("wx"), (true, true));
     }
 }

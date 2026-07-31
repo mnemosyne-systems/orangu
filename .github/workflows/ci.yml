@@ -252,6 +252,42 @@ jobs:
           done
           rm -f result.log
 
+      # `coop_tiles_are_vec4_only_where_component_stores_work` already probes
+      # the one thing that decides whether the tiled GEMM's *weight* tile can
+      # be `vec4` here: whether four threads writing four components of one
+      # shared vector all survive a barrier. On Metal the answer has been no,
+      # so `coop_vec4_tiles` gives that tile the scalar form.
+      #
+      # The probe reports its verdict through `eprintln!`, which `cargo test`
+      # captures and then discards on a pass — so the fact is computed on
+      # every run and recorded nowhere. That matters now for a specific
+      # reason: the "no" was measured on an Apple Paravirtual device, and this
+      # runner is `aarch64-apple-darwin`. If real Apple silicon does honour
+      # component stores, half of the tiled GEMM is leaving its `vec4` reads
+      # on the table for a reason that no longer holds.
+      #
+      # So run it once more with `--nocapture` purely to surface the answer.
+      # Not a gate — the test itself is already the gate, and it is in the
+      # ordinary suite above. This step only makes what it learned readable.
+      - name: Report Metal shared-memory store behaviour
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Both filters after `--`: `cargo test` takes only one positional
+          # test name, libtest takes several.
+          cargo test --bin orangu-server -- --nocapture \
+            engine::backend::vulkan::tests::coop_tiles_are_vec4_only_where_component_stores_work \
+            engine::backend::vulkan::tests::shared_vec4_whole_stores_survive_a_barrier \
+            | tee probe.log
+          grep -q '^test result: ok\. 2 passed' probe.log
+          if grep -q 'passes the component-store probe' probe.log; then
+            echo "::notice::This Metal device DOES honour component-wise stores into shared vec4 memory — vec4 tile_w may now be available here (see vulkan_shaders::coop_vec4_tiles)"
+          else
+            echo "::notice::This Metal device does not honour component-wise stores into shared vec4 memory; scalar tile_w remains correct"
+          fi
+          rm -f probe.log
+
   audit:
     runs-on: ubuntu-latest
     # rustsec/audit-check reports findings as a check run and needs write access

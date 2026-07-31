@@ -6,8 +6,13 @@ rpmbuild/
 *.html
 *.svg
 *.txt
+*.log
+*.patch
 llama.cpp/
 .ci-models/
 src/bin/orangu-server/engine/arch/testdata/
 src/bin/orangu-server/engine/testdata/
 doc/perf/
+perf/
+target-fp/
+

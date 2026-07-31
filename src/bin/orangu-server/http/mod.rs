@@ -20,6 +20,7 @@
 pub mod native;
 pub mod openai;
 
+use crate::engine::backend::Backend;
 use crate::engine::generate::Engine;
 use axum::{
     Router,
@@ -49,6 +50,18 @@ pub struct AppState {
     /// alongside the numbers — a throughput figure with no device attached
     /// to it cannot be compared against anything later.
     pub backend_label: String,
+    /// Which GPU kernels and tuning constants this device actually came up
+    /// with — `VulkanBackend::tuning_report`, or `None` for a backend that
+    /// has no such selection to make (CPU/CUDA/OpenCL/ROCm). Reported by
+    /// `/props` for the same reason `backend_label` is, one level deeper:
+    /// the label says *which device*, this says *which of its kernels*, and
+    /// on a GPU whose defaults were swept on different hardware that is the
+    /// difference between a comparable number and an anecdote.
+    pub gpu_tuning: Option<serde_json::Value>,
+    /// The `wgpu` engine, when this backend is one — so `/gpu-timings` can
+    /// drain `VulkanBackend::take_timings`. `None` for CPU/CUDA/OpenCL/ROCm,
+    /// which have no GPU timestamp queries to report.
+    pub wgpu_backend: Option<Arc<dyn Backend>>,
     /// The root directory this server operates in (`-w`/`--workspace`, or
     /// the current working directory). Reported by `/props` so a client can
     /// see which tree it is talking to.
@@ -61,6 +74,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(native::health))
         .route("/props", get(native::props))
+        .route("/gpu-timings", get(native::gpu_timings))
         .route("/slots", get(native::slots))
         .route("/slots/{id_slot}", post(native::slot_action))
         .route("/metrics", get(native::metrics))
