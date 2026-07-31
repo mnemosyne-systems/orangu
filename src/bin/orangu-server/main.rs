@@ -74,6 +74,18 @@ const DEFAULT_ARRAY_PREVIEW: usize = 8;
 
 const TERMINAL_TITLE: &str = "orangu-server";
 
+/// The terminal title for one mode of this binary: `orangu-server <mode>`
+/// — `orangu-server download` while a model is being fetched,
+/// `orangu-server prune` while sessions are being cleaned up, and so on. A
+/// single binary that both serves and manages an inventory of models is
+/// otherwise indistinguishable from itself in a tab bar; the mode is what a
+/// glance at a backgrounded terminal actually needs to answer. Serving
+/// itself has no mode word — it isn't a subcommand — and keeps the plain
+/// [`TERMINAL_TITLE`].
+fn terminal_title(mode: &str) -> String {
+    format!("{TERMINAL_TITLE} {mode}")
+}
+
 /// Sets the terminal window/tab title via the standard OSC 0 escape
 /// sequence (supported by essentially every modern terminal emulator), and
 /// restores it (clears it back) on drop. Mirrors `orangu`'s and
@@ -81,15 +93,28 @@ const TERMINAL_TITLE: &str = "orangu-server";
 struct TerminalTitleGuard;
 
 impl TerminalTitleGuard {
-    fn new(title: &str) -> Self {
+    /// `None` — nothing printed, nothing to restore — when stdout isn't a
+    /// terminal: `orangu-server list > models.txt` and `... show | grep`
+    /// would otherwise take the raw escape bytes into the file or the pipe,
+    /// and there's no title to set in the first place.
+    fn new(title: &str) -> Option<Self> {
+        if !std::io::stdout().is_terminal() {
+            return None;
+        }
         print!("\x1b]0;{title}\x07");
-        Self
+        // The sequence ends in BEL, not a newline, so a line-buffered stdout
+        // would otherwise hold the title back until the command's own first
+        // line of output — which for `download` is only after the fetch it
+        // was meant to announce.
+        let _ = std::io::stdout().flush();
+        Some(Self)
     }
 }
 
 impl Drop for TerminalTitleGuard {
     fn drop(&mut self) {
         print!("\x1b]0;\x07");
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -212,6 +237,23 @@ enum Command {
     },
 }
 
+impl Command {
+    /// This subcommand's name as the user typed it, for the terminal title
+    /// (see [`terminal_title`]). Kept in step with the variants' clap names
+    /// by [`terminal_title_names_every_subcommand`].
+    fn mode(&self) -> &'static str {
+        match self {
+            Command::System => "system",
+            Command::Suggest => "suggest",
+            Command::List => "list",
+            Command::Show { .. } => "show",
+            Command::Download { .. } => "download",
+            Command::Delete { .. } => "delete",
+            Command::Prune { .. } => "prune",
+        }
+    }
+}
+
 impl Args {
     /// The CLI role flag that was actually given, if any — `None` when
     /// none of `--all`/`--code`/`--review`/`--explorer`/`--embedding` was
@@ -285,6 +327,7 @@ fn main() -> ExitCode {
     }
 
     if args.init {
+        let _terminal_title_guard = TerminalTitleGuard::new(&terminal_title("init"));
         return match init::run_init() {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -295,6 +338,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(command) = args.command.take() {
+        let _terminal_title_guard = TerminalTitleGuard::new(&terminal_title(command.mode()));
         return match run_command(args.config, command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -303,6 +347,18 @@ fn main() -> ExitCode {
             }
         };
     }
+
+    // Serving is not a subcommand — it's the bare `orangu-server <model>`
+    // invocation — so it keeps the plain binary name as its title. Installed
+    // here rather than inside `serve`, so the title is already up during the
+    // slowest part of starting up: resolving, possibly downloading, and
+    // loading the model. Skipped under `--daemon`: the title would outlive
+    // this process's hold on the terminal, since `prepare` detaches before
+    // returning and the guard's restore would then run against the daemon's
+    // own (redirected) stdout.
+    let _terminal_title_guard = (!args.daemon)
+        .then(|| TerminalTitleGuard::new(TERMINAL_TITLE))
+        .flatten();
 
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
@@ -633,8 +689,6 @@ async fn serve(prepared: Prepared) -> Result<()> {
         web_listener,
         daemon,
     } = prepared;
-
-    let _terminal_title_guard = (!daemon).then(|| TerminalTitleGuard::new(TERMINAL_TITLE));
 
     let listener = tokio::net::TcpListener::from_std(api_listener)
         .context("failed to attach listener to the async runtime")?;
@@ -1280,7 +1334,71 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{label_carries_tag, resolve_workspace};
+    use super::{Args, Command, label_carries_tag, resolve_workspace, terminal_title};
+
+    /// Every subcommand clap parses has a `mode()` name for the terminal
+    /// title, spelled exactly the way the user typed it — the title is only
+    /// useful if `orangu-server download` says `download`.
+    #[test]
+    fn terminal_title_names_every_subcommand() {
+        use clap::CommandFactory;
+
+        let modes = [
+            Command::System.mode(),
+            Command::Suggest.mode(),
+            Command::List.mode(),
+            Command::Show {
+                file: None,
+                full: false,
+                tensors: false,
+            }
+            .mode(),
+            Command::Download {
+                repo: String::new(),
+            }
+            .mode(),
+            Command::Delete {
+                model: None,
+                yes: false,
+            }
+            .mode(),
+            Command::Prune {
+                identifier: None,
+                yes: false,
+            }
+            .mode(),
+        ];
+        let parsed: Vec<String> = Args::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .collect();
+
+        assert_eq!(
+            modes.len(),
+            parsed.len(),
+            "mode() covers {modes:?}, clap parses {parsed:?}"
+        );
+        for name in &parsed {
+            assert!(
+                modes.contains(&name.as_str()),
+                "subcommand {name} has no matching mode(): {modes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_title_is_the_binary_then_the_mode() {
+        assert_eq!(
+            terminal_title(
+                Command::Download {
+                    repo: String::new()
+                }
+                .mode()
+            ),
+            "orangu-server download"
+        );
+        assert_eq!(terminal_title("prune"), "orangu-server prune");
+    }
 
     #[test]
     fn workspace_defaults_to_the_current_directory() {

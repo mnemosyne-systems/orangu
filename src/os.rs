@@ -305,6 +305,69 @@ fn detect_transparent_hugepages() -> Option<String> {
     None
 }
 
+/// Bytes free on the filesystem holding `path`, as available to *this* user
+/// — `f_bavail`, not `f_bfree`, so the root-only reserve (5% of an ext4 by
+/// default) isn't counted as room a download can use.
+///
+/// `None` when the question can't be answered: `path` doesn't exist, the
+/// syscall fails, or the platform has no `statvfs` (Windows). A caller that
+/// checks free space before a large download has to treat that as "don't
+/// know" and carry on, not as "no room".
+#[cfg(unix)]
+pub fn available_space(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+    // call, and `stat` is a live, correctly-sized `statvfs` this initializes
+    // before reading.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    // `f_frsize` is the fragment size the block counts are in; it's `f_bsize`
+    // on Linux but not everywhere, and 0 on some filesystems, where the
+    // block size is the one to use.
+    let block = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Some(stat.f_bavail as u64 * block as u64)
+}
+
+#[cfg(not(unix))]
+pub fn available_space(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod space_tests {
+    /// A real filesystem, asked about through a path that exists: the answer
+    /// has to be a number, and a plausible one — a temp dir on a machine
+    /// that can build this has room for something, and not more than an
+    /// exabyte.
+    #[test]
+    fn available_space_answers_for_a_real_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let free = super::available_space(dir.path()).expect("statvfs");
+
+        assert!(free > 0, "a usable temp dir with no free space at all");
+        assert!(free < 1 << 60, "implausible free space: {free}");
+    }
+
+    /// A path that isn't there can't be measured, and says so rather than
+    /// claiming zero — which a caller would read as "no room".
+    #[test]
+    fn a_missing_path_is_unknown_rather_than_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        assert_eq!(super::available_space(&dir.path().join("nope")), None);
+    }
+}
+
 // ------------------------------------------------------------ reporting ---
 
 /// Formats the `OS` section of the `system` report: one `label : value`

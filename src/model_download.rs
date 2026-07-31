@@ -41,17 +41,21 @@
 //! A multi-part model's shards (and a bundled `mmproj`, when present)
 //! download concurrently rather than one at a time — bounded by rayon's
 //! global thread pool — each reporting its own progress line on a shared
-//! [`ProgressBoard`] so every in-flight file's percentage stays visible at
-//! once until all are done.
+//! [`ProgressBoard`]. Every file gets a line from the first draw onwards,
+//! whether or not a thread has picked it up yet, so all of them stay visible
+//! at once until the last one is done.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const HUB_ENDPOINT: &str = "https://huggingface.co";
@@ -95,18 +99,45 @@ pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
     fs::write(refs_dir.join("main"), &commit)
         .with_context(|| format!("failed to write {}", refs_dir.join("main").display()))?;
 
-    let total = selected.len();
+    // Every selected file gets a board line, in selection order, whether or
+    // not this run has to fetch it — the skipped ones included, so the
+    // `[index/total]` counter runs over one visible block instead of naming
+    // a file that scrolled past above it. Every file's size, and how much of
+    // it is already on disk, is known here — before a single byte is
+    // fetched — so the `Total` line starts out telling the truth instead of
+    // discovering it as threads free up.
+    let mut slots = Vec::with_capacity(selected.len());
     let mut tasks = Vec::new();
     for (index, file) in selected.iter().enumerate() {
-        let position = (index + 1, total);
         let blob_path = blobs_dir.join(&file.oid);
+        let already_downloaded =
+            blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
+        // What an interrupted earlier run left behind, which this one resumes
+        // from rather than re-fetches. Measured against the file's real size
+        // from the repository listing, never against anything on disk: a
+        // `.part` at or past that size is a stale leftover that
+        // `download_attempt` throws away and re-fetches from zero, so it's
+        // worth nothing here either.
+        let resumed = match fs::metadata(part_path(&blob_path)).map(|m| m.len()) {
+            Ok(len) if len < file.size => len,
+            _ => 0,
+        };
 
-        if blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size {
-            println!(
-                "{} already downloaded — skipping [{}/{total}]",
-                file.path, position.0
-            );
-        } else {
+        slots.push(Slot {
+            label: file.path.clone(),
+            size: file.size,
+            downloaded: if already_downloaded {
+                file.size
+            } else {
+                resumed
+            },
+            state: if already_downloaded {
+                SlotState::Skipped
+            } else {
+                SlotState::Queued
+            },
+        });
+        if !already_downloaded {
             tasks.push(DownloadTask {
                 label: file.path.clone(),
                 url: format!(
@@ -115,13 +146,26 @@ pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
                 ),
                 blob_path,
                 size: file.size,
-                position,
+                slot: index,
             });
         }
     }
 
+    // What this run still has to write, before it writes any of it: every
+    // file's real size less whatever of it is already on disk. Checked
+    // against the free space up front rather than discovered part-way
+    // through a multi-hour download that then dies with ENOSPC — and with
+    // dozens of shards streaming at once, the one that fails first is rarely
+    // the one that filled the disk.
+    let needed: u64 = slots.iter().map(|s| s.size - s.downloaded).sum();
+    check_space(&blobs_dir, needed, crate::os::available_space(&blobs_dir))?;
+
+    let board = Mutex::new(ProgressBoard::new(slots));
+    // Drawn even when there's nothing left to fetch: a repo that's already
+    // fully downloaded still says so, file by file.
+    board.lock().unwrap().draw();
     if !tasks.is_empty() {
-        download_all(&client, &tasks, token.as_deref())?;
+        download_all(&client, &tasks, token.as_deref(), &board)?;
     }
 
     for file in &selected {
@@ -558,76 +602,395 @@ fn percent_encode(segment: &str) -> String {
 
 /// One file still needing a fetch, everything [`download_with_resume`]
 /// needs to run independently of the others on its own thread: `label` is
-/// shown in progress text (the repo-relative path), `position` is this
-/// file's `(1-based index, total)` among every selected file (including
-/// ones already skipped as up to date).
+/// shown in progress text (the repo-relative path), `slot` is which line of
+/// the [`ProgressBoard`] this file reports on — its 0-based position among
+/// *every* selected file, not among the ones being fetched, so a file
+/// skipped as already downloaded still owns its own line.
 struct DownloadTask {
     label: String,
     url: String,
     blob_path: PathBuf,
     size: u64,
-    position: (usize, usize),
+    slot: usize,
 }
 
-/// Tracks one in-place-updating terminal line per concurrent download, so
-/// several files can report progress at once without their redraws
-/// clobbering each other. A single [`Mutex`] around the whole board (rather
-/// than one per line) means each update is an atomic "set this line's text,
-/// then redraw every line" — no interleaving of two threads' writes.
-struct ProgressBoard {
-    lines: Vec<String>,
-    /// Whether the board has drawn at least once yet — the first draw must
-    /// not move the cursor up, since there's nothing above it to overwrite.
-    drawn: bool,
+/// Where one file is in its own download, which is what its line on the
+/// [`ProgressBoard`] says. A file that hasn't started yet is [`Queued`], not
+/// blank: rayon runs only as many downloads at once as it has threads, so a
+/// 34-shard model otherwise showed a couple of dozen empty lines between the
+/// handful actually in flight.
+///
+/// [`Queued`]: SlotState::Queued
+#[derive(Clone, Copy)]
+enum SlotState {
+    /// Already on disk at the right size, so this run never fetches it. Reads
+    /// exactly like [`Done`] — from the outside a file that's on disk is
+    /// downloaded, however it got there — and is a state of its own only so
+    /// non-interactive output can log these up front, since they never pass
+    /// through [`ProgressBoard::update`].
+    ///
+    /// [`Done`]: SlotState::Done
+    Skipped,
+    Queued,
+    /// Being fetched. How far along is [`Slot::downloaded`], not part of the
+    /// state — a failed attempt waiting to be retried is still this state,
+    /// with `retry` set, since it's the same file with the same bytes on
+    /// disk, and the retry resumes from them rather than starting over.
+    Downloading {
+        retry: Option<Retry>,
+    },
+    Done,
 }
 
-impl ProgressBoard {
-    fn new(line_count: usize) -> Self {
-        Self {
-            lines: vec![String::new(); line_count],
-            drawn: false,
+/// An attempt that failed and is waiting out [`DOWNLOAD_RETRY_DELAY`] before
+/// the next one.
+#[derive(Clone, Copy)]
+struct Retry {
+    attempt: u32,
+    secs: u64,
+}
+
+/// One file's line on the board: everything needed to render it, so the
+/// board never has to parse text it printed earlier to know what a file is
+/// doing. Every selected file has one, including the skipped ones — a
+/// `[35/35]` that scrolls past above the board is a file the user then has
+/// to go looking for.
+struct Slot {
+    label: String,
+    /// This file's real size, from the repository listing (an LFS object's
+    /// own size for the files that matter here) — never anything measured on
+    /// disk.
+    size: u64,
+    /// How many of those bytes are on disk right now: whatever an interrupted
+    /// earlier run left in the `.part` to begin with, then the running count
+    /// as this run streams it, and `size` once it's complete. Bytes, not a
+    /// percentage, because `Total` subtracts them from the real total — a
+    /// per-file percentage would round away up to a gigabyte a shard.
+    downloaded: u64,
+    state: SlotState,
+}
+
+impl Slot {
+    fn line(&self, index: usize, total: usize) -> String {
+        let Slot { label, state, .. } = self;
+        let percent = self.percent();
+        match state {
+            // A file waiting on a thread with nothing on disk yet is just
+            // queued; one that a previous run got partway through says how
+            // far, since that's already progress against the total.
+            SlotState::Queued if self.downloaded == 0 => {
+                format!("Queued {label} [{index}/{total}]")
+            }
+            SlotState::Queued => format!("Queued {label}: {percent}% [{index}/{total}]"),
+            SlotState::Downloading { retry: None } => {
+                format!("Downloading {label}: {percent}% [{index}/{total}]")
+            }
+            SlotState::Downloading {
+                retry: Some(Retry { attempt, secs }),
+            } => format!(
+                "Downloading {label}: {percent}% (retry {attempt}/{DOWNLOAD_RETRIES} in {secs}s) [{index}/{total}]"
+            ),
+            SlotState::Done | SlotState::Skipped => {
+                format!("Downloaded {label}: 100% [{index}/{total}]")
+            }
         }
     }
 
-    /// Sets `slot`'s line to `text` and redraws the whole board in place.
-    fn update(&mut self, slot: usize, text: String) {
-        self.lines[slot] = text;
+    /// This file's own progress, for its own line — its bytes on disk against
+    /// its real size.
+    fn percent(&self) -> u64 {
+        (self.downloaded * 100)
+            .checked_div(self.size)
+            .unwrap_or(0)
+            .min(100)
+    }
+}
+
+/// Tracks one in-place-updating terminal line per file being downloaded, so
+/// several can report progress at once without their redraws clobbering each
+/// other. A single [`Mutex`] around the whole board (rather than one per
+/// line) means each update is an atomic "set this file's state, then redraw
+/// every line" — no interleaving of two threads' writes.
+struct ProgressBoard {
+    /// One per selected file, in the order they were selected — the shards
+    /// in shard order, then a bundled `mmproj` last — so a line's position
+    /// in the block is also its `[index/total]`.
+    slots: Vec<Slot>,
+    /// How many lines the previous draw actually wrote, and so how far up the
+    /// cursor has to move to overwrite them. Zero before the first draw,
+    /// which must not move up at all — there's nothing above it yet.
+    drawn: usize,
+    /// Whether progress is being drawn to a terminal at all. Piped or
+    /// redirected output gets one plain line per *completed* file instead:
+    /// cursor movement means nothing in a file, and a redraw per percent per
+    /// shard would bury the log in thousands of lines.
+    interactive: bool,
+    /// When this run started, for the `Total` line's ETA.
+    started: std::time::Instant,
+    /// Bytes this run has actually pulled off the network, counted as they're
+    /// read. The ETA divides by *this*, not by how much of the model is now
+    /// complete: a file already on disk, and the bytes a resumed `.part`
+    /// contributes the moment its first percentage lands, are progress this
+    /// run never spent any time on. Crediting them to its first seconds
+    /// projected a download speed nothing had reached — a 1.4 TiB model
+    /// resuming from a third of a terabyte read as minutes remaining.
+    ///
+    /// An atomic rather than a plain field: it's incremented per 64 KiB chunk
+    /// by every download thread at once, which would otherwise mean taking
+    /// the board's mutex thousands of times a second.
+    transferred: Arc<AtomicU64>,
+}
+
+impl ProgressBoard {
+    fn new(slots: Vec<Slot>) -> Self {
+        Self {
+            slots,
+            drawn: 0,
+            interactive: std::io::stdout().is_terminal(),
+            started: std::time::Instant::now(),
+            transferred: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// `slot` now has `downloaded` of its bytes on disk and is streaming —
+    /// which also clears any retry marker the line was carrying, since bytes
+    /// are moving again.
+    fn progress(&mut self, slot: usize, downloaded: u64) {
+        self.slots[slot].downloaded = downloaded;
+        self.update(slot, SlotState::Downloading { retry: None });
+    }
+
+    /// `slot`'s file is complete: all of its real size is on disk.
+    fn finished(&mut self, slot: usize) {
+        self.slots[slot].downloaded = self.slots[slot].size;
+        self.update(slot, SlotState::Done);
+    }
+
+    /// Moves `slot` to `state` and redraws every line, so the whole board
+    /// is one flush behind whatever just changed.
+    fn update(&mut self, slot: usize, state: SlotState) {
+        self.slots[slot].state = state;
+        if !self.interactive {
+            // A file finishing, and a download stalling into a retry, are the
+            // only two transitions worth a line in a log — the percentages in
+            // between would be thousands of them.
+            let worth_logging = matches!(
+                state,
+                SlotState::Done | SlotState::Downloading { retry: Some(_), .. }
+            );
+            if worth_logging {
+                println!("{}", self.slots[slot].line(slot + 1, self.slots.len()));
+            }
+            return;
+        }
+        self.draw();
+    }
+
+    /// Marks `slot`'s attempt as failed and waiting `secs` before the next
+    /// one. Its bytes on disk are untouched — the retry resumes from them
+    /// rather than restarting the file — so the line keeps its percentage.
+    fn set_retry(&mut self, slot: usize, attempt: u32, secs: u64) {
+        self.update(
+            slot,
+            SlotState::Downloading {
+                retry: Some(Retry { attempt, secs }),
+            },
+        );
+    }
+
+    /// Writes the whole board and flushes it. Called once before any file
+    /// starts — so every file queued for this run is on screen from the
+    /// outset rather than appearing only as a thread frees up — and again on
+    /// every state change after that.
+    fn draw(&mut self) {
+        if !self.interactive {
+            // Only ever reached by the single up-front call — `update`
+            // returns before drawing when output isn't a terminal. Files
+            // already on disk never reach `update` at all, so this is where
+            // they're logged.
+            for (i, slot) in self.slots.iter().enumerate() {
+                if matches!(slot.state, SlotState::Skipped) {
+                    println!("{}", slot.line(i + 1, self.slots.len()));
+                }
+            }
+            return;
+        }
+        let frame = self.frame(
+            terminal_rows().map_or(usize::MAX, |rows| rows.saturating_sub(1)),
+            self.started.elapsed(),
+        );
         let mut out = std::io::stdout();
-        if self.drawn {
+        if self.drawn > 0 {
             // Move the cursor back up to the first line so every line below
             // gets overwritten rather than appended below the last draw.
-            write!(out, "\x1b[{}A", self.lines.len()).ok();
+            write!(out, "\x1b[{}A", self.drawn).ok();
         }
-        self.drawn = true;
-        for line in &self.lines {
+        for line in &frame {
             // \x1b[2K clears the line first — a shorter new line (e.g. once
             // a percentage's digit count shrinks, which can't happen here,
             // but also just a differently-sized final "Downloaded" message)
             // otherwise leaves stray trailing characters from the old one.
             writeln!(out, "\r\x1b[2K{line}").ok();
         }
+        if frame.len() < self.drawn {
+            // The frame just got shorter — the terminal was resized down to
+            // where only the aggregate line fits. Erase everything below the
+            // cursor, or the tail of the taller previous draw stays on screen
+            // forever, frozen at whatever it last said.
+            write!(out, "\x1b[J").ok();
+        }
+        self.drawn = frame.len();
         out.flush().ok();
     }
+
+    /// The block of lines to draw, given how many rows there is `room` to
+    /// draw into: one line per file, every file, so nothing being downloaded
+    /// is invisible, closed by a `Total` line for the run as a whole.
+    ///
+    /// The one case that can't have them all is a terminal with fewer rows
+    /// than there are files — redrawing in place needs the whole block to
+    /// stay on screen, since a block that scrolls off the top can't be moved
+    /// back up to, and the redraws would smear down the screen instead. There
+    /// the per-file lines drop away and the `Total` line stands alone: it's
+    /// the one line that still accounts for every file.
+    fn frame(&self, room: usize, elapsed: std::time::Duration) -> Vec<String> {
+        let total = self.slots.len();
+        let mut lines: Vec<String> = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| slot.line(i + 1, total))
+            .collect();
+        lines.push(self.total_line(elapsed));
+        if lines.len() <= room {
+            return lines;
+        }
+        vec![self.total_line(elapsed)]
+    }
+
+    /// The run as a whole on one line: bytes on disk against the real total
+    /// (so a 5 GiB shard half fetched counts for more than a finished
+    /// 200 MiB one), how the files themselves are spread across
+    /// done/active/queued, and an ETA once there's enough of a download rate
+    /// to project one from.
+    fn total_line(&self, elapsed: std::time::Duration) -> String {
+        let total_bytes: u64 = self.slots.iter().map(|s| s.size).sum();
+        let done_bytes: u64 = self.slots.iter().map(|s| s.downloaded).sum();
+        let percent = (done_bytes * 100).checked_div(total_bytes).unwrap_or(0);
+        let done = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.state, SlotState::Done | SlotState::Skipped))
+            .count();
+        let queued = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.state, SlotState::Queued))
+            .count();
+        let active = self.slots.len() - done - queued;
+        let eta = match self.eta(done_bytes, total_bytes, elapsed) {
+            Some(eta) => format!(", ETA {}", format_eta(eta)),
+            None => String::new(),
+        };
+        format!(
+            "Total {percent}%: {done}/{} files ({} of {}), {active} active, {queued} queued{eta}",
+            self.slots.len(),
+            crate::format::format_bytes(done_bytes),
+            crate::format::format_bytes(total_bytes),
+        )
+    }
+
+    /// How long the bytes still outstanding — every file's, queued ones
+    /// included — should take at the rate this run has actually transferred
+    /// at. `None` until there's something to extrapolate from (the first
+    /// seconds of a run project wildly) and once there's nothing left.
+    fn eta(
+        &self,
+        done_bytes: u64,
+        total_bytes: u64,
+        elapsed: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        const MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let remaining = total_bytes.checked_sub(done_bytes).filter(|r| *r > 0)?;
+        let transferred = self.transferred.load(Ordering::Relaxed);
+        if elapsed < MIN_ELAPSED || transferred == 0 {
+            return None;
+        }
+        let per_second = transferred as f64 / elapsed.as_secs_f64();
+        Some(std::time::Duration::from_secs_f64(
+            remaining as f64 / per_second,
+        ))
+    }
+}
+
+/// An ETA as `(2h:05m)`, or just `(23m)` under an hour — a download measured
+/// in seconds isn't worth a number, so anything under a minute is `(<1m)`.
+fn format_eta(eta: std::time::Duration) -> String {
+    let minutes = eta.as_secs() / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "(<1m)".to_string(),
+        (0, minutes) => format!("({minutes}m)"),
+        (hours, minutes) => format!("({hours}h:{minutes:02}m)"),
+    }
+}
+
+/// Refuses a download that wouldn't fit: `needed` bytes to write into `dir`,
+/// with `available` bytes free there (`None` where the platform can't say,
+/// which passes — an unanswerable question is not a reason to refuse work
+/// that may well fit).
+///
+/// The margin is deliberately none: this catches the download that can't
+/// possibly fit, not the one that fits with little to spare. Anything else
+/// writing to the same filesystem meanwhile is beyond what a check before
+/// the fact can promise.
+fn check_space(dir: &Path, needed: u64, available: Option<u64>) -> Result<()> {
+    let Some(available) = available else {
+        return Ok(());
+    };
+    if needed <= available {
+        return Ok(());
+    }
+    bail!(
+        "not enough free space in {}: {} needed, {} free (short by {})",
+        dir.display(),
+        crate::format::format_bytes(needed),
+        crate::format::format_bytes(available),
+        crate::format::format_bytes(needed - available),
+    )
+}
+
+/// Where a blob's partial download lives until it's complete. Blob filenames
+/// are bare content hashes with no extension of their own for
+/// `Path::with_extension` to replace, so just append directly.
+fn part_path(blob: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part", blob.display()))
+}
+
+/// The terminal's height in rows, or `None` when output isn't a terminal at
+/// all (nothing to fit the board into).
+fn terminal_rows() -> Option<usize> {
+    terminal_size::terminal_size().map(|(_, terminal_size::Height(rows))| usize::from(rows))
 }
 
 /// Downloads every task concurrently — bounded by rayon's global thread
 /// pool rather than one thread per file, so a model with dozens of shards
 /// doesn't open dozens of simultaneous connections — each reporting into its
-/// own line of a shared [`ProgressBoard`] so every in-flight file's progress
-/// stays visible at once until all are done. Returns the first error
-/// encountered, if any; other in-flight downloads still run to completion
-/// (each writes its own `.part` file, so a later retry only re-fetches
-/// whatever actually failed).
+/// own line of the shared `board` (which already has a line for every
+/// selected file, this run's tasks and the files it had nothing to do
+/// among them) so every file's progress stays visible at once until all are
+/// done. Returns the first error encountered, if any; other in-flight
+/// downloads still run to completion (each writes its own `.part` file, so a
+/// later retry only re-fetches whatever actually failed).
 fn download_all(
     client: &reqwest::blocking::Client,
     tasks: &[DownloadTask],
     token: Option<&str>,
+    board: &Mutex<ProgressBoard>,
 ) -> Result<()> {
-    let board = Mutex::new(ProgressBoard::new(tasks.len()));
     tasks
         .par_iter()
-        .enumerate()
-        .try_for_each(|(slot, task)| download_with_resume(client, task, token, slot, &board))
+        .try_for_each(|task| download_with_resume(client, task, token, task.slot, board))
 }
 
 /// How many times a single file's download is retried after a transient
@@ -660,14 +1023,9 @@ fn download_with_resume(
     board: &Mutex<ProgressBoard>,
 ) -> Result<()> {
     let DownloadTask {
-        label,
-        blob_path: dest,
-        position: (index, total),
-        ..
+        blob_path: dest, ..
     } = task;
-    // Blob filenames are bare content hashes with no extension of their own
-    // for `Path::with_extension` to replace, so just append directly.
-    let part_path = PathBuf::from(format!("{}.part", dest.display()));
+    let part_path = part_path(dest);
 
     let mut attempt = 0;
     loop {
@@ -676,22 +1034,14 @@ fn download_with_resume(
             Err(_) if attempt < DOWNLOAD_RETRIES => {
                 attempt += 1;
                 let secs = DOWNLOAD_RETRY_DELAY.as_secs();
-                board.lock().unwrap().update(
-                    slot,
-                    format!(
-                        "Retrying {label} in {secs}s (attempt {attempt}/{DOWNLOAD_RETRIES}) [{index}/{total}]"
-                    ),
-                );
+                board.lock().unwrap().set_retry(slot, attempt, secs);
                 std::thread::sleep(DOWNLOAD_RETRY_DELAY);
             }
             Err(err) => return Err(err),
         }
     }
 
-    board
-        .lock()
-        .unwrap()
-        .update(slot, format!("Downloaded {label}: 100% [{index}/{total}]"));
+    board.lock().unwrap().finished(slot);
 
     fs::rename(&part_path, dest)
         .with_context(|| format!("failed to finalize {}", dest.display()))?;
@@ -716,7 +1066,6 @@ fn download_attempt(
         label,
         url,
         size: expected_size,
-        position: (index, total),
         ..
     } = task;
     let expected_size = *expected_size;
@@ -758,6 +1107,10 @@ fn download_attempt(
     let mut buf = [0u8; 65536];
     let mut last_printed = None;
     let mut body = response;
+    // Taken once: the read loop adds to it per chunk without going anywhere
+    // near the board's mutex, which every other download thread is also
+    // contending for.
+    let transferred = board.lock().unwrap().transferred.clone();
     loop {
         let read = body
             .read(&mut buf)
@@ -768,16 +1121,20 @@ fn download_attempt(
         file.write_all(&buf[..read])
             .with_context(|| format!("failed to write {}", part_path.display()))?;
         downloaded += read as u64;
+        // Only what this attempt actually pulled down — bytes a previous run
+        // left in the `.part` (`resume_from`) are not this run's throughput.
+        transferred.fetch_add(read as u64, Ordering::Relaxed);
 
+        // Reported on each whole percent rather than each chunk: the board
+        // redraws every line on every update, and 64 KiB at a time would be
+        // tens of thousands of redraws a shard. The byte count is what's
+        // handed over, though — `Total` subtracts it from the real total.
         if let Some(percent) = (downloaded * 100)
             .checked_div(expected_size)
             .map(|p| p.min(100))
             && last_printed != Some(percent)
         {
-            board.lock().unwrap().update(
-                slot,
-                format!("Downloading {label}: {percent}% [{index}/{total}]"),
-            );
+            board.lock().unwrap().progress(slot, downloaded);
             last_printed = Some(percent);
         }
     }
@@ -832,6 +1189,283 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A board of equally-sized 1 MiB files, each given as the state it's in
+    /// and how many of its bytes are on disk — built the way the real one is,
+    /// with every file's real size and starting position known at
+    /// construction.
+    fn board_with(files: Vec<(SlotState, u64)>) -> ProgressBoard {
+        let count = files.len();
+        ProgressBoard::new(
+            files
+                .into_iter()
+                .enumerate()
+                .map(|(i, (state, downloaded))| Slot {
+                    label: format!("model-{:05}-of-{count:05}.gguf", i + 1),
+                    size: MIB,
+                    downloaded,
+                    state,
+                })
+                .collect(),
+        )
+    }
+
+    fn board_of(count: usize) -> ProgressBoard {
+        board_with(vec![(SlotState::Queued, 0); count])
+    }
+
+    /// Long enough for the ETA to be worth projecting; short enough that the
+    /// arithmetic in these tests stays obvious.
+    const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Every file has a line from the very first draw, before any of them
+    /// has started — rayon runs only as many downloads at once as it has
+    /// threads, and the waiting ones used to render as blank lines.
+    #[test]
+    fn every_file_has_a_line_before_anything_starts() {
+        let board = board_of(34);
+
+        let frame = board.frame(usize::MAX, std::time::Duration::ZERO);
+
+        assert_eq!(frame.len(), 35, "34 files plus the Total line");
+        assert!(
+            frame[..34].iter().all(|line| line.starts_with("Queued ")),
+            "{frame:?}"
+        );
+        assert_eq!(frame[17], "Queued model-00018-of-00034.gguf [18/34]");
+    }
+
+    /// A file's own line carries its own state; the others stay put. A file
+    /// waiting on a retry stays a `Downloading` line, at the percentage it
+    /// had reached, with the retry as a note on that same line. The `Total`
+    /// line closes the block whatever they say.
+    #[test]
+    fn each_line_follows_its_own_files_state() {
+        let board = board_with(vec![
+            (SlotState::Skipped, MIB),
+            (SlotState::Downloading { retry: None }, MIB / 2),
+            (
+                SlotState::Downloading {
+                    retry: Some(Retry {
+                        attempt: 2,
+                        secs: 30,
+                    }),
+                },
+                MIB / 4,
+            ),
+        ]);
+        board.transferred.store(MIB, Ordering::Relaxed);
+
+        assert_eq!(
+            board.frame(usize::MAX, MINUTE),
+            vec![
+                // A file already on disk is downloaded, however it got there.
+                "Downloaded model-00001-of-00003.gguf: 100% [1/3]",
+                "Downloading model-00002-of-00003.gguf: 50% [2/3]",
+                "Downloading model-00003-of-00003.gguf: 25% (retry 2/5 in 30s) [3/3]",
+                "Total 58%: 1/3 files (1.75 MiB of 3.00 MiB), 2 active, 0 queued, ETA (1m)",
+            ]
+        );
+    }
+
+    /// A retry keeps the bytes the file had already reached — it resumes from
+    /// them — and the marker clears again once bytes move.
+    #[test]
+    fn a_retry_annotates_the_line_it_is_already_on() {
+        let mut board = board_with(vec![(SlotState::Downloading { retry: None }, MIB / 2)]);
+
+        board.set_retry(0, 1, 30);
+        assert_eq!(
+            board.slots[0].line(1, 1),
+            "Downloading model-00001-of-00001.gguf: 50% (retry 1/5 in 30s) [1/1]"
+        );
+        assert_eq!(board.slots[0].downloaded, MIB / 2, "no bytes were dropped");
+
+        board.progress(0, MIB * 3 / 4);
+        assert_eq!(
+            board.slots[0].line(1, 1),
+            "Downloading model-00001-of-00001.gguf: 75% [1/1]"
+        );
+    }
+
+    /// The ETA covers every byte still outstanding — the queued files
+    /// included, not just whatever is in flight.
+    #[test]
+    fn the_eta_accounts_for_every_file_still_outstanding() {
+        // 1 MiB transferred in a minute, 2 MiB still to go.
+        let two_queued = board_with(vec![
+            (SlotState::Skipped, MIB),
+            (SlotState::Done, MIB),
+            (SlotState::Queued, 0),
+            (SlotState::Queued, 0),
+        ]);
+        two_queued.transferred.store(MIB, Ordering::Relaxed);
+        assert_eq!(
+            two_queued.frame(usize::MAX, MINUTE).pop().unwrap(),
+            "Total 50%: 2/4 files (2.00 MiB of 4.00 MiB), 0 active, 2 queued, ETA (2m)"
+        );
+
+        // The same run with one fewer file still to fetch, at the same rate:
+        // an ETA that only covered what was in flight wouldn't move at all.
+        let one_queued = board_with(vec![
+            (SlotState::Skipped, MIB),
+            (SlotState::Done, MIB),
+            (SlotState::Queued, 0),
+        ]);
+        one_queued.transferred.store(MIB, Ordering::Relaxed);
+        assert_eq!(
+            one_queued.frame(usize::MAX, MINUTE).pop().unwrap(),
+            "Total 66%: 2/3 files (2.00 MiB of 3.00 MiB), 0 active, 1 queued, ETA (1m)"
+        );
+    }
+
+    /// Bytes that were already on disk are progress, but they are not
+    /// throughput: dividing by them projected minutes left on a download with
+    /// a terabyte to go. Only what this run pulled off the network counts.
+    #[test]
+    fn bytes_already_on_disk_are_not_this_runs_throughput() {
+        let board = board_with(vec![
+            (SlotState::Downloading { retry: None }, MIB * 3 / 4);
+            4
+        ]);
+        // 3 MiB of 4 MiB is on disk, but only 64 KiB of it came down the wire
+        // this minute — so the 1 MiB left is a quarter of an hour away, not
+        // the seconds that 3 MiB/min would have projected.
+        board.transferred.store(64 * 1024, Ordering::Relaxed);
+
+        assert_eq!(
+            board.frame(usize::MAX, MINUTE).pop().unwrap(),
+            "Total 75%: 0/4 files (3.00 MiB of 4.00 MiB), 4 active, 0 queued, ETA (16m)"
+        );
+    }
+
+    /// A file an earlier run got partway through is counted from the `.part`
+    /// on disk, before any thread picks it up — the `Total` line starts out
+    /// telling the truth instead of climbing as threads free up.
+    #[test]
+    fn a_resumed_file_counts_before_a_thread_picks_it_up() {
+        let board = board_with(vec![(SlotState::Queued, MIB / 4), (SlotState::Queued, 0)]);
+
+        let frame = board.frame(usize::MAX, MINUTE);
+
+        assert_eq!(frame[0], "Queued model-00001-of-00002.gguf: 25% [1/2]");
+        assert_eq!(frame[1], "Queued model-00002-of-00002.gguf [2/2]");
+        assert_eq!(
+            frame[2],
+            "Total 12%: 0/2 files (256.00 KiB of 2.00 MiB), 0 active, 2 queued"
+        );
+    }
+
+    /// No ETA is shown until this run has actually transferred something to
+    /// project from, and none once there's nothing left to fetch.
+    #[test]
+    fn an_eta_needs_both_a_rate_and_something_left_to_fetch() {
+        let mut board = board_of(2);
+        board.progress(0, MIB / 2);
+
+        let nothing_transferred = board.frame(usize::MAX, MINUTE);
+        assert!(
+            !nothing_transferred.last().unwrap().contains("ETA"),
+            "{nothing_transferred:?}"
+        );
+
+        board.transferred.store(MIB / 2, Ordering::Relaxed);
+        let too_early = board.frame(usize::MAX, std::time::Duration::from_secs(1));
+        assert!(!too_early.last().unwrap().contains("ETA"), "{too_early:?}");
+
+        board.finished(0);
+        board.finished(1);
+        let finished = board.frame(usize::MAX, MINUTE);
+        assert!(!finished.last().unwrap().contains("ETA"), "{finished:?}");
+    }
+
+    /// A download that can't fit is refused before it writes anything —
+    /// filling the disk halfway through a multi-hour fetch of a model this
+    /// size is a slow, confusing way to find out.
+    #[test]
+    fn a_download_that_cannot_fit_is_refused_up_front() {
+        let dir = std::path::Path::new("/models");
+
+        assert!(
+            check_space(dir, 10 * MIB, Some(10 * MIB)).is_ok(),
+            "exact fit"
+        );
+        assert!(check_space(dir, 10 * MIB, Some(11 * MIB)).is_ok());
+        // Nothing left to fetch always fits, even on a full disk.
+        assert!(check_space(dir, 0, Some(0)).is_ok());
+        // A platform that can't answer is not a reason to refuse.
+        assert!(check_space(dir, u64::MAX, None).is_ok());
+
+        let err = check_space(dir, 11 * MIB, Some(10 * MIB)).expect_err("does not fit");
+        assert_eq!(
+            err.to_string(),
+            "not enough free space in /models: 11.00 MiB needed, 10.00 MiB free (short by 1.00 MiB)"
+        );
+    }
+
+    /// What's checked is what's left to write, not the model's full size: a
+    /// resumed run only needs room for the bytes it hasn't fetched yet.
+    #[test]
+    fn the_space_needed_is_what_is_left_to_write() {
+        let board = board_with(vec![
+            (SlotState::Skipped, MIB),
+            (SlotState::Queued, MIB / 4),
+            (SlotState::Queued, 0),
+        ]);
+
+        let needed: u64 = board.slots.iter().map(|s| s.size - s.downloaded).sum();
+
+        assert_eq!(
+            needed,
+            MIB + MIB * 3 / 4,
+            "3 MiB of model, 1.25 MiB on disk"
+        );
+    }
+
+    #[test]
+    fn an_eta_is_hours_and_minutes_only_past_the_hour() {
+        use std::time::Duration;
+
+        assert_eq!(format_eta(Duration::from_secs(30)), "(<1m)");
+        assert_eq!(format_eta(Duration::from_secs(23 * 60)), "(23m)");
+        assert_eq!(format_eta(Duration::from_secs(59 * 60 + 59)), "(59m)");
+        assert_eq!(format_eta(Duration::from_secs(60 * 60)), "(1h:00m)");
+        assert_eq!(
+            format_eta(Duration::from_secs(2 * 3600 + 5 * 60)),
+            "(2h:05m)"
+        );
+        assert_eq!(format_eta(Duration::from_secs(30 * 3600)), "(30h:00m)");
+    }
+
+    /// A board taller than the terminal can't be redrawn in place — it would
+    /// scroll off the top and smear — so it collapses to the `Total` line,
+    /// which still accounts for every file.
+    #[test]
+    fn a_board_taller_than_the_terminal_collapses_to_the_total_line() {
+        let mut board = board_of(34);
+        board.finished(0);
+        board.progress(1, MIB / 2);
+        board.transferred.store(MIB + MIB / 2, Ordering::Relaxed);
+
+        let frame = board.frame(23, MINUTE);
+
+        assert_eq!(
+            frame,
+            vec!["Total 4%: 1/34 files (1.50 MiB of 34.00 MiB), 1 active, 32 queued, ETA (21m)"]
+        );
+        assert_eq!(
+            board.frame(35, MINUTE).len(),
+            35,
+            "35 rows of room fits 34 files plus the Total line"
+        );
+        assert_eq!(
+            board.frame(34, MINUTE).len(),
+            1,
+            "one row short of the whole block is not enough"
+        );
+    }
 
     #[test]
     fn split_repo_tag_separates_an_optional_quant() {

@@ -115,6 +115,15 @@ Six subcommands cover getting, choosing, and cleaning up a model, all
 sharing the same `orangu-server.conf` and its `models` directory (see
 **Configuration** below).
 
+Each of them names itself in the **terminal title** while it runs —
+`orangu-server download`, `orangu-server list`, `orangu-server prune`, and
+so on (`orangu-server init` for `-i`) — so a backgrounded or unfocused
+terminal still says which mode that process is in. Serving keeps the plain
+`orangu-server`, set as soon as the model starts resolving rather than only
+once it's loaded. The title is left alone entirely when output isn't going
+to a terminal (`orangu-server list > models.txt`, or under `--daemon`), and
+is cleared again when the command finishes.
+
 **`download`** fetches a model from Hugging Face into the configured
 `models` directory, laid out **exactly** the way llama.cpp's own
 `-hf`/`--hf-repo` downloads into —
@@ -130,6 +139,7 @@ orangu-server download ggml-org/embeddinggemma-300M-GGUF   # no :quant -> prefer
 
 ```
 Downloading Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf: 47% [1/1]
+Total 47%: 0/1 files (8.60 GiB of 18.30 GiB), 1 active, 0 queued, ETA (12m)
 ```
 
 If the repository also ships a multimodal projector (`mmproj-*.gguf`,
@@ -141,6 +151,76 @@ launched. A multi-part model's every shard (and a bundled `mmproj`)
 downloads concurrently rather than one at a time; an interrupted download
 resumes from where it left off next time. Set `HF_TOKEN` in the environment
 for a private or gated repository.
+
+A sharded model shows **one line per file**, all of them from the start and
+all of them in one block, closed by a `Total` line for the run as a whole.
+A file is `Queued` until a thread picks it up, `Downloading` while it
+streams, and `Downloaded` once it's on disk — including a file that was
+already there when the command started, which is simply downloaded as far as
+anything else is concerned. Those three are the whole vocabulary: an attempt
+that failed and is waiting to retry is still `Downloading`, at the
+percentage it had already reached, with the retry noted on that same line —
+a retry resumes from the bytes on disk rather than starting the file over.
+Every line is rewritten in place as that file's own state changes:
+
+```
+Downloaded UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00001-of-00034.gguf: 100% [1/35]
+Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00002-of-00034.gguf: 63% [2/35]
+Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00003-of-00034.gguf: 12% (retry 1/5 in 30s) [3/35]
+Queued UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00004-of-00034.gguf [4/35]
+...
+Downloaded mmproj-BF16.gguf: 100% [35/35]
+Total 12%: 2/35 files (7.12 GiB of 58.30 GiB), 15 active, 18 queued, ETA (2h:47m)
+```
+
+`Total` is **bytes**, not an average of the per-file percentages: how much
+of the model is on disk against what all of it really weighs. So a 5 GiB
+shard half fetched counts for more than a finished 200 MiB one, and nothing
+is rounded away.
+
+Both of those numbers are known **before the first byte is fetched** — the
+sizes from the repository listing (an LFS file's own object size, never
+anything measured on disk), what's already there from any `.part` an
+interrupted earlier run left behind. So the `Total` line is accurate from
+the moment it appears rather than climbing as threads free up, and a file a
+previous run got partway through says so while it waits: `Queued
+…-00002-of-00034.gguf: 23% [2/35]`.
+
+The **ETA** is that difference — the real total minus what's downloaded, so
+every outstanding byte including the queued files' — divided by the rate
+**this** run has actually pulled off the network. Bytes that were already on
+disk are progress but not throughput: counting them as speed would have a
+resumed terabyte-sized download claim to be minutes from finishing. It reads
+`(2h:47m)` past the hour and `(47m)` under it, and appears once there are a
+few seconds of real transfer to extrapolate from — before that, and once
+everything is fetched, there's no ETA on the line at all.
+
+Before a single byte is fetched, the free space on the filesystem holding
+the `models` directory is checked against what this run still has to write
+— the model's real total less whatever is already on disk. A download that
+can't possibly fit is refused there and then, rather than filling the disk
+somewhere in the middle of a multi-hour fetch:
+
+```
+error: not enough free space in /mnt/ai/models/models--unsloth--Kimi-K3-GGUF/blobs:
+       1.31 TiB needed, 103.08 GiB free (short by 1.21 TiB)
+```
+
+The free space counted is what's available to *your* user, not counting the
+root-only reserve. There's no safety margin beyond that: the check catches
+the download that cannot fit, not the one that fits with little to spare,
+and it can't account for anything else writing to the same filesystem while
+the download runs. On a platform that can't report free space (Windows), the
+check is skipped rather than guessed at.
+
+Redrawing in place needs the whole block on screen at once, so a model with
+more files than the terminal has rows drops the per-file lines and leaves
+the `Total` line standing alone — it accounts for all of them anyway.
+Making the window taller (or having fewer files than rows) brings the
+per-file lines back. When output isn't a terminal at all (`orangu-server
+download ... | tee log`), there's no cursor movement or redraws: a plain
+line per file as it finishes, plus one whenever a download stalls into a
+retry, so a slow run still says why.
 
 **`system`** detects the machine's operating system, CPU and GPU(s) — the
 same report printed at the top of every attached `orangu-server` startup
