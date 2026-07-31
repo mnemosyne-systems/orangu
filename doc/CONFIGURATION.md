@@ -39,6 +39,7 @@ theme = classic
 | `width` | No | Virtual terminal width for the output canvas. Source lines from `/show_file` are laid out at this width and can be panned horizontally. Defaults to `512` |
 | `banner` | No | Horizontal placement of the header banner. Defaults to `left`. Options: `left`, `center`, `right` |
 | `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`; `random` draws one of the available themes at each launch. User themes are loaded from `~/.orangu/themes/*.theme` |
+| `word_wrap` | No | Wrap long lines in the main TUI, `/show_file`, `/review`, and `/auto_review` windows. Defaults to `off`; set it to `on` to wrap at the visible width. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `feedback` | No | Show a green or red dot in the output window after each command to indicate success or failure, blink an `orangu ●` progress title and ring the terminal bell when a `/auto_review` finishes. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `auto_rebase` | No | Automatically rebase the branch before `/pull_request` if it is behind the base. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `auto_squash` | No | Automatically squash commits before `/pull_request` if more than one commit is ahead of the base. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |

@@ -101,6 +101,7 @@ pub(crate) struct ReviewChrome<'a> {
     pub(crate) prompt_branch: Option<&'a str>,
     pub(crate) pending_count: usize,
     pub(crate) skills: &'a orangu::skills::SkillRegistry,
+    pub(crate) word_wrap: bool,
 }
 
 impl ReviewState {
@@ -589,6 +590,7 @@ pub(crate) fn print_review_screen(
         lines: &feedback.lines,
         scroll: feedback.scroll,
         x_offset: feedback.x_offset,
+        word_wrap: chrome.word_wrap,
     });
     let comment_editor = state
         .comment_editor
@@ -607,6 +609,7 @@ pub(crate) fn print_review_screen(
         line: state.line,
         scroll: state.scroll,
         x_offset: state.x_offset,
+        word_wrap: chrome.word_wrap,
         feedback,
         comment_editor,
         commented_lines: &commented_lines,
@@ -1247,6 +1250,7 @@ mod tests {
                         line: state.line,
                         scroll: state.scroll,
                         x_offset: state.x_offset,
+                        word_wrap: true,
                         feedback: None,
                         comment_editor: editor,
                         commented_lines: &commented,

@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Clear, Paragraph, Wrap},
 };
 
 fn clip_plain(line: &str, width: usize) -> String {
@@ -207,7 +207,11 @@ fn draw_auto_review_panes(
         let line_index = args.scroll + row;
         match args.report_lines.get(line_index) {
             Some(line) => {
-                let cell = clip_line(line, args.x_offset, left_inner_area.width as usize);
+                let cell = if args.word_wrap {
+                    line.clone()
+                } else {
+                    clip_line(line, args.x_offset, left_inner_area.width as usize)
+                };
                 // Highlight if selected
                 let is_selected = match args.selected_lines {
                     Some((start, end)) => line_index >= start && line_index < end,
@@ -223,11 +227,14 @@ fn draw_auto_review_panes(
         }
     }
 
-    f.render_widget(
-        Paragraph::new(left_lines)
-            .block(ratatui::widgets::Block::bordered().border_style(theme.muted)),
-        left_area,
-    );
+    let paragraph = Paragraph::new(left_lines)
+        .block(ratatui::widgets::Block::bordered().border_style(theme.muted));
+    let paragraph = if args.word_wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    f.render_widget(paragraph, left_area);
 
     let right_header = format!("Files ({})", args.files.len());
     let mut right_lines = vec![Line::from(Span::styled(
@@ -410,10 +417,17 @@ fn draw_auto_review_diff_panel(
     let body_height = area.height.saturating_sub(1) as usize;
     for row in 0..body_height {
         let line = match diff.lines.get(diff.scroll + row) {
+            Some(line) if diff.word_wrap => line.clone(),
             Some(line) => clip_line(line, diff.x_offset, area.width as usize),
             None => "".to_string(),
         };
         lines.push(first_ansi_line(&line));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    let paragraph = Paragraph::new(lines);
+    let paragraph = if diff.word_wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    f.render_widget(paragraph, area);
 }

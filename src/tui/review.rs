@@ -44,6 +44,7 @@ pub struct ReviewFeedbackView<'a> {
     pub lines: &'a [String],
     pub scroll: usize,
     pub x_offset: usize,
+    pub word_wrap: bool,
 }
 
 /// The inline comment editor shown below the highlighted line: a single
@@ -66,6 +67,7 @@ pub struct ReviewScreenArgs<'a> {
     pub line: usize,
     pub scroll: usize,
     pub x_offset: usize,
+    pub word_wrap: bool,
     /// When set, the feedback popup is drawn over the panes.
     pub feedback: Option<ReviewFeedbackView<'a>>,
     /// When set, the inline comment editor is drawn below the highlighted line.

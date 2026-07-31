@@ -2095,6 +2095,7 @@ pub(crate) fn print_auto_review_screen(
         lines: &diff.lines,
         scroll: diff.scroll,
         x_offset: diff.x_offset,
+        word_wrap: chrome.word_wrap,
     });
     let reject = state
         .reject
@@ -2130,6 +2131,7 @@ pub(crate) fn print_auto_review_screen(
         },
         scroll: state.scroll,
         x_offset: state.x_offset,
+        word_wrap: chrome.word_wrap,
         status: &status_text,
         input,
         cursor,

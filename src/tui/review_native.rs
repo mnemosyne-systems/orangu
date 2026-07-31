@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
 };
 
 use super::*;
@@ -104,7 +104,11 @@ fn draw_review_feedback_panel(
 
     for row in 0..body_height {
         let content = if let Some(line) = feedback.lines.get(feedback.scroll + row) {
-            clip_line(line, feedback.x_offset, width)
+            if feedback.word_wrap {
+                line.clone()
+            } else {
+                clip_line(line, feedback.x_offset, width)
+            }
         } else {
             String::new()
         };
@@ -117,7 +121,13 @@ fn draw_review_feedback_panel(
         lines.push(Line::from(content));
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    let paragraph = Paragraph::new(lines);
+    let paragraph = if feedback.word_wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_review_panes(
@@ -343,7 +353,11 @@ fn draw_review_panes(
             if let Some(diff_line) = selected_lines.get(diff_index) {
                 let mut spans = Vec::new();
                 let is_cursor = diff_index == args.line;
-                let clipped = clip_line(diff_line, args.x_offset, left_inner_area.width as usize);
+                let clipped = if args.word_wrap {
+                    diff_line.clone()
+                } else {
+                    clip_line(diff_line, args.x_offset, left_inner_area.width as usize)
+                };
 
                 if let Ok(text) = ansi_to_tui::IntoText::into_text(&clipped) {
                     if let Some(parsed_line) = text.lines.into_iter().next() {
@@ -381,11 +395,14 @@ fn draw_review_panes(
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(left_lines)
-            .block(ratatui::widgets::Block::bordered().border_style(theme.muted)),
-        left_area,
-    );
+    let paragraph = Paragraph::new(left_lines)
+        .block(ratatui::widgets::Block::bordered().border_style(theme.muted));
+    let paragraph = if args.word_wrap {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
+    frame.render_widget(paragraph, left_area);
     frame.render_widget(
         Paragraph::new(right_lines).block(
             ratatui::widgets::Block::default().padding(ratatui::widgets::Padding::new(1, 1, 1, 0)),

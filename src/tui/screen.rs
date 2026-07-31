@@ -25,6 +25,7 @@ struct TranscriptRenderCache {
     transcript_len: usize,
     transcript_epoch: usize,
     width: usize,
+    word_wrap: bool,
     lines: Vec<ratatui::text::Line<'static>>,
     is_user_input: Vec<bool>,
     user_input_ranges: Vec<(usize, usize)>,
@@ -99,6 +100,8 @@ pub struct ScreenRenderArgs<'a> {
     pub actual_width: usize,
     pub actual_height: usize,
     pub x_offset: usize,
+    /// Whether long transcript text should wrap at the visible output width.
+    pub word_wrap: bool,
     pub dropdown_candidates: Option<&'a [(String, String)]>,
     pub dropdown_selected: usize,
     pub valid_command_len: usize,
@@ -108,6 +111,7 @@ fn build_transcript_render_cache(
     transcript: &[TranscriptLine],
     transcript_epoch: usize,
     width: usize,
+    word_wrap: bool,
     theme: &crate::tui::theme::Theme,
 ) -> TranscriptRenderCache {
     let mut lines = Vec::new();
@@ -117,6 +121,15 @@ fn build_transcript_render_cache(
     for line in transcript {
         let start_index = lines.len();
         let rendered = render_transcript_line_multi(line, width, theme);
+        let rendered =
+            if word_wrap && matches!(line, TranscriptLine::Plain(_) | TranscriptLine::Wide(_)) {
+                rendered
+                    .iter()
+                    .flat_map(|line| crate::tui::text::wrap_ratatui_line(line, width))
+                    .collect()
+            } else {
+                rendered
+            };
         let user_input = matches!(line, TranscriptLine::UserInput(_));
         for rendered_line in rendered {
             lines.push(rendered_line);
@@ -132,6 +145,7 @@ fn build_transcript_render_cache(
         transcript_len: transcript.len(),
         transcript_epoch,
         width,
+        word_wrap,
         lines,
         is_user_input,
         user_input_ranges,
@@ -142,6 +156,7 @@ fn with_transcript_render_cache<R>(
     transcript: &[TranscriptLine],
     transcript_epoch: usize,
     width: usize,
+    word_wrap: bool,
     theme: &crate::tui::theme::Theme,
     f: impl FnOnce(&TranscriptRenderCache) -> R,
 ) -> R {
@@ -153,12 +168,14 @@ fn with_transcript_render_cache<R>(
                 || cached.transcript_len != transcript.len()
                 || cached.transcript_epoch != transcript_epoch
                 || cached.width != width
+                || cached.word_wrap != word_wrap
         });
         if cache_miss {
             *cache = Some(build_transcript_render_cache(
                 transcript,
                 transcript_epoch,
                 width,
+                word_wrap,
                 theme,
             ));
         }
@@ -534,14 +551,36 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
     let pending_lines = args
         .pending_lines
         .iter()
-        .flat_map(|line| render_transcript_line_multi(line, inner_width, &theme))
-        .map(|line| crate::tui::text::clip_ratatui_line(&line, args.x_offset, inner_width))
+        .flat_map(|transcript_line| {
+            let rendered = render_transcript_line_multi(transcript_line, inner_width, &theme);
+            if args.word_wrap
+                && matches!(
+                    transcript_line,
+                    TranscriptLine::Plain(_) | TranscriptLine::Wide(_)
+                )
+            {
+                rendered
+                    .iter()
+                    .flat_map(|line| crate::tui::text::wrap_ratatui_line(line, inner_width))
+                    .collect()
+            } else {
+                rendered
+            }
+        })
+        .map(|line| {
+            crate::tui::text::clip_ratatui_line(
+                &line,
+                if args.word_wrap { 0 } else { args.x_offset },
+                inner_width,
+            )
+        })
         .collect::<Vec<_>>();
 
     let (scroll_offset, mut visible_lines) = with_transcript_render_cache(
         args.transcript,
         args.transcript_epoch,
         inner_width,
+        args.word_wrap,
         &theme,
         |cache| {
             let total_lines = cache.lines.len() + pending_lines.len();
@@ -569,7 +608,7 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
                     let offset = if cache.is_user_input[global_idx] {
                         0
                     } else {
-                        args.x_offset
+                        if args.word_wrap { 0 } else { args.x_offset }
                     };
                     visible_lines.push(crate::tui::text::clip_ratatui_line(
                         line,

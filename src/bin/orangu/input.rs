@@ -121,6 +121,7 @@ pub struct RenderContext<'a> {
     pub x_offset: usize,
     pub banner: Banner,
     pub drop_down: bool,
+    pub word_wrap: bool,
     /// Currently unread: carried from `config.feedback` for future use by the
     /// screen renderer.
     #[allow(dead_code)]

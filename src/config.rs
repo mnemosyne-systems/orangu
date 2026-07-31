@@ -49,6 +49,9 @@ pub struct ClientAppConfiguration {
     /// collapsibles). Hold **Shift** while clicking/dragging to do native text
     /// selection and copy. Set to `false` to disable all mouse handling.
     pub mouse: bool,
+    /// Wrap long TUI output at the visible window width. Disable this to keep
+    /// long lines on one row and inspect them with horizontal panning.
+    pub word_wrap: bool,
     pub semantic_budget_tokens: usize,
     pub theme: String,
 }
@@ -154,6 +157,10 @@ pub fn default_drop_down() -> bool {
     true
 }
 
+pub fn default_word_wrap() -> bool {
+    false
+}
+
 pub fn default_theme() -> String {
     "classic".to_string()
 }
@@ -216,6 +223,10 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         .get("mouse")
         .map(|value| parse_feedback_bool(value))
         .unwrap_or(true);
+    let word_wrap = client
+        .get("word_wrap")
+        .map(|value| parse_feedback_bool(value))
+        .unwrap_or_else(default_word_wrap);
     let auto_downsample_lines = parse_client_field(
         &client,
         "auto_downsample_lines",
@@ -278,6 +289,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         workspaces,
         drop_down,
         mouse,
+        word_wrap,
         theme,
     })
 }
@@ -356,9 +368,9 @@ where
 }
 
 /// Minimal INI parser: `[section]` headers and `key = value` lines, with `#`
-/// and `;` full-line comments and blank lines ignored. Section names and
-/// values are taken literally, so model identifiers containing `.` or `:`
-/// (e.g. `Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M`) round-trip unchanged.
+/// and `;` comments and blank lines ignored. An inline comment must follow
+/// whitespace, so values such as URL fragments remain literal. Section names
+/// and values may contain `.` or `:` (e.g. `Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M`).
 pub fn parse_ini_sections(contents: &str) -> Result<HashMap<String, HashMap<String, String>>> {
     let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut current: Option<String> = None;
@@ -396,10 +408,27 @@ pub fn parse_ini_sections(contents: &str) -> Result<HashMap<String, HashMap<Stri
         sections
             .get_mut(section)
             .expect("current section was inserted")
-            .insert(key.trim().to_string(), value.trim().to_string());
+            .insert(
+                key.trim().to_string(),
+                strip_inline_comment(value).trim().to_string(),
+            );
     }
 
     Ok(sections)
+}
+
+fn strip_inline_comment(value: &str) -> &str {
+    for (index, ch) in value.char_indices() {
+        if matches!(ch, '#' | ';')
+            && value[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return &value[..index];
+        }
+    }
+    value
 }
 
 pub fn default_client_config_path() -> Option<PathBuf> {
@@ -622,6 +651,7 @@ mod tests {
         assert_eq!(conf.llms["gemma"].request_timeout_seconds, 45);
         assert_eq!(conf.llms["gemma"].max_tool_rounds, 12);
         assert!(conf.compression);
+        assert!(!conf.word_wrap);
         // Absent platform defaults to GitHub.
         assert_eq!(conf.platform, "github");
         // Absent theme keeps the original orangu UI as the named classic theme.
@@ -638,6 +668,32 @@ mod tests {
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
         assert_eq!(conf.theme, "random");
+    }
+
+    #[test]
+    fn parses_inline_comments_without_changing_url_fragments() {
+        let parsed = parse_ini_sections(
+            "[orangu]\ntheme = classic  # bundled default\n\n[a]\nendpoint = http://x/v1#fragment ; ignored\nmodel = m\n",
+        )
+        .unwrap();
+        assert_eq!(parsed[CLIENT_SECTION]["theme"], "classic");
+        assert_eq!(parsed["a"]["endpoint"], "http://x/v1#fragment");
+    }
+
+    #[test]
+    fn parses_word_wrap_on_and_off() {
+        for (value, expected) in [("on", true), ("off", false)] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu]\nserver = a\nword_wrap = {value}\n\n[a]\nendpoint = http://x/v1\nmodel = m\n"
+            )
+            .unwrap();
+            assert_eq!(
+                load_client_configuration(file.path()).unwrap().word_wrap,
+                expected
+            );
+        }
     }
 
     #[test]

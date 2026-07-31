@@ -125,6 +125,7 @@ theme = classic
 | `banner` | No | Horizontal placement of the banner. Defaults to `left`. Options: `left`, `center`, `right` |
 | `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`; `random` draws one of the available themes at each launch. User themes are loaded from `~/.orangu/themes/*.theme` |
 | `drop_down` | No | Enable the autocomplete dropdown for slash commands. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `word_wrap` | No | Wrap long lines in the main TUI, `/show_file`, `/review`, and `/auto_review` windows. Defaults to `off`; set it to `on` to wrap at the visible width. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `mouse` | No | Enable mouse capture in the terminal. When `true` (the default), the TUI handles mouse scroll and double-click. Hold **Shift** while clicking/dragging to do native text selection and copy. Set to `false` to disable all mouse handling |
 | `workspaces` | No | Placement of the workspace tabs. Defaults to `top`. Options: `top`, `bottom`, `left`, `right`. See the Workspaces chapter |
 | `feedback` | No | Show a green or red dot in the output window after each command to indicate success or failure, blink an `orangu ●` progress title and ring the terminal bell when a `/auto_review` finishes. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
