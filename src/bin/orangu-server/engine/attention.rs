@@ -193,7 +193,7 @@ pub fn attention_decode_on_device(
         params.n_swa,
         params.start_pos,
     );
-    let vulkan = params.backend.as_vulkan()?;
+    let vulkan = params.backend.as_wgpu()?;
     if !vulkan.prefill_attention_enabled() {
         return None;
     }
@@ -269,7 +269,7 @@ pub fn attention(
     // shaped for it: it parallelises over *positions* rather than over queries,
     // and at `n_tokens == 1` there is exactly one query to parallelise over.
     if n_tokens == 1
-        && let Some(vulkan) = params.backend.as_vulkan()
+        && let Some(vulkan) = params.backend.as_wgpu()
         && vulkan.prefill_attention_enabled()
     {
         let (window_start, window_end) = window(0);
@@ -293,7 +293,7 @@ pub fn attention(
     }
 
     if n_tokens >= min_gpu_tokens()
-        && let Some(vulkan) = params.backend.as_vulkan()
+        && let Some(vulkan) = params.backend.as_wgpu()
         && vulkan.prefill_attention_enabled()
     {
         *out = vulkan.gpu_attention_prefill(

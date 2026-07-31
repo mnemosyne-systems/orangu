@@ -154,10 +154,12 @@ impl Role {
 /// Which `engine::backend::Backend` to run the forward pass on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BackendPreference {
-    /// Tries every GPU backend compiled into this build (in order:
+    /// Tries every GPU backend compiled into this build, otherwise falls
+    /// back to the CPU backend — no error either way. The order is
     /// Vulkan, CUDA, OpenCL, then — only if built with the `rocm` Cargo
-    /// feature — ROCm), otherwise falls back to the CPU backend — no error
-    /// either way.
+    /// feature — ROCm, except on Apple targets, where Metal is tried
+    /// first: it is the only GPU API macOS actually ships, and it reaches
+    /// the same kernels (see `main.rs::select_backend`).
     #[default]
     Auto,
     Cpu,
@@ -165,6 +167,8 @@ pub enum BackendPreference {
     /// adapter is found — for when GPU inference was specifically asked
     /// for and silently running on the CPU instead would be surprising.
     Vulkan,
+    /// Same fail-loudly contract as `Vulkan`, for an Apple Metal device.
+    Metal,
     /// Same fail-loudly contract as `Vulkan`, for an NVIDIA CUDA device.
     Cuda,
     /// Same fail-loudly contract as `Vulkan`, for an OpenCL device.
@@ -192,8 +196,9 @@ pub struct ServerConfiguration {
     /// Port the web UI listens on, bound alongside (not instead of) the
     /// API's own `port`. `0` disables it — no second listener is bound.
     pub web: u16,
-    /// Which `Backend` runs the forward pass — CPU, Vulkan, or (the
-    /// default) whichever Vulkan finds first, falling back to CPU.
+    /// Which `Backend` runs the forward pass — CPU, a named GPU API, or
+    /// (the default) whichever GPU this platform finds first, falling back
+    /// to CPU.
     pub backend: BackendPreference,
     /// A model spec (local path, `NR`/`MODEL` label, or `<user>/<model>
     /// [:quant]` Hugging Face repo) — the same shape as the CLI's
@@ -316,13 +321,14 @@ pub fn load_server_configuration(
             "auto" => BackendPreference::Auto,
             "cpu" => BackendPreference::Cpu,
             "vulkan" => BackendPreference::Vulkan,
+            "metal" => BackendPreference::Metal,
             "cuda" => BackendPreference::Cuda,
             "opencl" => BackendPreference::OpenCl,
             "rocm" => BackendPreference::Rocm,
             other => {
                 return Err(anyhow!(
                     "invalid value for [{SERVER_SECTION}].backend: '{other}' \
-                     (expected auto, cpu, vulkan, cuda, opencl, or rocm)"
+                     (expected auto, cpu, vulkan, metal, cuda, opencl, or rocm)"
                 ));
             }
         },
@@ -369,6 +375,8 @@ mod tests {
             ("cpu", BackendPreference::Cpu),
             ("CPU", BackendPreference::Cpu),
             ("vulkan", BackendPreference::Vulkan),
+            ("metal", BackendPreference::Metal),
+            ("METAL", BackendPreference::Metal),
             ("cuda", BackendPreference::Cuda),
             ("CUDA", BackendPreference::Cuda),
             ("opencl", BackendPreference::OpenCl),

@@ -53,7 +53,7 @@ use engine::arch::mistral::MistralModel;
 use engine::arch::phi::PhiModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
-use engine::backend::{Backend, CpuBackend, CudaBackend, VulkanBackend};
+use engine::backend::{Backend, CpuBackend, CudaBackend, MetalBackend, VulkanBackend};
 use engine::generate::Engine;
 use engine::loader::ArchFamily;
 use engine::loader::LoadedModel;
@@ -1246,32 +1246,24 @@ async fn wait_for_sigint() {
     std::future::pending::<()>().await
 }
 
-/// Picks the `Backend` the forward pass runs on, per `[orangu-server].
-/// backend` (`auto`/`cpu`/`vulkan`/`cuda`/`opencl`/`rocm`, see
-/// `config::BackendPreference`), and a label for the startup banner (e.g.
-/// `"CPU/AVX2"` or `"Vulkan/AMD Radeon RX 5500M (RADV NAVI14)"`). `auto`
-/// tries every GPU backend compiled into this build, preferring the most
-/// mature one first (`VulkanBackend`, the only one with real fused/GPU-
-/// resident optimizations — see its module doc), then falls back to the
-/// CPU backend if none found one; every other named backend fails loudly
-/// instead of falling back, since GPU inference was asked for explicitly.
-/// `rocm` additionally fails loudly (a clear "rebuild with `--features
-/// rocm`" message, not a panic) when this binary wasn't built with that
-/// Cargo feature — see `engine::backend::rocm`'s module doc for why it's
-/// the one opt-in backend (`cuda`/`opencl`/`vulkan` are always compiled
-/// in).
+/// Retries `init` a few times with a short backoff before giving up.
+///
 /// `VulkanBackend::try_init` can transiently return `None` — its
 /// `request_adapter`/`request_device` fail intermittently right after a prior
 /// process released the GPU (the driver hasn't finished tearing the previous
 /// context down), which surfaces as a flaky "no usable Vulkan adapter" at
-/// startup. Retry a few times with a short backoff (silently) so a transient
-/// race doesn't sink the whole server; the caller prints a single error if it
-/// still returns `None`. A genuine absence of a Vulkan device also returns
-/// `None`, only a little later — each attempt is fast when there's no adapter.
-fn init_vulkan_with_retry() -> Option<VulkanBackend> {
+/// startup. Retrying (silently) means a transient race doesn't sink the whole
+/// server; the caller prints a single error if this still returns `None`. A
+/// genuine absence of a device also returns `None`, only a little later — each
+/// attempt is fast when there's no adapter.
+///
+/// Generic over the constructor rather than hardcoding `VulkanBackend` because
+/// `MetalBackend` comes up through the same `wgpu` machinery and so has the
+/// same transient-failure window.
+fn init_gpu_with_retry<B>(init: fn() -> Option<B>) -> Option<B> {
     const ATTEMPTS: usize = 4;
     for attempt in 1..=ATTEMPTS {
-        if let Some(backend) = VulkanBackend::try_init() {
+        if let Some(backend) = init() {
             return Some(backend);
         }
         if attempt < ATTEMPTS {
@@ -1281,7 +1273,38 @@ fn init_vulkan_with_retry() -> Option<VulkanBackend> {
     None
 }
 
+/// Picks the `Backend` the forward pass runs on, per `[orangu-server].
+/// backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`, see
+/// `config::BackendPreference`), and a label for the startup banner (e.g.
+/// `"CPU/AVX2"`, `"Vulkan/AMD Radeon RX 5500M (RADV NAVI14)"` or
+/// `"Metal/Apple M1 Pro (Metal)"`). `auto`
+/// tries every GPU backend compiled into this build, preferring the most
+/// mature one first (`VulkanBackend`, the one with real fused/GPU-
+/// resident optimizations — see its module doc), then falls back to the
+/// CPU backend if none found one; every other named backend fails loudly
+/// instead of falling back, since GPU inference was asked for explicitly.
+/// `rocm` additionally fails loudly (a clear "rebuild with `--features
+/// rocm`" message, not a panic) when this binary wasn't built with that
+/// Cargo feature — see `engine::backend::rocm`'s module doc for why it's
+/// the one opt-in backend (`cuda`/`opencl`/`vulkan`/`metal` are always
+/// compiled in).
+///
+/// On Apple targets `auto` tries **Metal first**. Not a preference: macOS
+/// ships no Vulkan driver at all, so leading with Vulkan there is four
+/// retry rounds of guaranteed failure (2.1s of startup latency) before
+/// reaching the API the machine actually has — and `MetalBackend` is the
+/// same engine and the same kernels as `VulkanBackend`, so nothing is
+/// given up by preferring it. Vulkan stays in the chain behind it for a
+/// Mac running MoltenVK.
 fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, String)> {
+    // Metal is an Apple API and `wgpu` compiles its Metal backend only for
+    // Apple targets, so `Backends::METAL` matches nothing anywhere else.
+    // Elsewhere, `auto` therefore skips it rather than paying an adapter
+    // request that cannot succeed, and an explicit `backend = metal` says
+    // *that* rather than "no device found" after 2.1s of retry backoff for
+    // a device that was never going to appear.
+    const HAS_METAL: bool = cfg!(target_vendor = "apple");
+
     let cpu = || -> (Arc<dyn Backend>, String) {
         let label = if is_x86_feature_detected() {
             "CPU/AVX2"
@@ -1293,13 +1316,28 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
     match preference {
         BackendPreference::Cpu => Ok(cpu()),
         BackendPreference::Vulkan => {
-            let backend = init_vulkan_with_retry().ok_or_else(|| {
+            let backend = init_gpu_with_retry(VulkanBackend::try_init).ok_or_else(|| {
                 anyhow!(
                     "[{}].backend = vulkan, but no usable Vulkan adapter was found",
                     config::SERVER_SECTION
                 )
             })?;
             let label = format!("Vulkan/{}", backend.adapter_name);
+            Ok((Arc::new(backend), label))
+        }
+        BackendPreference::Metal if !HAS_METAL => Err(anyhow!(
+            "[{}].backend = metal, but Metal is an Apple API and this build is not \
+             running on macOS",
+            config::SERVER_SECTION
+        )),
+        BackendPreference::Metal => {
+            let backend = init_gpu_with_retry(MetalBackend::try_init).ok_or_else(|| {
+                anyhow!(
+                    "[{}].backend = metal, but no usable Metal device was found",
+                    config::SERVER_SECTION
+                )
+            })?;
+            let label = format!("Metal/{}", backend.device_name());
             Ok((Arc::new(backend), label))
         }
         BackendPreference::Cuda => {
@@ -1344,7 +1382,13 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
             }
         }
         BackendPreference::Auto => {
-            if let Some(backend) = init_vulkan_with_retry() {
+            // Ahead of Vulkan, and only where it can succeed at all — see
+            // this function's doc comment for both halves of that.
+            if HAS_METAL && let Some(backend) = init_gpu_with_retry(MetalBackend::try_init) {
+                let label = format!("Metal/{}", backend.device_name());
+                return Ok((Arc::new(backend), label));
+            }
+            if let Some(backend) = init_gpu_with_retry(VulkanBackend::try_init) {
                 let label = format!("Vulkan/{}", backend.adapter_name);
                 return Ok((Arc::new(backend), label));
             }

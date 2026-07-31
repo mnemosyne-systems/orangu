@@ -98,7 +98,8 @@ The model line names the model as `MODEL:QUANT` — the quantization the
 resolved file is actually stored at, the same value `list`'s `QUANT` column
 shows, appended unless the model was named with a `:tag` of its own already.
 Its second field names the backend the forward pass actually
-ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `CUDA/<device name>`,
+ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `Metal/<device name>`,
+`CUDA/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
 was used (see **GPU backend** below). The workspace line is the directory
 tree this server operates in (see **Workspace** below).
@@ -525,10 +526,13 @@ role = all
 - `web` — port for the built-in web UI (see below), bound alongside `port`
   rather than instead of it. `0` (the default) disables it — no second
   listener is bound.
-- `backend` — `auto` (the default), `cpu`, `vulkan`, `cuda`, `opencl`, or
+- `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
+  `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
   (Vulkan, CUDA, OpenCL, then ROCm if built with the `rocm` feature),
-  falling back to the CPU backend silently if none is found; naming a
+  falling back to the CPU backend silently if none is found. **On macOS the
+  order starts with Metal**, which is the only GPU API Apple ships — Vulkan
+  is still tried behind it, for a Mac running MoltenVK. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
 - `role` — `all` (the default), `code`, `review`, `explorer`, or
@@ -640,11 +644,11 @@ file's own `role` key; or, failing all three, `all`.
 ## GPU backend
 
 `orangu-server` can run the forward pass on a GPU as well as on the CPU.
-Four GPU backends are available, chosen via `backend` in the config (or
+Five GPU backends are available, chosen via `backend` in the config (or
 `auto`, the default — see **Configuration** above for the fallback order):
 
 - **Vulkan** (`backend = vulkan`) — the most mature and heavily tuned of
-  the four. Weight tensors are uploaded once and cached on the GPU for the
+  the five. Weight tensors are uploaded once and cached on the GPU for the
   model's lifetime rather than re-uploaded per request, and a decode
   step's matrix multiplications, attention, RoPE, and normalization are
   fused together into as few GPU submissions as practical, cutting the
@@ -657,10 +661,24 @@ Four GPU backends are available, chosen via `backend` in the config (or
   meaningfully behind llama.cpp's own tuned Vulkan backend on the same
   model and hardware — a real, ongoing, and openly tracked performance
   gap, not a hidden one.
+- **Metal** (`backend = metal`, Apple GPUs; the default on macOS) — the
+  Vulkan backend's engine and its kernels, running on Apple hardware. Not
+  a separate, smaller implementation: the compute shaders, the cached
+  GPU-resident weights, the fused decode and prefill submissions, split-k
+  attention and GPU sampling are all written against portable `wgpu` and
+  WGSL, and this backend simply brings that same code up on a Metal device
+  instead of a Vulkan one. So everything listed for Vulkan above is live
+  here too, and both get every future optimization at the same time. macOS
+  ships no Vulkan driver, which is why `auto` prefers Metal there and why
+  a Mac previously fell all the way back to the CPU backend. Verified on
+  each push by CI's macOS runner: the same per-quantization-type
+  cross-checks against the CPU backend that gate the Vulkan path, plus a
+  whole-model prefill and a batched decode on a real GGUF.
 - **CUDA** (`backend = cuda`, NVIDIA GPUs), **OpenCL** (`backend = opencl`,
   any OpenCL-capable GPU), and **ROCm** (`backend = rocm`, AMD GPUs via
   HIP) — each real and working, cross-checked in automated tests against
-  the CPU backend's own output, but scoped more narrowly than Vulkan: a
+  the CPU backend's own output, but scoped more narrowly than Vulkan and
+  Metal: a
   straightforward dequantizing matmul kernel without Vulkan's fused,
   GPU-resident optimizations. None of the three has been run against real
   NVIDIA/OpenCL/ROCm hardware during development, so treat them as
@@ -668,8 +686,10 @@ Four GPU backends are available, chosen via `backend` in the config (or
   own hardware. ROCm additionally requires building with the `rocm`
   Cargo feature, since it's off by default in a plain build.
 
-On macOS, `backend = auto` automatically detects the machine and runs on
-CPU, no configuration needed.
+On macOS, `backend = auto` needs no configuration: it finds the machine's
+Metal device and runs the model on the GPU. Earlier releases fell back to
+the CPU there, because Apple ships no Vulkan driver and Metal had no
+backend yet.
 
 Naming a `backend` explicitly fails to start rather than silently falling
 back to the CPU, for when GPU inference was asked for specifically.
@@ -863,7 +883,8 @@ but not a multiple of 256, so the file that download produces is mostly
 loads and runs; what the label predicts is the size, not a single tensor type.
 
 Type coverage differs by backend. Only `cpu` reads every type listed above.
-`vulkan` covers all of them except `IQ1_S`, `IQ1_M`, and `IQ2_XXS`; `cuda`,
+`vulkan` and `metal` — the same kernels — cover all of them except `IQ1_S`,
+`IQ1_M`, and `IQ2_XXS`; `cuda`,
 `opencl`, and `rocm` cover the float types, the legacy quants,
 `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and `IQ4_NL`. What's missing in each case
 is the `IQ*` types that index a lattice codebook the backend has no uploaded

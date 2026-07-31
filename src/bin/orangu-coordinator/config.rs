@@ -145,7 +145,7 @@ pub struct CoordinatorLlmEntry {
     pub port: u16,
     /// Forwarded verbatim to this profile's generated `[orangu-server].
     /// backend` key when set — `orangu-server` itself validates the value
-    /// (`auto`/`cpu`/`vulkan`/`cuda`/`opencl`/`rocm`), so this isn't
+    /// (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`), so this isn't
     /// re-validated here. `None` leaves `orangu-server`'s own default
     /// (`auto`) in place by simply omitting the key.
     pub backend: Option<String>,

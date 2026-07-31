@@ -704,6 +704,41 @@ pub fn coop_f16_tiles() -> bool {
     *F.get_or_init(|| std::env::var_os("ORANGU_COOP_F16_TILES").is_some())
 }
 
+/// Whether the tiled GEMM may hold its shared tiles as `vec4` — **a
+/// correctness question, not a tuning one**.
+///
+/// The tiled kernel is the only one that fills shared memory by having many
+/// threads each write a single dynamically-indexed *component* of a shared
+/// vector (`store_w`/`store_x`; four different threads write the four
+/// components of each `vec4`). On Vulkan/RADV that lowers to a 4-byte
+/// store and the reads can then take four values per load, which is what
+/// the `vec4` tiles are for.
+///
+/// On `wgpu`'s Metal backend it does not. Measured on a real device (CI's
+/// macOS runner, Apple Paravirtual): of each `vec4`, exactly one
+/// component survived the barrier and the other three read back as their
+/// initial value — the signature of a read-modify-write of the whole
+/// 16-byte vector, with the four writing threads clobbering one another.
+/// Every tiled-path cross-check disagreed with the CPU backend there,
+/// including plain `f32`, while the scalar-shared-memory reduce kernels
+/// all passed. `tests::shared_vec4_component_stores_survive_a_barrier` is
+/// that finding reduced to one kernel, and
+/// `tests::coop_tiles_are_vec4_only_where_component_stores_work` is what
+/// ties this function to it.
+///
+/// So `vec4` tiles are enabled only where they are known-correct, and
+/// anything else gets the scalar form: four loads where the `vec4` form
+/// takes one, same arithmetic, same tile layout, same results. Defaulting
+/// an unrecognized backend to the safe form is the deliberate direction —
+/// a new backend that silently computed wrong numbers would be far worse
+/// than one that is a little slower until someone runs the probe on it.
+///
+/// `ORANGU_COOP_SCALAR_TILES=1` forces the scalar form on for an A/B on a
+/// backend that does not need it.
+pub fn coop_vec4_tiles(backend: wgpu::Backend) -> bool {
+    backend == wgpu::Backend::Vulkan && std::env::var_os("ORANGU_COOP_SCALAR_TILES").is_none()
+}
+
 /// The geometry in force, read once from `ORANGU_COOP_GEOM`.
 pub fn coop_geom() -> CoopGeom {
     static G: std::sync::OnceLock<CoopGeom> = std::sync::OnceLock::new();
@@ -811,8 +846,7 @@ const RUN: u32 = %RUN%u;
 const RUNS_PER_ROW: u32 = CHUNK / RUN;
 const THREADS: u32 = %THREADS%u;
 
-var<workgroup> tile_w: array<vec4<%TILE_T%>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;
-var<workgroup> tile_x: array<vec4<%TILE_T%>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;
+%TILE_DECL%
 
 fn elem_at(row_byte_base: u32, k: u32) -> f32 {
     let block_idx = k / BLOCK_ELEMS;
@@ -825,7 +859,7 @@ fn elem_at(row_byte_base: u32, k: u32) -> f32 {
 // index arithmetic at each site.
 fn store_w(rr: u32, kk: u32, v: f32) {
     let widx = kk * TILE_ROWS + rr;
-    tile_w[widx >> 2u][widx & 3u] = %TILE_T%(v);
+%STORE_W%
 }
 
 // `tile_x` is k-major too (`k * TILE_TOKENS + token`), same reason as
@@ -833,7 +867,7 @@ fn store_w(rr: u32, kk: u32, v: f32) {
 // shared-memory addresses.
 fn store_x(tt: u32, kk: u32, v: f32) {
     let xidx = kk * TILE_TOKENS + tt;
-    tile_x[xidx >> 2u][xidx & 3u] = %TILE_T%(v);
+%STORE_X%
 }
 
 %RUN_FILL%
@@ -908,7 +942,11 @@ fn main(
 /// Generated from the same `REG_ROWS`/`REG_TOKENS` the tile constants above
 /// imply (4×4, from `TILE_ROWS`/`THREADS_Y` and `TILE_TOKENS`/`THREADS_X`),
 /// so the unrolled text cannot drift from the tile geometry.
-fn coop_tiled_register_block(g: CoopGeom, f16_tiles: bool) -> (String, String, String, usize) {
+fn coop_tiled_register_block(
+    g: CoopGeom,
+    f16_tiles: bool,
+    vec4_tiles: bool,
+) -> (String, String, String, usize) {
     let reg_rows = g.reg_rows as usize;
     let reg_tokens = g.reg_tokens as usize;
     // K iterations fused into one loop body; must divide the chunk.
@@ -930,32 +968,51 @@ fn coop_tiled_register_block(g: CoopGeom, f16_tiles: bool) -> (String, String, S
     // the FMA units waiting on LDS with nothing else in flight. Interleaving
     // `K_UNROLL` independent iterations gives the scheduler that other work,
     // and amortizes the loop's own compare/branch over 4× the arithmetic.
+    // With `vec4` tiles one load covers four of the block's values; with
+    // scalar tiles it takes four loads, so the load count — but nothing
+    // else — differs between the two forms. Both still issue every load for
+    // an unrolled step before the first FMA consumes one.
     let mut inner = String::new();
     for u in 0..k_unroll {
-        for i in 0..reg_rows.div_ceil(4) {
-            inner.push_str(&format!(
-                "            let wv{u}_{i} = tile_w[((k + {u}u) * TILE_ROWS + w_base) / 4u + {i}u];\n"
-            ));
-        }
-        for j in 0..reg_tokens.div_ceil(4) {
-            inner.push_str(&format!(
-                "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
-            ));
+        if vec4_tiles {
+            for i in 0..reg_rows.div_ceil(4) {
+                inner.push_str(&format!(
+                    "            let wv{u}_{i} = tile_w[((k + {u}u) * TILE_ROWS + w_base) / 4u + {i}u];\n"
+                ));
+            }
+            for j in 0..reg_tokens.div_ceil(4) {
+                inner.push_str(&format!(
+                    "            let xv{u}_{j} = tile_x[((k + {u}u) * TILE_TOKENS + x_base) / 4u + {j}u];\n"
+                ));
+            }
+        } else {
+            for i in 0..reg_rows {
+                inner.push_str(&format!(
+                    "            let wv{u}_{i} = tile_w[(k + {u}u) * TILE_ROWS + w_base + {i}u];\n"
+                ));
+            }
+            for j in 0..reg_tokens {
+                inner.push_str(&format!(
+                    "            let xv{u}_{j} = tile_x[(k + {u}u) * TILE_TOKENS + x_base + {j}u];\n"
+                ));
+            }
         }
     }
     for u in 0..k_unroll {
         for i in 0..reg_rows {
             for j in 0..reg_tokens {
-                let (w, x) = if f16_tiles {
-                    (
-                        format!("f32(wv{u}_{}[{}])", i / 4, i % 4),
-                        format!("f32(xv{u}_{}[{}])", j / 4, j % 4),
-                    )
-                } else {
+                let (w, x) = if vec4_tiles {
                     (
                         format!("wv{u}_{}[{}]", i / 4, i % 4),
                         format!("xv{u}_{}[{}]", j / 4, j % 4),
                     )
+                } else {
+                    (format!("wv{u}_{i}"), format!("xv{u}_{j}"))
+                };
+                let (w, x) = if f16_tiles {
+                    (format!("f32({w})"), format!("f32({x})"))
+                } else {
+                    (w, x)
                 };
                 inner.push_str(&format!(
                     "            acc_{i}_{j} = fma({w}, {x}, acc_{i}_{j});\n"
@@ -1027,7 +1084,13 @@ fn coop_tiled_weight_fill(ggml_type: u32, run: u32, amortized: bool) -> (String,
             } else {
                 store_w(rr, kk, 0.0);
             }
-            fi = fi + %THREADS%u;
+            // `THREADS`, the WGSL const, not the `%THREADS%` placeholder:
+            // this text is inserted via `%W_FILL%`, which the substitution
+            // chain applies *after* `%THREADS%`, so a placeholder here would
+            // survive into the final source and fail to parse. `ROLLED_X_FILL`
+            // — the sibling control, for `ORANGU_NO_TILE_X_STRAIGHT` — already
+            // does it this way.
+            fi = fi + THREADS;
         }
 "#
             .to_string(),
@@ -3890,12 +3953,30 @@ pub fn shader_source_coop(ggml_type: u32) -> Option<String> {
 /// alternative to [`shader_source_coop`] — see `MAIN_COOP_TILED_SUFFIX`'s
 /// own doc comment for the design, and `MAIN_COOP_SUFFIX`'s for why this
 /// is the default now.
-pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
+pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: bool) -> Option<String> {
     let middle = coop_middle(ggml_type)?;
     let prelude = prelude_for(ggml_type);
     let g = coop_geom();
     let f16_tiles = coop_f16_tiles();
-    let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block(g, f16_tiles);
+    let (acc_decl, inner, store, k_unroll) = coop_tiled_register_block(g, f16_tiles, vec4_tiles);
+    // The two shared tiles, and the one line each `store_w`/`store_x` needs
+    // to write into them. See [`vec4_tiles_supported`] for what decides
+    // which form a backend gets.
+    let (tile_decl, store_w, store_x) = if vec4_tiles {
+        (
+            "var<workgroup> tile_w: array<vec4<%TILE_T%>, (%TILE_ROWS%u * %CHUNK%u) / 4u>;\n\
+             var<workgroup> tile_x: array<vec4<%TILE_T%>, (%TILE_TOKENS%u * %CHUNK%u) / 4u>;",
+            "    tile_w[widx >> 2u][widx & 3u] = %TILE_T%(v);",
+            "    tile_x[xidx >> 2u][xidx & 3u] = %TILE_T%(v);",
+        )
+    } else {
+        (
+            "var<workgroup> tile_w: array<%TILE_T%, %TILE_ROWS%u * %CHUNK%u>;\n\
+             var<workgroup> tile_x: array<%TILE_T%, %TILE_TOKENS%u * %CHUNK%u>;",
+            "    tile_w[widx] = %TILE_T%(v);",
+            "    tile_x[xidx] = %TILE_T%(v);",
+        )
+    };
     let run = coop_tiled_run_len(g);
     // `ORANGU_NO_TILE_DEQUANT_RUN=1` restores the per-element fill this
     // replaced, so the two can be A/B'd in one build. Same output either way —
@@ -3903,6 +3984,9 @@ pub fn shader_source_coop_tiled(ggml_type: u32) -> Option<String> {
     let amortized = std::env::var_os("ORANGU_NO_TILE_DEQUANT_RUN").is_none();
     let (w_fill, run_fill) = coop_tiled_weight_fill(ggml_type, run, amortized);
     let suffix = MAIN_COOP_TILED_SUFFIX
+        .replace("%TILE_DECL%", tile_decl)
+        .replace("%STORE_W%", store_w)
+        .replace("%STORE_X%", store_x)
         .replace("%TILE_T%", if f16_tiles { "f16" } else { "f32" })
         .replace("%THREADS_Y%", &g.threads_y.to_string())
         .replace("%THREADS_X%", &g.threads_x.to_string())
@@ -4016,6 +4100,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// this decode-shaped dispatch is launch/occupancy-bound, not compute-bound —
 /// quartering the thread count underfills the GPU. Kept scalar; see
 /// `_scratch_measure_ffn_elementwise_dispatch_cost`.
+///
+/// # Why the argument is clamped
+///
+/// The cubic inside `tanh` grows fast: `|v| = 1000` already asks for
+/// `tanh(3.6e7)`. That is fine on a hardware SFU, which saturates, and fine
+/// in Rust (`f32::tanh`), which is what `engine::tensor::gelu` uses. It is
+/// **not** fine wherever `tanh` is lowered to `(exp(2x) - 1) / (exp(2x) + 1)`:
+/// `exp` overflows to `inf` and `inf / inf` is `NaN`. Measured on `wgpu`'s
+/// Metal backend, where every GELU-path cross-check returned `NaN` while
+/// every SwiGLU one passed — SiLU's `v / (1 + exp(-v))` has no such form,
+/// which is exactly why the two split.
+///
+/// `tanh` is already saturated to `±1.0` in `f32` well below `±20`, so the
+/// clamp changes no representable result: it is the same function, minus an
+/// overflow. Applied unconditionally rather than per-backend, because a
+/// kernel that returns `NaN` for large-but-finite input is wrong everywhere
+/// — it only happened to be unobservable on the one driver this was
+/// developed against.
 const GELU_SHADER_BODY: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -4030,7 +4132,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = x[i];
     let sqrt_2_over_pi = 0.7978846;
     let coef_a = 0.044715;
-    y[i] = 0.5 * v * (1.0 + tanh(sqrt_2_over_pi * v * (1.0 + coef_a * v * v)));
+    y[i] = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));
 }
 "#;
 
@@ -4056,7 +4158,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = a[i];
     let sqrt_2_over_pi = 0.7978846;
     let coef_a = 0.044715;
-    let g = 0.5 * v * (1.0 + tanh(sqrt_2_over_pi * v * (1.0 + coef_a * v * v)));
+    let g = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));
     y[i] = g * b[i];
 }
 "#;

@@ -292,7 +292,7 @@ impl Qwen35Model {
 
 impl ModelForward for Qwen35Model {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
-        self.backend.as_vulkan()
+        self.backend.as_wgpu()
     }
 
     fn config(&self) -> &ModelConfig {

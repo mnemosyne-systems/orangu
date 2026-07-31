@@ -85,10 +85,15 @@ binary instead.
 
 ## GPU backends
 
-`orangu-server`'s Vulkan/CUDA/OpenCL GPU backends (`engine::backend::
-vulkan`/`cuda`/`opencl`) are always compiled in — a plain `cargo build`
+`orangu-server`'s Vulkan/Metal/CUDA/OpenCL GPU backends (`engine::backend::
+vulkan`/`metal`/`cuda`/`opencl`) are always compiled in — a plain `cargo
+build`
 needs nothing beyond what's already covered above, since `wgpu`/`cudarc`/
 `opencl3` all dlopen their vendor library at *runtime*, not build time.
+Metal needs no build-time setup of its own either: it is the same `wgpu`
+engine as the Vulkan backend, asked for a Metal adapter instead, and
+`wgpu`'s `metal` feature is already in `Cargo.toml`. It finds a device
+only on macOS, so a Linux or Windows build simply never selects it.
 
 The ROCm/HIP backend (`engine::backend::rocm`) is the one exception: it's
 behind a `rocm` Cargo feature, off by default, because its underlying
@@ -103,10 +108,12 @@ cargo build --release --features rocm
 ```
 
 See `doc/manual/en/78-server.md` (the Developer information chapter's
-"CUDA, OpenCL, and ROCm backends" section) for what each of the three
-non-Vulkan GPU backends actually implements (a real but smaller-scoped
+"CUDA, OpenCL, and ROCm backends" section) for what each of those three
+backends actually implements (a real but smaller-scoped
 `matmul`-only kernel, unverified on real hardware — none of CUDA, OpenCL,
-or ROCm hardware was available when they were built).
+or ROCm hardware was available when they were built). Metal is not in that
+group: it shares the Vulkan backend's kernels outright, so it is at full
+parity and is covered by the same tests.
 
 ## Test
 

@@ -20,7 +20,10 @@
 //! Implementors: `CpuBackend` (scalar with runtime AVX2 dispatch, always
 //! available); `VulkanBackend` (compute shaders via `wgpu`, the most
 //! mature GPU backend — real fused attention/RoPE/layer submissions,
-//! verified against real AMD hardware, see its own module doc); `cuda`'s
+//! verified against real AMD hardware, see its own module doc); `metal`'s
+//! `MetalBackend` (that *same* engine and the same WGSL kernels, brought
+//! up on `wgpu`'s Metal backend for Apple GPUs — not a reimplementation,
+//! see its module doc); `cuda`'s
 //! `CudaBackend` and `opencl`'s `OpenClBackend` (both dlopen their vendor
 //! library at runtime, same as `wgpu`, so both are always compiled in);
 //! `rocm`'s `RocmBackend` (behind the `rocm` Cargo feature, off by
@@ -28,7 +31,8 @@
 //! library at *build* time, see that module's own doc comment for why).
 //! `CudaBackend`/`OpenClBackend`/`RocmBackend` are each a real but
 //! smaller-scoped `matmul`-only implementation — see their module docs for
-//! exactly what's ported and what isn't.
+//! exactly what's ported and what isn't; `MetalBackend` is the one that
+//! is at full parity, because it is the same code.
 //!
 //! Earlier revisions of this file claimed AMD GPUs are reached only through
 //! `VulkanBackend` (Mesa/RADV implements Vulkan on AMD hardware directly)
@@ -40,6 +44,7 @@
 
 pub mod cpu;
 pub mod cuda;
+pub mod metal;
 pub mod opencl;
 #[cfg(feature = "rocm")]
 pub mod rocm;
@@ -49,6 +54,7 @@ pub mod vulkan_shaders;
 
 pub use cpu::CpuBackend;
 pub use cuda::CudaBackend;
+pub use metal::MetalBackend;
 pub use opencl::OpenClBackend;
 #[cfg(feature = "rocm")]
 pub use rocm::RocmBackend;
@@ -116,15 +122,22 @@ pub trait Backend: Send + Sync {
         self.matmul_batch(ops)
     }
 
-    /// Downcast hook for the one GPU-specific fast path that doesn't fit
-    /// this trait's backend-agnostic shape: `VulkanBackend::
+    /// Downcast hook for the GPU-specific fast paths that don't fit this
+    /// trait's backend-agnostic shape: `VulkanBackend::
     /// fused_post_attention` chains a whole gemma4 sub-layer's matmuls and
     /// elementwise/norm ops into a single GPU submission, which needs
     /// `VulkanBackend`'s own buffer-cache internals, not just `matmul`/
     /// `matmul_batch`. `CpuBackend` has no round-trip cost to amortize
     /// there, so it keeps the default `None` and callers fall back to the
     /// ordinary step-by-step path.
-    fn as_vulkan(&self) -> Option<&VulkanBackend> {
+    ///
+    /// Named for `wgpu`, not for Vulkan, because two backends answer
+    /// `Some` here: `VulkanBackend` itself and [`MetalBackend`], which is
+    /// the same `wgpu` engine and the same WGSL kernels brought up on
+    /// Metal (see `metal`'s module doc). Everything reached through this
+    /// hook is therefore live on Apple GPUs too — a `Some` here means "a
+    /// `wgpu` device with orangu's fused pipelines on it", not "Vulkan".
+    fn as_wgpu(&self) -> Option<&VulkanBackend> {
         None
     }
 

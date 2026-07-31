@@ -1052,7 +1052,7 @@ impl GemmaModel {
             let mut fused_attn_buf: Option<wgpu::Buffer> = None;
             let fused_attn = self
                 .backend
-                .as_vulkan()
+                .as_wgpu()
                 .filter(|vulkan| vulkan.prefill_fused_attention_enabled())
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
@@ -1264,7 +1264,7 @@ impl GemmaModel {
             // time, and it takes the step-by-step path below.
             let t0 = Instant::now();
             let fused_layer = if layer.moe.is_none() {
-                self.backend.as_vulkan().and_then(|vulkan| {
+                self.backend.as_wgpu().and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
                         match &fused_attn_buf {
                             Some(b) => {
@@ -1350,7 +1350,7 @@ impl GemmaModel {
                     // for `ORANGU_Q4K_MMVQ`, which needs a quantize pass the fused
                     // recorder doesn't emit.
                     let t0 = Instant::now();
-                    let fused = self.backend.as_vulkan().and_then(|vulkan| {
+                    let fused = self.backend.as_wgpu().and_then(|vulkan| {
                         vulkan.fused_ffn_prefill(
                             &ffn_normed,
                             n_tokens,
@@ -1436,7 +1436,7 @@ impl GemmaModel {
                 // the same strided slices one token at a time instead.
                 let t0 = Instant::now();
                 let mut gather_ms = 0.0;
-                let fused = self.backend.as_vulkan().and_then(|vulkan| {
+                let fused = self.backend.as_wgpu().and_then(|vulkan| {
                     let t_gather = Instant::now();
                     let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
                     for t in 0..n_tokens {
@@ -1479,7 +1479,7 @@ impl GemmaModel {
         // Once per prefill, not per layer: what the backend's own allocators
         // have committed. `mem_info_vram_used` gives the total; this attributes
         // it (P11).
-        if let Some(vulkan) = self.backend.as_vulkan().filter(|_| prefill_trace) {
+        if let Some(vulkan) = self.backend.as_wgpu().filter(|_| prefill_trace) {
             eprintln!("{}", vulkan.footprint_report());
         }
 
@@ -1845,7 +1845,7 @@ impl GemmaModel {
 
 impl ModelForward for GemmaModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
-        self.backend.as_vulkan()
+        self.backend.as_wgpu()
     }
 
     fn config(&self) -> &ModelConfig {
@@ -1882,7 +1882,7 @@ impl ModelForward for GemmaModel {
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let trace = *TRACE.get_or_init(|| std::env::var("ORANGU_GPU_TRACE").is_ok());
         let submissions_before = (trace && n_tokens == 1)
-            .then(|| self.backend.as_vulkan())
+            .then(|| self.backend.as_wgpu())
             .flatten()
             .map(|v| v.submission_count());
 
@@ -1933,7 +1933,7 @@ impl ModelForward for GemmaModel {
         // and by `Self::forward_hidden_states`) still does internally.
         let mut logits = if n_tokens == 1
             && !self.is_moe
-            && let Some(vulkan) = self.backend.as_vulkan()
+            && let Some(vulkan) = self.backend.as_wgpu()
         {
             // See `Self::record_decode_forward`'s own doc comment for
             // what's recorded; GPU submissions per decode token dropped
@@ -1975,7 +1975,7 @@ impl ModelForward for GemmaModel {
             }
         }
         if let Some(before) = submissions_before
-            && let Some(vulkan) = self.backend.as_vulkan()
+            && let Some(vulkan) = self.backend.as_wgpu()
         {
             eprintln!(
                 "orangu-server: [gpu-trace] {} GPU submissions for this decode step (pos {start_pos})",
@@ -2106,7 +2106,7 @@ impl ModelForward for GemmaModel {
         if tokens.len() == 1
             && !self.is_moe
             && (force || (replay_supported && replay_on))
-            && let Some(vulkan) = self.backend.as_vulkan()
+            && let Some(vulkan) = self.backend.as_wgpu()
         {
             return self.decode_forward_replay(
                 vulkan,
@@ -2126,7 +2126,7 @@ impl ModelForward for GemmaModel {
         if tokens.len() == 1
             && !self.is_moe
             && let Some(params) = &greedy_sample
-            && let Some(vulkan) = self.backend.as_vulkan()
+            && let Some(vulkan) = self.backend.as_wgpu()
             && vulkan.gpu_sample()
         {
             let n_embd = self.config.n_embd;
@@ -2240,7 +2240,7 @@ impl ModelForward for GemmaModel {
         }
 
         if !self.is_moe
-            && let Some(vulkan) = self.backend.as_vulkan()
+            && let Some(vulkan) = self.backend.as_wgpu()
         {
             return Ok(self
                 .record_batched_decode_forward(vulkan, items)
@@ -2871,6 +2871,7 @@ pub(crate) fn rmsnorm_weightless_inplace(x: &mut [f32], n_rows: usize, dim: usiz
 mod real_model_tests {
     use super::*;
     use crate::engine::arch::ModelForward;
+    use crate::engine::backend::vulkan::NO_GPU_SKIP;
 
     /// Cross-check against real llama.cpp: given the correct token IDs for
     /// "The capital of France is" (BOS=2 prepended, matching real
@@ -2888,11 +2889,40 @@ mod real_model_tests {
     #[test]
     #[ignore]
     fn gemma4_predicts_paris_after_capital_of_france() {
+        check_predicts_paris(Arc::new(crate::engine::backend::CpuBackend));
+    }
+
+    /// The same end-to-end assertion on a real GGUF, run through
+    /// [`MetalBackend`] — a whole prefill (every projection, every norm,
+    /// split-k attention, the fused sub-layer chains `Backend::as_wgpu`
+    /// unlocks, the output projection) on an Apple GPU, checked against a
+    /// prediction llama.cpp independently agrees on.
+    ///
+    /// The per-`ggml_type` cross-checks in `engine::backend::vulkan`'s test
+    /// module already prove the Metal kernels compute the right numbers for
+    /// one matmul at a time. This proves the whole model does, which is a
+    /// different claim: it is the test that would catch a fused chain
+    /// silently producing garbage, or an attention kernel that only looks
+    /// right at test-shaped dimensions.
+    ///
+    /// Skips (rather than fails) with no Metal device, so it is harmless on
+    /// the Linux/Windows CI runners; the macOS runner is where it does its
+    /// work, and `MetalBackend`'s own unit test is what fails loudly there
+    /// if the adapter is missing entirely.
+    #[test]
+    #[ignore]
+    fn gemma4_predicts_paris_after_capital_of_france_metal() {
+        let Some(metal) = crate::engine::backend::MetalBackend::try_init() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        check_predicts_paris(Arc::new(metal));
+    }
+
+    fn check_predicts_paris(backend: Arc<dyn crate::engine::backend::Backend>) {
         let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
         let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
-        let model =
-            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
-                .expect("build model");
+        let model = GemmaModel::load_with_backend(&loaded, backend).expect("build model");
 
         let mut cache = model.new_kv_cache(64);
         let tokens: Vec<u32> = vec![2, 818, 5279, 529, 7001, 563];
@@ -3150,10 +3180,26 @@ mod real_model_tests {
     #[ignore]
     fn forward_batch_decode_matches_independent_forward_calls_vulkan() {
         let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let backend: Arc<dyn crate::engine::backend::Backend> = Arc::new(vulkan);
+        check_forward_batch_decode_matches_independent(backend);
+    }
+
+    /// The Metal twin of the Vulkan case above, and it holds for the same
+    /// reason: `MetalBackend` *is* that backend's engine on another `wgpu`
+    /// API, so batched and independent decode run literally the same
+    /// dispatches here too, and bit-for-bit equality is the right bar
+    /// rather than a tolerance. Skipped where there is no Metal device.
+    #[test]
+    #[ignore]
+    fn forward_batch_decode_matches_independent_forward_calls_metal() {
+        let Some(metal) = crate::engine::backend::MetalBackend::try_init() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        let backend: Arc<dyn crate::engine::backend::Backend> = Arc::new(metal);
         check_forward_batch_decode_matches_independent(backend);
     }
 
@@ -3257,7 +3303,7 @@ mod real_model_tests {
     #[ignore]
     fn forward_batch_decode_identical_prompts_stay_identical_over_many_steps_vulkan() {
         let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let backend: Arc<dyn crate::engine::backend::Backend> = Arc::new(vulkan);

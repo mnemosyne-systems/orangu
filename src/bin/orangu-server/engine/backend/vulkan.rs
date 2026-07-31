@@ -23,6 +23,21 @@
 //! specifically, but this path needs nothing beyond a working Vulkan
 //! driver.
 //!
+//! **Not only Vulkan.** Everything below the `wgpu` API in this module —
+//! every pipeline, every WGSL kernel in `vulkan_shaders`, the weight/op
+//! caches, the fused decode and prefill submissions — is written against
+//! portable `wgpu`/WGSL and is not Vulkan-specific. `Self::try_init`
+//! therefore takes the `wgpu::Backends` set to look in, and
+//! `engine::backend::metal::MetalBackend` builds this same type on
+//! `wgpu::Backends::METAL` so Apple GPUs run the identical kernels through
+//! Metal (`naga` translates the WGSL to MSL instead of SPIR-V). The type
+//! keeps its name because Vulkan is what it is built and tuned against on
+//! the project's own hardware; [`Self::wgpu_backend`] records which API a
+//! given instance actually came up on, and the *few* genuinely
+//! Vulkan-only paths (the SPIR-V passthrough kernel, the persistent
+//! pipeline cache, the raw-Vulkan replay harness) check it rather than
+//! assuming.
+//!
 //! Each supported `ggml_type` gets two compute pipelines — `pipelines`
 //! (`vulkan_shaders::shader_source_reduce`, one workgroup per `(row,
 //! token)` pair reducing across all 64 threads, used for small `n_tokens`
@@ -1126,6 +1141,12 @@ pub struct VulkanBackend {
     /// The adapter's own description (the driver's GPU name string) — for
     /// the startup banner.
     pub adapter_name: String,
+    /// Which `wgpu` API this instance actually came up on — `Vulkan` for
+    /// [`VulkanBackend::try_init`], `Metal` for `engine::backend::metal::
+    /// MetalBackend`. Only the handful of paths that genuinely cannot be
+    /// expressed portably consult it (see the module doc); everything else
+    /// goes through `wgpu` and does not care.
+    wgpu_backend: wgpu::Backend,
     /// Bind group layout shared by `add_pipeline`/`mul_pipeline`/
     /// `rmsnorm_pipeline` — see `elem4_bind_group_layout`.
     elem4_bind_group_layout: wgpu::BindGroupLayout,
@@ -2210,7 +2231,11 @@ struct ReadbackSplit {
 /// dim` for the attention kernels isn't known this early, so they're dumped
 /// at a representative width noted in the filename. Best-effort — any I/O
 /// error is logged and skipped, never fatal.
-fn dump_shaders_if_requested(subgroup: bool, kv_storage: vulkan_shaders::KvStorage) {
+fn dump_shaders_if_requested(
+    subgroup: bool,
+    kv_storage: vulkan_shaders::KvStorage,
+    vec4_tiles: bool,
+) {
     let Some(dir) = std::env::var_os("ORANGU_DUMP_SHADERS") else {
         return;
     };
@@ -2264,7 +2289,7 @@ fn dump_shaders_if_requested(subgroup: bool, kv_storage: vulkan_shaders::KvStora
         // against a K-quant's isolates exactly what dequantization costs.
         ("f32", crate::engine::quant::GGML_TYPE_F32),
     ] {
-        if let Some(src) = vulkan_shaders::shader_source_coop_tiled(ggml_type) {
+        if let Some(src) = vulkan_shaders::shader_source_coop_tiled(ggml_type, vec4_tiles) {
             shaders.push((format!("{name}_matmul_tiled_prefill.wgsl"), src));
         }
     }
@@ -2330,8 +2355,29 @@ impl VulkanBackend {
     /// Vulkan driver is present, or device/pipeline creation otherwise
     /// fails — callers fall back to `CpuBackend` in that case.
     pub fn try_init() -> Option<Self> {
+        Self::try_init_backends(wgpu::Backends::VULKAN)
+    }
+
+    /// Which `wgpu` API this instance actually came up on. `Vulkan` for
+    /// [`Self::try_init`]; `Metal` when `engine::backend::metal::
+    /// MetalBackend` built it. See the module doc for what does and does
+    /// not depend on the answer.
+    pub fn wgpu_backend(&self) -> wgpu::Backend {
+        self.wgpu_backend
+    }
+
+    /// [`Self::try_init`] against an arbitrary `wgpu` API set, so the same
+    /// kernels can be brought up on Metal (`engine::backend::metal::
+    /// MetalBackend`) without a second copy of this 20k-line module. Same
+    /// contract: `None`, never a panic, when no adapter in `backends` is
+    /// usable.
+    ///
+    /// `backends` is a *set* rather than a single API only because that is
+    /// `wgpu`'s own shape; callers pass exactly one bit, so
+    /// `Self::wgpu_backend` is unambiguous.
+    pub fn try_init_backends(backends: wgpu::Backends) -> Option<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -2343,6 +2389,7 @@ impl VulkanBackend {
         .ok()?;
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
+        let wgpu_backend = info.backend;
 
         // Request the adapter's own limits rather than wgpu's conservative
         // portable defaults (128MiB storage buffers) — a model's larger
@@ -2416,6 +2463,10 @@ impl VulkanBackend {
         // entirely and is measurably faster at prompt lengths where both
         // variants can still complete.
         let tiled_prefill = std::env::var_os("ORANGU_NO_TILED_PREFILL").is_none();
+        // Whether the tiled kernel's shared tiles may be `vec4` — a
+        // correctness question this API's own behaviour decides, not a
+        // tuning knob. See `vulkan_shaders::coop_vec4_tiles`.
+        let vec4_tiles = vulkan_shaders::coop_vec4_tiles(wgpu_backend);
         // See `Self::coop_min_n_tokens`'s own doc comment. Read once, clamped
         // to at least 1 (a `0` would divide by zero in the reduce dispatch
         // math); a malformed value falls back to the compile-time default.
@@ -2545,7 +2596,7 @@ impl VulkanBackend {
         let attn_split_k_pinned = attn_split_k_override.is_some();
         let attn_split_k =
             attn_split_k_override.unwrap_or(if attn_coop { 32 } else { ATTN_SPLIT_K_DEFAULT });
-        dump_shaders_if_requested(subgroup_reduce, kv_storage);
+        dump_shaders_if_requested(subgroup_reduce, kv_storage, vec4_tiles);
         // Per-layer GPU timestamps for one decode step (`Self::
         // timestamp_query_set`/`finish_timestamps`/`report_timestamps`,
         // written from `GemmaModel::record_decode_forward`). Needs both the
@@ -2586,19 +2637,27 @@ impl VulkanBackend {
         let gpu_timestamps = supports_timestamp_query && wants_timestamps;
         // A persistent, on-disk pipeline
         // cache — `wgpu::util::pipeline_cache_key` returns
-        // `Some` only for the Vulkan backend (the only one this project
-        // ever requests, `wgpu::Backends::VULKAN` above) and only encodes
+        // `Some` only for the Vulkan backend and only encodes
         // the info needed to keep a cache from one GPU/driver from being
         // loaded on an incompatible one; the driver itself does a further,
         // stricter validation of the blob it's handed (see `Self::
-        // try_init`'s own comment where the cache is actually created).
+        // try_init_backends`'s own comment where the cache is actually
+        // created). On Metal it is simply `None` and no cache is built —
+        // nothing else here has to special-case that.
         let supports_pipeline_cache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
         let pipeline_cache_key = wgpu::util::pipeline_cache_key(&info);
         // SPIR-V passthrough for the glslc-compiled Q4_K GEMV kernel —
         // hands RADV glslc's SPIR-V directly, bypassing naga's WGSL codegen.
-        let supports_passthrough = adapter
-            .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        //
+        // `PASSTHROUGH_SHADERS` is *also* advertised by wgpu's Metal
+        // backend, where it means MSL passthrough — handing it
+        // `Q4K_GLSL_GEMV_SPIRV` would be handing a Metal driver a SPIR-V
+        // blob. The feature bit alone is therefore not enough to gate on;
+        // this path needs the API whose shader IR the constant actually is.
+        let supports_passthrough = wgpu_backend == wgpu::Backend::Vulkan
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS);
         let q4k_glsl = supports_passthrough && std::env::var_os("ORANGU_Q4K_GLSL").is_some();
         let mut required_features = if supports_f16 {
             wgpu::Features::SHADER_F16
@@ -2740,7 +2799,9 @@ impl VulkanBackend {
             );
             pipelines_coop_tiled.insert(
                 ggml_type,
-                build_pipeline(vulkan_shaders::shader_source_coop_tiled(ggml_type)?),
+                build_pipeline(vulkan_shaders::shader_source_coop_tiled(
+                    ggml_type, vec4_tiles,
+                )?),
             );
         }
 
@@ -3234,6 +3295,7 @@ impl VulkanBackend {
             argmax_sample_cache: Mutex::new(HashMap::new()),
             uniform_arena: Mutex::new(ScratchArena::new()),
             adapter_name,
+            wgpu_backend,
             elem4_bind_group_layout,
             elem3_bind_group_layout,
             add_pipeline,
@@ -3446,7 +3508,7 @@ impl Backend for VulkanBackend {
         self.matmul_batch_striped(ops, n_tokens)
     }
 
-    fn as_vulkan(&self) -> Option<&VulkanBackend> {
+    fn as_wgpu(&self) -> Option<&VulkanBackend> {
         Some(self)
     }
 }
@@ -12690,11 +12752,41 @@ struct FusedResources {
 /// test run creates exactly one `wgpu::Instance`/`Device`. Multiple concurrent
 /// instances intermittently SIGSEGV below wgpu (see `tests::shared_vulkan`), so
 /// the replay tests must reuse this device rather than boot their own.
+///
+/// Built on whichever `wgpu` API this platform actually has: Vulkan
+/// everywhere the project develops against it, Metal on Apple, where there
+/// is no Vulkan backend at all (`engine::backend::metal`). That is what
+/// makes the per-`ggml_type` cross-checks below — which are ordinary
+/// non-`#[ignore]` tests — run against a real Metal device on the macOS CI
+/// runner instead of silently skipping, which is all the coverage the
+/// Metal path would otherwise have.
 #[cfg(test)]
 pub(crate) fn shared_test_backend() -> Option<&'static VulkanBackend> {
     static BACKEND: std::sync::OnceLock<Option<VulkanBackend>> = std::sync::OnceLock::new();
-    BACKEND.get_or_init(VulkanBackend::try_init).as_ref()
+    BACKEND
+        .get_or_init(|| VulkanBackend::try_init_backends(test_backends()))
+        .as_ref()
 }
+
+/// The `wgpu` API [`shared_test_backend`] looks in.
+#[cfg(test)]
+pub(crate) fn test_backends() -> wgpu::Backends {
+    if cfg!(target_vendor = "apple") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
+    }
+}
+
+/// What a GPU test prints when [`shared_test_backend`] found nothing —
+/// naming the API actually looked for, so a skipped run on the macOS CI
+/// runner does not read as "Vulkan is missing" (it always is, there) and
+/// send the reader hunting for the wrong thing.
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) const NO_GPU_SKIP: &str = "skipping: no Metal adapter available in this environment";
+/// See the Apple-side twin above.
+#[cfg(all(test, not(target_vendor = "apple")))]
+pub(crate) const NO_GPU_SKIP: &str = "skipping: no Vulkan adapter available in this environment";
 
 impl VulkanBackend {
     /// The underlying `wgpu::Device` — used by the raw-Vulkan replay path
@@ -12838,6 +12930,12 @@ mod tests {
     /// intermittently. Concurrent *use* of one Vulkan device is safe (and
     /// is what this pool now proves); concurrent *creation* of several was
     /// not — and was never something the real server does anyway.
+    ///
+    /// Not necessarily a *Vulkan* device: [`shared_test_backend`] asks for
+    /// whichever `wgpu` API the platform has, which is Metal on Apple. Every
+    /// cross-check below is written against `wgpu`, not against Vulkan, so
+    /// they are the Metal backend's correctness tests too — see
+    /// `engine::backend::metal`.
     fn shared_vulkan() -> Option<&'static VulkanBackend> {
         // Delegates to the module-level single shared backend so this module's
         // tests and `vulkan_replay`'s share one `wgpu::Device` across the whole
@@ -12858,7 +12956,7 @@ mod tests {
     #[ignore]
     fn _scratch_measure_streaming_bandwidth() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         // Same kernel at three load widths: 16 B (`vec4<f32>`), 8 B and 4 B.
@@ -13084,6 +13182,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return;
             }
         };
+        // Vulkan specifically, not `test_backends()`: this test exists to
+        // read back RADV's ACO disassembly via `RADV_DEBUG`, which no other
+        // driver produces. Hence its own skip message rather than
+        // `NO_GPU_SKIP` — on a Mac the honest answer is "wrong driver", not
+        // "no adapter".
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -13140,7 +13243,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     #[ignore]
     fn _scratch_measure_attention_dispatch_cost() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -13324,7 +13427,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     #[ignore]
     fn _scratch_measure_ffn_elementwise_dispatch_cost() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -13604,7 +13707,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     #[ignore]
     fn _scratch_sweep_attn_split_k() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         for k_num in [1u32, 2, 4, 8, 16] {
@@ -13743,7 +13846,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     #[ignore]
     fn _scratch_measure_rmsnorm_workgroup_size_and_subgroup() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if !vulkan.device.features().contains(wgpu::Features::SUBGROUP) {
@@ -14130,7 +14233,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[ignore]
     fn _scratch_measure_argmax_dispatch_cost() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let n_vocab = 262144usize;
@@ -14347,7 +14450,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[ignore]
     fn _scratch_measure_prefill_gemm() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         // Same output size (so upload/readback/submission cost is identical)
@@ -14394,6 +14497,251 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// quantization loss on this test's adversarial random-uniform data is
     /// several % — far above the tolerance below, and not something the GPU
     /// kernel (which keeps activations in `f32`) should be reproducing.
+    /// Runs `wgsl` (one workgroup of `threads`, entry point `main`, one
+    /// `read_write` storage buffer at `@binding(0)`) and reads back
+    /// `out_len` floats. A minimal harness for kernels that test a single
+    /// language/hardware behaviour rather than any of orangu's own math —
+    /// nothing here touches the backend's layouts or caches.
+    fn run_probe_kernel(
+        vulkan: &VulkanBackend,
+        wgsl: &str,
+        threads: u32,
+        out_len: usize,
+    ) -> Vec<f32> {
+        let device = &vulkan.device;
+        let bytes = (out_len * 4) as u64;
+        let out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe out"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("probe"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("probe"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: out.as_entire_binding(),
+            }],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("probe"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("probe"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, bytes);
+        vulkan.queue.submit(Some(enc.finish()));
+        let slice = read.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = slice.get_mapped_range().expect("map probe readback");
+        let values: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        read.unmap();
+        let _ = threads;
+        values
+    }
+
+    /// **The invariant `vulkan_shaders::coop_vec4_tiles` has to satisfy**, and
+    /// the language-level probe it rests on.
+    ///
+    /// Many threads each write one *component* of a shared `vec4<f32>`,
+    /// barrier, then read the completed `vec4`s back — exactly what
+    /// `store_w`/`store_x` do to fill `tile_w`/`tile_x` in the tiled prefill
+    /// GEMM, and the one pattern that kernel uses which no other kernel does.
+    /// If that does not land as a 4-byte store, four threads read-modify-write
+    /// the same 16 bytes and three of every four values are lost.
+    ///
+    /// This exists because the tiled GEMM was the *only* thing that broke when
+    /// this WGSL was first run through Metal: every scalar-shared-memory
+    /// kernel (the whole reduce/GEMV family, every quant type) agreed with the
+    /// CPU backend, while every test routing through the tiled path disagreed
+    /// or produced `NaN`, including plain `f32` with no dequant in play. On
+    /// CI's Apple Paravirtual device this probe returned
+    /// `[1, 0, 0, 0, 5, 0, 0, 0, …]` — one surviving component per vector,
+    /// precisely the predicted clobber — while RADV returns all 64 values.
+    ///
+    /// Asserted **one-directionally**: a backend using `vec4` tiles must pass
+    /// the probe. The converse is deliberately not required, so a driver that
+    /// later gains component-granular stores does not fail this test merely
+    /// for still being on the (correct, slightly slower) scalar form until
+    /// someone measures the switch.
+    #[test]
+    fn coop_tiles_are_vec4_only_where_component_stores_work() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        // 64 threads, 64 f32 slots = 16 shared vec4s. Thread `t` writes slot
+        // `t` (vec4 `t >> 2`, component `t & 3`) — so four different threads
+        // write four components of each vec4, which is the racy case if the
+        // store is not component-granular.
+        const SRC: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+var<workgroup> tile: array<vec4<f32>, 16>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    tile[t >> 2u][t & 3u] = f32(t) + 1.0;
+    workgroupBarrier();
+    // Read back whole vec4s, the way the tiled GEMM's register block does.
+    if (t < 16u) {
+        let v = tile[t];
+        out[t * 4u + 0u] = v.x;
+        out[t * 4u + 1u] = v.y;
+        out[t * 4u + 2u] = v.z;
+        out[t * 4u + 3u] = v.w;
+    }
+}
+"#;
+        let got = run_probe_kernel(vulkan, SRC, 64, 64);
+        let want: Vec<f32> = (0..64).map(|i| i as f32 + 1.0).collect();
+        let component_stores_work = got == want;
+        if vulkan_shaders::coop_vec4_tiles(vulkan.wgpu_backend()) {
+            assert!(
+                component_stores_work,
+                "{} builds the tiled GEMM with vec4 tiles, but component-wise \
+                 stores into shared vec4 memory do not survive a barrier there \
+                 — every tiled-path result on this device is wrong. Got {got:?}",
+                vulkan.adapter_name
+            );
+        } else if component_stores_work {
+            // Not a failure — the scalar form is always correct — but worth
+            // saying, since it is the one measurement that would justify
+            // turning `vec4` tiles on for this backend.
+            eprintln!(
+                "note: {} passes the component-store probe but is on scalar \
+                 tiles; vec4 tiles may be worth measuring here",
+                vulkan.adapter_name
+            );
+        }
+    }
+
+    /// The control for [`coop_tiles_are_vec4_only_where_component_stores_work`]:
+    /// the same shared tile filled by *whole*-`vec4` stores, one thread per
+    /// vector. It passes on Metal, where the component version does not —
+    /// which is what pins the fault to the component store specifically
+    /// rather than to shared `vec4` memory, the barrier, or the readback.
+    ///
+    /// It also rules out the tempting cheaper fix. Whole-`vec4` stores work
+    /// everywhere, but the tiled kernel cannot use them without changing its
+    /// tile layout: `store_w`'s four consecutive slots are four consecutive
+    /// *rows* at one `k`, while the fill deliberately gives one thread `RUN`
+    /// consecutive `k` of one row so a quantized block's scale/min hoist once
+    /// per run. Hence the scalar tile rather than a restructured fill.
+    #[test]
+    fn shared_vec4_whole_stores_survive_a_barrier() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        const SRC: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+var<workgroup> tile: array<vec4<f32>, 16>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    if (t < 16u) {
+        let b = f32(t * 4u);
+        tile[t] = vec4<f32>(b + 1.0, b + 2.0, b + 3.0, b + 4.0);
+    }
+    workgroupBarrier();
+    if (t < 16u) {
+        let v = tile[t];
+        out[t * 4u + 0u] = v.x;
+        out[t * 4u + 1u] = v.y;
+        out[t * 4u + 2u] = v.z;
+        out[t * 4u + 3u] = v.w;
+    }
+}
+"#;
+        let got = run_probe_kernel(vulkan, SRC, 64, 64);
+        let want: Vec<f32> = (0..64).map(|i| i as f32 + 1.0).collect();
+        assert_eq!(got, want, "whole-vec4 shared stores are broken too");
+    }
+
+    /// The GELU kernels must stay finite for large-but-finite input.
+    ///
+    /// `GELU_SHADER_BODY`'s cubic reaches `tanh(3.6e7)` at `|v| = 1000`.
+    /// Where `tanh` is a saturating hardware instruction that is harmless;
+    /// where it is lowered to `(exp(2x) - 1) / (exp(2x) + 1)` — `wgpu`'s
+    /// Metal backend — `exp` overflows and the result is `NaN`. That is what
+    /// made every GELU-path fused cross-check fail on Metal while every
+    /// SwiGLU one passed, and it is why the shader clamps the argument.
+    ///
+    /// Checked against the CPU `gelu` this is a port of, so the test says
+    /// "the two implementations still agree at the extremes" rather than
+    /// merely "not NaN" — a clamp that was too tight would fail here too.
+    #[test]
+    fn gelu_kernel_stays_finite_at_large_inputs() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        // Spans the range a badly-scaled activation can reach, both signs,
+        // well past where the cubic overflows a naive `tanh`.
+        const SRC: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    // -1e5 .. 1e5, dense near zero and reaching far past saturation.
+    let v = (f32(t) - 32.0) * 3125.0;
+    let sqrt_2_over_pi = 0.7978846;
+    let coef_a = 0.044715;
+    out[t] = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));
+}
+"#;
+        let got = run_probe_kernel(vulkan, SRC, 64, 64);
+        for (t, g) in got.iter().enumerate() {
+            let v = (t as f32 - 32.0) * 3125.0;
+            let want = crate::engine::tensor::gelu(v);
+            assert!(
+                g.is_finite(),
+                "gelu({v}) came back {g} on {} — the tanh argument overflowed",
+                vulkan.adapter_name
+            );
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (g - want).abs() <= tol,
+                "gelu({v}): gpu={g} cpu={want} on {}",
+                vulkan.adapter_name
+            );
+        }
+    }
+
     fn cross_check(ggml_type: u32, in_dim: usize, out_dim: usize) {
         cross_check_n_tokens(ggml_type, in_dim, out_dim, 3);
     }
@@ -14405,7 +14753,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// never reaches.
     fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -14920,7 +15268,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// two paths only disagree above it.
     fn cross_check_recorded_matmul(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15019,7 +15367,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn concurrent_prefill_matmuls_on_same_shaped_weights_do_not_corrupt_each_other() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15144,7 +15492,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn concurrent_fused_ffn_prefills_do_not_corrupt_each_other() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15185,7 +15533,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn concurrent_fused_post_attention_prefills_do_not_corrupt_each_other() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15260,7 +15608,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn concurrent_fused_attention_prefills_do_not_corrupt_each_other() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15358,7 +15706,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn concurrent_fused_ple_prefills_do_not_corrupt_each_other() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -15445,7 +15793,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn a_decode_width_and_a_prefill_width_never_share_an_activation_region() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let (in_dim, out_dim) = (512usize, 128usize);
@@ -15616,7 +15964,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn matmul_batch_matches_sequential_cpu_matmuls() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -15711,7 +16059,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn matmul_batch_matches_cpu_backend_across_multiple_token_stripes() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -15788,7 +16136,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn stress_single_backend_concurrent_threads() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -15848,7 +16196,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_matches_cpu_reference_with_ple() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -15968,7 +16316,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_matches_cpu_reference_without_ple() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16066,7 +16414,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16204,7 +16552,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_attention_matches_cpu_reference_kv_dim_32() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16284,7 +16632,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_attention_matches_cpu_reference_full_window() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16365,7 +16713,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_attention_matches_cpu_reference_sliding_window_across_multiple_steps() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16451,7 +16799,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_attention_matches_cpu_reference_many_positions_multi_tile() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16553,7 +16901,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
     fn cross_check_gpu_attention_split(n_head: usize, n_head_kv: usize, head_dim: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16631,7 +16979,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_attention_split_matches_cpu_reference_fewer_positions_than_splits() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16709,7 +17057,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_rope_matches_cpu_reference_without_freq_factors() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16769,7 +17117,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_rope_matches_cpu_reference_with_norm_pairing() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let (n_head, head_dim, rope_dim, pos, freq_base) =
@@ -16870,7 +17218,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_rope_argument_reduction_diverges_with_position() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let params = crate::engine::tensor::RopeParams {
@@ -16917,7 +17265,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_rope_matches_cpu_reference_with_yarn_scaling() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -16999,7 +17347,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_with_yarn_scaling() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17080,7 +17428,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17138,7 +17486,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_perhead_rmsnorm_matches_cpu_reference() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17180,7 +17528,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_without_freq_factors() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17244,7 +17592,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17325,7 +17673,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_with_norm_pairing() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let (n_head, head_dim, rope_dim, pos, freq_base, eps) =
@@ -17396,7 +17744,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_fused_norm_rope_matches_cpu_reference_over_a_token_batch() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17478,7 +17826,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn record_ple_projection_matches_cpu_reference() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17562,7 +17910,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn record_argmax_sample_matches_cpu_reference() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17658,7 +18006,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn record_argmax_sample_matches_cpu_reference_at_a_large_uneven_vocab() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17708,7 +18056,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn gpu_perhead_rmsnorm_weightless_matches_cpu_reference() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17753,7 +18101,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_matches_cpu_reference_owns_v() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -17931,7 +18279,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_matches_cpu_reference_kv_dim_32() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -18092,7 +18440,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_matches_cpu_reference_shared_v_with_freq_factors() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -18256,7 +18604,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -18477,7 +18825,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// `padding_a_stripe_leaves_its_real_rows_unchanged`.
     fn cross_check_fused_ffn_prefill(n_tokens: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -18537,7 +18885,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// per-token `mul_inplace` loop reads it.
     fn cross_check_fused_ple_prefill(n_tokens: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -18622,7 +18970,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// what the CPU path pushed, since those are what slot save serializes.
     fn cross_check_fused_attention_prefill(n_tokens: usize, owns_v: bool, start_pos: usize) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -18823,7 +19171,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// how the bug was found: Q and K agree with the reference and V does not.
     fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize, biases: &str) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -19108,7 +19456,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_prefill_matches_the_unfused_sequence_kv_donor() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -19238,7 +19586,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_prefill_gpu_source_matches_the_host_source() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -19390,7 +19738,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         gemma_shaped: bool,
     ) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         if vulkan.q4_k_mmvq {
@@ -19534,7 +19882,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn padding_a_stripe_leaves_its_real_rows_unchanged() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let (in_dim, out_dim) = (256usize, 512usize);
@@ -19605,7 +19953,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         n_tokens: usize,
     ) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let kv_dim = n_head_kv * head_dim;
@@ -19811,7 +20159,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// that should have existed before it.
     fn cross_check_fused_layer_llama_shaped(biases: &str) {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -20027,7 +20375,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let n_embd = 24;
@@ -20153,7 +20501,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
         let n_embd = 24;
@@ -20271,7 +20619,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 
@@ -20506,7 +20854,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     #[test]
     fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
         let Some(vulkan) = shared_vulkan() else {
-            eprintln!("skipping: no Vulkan adapter available in this environment");
+            eprintln!("{NO_GPU_SKIP}");
             return;
         };
 

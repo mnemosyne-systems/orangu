@@ -56,8 +56,8 @@ dependency on llama.cpp/ggml's own compiled code.
   slices — not a general ND-array library.
 - `engine/arch/{mod,llama,gemma,phi,mistral,qwen35moe,qwen35}.rs` — one
   `ModelForward` implementor per architecture family.
-- `engine/backend/{mod,cpu,vulkan,vulkan_shaders,cuda,opencl,rocm}.rs` —
-  the `Backend` trait and its five implementors; see below.
+- `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
+  — the `Backend` trait and its six implementors; see below.
 - `engine/tokenizer.rs` — a from-scratch BPE tokenizer.
 - `engine/chat_template.rs` — renders `tokenizer.chat_template` via
   `minijinja`.
@@ -1168,17 +1168,27 @@ sweeps slot files untouched for over 30 days on every run
 ### GPU backend architecture
 
 `engine::backend::Backend` (`backend/mod.rs`) is the trait every backend
-implements — `matmul`/`matmul_batch` plus a downcast hook (`as_vulkan`) the
+implements — `matmul`/`matmul_batch` plus a downcast hook (`as_wgpu`) the
 model forward pass uses to reach `VulkanBackend`'s much larger fused
-surface when it's the active backend. Five implementors exist:
+surface when it's the active backend. Six implementors exist:
 `CpuBackend` (scalar with runtime AVX2 dispatch via `engine::tensor::dot`,
 parallelized across output rows with `rayon`; always available, and the
-fallback when no GPU backend is found), `VulkanBackend`, `CudaBackend`,
-`OpenClBackend`, and `RocmBackend`.
+fallback when no GPU backend is found), `VulkanBackend`, `MetalBackend`,
+`CudaBackend`, `OpenClBackend`, and `RocmBackend`.
+
+The hook is named for `wgpu` rather than for Vulkan because two backends
+answer `Some` to it: `VulkanBackend` and `MetalBackend`, which is that
+same engine on another `wgpu` API (see **The Metal backend** below). Every
+fused path reached through it is therefore live on Apple GPUs too.
 
 `main.rs`'s `select_backend` implements the `backend = auto` cascade:
 Vulkan, then CUDA, then OpenCL, then ROCm (if built with the `rocm`
-feature), falling back to `CpuBackend` if none of them initialize. An
+feature), falling back to `CpuBackend` if none of them initialize. On
+Apple targets the cascade starts with Metal instead — not a preference
+but a cost: macOS ships no Vulkan driver, so leading with Vulkan there is
+four retry rounds of guaranteed failure before reaching the API the
+machine actually has, and `MetalBackend` gives up nothing, being the same
+kernels. An
 explicit `backend = <name>` instead calls that one backend's `try_init`
 directly and fails to start if it returns `None`, rather than falling back
 — useful when GPU inference was asked for specifically and a silent
@@ -1267,6 +1277,84 @@ derived string so a cache built for one GPU is never handed to another) —
 a startup-time optimization only, with no effect on decode/prefill
 throughput once running.
 
+### The Metal backend
+
+`engine::backend::metal::MetalBackend` is the section above, on Apple
+hardware. It is not a reimplementation of anything: nothing in
+`VulkanBackend` is Vulkan-specific. Every compute pipeline, every kernel
+in `vulkan_shaders`, the weight/op/uniform arenas, the fused decode and
+prefill submissions, split-k attention and GPU sampling are written
+against portable `wgpu` and WGSL, and only ever ran on Vulkan because
+`VulkanBackend::try_init` asked `wgpu` for a Vulkan adapter and nothing
+else.
+
+So `try_init` now delegates to `try_init_backends(wgpu::Backends)`, and
+`MetalBackend` calls that with `METAL` and wraps the result. `naga`
+translates the same WGSL to MSL rather than SPIR-V. `MetalBackend::
+as_wgpu` returns the inner engine, so every fused submission
+`engine::arch` reaches for through that hook runs here too — the point of
+the newtype is to keep the two distinct at the type level while sharing
+all of the code.
+
+Bring-up is entirely feature-negotiated in `try_init_backends`, so the
+Metal module has no adapter logic of its own. On Apple silicon
+`SHADER_F16` (so the `f16` KV cache is on), `SUBGROUP` (so the
+cooperative-reduction attention kernel is on) and `TIMESTAMP_QUERY` (so
+`ORANGU_GPU_TIMESTAMPS` works) are all present. `PIPELINE_CACHE` is not:
+`wgpu::util::pipeline_cache_key` returns `None` for anything but Vulkan,
+so no on-disk pipeline cache is built and cold start recompiles the
+kernels, which Metal's own shader cache largely absorbs.
+
+One kernel needs a different *form* on Metal, and it is a correctness
+difference rather than a tuning one. The tiled prefill GEMM is the only
+kernel that fills shared memory by having many threads each write a single
+dynamically-indexed **component** of a shared `vec4` (`store_w`/`store_x`
+into `tile_w`/`tile_x`; four different threads write the four components of
+each vector). On Vulkan/RADV that lowers to a 4-byte store, which is what
+lets the read side take four values per load. On Metal it does not: a probe
+kernel on CI's Apple Paravirtual device read back
+`[1, 0, 0, 0, 5, 0, 0, 0, …]` — exactly one surviving component per vector,
+the signature of a read-modify-write of the whole 16 bytes with the four
+writing threads clobbering one another. Every tiled-path cross-check
+disagreed with the CPU backend there, including plain `f32` with no
+dequantization in play, while every scalar-shared-memory kernel passed.
+
+`vulkan_shaders::coop_vec4_tiles` therefore enables `vec4` tiles only where
+they are known-correct, and everything else gets a scalar tile: four loads
+where the `vec4` form takes one, same layout, same arithmetic, same results.
+An unrecognized backend defaults to the safe form on purpose. Whole-`vec4`
+stores would also have worked and are the faster-looking fix, but the tiled
+kernel cannot use them without changing its tile layout — `store_w`'s four
+consecutive slots are four consecutive *rows* at one `k`, while the fill
+deliberately gives one thread `RUN` consecutive `k` of one row so a
+quantized block's scale and min hoist once per run.
+`tests::coop_tiles_are_vec4_only_where_component_stores_work` asserts the
+invariant, and its whole-`vec4` twin is the control that pins the fault to
+the component store rather than to shared memory or the barrier.
+
+Two further things genuinely are Vulkan-only, and both check the API rather
+than assuming:
+
+- `ORANGU_Q4K_GLSL`, a glslc-compiled Q4_K GEMV handed to the driver
+  through shader passthrough. `PASSTHROUGH_SHADERS` *is* advertised by
+  wgpu's Metal backend, where it means **MSL** passthrough — so gating on
+  the feature bit alone would have handed a Metal driver a SPIR-V blob.
+  `try_init_backends` gates it on `wgpu::Backend::Vulkan` instead.
+- The raw-Vulkan replay path (`ORANGU_REPLAY`, `vulkan_replay`), which
+  reaches through `as_hal` for an `ash::Device`. It was already compiled
+  out on Apple targets; setting the variable on macOS is a no-op, not a
+  failure.
+
+Correctness rests on the same tests as the Vulkan path, not on a separate
+suite: `vulkan::shared_test_backend` asks for whichever `wgpu` API the
+platform has, so the per-`ggml_type` cross-checks against `CpuBackend` —
+ordinary tests, not `#[ignore]`d ones — run against a real Metal device on
+CI's macOS runner. Two `#[ignore]`d real-model tests
+(`gemma4_predicts_paris_after_capital_of_france_metal`,
+`forward_batch_decode_matches_independent_forward_calls_metal`) add the
+whole-model claim on top, and CI fails rather than passes if either skips
+for want of an adapter.
+
 ### CUDA, OpenCL, and ROCm backends
 
 `engine::backend::cuda::CudaBackend`, `engine::backend::opencl::
@@ -1331,8 +1419,12 @@ different inputs each time, to catch cache-reuse bugs specifically), and
 fused attention (including GQA head-grouping, sliding-window attention,
 proportional RoPE, and Gemma4's cross-layer KV-donor case — two different
 layers sharing one KV cache) are covered by cross-check tests in
-`engine::backend::vulkan::tests`, run on real Vulkan hardware whenever
-it's present and skipped otherwise. The CUDA/OpenCL/ROCm backends follow
+`engine::backend::vulkan::tests`, run on real hardware whenever
+it's present and skipped otherwise. Those same tests are the Metal
+backend's tests: the device they run against comes from
+`shared_test_backend`, which asks for whichever `wgpu` API the platform
+has, so they are a Vulkan cross-check on Linux and a Metal one on macOS.
+The CUDA/OpenCL/ROCm backends follow
 the same skip-if-no-device pattern.
 
 A second set of tests runs a full forward pass against a real downloaded

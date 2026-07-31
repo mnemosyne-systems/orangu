@@ -224,7 +224,7 @@ profile needs something different.
 | `model` | profile | Yes | A model spec in the same shape `orangu-server`'s own positional `MODEL` argument accepts: a local `.gguf` path, an `NR`/`MODEL` label already under the shared `models` directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first start if not already cached). This is the model id a client request's `model` field matches against — profiles *may* share one, e.g. the same model configured once per role; `resolve_entry` breaks any resulting tie by profile name |
 | `host` | profile | No | Host this profile's `orangu-server` listens on. Defaults to `127.0.0.1` |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
-| `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`cuda`/`opencl`/`rocm`) when set. Defaults to `orangu-server`'s own default (`auto`) |
+| `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set. Defaults to `orangu-server`'s own default (`auto`) |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set. Defaults to `orangu-server`'s own role-based default |
 | `web` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].web` when set, exposing that profile's own web UI on the given port while it's active. Off by default |
 

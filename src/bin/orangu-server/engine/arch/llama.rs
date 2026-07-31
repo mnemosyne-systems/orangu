@@ -303,7 +303,7 @@ impl LlamaModel {
         if tokens.len() != 1 || no_fused_qkv() || no_fused_post_attention() {
             return None;
         }
-        let vulkan = self.backend.as_vulkan()?;
+        let vulkan = self.backend.as_wgpu()?;
         if !vulkan.prefill_attention_enabled() {
             return None;
         }
@@ -480,7 +480,7 @@ impl LlamaModel {
                 && layer.k_norm.is_none();
             let fused_qkv = self
                 .backend
-                .as_vulkan()
+                .as_wgpu()
                 .filter(|_| fusable && !no_fused_post_attention())
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
@@ -660,7 +660,7 @@ impl LlamaModel {
             // (`fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_*`).
             let fused = self
                 .backend
-                .as_vulkan()
+                .as_wgpu()
                 .filter(|_| !no_fused_post_attention())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
@@ -691,7 +691,7 @@ impl LlamaModel {
                 // The fused chain declined after attention had already left its
                 // output on the device, so bring it back — the CPU sequence
                 // below reads `attn_out`, and it would otherwise read zeros.
-                if let (Some(buf), Some(vulkan)) = (&attn_on_device, self.backend.as_vulkan()) {
+                if let (Some(buf), Some(vulkan)) = (&attn_on_device, self.backend.as_wgpu()) {
                     attn_out = vulkan.read_buffer_f32(buf, n_tokens * n_head * head_dim);
                 }
                 let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
@@ -734,7 +734,7 @@ impl LlamaModel {
 
 impl ModelForward for LlamaModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
-        self.backend.as_vulkan()
+        self.backend.as_wgpu()
     }
 
     fn config(&self) -> &ModelConfig {

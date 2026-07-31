@@ -57,7 +57,7 @@ OpenAI-compatible API to the next:
 * **`orangu-server`** — *is* the inference engine: GGUF loading, tokenization,
   the transformer forward pass, sampling, and request scheduling implemented
   directly in Rust with no dependency on llama.cpp/ggml's compiled code, running
-  on CPU or GPU (Vulkan, CUDA, ROCm, OpenCL). Besides the OpenAI-compatible and
+  on CPU or GPU (Vulkan, Metal, CUDA, ROCm, OpenCL). Besides the OpenAI-compatible and
   native endpoints it offers a workspace-scoped file API and an optional
   browser chat console, and it serves as the machine's GGUF inventory —
   listing, downloading, and deleting models, and reporting the hardware they

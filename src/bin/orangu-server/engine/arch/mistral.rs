@@ -310,7 +310,7 @@ impl MistralModel {
         if self.attn_temperature(start_pos) != 1.0 {
             return None;
         }
-        let vulkan = self.backend.as_vulkan()?;
+        let vulkan = self.backend.as_wgpu()?;
         if !vulkan.prefill_attention_enabled() {
             return None;
         }
@@ -524,7 +524,7 @@ impl MistralModel {
             // sequence the fused chain is cross-checked against.
             let fused = self
                 .backend
-                .as_vulkan()
+                .as_wgpu()
                 .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
@@ -585,7 +585,7 @@ impl MistralModel {
 
 impl ModelForward for MistralModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
-        self.backend.as_vulkan()
+        self.backend.as_wgpu()
     }
 
     fn config(&self) -> &ModelConfig {

@@ -378,7 +378,7 @@ impl PhiModel {
         {
             return None;
         }
-        let vulkan = self.backend.as_vulkan()?;
+        let vulkan = self.backend.as_wgpu()?;
         if !vulkan.prefill_attention_enabled() {
             return None;
         }
@@ -608,7 +608,7 @@ impl PhiModel {
             let (w_gate, w_up_half) = layer.ffn_gate_up();
             let fused = self
                 .backend
-                .as_vulkan()
+                .as_wgpu()
                 .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
@@ -659,7 +659,7 @@ impl PhiModel {
 
 impl ModelForward for PhiModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
-        self.backend.as_vulkan()
+        self.backend.as_wgpu()
     }
 
     fn config(&self) -> &ModelConfig {

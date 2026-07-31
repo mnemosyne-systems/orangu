@@ -32,7 +32,7 @@
 //! AMD hardware to get right (long prompts, for example, were found to
 //! reliably hang the GPU driver on real hardware — a bug only real
 //! hardware testing surfaced); none of that exists here, and none of it can be
-//! verified on a machine with no NVIDIA GPU. `CudaBackend::as_vulkan`
+//! verified on a machine with no NVIDIA GPU. `CudaBackend::as_wgpu`
 //! correctly returns `None` (the trait's default), so callers fall back to
 //! the ordinary step-by-step path exactly like `CpuBackend` already does.
 //! Not verified on real NVIDIA hardware — no such hardware was available

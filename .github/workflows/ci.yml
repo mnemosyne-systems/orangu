@@ -173,6 +173,7 @@ jobs:
           key: ${{ matrix.os }}
       - name: Run cargo test
         run: cargo test
+
       - name: Restore the cached model
         uses: actions/cache/restore@v4
         with:
@@ -213,6 +214,41 @@ jobs:
             # otherwise quietly stop testing it while CI stayed green, so
             # require that a test actually ran.
             grep -q '^test result: ok\. 1 passed' result.log
+          done
+          rm -f result.log
+
+      # macOS is the only runner in this matrix with a GPU orangu can reach
+      # (Apple ships no Vulkan driver; the Linux and Windows runners have no
+      # GPU at all), so it is the only place the `wgpu` engine gets exercised
+      # against real hardware in CI at all — see `engine::backend::metal`.
+      #
+      # The per-`ggml_type` cross-checks against `CpuBackend` already ran in
+      # `cargo test` above, on this same Metal device. What these two add is
+      # the whole-model claim: a real GGUF's full prefill and a batched decode
+      # on the GPU, matching a prediction llama.cpp independently agrees on
+      # and matching independent per-sequence decode bit-for-bit.
+      #
+      # A skipped run is not a pass here. Both tests print `NO_GPU_SKIP` and
+      # return when no Metal adapter is found, which libtest still reports as
+      # ok — so grep the output and fail instead, rather than letting a runner
+      # image that lost its GPU quietly turn this job into a no-op.
+      - name: Run real-model tests on Metal
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          ORANGU_TEST_MODEL: ${{ github.workspace }}/.ci-models/model.gguf
+        run: |
+          set -euo pipefail
+          for test in gemma4_predicts_paris_after_capital_of_france_metal \
+                      forward_batch_decode_matches_independent_forward_calls_metal; do
+            cargo test --release --bin orangu-server \
+              "engine::arch::gemma::real_model_tests::$test" \
+              -- --ignored --exact --nocapture | tee result.log
+            grep -q '^test result: ok\. 1 passed' result.log
+            if grep -q 'no Metal adapter available' result.log; then
+              echo "::error::$test skipped for want of a Metal adapter — the Metal backend is untested on this runner" >&2
+              exit 1
+            fi
           done
           rm -f result.log
 
