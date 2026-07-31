@@ -191,6 +191,7 @@ impl TerminalUiGuard {
             actual_width: render.actual_width,
             actual_height: render.actual_height,
             x_offset: render.x_offset,
+            word_wrap: render.word_wrap,
             dropdown_candidates: if render.drop_down {
                 screen.dropdown.map(|d| d.candidates.as_slice())
             } else {

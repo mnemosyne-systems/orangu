@@ -968,6 +968,7 @@ async fn run() -> Result<()> {
             x_offset: viewport.x_offset,
             banner: config.banner,
             drop_down: config.drop_down,
+            word_wrap: config.word_wrap,
             feedback: config.feedback,
             server_names: &server_names,
             available_models: &available_models,
@@ -999,6 +1000,7 @@ async fn run() -> Result<()> {
                         x_offset: viewport.x_offset,
                         banner: config.banner,
                         drop_down: config.drop_down,
+                        word_wrap: config.word_wrap,
                         feedback: config.feedback,
                         server_names: &server_names,
                         available_models: &available_models,
@@ -1625,6 +1627,7 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     drop_down: config.drop_down,
+                    word_wrap: config.word_wrap,
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
@@ -1691,6 +1694,7 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     drop_down: config.drop_down,
+                    word_wrap: config.word_wrap,
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
@@ -1758,6 +1762,7 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     drop_down: config.drop_down,
+                    word_wrap: config.word_wrap,
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,
@@ -1842,6 +1847,7 @@ async fn run() -> Result<()> {
                         prompt_branch: prompt_branch.as_deref(),
                         pending_count: pending_commands.len(),
                         skills: &skills,
+                        word_wrap: config.word_wrap,
                     };
                     match run_review_mode(
                         &mut review,
@@ -2048,6 +2054,7 @@ async fn run() -> Result<()> {
                     prompt_branch: prompt_branch.as_deref(),
                     pending_count: pending_commands.len(),
                     skills: &skills,
+                    word_wrap: config.word_wrap,
                 };
 
                 let state = run_auto_review_mode(
@@ -2314,6 +2321,7 @@ async fn run() -> Result<()> {
                     x_offset: viewport.x_offset,
                     banner: config.banner,
                     drop_down: config.drop_down,
+                    word_wrap: config.word_wrap,
                     feedback: config.feedback,
                     server_names: &server_names,
                     available_models: &available_models,

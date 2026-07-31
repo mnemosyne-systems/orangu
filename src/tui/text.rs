@@ -16,6 +16,70 @@
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+/// Wrap a styled line at word boundaries, preserving every span's style. Long
+/// unbroken words are split so no rendered row exceeds `visible_width`.
+pub fn wrap_ratatui_line(line: &Line<'_>, visible_width: usize) -> Vec<Line<'static>> {
+    let visible_width = visible_width.max(1);
+    let mut words: Vec<Vec<(char, ratatui::style::Style)>> = Vec::new();
+    let mut word = Vec::new();
+
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            if ch.is_whitespace() && ch != '\n' {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                words.push(vec![(ch, span.style)]);
+            } else {
+                word.push((ch, span.style));
+            }
+        }
+    }
+    if !word.is_empty() || words.is_empty() {
+        words.push(word);
+    }
+
+    let mut rows: Vec<Vec<(char, ratatui::style::Style)>> = vec![Vec::new()];
+    let mut row_width = 0;
+    for word in words {
+        let word_width = word
+            .iter()
+            .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(0))
+            .sum::<usize>();
+        let whitespace = word.iter().all(|(ch, _)| ch.is_whitespace());
+        if row_width > 0 && row_width + word_width > visible_width {
+            rows.push(Vec::new());
+            row_width = 0;
+            if whitespace {
+                continue;
+            }
+        }
+        for (ch, style) in word {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if row_width > 0 && row_width + char_width > visible_width {
+                rows.push(Vec::new());
+                row_width = 0;
+            }
+            rows.last_mut().expect("wrap row exists").push((ch, style));
+            row_width += char_width;
+        }
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            let spans: Vec<Span<'static>> = row
+                .into_iter()
+                .map(|(ch, style)| Span::styled(ch.to_string(), style))
+                .collect();
+            let mut wrapped = Line::from(spans);
+            if let Some(alignment) = line.alignment {
+                wrapped = wrapped.alignment(alignment);
+            }
+            wrapped
+        })
+        .collect()
+}
+
 pub fn clip_ratatui_line<'a>(
     line: &Line<'a>,
     mut x_offset: usize,
@@ -241,5 +305,25 @@ mod tests {
         // The hyperlink's opening and closing control sequences survive.
         assert!(clipped.contains("\x1b]8;;https://example.com/\x1b\\"));
         assert!(clipped.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn wraps_styled_lines_on_word_boundaries() {
+        let line = Line::from(vec![
+            Span::styled("alpha ", ratatui::style::Style::default().bold()),
+            Span::raw("beta gamma"),
+        ]);
+        let wrapped = wrap_ratatui_line(&line, 6);
+        let text = wrapped
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["alpha ", "beta ", "gamma"]);
+        assert!(
+            wrapped[0].spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
     }
 }

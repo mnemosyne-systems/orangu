@@ -316,7 +316,7 @@ The header, status bar, and input window always occupy the full visible terminal
 
 The virtual canvas width is set by the `width` key in the `[orangu]` config section (default `512`). When the terminal is resized to a width larger than the configured virtual width, the virtual width grows to match so that content is never clipped unexpectedly. The virtual width never shrinks below its initial value during a session.
 
-LLM and tool output is always wrapped or clipped to the visible terminal width and does not pan. Only `/show_file` output — where source lines must stay intact — uses the full virtual canvas.
+With `word_wrap = on`, LLM, tool, and `/show_file` output wraps to the visible terminal width and does not pan. By default `word_wrap` is `off`, so long lines remain on the virtual canvas and can be inspected with horizontal panning.
 
 ### Waiting and exit control
 

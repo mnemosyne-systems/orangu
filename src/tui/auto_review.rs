@@ -44,6 +44,7 @@ pub struct AutoReviewDiffView<'a> {
     pub lines: &'a [String],
     pub scroll: usize,
     pub x_offset: usize,
+    pub word_wrap: bool,
 }
 
 /// Alt+m in the `/auto_review` pre-start phase cycles a file through these
@@ -93,6 +94,7 @@ pub struct AutoReviewScreenArgs<'a> {
     pub selected_lines: Option<(usize, usize)>,
     pub scroll: usize,
     pub x_offset: usize,
+    pub word_wrap: bool,
     /// The status area's text: the file and category being worked on, e.g.
     /// `File: src/main.rs (2/5)  Category: Security`.
     pub status: &'a str,
