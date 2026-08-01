@@ -42,7 +42,10 @@ dependency on llama.cpp/ggml's own compiled code.
   `all`/interactive/explicit-identifier flows), built on `web::sessions`'s
   activity tracking; see below.
 - `config.rs`, `init.rs` — `orangu-server.conf` loading and the `--init`
-  wizard.
+  wizard. The web console has its own `[web]` section, whose *presence* is
+  what enables it; `[web].host` falls back to `[orangu-server].host`, and
+  the pre-section `[orangu-server].web` key is still honored when no `[web]`
+  section is there to take precedence over it.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
   top of `orangu::hardware`'s own detection; see below.
 - `shell.rs` — hand-written bash/zsh/fish completion scripts.
@@ -1459,7 +1462,7 @@ handle, config, workspace root, start time); `http::openai` and
 `tokio::select!`, mirroring `orangu-coordinator`'s own pattern.
 
 `web::mod` serves a small server-rendered chat UI (vanilla HTML/CSS/JS, no
-build step) on its own `web` port, sharing the same in-process `Engine` as
+build step) on its own `[web].port`, sharing the same in-process `Engine` as
 the API so a chat turn never makes an HTTP hop. `web::render` renders
 markdown to HTML (including syntax-highlighted code blocks) with the same
 `markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::sessions`
@@ -1523,11 +1526,9 @@ correctness: a client whose connection is reset instead of receiving the
 either way. `WebState::arm_handover` allows one per process — there is only
 one process to replace.
 
-`[orangu-server].reexec` (default `true`) and `reexec::supported()`
-(`cfg!(unix)`) gate the whole thing. When either is false `serve` builds no
-`Handover`, `GET /api/models` reports `can_load: false`, and the panel
-disables its Load buttons rather than offering something that would only
-refuse.
+`[web].reexec` (default `true`) and `reexec::supported()` (`cfg!(unix)`)
+gate the whole thing. When either is false `serve` builds no `Handover` and
+`GET /api/models` reports `can_load: false`.
 
 ### Model manager (`web::models`)
 
@@ -1577,6 +1578,18 @@ panel opening, its **Rescan** button) or after `invalidate()` (a delete, a
 finished download). Which row is `loaded` is *not* cached — that is about this
 process, not about the directory, so it is decided per request against
 `WebState::model_path`.
+
+`[web].delete` (default `true`) gates removal the same way, reported as
+`can_delete`.
+
+Both switches **remove** their button rather than disabling it. A disabled
+control with a tooltip is the right shape for something conditional — a
+handover already in flight, a model this build can't load — where the same
+button works a moment later or on the row below. A capability the config has
+switched off is not a condition of any row; it is what this server does, and
+a column of permanently dead buttons explains less than their absence. When
+`can_load` is false the loaded row's check mark goes too: which model is
+serving is already on the row, as the `loaded` badge beside its name.
 
 Three things are refused rather than attempted:
 

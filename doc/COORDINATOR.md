@@ -226,7 +226,7 @@ profile needs something different.
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set. Defaults to `orangu-server`'s own default (`auto`) |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set. Defaults to `orangu-server`'s own role-based default |
-| `web` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].web` when set, exposing that profile's own web UI on the given port while it's active. Off by default |
+| `web` | profile | No | Forwarded to this profile's `orangu-server` as `[web].port` when set, exposing that profile's own web console on the given port while it's active. Off by default |
 
 Each profile's own `orangu-server` is started with a small, coordinator-
 generated config file (`~/.orangu/coordinator/servers/<profile-name>.conf`,

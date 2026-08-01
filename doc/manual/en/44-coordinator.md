@@ -100,7 +100,7 @@ over the port.
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set |
-| `web` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].web` when set, exposing that profile's own web UI while it's active |
+| `web` | profile | No | Forwarded to this profile's `orangu-server` as `[web].port` when set, exposing that profile's own web console while it's active |
 
 Run it with:
 

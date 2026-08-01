@@ -153,7 +153,7 @@ pub struct CoordinatorLlmEntry {
     /// when set. `None` leaves `orangu-server`'s own role-based default in
     /// place (see `orangu-server`'s `config::Role::default_slots`).
     pub slots: Option<usize>,
-    /// Forwarded to this profile's generated `[orangu-server].web` key when
+    /// Forwarded to this profile's generated `[web].port` key when
     /// set. `None` leaves `orangu-server`'s own default (`0`, disabled) in
     /// place — a coordinator-managed profile has no obvious single "the"
     /// web UI port across every role, so this is opt-in per profile only.

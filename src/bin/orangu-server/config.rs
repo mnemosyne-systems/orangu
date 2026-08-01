@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 
 pub const SERVER_SECTION: &str = "orangu-server";
 
+/// The web console's own section. **Its presence is what enables the
+/// console** — a config with no `[web]` section binds no second listener at
+/// all, which is what `--init` writes when the web console is declined.
+pub const WEB_SECTION: &str = "web";
+
 /// The `host` value meaning "every network interface on this machine" —
 /// the default, and what `--init`'s `host` prompt offers first. `*` is
 /// accepted as an alias for it, since that is the spelling most other
@@ -52,9 +57,18 @@ pub fn default_port() -> u16 {
     8100
 }
 
-/// `0` means disabled — no web UI listener is bound.
+/// The resolved web-console port when there is no `[web]` section (and no
+/// legacy `[orangu-server].web` either): `0`, meaning no second listener is
+/// bound at all.
 pub fn default_web() -> u16 {
     0
+}
+
+/// The port a `[web]` section that doesn't name one gets. Adjacent to the
+/// API's own default so the pair reads as one server, and the value the
+/// manual's example has always used.
+pub fn default_web_port() -> u16 {
+    8101
 }
 
 /// A hint at which of `orangu-server`'s features matter for this
@@ -191,16 +205,22 @@ pub fn default_reexec() -> bool {
     true
 }
 
+/// Whether the web console may delete models — see
+/// [`ServerConfiguration::delete`]. On by default.
+pub fn default_delete() -> bool {
+    true
+}
+
 /// Parses a `yes`/`no`/`true`/`false`/`on`/`off`/`1`/`0` config value.
 /// Every spelling a person might reasonably write for a switch, rather than
 /// only the two Rust's own `bool` parser accepts — this is a hand-edited
 /// `.ini`, not a serialized struct.
-fn parse_bool(key: &str, value: &str) -> Result<bool> {
+fn parse_bool(section: &str, key: &str, value: &str) -> Result<bool> {
     match value.trim().to_lowercase().as_str() {
         "yes" | "true" | "on" | "1" => Ok(true),
         "no" | "false" | "off" | "0" => Ok(false),
         other => Err(anyhow!(
-            "invalid value for [{SERVER_SECTION}].{key}: '{other}' \
+            "invalid value for [{section}].{key}: '{other}' \
              (expected yes/no, true/false, on/off, or 1/0)"
         )),
     }
@@ -216,9 +236,17 @@ pub struct ServerConfiguration {
     /// Number of concurrent request slots (each with its own KV cache) the
     /// continuous-batching scheduler serves at once.
     pub slots: usize,
-    /// Port the web UI listens on, bound alongside (not instead of) the
-    /// API's own `port`. `0` disables it — no second listener is bound.
+    /// `[web].port`: the port the web console listens on, bound alongside
+    /// (not instead of) the API's own `port`. `0` — no `[web]` section, and
+    /// no legacy `[orangu-server].web` either — disables it, and no second
+    /// listener is bound.
     pub web: u16,
+    /// `[web].host`: the address the web console binds, when it should
+    /// differ from the API's. Defaults to [`host`](Self::host), so the two
+    /// are reachable in the same places unless deliberately separated —
+    /// which is the point of being able to set it: an API on `all` for the
+    /// machines that consume it, with the console kept on `127.0.0.1`.
+    pub web_host: String,
     /// Which `Backend` runs the forward pass — CPU, a named GPU API, or
     /// (the default) whichever GPU this platform finds first, falling back
     /// to CPU.
@@ -229,15 +257,33 @@ pub struct ServerConfiguration {
     /// where there is no attached terminal to pass a CLI argument to or
     /// prompt on interactively; ignored otherwise.
     pub model: Option<String>,
-    /// Whether the web console's model manager may load a different model
-    /// into this server. `true` (the default) lets it; `false` disables the
-    /// panel's Load button and makes the endpoint behind it refuse.
+    /// `[web].delete`: whether the web console's model manager may delete
+    /// models. `true` (the default) lets it; `false` removes the Delete
+    /// button from every row — not merely disables it, since unlike the
+    /// other switches there is nothing conditional about it to explain — and
+    /// makes the endpoint behind it refuse.
+    ///
+    /// Worth its own key rather than riding on `reexec`: deleting a model is
+    /// the one irreversible thing the console can do, and a deployment may
+    /// well want to allow a model switch while keeping the models directory
+    /// read-only.
+    pub delete: bool,
+    /// `[web].reexec`: whether the web console's model manager may load a
+    /// different model into this server. `true` (the default) lets it;
+    /// `false` disables the panel's Load button and makes the endpoint
+    /// behind it refuse.
     ///
     /// Loading a model re-executes this process (see `main::reexec`), which
     /// is exactly what makes it worth a switch: a deployment behind a
     /// supervisor, or one where a specific model is the point of the
     /// process, wants the server it started to stay the server it started.
     pub reexec: bool,
+    /// The config file's own `role` key, parsed, whatever mode this is —
+    /// as opposed to [`role`](Self::role), which is the *resolved* role and
+    /// still ignores this outside `--daemon`. Kept apart so the interactive
+    /// startup prompt can pre-select what the config names without that
+    /// silently becoming the role of a run that never reaches the prompt.
+    pub role_key: Option<Role>,
     /// The resolved [`Role`] — whichever CLI flag (`--all`/`--code`/
     /// `--review`/`--explorer`/`--embedding`) was passed to
     /// [`load_server_configuration`]; or, in `--daemon` mode only (same
@@ -311,13 +357,20 @@ pub fn load_server_configuration(
         None => default_port(),
     };
 
+    // Parsed unconditionally, so a bad value is an error in every mode
+    // rather than only under `--daemon` — and so the interactive prompt has
+    // something to pre-select.
+    let role_key = match section.get("role") {
+        Some(value) => Some(
+            Role::parse(value)
+                .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].role: {err}"))?,
+        ),
+        None => None,
+    };
+
     let role = match cli_role {
         Some(role) => role,
-        None if daemon => match section.get("role") {
-            Some(value) => Role::parse(value)
-                .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].role: {err}"))?,
-            None => Role::default(),
-        },
+        None if daemon => role_key.unwrap_or_default(),
         None => Role::default(),
     };
 
@@ -335,23 +388,54 @@ pub fn load_server_configuration(
         None => role.default_slots(),
     };
 
-    let web = match section.get("web") {
-        Some(value) => value
-            .trim()
-            .parse::<u16>()
-            .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].web: {err}"))?,
-        None => default_web(),
+    // The web console lives in its own `[web]` section, and *having* one is
+    // what turns the console on. `[orangu-server].web` is the spelling that
+    // shipped before that section existed and is still honored — a config
+    // written against it goes on working untouched — but only when there is
+    // no `[web]` section to take precedence over it.
+    let web_section = sections.remove(WEB_SECTION);
+    let (web, web_host, reexec, delete) = match web_section {
+        Some(web_section) => {
+            let port = match web_section.get("port") {
+                Some(value) => value
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|err| anyhow!("invalid value for [{WEB_SECTION}].port: {err}"))?,
+                None => default_web_port(),
+            };
+            // Only worth spelling out when the console should be reachable
+            // somewhere the API isn't; unset, the two share an address.
+            let web_host = web_section
+                .get("host")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| host.clone());
+            let reexec = match web_section.get("reexec") {
+                Some(value) => parse_bool(WEB_SECTION, "reexec", value)?,
+                None => default_reexec(),
+            };
+            let delete = match web_section.get("delete") {
+                Some(value) => parse_bool(WEB_SECTION, "delete", value)?,
+                None => default_delete(),
+            };
+            (port, web_host, reexec, delete)
+        }
+        None => {
+            let port = match section.get("web") {
+                Some(value) => value
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].web: {err}"))?,
+                None => default_web(),
+            };
+            (port, host.clone(), default_reexec(), default_delete())
+        }
     };
 
     let model = section
         .get("model")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-
-    let reexec = match section.get("reexec") {
-        Some(value) => parse_bool("reexec", value)?,
-        None => default_reexec(),
-    };
 
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
@@ -377,11 +461,14 @@ pub fn load_server_configuration(
         host,
         port,
         model,
+        role_key,
         role,
         slots,
         web,
+        web_host,
         backend,
         reexec,
+        delete,
     })
 }
 
@@ -405,9 +492,9 @@ mod tests {
         assert_eq!(conf.model, None);
         assert_eq!(conf.backend, BackendPreference::Auto);
         assert_eq!(conf.role, Role::All);
-        // On by default: the web console is already trusted with deleting a
-        // model, and changing which one is served is the milder of the two.
+        // Both on by default.
         assert!(conf.reexec);
+        assert!(conf.delete);
     }
 
     /// A hand-edited `.ini` gets every spelling of a switch a person might
@@ -429,7 +516,7 @@ mod tests {
             let mut file = tempfile::NamedTempFile::new().unwrap();
             writeln!(
                 file,
-                "[orangu-server]\nmodels = /srv/models\nreexec = {value}\n"
+                "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\nreexec = {value}\n"
             )
             .unwrap();
 
@@ -445,13 +532,177 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu-server]\nmodels = /srv/models\nreexec = maybe\n"
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\nreexec = maybe\n"
         )
         .unwrap();
 
         let err = load_server_configuration(file.path(), None, false).unwrap_err();
-        assert!(err.to_string().contains("reexec"), "{err}");
+        assert!(err.to_string().contains("[web].reexec"), "{err}");
         assert!(err.to_string().contains("maybe"), "{err}");
+    }
+
+    /// Having a `[web]` section is what turns the console on — so one that
+    /// names nothing at all still gets a working port.
+    #[test]
+    fn a_bare_web_section_enables_the_console_on_the_default_port() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n\n[web]\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web, default_web_port());
+        assert!(conf.reexec);
+        assert!(conf.delete);
+    }
+
+    #[test]
+    fn parses_every_delete_spelling() {
+        for (value, expected) in [
+            ("yes", true),
+            ("true", true),
+            ("on", true),
+            ("1", true),
+            ("no", false),
+            ("NO", false),
+            ("false", false),
+            ("off", false),
+            ("0", false),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\ndelete = {value}\n"
+            )
+            .unwrap();
+
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.delete, expected, "delete = {value}");
+        }
+    }
+
+    /// The two console switches are independent: a deployment may well want
+    /// a model switch allowed while the models directory stays read-only.
+    #[test]
+    fn delete_and_reexec_are_set_independently() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\nreexec = yes\ndelete = no\n"
+        )
+        .unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert!(conf.reexec);
+        assert!(!conf.delete);
+    }
+
+    #[test]
+    fn rejects_an_invalid_delete_value() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\ndelete = sometimes\n"
+        )
+        .unwrap();
+
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("[web].delete"), "{err}");
+    }
+
+    /// No `[web]` section means no console and no second listener — which is
+    /// what `--init` writes when it is declined.
+    #[test]
+    fn no_web_section_means_no_console() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web, 0);
+    }
+
+    /// The console inherits the API's address unless it says otherwise, so
+    /// the ordinary config names one host and both listeners use it.
+    #[test]
+    fn the_web_console_inherits_the_api_host_when_it_names_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = 192.168.1.10\n\n[web]\nport = 8101\n"
+        )
+        .unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web_host, "192.168.1.10");
+        assert_eq!(conf.host, conf.web_host);
+    }
+
+    /// And overrides it when it does — the case this exists for: an API
+    /// reachable from the network, with the console kept off it.
+    #[test]
+    fn the_web_console_can_bind_a_different_host_than_the_api() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = all\n\n[web]\nport = 8101\nhost = 127.0.0.1\n"
+        )
+        .unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.host, "all");
+        assert_eq!(conf.web_host, "127.0.0.1");
+        assert_eq!(resolve_bind_host(&conf.host), "0.0.0.0");
+        assert_eq!(resolve_bind_host(&conf.web_host), "127.0.0.1");
+    }
+
+    #[test]
+    fn reads_the_web_port_from_its_own_section() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8200\n"
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_server_configuration(file.path(), None, false)
+                .unwrap()
+                .web,
+            8200
+        );
+    }
+
+    /// `[orangu-server].web` is the spelling that shipped before `[web]`
+    /// existed. A config written against it has to go on working untouched —
+    /// silently disabling somebody's console because a key moved would be
+    /// the worst possible way to introduce a section.
+    #[test]
+    fn the_pre_section_web_key_still_works() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\nweb = 8200\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web, 8200);
+        assert!(conf.reexec, "the legacy spelling gets the default");
+        assert!(conf.delete, "the legacy spelling gets the default");
+        assert_eq!(conf.web_host, conf.host);
+    }
+
+    /// ...but only until there is a `[web]` section, which is the one that
+    /// means anything once it exists.
+    #[test]
+    fn a_web_section_takes_precedence_over_the_legacy_key() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nweb = 9999\n\n[web]\nport = 8200\n"
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_server_configuration(file.path(), None, false)
+                .unwrap()
+                .web,
+            8200
+        );
     }
 
     #[test]

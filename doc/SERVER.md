@@ -665,9 +665,11 @@ model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 host = all
 port = 8100
 slots = 1
-web = 8101
 backend = auto
 role = all
+
+[web]
+port = 8101
 reexec = yes
 ```
 
@@ -676,15 +678,29 @@ reexec = yes
   the serving path resolves the CLI's positional `model` argument against. A
   leading `~`/`~/` is expanded to the home directory. Required by every
   subcommand except `system` and `suggest` (pure hardware inventory, no
-  models directory involved) and a `show` given a direct path.
+  models directory involved) and a `show` given a direct path. `-i`/`--init`
+  prompts for it with TAB-completion over real filesystem paths and an
+  inline grey ghost suggestion of the directory being typed — the same
+  completer drives both, so what the grey text previews and what TAB fills
+  in can never disagree.
 - `model` — a model spec, the same shape as the CLI's positional argument
   (a local `.gguf` path, an `NR`/`MODEL` label, or a `<user>/<model>
-  [:quant]` Hugging Face repo). **Only consulted in `--daemon` mode** — a
-  normal, attached-terminal run still takes its model from the CLI argument,
-  or prompts interactively if none is given, exactly as before; `model`
-  in the config is otherwise ignored. `-i`/`--init` prompts for it with
+  [:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
+  terminal to prompt on. An attached run still takes its model from the CLI
+  argument when one is given; when none is, the interactive picker
+  **pre-selects this one** — its `NR` is shown as the prompt's default and
+  ghosted on the empty line, so a config that already names a model is one
+  Enter away rather than a row to find. Type a different `NR` (or a label,
+  or a path) to override it. A model the config names but that isn't
+  installed has no row to point at; its spec is offered as written instead,
+  and Enter fetches it exactly as `orangu-server <spec>` would. `-i`/`--init` prompts for it with
   TAB-completion over the models already installed under `models` — every
-  `NR` and every `MODEL` label, in the same order `list` prints them. The
+  `NR` and every `MODEL:QUANT`, in the same order `list` prints them. The
+  quantization is part of the offered name (`unsloth/gemma-4-E2B-it-GGUF:Q4_K_M`)
+  rather than a separate column, because a repo with several quantizations
+  on disk prints the same bare `MODEL` on every one of their rows: offering
+  that would list one name once per quantization, and write a `model =`
+  value resolving to whichever came first instead of the one picked. The
   labels also drive an inline grey ghost suggestion: the prompt opens
   already previewing the first model listed, and narrows to whatever the
   typed prefix matches (an `NR` is completed but never ghosted — it's a
@@ -702,9 +718,6 @@ reexec = yes
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
-- `web` — port for the built-in web UI (see below), bound alongside `port`
-  rather than instead of it. `0` (the default) disables it — no second
-  listener is bound.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
   `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
@@ -714,25 +727,65 @@ reexec = yes
   is still tried behind it, for a Mac running MoltenVK. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
-- `reexec` — whether the web console's model manager may load a different
-  model (default `yes`; `no`/`true`/`false`/`on`/`off`/`1`/`0` are all
-  accepted). Loading one restarts this process on it, so a deployment that
-  needs the server it started to stay the server it started — behind a
-  supervisor, or where one specific model is the point of the process — sets
-  `no`, and the console disables its **Load** button accordingly. Ignored
-  where `web = 0` (nothing to disable) and on non-Unix platforms, which have
-  no `execve` and where the button is disabled regardless. See **Loading a
-  different model** below.
 - `role` — `all` (the default), `code`, `review`, `explorer`, or
-  `embedding`. See **Roles** below. **Only consulted in `--daemon`
-  mode** — same as `model`, and for the same reason: an attached-terminal
-  run always takes its role from the CLI flag if one was given, or (when
-  no model was given on the CLI either) the interactive `role [all]: `
-  prompt right after model selection, or `all` otherwise — never from this
-  key; `role` in the config is otherwise ignored. In `--daemon` mode, an
-  explicit CLI role flag still overrides it, same as `model` doesn't get
-  that override (there's no CLI model argument to override *with* once
-  daemonized, but a role flag can still be passed alongside `--daemon`).
+  `embedding`. See **Roles** below. Resolved in this order: an explicit CLI
+  flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`) wins
+  everywhere and skips the prompt entirely; failing that, `--daemon` takes
+  this key directly, having no terminal to prompt on; and an attached run
+  with no flag uses it to **pre-select the interactive `role` prompt** —
+  ghosted on the empty line, TAB-completing over the five names, and
+  overridable by typing another. That prompt only appears when no model was
+  given on the CLI either; an attached run that names a model and no role
+  flag is `all`, as before.
+
+### The `[web]` section
+
+The built-in web console (see **Web UI** below) is configured in its own
+section, and **having that section at all is what enables it**. A config
+with no `[web]` binds no second listener; `-i`/`--init` asks
+`Add web console` and then `host`, `port`, `reexec` and `delete`, or writes
+no section at all.
+
+```ini
+[web]
+host = 127.0.0.1
+port = 8101
+reexec = yes
+delete = yes
+```
+
+- `port` — where the console listens, bound alongside `[orangu-server].port`
+  rather than instead of it. Defaults to `8101` when the section is present
+  but says nothing.
+- `host` — the address it binds, prompted for with the same interface
+  completion and ghost suggestion `[orangu-server].host` gets, and defaulting
+  to whatever that was just answered. **When the key is absent it falls back
+  to `[orangu-server].host`**, so an ordinary config names one host and both
+  listeners use it; answering differently is how the two get separated — an
+  API on `all` for the machines that consume it, with the console kept on
+  `127.0.0.1`.
+- `reexec` — whether the console's model manager may load a different model
+  (default `yes`; `no`/`true`/`false`/`on`/`off`/`1`/`0` are all accepted).
+  Loading one restarts this process on it, so a deployment that needs the
+  server it started to stay the server it started — behind a supervisor, or
+  where one specific model is the point of the process — sets `no`, and every
+  row's **Load** button is gone. Removed rather than disabled, for the same
+  reason `delete` below removes its own: a control that can never do anything
+  on this server explains less than its absence does. Non-Unix platforms have
+  no `execve` and behave as though it were `no`. See **Loading a different
+  model** below.
+- `delete` — whether the console's model manager may delete models (default
+  `yes`, same spellings). Set `no` and every row's **Delete** button is
+  gone, and the endpoint behind it refuses. Its own key rather than riding
+  on `reexec` because the two are
+  genuinely separate wishes: deleting a model is the one irreversible thing
+  the console can do, and a deployment may well want a model switch allowed
+  while the models directory stays read-only.
+
+`web = <port>` under `[orangu-server]` is what this replaced, and still
+works: a configuration written against it goes on serving the console on
+that port, with `host` and `reexec` at their defaults. A `[web]` section
+takes precedence over it wherever both appear.
 
 Default lookup order for the config file: `-c`/`--config` picks one
 explicitly; without it, `./orangu-server.conf` then
@@ -917,8 +970,8 @@ above).
 
 ## Web UI
 
-Set `web` in the config (or at the `web` prompt in `--init`) and visit
-`http://<host>:<web>/` for a small built-in chat UI:
+Add a `[web]` section to the config (or answer `Add web console` in
+`--init`) and visit `http://<host>:<port>/` for a small built-in chat UI:
 an input box, a scrolling transcript, a **New Chat** button, and a
 **History** button that lists previous chat sessions — sessions with no
 messages in them (e.g. one just started with **New Chat** but never sent
@@ -978,12 +1031,13 @@ Two icon buttons per row — hover either for what it does:
 
 | Icon | Tooltip | |
 | :-- | :-- | :-- |
-| play triangle | **Load ...** | serve this model instead — see below |
+| play triangle | **Load ...** | serve this model instead — see below. Absent entirely when `[web].reexec` is off |
 | document | **Show ...** | this file's full GGUF metadata — `orangu-server show` |
-| waste basket | **Delete ...** | remove every shard — `orangu-server delete` |
+| waste basket | **Delete ...** | remove every shard — `orangu-server delete`. Absent entirely when `[web].delete` is off |
 
 The loaded model's row shows a check mark where its **Load** button would
-be. **Delete** is disabled on it: its weights are memory-mapped by
+be (and is named **loaded** beside its own name, which is what says so when
+there are no Load buttons at all). **Delete** is disabled on it: its weights are memory-mapped by
 the running engine, so removing the file would leave this process reading
 something that no longer has a name. It asks for confirmation naming the
 model and its size, and reclaims the Hugging Face hub-cache blobs too when
@@ -1065,12 +1119,11 @@ The switch is not written anywhere: restart the server and it comes back on
 whatever the command line or `model` in `orangu-server.conf` names. To make
 a choice permanent, set `model` in the config.
 
-Set `reexec = no` in `orangu-server.conf` to turn this off — the **Load**
-buttons are then disabled with a tooltip saying so, and the endpoint behind
-them refuses. It is also unavailable on non-Unix platforms, which have no
-`execve`.
+Set `reexec = no` in the `[web]` section to turn this off — the **Load**
+buttons are then gone entirely, and the endpoint behind them refuses. It is
+also unavailable on non-Unix platforms, which have no `execve`.
 
-The whole panel is served on the `web` port, which is unauthenticated — like
+The whole panel is served on the `[web]` port, which is unauthenticated — like
 the rest of the web UI, and like the file-lifecycle API on the API port, it
 assumes a trusted network. A server reachable from an untrusted one should
 not have `web` enabled at all.
@@ -1192,7 +1245,8 @@ server internals chapter of the manual (`doc/manual/en/78-server.md`), under
 The built-in **Web UI** (above) is served on its own `web` port, separate
 from the API's `port`, and exposes a small `/api/...` surface of its own —
 used only by that page's own JavaScript, not part of the OpenAI-
-compatible API above, and only reachable at all when `web` is configured:
+compatible API above, and only reachable at all when a `[web]` section is
+configured:
 
 | Endpoint | |
 | :-- | :-- |

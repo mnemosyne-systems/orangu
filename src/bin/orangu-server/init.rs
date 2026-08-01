@@ -16,7 +16,8 @@
 //! Interactive `--init` flow that writes `~/.orangu/orangu-server.conf`.
 
 use crate::config::{
-    HOST_ALL, HOST_ALL_ALIAS, Role, default_host, default_port, default_reexec, default_web,
+    HOST_ALL, HOST_ALL_ALIAS, Role, WEB_SECTION, default_delete, default_host, default_port,
+    default_reexec, default_web_port,
 };
 use anyhow::{Context, Result, anyhow};
 use rustyline::{
@@ -29,6 +30,7 @@ use rustyline::{
     validate::Validator,
 };
 use std::borrow::Cow;
+use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -48,23 +50,27 @@ pub fn run_init() -> Result<()> {
 
     let models = prompt_dir("models", huggingface_cache_dir().as_deref())?;
     let model = prompt_model(Path::new(&models))?;
-    let role = prompt_role(&format!(
-        "role (optional, only used with --daemon) [{}]: ",
-        Role::default().label()
-    ))?;
+    let role = prompt_role(
+        &format!("role [{}]: ", Role::default().label()),
+        Role::default(),
+    )?;
     let host = prompt_host(&default_host())?;
     let port = prompt_line("port", &default_port().to_string())?;
-    let web = prompt_line("web", &default_web().to_string())?;
-    // Only worth asking about when there is a web console to ask about it
-    // for: `reexec` governs one button in that console, so a `web = 0`
-    // configuration has nothing to gate.
-    let reexec = if web.trim() == "0" {
-        default_reexec()
+    // The web console is a section of its own, so it is one yes/no question
+    // rather than a port that has to be guessed at (and `0` remembered as
+    // the way to decline). Declining writes no `[web]` section at all.
+    let web = if prompt_bool("Add web console", true)? {
+        // Defaults to the address the API just took, which is also what
+        // `[web].host` falls back to when the key is absent — so pressing
+        // Enter through this section puts the console wherever the API is,
+        // and answering differently is how the two get separated.
+        let web_host = prompt_host(&host)?;
+        let web_port = prompt_line("port", &default_web_port().to_string())?;
+        let reexec = prompt_bool("reexec", default_reexec())?;
+        let delete = prompt_bool("delete", default_delete())?;
+        Some((web_host, web_port, reexec, delete))
     } else {
-        prompt_bool(
-            "reexec (let the web console load a different model)",
-            default_reexec(),
-        )?
+        None
     };
 
     let mut contents = format!("[orangu-server]\nmodels = {models}\n");
@@ -74,11 +80,28 @@ pub fn run_init() -> Result<()> {
     if role != Role::default() {
         contents.push_str(&format!("role = {}\n", role.label()));
     }
-    contents.push_str(&format!("host = {host}\nport = {port}\nweb = {web}\n"));
-    // Written only when it differs from the default, matching how `role` is
-    // handled above and how `--init` stays terse generally.
-    if reexec != default_reexec() {
-        contents.push_str(&format!("reexec = {}\n", if reexec { "yes" } else { "no" }));
+    contents.push_str(&format!("host = {host}\nport = {port}\n"));
+    if let Some((web_host, web_port, reexec, delete)) = &web {
+        // `host` and `port` together, the same pair `[orangu-server]` writes
+        // unconditionally above — a section that names where it listens
+        // reads better than one that leaves half of it implied.
+        contents.push_str(&format!(
+            "\n[{WEB_SECTION}]\nhost = {web_host}\nport = {web_port}\n"
+        ));
+        // Written only when it differs from the default, matching how `role`
+        // is handled above and how `--init` stays terse generally.
+        if *reexec != default_reexec() {
+            contents.push_str(&format!(
+                "reexec = {}\n",
+                if *reexec { "yes" } else { "no" }
+            ));
+        }
+        if *delete != default_delete() {
+            contents.push_str(&format!(
+                "delete = {}\n",
+                if *delete { "yes" } else { "no" }
+            ));
+        }
     }
 
     println!("\nConfiguration to write:\n");
@@ -136,9 +159,34 @@ impl Completer for DirCompleter {
 
 impl Hinter for DirCompleter {
     type Hint = String;
+
+    /// Ghost-suggests the rest of the directory being typed, from the same
+    /// [`FilenameCompleter`] TAB completes with — so what the grey text
+    /// previews and what TAB fills in can never disagree.
+    fn hint(&self, line: &str, pos: usize, ctx: &RlContext<'_>) -> Option<String> {
+        // Only hint when the cursor is at the end of the line — matching
+        // `rustyline`'s own `HistoryHinter` convention: a hint previewing
+        // what comes *after* the cursor makes no sense while editing
+        // earlier in the middle of an already-typed path.
+        if pos < line.len() {
+            return None;
+        }
+        let (start, candidates) = self.inner.complete(line, pos, ctx).ok()?;
+        let candidate = candidates.first()?;
+        let typed = line.get(start..pos)?;
+        candidate
+            .replacement
+            .strip_prefix(typed)
+            .filter(|suffix| !suffix.is_empty())
+            .map(str::to_string)
+    }
 }
 
-impl Highlighter for DirCompleter {}
+impl Highlighter for DirCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{GHOST_TEXT}{hint}{ANSI_RESET}"))
+    }
+}
 impl Validator for DirCompleter {}
 impl Helper for DirCompleter {}
 
@@ -197,6 +245,9 @@ fn prompt_dir(label: &str, default: Option<&std::path::Path>) -> Result<String> 
 /// each `--init` wizard is a separate, self-contained binary.
 struct OptionCompleter {
     options: Vec<String>,
+    /// What an empty line means, ghosted so pressing Enter has a visible
+    /// effect before it is pressed. `None` leaves an empty line unhinted.
+    default: Option<String>,
 }
 
 impl Completer for OptionCompleter {
@@ -224,9 +275,32 @@ impl Completer for OptionCompleter {
 
 impl Hinter for OptionCompleter {
     type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &RlContext<'_>) -> Option<String> {
+        // Same end-of-line rule as every other hinter here.
+        if pos < line.len() {
+            return None;
+        }
+        if line.is_empty() {
+            return self.default.clone();
+        }
+        let prefix = line.to_lowercase();
+        let candidate = self
+            .options
+            .iter()
+            .find(|option| option.to_lowercase().starts_with(&prefix))?;
+        candidate
+            .get(line.len()..)
+            .filter(|suffix| !suffix.is_empty())
+            .map(str::to_string)
+    }
 }
 
-impl Highlighter for OptionCompleter {}
+impl Highlighter for OptionCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{GHOST_TEXT}{hint}{ANSI_RESET}"))
+    }
+}
 impl Validator for OptionCompleter {}
 impl Helper for OptionCompleter {}
 
@@ -269,7 +343,7 @@ fn prompt_model(models_dir: &Path) -> Result<String> {
         labels: model_hint_options(&groups),
     }));
 
-    match editor.readline("model (optional, only used with --daemon) []: ") {
+    match editor.readline("model []: ") {
         Ok(line) => Ok(line.trim().to_string()),
         Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
             Err(anyhow!("aborted: reached end of input"))
@@ -362,27 +436,173 @@ pub(crate) fn sole_model(
 
 /// Turns `group_models`'s output into TAB-completion candidates: `NR` (its
 /// 1-based position — `resolve_show_target`'s own NR resolution counts the
-/// exact same way) immediately followed by that row's `MODEL` label, for
-/// every group in turn — the same NR-then-MODEL pairing, in the same
+/// exact same way) immediately followed by that row's `MODEL:QUANT`
+/// ([`qualified_label`]), for every group in turn — the same NR-then-MODEL pairing, in the same
 /// order, `orangu-server`'s own shell completion for `show`/`download`
 /// prints from `orangu-server list`'s output (`awk 'NR>1 {print $1; print
 /// $2}'`). Split out from [`prompt_model`] so this ordering claim is
 /// actually checked, not just asserted in a doc comment.
 fn model_completion_options(groups: &[orangu::model_spec::ModelGroup]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     groups
         .iter()
         .enumerate()
-        .flat_map(|(index, group)| [(index + 1).to_string(), group.label.clone()])
+        .flat_map(|(index, group)| [(index + 1).to_string(), qualified_label(group)])
+        // Two snapshots of one repo at one quantization would still collide;
+        // each distinct candidate is offered once, in first-seen order, so
+        // the NR-then-MODEL ordering above holds for everything that
+        // survives. (Every such row keeps its own `NR` regardless.)
+        .filter(|option| seen.insert(option.clone()))
         .collect()
 }
 
-/// What the `model` prompt ghost-suggests from: the `MODEL` labels only, in
-/// `group_models` order — so the first one is the first row `orangu-server
+/// A group's `MODEL` column with its `QUANT` appended —
+/// `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` — which is what the prompt offers
+/// and what an answer gets written to the config as.
+///
+/// The bare label is not enough. A repo with several quantizations on disk
+/// prints the same `MODEL` on every one of their rows, so offering that
+/// would list one name eight times over and — worse — write a `model =`
+/// value that resolves to whichever of them comes first, rather than the one
+/// picked. `<repo>:<quant>` is a spelling
+/// [`orangu::model_spec::ModelGroup::matches_label`] already accepts, so it
+/// resolves straight back to this exact row.
+///
+/// Falls back to the plain label where that spelling wouldn't resolve: a
+/// model outside the Hugging Face cache layout has no repo id to qualify,
+/// and one whose file says nothing about its scheme has no quantization to
+/// qualify it with.
+fn qualified_label(group: &orangu::model_spec::ModelGroup) -> String {
+    match (&group.hf_repo, &group.quantization) {
+        (Some(repo), Some(quant)) => format!("{repo}:{quant}"),
+        _ => group.label.clone(),
+    }
+}
+
+/// What the `model` prompt ghost-suggests from: the `MODEL:QUANT` labels
+/// only ([`qualified_label`]), in `group_models` order — so the first one is the first row `orangu-server
 /// list` prints, and it's what an empty line previews. Deliberately not
 /// [`model_completion_options`]'s NR-and-label interleaving: its first entry
 /// is the digit `1`, which is a shorthand to type, not a model to preview.
 fn model_hint_options(groups: &[orangu::model_spec::ModelGroup]) -> Vec<String> {
-    groups.iter().map(|group| group.label.clone()).collect()
+    let mut seen = std::collections::HashSet::new();
+    groups
+        .iter()
+        .map(qualified_label)
+        .filter(|label| seen.insert(label.clone()))
+        .collect()
+}
+
+/// The model prompt of `orangu-server`'s own interactive startup picker,
+/// with `default` (the `NR` of whatever `[orangu-server].model` names, when
+/// it names something installed) pre-selected — ghosted on the empty line,
+/// and returned when Enter is pressed on nothing.
+///
+/// The pre-selection shows *only* as the ghost: no `[61]` after the label
+/// as well. The bracketed form is right for a prompt whose default can't be
+/// previewed any other way (`--init`'s `port`, `host`, and the rest), but
+/// here it would print the same value twice on one line, once in a place the
+/// answer can't be typed and once where it can.
+///
+/// TAB completes over every `NR` *and* every `MODEL:QUANT`
+/// ([`model_completion_options`]) — the same candidates `--init`'s own
+/// `model` prompt offers — so anything the prompt suggests is also something
+/// the caller accepts. Returns the answer as typed; resolving it is the
+/// caller's job, since it accepts more spellings than are offered.
+pub(crate) fn prompt_model_nr(
+    groups: &[orangu::model_spec::ModelGroup],
+    default: Option<&str>,
+) -> Result<String> {
+    // The blank line separating the table above from the prompt, printed
+    // rather than folded into the prompt string — `echo_answer` rewrites the
+    // prompt's own line afterwards, and a leading newline in it would make
+    // that rewrite land a line too high.
+    println!();
+    let label = "Model: ";
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut editor: Editor<OptionCompleter, DefaultHistory> = Editor::with_config(config)?;
+    editor.set_helper(Some(OptionCompleter {
+        options: model_completion_options(groups),
+        default: default.map(str::to_string),
+    }));
+
+    let value = match editor.readline(label) {
+        Ok(line) => line.trim().to_string(),
+        Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
+            return Err(anyhow!("aborted: reached end of input"));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    match (value.is_empty(), default) {
+        (true, Some(default)) => Ok(default.to_string()),
+        (true, None) => Err(anyhow!("no model selected")),
+        (false, _) => Ok(value),
+    }
+}
+
+/// Rewrites the line a prompt was just answered on so it reads
+/// `<label><value>`.
+///
+/// Without this, answering a ghost-only prompt with Enter leaves `Model: `
+/// with nothing after it: the ghost is a hint, not part of the line, so it
+/// vanishes the moment Enter is pressed and takes the record of what was
+/// chosen with it. The startup transcript is the only place that says which
+/// model and role this server came up on before the banner prints, so it has
+/// to survive.
+///
+/// Idempotent for a typed answer — rewriting `Model: 61` as `Model: 61`
+/// changes nothing on screen — so the caller doesn't have to know which of
+/// the two happened. Skipped entirely when stdout isn't a terminal: there is
+/// no line to move back up to in a pipe or a log file, and the escape codes
+/// would be the only thing that landed there.
+pub(crate) fn echo_answer(label: &str, value: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    print!("{}", answer_line(label, value));
+    let _ = std::io::stdout().flush();
+}
+
+/// The escape sequence [`echo_answer`] writes: up onto the line `readline`
+/// just left behind, clear it, write it out again with the value that was
+/// actually taken. Split out so the cursor arithmetic is testable — it is
+/// the part that quietly ruins the line above if `label` ever grows a
+/// newline of its own.
+fn answer_line(label: &str, value: &str) -> String {
+    debug_assert!(
+        !label.contains('\n'),
+        "a label with a newline would put the rewrite on the wrong line"
+    );
+    format!("\x1b[1A\r\x1b[2K{label}{value}\n")
+}
+
+/// Where `spec` sits in `groups` as an `NR`, or `None` when it names
+/// nothing installed — a repo that hasn't been downloaded yet, most often,
+/// which has no row to point at and is left to the caller to fetch.
+///
+/// Accepts every spelling the listing itself does: an `NR`, a `MODEL` label,
+/// the `MODEL:QUANT` spelling [`qualified_label`] offers, and a path to any
+/// of a model's shards.
+pub(crate) fn nr_of(groups: &[orangu::model_spec::ModelGroup], spec: &str) -> Option<usize> {
+    if let Ok(nr) = spec.parse::<usize>() {
+        return (nr >= 1 && nr <= groups.len()).then_some(nr);
+    }
+    let path = std::fs::canonicalize(spec).ok();
+    groups
+        .iter()
+        .position(|group| {
+            group.matches_label(spec)
+                || qualified_label(group) == spec
+                || path.as_ref().is_some_and(|path| {
+                    group
+                        .paths
+                        .iter()
+                        .any(|shard| std::fs::canonicalize(shard).is_ok_and(|s| s == *path))
+                })
+        })
+        .map(|index| index + 1)
 }
 
 /// Prompts for a [`Role`], TAB-completing over the five valid role names
@@ -398,7 +618,7 @@ fn model_hint_options(groups: &[orangu::model_spec::ModelGroup]) -> Vec<String> 
 /// there yet) an unrecognized entry here just re-prompts:
 /// there's no sensible way to "use" a role that isn't one of the five
 /// [`Role`] actually implements.
-pub(crate) fn prompt_role(prompt: &str) -> Result<Role> {
+pub(crate) fn prompt_role(prompt: &str, default: Role) -> Result<Role> {
     let options: Vec<String> = [
         Role::All,
         Role::Code,
@@ -414,7 +634,10 @@ pub(crate) fn prompt_role(prompt: &str) -> Result<Role> {
         .completion_type(rustyline::CompletionType::List)
         .build();
     let mut editor: Editor<OptionCompleter, DefaultHistory> = Editor::with_config(config)?;
-    editor.set_helper(Some(OptionCompleter { options }));
+    editor.set_helper(Some(OptionCompleter {
+        options,
+        default: Some(default.label().to_string()),
+    }));
 
     loop {
         let value = match editor.readline(prompt) {
@@ -425,7 +648,7 @@ pub(crate) fn prompt_role(prompt: &str) -> Result<Role> {
             Err(err) => return Err(err.into()),
         };
         if value.is_empty() {
-            return Ok(Role::default());
+            return Ok(default);
         }
         match Role::parse(&value) {
             Ok(role) => return Ok(role),
@@ -695,10 +918,204 @@ mod tests {
         );
     }
 
+    /// A real hub-cache group, whose `MODEL` column is the bare repo and
+    /// whose quantization is a column of its own.
+    fn hub_group(repo: &str, quant: &str) -> ModelGroup {
+        ModelGroup {
+            label: repo.to_string(),
+            size_bytes: 0,
+            quantization: Some(quant.to_string()),
+            errors: Vec::new(),
+            representative_path: PathBuf::new(),
+            paths: Vec::new(),
+            hf_repo: Some(repo.to_string()),
+            local_commit: None,
+        }
+    }
+
+    /// A repo with several quantizations on disk prints the same bare
+    /// `MODEL` on every one of their rows. Offering *that* would list one
+    /// name once per quantization — and write a `model =` value resolving to
+    /// whichever came first rather than the one picked. Each row is offered
+    /// as `MODEL:QUANT` instead, which names it exactly.
+    #[test]
+    fn each_quantization_is_offered_as_its_own_qualified_label() {
+        let repo = "unsloth/gemma-4-E2B-it-GGUF";
+        let groups = vec![
+            hub_group(repo, "Q4_K_M"),
+            hub_group(repo, "Q6_K"),
+            hub_group(repo, "Q8_0"),
+        ];
+
+        assert_eq!(
+            model_completion_options(&groups),
+            vec![
+                "1".to_string(),
+                format!("{repo}:Q4_K_M"),
+                "2".to_string(),
+                format!("{repo}:Q6_K"),
+                "3".to_string(),
+                format!("{repo}:Q8_0"),
+            ]
+        );
+        // And nothing is offered twice.
+        assert_eq!(
+            model_hint_options(&groups),
+            vec![
+                format!("{repo}:Q4_K_M"),
+                format!("{repo}:Q6_K"),
+                format!("{repo}:Q8_0"),
+            ]
+        );
+    }
+
+    /// `<repo>:<quant>` only resolves for a model that *has* a repo and a
+    /// quantization; anything else keeps the plain label, which is the
+    /// spelling that does resolve for it.
+    #[test]
+    fn a_model_with_nothing_to_qualify_keeps_its_plain_label() {
+        // A `.gguf` copied in by hand: no hub-cache repo id.
+        assert_eq!(qualified_label(&group("my-local-model")), "my-local-model");
+
+        // A hub-cache model whose file says nothing about its scheme.
+        let mut no_quant = hub_group("user/model", "Q4_K_M");
+        no_quant.quantization = None;
+        assert_eq!(qualified_label(&no_quant), "user/model");
+    }
+
     #[test]
     fn empty_groups_give_no_completion_options() {
         assert!(model_completion_options(&[]).is_empty());
         assert!(model_hint_options(&[]).is_empty());
+    }
+
+    /// A configuration that already names a model and a role should cost one
+    /// Enter each at startup, not a retype — so `nr_of` has to find the row
+    /// whatever spelling the config used.
+    #[test]
+    fn finds_the_row_a_configured_model_names_however_it_is_spelled() {
+        let repo = "bartowski/Llama-3.2-3B-Instruct-GGUF";
+        let groups = vec![
+            hub_group("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "Q4_K_M"),
+            hub_group(repo, "IQ3_M"),
+            hub_group(repo, "Q4_K_M"),
+        ];
+
+        // The `MODEL:QUANT` spelling the prompt itself offers.
+        assert_eq!(nr_of(&groups, &format!("{repo}:Q4_K_M")), Some(3));
+        assert_eq!(nr_of(&groups, &format!("{repo}:IQ3_M")), Some(2));
+        // A bare `MODEL`, which two rows share — first match, exactly as
+        // every other bare-label resolution in the codebase.
+        assert_eq!(nr_of(&groups, repo), Some(2));
+        // An `NR` as written.
+        assert_eq!(nr_of(&groups, "1"), Some(1));
+    }
+
+    /// Out-of-range numbers and unknown names have no row to point at, and
+    /// must say so rather than picking one.
+    #[test]
+    fn a_configured_model_that_names_no_row_has_no_nr() {
+        let groups = vec![hub_group("user/model", "Q4_K_M")];
+        assert_eq!(nr_of(&groups, "2"), None);
+        assert_eq!(nr_of(&groups, "0"), None);
+        assert_eq!(nr_of(&groups, "user/not-installed-yet"), None);
+        assert_eq!(nr_of(&[], "1"), None);
+    }
+
+    /// Enter on a ghost leaves the prompt line blank — the hint was never
+    /// part of the line. The answer has to be written back onto it, one line
+    /// up from where `readline` left the cursor, or the startup transcript
+    /// never says which model and role this server came up on.
+    #[test]
+    fn rewrites_the_answered_line_one_line_up() {
+        assert_eq!(answer_line("Model: ", "61"), "\x1b[1A\r\x1b[2KModel: 61\n");
+        assert_eq!(answer_line("Role: ", "all"), "\x1b[1A\r\x1b[2KRole: all\n");
+    }
+
+    fn option_hinter(default: Option<&str>) -> OptionCompleter {
+        OptionCompleter {
+            options: ["all", "code", "review", "explorer", "embedding"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            default: default.map(str::to_string),
+        }
+    }
+
+    /// The pre-selected value is ghosted on an empty line, so what Enter is
+    /// about to do is visible before it is pressed.
+    #[test]
+    fn ghosts_the_pre_selected_option_on_an_empty_line() {
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        assert_eq!(
+            option_hinter(Some("review")).hint("", 0, &ctx).as_deref(),
+            Some("review")
+        );
+        // Nothing pre-selected, nothing ghosted.
+        assert_eq!(option_hinter(None).hint("", 0, &ctx), None);
+    }
+
+    /// Once something is typed the ghost follows the options, not the
+    /// pre-selection — otherwise typing `e` under a `review` default would
+    /// preview `review`, which is not what Enter would then do.
+    #[test]
+    fn typing_ghosts_the_matching_option_not_the_default() {
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        let hinter = option_hinter(Some("review"));
+        // `explorer` precedes `embedding` in the offered order, so a bare
+        // `e` previews the first of the two rather than either at random.
+        assert_eq!(hinter.hint("e", 1, &ctx).as_deref(), Some("xplorer"));
+        assert_eq!(hinter.hint("emb", 3, &ctx).as_deref(), Some("edding"));
+        assert_eq!(hinter.hint("zzz", 3, &ctx), None);
+        assert_eq!(hinter.hint("review", 3, &ctx), None, "not at end of line");
+    }
+
+    fn dir_hinter() -> DirCompleter {
+        DirCompleter {
+            inner: FilenameCompleter::new(),
+        }
+    }
+
+    /// The `models` prompt ghost-suggests the rest of the directory being
+    /// typed, from the same completer TAB fills in from — so pointing at a
+    /// models directory is a prefix and a keypress, not a full path typed
+    /// out.
+    #[test]
+    fn hints_the_remainder_of_a_directory_being_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("models-directory")).unwrap();
+        let typed = format!("{}/models-dir", dir.path().display());
+
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        let hint = dir_hinter()
+            .hint(&typed, typed.len(), &ctx)
+            .expect("a real subdirectory prefix should ghost the rest of its name");
+        assert!(
+            format!("{typed}{hint}")
+                .starts_with(&format!("{}/models-directory", dir.path().display())),
+            "hint {hint:?} did not complete {typed:?}"
+        );
+    }
+
+    /// A `Hinter` with no `Highlighter` behind it produces a hint nobody can
+    /// see — which is exactly what the `models` prompt used to do. Assert
+    /// the grey is actually applied.
+    #[test]
+    fn renders_the_directory_hint_in_grey() {
+        let rendered = dir_hinter().highlight_hint("ectory");
+        assert_eq!(rendered, format!("{GHOST_TEXT}ectory{ANSI_RESET}"));
+    }
+
+    /// Same end-of-line rule the other hinters follow: a preview of what
+    /// comes *after* the cursor means nothing while editing before it.
+    #[test]
+    fn does_not_hint_a_directory_before_the_end_of_the_line() {
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        assert_eq!(dir_hinter().hint("/tmp/x", 2, &ctx), None);
     }
 
     fn model_hinter() -> ModelCompleter {

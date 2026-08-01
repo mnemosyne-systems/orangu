@@ -977,7 +977,7 @@
   // load, the same `(Refresh)` marker on a row whose repo has moved on, and
   // the same `error:` row replacing the cells for a file whose header
   // wouldn't parse. Two icons per row: Show and Delete.
-  function renderTable(models, canLoad, loading) {
+  function renderTable(models, canLoad, canDelete, loading) {
     modelsTableEl.innerHTML = "";
     if (models.length === 0) {
       const empty = document.createElement("div");
@@ -1055,36 +1055,41 @@
       const actions = document.createElement("td");
       actions.className = "models-actions";
 
-      if (model.loaded) {
-        const marker = iconButton(ICON.loaded, "Currently loaded", null, "is-loaded");
-        marker.disabled = true;
-        actions.appendChild(marker);
-      } else {
-        const load = iconButton(ICON.load, `Load ${rowTitle(model)}`, () => {
-          if (
-            !window.confirm(
-              `Load "${rowTitle(model)}"?\n\nThe server restarts itself on this model. ` +
-                `Chat history is kept; anything still generating is not.`,
-            )
-          ) {
-            return;
+      // Nothing at all when `[web].reexec` is off (or the platform has no
+      // execve): no Load button, and no check mark in its place either —
+      // which row is serving is already on the row itself, as the `loaded`
+      // badge beside its name. A column of permanently dead buttons explains
+      // nothing that the config file doesn't explain better.
+      if (canLoad) {
+        if (model.loaded) {
+          const marker = iconButton(ICON.loaded, "Currently loaded", null, "is-loaded");
+          marker.disabled = true;
+          actions.appendChild(marker);
+        } else {
+          const load = iconButton(ICON.load, `Load ${rowTitle(model)}`, () => {
+            if (
+              !window.confirm(
+                `Load "${rowTitle(model)}"?\n\nThe server restarts itself on this model. ` +
+                  `Chat history is kept; anything still generating is not.`,
+              )
+            ) {
+              return;
+            }
+            loadModel(model);
+          });
+          // Disabled, not removed, for the two reasons that *are* conditional
+          // — a handover already running, and a model this build can't load —
+          // so the button says which rather than the click discovering it.
+          if (loading) {
+            load.disabled = true;
+            load.title = `Already loading ${loading}`;
+          } else if (!model.loadable) {
+            load.disabled = true;
+            load.title = "This build cannot load this model";
           }
-          loadModel(model);
-        });
-        // Disabled for the three reasons the server would refuse anyway, so
-        // the button says so instead of the click doing.
-        if (!canLoad) {
-          load.disabled = true;
-          load.title = "Loading a model from here is disabled (reexec = no in orangu-server.conf)";
-        } else if (loading) {
-          load.disabled = true;
-          load.title = `Already loading ${loading}`;
-        } else if (!model.loadable) {
-          load.disabled = true;
-          load.title = "This build cannot load this model";
+          load.setAttribute("aria-label", load.title);
+          actions.appendChild(load);
         }
-        load.setAttribute("aria-label", load.title);
-        actions.appendChild(load);
       }
 
       actions.appendChild(
@@ -1092,6 +1097,14 @@
           showMetadata(String(model.nr), rowTitle(model)),
         ),
       );
+
+      // Same for Delete: switched off in the config means no button, not a
+      // dead one.
+      if (!canDelete) {
+        row.appendChild(actions);
+        body.appendChild(row);
+        continue;
+      }
 
       const remove = iconButton(
         ICON.trash,
@@ -1245,10 +1258,15 @@
     renderJob(data.job);
     // `can_load`/`loading` change what a row's Load button does, so they
     // are part of what the table is compared on, not just the rows.
-    const signature = JSON.stringify([data.models, data.can_load, data.loading ?? null]);
+    const signature = JSON.stringify([
+      data.models,
+      data.can_load,
+      data.can_delete,
+      data.loading ?? null,
+    ]);
     if (signature !== modelsState.tableSignature) {
       modelsState.tableSignature = signature;
-      renderTable(data.models, data.can_load, data.loading);
+      renderTable(data.models, data.can_load, data.can_delete, data.loading);
     }
     // The topbar name follows the loaded model, so a handover is visible
     // without reloading the page.

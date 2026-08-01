@@ -461,9 +461,11 @@ struct Prepared {
     config_path: Option<PathBuf>,
     /// The role this process actually resolved to, flag or prompt.
     role: config::Role,
-    /// `[orangu-server].reexec`: whether the web console may load a
-    /// different model into this server.
+    /// `[web].reexec`: whether the web console may load a different model
+    /// into this server.
     reexec: bool,
+    /// `[web].delete`: whether the web console may delete models.
+    delete: bool,
     /// The GPU kernel/tuning selection this device came up with, and its
     /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
     /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
@@ -518,7 +520,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 (path, spec)
             }
             None => {
-                let selected = select_model_interactively(&conf.models)?;
+                let selected = select_model_interactively(&conf.models, conf.model.as_deref())?;
                 // Only when no `--all`/`--code`/`--review`/`--explorer`/
                 // `--embedding` flag was given — an explicit flag already
                 // settled `role`, and shouldn't be second-guessed by a
@@ -531,10 +533,17 @@ fn prepare(args: Args) -> Result<Prepared> {
                 // `--code`/`--review`/etc. already have when combined with
                 // an interactively-prompted model.
                 if cli_role.is_none() {
-                    role = init::prompt_role(&format!(
-                        "role [{}]: ",
-                        config::Role::default().label()
-                    ))?;
+                    // Pre-selected from `[orangu-server].role` when the
+                    // config names one, so a configuration that already says
+                    // how this server is meant to run is one Enter away
+                    // rather than something to retype. An explicit CLI flag
+                    // never reaches here at all.
+                    // Pre-selected as the ghost alone, matching the model
+                    // prompt just above it — no `[review]` after the label
+                    // as well, which would print the same value twice.
+                    let default = conf.role_key.unwrap_or_default();
+                    role = init::prompt_role("Role: ", default)?;
+                    init::echo_answer("Role: ", role.label());
                 }
                 selected
             }
@@ -698,7 +707,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         .with_context(|| format!("failed to configure listener on {api_addr}"))?;
 
     let web_listener = if conf.web != 0 {
-        let web_addr = format!("{bind_host}:{}", conf.web);
+        // `[web].host` when it names one, else the API's own — see
+        // `ServerConfiguration::web_host`.
+        let web_addr = format!("{}:{}", config::resolve_bind_host(&conf.web_host), conf.web);
         let listener = reexec::adopt_or_bind(inherited.web, &web_addr)?;
         listener
             .set_nonblocking(true)
@@ -723,6 +734,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         config_path,
         role,
         reexec: conf.reexec,
+        delete: conf.delete,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -814,6 +826,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         config_path,
         role,
         reexec: reexec_allowed,
+        delete: delete_allowed,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -936,6 +949,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             jobs: Default::default(),
             catalog: Default::default(),
             handover,
+            can_delete: delete_allowed,
             loading: Default::default(),
         });
         let web_app = web::build_router(web_state);
@@ -1354,7 +1368,10 @@ pub(crate) fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String 
 /// A directory holding exactly one model ([`init::sole_model`], shared with
 /// the `--init` wizard's own `model` prompt) skips the `NR` prompt entirely
 /// and goes straight on to the caller's role prompt.
-fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
+fn select_model_interactively(
+    models_dir: &Path,
+    configured: Option<&str>,
+) -> Result<(PathBuf, String)> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
     let groups = orangu::model_spec::group_models(&models);
@@ -1387,22 +1404,33 @@ fn select_model_interactively(models_dir: &Path) -> Result<(PathBuf, String)> {
         return Ok((only.representative_path.clone(), only.label.clone()));
     }
 
-    print!("\nSelect a model (NR): ");
-    std::io::stdout().flush().ok();
+    // `[orangu-server].model`, as the `NR` of the row it names — the prompt
+    // asks for a number, so that is the form to pre-select it in. A config
+    // naming a model that isn't installed has no row to point at; its spec
+    // is offered as written instead, and Enter fetches it exactly as
+    // `orangu-server <spec>` would.
+    let default = configured.map(|spec| match init::nr_of(&groups, spec) {
+        Some(nr) => nr.to_string(),
+        None => spec.to_string(),
+    });
+    let answer = init::prompt_model_nr(&groups, default.as_deref())?;
+    // Enter on the ghost leaves the line blank; put the value that was
+    // actually taken back on it, so the transcript says what was chosen.
+    init::echo_answer("Model: ", &answer);
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("failed to read model selection")?;
-    let nr: usize = input
-        .trim()
-        .parse()
-        .with_context(|| format!("'{}' is not a number", input.trim()))?;
-    let group = nr
-        .checked_sub(1)
-        .and_then(|index| groups.get(index))
-        .ok_or_else(|| anyhow!("no model with NR {nr} ({} model(s) listed)", groups.len()))?;
-    Ok((group.representative_path.clone(), group.label.clone()))
+    // An `NR` is answered straight out of the table already in hand. Anything
+    // else — a label, a path, a repo still to fetch — goes through the same
+    // resolution the positional argument uses, so the prompt accepts
+    // everything that does.
+    if let Ok(nr) = answer.parse::<usize>() {
+        let group = nr
+            .checked_sub(1)
+            .and_then(|index| groups.get(index))
+            .ok_or_else(|| anyhow!("no model with NR {nr} ({} model(s) listed)", groups.len()))?;
+        return Ok((group.representative_path.clone(), group.label.clone()));
+    }
+    orangu::model_spec::resolve_load_target(models_dir, &answer)
+        .with_context(|| format!("resolving model '{answer}'"))
 }
 
 /// Ctrl+C (`tokio::signal::ctrl_c`) already covers `SIGINT` on Unix in

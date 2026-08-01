@@ -193,6 +193,11 @@ pub struct WebState {
     /// `execve`, which is how the button knows to disable itself instead of
     /// offering something that would only refuse.
     pub handover: Option<Arc<crate::reexec::Handover>>,
+    /// `[web].delete`: whether the model manager may delete models. When
+    /// false the panel draws no Delete button at all — unlike **Load**,
+    /// which is drawn disabled with a tooltip, because there is nothing
+    /// conditional here to explain: this server simply doesn't do that.
+    pub can_delete: bool,
     /// The model a handover has been accepted for, once one has — see
     /// `models::select`. Only ever goes from empty to set: this process is
     /// about to be replaced, so there is nothing to reset it back to.

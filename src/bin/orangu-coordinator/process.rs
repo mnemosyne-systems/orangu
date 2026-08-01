@@ -577,9 +577,10 @@ async fn format_output_tail(tail: &OutputTail) -> String {
     format!("\nlast output:\n{lines}")
 }
 
-/// Writes `entry`'s own `orangu-server.conf` (just the `[orangu-server]`
-/// section: `models`, `host`, `port`, and whichever of `backend`/`slots`/
-/// `web` were set) to `~/.orangu/coordinator/servers/<name>.conf`,
+/// Writes `entry`'s own `orangu-server.conf` — the `[orangu-server]`
+/// section (`models`, `host`, `port`, and whichever of `backend`/`slots`
+/// were set), plus a `[web]` section when the profile asks for a web console
+/// — to `~/.orangu/coordinator/servers/<name>.conf`,
 /// overwriting any previous contents — `orangu-server` itself reads this
 /// file once at its own startup, so a stale file from a previous run is
 /// never an issue, and this path doubles as a debugging aid: exactly what a
@@ -604,8 +605,11 @@ fn write_server_config(entry: &CoordinatorLlmEntry, models_dir: &Path) -> Result
     if let Some(slots) = entry.slots {
         contents.push_str(&format!("slots = {slots}\n"));
     }
+    // Its own section, which is what `orangu-server` reads today: the
+    // section's presence is what turns the console on. A profile with no
+    // `web` gets no section, and so no second listener.
     if let Some(web) = entry.web {
-        contents.push_str(&format!("web = {web}\n"));
+        contents.push_str(&format!("\n[web]\nport = {web}\n"));
     }
 
     std::fs::write(&path, contents)
@@ -1027,7 +1031,7 @@ mod tests {
         assert!(contents.contains("port = 8100"));
         assert!(contents.contains("backend = vulkan"));
         assert!(contents.contains("slots = 4"));
-        assert!(contents.contains("web = 8181"));
+        assert!(contents.contains("[web]\nport = 8181"), "{contents}");
         std::fs::remove_file(&path).ok();
 
         let minimal_entry = CoordinatorLlmEntry {

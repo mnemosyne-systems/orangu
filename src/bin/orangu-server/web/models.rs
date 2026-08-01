@@ -289,10 +289,13 @@ struct ListView {
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_available_bytes: Option<u64>,
     current: CurrentView,
-    /// Whether **Load** is offered at all: `[orangu-server].reexec` is on
-    /// *and* this platform can `execve`. The panel disables the button when
-    /// this is false rather than letting it fail on click.
+    /// Whether **Load** is offered at all: `[web].reexec` is on *and* this
+    /// platform can `execve`. The panel disables the button when this is
+    /// false rather than letting it fail on click.
     can_load: bool,
+    /// `[web].delete`. The panel draws no Delete button at all when this is
+    /// false — see [`WebState::can_delete`].
+    can_delete: bool,
     /// Set once a handover has been accepted — the process is about to be
     /// replaced. The panel shows it and stops offering more actions; its
     /// next poll is the one that lands on the new image.
@@ -355,6 +358,7 @@ async fn list(
             slots: state.engine.slots.total(),
         },
         can_load: state.handover.is_some(),
+        can_delete: state.can_delete,
         loading: state.loading_model(),
         job: state.jobs.snapshot(),
         // Which row is loaded is decided here rather than baked into the
@@ -682,6 +686,9 @@ async fn download(
 /// Deletes every shard of a model, reclaiming its hub-cache blob(s) too when
 /// nothing else still references them — `orangu-server delete`.
 ///
+/// Refused outright when `[web].delete` is off — the panel draws no button
+/// for it then, so reaching this at all means a hand-made request.
+///
 /// The loaded model is refused: its weights are memory-mapped by the running
 /// engine, so deleting the file underneath it leaves this process reading a
 /// file that no longer has a name and the next request generating from
@@ -692,6 +699,15 @@ async fn remove(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ModelRequest>,
 ) -> impl IntoResponse {
+    if !state.can_delete {
+        return (
+            StatusCode::FORBIDDEN,
+            "deleting models from the web console is disabled (set delete = yes in the [web] \
+             section of orangu-server.conf to enable it)",
+        )
+            .into_response();
+    }
+
     let models_dir = state.models_dir.clone();
     let loaded_path = state.model_path.clone();
     let catalog = state.catalog.clone();
