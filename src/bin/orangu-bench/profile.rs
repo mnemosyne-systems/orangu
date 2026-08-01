@@ -480,6 +480,73 @@ fn render(folded: &str, opts: &Options, seconds: f64, samples: u64) -> anyhow::R
     Ok(opts.svg.clone())
 }
 
+/// Re-render an already-collapsed `.folded` profile to SVG, and optionally to
+/// PNG — no `perf`, no server, no re-run.
+///
+/// The `.folded` file is the durable artifact of a capture: the transient
+/// `perf.data` is deleted the moment it collapses, so this is what makes
+/// "re-renders without a re-run" true rather than merely claimed. Three uses,
+/// all of which otherwise cost re-measuring:
+///
+/// * **a rasterizer that was missing at capture time.** `--flamegraph-png` is
+///   a pure function of the SVG, so a PNG can always be produced later — but
+///   before this there was no way to ask for one without re-running the
+///   benchmark that produced the profile.
+/// * a profile captured on another machine, or one whose title wants fixing.
+/// * re-rendering after a change to the renderer itself.
+///
+/// The subtitle's `pid`, `freq` and `seconds` come from the `.meta.json`
+/// sidecar when it is still beside the file. The **sample count never does** —
+/// it is summed from the stacks, so it is exact even for a `.folded` carried
+/// off the machine alone. What the sidecar cannot supply is reported as
+/// unknown rather than invented, because a subtitle claiming `0s at 0 Hz`
+/// would be read as a measurement.
+pub fn rerender(
+    folded_path: &Path,
+    svg: &Path,
+    png: bool,
+    title: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    let folded = read_maybe_gzipped(folded_path)?;
+    let samples = attribution_samples(&folded);
+    if samples == 0 {
+        anyhow::bail!(
+            "{} contains no samples — is it a collapsed profile?",
+            folded_path.display()
+        );
+    }
+    let meta: serde_json::Value = std::fs::read_to_string(sibling(folded_path, "meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let num = |k: &str| meta.get(k).and_then(serde_json::Value::as_f64);
+    let text = |k: &str| {
+        meta.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+
+    let opts = Options {
+        svg: svg.to_path_buf(),
+        pid: num("pid").unwrap_or(0.0) as u32,
+        freq: num("freq_hz").unwrap_or(0.0) as u32,
+        call_graph: text("call_graph").unwrap_or_else(|| "?".to_string()),
+        png,
+        title: title
+            .map(str::to_string)
+            .or_else(|| text("title"))
+            .unwrap_or_else(|| {
+                folded_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "flamegraph".to_string())
+            }),
+    };
+    let out = render(&folded, &opts, num("seconds").unwrap_or(0.0), samples)?;
+    let png_path = if png { render_png(&out)? } else { None };
+    Ok((out, png_path))
+}
+
 /// A raster copy beside the SVG, for documents and diffs that cannot embed one.
 /// Absence of a converter is reported, not fatal — the SVG is already written
 /// and is the better artifact of the two.

@@ -83,6 +83,24 @@ impl CpuBackend {
             ));
         }
 
+        // The two-bit family decodes through a per-super-block activation
+        // scale, which lets the whole 256-element accumulation stay in `i32`
+        // instead of converting once per 32. Measured at 1.24x (`Q3_K`) and
+        // 1.45x (`Q2_K`) in isolation — see `engine::vecdot`'s section comment
+        // and `doc/perf/tiny-kernel`.
+        //
+        // Ahead of the `quantize_act` below because it needs a *different*
+        // activation quantization, and doing both would pay for one twice.
+        if n_tokens == 1 && vecdot::supports_k_row(ggml_type, in_dim) {
+            let act = vecdot::quantize_act_k_row(&x[..in_dim]);
+            let mut y = vec![0f32; out_dim];
+            y.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
+                dst[0] =
+                    vecdot::dot_k_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], &act);
+            });
+            return Some(y);
+        }
+
         // Once per call, not once per (row, token) — this is the whole point.
         let acts: Vec<vecdot::ActQ8> = (0..n_tokens)
             .map(|t| vecdot::quantize_act(&x[t * in_dim..(t + 1) * in_dim]))

@@ -925,15 +925,26 @@ pub(crate) fn model_support(
 /// `show`/`download`) to completion and returns — none of these load a
 /// model or bind a listener, so there's no `tokio` runtime involved, unlike
 /// [`serve`]. `system`/`suggest` don't even need a config file (they only
-/// ever look at the local machine's own hardware); `list`/`show`/`download`
-/// resolve against the same `[orangu-server].models` directory the serving
-/// path uses, via the same [`load_config`] — `cli_role`/`daemon` are passed
-/// as `None`/`false` since neither matters to a subcommand that never
+/// ever look at the local machine's own hardware, plus — for `system` — the
+/// models directory a config names, if there is one); `list`/`show`/
+/// `download` resolve against the same `[orangu-server].models` directory the
+/// serving path uses, via the same [`load_config`] — `cli_role`/`daemon` are
+/// passed as `None`/`false` since neither matters to a subcommand that never
 /// serves anything.
 fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
     match command {
         Command::System => {
-            let os = orangu::os::detect();
+            let mut os = orangu::os::detect();
+            // Best-effort, unlike every other subcommand's `load_config?`:
+            // `system` reports the machine, and has to keep working on one
+            // with no config file at all (the first thing run after an
+            // install, and what a bug report is asked for). A config that
+            // is there adds the models directory's disk use and the room
+            // left for the next download; one that isn't just leaves those
+            // lines out.
+            os.models = load_config(config_arg, None, false)
+                .ok()
+                .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
             print!("{}", orangu::hardware::format_report(&os, &cpu, &gpus));

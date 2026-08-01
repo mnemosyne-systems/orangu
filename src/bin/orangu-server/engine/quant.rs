@@ -779,7 +779,7 @@ fn dequantize_q3_k(bytes: &[u8], element_count: usize) -> Vec<f32> {
 /// scale at a time rather than four-at-a-time over a `uint32_t`, which is the
 /// same permutation without the endianness assumption a `memcpy` into a
 /// `uint32_t[4]` carries.
-fn unpack_q3_k_scales(packed: &[u8]) -> [i32; 16] {
+pub(crate) fn unpack_q3_k_scales(packed: &[u8]) -> [i32; 16] {
     let mut scales = [0i32; 16];
     for (i, scale) in scales.iter_mut().enumerate() {
         let low = if i < 8 {

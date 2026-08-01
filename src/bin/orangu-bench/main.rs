@@ -225,6 +225,13 @@ struct Args {
     /// Seconds to wait for a swept server to come up.
     #[arg(long, default_value_t = 300)]
     sweep_start_timeout: u64,
+
+    /// Re-render an already-collapsed `.folded` profile to SVG; measure
+    /// nothing. Writes beside the input unless `--flamegraph` names an output.
+    /// Combine with `--flamegraph-png` to add the PNG a run could not produce
+    /// because no rasterizer was installed at the time.
+    #[arg(long)]
+    render_profile: Option<String>,
 }
 
 /// POST `body` to `endpoint`, retrying once on a connection-level failure.
@@ -759,6 +766,25 @@ fn run(args: &Args) -> anyhow::Result<()> {
         return compare_bundles(args);
     }
 
+    // Likewise — and the reason the `.folded` is the artifact worth keeping.
+    // Grouped with the other read-only modes above rather than with `--sweep`
+    // below, because it touches no server and starts nothing.
+    if let Some(folded) = &args.render_profile {
+        let folded = std::path::Path::new(folded);
+        // Default the output beside the input, so the common case ("give me
+        // the PNG for this profile") needs one flag rather than two.
+        let svg = match &args.flamegraph {
+            Some(s) => std::path::PathBuf::from(s),
+            None => folded.with_extension("svg"),
+        };
+        let (svg, png) = profile::rerender(folded, &svg, args.flamegraph_png, None)?;
+        println!("  profile  {}", svg.display());
+        if let Some(p) = png {
+            println!("           {}", p.display());
+        }
+        return Ok(());
+    }
+
     // Starts its own servers, so it comes before the client below is pointed
     // at one that is not up yet.
     if args.sweep.is_some() {
@@ -1250,11 +1276,7 @@ fn measure(
     }
 
     if args.curve > 0 {
-        // Curve mode reports one generation bucketed by position, not a rate at
-        // a named workload; there is no series for it to extend, so it is not
-        // recorded. A chart requested alongside it still redraws the file.
-        run_curve(client, args)?;
-        return Ok(Vec::new());
+        return run_curve(client, args, label);
     }
 
     run_tg(client, args, label)
@@ -2660,7 +2682,19 @@ fn report_clocks(activity: &[GpuActivity], args: &Args) {
 /// context window. Measures decode-vs-context scaling directly — no prompt
 /// padding, so no slow/VRAM-heavy deep-context prefill. Context position is
 /// approximated by the generated-token index (the prompt is short).
-fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<()> {
+///
+/// Recorded to `--history` under its own `curve` mode. The depth sweep reaches
+/// a context by *padding the prompt*, so every row costs a full prefill at that
+/// depth per repetition — which on a model whose prefill is itself the thing
+/// being investigated is both slow and a measurement of the wrong phase. One
+/// generation gives the whole curve for one prefill, which is what makes a
+/// decode-vs-context before/after affordable on a slow build.
+fn run_curve(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
     let prompt = build_prompt(0);
     let endpoint = format!("{}/v1/completions", args.url);
     let mut body = serde_json::json!({
@@ -2670,6 +2704,12 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
         "temperature": 0,
         "stream": true,
         "cache_prompt": false,
+        // Same contract as the depth sweep: measure decode, not content. A
+        // greedy model will emit EOS well before a long curve is done — asking
+        // for 192 tokens returned **45** on TinyLlama `Q8_0`, which is one
+        // bucket, and a decode-vs-context curve of a single point is not a
+        // curve. The whole mode exists to reach depth cheaply.
+        "ignore_eos": true,
     });
     if let Some(m) = &args.model {
         body["model"] = serde_json::Value::String(m.clone());
@@ -2745,9 +2785,26 @@ fn run_curve(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<
         } else {
             println!("{:>8} | {:>8.2}", lo, rate);
         }
+        // One bucket is one measurement of decode at a context length, which is
+        // the same quantity `run_tg` records — but arrived at by a single pass
+        // rather than best-of-N, so `best == mean` and `sd` is 0 by
+        // construction. That is exactly why these rows get their own mode
+        // rather than joining `tg`: merging a single-sample rate into a
+        // best-of-N series would silently make the curve look like the same
+        // statistic, and the noisier one would win the `best` reduction the
+        // chart applies per (label, n).
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "curve".to_string(),
+            n: lo as u32,
+            best: rate,
+            mean: rate,
+            sd: 0.0,
+        });
         lo = hi;
     }
-    Ok(())
+    Ok(records)
 }
 
 #[cfg(test)]

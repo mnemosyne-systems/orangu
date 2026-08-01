@@ -183,6 +183,9 @@ OS
   Huge pages       : madvise
   Page size        : 4.00 KiB
   Open files       : 1048576 (max 1048576)
+  Models           : /home/orangu/models
+  Models used      : 42.31 GiB
+  Models free      : 118.92 GiB
   Built for        : x86_64-linux-gnu
 
 CPU
@@ -240,6 +243,9 @@ rather than a line saying `unknown`:
 | `Huge pages` | The transparent-hugepage policy (`always`/`madvise`/`never`), which decides whether a mapped model's weights get 2 MiB pages or 4 KiB ones | ✅ | — | — |
 | `Page size` | `sysconf(_SC_PAGESIZE)` — 4 KiB on most machines, 16 KiB on Apple Silicon | ✅ | ✅ | — |
 | `Open files` | `RLIMIT_NOFILE`, soft and hard. A server holding a listener, every accepted connection and one mapping per model shard runs into this one first | ✅ | ✅ | — |
+| `Models` | The configured `[orangu-server].models` directory. Printed only when a config file is found — `system` itself needs none | ✅ | ✅ | ✅ |
+| `Models used` | Bytes on disk under that directory: everything it holds, not only the `.gguf` files `list` shows, with a blob shared by several snapshot revisions counted once | ✅ | ✅ | ✅ |
+| `Models free` | Room left on the filesystem holding it — what the *next* `download` has to fit into. Excludes the root-only reserve, so it's space this user can actually use | ✅ | ✅ | — |
 | `Built for` | The target this binary was *built* for, which isn't always the machine it runs on: an `x86_64` build on an `aarch64` Mac is running under Rosetta | ✅ | ✅ | ✅ |
 
 CPU statistics (model, vendor, architecture, physical/logical core counts,

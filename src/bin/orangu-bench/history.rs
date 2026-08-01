@@ -43,9 +43,13 @@ pub struct Record {
     /// Which engine/build produced it (`--label`). The series identity in the
     /// chart, so it must stay stable across runs to draw a line.
     pub label: String,
-    /// `pp` (prompt processing) or `tg` (token generation).
+    /// `pp` (prompt processing), `tg` (token generation), `curve` (decode rate
+    /// bucketed by context, from one pass), `cpu` (CPU ms per token) or
+    /// `embed`. Each is drawn as its own chart panel, because they are
+    /// different measurements — two of them are not even in tokens/second.
     pub mode: String,
-    /// Prompt length for `pp`, context depth for `tg`.
+    /// Prompt length for `pp`/`embed`, context depth for `tg`/`cpu`, the
+    /// bucket's starting context for `curve`.
     pub n: u32,
     /// Best of the run's repetitions, in tokens/second — the same statistic
     /// the table prints, chosen for the same reason: it is the one least

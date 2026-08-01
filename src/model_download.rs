@@ -924,14 +924,14 @@ impl ProgressBoard {
     }
 }
 
-/// An ETA as `(2h:05m)`, or just `(23m)` under an hour — a download measured
-/// in seconds isn't worth a number, so anything under a minute is `(<1m)`.
+/// An ETA as `2h:05m`, or just `23m` under an hour — a download measured
+/// in seconds isn't worth a number, so anything under a minute is `<1m`.
 fn format_eta(eta: std::time::Duration) -> String {
     let minutes = eta.as_secs() / 60;
     match (minutes / 60, minutes % 60) {
-        (0, 0) => "(<1m)".to_string(),
-        (0, minutes) => format!("({minutes}m)"),
-        (hours, minutes) => format!("({hours}h:{minutes:02}m)"),
+        (0, 0) => "<1m".to_string(),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, minutes) => format!("{hours}h:{minutes:02}m"),
     }
 }
 
@@ -1265,7 +1265,7 @@ mod tests {
                 "Downloaded model-00001-of-00003.gguf: 100% [1/3]",
                 "Downloading model-00002-of-00003.gguf: 50% [2/3]",
                 "Downloading model-00003-of-00003.gguf: 25% (retry 2/5 in 30s) [3/3]",
-                "Total 58%: 1/3 files (1.75 MiB of 3.00 MiB), 2 active, 0 queued, ETA (1m)",
+                "Total 58%: 1/3 files (1.75 MiB of 3.00 MiB), 2 active, 0 queued, ETA 1m",
             ]
         );
     }
@@ -1304,7 +1304,7 @@ mod tests {
         two_queued.transferred.store(MIB, Ordering::Relaxed);
         assert_eq!(
             two_queued.frame(usize::MAX, MINUTE).pop().unwrap(),
-            "Total 50%: 2/4 files (2.00 MiB of 4.00 MiB), 0 active, 2 queued, ETA (2m)"
+            "Total 50%: 2/4 files (2.00 MiB of 4.00 MiB), 0 active, 2 queued, ETA 2m"
         );
 
         // The same run with one fewer file still to fetch, at the same rate:
@@ -1317,7 +1317,7 @@ mod tests {
         one_queued.transferred.store(MIB, Ordering::Relaxed);
         assert_eq!(
             one_queued.frame(usize::MAX, MINUTE).pop().unwrap(),
-            "Total 66%: 2/3 files (2.00 MiB of 3.00 MiB), 0 active, 1 queued, ETA (1m)"
+            "Total 66%: 2/3 files (2.00 MiB of 3.00 MiB), 0 active, 1 queued, ETA 1m"
         );
     }
 
@@ -1337,7 +1337,7 @@ mod tests {
 
         assert_eq!(
             board.frame(usize::MAX, MINUTE).pop().unwrap(),
-            "Total 75%: 0/4 files (3.00 MiB of 4.00 MiB), 4 active, 0 queued, ETA (16m)"
+            "Total 75%: 0/4 files (3.00 MiB of 4.00 MiB), 4 active, 0 queued, ETA 16m"
         );
     }
 
@@ -1428,15 +1428,12 @@ mod tests {
     fn an_eta_is_hours_and_minutes_only_past_the_hour() {
         use std::time::Duration;
 
-        assert_eq!(format_eta(Duration::from_secs(30)), "(<1m)");
-        assert_eq!(format_eta(Duration::from_secs(23 * 60)), "(23m)");
-        assert_eq!(format_eta(Duration::from_secs(59 * 60 + 59)), "(59m)");
-        assert_eq!(format_eta(Duration::from_secs(60 * 60)), "(1h:00m)");
-        assert_eq!(
-            format_eta(Duration::from_secs(2 * 3600 + 5 * 60)),
-            "(2h:05m)"
-        );
-        assert_eq!(format_eta(Duration::from_secs(30 * 3600)), "(30h:00m)");
+        assert_eq!(format_eta(Duration::from_secs(30)), "<1m");
+        assert_eq!(format_eta(Duration::from_secs(23 * 60)), "23m");
+        assert_eq!(format_eta(Duration::from_secs(59 * 60 + 59)), "59m");
+        assert_eq!(format_eta(Duration::from_secs(60 * 60)), "1h:00m");
+        assert_eq!(format_eta(Duration::from_secs(2 * 3600 + 5 * 60)), "2h:05m");
+        assert_eq!(format_eta(Duration::from_secs(30 * 3600)), "30h:00m");
     }
 
     /// A board taller than the terminal can't be redrawn in place — it would
@@ -1453,7 +1450,7 @@ mod tests {
 
         assert_eq!(
             frame,
-            vec!["Total 4%: 1/34 files (1.50 MiB of 34.00 MiB), 1 active, 32 queued, ETA (21m)"]
+            vec!["Total 4%: 1/34 files (1.50 MiB of 34.00 MiB), 1 active, 32 queued, ETA 21m"]
         );
         assert_eq!(
             board.frame(35, MINUTE).len(),

@@ -163,6 +163,17 @@ pub fn render_labelled(
             "Decode — CPU per generated token",
             axes.x.as_deref().unwrap_or("context depth (tokens)"),
         ),
+        // `--curve`'s rows: decode rate against context, from one generation
+        // bucketed by position. Same unit and same x-axis meaning as `tg`, and
+        // deliberately still a separate panel — a bucket is a single-pass
+        // instantaneous rate where a `tg` row is best-of-N, so the two are not
+        // the same statistic and a reader must not be invited to compare their
+        // heights directly.
+        (
+            "curve",
+            "Decode — rate vs context (single pass)",
+            axes.x.as_deref().unwrap_or("context length (tokens)"),
+        ),
         // Its own panel rather than a series on the prefill one: an embedding
         // forward pass is prompt processing, but of a different model, and
         // plotting the two together would invite reading one as the other.

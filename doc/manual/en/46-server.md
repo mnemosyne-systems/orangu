@@ -140,7 +140,7 @@ orangu-server download ggml-org/embeddinggemma-300M-GGUF   # no :quant -> prefer
 
 ```
 Downloading Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf: 47% [1/1]
-Total 47%: 0/1 files (8.60 GiB of 18.30 GiB), 1 active, 0 queued, ETA (12m)
+Total 47%: 0/1 files (8.60 GiB of 18.30 GiB), 1 active, 0 queued, ETA 12m
 ```
 
 If the repository also ships a multimodal projector (`mmproj-*.gguf`,
@@ -171,7 +171,7 @@ Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00003-of-00034.gguf: 12% (retry 1/5 in
 Queued UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00004-of-00034.gguf [4/35]
 ...
 Downloaded mmproj-BF16.gguf: 100% [35/35]
-Total 12%: 2/35 files (7.12 GiB of 58.30 GiB), 15 active, 18 queued, ETA (2h:47m)
+Total 12%: 2/35 files (7.12 GiB of 58.30 GiB), 15 active, 18 queued, ETA 2h:47m
 ```
 
 `Total` is **bytes**, not an average of the per-file percentages: how much
@@ -192,7 +192,7 @@ every outstanding byte including the queued files' — divided by the rate
 **this** run has actually pulled off the network. Bytes that were already on
 disk are progress but not throughput: counting them as speed would have a
 resumed terabyte-sized download claim to be minutes from finishing. It reads
-`(2h:47m)` past the hour and `(47m)` under it, and appears once there are a
+`2h:47m` past the hour and `47m` under it, and appears once there are a
 few seconds of real transfer to extrapolate from — before that, and once
 everything is fetched, there's no ETA on the line at all.
 
@@ -246,6 +246,9 @@ OS
   Huge pages       : madvise
   Page size        : 4.00 KiB
   Open files       : 1048576 (max 1048576)
+  Models           : /home/orangu/models
+  Models used      : 42.31 GiB
+  Models free      : 118.92 GiB
   Built for        : x86_64-linux-gnu
 
 CPU
@@ -276,6 +279,15 @@ average, swap, the transparent-hugepage policy, page size, the open-file
 limit (`RLIMIT_NOFILE`, soft and hard), and the target this binary was
 built for — which isn't always the machine it runs on, an
 `x86_64` build on an `aarch64` Mac being under Rosetta.
+
+The three `Models` lines are the disk side of the same picture: the
+configured `[orangu-server].models` directory, the space its contents take
+(everything under it, with a blob shared by several snapshot revisions
+counted once — not just the `.gguf` files `list` shows), and the free space
+left on the filesystem holding it, which is what the next `download` has to
+fit into. They need a config file to know which directory to measure, so on
+a machine that has none — `system` deliberately runs without one — those
+three lines are left out and the rest of the report is unchanged.
 
 Every field is best-effort and every platform answers a different subset;
 whatever the running platform can't answer simply gets no line rather than

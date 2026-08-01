@@ -616,10 +616,11 @@ orangu-bench --chart-only --history perf-history.tsv --chart perf-history.svg
 
 The file is plain TSV with a `#` header, so it diffs in review and is
 hand-editable; blank lines, comments and unparseable rows are skipped rather
-than fatal. Each row is `date`, `label`, `mode` (`pp`, `tg` or `embed` — each
-drawn as its own chart panel, since an embedding pass and a generative
-model's prefill are not the same measurement), `n`, and the best / mean / sd of
-the run's repetitions:
+than fatal. Each row is `date`, `label`, `mode` (`pp`, `tg`, `curve`, `cpu` or
+`embed` — each drawn as its own chart panel, since an embedding pass and a
+generative model's prefill are not the same measurement, and two of the five
+are not even in tokens/second), `n`, and the best / mean / sd of the run's
+repetitions:
 
 ```text
 #date	label	mode	n	best	mean	sd
@@ -693,6 +694,21 @@ orangu-bench → http://127.0.0.1:8100 (curve: 3072 tokens, bucket 256)
 
 Context position is approximated by the generated-token index (the prompt is
 short). `--json` emits `{"ctx":…,"tok_per_s":…,"tokens":…}` per bucket.
+
+Each bucket is also recorded to `--history` under its own **`curve`** mode and
+drawn on its own chart panel. That makes a decode-vs-context before/after
+affordable on a slow build: the depth sweep reaches a context by *padding the
+prompt*, so every row costs a full prefill at that depth **per repetition**,
+which on a model whose prefill is itself the thing under investigation is both
+slow and a measurement of the wrong phase. One generation gives the whole curve
+for one prefill.
+
+It is a separate panel from `tg` rather than extra points on it, even though
+both are decode rates against context in the same unit. A `tg` row is
+best-of-N; a curve bucket is a **single-pass instantaneous rate**, so `best`
+equals `mean` and `sd` is `0` by construction. Merging them would present two
+different statistics as one series — and since the chart reduces by `best` per
+`(label, n)`, the noisier single sample would win wherever the two overlapped.
 
 ### Confirm you are measuring the build you think you are
 

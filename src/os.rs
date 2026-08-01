@@ -32,6 +32,7 @@
 //! than being guessed at or reported as an error.
 
 use crate::format::format_bytes;
+use std::path::{Path, PathBuf};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 /// One machine's OS-level inventory. Field availability differs per platform
@@ -73,12 +74,81 @@ pub struct OsInfo {
     /// `aarch64` Mac is running under Rosetta, and a `gnu` build won't run
     /// on a musl-only host at all.
     pub build_target: String,
+    /// The models directory and the disk it sits on, when one is known —
+    /// [`detect`] can't find it out on its own (it's a configured path, not
+    /// a machine property), so callers that have a config fill this in with
+    /// [`detect_model_storage`] and the rest leave it [`None`].
+    pub models: Option<ModelStorage>,
 }
 
 pub struct LoadAverage {
     pub one: f64,
     pub five: f64,
     pub fifteen: f64,
+}
+
+/// How much room the downloaded models take, and how much is left for the
+/// next one — the two numbers that decide whether a `download` will fit,
+/// reported for the configured `[orangu-server].models` directory.
+pub struct ModelStorage {
+    /// The models directory itself, so the two sizes below say what they're
+    /// about: a machine can have several, one per config.
+    pub path: PathBuf,
+    /// Bytes occupied by everything under [`path`](Self::path) — not just
+    /// the `.gguf` files `list` counts, since a half-finished download or a
+    /// repo's metadata takes the same disk from the same filesystem.
+    pub used_bytes: u64,
+    /// Free space on the filesystem holding the models directory, from
+    /// [`available_space`] — [`None`] where that can't be answered.
+    pub available_bytes: Option<u64>,
+}
+
+/// Measures `dir` as a models directory: what it holds and what's left
+/// beside it. [`None`] when `dir` isn't a directory at all — a models path
+/// that was configured but never created has nothing to say about disk use,
+/// and reporting `0 B` used would read as "empty" rather than "not there".
+pub fn detect_model_storage(dir: &Path) -> Option<ModelStorage> {
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(ModelStorage {
+        path: dir.to_path_buf(),
+        used_bytes: directory_size(dir),
+        available_bytes: available_space(dir),
+    })
+}
+
+/// Bytes on disk under `dir`, counting each physical file exactly once —
+/// which a naive walk wouldn't: a model cache names one downloaded blob from
+/// every snapshot revision that shares it, so symlinks are not followed
+/// (their targets are already visited under `blobs/`), and hard links to one
+/// blob are collapsed by `(device, inode)`. Unreadable entries are skipped
+/// rather than failing the walk: an under-reported total is worth more here
+/// than no total at all.
+fn directory_size(dir: &Path) -> u64 {
+    #[cfg(unix)]
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !seen.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+        }
+        total = total.saturating_add(metadata.len());
+    }
+
+    total
 }
 
 /// Collects everything [`OsInfo`] can hold on this platform. Portable fields
@@ -106,6 +176,7 @@ pub fn detect() -> OsInfo {
         page_size_bytes: detect_page_size(),
         open_files_limit: detect_open_files_limit(),
         build_target: build_target(),
+        models: None,
     }
 }
 
@@ -314,7 +385,7 @@ fn detect_transparent_hugepages() -> Option<String> {
 /// checks free space before a large download has to treat that as "don't
 /// know" and carry on, not as "no room".
 #[cfg(unix)]
-pub fn available_space(path: &std::path::Path) -> Option<u64> {
+pub fn available_space(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -338,7 +409,7 @@ pub fn available_space(path: &std::path::Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-pub fn available_space(_path: &std::path::Path) -> Option<u64> {
+pub fn available_space(_path: &Path) -> Option<u64> {
     None
 }
 
@@ -365,6 +436,38 @@ mod space_tests {
         let dir = tempfile::tempdir().expect("temp dir");
 
         assert_eq!(super::available_space(&dir.path().join("nope")), None);
+    }
+
+    /// The models total is the bytes actually on the disk: a cached repo's
+    /// one blob, counted once, however many snapshot revisions name it —
+    /// which is the layout every Hugging Face download produces.
+    #[test]
+    fn a_blob_named_from_two_snapshots_counts_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blobs = dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs dir");
+        let blob = blobs.join("sha256-abc");
+        std::fs::write(&blob, vec![0u8; 4096]).expect("blob");
+        for revision in ["rev1", "rev2"] {
+            let snapshot = dir.path().join("snapshots").join(revision);
+            std::fs::create_dir_all(&snapshot).expect("snapshot dir");
+            std::os::unix::fs::symlink(&blob, snapshot.join("model.gguf")).expect("symlink");
+        }
+
+        let storage = super::detect_model_storage(dir.path()).expect("models dir");
+
+        assert_eq!(storage.used_bytes, 4096);
+        assert_eq!(storage.path, dir.path());
+        assert!(storage.available_bytes.is_some_and(|free| free > 0));
+    }
+
+    /// A configured models directory that was never created has no disk use
+    /// to report — and reports none, rather than an empty-looking `0 B`.
+    #[test]
+    fn a_models_directory_that_does_not_exist_is_not_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        assert!(super::detect_model_storage(&dir.path().join("nope")).is_none());
     }
 }
 
@@ -431,6 +534,18 @@ pub fn format_section(os: &OsInfo) -> String {
             "Open files",
             &format!("{} (max {})", format_limit(soft), format_limit(hard)),
         );
+    }
+    // Only where a models directory is known — `suggest` and the report a
+    // machine with no config prints have no directory to measure, and say
+    // nothing about disk rather than measuring some default that isn't in
+    // use. The free-space line is the filesystem's, not the directory's:
+    // it's what the *next* download has to fit into.
+    if let Some(models) = &os.models {
+        field("Models", &models.path.display().to_string());
+        field("Models used", &format_bytes(models.used_bytes));
+        if let Some(available) = models.available_bytes {
+            field("Models free", &format_bytes(available));
+        }
     }
     field("Built for", &os.build_target);
 
@@ -518,6 +633,11 @@ mod tests {
             page_size_bytes: Some(4096),
             open_files_limit: Some((1024, 524_288)),
             build_target: "x86_64-linux-gnu".to_string(),
+            models: Some(ModelStorage {
+                path: PathBuf::from("/srv/models"),
+                used_bytes: 42 * 1024 * 1024 * 1024,
+                available_bytes: Some(128 * 1024 * 1024 * 1024),
+            }),
         }
     }
 
@@ -549,7 +669,31 @@ mod tests {
         assert!(section.contains("Huge pages       : madvise\n"));
         assert!(section.contains("Page size        : 4.00 KiB\n"));
         assert!(section.contains("Open files       : 1024 (max 524288)\n"));
+        assert!(section.contains("Models           : /srv/models\n"));
+        assert!(section.contains("Models used      : 42.00 GiB\n"));
+        assert!(section.contains("Models free      : 128.00 GiB\n"));
         assert!(section.contains("Built for        : x86_64-linux-gnu\n"));
+    }
+
+    /// A models directory on a filesystem that can't be asked for its free
+    /// space still reports what it holds — the two numbers are measured
+    /// separately, and one being unavailable doesn't hide the other.
+    #[test]
+    fn models_are_reported_even_when_free_space_is_unknown() {
+        let mut os = os();
+        os.models = Some(ModelStorage {
+            path: PathBuf::from("/srv/models"),
+            used_bytes: 1024 * 1024 * 1024,
+            available_bytes: None,
+        });
+
+        let section = format_section(&os);
+
+        assert!(
+            section.contains("Models used      : 1.00 GiB\n"),
+            "{section}"
+        );
+        assert!(!section.contains("Models free"), "{section}");
     }
 
     /// Every optional field is genuinely optional: a platform that answers
@@ -568,6 +712,7 @@ mod tests {
         os.transparent_hugepages = None;
         os.page_size_bytes = None;
         os.open_files_limit = None;
+        os.models = None;
 
         let section = format_section(&os);
 
@@ -582,6 +727,7 @@ mod tests {
             "Huge pages",
             "Page size",
             "Open files",
+            "Models",
         ] {
             assert!(!section.contains(absent), "{absent} in section:\n{section}");
         }

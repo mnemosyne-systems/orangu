@@ -46,8 +46,9 @@
 use super::iq_grids::KVALUES_IQ4NL;
 use super::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
+    unpack_q3_k_scales,
 };
 
 /// Elements per activation-quantization block — one shared `f32` scale per
@@ -146,9 +147,12 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
         GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL => {
             in_dim.is_multiple_of(32)
         }
-        GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS => {
-            in_dim.is_multiple_of(256)
-        }
+        GGML_TYPE_Q2_K
+        | GGML_TYPE_Q3_K
+        | GGML_TYPE_Q4_K
+        | GGML_TYPE_Q5_K
+        | GGML_TYPE_Q6_K
+        | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
         _ => false,
     }
 }
@@ -227,8 +231,12 @@ impl Default for UnpackedRow {
 /// Unpacks one weight row (`QuantMatrix::row_bytes()` long) into `out`.
 /// `ggml_type`/`in_dim` must have passed [`supports`].
 pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedRow) {
-    // Only `Q6_K` needs per-GROUP scales; everything else is uniform per block.
-    let stride = if ggml_type == GGML_TYPE_Q6_K {
+    // `Q6_K`, `Q3_K` and `Q2_K` carry a scale per 16; everything else is
+    // uniform across a 32-element block.
+    let stride = if matches!(
+        ggml_type,
+        GGML_TYPE_Q6_K | GGML_TYPE_Q3_K | GGML_TYPE_Q2_K
+    ) {
         GROUP
     } else {
         32
@@ -241,6 +249,8 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q5_1 => unpack_q5_1(row, out),
         GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
         GGML_TYPE_IQ4_XS => unpack_iq4_xs(row, out),
+        GGML_TYPE_Q2_K => unpack_q2_k(row, out),
+        GGML_TYPE_Q3_K => unpack_q3_k(row, out),
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
         GGML_TYPE_Q5_K => unpack_q5_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
@@ -934,6 +944,119 @@ unsafe fn unpack_block_q5_bits_neon(qh: u32, qs: &[u8], bias_v: i8, w: &mut [i8;
 const Q6K_RUNS: [(usize, i32, bool); 4] =
     [(0, 0, false), (32, 2, false), (0, 4, true), (32, 6, true)];
 
+// =====================================================================
+// `Q2_K` and `Q3_K`: the two-bit family.
+//
+// Both store their quants two bits at a time in a 64-byte `qs` array that is
+// read **four times over** at shifts 0/2/4/6, and both carry one scale per
+// **16** elements. `Q3_K` adds a third bit from a separate `hmask` plane;
+// `Q2_K` adds a per-16 min instead.
+//
+// `quant::dequantize_q{2,3}_k` walk that as a `(q_off, shift, half)` triple.
+// Rewritten as eight 32-element runs it collapses: run `p` covers elements
+// `p*32 .. p*32+32` — exactly activation block `p` — reading the contiguous
+// `qs[(p/4)*32 ..][..32]` at shift `2*(p%4)`, under scale sub-blocks `2p` and
+// `2p+1`. For `Q3_K` the `hmask` bit works out to precisely `1 << p`.
+//
+// That equivalence is not obvious from the reference loops and is what lets
+// both types reuse the existing per-`GROUP` machinery unchanged, so it is
+// checked directly against `quant::dequantize` in the tests below.
+
+/// `(qs byte offset, low-bit shift)` for each of the eight 32-element runs of
+/// a `Q2_K`/`Q3_K` super-block, in element order. `Q3_K`'s `hmask` bit for run
+/// `p` is `1 << p`.
+const Q2K_RUNS: [(usize, u32); 8] = [
+    (0, 0),
+    (0, 2),
+    (0, 4),
+    (0, 6),
+    (32, 0),
+    (32, 2),
+    (32, 4),
+    (32, 6),
+];
+
+/// `Q2_K` bytes per super-block: `scales[16] + qs[64] + d + dmin`.
+const Q2K_BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
+/// `Q3_K` bytes per super-block: `hmask[32] + qs[64] + scales[12] + d`.
+const Q3K_BLOCK_BYTES: usize = 32 + 64 + 12 + 2;
+
+/// One `Q2_K` run: 32 unsigned two-bit quants, `0..=3`. The per-16 min that
+/// makes the type asymmetric lives in the scales, not here.
+#[inline(always)]
+fn unpack_q2k_run(qs: &[u8], shift: u32, w: &mut [i8; 32]) {
+    for (j, slot) in w.iter_mut().enumerate() {
+        *slot = ((qs[j] >> shift) & 3) as i8;
+    }
+}
+
+/// One `Q3_K` run: 32 three-bit quants biased into `-4..=3`.
+///
+/// The third bit is stored **inverted** — a set `hmask` bit means "do *not*
+/// subtract 4" — which is why the bias applies when the bit is clear. Getting
+/// that backwards produces a model that still runs and still emits fluent
+/// text, so it is covered by an exact round-trip test rather than by reading
+/// the output.
+#[inline(always)]
+fn unpack_q3k_run(qs: &[u8], hmask: &[u8], shift: u32, bit: u8, w: &mut [i8; 32]) {
+    for (j, slot) in w.iter_mut().enumerate() {
+        let lo = ((qs[j] >> shift) & 3) as i8;
+        *slot = lo - if hmask[j] & bit != 0 { 0 } else { 4 };
+    }
+}
+
+/// `Q2_K` into the per-[`GROUP`] [`UnpackedRow`] shape: `scale[g] * q - min[g]`
+/// with `scale = d * (sc & 0xF)` and `min = dmin * (sc >> 4)`.
+///
+/// The only asymmetric type here besides `Q4_K`, and the only one that is
+/// asymmetric *per 16* — which is exactly why it gets no `supports_k` arm; see
+/// [`supports_k`].
+fn unpack_q2_k(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = true;
+    for (s, block) in row.chunks_exact(Q2K_BLOCK_BYTES).enumerate() {
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = read_f16(block, 80);
+        let dmin = read_f16(block, 82);
+        let base = s * SUPER_BLOCK;
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            let e0 = base + p * 32;
+            let w: &mut [i8; 32] = (&mut out.q[e0..e0 + 32]).try_into().unwrap();
+            unpack_q2k_run(&qs[off..off + 32], shift, w);
+            let gi = e0 / GROUP;
+            for half in 0..2 {
+                let sc = scales[2 * p + half];
+                out.scale[gi + half] = d * (sc & 0xF) as f32;
+                out.min[gi + half] = dmin * (sc >> 4) as f32;
+            }
+        }
+    }
+}
+
+/// `Q3_K` into the per-[`GROUP`] [`UnpackedRow`] shape. Symmetric — the `-4`
+/// bias is folded into the `int8` weight — so `min` is zero throughout and the
+/// dot loop's correction term vanishes.
+fn unpack_q3_k(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = false;
+    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let sc = unpack_q3_k_scales(&block[96..108]);
+        let d = read_f16(block, 108);
+        let base = s * SUPER_BLOCK;
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            let e0 = base + p * 32;
+            let w: &mut [i8; 32] = (&mut out.q[e0..e0 + 32]).try_into().unwrap();
+            unpack_q3k_run(&qs[off..off + 32], hmask, shift, 1 << p, w);
+            let gi = e0 / GROUP;
+            for half in 0..2 {
+                out.scale[gi + half] = d * (sc[2 * p + half] - 32) as f32;
+                out.min[gi + half] = 0.0;
+            }
+        }
+    }
+}
+
 /// Unpacks one `Q6_K` run's 32 weights into `w`: a nibble from `ql` plus a bit
 /// pair from `qh` forming a 6-bit value, biased by -32 into a signed `int8`.
 #[inline(always)]
@@ -1388,12 +1511,28 @@ fn dot_unpacked_pair_impl<const ISA: u8>(
                 let (s0, s1) = (w0.scale[g], w1.scale[g]);
                 let (q0, q1) = (&w0.q[g * GROUP..], &w1.q[g * GROUP..]);
                 let b = g * GROUP / ACT_BLOCK;
-                for k in 0..TOKEN_TILE {
-                    let a = &acts[t0 + k];
-                    let xq = &a.q[g * GROUP..];
-                    let d = a.d[b];
-                    a0[k] += d * (s0 * dot16::<ISA>(q0, xq) as f32);
-                    a1[k] += d * (s1 * dot16::<ISA>(q1, xq) as f32);
+                // `Q2_K` is the first per-[`GROUP`] type with a min. While
+                // `Q6_K` and `Q3_K` were the only ones, both symmetric, this
+                // branch could drop the correction — and did, which produced a
+                // model that emitted nothing but newlines. `act.sums` is
+                // per-GROUP, so the term is indexed by `g`, not by `b`.
+                if w0.has_min {
+                    let (m0, m1) = (w0.min[g], w1.min[g]);
+                    for k in 0..TOKEN_TILE {
+                        let a = &acts[t0 + k];
+                        let xq = &a.q[g * GROUP..];
+                        let (d, gs) = (a.d[b], a.sums[g] as f32);
+                        a0[k] += d * (s0 * dot16::<ISA>(q0, xq) as f32 - m0 * gs);
+                        a1[k] += d * (s1 * dot16::<ISA>(q1, xq) as f32 - m1 * gs);
+                    }
+                } else {
+                    for k in 0..TOKEN_TILE {
+                        let a = &acts[t0 + k];
+                        let xq = &a.q[g * GROUP..];
+                        let d = a.d[b];
+                        a0[k] += d * (s0 * dot16::<ISA>(q0, xq) as f32);
+                        a1[k] += d * (s1 * dot16::<ISA>(q1, xq) as f32);
+                    }
                 }
             }
         }
@@ -1413,14 +1552,6 @@ fn dot_unpacked_pair_impl<const ISA: u8>(
 pub const TOKEN_TILE: usize = 4;
 
 fn dot_unpacked_multi_impl<const ISA: u8>(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f32]) {
-    // The per-GROUP branch below omits the min correction: `Q6_K` is the only
-    // type with per-16 scales and it is symmetric. A future asymmetric per-16
-    // type would need that branch extended, so fail loudly rather than
-    // silently drop the term.
-    debug_assert!(
-        w.per32 || !w.has_min,
-        "a per-GROUP type with a min correction needs the other branch"
-    );
     let n = acts.len();
     let mut t0 = 0;
     while t0 + TOKEN_TILE <= n {
@@ -1448,14 +1579,34 @@ fn dot_unpacked_multi_impl<const ISA: u8>(w: &UnpackedRow, acts: &[ActQ8], out: 
                 let wq = &w.q[g * GROUP..];
                 let sc = w.scale[g];
                 let b = g * GROUP / ACT_BLOCK;
-                for (k, slot) in acc.iter_mut().enumerate() {
-                    let a = &acts[t0 + k];
-                    // Parenthesised to match `dot_unpacked_impl`'s association
-                    // exactly: `d * (sc * isum)`, not `(d * sc) * isum`. Same
-                    // maths, different rounding — the tests compare the two
-                    // paths for bit equality, which is what caught this.
-                    let isum = dot16::<ISA>(wq, &a.q[g * GROUP..]);
-                    *slot += a.d[b] * (sc * isum as f32);
+                // See the same branch in `dot_unpacked_pair_impl`: the min is
+                // per-GROUP for `Q2_K`, so it is indexed by `g`. This used to
+                // carry a `debug_assert!` that a per-16 asymmetric type would
+                // need the branch extended; `Q2_K` is that type, and the
+                // assertion never fired because release builds disable it.
+                //
+                // Split rather than folded into one expression with a zero
+                // min: `Q3_K` and `Q6_K` come through here on every prefill,
+                // and `- 0.0 * sums` would cost them a multiply and a subtract
+                // per group for a term that is always zero.
+                if w.has_min {
+                    let mn = w.min[g];
+                    for (k, slot) in acc.iter_mut().enumerate() {
+                        let a = &acts[t0 + k];
+                        let isum = dot16::<ISA>(wq, &a.q[g * GROUP..]);
+                        *slot += a.d[b] * (sc * isum as f32 - mn * a.sums[g] as f32);
+                    }
+                } else {
+                    for (k, slot) in acc.iter_mut().enumerate() {
+                        let a = &acts[t0 + k];
+                        // Parenthesised to match `dot_unpacked_impl`'s
+                        // association exactly: `d * (sc * isum)`, not
+                        // `(d * sc) * isum`. Same maths, different rounding —
+                        // the tests compare the two paths for bit equality,
+                        // which is what caught this.
+                        let isum = dot16::<ISA>(wq, &a.q[g * GROUP..]);
+                        *slot += a.d[b] * (sc * isum as f32);
+                    }
                 }
             }
         }
@@ -1527,10 +1678,20 @@ const Q6K_GROUPS: usize = SUPER_BLOCK / GROUP;
 /// Narrower than [`supports`] on purpose: this path exists for the two K-quant
 /// types, which are the only ones with a 256-element super-block to accumulate
 /// across.
+/// Note `Q2_K` is deliberately absent while [`supports`] accepts it.
+///
+/// Its min is per **16**, and [`gemm_k_q4_k`]'s correction pass reads
+/// [`ActQ8K::bsum`], which is per **32** — so a `Q2_K` arm would need a second
+/// sum array built for every K-quant matmul, including the ones that would
+/// never read it. Without an arm here it simply takes the generic
+/// [`dot_unpacked_pair`] prefill path instead, which is still fused; what it
+/// gives up is the per-256 integer accumulation, not the kernel. `Q2_K` is
+/// 11.5% of a `Q2_K` file against `Q3_K`'s 77.2%, so that trade is measured
+/// before it is paid for — see `doc/PERF-TINY.md`.
 pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
     matches!(
         ggml_type,
-        GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
     ) && in_dim.is_multiple_of(SUPER_BLOCK)
 }
 
@@ -1720,6 +1881,14 @@ pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
             out.resize_for(in_dim, KKind::Q4K);
             unpack_k_q5_k(row, out);
         }
+        // `Q3_K` *is* `Q6_K`'s shape — a signed integer scale per 16 with no
+        // min — so it fills a [`KKind::Q6K`] row and takes `gemm_k_q6_k`
+        // unchanged. The quants are narrower (`-4..=3` against `-32..=31`),
+        // which only makes the accumulator bound looser.
+        GGML_TYPE_Q3_K => {
+            out.resize_for(in_dim, KKind::Q6K);
+            unpack_k_q3_k(row, out);
+        }
         GGML_TYPE_Q6_K => {
             out.resize_for(in_dim, KKind::Q6K);
             unpack_k_q6_k(row, out);
@@ -1785,6 +1954,33 @@ fn unpack_k_q5_k(row: &[u8], out: &mut KRow) {
                 out.mins[sb + half] = m as i16;
             }
             sb += 2;
+        }
+    }
+}
+
+/// Same bit layout as [`unpack_q3_k`], with the six-bit scales kept as
+/// integers — `sc - 32`, i.e. `-32..=31`, matching what [`gemm_k_q6_k`]
+/// expects of a [`KKind::Q6K`] row.
+///
+/// Accumulator bound, the thing that has to hold for the integer path to be
+/// legal: `|sc| <= 32`, `|q| <= 4`, `|x| <= 127`, so a 16-element group
+/// partial is at most `16*4*127 = 8128`, and 16 groups of 32 lanes reach
+/// ~4.2e6 — two orders of magnitude inside `i32`, and looser than `Q6_K`'s
+/// own, which the same kernel already carries.
+fn unpack_k_q3_k(row: &[u8], out: &mut KRow) {
+    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let sc = unpack_q3_k_scales(&block[96..108]);
+        out.d[s] = read_f16(block, 108);
+        let base = s * SUPER_BLOCK;
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            let e0 = base + p * 32;
+            let w: &mut [i8; 32] = (&mut out.q[e0..e0 + 32]).try_into().unwrap();
+            unpack_q3k_run(&qs[off..off + 32], hmask, shift, 1 << p, w);
+            let gi = e0 / GROUP;
+            out.sc[gi] = (sc[2 * p] - 32) as i16;
+            out.sc[gi + 1] = (sc[2 * p + 1] - 32) as i16;
         }
     }
 }
@@ -2359,6 +2555,8 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_Q4_0 => dot_q4_0::<ISA>(row, act),
         GGML_TYPE_Q5_1 => dot_q5_1::<ISA>(row, act),
         GGML_TYPE_IQ4_NL => dot_iq4_nl::<ISA>(row, act),
+        GGML_TYPE_Q2_K => dot_q2_k::<ISA>(row, act),
+        GGML_TYPE_Q3_K => dot_q3_k::<ISA>(row, act),
         GGML_TYPE_Q4_K => dot_q4_k::<ISA>(row, act),
         GGML_TYPE_Q5_K => dot_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
@@ -2659,6 +2857,391 @@ fn dot_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     total
 }
 
+// =====================================================================
+// K-quant decode with a per-super-block activation scale.
+//
+// [`ActQ8`] carries an `f32` scale per **32** activations. For a per-16
+// K-quant that forces the accumulator out of the integer domain eight times
+// per super-block, because each 32-element block has a different scale and
+// each 16-element group has a different weight scale.
+//
+// ggml does not pay this: `block_q8_K` has a single `d` per **256**, so the
+// whole super-block accumulates in `i32` — a weight scale is an integer, so
+// `sc * partial` stays integral — and converts once. orangu already has that
+// activation shape as [`ActQ8K`] and already uses it for the K-quant *prefill*
+// GEMM; decode never got it.
+//
+// Measured in isolation with `doc/perf/tiny-kernel` (512 rows, in_dim 2048,
+// single thread, best of 7): **1.24x for `Q3_K` and 1.45x for `Q2_K`** against
+// the per-32 form. Two other candidates were measured there and rejected
+// first — a NEON unpack (1.02x/1.06x: LLVM already vectorizes the scalar
+// loops, as it does for `Q4_K`) and removing the per-16 horizontal reduction
+// (a further 1.07x/1.08x). The activation format is the one that matters.
+
+/// Activations for the K-quant decode path: `int8` with **one scale per
+/// [`SUPER_BLOCK`]**, plus per-[`GROUP`] sums for the asymmetric min.
+///
+/// Flat rather than tiled by token, unlike [`ActQ8K`] — decode is one token, so
+/// there is nothing to interleave.
+pub struct ActQ8KRow {
+    q: Vec<i8>,
+    /// Per-[`SUPER_BLOCK`].
+    d: Vec<f32>,
+    /// Per-[`GROUP`] `sum(q)`, for `Q2_K`'s min term.
+    sums: Vec<i32>,
+}
+
+/// Quantizes one token's activations for [`dot_k_row`]. `x.len()` must be a
+/// multiple of [`SUPER_BLOCK`] — guaranteed by [`supports_k_row`].
+pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
+    debug_assert_eq!(x.len() % SUPER_BLOCK, 0);
+    let mut q = vec![0i8; x.len()];
+    let mut d = Vec::with_capacity(x.len() / SUPER_BLOCK);
+    let mut sums = Vec::with_capacity(x.len() / GROUP);
+    for (s, chunk) in x.chunks_exact(SUPER_BLOCK).enumerate() {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // A super-block of exact zeros has no scale; leave it 0 so `q * d`
+        // reproduces 0 rather than NaN. Same contract as `quantize_act`.
+        let scale = amax / 127.0;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        for (g, group) in chunk.chunks_exact(GROUP).enumerate() {
+            let mut sum = 0i32;
+            for (i, &v) in group.iter().enumerate() {
+                let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                q[s * SUPER_BLOCK + g * GROUP + i] = qi;
+                sum += qi as i32;
+            }
+            sums.push(sum);
+        }
+        d.push(scale);
+    }
+    ActQ8KRow { q, d, sums }
+}
+
+/// Whether [`dot_k_row`] handles this type.
+///
+/// **Every 256-element super-block type — a strict superset of
+/// [`supports_k`].** The extra member is `Q2_K`, and the asymmetry is real
+/// rather than an oversight: `Q2_K`'s min is per 16, which the prefill GEMM
+/// cannot serve because [`ActQ8K::bsum`] is per 32, but which decode computes
+/// directly from [`ActQ8KRow::sums`]. So `Q2_K` gets the integer accumulation
+/// at decode and not at prefill.
+///
+/// This began as `Q2_K`/`Q3_K` only, so the change could be measured on four
+/// files before altering the arithmetic of every K-quant model in the
+/// reference set; the extension to the other four was then measured and kept.
+///
+/// **The bound that has to hold for each type** is that a whole super-block's
+/// integer accumulation stays inside `i32`. Worst case per type, at `|x| <=
+/// 127`:
+///
+/// | type | scale | quant | per super-block |
+/// |---|---:|---:|---:|
+/// | `Q2_K` | 15 | 3 | 1.5e6 |
+/// | `Q3_K` | 32 | 4 | 4.2e6 |
+/// | `Q4_K` | 63 | 15 | 3.1e7 |
+/// | `Q5_K` | 63 | 31 | 6.3e7 |
+/// | `Q6_K` | 127 | 32 | 1.4e8 |
+/// | `IQ4_XS` | 32 | 127 | 1.4e8 |
+///
+/// All are at least an order of magnitude inside `i32::MAX` (2.1e9), the
+/// tightest being `Q6_K` and `IQ4_XS` at ~15x margin.
+pub fn supports_k_row(ggml_type: u32, in_dim: usize) -> bool {
+    matches!(
+        ggml_type,
+        GGML_TYPE_Q2_K
+            | GGML_TYPE_Q3_K
+            | GGML_TYPE_Q4_K
+            | GGML_TYPE_Q5_K
+            | GGML_TYPE_Q6_K
+            | GGML_TYPE_IQ4_XS
+    ) && in_dim.is_multiple_of(SUPER_BLOCK)
+}
+
+/// Activation sum over the 32-element block `b`, from the per-[`GROUP`] sums.
+#[inline(always)]
+fn k_row_block_sum(act: &ActQ8KRow, b: usize) -> i32 {
+    act.sums[b * 2] + act.sums[b * 2 + 1]
+}
+
+/// Decode dot for the two-bit family, accumulating across the whole
+/// super-block in `i32`.
+pub fn dot_k_row(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        return dot_k_row_impl::<ISA_DOTPROD>(ggml_type, row, act);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_vnni() {
+            // Safety: `have_vnni` verified the features.
+            return unsafe { dot_k_row_vnni(ggml_type, row, act) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            // Safety: guarded by the runtime feature check above.
+            return unsafe { dot_k_row_avx2(ggml_type, row, act) };
+        }
+    }
+    dot_k_row_impl::<ISA_BASELINE>(ggml_type, row, act)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl,avx2,ssse3")]
+unsafe fn dot_k_row_vnni(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
+    dot_k_row_impl::<ISA_VNNI>(ggml_type, row, act)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_avx2(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
+    dot_k_row_impl::<ISA_AVX2>(ggml_type, row, act)
+}
+
+fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
+    match ggml_type {
+        GGML_TYPE_Q2_K => dot_k_row_q2_k::<ISA>(row, act),
+        GGML_TYPE_Q3_K => dot_k_row_q3_k::<ISA>(row, act),
+        GGML_TYPE_Q4_K => dot_k_row_q4_k::<ISA>(row, act),
+        GGML_TYPE_Q5_K => dot_k_row_q5_k::<ISA>(row, act),
+        GGML_TYPE_Q6_K => dot_k_row_q6_k::<ISA>(row, act),
+        GGML_TYPE_IQ4_XS => dot_k_row_iq4_xs::<ISA>(row, act),
+        other => panic!("vecdot::dot_k_row called for unsupported ggml_type {other}"),
+    }
+}
+
+/// `Q4_K`: [`dot_q4_k`]'s unpack, with both the dot and the asymmetric min
+/// correction accumulated across the super-block in `i32`.
+///
+/// The min term collapses the same way the dot does — `sum_b m_b * bsum_b` is
+/// integral — so an asymmetric type saves *two* float conversions per 32
+/// rather than one.
+fn dot_k_row_q4_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = read_f16(block, 0);
+        let dmin = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qs = &block[16..];
+        let sb = s * SUBS;
+        let (mut isum, mut imin) = (0i32, 0i32);
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let b = sb + g * 2 + half;
+                for (j, &byte) in bytes.iter().enumerate() {
+                    w[j] = ((byte >> shift) & 0x0F) as i8;
+                }
+                isum += sc as i32 * dot32::<ISA>(&w, &act.q[b * 32..]);
+                imin += m as i32 * k_row_block_sum(act, b);
+            }
+        }
+        total += act.d[s] * (d * isum as f32 - dmin * imin as f32);
+    }
+    total
+}
+
+/// `Q5_K`: [`dot_k_row_q4_k`] with the fifth bit taken from the `qh` plane.
+fn dot_k_row_q5_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = read_f16(block, 0);
+        let dmin = read_f16(block, 2);
+        let scales = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..];
+        let sb = s * SUBS;
+        let (mut isum, mut imin) = (0i32, 0i32);
+        for g in 0..4 {
+            let bytes = &qs[g * 32..g * 32 + 32];
+            for (half, shift) in [(0usize, 0u32), (1, 4)] {
+                let (sc, m) = get_scale_min_k4(g * 2 + half, scales);
+                let hi_mask = 1u8 << (g * 2 + half);
+                let b = sb + g * 2 + half;
+                for (j, &byte) in bytes.iter().enumerate() {
+                    let hi = if qh[j] & hi_mask != 0 { 16 } else { 0 };
+                    w[j] = (((byte >> shift) & 0x0F) + hi) as i8;
+                }
+                isum += sc as i32 * dot32::<ISA>(&w, &act.q[b * 32..]);
+                imin += m as i32 * k_row_block_sum(act, b);
+            }
+        }
+        total += act.d[s] * (d * isum as f32 - dmin * imin as f32);
+    }
+    total
+}
+
+/// `Q6_K`: symmetric, so no min pass — but its scales are per 16, so each
+/// 32-element run contributes two separately-scaled 16-lane dots to the same
+/// integer accumulator.
+fn dot_k_row_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let sc = &block[192..208];
+        let d = read_f16(block, 208);
+        let base = s * SUPER_BLOCK;
+        let mut isum = 0i32;
+        let mut r = 0usize;
+        for h in 0..2 {
+            let qh_run = &qh[h * 32..h * 32 + 32];
+            for &(ql_add, hshift, high) in Q6K_RUNS.iter() {
+                let ql_run = &ql[h * 64 + ql_add..h * 64 + ql_add + 32];
+                unpack_q6k_run(ql_run, qh_run, hshift, high, &mut w);
+                let x = &act.q[base + r * 32..];
+                isum += sc[2 * r] as i8 as i32 * dot16::<ISA>(&w, x)
+                    + sc[2 * r + 1] as i8 as i32 * dot16::<ISA>(&w[16..], &x[16..]);
+                r += 1;
+            }
+        }
+        total += act.d[s] * d * isum as f32;
+    }
+    total
+}
+
+/// `IQ4_XS`: symmetric with a uniform scale across each 32, so one `dot32` per
+/// sub-block feeds the accumulator directly.
+fn dot_k_row_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = read_f16(block, 0);
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..BLOCK_BYTES];
+        let base = s * SUPER_BLOCK;
+        let mut isum = 0i32;
+        for ib in 0..SUBS {
+            let low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            let high = ((scales_h >> (2 * ib)) & 3) as u8;
+            let ls = ((low | (high << 4)) as i32) - 32;
+            unpack_block_iq4_nl(&qs[ib * 16..], &mut w);
+            isum += ls * dot32::<ISA>(&w, &act.q[base + ib * 32..]);
+        }
+        total += act.d[s] * d * isum as f32;
+    }
+    total
+}
+
+/// `Q3_K`: `sum_s d_s * act_d_s * sum_g sc_g * (q_g . x_g)`, the inner sum
+/// entirely in `i32`.
+///
+/// Accumulator bound: `|sc| <= 32`, `|q| <= 4`, `|x| <= 127`, 256 elements —
+/// at most `32 * 4 * 127 * 256 ~ 4.2e6`, two orders inside `i32`.
+fn dot_k_row_q3_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let sc = unpack_q3_k_scales(&block[96..108]);
+        let d = read_f16(block, 108);
+        let base = s * SUPER_BLOCK;
+        let mut isum = 0i32;
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            unpack_q3k_run(&qs[off..off + 32], hmask, shift, 1 << p, &mut w);
+            let x = &act.q[base + p * 32..];
+            isum += (sc[2 * p] - 32) * dot16::<ISA>(&w, x)
+                + (sc[2 * p + 1] - 32) * dot16::<ISA>(&w[16..], &x[16..]);
+        }
+        total += act.d[s] * d * isum as f32;
+    }
+    total
+}
+
+/// `Q2_K`: as above, and the min term collapses the same way —
+/// `dmin * sum_g m_g * bsum_g` accumulates in `i32` and converts once.
+fn dot_k_row_q2_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.chunks_exact(Q2K_BLOCK_BYTES).enumerate() {
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = read_f16(block, 80);
+        let dmin = read_f16(block, 82);
+        let base = s * SUPER_BLOCK;
+        let (mut isum, mut imin) = (0i32, 0i32);
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            unpack_q2k_run(&qs[off..off + 32], shift, &mut w);
+            let x = &act.q[base + p * 32..];
+            let (a, b) = (scales[2 * p], scales[2 * p + 1]);
+            isum += (a & 0xF) as i32 * dot16::<ISA>(&w, x)
+                + (b & 0xF) as i32 * dot16::<ISA>(&w[16..], &x[16..]);
+            let g = s * (SUPER_BLOCK / GROUP) + p * 2;
+            imin += (a >> 4) as i32 * act.sums[g] + (b >> 4) as i32 * act.sums[g + 1];
+        }
+        total += act.d[s] * (d * isum as f32 - dmin * imin as f32);
+    }
+    total
+}
+
+/// Fused `Q2_K` decode: `sum_g (d*sc_g) * (q_g . x_g) - (dmin*m_g) * sum(x_g)`,
+/// over 16-element groups.
+///
+/// The min term is why this cannot share [`dot_q3_k`]'s loop: it needs the
+/// activation *sums* per [`GROUP`], which [`ActQ8`] already carries for
+/// exactly this reason.
+fn dot_q2_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut blk = 0usize;
+    let mut w = [0i8; 32];
+    for block in row.chunks_exact(Q2K_BLOCK_BYTES) {
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = read_f16(block, 80);
+        let dmin = read_f16(block, 82);
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            unpack_q2k_run(&qs[off..off + 32], shift, &mut w);
+            let qx = &act.q[blk * 32..];
+            let g = blk * 2;
+            let (a, b) = (scales[2 * p], scales[2 * p + 1]);
+            total += act.d[blk]
+                * (d * ((a & 0xF) as f32 * dot16::<ISA>(&w, qx) as f32
+                    + (b & 0xF) as f32 * dot16::<ISA>(&w[16..], &qx[16..]) as f32)
+                    - dmin
+                        * ((a >> 4) as f32 * act.sums[g] as f32
+                            + (b >> 4) as f32 * act.sums[g + 1] as f32));
+            blk += 1;
+        }
+    }
+    total
+}
+
+/// Fused `Q3_K` decode. Symmetric, so this is [`dot_q6_k`]'s shape at a
+/// different unpack: two 16-element dots per 32-element run, one shared `f32`
+/// conversion, no min pass.
+fn dot_q3_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut blk = 0usize;
+    let mut w = [0i8; 32];
+    for block in row.chunks_exact(Q3K_BLOCK_BYTES) {
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let sc = unpack_q3_k_scales(&block[96..108]);
+        let d = read_f16(block, 108);
+        for (p, &(off, shift)) in Q2K_RUNS.iter().enumerate() {
+            unpack_q3k_run(&qs[off..off + 32], hmask, shift, 1 << p, &mut w);
+            let qx = &act.q[blk * 32..];
+            let s0 = (sc[2 * p] - 32) as f32;
+            let s1 = (sc[2 * p + 1] - 32) as f32;
+            total += act.d[blk]
+                * d
+                * (s0 * dot16::<ISA>(&w, qx) as f32
+                    + s1 * dot16::<ISA>(&w[16..], &qx[16..]) as f32);
+            blk += 1;
+        }
+    }
+    total
+}
+
 fn dot_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
     let mut total = 0f32;
@@ -2723,6 +3306,8 @@ mod tests {
             GGML_TYPE_Q4_0 => (18, 32),
             GGML_TYPE_Q5_1 => (24, 32),
             GGML_TYPE_IQ4_NL => (18, 32),
+            GGML_TYPE_Q2_K => (84, 256),
+            GGML_TYPE_Q3_K => (110, 256),
             GGML_TYPE_Q4_K => (144, 256),
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
@@ -2750,6 +3335,13 @@ mod tests {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
                     block[2..4].copy_from_slice(&[0x00, 0x2c]);
                 }
+                // `Q2_K` carries `d` then `dmin` at the *end* of the block.
+                GGML_TYPE_Q2_K => {
+                    block[80..82].copy_from_slice(&[0x00, 0x30]);
+                    block[82..84].copy_from_slice(&[0x00, 0x2c]);
+                }
+                // `Q3_K` is symmetric: one trailing `d`, no `dmin`.
+                GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 other => panic!("unhandled {other}"),
@@ -2902,6 +3494,8 @@ mod tests {
             GGML_TYPE_Q4_0,
             GGML_TYPE_Q5_1,
             GGML_TYPE_IQ4_NL,
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
             GGML_TYPE_Q4_K,
             GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K,
@@ -2912,10 +3506,127 @@ mod tests {
         }
     }
 
+    /// Block geometry and pinned `f16` scale fields for a synthetic row of any
+    /// supported type. Random bytes in an `f16` scale decode to Inf/NaN often
+    /// enough to make a comparison meaningless, so every fixture pins them and
+    /// leaves the quant payload random.
+    fn fixture_row(ggml_type: u32, in_dim: usize, seed: u32) -> Vec<u8> {
+        let (block_bytes, block_elems) = match ggml_type {
+            GGML_TYPE_Q8_0 => (34, 32),
+            GGML_TYPE_Q5_0 => (22, 32),
+            GGML_TYPE_Q4_0 => (18, 32),
+            GGML_TYPE_Q5_1 => (24, 32),
+            GGML_TYPE_IQ4_NL => (18, 32),
+            GGML_TYPE_Q2_K => (84, 256),
+            GGML_TYPE_Q3_K => (110, 256),
+            GGML_TYPE_Q4_K => (144, 256),
+            GGML_TYPE_Q5_K => (176, 256),
+            GGML_TYPE_Q6_K => (210, 256),
+            GGML_TYPE_IQ4_XS => (136, 256),
+            other => panic!("unhandled {other}"),
+        };
+        let mut row = pseudo_bytes(in_dim / block_elems * block_bytes, seed);
+        for block in row.chunks_exact_mut(block_bytes) {
+            match ggml_type {
+                GGML_TYPE_Q8_0
+                | GGML_TYPE_Q5_0
+                | GGML_TYPE_Q4_0
+                | GGML_TYPE_IQ4_NL
+                | GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_Q5_1 | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => {
+                    block[0..2].copy_from_slice(&[0x00, 0x30]);
+                    block[2..4].copy_from_slice(&[0x00, 0x2c]);
+                }
+                GGML_TYPE_Q2_K => {
+                    block[80..82].copy_from_slice(&[0x00, 0x30]);
+                    block[82..84].copy_from_slice(&[0x00, 0x2c]);
+                }
+                GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
+                other => panic!("unhandled {other}"),
+            }
+        }
+        row
+    }
+
+    /// Every prefill kernel must agree with the single-token path, for **every**
+    /// supported type.
+    ///
+    /// This test exists because the one below it did not do that, and a real
+    /// bug went out through the gap. `dot_unpacked_pair` is what prefill
+    /// actually runs, and its per-[`GROUP`] branch dropped the min correction
+    /// outright — correct while `Q6_K` was the only per-16 type, since it is
+    /// symmetric, and silently wrong the moment `Q2_K` arrived. The older test
+    /// covered only `dot_unpacked_multi` and only `Q8_0`/`Q5_0`/`IQ4_NL`, all
+    /// per-32, so nothing in the suite executed the broken branch. What caught
+    /// it was a whole-model generation that produced nothing but newlines.
+    ///
+    /// Both kernels, every type, and token counts either side of
+    /// [`TOKEN_TILE`] so the tiled body and the scalar tail both run.
+    #[test]
+    fn prefill_kernels_match_the_single_token_path_for_every_type() {
+        // A multiple of 256, so the 256-element super-block types are legal.
+        let in_dim = 2048;
+        for n_tokens in [1usize, 3, 4, 7, 8, 17] {
+            for ggml_type in [
+                GGML_TYPE_Q8_0,
+                GGML_TYPE_Q5_0,
+                GGML_TYPE_Q4_0,
+                GGML_TYPE_Q5_1,
+                GGML_TYPE_IQ4_NL,
+                GGML_TYPE_IQ4_XS,
+                GGML_TYPE_Q2_K,
+                GGML_TYPE_Q3_K,
+                GGML_TYPE_Q4_K,
+                GGML_TYPE_Q5_K,
+                GGML_TYPE_Q6_K,
+            ] {
+                let row = fixture_row(ggml_type, in_dim, 5);
+                let acts: Vec<ActQ8> = (0..n_tokens)
+                    .map(|t| {
+                        let x: Vec<f32> = (0..in_dim)
+                            .map(|i| (((i * 37 + t * 11) % 23) as f32 - 11.0) * 0.031)
+                            .collect();
+                        quantize_act(&x)
+                    })
+                    .collect();
+                let mut w = UnpackedRow::new();
+                unpack_row(ggml_type, &row, in_dim, &mut w);
+
+                let want: Vec<f32> = acts.iter().map(|a| dot_unpacked(&w, a)).collect();
+
+                let mut got = vec![0f32; n_tokens];
+                dot_unpacked_multi(&w, &acts, &mut got);
+                assert_eq!(
+                    got, want,
+                    "dot_unpacked_multi disagrees: type {ggml_type}, {n_tokens} tokens"
+                );
+
+                // The same row down both lanes: each must reproduce the
+                // single-token result, which also pins the two lanes together.
+                let mut g0 = vec![0f32; n_tokens];
+                let mut g1 = vec![0f32; n_tokens];
+                dot_unpacked_pair(&w, &w, &acts, &mut g0, &mut g1);
+                assert_eq!(
+                    g0, want,
+                    "dot_unpacked_pair lane 0 disagrees: type {ggml_type}, {n_tokens} tokens"
+                );
+                assert_eq!(
+                    g1, want,
+                    "dot_unpacked_pair lane 1 disagrees: type {ggml_type}, {n_tokens} tokens"
+                );
+            }
+        }
+    }
+
     /// The tiled multi-token path must agree with calling the single-token
     /// path once per token. Both quantize identically and sum in the same
     /// order per token, so this is an exact-equality check, not a tolerance —
     /// any difference means the tiling got an index wrong.
+    ///
+    /// Kept alongside the every-type test above for its `in_dim` of 896, which
+    /// is *not* a multiple of 256 — the width that forced `Qwen2.5-0.5B` onto
+    /// `IQ4_NL`, and one no super-block type can be tested at.
     #[test]
     fn tiled_multi_token_matches_one_call_per_token() {
         let in_dim = 896;
@@ -3062,6 +3773,215 @@ mod tests {
             check(GGML_TYPE_IQ4_XS, 256, seed);
             check(GGML_TYPE_IQ4_XS, 2048, seed);
             check(GGML_TYPE_IQ4_XS, 4864, seed);
+        }
+    }
+
+    #[test]
+    fn q2_k_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q2_K, 256, seed);
+            check(GGML_TYPE_Q2_K, 2048, seed);
+            check(GGML_TYPE_Q2_K, 5632, seed);
+        }
+    }
+
+    #[test]
+    fn q3_k_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q3_K, 256, seed);
+            check(GGML_TYPE_Q3_K, 2048, seed);
+            // TinyLlama's `ffn_down` width, the one this was written for.
+            check(GGML_TYPE_Q3_K, 5632, seed);
+        }
+    }
+
+    /// `Q3_K` stores its third bit **inverted**: a set `hmask` bit means "do
+    /// not subtract 4". Reading that sense backwards is the realistic failure
+    /// mode — it yields plausible weights of the wrong value everywhere, and a
+    /// model that still emits fluent text — so pin both poles directly rather
+    /// than trusting the round-trip test to notice.
+    ///
+    /// Also asserts the K-path agrees, since `Q3_K` reaches `gemm_k_q6_k`
+    /// through a *different* unpack than the GEMV path uses.
+    #[test]
+    fn q3_k_unpack_applies_the_inverted_high_bit() {
+        let block_for = |hmask: u8| {
+            let mut b = vec![hmask; 32]; // hmask
+            b.extend_from_slice(&[0x00u8; 64]); // qs: every 2-bit field zero
+            b.extend_from_slice(&[0x20u8; 12]); // scales, value irrelevant here
+            b.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes()); // d
+            b
+        };
+        // hmask clear -> subtract 4; hmask set -> subtract nothing.
+        for (hmask, want) in [(0x00u8, -4i8), (0xFFu8, 0i8)] {
+            let block = block_for(hmask);
+            assert_eq!(block.len(), Q3K_BLOCK_BYTES);
+
+            let mut row = UnpackedRow::new();
+            unpack_row(GGML_TYPE_Q3_K, &block, 256, &mut row);
+            assert!(
+                row.q.iter().all(|&q| q == want),
+                "hmask {hmask:#04x}: expected every weight {want}; got {:?}",
+                &row.q[..16]
+            );
+
+            let mut krow = KRow::new();
+            unpack_k_row(GGML_TYPE_Q3_K, &block, 256, &mut krow);
+            assert!(
+                krow.q.iter().all(|&q| q == want),
+                "hmask {hmask:#04x}: K-path disagrees with the GEMV path; got {:?}",
+                &krow.q[..16]
+            );
+            // `Q3_K` is `Q6_K`'s shape, not a fourth one.
+            assert_eq!(krow.kind, KKind::Q6K);
+        }
+    }
+
+    /// The eight-run rewrite of the `(q_off, shift, half)` walk is the one
+    /// piece of these two kernels that is derived rather than transcribed, so
+    /// check the element *ordering* against `quant::dequantize` exactly —
+    /// scales pinned to 1 so any mismatch is the walk, not rounding.
+    #[test]
+    fn two_bit_family_run_walk_matches_the_reference_ordering() {
+        for (ggml_type, bytes) in [(GGML_TYPE_Q2_K, 84), (GGML_TYPE_Q3_K, 110)] {
+            let mut block = pseudo_bytes(bytes, 42);
+            match ggml_type {
+                GGML_TYPE_Q2_K => {
+                    block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+                    block[82..84].copy_from_slice(&half::f16::from_f32(0.0).to_le_bytes());
+                }
+                _ => block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes()),
+            }
+            let want = quant::dequantize(ggml_type, &block, 256).unwrap();
+
+            let mut row = UnpackedRow::new();
+            unpack_row(ggml_type, &block, 256, &mut row);
+            for i in 0..256 {
+                let g = i / GROUP;
+                let got = row.scale[g] * row.q[i] as f32 - row.min[g];
+                assert!(
+                    (got - want[i]).abs() <= 1e-3 * want[i].abs().max(1.0),
+                    "type {ggml_type} element {i}: got {got}, want {}",
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// The per-super-block decode path must agree with `dequantize` + an exact
+    /// `f32` dot, to the same budget every other fused kernel is held to.
+    ///
+    /// A tolerance rather than equality against `dot_row`: one activation scale
+    /// per 256 is coarser than one per 32, so this is deliberately a *different*
+    /// approximation — the same one ggml makes for K-quants (`block_q8_K`), and
+    /// the one orangu's K-quant prefill GEMM already makes. What must hold is
+    /// that it stays inside the int8-activation error budget, not that it
+    /// reproduces the finer path bit for bit.
+    #[test]
+    fn k_row_decode_matches_dequantize_reference() {
+        for ggml_type in [
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+        ] {
+            for in_dim in [256usize, 2048, 5632] {
+                for seed in [1u32, 7, 99] {
+                    let row = fixture_row(ggml_type, in_dim, seed);
+                    let x = activations(in_dim);
+                    let deq = quant::dequantize(ggml_type, &row, in_dim).unwrap();
+                    let reference: f32 = deq.iter().zip(&x).map(|(w, v)| w * v).sum();
+                    let scale: f32 = deq.iter().zip(&x).map(|(w, v)| (w * v).abs()).sum();
+
+                    assert!(supports_k_row(ggml_type, in_dim));
+                    let act = quantize_act_k_row(&x);
+                    let got = dot_k_row(ggml_type, &row, &act);
+                    let err = (got - reference).abs();
+                    assert!(
+                        err <= 0.02 * scale.max(1e-6),
+                        "type {ggml_type} in_dim {in_dim}: got {got}, want {reference} \
+                         (err {err}, term-magnitude {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `supports_k_row` must be a **superset** of `supports_k`, with `Q2_K` the
+    /// only difference.
+    ///
+    /// A type in `supports_k` but missing here would be a K-quant silently left
+    /// on the per-32 activation scale — invisible, because it is only slower,
+    /// never wrong. A type here but missing from `dot_k_row`'s match is a panic
+    /// on the first token. And `Q2_K` is in decode but not prefill on purpose:
+    /// its min is per 16 and the prefill GEMM's `bsum` is per 32.
+    #[test]
+    fn supports_k_row_is_a_superset_of_supports_k() {
+        for t in [
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+        ] {
+            assert!(supports_k_row(t, 2048), "type {t}");
+            // Decode must cover everything prefill's K-GEMM does.
+            assert!(
+                !supports_k(t, 2048) || supports_k_row(t, 2048),
+                "type {t} takes the K GEMM at prefill but not the k-row path at decode"
+            );
+        }
+        // The one deliberate asymmetry, pinned so it cannot drift silently.
+        assert!(supports_k_row(GGML_TYPE_Q2_K, 2048));
+        assert!(!supports_k(GGML_TYPE_Q2_K, 2048));
+        // Not super-block types: they have no 256-element accumulation to make.
+        for t in [
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q5_0,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_Q5_1,
+            GGML_TYPE_IQ4_NL,
+        ] {
+            assert!(!supports_k_row(t, 2048), "type {t}");
+            assert!(!supports_k(t, 2048), "type {t}");
+        }
+        // 896 is not a whole number of super-blocks.
+        assert!(!supports_k_row(GGML_TYPE_Q3_K, 896));
+        assert!(!supports_k_row(GGML_TYPE_Q4_K, 896));
+    }
+
+    /// The per-super-block accumulator must not overflow `i32` for any
+    /// supported type, at the worst case the format allows.
+    ///
+    /// Checked by construction rather than by fixture, because a random row
+    /// will not produce the extreme and the failure would be a silent wrap
+    /// rather than a panic in release. The table in `supports_k_row`'s doc
+    /// comment is what this pins.
+    #[test]
+    fn k_row_accumulator_bounds_stay_inside_i32() {
+        // (type, |max scale|, |max quant|)
+        for (t, sc, q) in [
+            (GGML_TYPE_Q2_K, 15i64, 3i64),
+            (GGML_TYPE_Q3_K, 32, 4),
+            (GGML_TYPE_Q4_K, 63, 15),
+            (GGML_TYPE_Q5_K, 63, 31),
+            (GGML_TYPE_Q6_K, 127, 32),
+            (GGML_TYPE_IQ4_XS, 32, 127),
+        ] {
+            // Every element of a super-block at its extreme, against |x| = 127.
+            let worst = sc * q * 127 * SUPER_BLOCK as i64;
+            assert!(
+                worst < i32::MAX as i64,
+                "type {t}: worst-case accumulator {worst} exceeds i32::MAX"
+            );
+            // And keep a real margin, not a hair's breadth.
+            assert!(
+                worst < i32::MAX as i64 / 8,
+                "type {t}: worst-case accumulator {worst} leaves under 8x margin"
+            );
         }
     }
 
@@ -3392,6 +4312,17 @@ mod tests {
         assert!(supports_k(GGML_TYPE_Q5_K, 2048));
         assert!(!supports_flat(GGML_TYPE_Q5_K, 2048));
         assert!(!supports_k(GGML_TYPE_Q5_K, 896));
+        // `Q3_K` is `Q6_K`'s shape — per-16 signed scale, symmetric — so it
+        // takes the same kernel.
+        assert!(supports_k(GGML_TYPE_Q3_K, 2048));
+        assert!(!supports_flat(GGML_TYPE_Q3_K, 2048));
+        // `Q2_K` deliberately does NOT: its min is per-16 while the min pass
+        // reads a per-32 `bsum`. It must still be fused for decode, and it
+        // must still be refused here, or the K GEMM would silently drop the
+        // min term and produce a subtly wrong forward pass.
+        assert!(supports(GGML_TYPE_Q2_K, 2048));
+        assert!(!supports_k(GGML_TYPE_Q2_K, 2048));
+        assert!(!supports_flat(GGML_TYPE_Q2_K, 2048));
         // `IQ4_XS` is a 256-element super-block type like the other two, and
         // must NOT be claimed by `supports_flat` — its scales are per-32 but
         // it accumulates per-256, which is the K-quant kernel's shape.
