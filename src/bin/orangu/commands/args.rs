@@ -262,6 +262,10 @@ pub fn server_usage_message() -> &'static str {
     "Usage: /server <name>. Use /help to see available commands."
 }
 
+pub fn mcp_usage_message() -> &'static str {
+    "Usage: /mcp [refresh|add <name> <endpoint>|modify <name> <endpoint>]"
+}
+
 pub fn pull_usage_message() -> &'static str {
     "Usage: /pull <number>. Use /help to see available commands."
 }

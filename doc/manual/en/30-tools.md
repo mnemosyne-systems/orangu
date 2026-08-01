@@ -15,6 +15,16 @@ tools available. `orangu-server` passes the array through to the template and
 translates the answer back — see **Tool calling** in the Inference server
 chapter for which answer formats it recognises.
 
+Configured Streamable HTTP MCP servers can add tools to this list. Their names are
+namespaced as `mcp__<server>__<tool>` so they cannot collide with built-in tools
+or another server. orangu discovers them once when a workspace opens; a server
+that cannot be reached is disabled with a warning while built-in and other MCP tools
+remain available. MCP tool results are returned through the same text tool
+result channel as built-in tools and are capped at 20,000 characters.
+
+MCP support currently exposes tools only. Resources and prompts are not exposed;
+`/mcp refresh` re-discovers tools at runtime.
+
 ## Available tools
 
 | Tool | Purpose | Key arguments |

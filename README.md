@@ -174,7 +174,7 @@ orangu makes a deliberate trade: a focused, offline-first, Git-centric terminal 
 | **Git workflow** | Full Git + GitHub/GitLab loop from the prompt | Varies; often browser-based |
 | **Privacy posture** | Suited to regulated / air-gapped environments | Depends on the provider's data policy |
 
-orangu trades breadth and extensibility for simplicity, predictability, and a small attack surface. If you need a multi-front-end platform with a large plugin/MCP ecosystem, a cloud-first agent will fit better — orangu is the lean, private alternative for local models.
+orangu trades breadth for simplicity, predictability, and a small attack surface. It supports a focused, tools-only integration with already-running Streamable HTTP MCP servers; broader plugin ecosystems remain outside its scope. orangu is the lean, private alternative for local models.
 
 ## Installation
 

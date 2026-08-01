@@ -28,6 +28,7 @@ pub enum SlashCommand {
     ListFiles,
     ShowFile,
     Tools,
+    Mcp,
     Model,
     Server,
     Information,
@@ -97,6 +98,7 @@ impl SlashCommand {
             SlashCommand::ListFiles => "Lists the workspace files as a tree",
             SlashCommand::ShowFile => "Shows the contents of a workspace file",
             SlashCommand::Tools => "Lists the model-facing workspace tools",
+            SlashCommand::Mcp => "Shows MCP server status and discovered tools",
             SlashCommand::Model => "Selects the model used for requests",
             SlashCommand::Server => "Selects the server orangu talks to",
             SlashCommand::Information => {

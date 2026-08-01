@@ -41,6 +41,7 @@ markdown = "1.0.0"
 merman = { version = "0.7.0", features = ["render"] }
 printpdf = { version = "0.12.5", default-features = false, features = ["text_layout", "png"] }
 regex = "1.13"
+rmcp = { version = "3.1.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 rustc-hash = "2.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 rustyline = "18.0.1"

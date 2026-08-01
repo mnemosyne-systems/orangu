@@ -1674,6 +1674,60 @@
     }
   });
 
+  // MCP inventory is deliberately read-only. The server reads its MCP
+  // sections at startup, so changing one belongs in the config plus restart.
+  const mcpsBtn = document.getElementById("mcps-btn");
+  const mcpsOverlay = document.getElementById("mcps-overlay");
+  const mcpsCloseBtn = document.getElementById("mcps-close-btn");
+  const mcpsTable = document.getElementById("mcps-table");
+  const mcpsDetails = document.getElementById("mcps-details");
+
+  function closeMcps() {
+    mcpsOverlay.hidden = true;
+    mcpsBtn.setAttribute("aria-expanded", "false");
+  }
+
+  async function showMcp(name) {
+    const res = await fetch(`/api/mcps/${encodeURIComponent(name)}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    mcpsDetails.textContent = JSON.stringify(await res.json(), null, 2);
+    mcpsDetails.hidden = false;
+  }
+
+  async function openMcps() {
+    mcpsOverlay.hidden = false;
+    mcpsBtn.setAttribute("aria-expanded", "true");
+    mcpsDetails.hidden = true;
+    mcpsTable.textContent = "Loading…";
+    const res = await fetch("/api/mcps", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const mcps = await res.json();
+    if (!mcps.length) {
+      mcpsTable.textContent = "No MCP servers are configured.";
+      return;
+    }
+    const table = document.createElement("table");
+    table.innerHTML = "<thead><tr><th>Name</th><th>Endpoint</th><th>Status</th><th></th></tr></thead>";
+    const body = document.createElement("tbody");
+    mcps.forEach((mcp) => {
+      const row = document.createElement("tr");
+      [mcp.name, mcp.endpoint, mcp.enabled ? "Enabled" : "Disabled"].forEach((value) => {
+        const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell);
+      });
+      const action = document.createElement("td");
+      const show = document.createElement("button");
+      show.type = "button"; show.className = "icon-btn subtle-btn"; show.textContent = "Show";
+      show.addEventListener("click", () => showMcp(mcp.name).catch((err) => { mcpsDetails.textContent = err.message; mcpsDetails.hidden = false; }));
+      action.appendChild(show); row.appendChild(action); body.appendChild(row);
+    });
+    table.appendChild(body);
+    mcpsTable.replaceChildren(table);
+  }
+
+  mcpsBtn.addEventListener("click", () => openMcps().catch((err) => { mcpsTable.textContent = err.message; }));
+  mcpsCloseBtn.addEventListener("click", closeMcps);
+  mcpsOverlay.addEventListener("click", (event) => { if (event.target === mcpsOverlay) closeMcps(); });
+
   (async function init() {
     const savedId = localStorage.getItem("orangu-session-id");
     if (savedId) {

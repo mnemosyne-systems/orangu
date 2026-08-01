@@ -24,6 +24,7 @@
 //! ```` ```mermaid ```` blocks drawn to SVG by `web::mermaid`.
 
 pub mod attachments;
+pub mod mcp;
 pub mod mermaid;
 pub mod models;
 pub mod render;
@@ -213,6 +214,9 @@ pub struct WebState {
     /// `models::select`. Only ever goes from empty to set: this process is
     /// about to be replaced, so there is nothing to reset it back to.
     pub loading: std::sync::Mutex<Option<String>>,
+    /// Configured MCP profiles are displayed read-only; applying config edits
+    /// requires a server restart.
+    pub mcp_servers: Vec<crate::config::McpConfiguration>,
 }
 
 impl WebState {
@@ -261,6 +265,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/messages", post(send_message))
+        .merge(mcp::router())
         // The model manager: list, metadata, download, delete — on the same
         // port as the chat UI.
         .merge(models::router())

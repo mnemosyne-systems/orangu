@@ -136,13 +136,19 @@ pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<
         .get(&server)
         .ok_or_else(|| anyhow!("missing configured server {server}"))?;
 
+    let (mcp, mcp_warnings) =
+        orangu::mcp::McpManager::connect_all(&config.mcp_servers, &workspace).await?;
+    for warning in mcp_warnings {
+        console.note(&format!("Warning: {warning}"));
+    }
     let tools = orangu::tools::ToolExecutor::with_config(
         &workspace,
         config.compression,
         config.auto_downsample_lines,
         config.diff_file_cap,
         None,
-    );
+    )
+    .with_mcp(mcp.clone());
     let skills = orangu::skills::SkillRegistry::discover(&workspace);
 
     // Anything orangu answers on its own is answered here, before a single byte
@@ -174,6 +180,10 @@ pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<
         system.push_str(&index);
     }
     system.push_str(&orangu::config::load_agents_instructions(&workspace));
+    if !mcp.instructions().is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&mcp.instructions());
+    }
 
     let definitions = tools.definitions();
     let tools_bytes = serde_json::to_string(&definitions).map_or(0, |json| json.len());
@@ -215,6 +225,7 @@ pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<
             |tool_call| {
                 console.note(&format!("[tool] {}", tool_call.function.name));
             },
+            |_| false,
         )
         .await;
 

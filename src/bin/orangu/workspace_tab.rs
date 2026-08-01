@@ -35,6 +35,8 @@ pub(crate) struct TabServerConfig<'a> {
     pub(crate) model_id: String,
     pub(crate) endpoint: Option<String>,
     pub(crate) llms: &'a std::collections::HashMap<String, orangu::config::LlmConfiguration>,
+    pub(crate) mcp_servers:
+        &'a std::collections::HashMap<String, orangu::config::McpServerConfiguration>,
     /// Shared `id_slot` registry (see [`orangu::llm::SlotRegistry`]), so every
     /// tab's interactive session pins its requests through the same
     /// per-endpoint round-robin assignment.
@@ -117,7 +119,7 @@ impl WorkspaceTab {
     /// — used by `Alt+Insert`, which opens a fresh tab the user then points
     /// somewhere with `/workspace`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open(
+    pub(crate) async fn open(
         workspace: PathBuf,
         resume: Option<&str>,
         auto_resume: bool,
@@ -132,6 +134,7 @@ impl WorkspaceTab {
             model_id: default_model_id,
             endpoint: default_endpoint,
             llms: config_llms,
+            mcp_servers,
             slots,
         } = server_config;
         let workspace_created = if !workspace.exists() {
@@ -180,13 +183,16 @@ impl WorkspaceTab {
             (server, model_id, endpoint)
         };
 
+        let (mcp, mcp_warnings) =
+            orangu::mcp::McpManager::connect_all(mcp_servers, &workspace).await?;
         let tools = ToolExecutor::with_config(
             &workspace,
             compression_enabled,
             auto_downsample_lines,
             diff_file_cap,
             Some(session_dir.clone()),
-        );
+        )
+        .with_mcp(mcp.clone());
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");
@@ -215,6 +221,10 @@ impl WorkspaceTab {
             };
 
             ep.push_str(&orangu::config::load_agents_instructions(&workspace));
+            if !mcp.instructions().is_empty() {
+                ep.push_str("\n\n");
+                ep.push_str(&mcp.instructions());
+            }
             ep
         };
         let mut session = ChatSession::new(&enhanced_prompt).with_slots(slots);
@@ -227,6 +237,9 @@ impl WorkspaceTab {
             .with_workspace(&workspace);
         let history = load_history(&session_hist_path)?;
         let mut output_state = OutputState::default();
+        for warning in mcp_warnings {
+            output_state.push_text(&format!("Warning: {warning}"));
+        }
         // The auto-resume notice only shows for a session restored implicitly on
         // open, not for an explicit `--resume`/`/session <uuid>` target.
         let startup_notice_until = if is_resumed && resume.is_none() {
