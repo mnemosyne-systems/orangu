@@ -47,7 +47,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::{IsTerminal, Read, Write},
@@ -64,6 +64,60 @@ const HUB_ENDPOINT: &str = "https://huggingface.co";
 /// in that order, first match wins.
 const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
 
+/// One file's line of a [`DownloadSnapshot`] — the structured form of the
+/// text [`Slot::line`] renders for a terminal.
+#[derive(Clone, Serialize)]
+pub struct DownloadFile {
+    /// The repo-relative path of the file, as [`Slot::label`].
+    pub label: String,
+    /// Its real size from the repository listing.
+    pub size: u64,
+    /// How many of those bytes are on disk right now.
+    pub downloaded: u64,
+    /// `queued`, `downloading`, `retrying`, or `done`.
+    pub state: &'static str,
+    /// Which retry attempt this file is waiting out, when `state` is
+    /// `retrying`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<u32>,
+}
+
+/// Where a download is right now, for a caller with no terminal to draw a
+/// [`ProgressBoard`] on — the same numbers the board's own `Total` line is
+/// built from, as data rather than text.
+#[derive(Clone, Default, Serialize)]
+pub struct DownloadSnapshot {
+    pub files: Vec<DownloadFile>,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub percent: u64,
+    /// Seconds remaining at the rate this run has actually transferred at,
+    /// or `None` before there is enough of one to extrapolate from — the
+    /// same rule [`ProgressBoard::eta`] uses for its own text.
+    pub eta_secs: Option<u64>,
+}
+
+/// A live, shared view of an in-progress [`download_model_reporting`] run.
+/// Passing one both redirects the [`ProgressBoard`] away from stdout
+/// entirely (a server has no terminal to draw an in-place-updating block
+/// on, and would only spam its log) and makes the same state readable at
+/// any moment from another thread — which is what the web console's model
+/// manager polls.
+#[derive(Default)]
+pub struct DownloadProgress {
+    snapshot: Mutex<DownloadSnapshot>,
+}
+
+impl DownloadProgress {
+    pub fn snapshot(&self) -> DownloadSnapshot {
+        self.snapshot.lock().unwrap().clone()
+    }
+
+    fn publish(&self, snapshot: DownloadSnapshot) {
+        *self.snapshot.lock().unwrap() = snapshot;
+    }
+}
+
 /// Downloads `spec` (`<user>/<model>[:quant]`) from the Hugging Face Hub
 /// into `models_dir`, and returns the local path of the primary model file
 /// (the first shard, for a multi-part model) once every selected file
@@ -72,6 +126,18 @@ const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
 /// files land on disk) and model-spec resolution ahead of serving (which
 /// also needs the resulting path to load).
 pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
+    download_model_reporting(models_dir, spec, None)
+}
+
+/// [`download_model`], reporting into `progress` as it goes instead of onto
+/// a terminal. Blocking exactly as `download_model` is — a caller inside an
+/// async runtime has to run it on a blocking thread, and reads `progress`
+/// from wherever it likes meanwhile.
+pub fn download_model_reporting(
+    models_dir: &Path,
+    spec: &str,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<PathBuf> {
     let (repo, tag) = split_repo_tag(spec)?;
     let client = build_client(None)?;
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
@@ -160,7 +226,7 @@ pub fn download_model(models_dir: &Path, spec: &str) -> Result<PathBuf> {
     let needed: u64 = slots.iter().map(|s| s.size - s.downloaded).sum();
     check_space(&blobs_dir, needed, crate::os::available_space(&blobs_dir))?;
 
-    let board = Mutex::new(ProgressBoard::new(slots));
+    let board = Mutex::new(ProgressBoard::new(slots, progress));
     // Drawn even when there's nothing left to fetch: a repo that's already
     // fully downloaded still says so, file by file.
     board.lock().unwrap().draw();
@@ -739,17 +805,65 @@ struct ProgressBoard {
     /// by every download thread at once, which would otherwise mean taking
     /// the board's mutex thousands of times a second.
     transferred: Arc<AtomicU64>,
+    /// Set when the caller wants the state as data rather than as output
+    /// (see [`DownloadProgress`]). Its presence turns *all* printing off,
+    /// interactive and logged alike: the one caller that passes it is a
+    /// running server, where the in-place redraws would be escape-sequence
+    /// noise and the per-file log lines would go somewhere nobody is
+    /// watching.
+    sink: Option<Arc<DownloadProgress>>,
 }
 
 impl ProgressBoard {
-    fn new(slots: Vec<Slot>) -> Self {
+    fn new(slots: Vec<Slot>, sink: Option<Arc<DownloadProgress>>) -> Self {
         Self {
             slots,
             drawn: 0,
-            interactive: std::io::stdout().is_terminal(),
+            interactive: sink.is_none() && std::io::stdout().is_terminal(),
             started: std::time::Instant::now(),
             transferred: Arc::new(AtomicU64::new(0)),
+            sink,
         }
+    }
+
+    /// Hands the sink, if there is one, everything its holder could want to
+    /// know right now. Called from every state change (via [`Self::update`])
+    /// and from the one up-front [`Self::draw`], so a poll never sees a
+    /// board older than the last transition.
+    fn publish(&self) {
+        let Some(sink) = &self.sink else { return };
+        let elapsed = self.started.elapsed();
+        let total_bytes: u64 = self.slots.iter().map(|s| s.size).sum();
+        let done_bytes: u64 = self.slots.iter().map(|s| s.downloaded).sum();
+        sink.publish(DownloadSnapshot {
+            files: self
+                .slots
+                .iter()
+                .map(|slot| DownloadFile {
+                    label: slot.label.clone(),
+                    size: slot.size,
+                    downloaded: slot.downloaded,
+                    state: match slot.state {
+                        SlotState::Skipped | SlotState::Done => "done",
+                        SlotState::Queued => "queued",
+                        SlotState::Downloading { retry: None } => "downloading",
+                        SlotState::Downloading { retry: Some(_) } => "retrying",
+                    },
+                    retry: match slot.state {
+                        SlotState::Downloading {
+                            retry: Some(Retry { attempt, .. }),
+                        } => Some(attempt),
+                        _ => None,
+                    },
+                })
+                .collect(),
+            total_bytes,
+            done_bytes,
+            percent: (done_bytes * 100).checked_div(total_bytes).unwrap_or(0),
+            eta_secs: self
+                .eta(done_bytes, total_bytes, elapsed)
+                .map(|eta| eta.as_secs()),
+        });
     }
 
     /// `slot` now has `downloaded` of its bytes on disk and is streaming —
@@ -770,6 +884,10 @@ impl ProgressBoard {
     /// is one flush behind whatever just changed.
     fn update(&mut self, slot: usize, state: SlotState) {
         self.slots[slot].state = state;
+        self.publish();
+        if self.sink.is_some() {
+            return;
+        }
         if !self.interactive {
             // A file finishing, and a download stalling into a retry, are the
             // only two transitions worth a line in a log — the percentages in
@@ -803,6 +921,10 @@ impl ProgressBoard {
     /// outset rather than appearing only as a thread frees up — and again on
     /// every state change after that.
     fn draw(&mut self) {
+        self.publish();
+        if self.sink.is_some() {
+            return;
+        }
         if !self.interactive {
             // Only ever reached by the single up-front call — `update`
             // returns before drawing when output isn't a terminal. Files
@@ -1209,6 +1331,7 @@ mod tests {
                     state,
                 })
                 .collect(),
+            None,
         )
     }
 

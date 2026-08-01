@@ -736,6 +736,659 @@
     }
   });
 
+  // ---------------------------------------------------------------- models
+
+  // The model manager (see web/models.rs): `orangu-server list`'s own table
+  // as the view — NR / MODEL / QUANT / SIZE / SUPPORTED, the same strings
+  // the CLI prints, rendered server-side so the two cannot disagree — plus
+  // Show and Delete per row and a download box above it. Every action is an
+  // icon button whose label lives in its `title`/`aria-label`, matching the
+  // rest of this UI's chrome.
+
+  const modelsBtn = document.getElementById("models-btn");
+  const modelsOverlay = document.getElementById("models-overlay");
+  const modelsCloseBtn = document.getElementById("models-close-btn");
+  const modelsReloadBtn = document.getElementById("models-reload-btn");
+  const modelsDirEl = document.getElementById("models-dir");
+  const modelsCurrentEl = document.getElementById("models-current");
+  const modelsTableEl = document.getElementById("models-table");
+  const modelsJobEl = document.getElementById("models-job");
+  const modelsNoticeEl = document.getElementById("models-notice");
+  const modelsDownloadForm = document.getElementById("models-download-form");
+  const modelsDownloadInput = document.getElementById("models-download-input");
+  const modelsMetadataEl = document.getElementById("models-metadata");
+  const modelsMetadataTitle = document.getElementById("models-metadata-title");
+  const modelsMetadataBody = document.getElementById("models-metadata-body");
+  const modelsMetadataTensorsBtn = document.getElementById("models-metadata-tensors-btn");
+  const modelsMetadataFullBtn = document.getElementById("models-metadata-full-btn");
+  const modelsMetadataSaveBtn = document.getElementById("models-metadata-save-btn");
+  const modelsMetadataCloseBtn = document.getElementById("models-metadata-close-btn");
+
+  const ICON = {
+    // Load — a play triangle: start serving this one.
+    load: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="6 3 20 12 6 21 6 3"/></svg>`,
+    // The loaded row's marker, in place of its Load button.
+    loaded: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`,
+    // Show — a document with lines on it, for "this file's metadata".
+    show: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="14" y2="17"/></svg>`,
+    trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
+    close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  };
+
+  // How often the panel re-reads /api/models while it's open. A download's
+  // progress is the only thing that moves on its own, and it moves in
+  // megabytes, so a second is plenty. The poll deliberately does *not* pass
+  // `rescan` — re-reading the models directory opens every GGUF header under
+  // it (seconds, on a directory holding a few dozen models), and nothing on
+  // disk changes on its own. A rescan is asked for exactly where the
+  // directory can have changed: when the panel opens, after an action, and
+  // from the Rescan button.
+  const MODELS_POLL_MS = 1000;
+
+  const modelsState = {
+    open: false,
+    timer: null,
+    busy: false,
+    // Row numbers the Hub says are behind their repo, applied to the next
+    // listing — `list`'s own `(Refresh)` marker.
+    behind: new Set(),
+    // Which model's metadata the viewer is showing, and how — kept so the
+    // tensors/full toggles can re-fetch the same target.
+    metadata: { model: null, title: "", tensors: false, full: false, text: "" },
+    // What the table was last built from. The poll runs once a second and
+    // the table almost never changes between two of them — rebuilding it
+    // anyway would drop hover state and any tooltip the pointer is resting
+    // on, once a second, for nothing.
+    tableSignature: null,
+    // Set across a Load: the poll below expects failures then, and must not
+    // report them as the panel breaking.
+    handingOver: false,
+  };
+
+  function formatBytes(bytes) {
+    if (bytes == null) return "";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+  }
+
+  function formatEta(seconds) {
+    if (seconds == null) return "";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 1) return "<1m";
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.floor(minutes / 60)}h:${String(minutes % 60).padStart(2, "0")}m`;
+  }
+
+  function iconButton(icon, label, onClick, extraClass) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `icon-btn row-btn${extraClass ? ` ${extraClass}` : ""}`;
+    btn.innerHTML = icon;
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+    if (onClick) btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  // A transient line above the table: the result of the last action, or the
+  // reason it was refused. Errors carry the server's own message verbatim —
+  // "this model is currently loaded", "not enough free space", and the like
+  // are exactly what the user needs to read.
+  function modelsNotice(message, kind) {
+    modelsNoticeEl.textContent = message;
+    modelsNoticeEl.className = kind === "error" ? "models-notice error" : "models-notice";
+    modelsNoticeEl.hidden = !message;
+  }
+
+  // Every mutating action goes through here: it serializes them (one at a
+  // time, so a delete can't race the load that would have made it legal),
+  // shows the outcome, and re-reads the listing afterwards either way.
+  async function modelsAction(label, request) {
+    if (modelsState.busy) return;
+    modelsState.busy = true;
+    modelsNotice(`${label}…`);
+    modelsOverlay.classList.add("busy");
+    try {
+      const res = await request();
+      const text = await res.text();
+      if (!res.ok) {
+        modelsNotice(text.trim() || `failed (${res.status})`, "error");
+      } else {
+        let message = "";
+        try {
+          message = JSON.parse(text).message || "";
+        } catch {
+          message = "";
+        }
+        modelsNotice(message);
+      }
+    } catch (err) {
+      modelsNotice(String(err), "error");
+    } finally {
+      modelsState.busy = false;
+      modelsOverlay.classList.remove("busy");
+      // A rescan, not a cached read: an action is exactly what changes the
+      // models directory.
+      await refreshModels(true);
+    }
+  }
+
+  // Which of the listed rows is actually serving requests, and on what.
+  function renderCurrent(current, loading) {
+    modelsCurrentEl.innerHTML = "";
+    const name = document.createElement("div");
+    name.className = "models-current-name";
+    name.textContent = current.display;
+    const detail = document.createElement("div");
+    detail.className = "models-subtle";
+    detail.textContent =
+      `${current.architecture} · ${current.backend} · ${current.n_layer} layers · ` +
+      `${current.n_ctx} ctx · ${current.role} · ${current.slots} slot(s)`;
+    detail.title = current.path;
+    modelsCurrentEl.append(name, detail);
+    if (loading) {
+      const notice = document.createElement("div");
+      notice.className = "models-loading";
+      notice.textContent = `Loading ${loading}… the server is restarting itself on it.`;
+      modelsCurrentEl.appendChild(notice);
+    }
+  }
+
+  function renderJob(job) {
+    modelsJobEl.innerHTML = "";
+    modelsJobEl.hidden = !job;
+    if (!job) return;
+
+    const header = document.createElement("div");
+    header.className = "models-job-header";
+    const title = document.createElement("span");
+    title.textContent = job.spec;
+    header.appendChild(title);
+
+    const p = job.progress || {};
+    if (job.state === "running") {
+      const summary = document.createElement("span");
+      summary.className = "models-subtle";
+      const eta = formatEta(p.eta_secs);
+      summary.textContent =
+        `${p.percent ?? 0}% — ${formatBytes(p.done_bytes || 0)} of ` +
+        `${formatBytes(p.total_bytes || 0)}${eta ? `, ETA ${eta}` : ""}`;
+      header.appendChild(summary);
+    } else {
+      const state = document.createElement("span");
+      state.className = job.state === "failed" ? "models-job-failed" : "models-subtle";
+      state.textContent = job.message || job.state;
+      header.appendChild(state);
+      // Only a finished job can be dismissed — there is no cancellation, and
+      // a dismiss button that hid a live download would be a lie.
+      header.appendChild(
+        iconButton(ICON.close, "Dismiss", () =>
+          modelsAction("Dismissing", () => fetch("/api/models/job", { method: "DELETE" })),
+        ),
+      );
+    }
+    modelsJobEl.appendChild(header);
+
+    if (job.state === "running") {
+      modelsJobEl.appendChild(progressBar(p.percent ?? 0));
+      for (const file of p.files || []) {
+        const line = document.createElement("div");
+        line.className = "models-job-file";
+        const name = document.createElement("span");
+        name.className = "models-job-file-name";
+        name.textContent = file.label;
+        name.title = file.label;
+        const status = document.createElement("span");
+        status.className = "models-subtle";
+        const percent = file.size ? Math.min(100, Math.floor((file.downloaded * 100) / file.size)) : 0;
+        status.textContent =
+          file.state === "done"
+            ? "100%"
+            : file.state === "retrying"
+              ? `${percent}% (retry ${file.retry})`
+              : file.state === "queued"
+                ? "queued"
+                : `${percent}%`;
+        line.append(name, status);
+        modelsJobEl.appendChild(line);
+      }
+    }
+  }
+
+  function progressBar(percent) {
+    const track = document.createElement("div");
+    track.className = "models-progress";
+    const fill = document.createElement("div");
+    fill.className = "models-progress-fill";
+    fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    track.appendChild(fill);
+    return track;
+  }
+
+  // `orangu-server list`, as a table: the same five columns, the same
+  // strings (the server sends `quant`/`size`/`supported` already formatted
+  // by the CLI's own code), the same greying of a row this build can't
+  // load, the same `(Refresh)` marker on a row whose repo has moved on, and
+  // the same `error:` row replacing the cells for a file whose header
+  // wouldn't parse. Two icons per row: Show and Delete.
+  function renderTable(models, canLoad, loading) {
+    modelsTableEl.innerHTML = "";
+    if (models.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "models-empty";
+      empty.textContent = "No models here yet — download one above.";
+      modelsTableEl.appendChild(empty);
+      return;
+    }
+
+    const table = document.createElement("table");
+    const head = document.createElement("thead");
+    head.innerHTML =
+      "<tr><th class='num'>NR</th><th>MODEL</th><th>QUANT</th>" +
+      "<th class='num'>SIZE</th><th>SUPPORTED</th><th></th></tr>";
+    table.appendChild(head);
+    const body = document.createElement("tbody");
+
+    for (const model of models) {
+      const row = document.createElement("tr");
+      if (model.loaded) row.classList.add("loaded");
+      // `list` greys a row it can't load; an error row is greyed too, since
+      // there is nothing there to load either.
+      if (!model.loadable || model.error) row.classList.add("unsupported");
+
+      const nr = document.createElement("td");
+      nr.className = "num";
+      nr.textContent = model.nr;
+
+      const label = document.createElement("td");
+      label.className = "models-label";
+      label.textContent = model.label;
+      label.title = model.path;
+      if (model.loaded) {
+        const badge = document.createElement("span");
+        badge.className = "models-badge loaded";
+        badge.textContent = "loaded";
+        badge.title = "The model this server is serving";
+        label.appendChild(badge);
+      }
+      if (model.refresh) {
+        const badge = document.createElement("span");
+        badge.className = "models-badge";
+        badge.textContent = "Refresh";
+        badge.title =
+          "This repo has a newer revision on Hugging Face — " +
+          "`orangu-server refresh` downloads it again";
+        label.appendChild(badge);
+      }
+
+      row.append(nr, label);
+
+      if (model.error) {
+        // `list` drops SIZE and SUPPORTED entirely for an unreadable file
+        // and prints the error across the rest of the line.
+        const error = document.createElement("td");
+        error.colSpan = 3;
+        error.textContent = `error: ${model.error}`;
+        error.title = model.error;
+        error.className = "models-row-error";
+        row.appendChild(error);
+      } else {
+        const quant = document.createElement("td");
+        quant.textContent = model.quant;
+
+        const size = document.createElement("td");
+        size.className = "num";
+        size.textContent = model.size;
+
+        const supported = document.createElement("td");
+        supported.textContent = model.supported;
+
+        row.append(quant, size, supported);
+      }
+
+      const actions = document.createElement("td");
+      actions.className = "models-actions";
+
+      if (model.loaded) {
+        const marker = iconButton(ICON.loaded, "Currently loaded", null, "is-loaded");
+        marker.disabled = true;
+        actions.appendChild(marker);
+      } else {
+        const load = iconButton(ICON.load, `Load ${rowTitle(model)}`, () => {
+          if (
+            !window.confirm(
+              `Load "${rowTitle(model)}"?\n\nThe server restarts itself on this model. ` +
+                `Chat history is kept; anything still generating is not.`,
+            )
+          ) {
+            return;
+          }
+          loadModel(model);
+        });
+        // Disabled for the three reasons the server would refuse anyway, so
+        // the button says so instead of the click doing.
+        if (!canLoad) {
+          load.disabled = true;
+          load.title = "Loading a model from here is disabled (reexec = no in orangu-server.conf)";
+        } else if (loading) {
+          load.disabled = true;
+          load.title = `Already loading ${loading}`;
+        } else if (!model.loadable) {
+          load.disabled = true;
+          load.title = "This build cannot load this model";
+        }
+        load.setAttribute("aria-label", load.title);
+        actions.appendChild(load);
+      }
+
+      actions.appendChild(
+        iconButton(ICON.show, `Show ${model.label}`, () =>
+          showMetadata(String(model.nr), rowTitle(model)),
+        ),
+      );
+
+      const remove = iconButton(
+        ICON.trash,
+        `Delete ${model.label}`,
+        () => {
+          if (
+            !window.confirm(
+              `Delete "${rowTitle(model)}" (${model.size})?\n\nThis cannot be undone.`,
+            )
+          ) {
+            return;
+          }
+          modelsAction(`Deleting ${model.label}`, () =>
+            fetch("/api/models", {
+              method: "DELETE",
+              headers: { "Content-Type": "application/json" },
+              // Addressed by `nr`, not by label: a repo with several
+              // quantizations on disk prints the same bare MODEL on every
+              // one of their rows, so a label would delete whichever came
+              // first rather than the row that was clicked. `path` is what
+              // the server checks the row against — see ModelRequest::path
+              // in web/models.rs.
+              body: JSON.stringify({ model: String(model.nr), path: model.path }),
+            }),
+          );
+        },
+        "danger",
+      );
+      // The loaded model's weights are mapped by the running engine, so
+      // deleting the file would leave it reading something with no name.
+      remove.disabled = model.loaded;
+      if (model.loaded) {
+        remove.title = "This is the model this server is serving";
+        remove.setAttribute("aria-label", remove.title);
+      }
+      actions.appendChild(remove);
+
+      row.appendChild(actions);
+      body.appendChild(row);
+    }
+    table.appendChild(body);
+    modelsTableEl.appendChild(table);
+  }
+
+  // How a row is named in a confirmation dialog and above its metadata:
+  // MODEL:QUANT, since MODEL alone can name several rows.
+  function rowTitle(model) {
+    return model.quant && model.quant !== "-" ? `${model.label}:${model.quant}` : model.label;
+  }
+
+  // Load: the server replaces itself with a new process serving the chosen
+  // model (see reexec.rs). Its listening socket survives the exec, so the
+  // port never goes away — but the connection this page has open at that
+  // moment does not, and neither does the response to the request that
+  // asked for it. So both "got the 202" and "the connection died" mean the
+  // same thing here, and both are followed by waiting for the new image.
+  async function loadModel(model) {
+    if (modelsState.busy) return;
+    modelsState.busy = true;
+    modelsState.handingOver = true;
+    modelsOverlay.classList.add("busy");
+    modelsNotice(`Loading ${rowTitle(model)}…`);
+    const before = model.path;
+    try {
+      const res = await fetch("/api/models/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // By `nr`, like every other row action — see the Delete button.
+        body: JSON.stringify({ model: String(model.nr), path: model.path }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        modelsNotice(detail.trim() || `failed (${res.status})`, "error");
+        return;
+      }
+    } catch {
+      // Reset before the reply arrived — the handover beat it. Fall through
+      // and find out from the new image.
+    }
+    const current = await waitForServer();
+    if (!current) {
+      modelsNotice(
+        "The server did not come back. It may still be loading, or the model may have failed " +
+          "to load and it fell back — check its output.",
+        "error",
+      );
+    } else if (current.path === before) {
+      modelsNotice(`Now serving ${current.display}.`);
+    } else {
+      // Came back on something else: the load failed and the fallback took
+      // over (see ORANGU_FALLBACK_MODEL in reexec.rs).
+      modelsNotice(
+        `${rowTitle(model)} did not load — the server fell back to ${current.display}.`,
+        "error",
+      );
+    }
+    modelsState.busy = false;
+    modelsState.handingOver = false;
+    modelsOverlay.classList.remove("busy");
+    await refreshModels(true).catch(() => {});
+  }
+
+  // Polls until the replacement process answers, and returns what it is
+  // serving. The wait is generous because a cold load of a large model on a
+  // slow disk genuinely takes minutes — and it costs nothing to wait, since
+  // the alternative is telling the user it failed while it is still working.
+  const HANDOVER_TIMEOUT_MS = 300000;
+
+  async function waitForServer() {
+    const deadline = Date.now() + HANDOVER_TIMEOUT_MS;
+    // The old image is still answering for the grace period before it execs,
+    // so don't accept the very first reply as proof it came back.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch("/api/models", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          if (!data.loading) return data.current;
+        }
+      } catch {
+        // Not accepting yet — the exec is in flight, or the model is loading.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return null;
+  }
+
+  async function refreshModels(rescan) {
+    const res = await fetch(`/api/models${rescan ? "?rescan=true" : ""}`, { cache: "no-store" });
+    if (!res.ok) {
+      modelsNotice(`could not read the models directory (${res.status})`, "error");
+      return;
+    }
+    const data = await res.json();
+    const dir = [
+      data.models_dir,
+      data.disk_used_bytes != null ? `${formatBytes(data.disk_used_bytes)} used` : null,
+      data.disk_available_bytes != null ? `${formatBytes(data.disk_available_bytes)} free` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    modelsDirEl.textContent = dir;
+    modelsDirEl.title = data.models_dir;
+    // The Hub lookup runs on its own schedule (see refreshUpdateBadges), so
+    // its answer is merged onto whatever listing is current.
+    for (const model of data.models) {
+      model.refresh = modelsState.behind.has(model.nr);
+    }
+    renderCurrent(data.current, data.loading);
+    renderJob(data.job);
+    // `can_load`/`loading` change what a row's Load button does, so they
+    // are part of what the table is compared on, not just the rows.
+    const signature = JSON.stringify([data.models, data.can_load, data.loading ?? null]);
+    if (signature !== modelsState.tableSignature) {
+      modelsState.tableSignature = signature;
+      renderTable(data.models, data.can_load, data.loading);
+    }
+    // The topbar name follows the loaded model, so a handover is visible
+    // without reloading the page.
+    document.getElementById("model-name").textContent = data.current.display;
+  }
+
+  // `list`'s own `(Refresh)` marker. Once per panel opening rather than on
+  // every poll: it is one network round trip per distinct repo, and a repo
+  // does not gain a new revision while someone is looking at a table. A
+  // failure is silent — "unknown" is not "behind", the same rule
+  // `orangu-server list` follows.
+  async function refreshUpdateBadges() {
+    try {
+      const res = await fetch("/api/models/updates", { cache: "no-store" });
+      if (!res.ok) return;
+      const { behind } = await res.json();
+      modelsState.behind = new Set(behind || []);
+      if (modelsState.open) await refreshModels(false);
+    } catch {
+      // Offline, or the Hub is unreachable — leave every badge off.
+    }
+  }
+
+  // `model` is the row's NR (exact — see the load button above); `title` is
+  // what to call it on screen.
+  async function showMetadata(model, title) {
+    modelsState.metadata.model = model;
+    modelsState.metadata.title = title ?? modelsState.metadata.title;
+    modelsMetadataEl.hidden = false;
+    modelsMetadataTitle.textContent = modelsState.metadata.title;
+    modelsMetadataBody.textContent = "Loading…";
+    const params = new URLSearchParams({ model });
+    if (modelsState.metadata.tensors) params.set("tensors", "true");
+    if (modelsState.metadata.full) params.set("full", "true");
+    try {
+      const res = await fetch(`/api/models/metadata?${params}`, { cache: "no-store" });
+      const text = await res.text();
+      modelsState.metadata.text = res.ok ? text : "";
+      modelsMetadataBody.textContent = res.ok ? text : `Could not read it: ${text.trim()}`;
+      modelsMetadataBody.scrollTop = 0;
+    } catch (err) {
+      modelsMetadataBody.textContent = String(err);
+    }
+  }
+
+  function toggleMetadataOption(key, button) {
+    modelsState.metadata[key] = !modelsState.metadata[key];
+    button.setAttribute("aria-pressed", modelsState.metadata[key] ? "true" : "false");
+    button.classList.toggle("pressed", modelsState.metadata[key]);
+    if (modelsState.metadata.model) {
+      showMetadata(modelsState.metadata.model).catch((err) => console.error(err));
+    }
+  }
+
+  modelsMetadataTensorsBtn.addEventListener("click", () =>
+    toggleMetadataOption("tensors", modelsMetadataTensorsBtn),
+  );
+  modelsMetadataFullBtn.addEventListener("click", () =>
+    toggleMetadataOption("full", modelsMetadataFullBtn),
+  );
+  modelsMetadataSaveBtn.addEventListener("click", () => {
+    if (!modelsState.metadata.text) return;
+    const name = (modelsState.metadata.title || "model").replace(/[^\w.-]+/g, "-");
+    downloadTextFile(modelsState.metadata.text, `orangu-${name}-metadata`);
+  });
+  modelsMetadataCloseBtn.addEventListener("click", () => {
+    modelsMetadataEl.hidden = true;
+    modelsState.metadata.model = null;
+  });
+
+  modelsDownloadForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const repo = modelsDownloadInput.value.trim();
+    if (!repo) return;
+    modelsDownloadInput.value = "";
+    modelsAction(`Starting download of ${repo}`, () =>
+      fetch("/api/models/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo }),
+      }),
+    ).catch((err) => console.error(err));
+  });
+
+  function openModels() {
+    modelsState.open = true;
+    modelsOverlay.hidden = false;
+    modelsBtn.setAttribute("aria-expanded", "true");
+    modelsNotice("");
+    refreshModels(true).catch((err) => console.error(err));
+    refreshUpdateBadges().catch((err) => console.error(err));
+    modelsState.timer = setInterval(() => {
+      // `loadModel` drives its own polling across a handover, and every
+      // request in that window is expected to fail.
+      if (modelsState.handingOver) return;
+      refreshModels(false).catch((err) => console.error(err));
+    }, MODELS_POLL_MS);
+  }
+
+  function closeModels() {
+    modelsState.open = false;
+    modelsOverlay.hidden = true;
+    modelsBtn.setAttribute("aria-expanded", "false");
+    modelsMetadataEl.hidden = true;
+    modelsState.metadata.model = null;
+    if (modelsState.timer) {
+      clearInterval(modelsState.timer);
+      modelsState.timer = null;
+    }
+  }
+
+  modelsBtn.addEventListener("click", () => {
+    if (modelsOverlay.hidden) {
+      openModels();
+    } else {
+      closeModels();
+    }
+  });
+  modelsCloseBtn.addEventListener("click", closeModels);
+  modelsReloadBtn.addEventListener("click", () => {
+    modelsNotice("");
+    refreshModels(true).catch((err) => console.error(err));
+    refreshUpdateBadges().catch((err) => console.error(err));
+  });
+  // Clicking the backdrop closes; clicking inside the panel does not. Escape
+  // closes the metadata viewer first, if it's open, so one key doesn't throw
+  // away two levels at once.
+  modelsOverlay.addEventListener("click", (event) => {
+    if (event.target === modelsOverlay) closeModels();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || modelsOverlay.hidden) return;
+    if (!modelsMetadataEl.hidden) {
+      modelsMetadataEl.hidden = true;
+      modelsState.metadata.model = null;
+    } else {
+      closeModels();
+    }
+  });
+
   document.addEventListener("click", (event) => {
     if (
       !historyPanel.hidden &&

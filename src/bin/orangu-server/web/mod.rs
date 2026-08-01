@@ -23,6 +23,7 @@
 //! crates `orangu`'s own TUI uses for its terminal rendering.
 
 pub mod attachments;
+pub mod models;
 pub mod render;
 pub mod sessions;
 
@@ -177,6 +178,44 @@ pub struct WebState {
     /// server was rooted at.
     pub workspace: PathBuf,
     pub version: &'static str,
+    /// The `.gguf` this server loaded, and the directory the model manager
+    /// lists — see `web::models`, and `Prepared`'s own fields of the same
+    /// names for why the manager needs each.
+    pub model_path: PathBuf,
+    pub models_dir: PathBuf,
+    /// The model manager's one background-download slot, and the cached
+    /// models-directory scan its listing is served from.
+    pub jobs: Arc<models::ModelJobs>,
+    pub catalog: Arc<models::ModelCatalog>,
+    /// What the model manager's **Load** button needs to replace this
+    /// process with one serving a different model — see `crate::reexec`.
+    /// `None` when `[orangu-server].reexec` is off or the platform has no
+    /// `execve`, which is how the button knows to disable itself instead of
+    /// offering something that would only refuse.
+    pub handover: Option<Arc<crate::reexec::Handover>>,
+    /// The model a handover has been accepted for, once one has — see
+    /// `models::select`. Only ever goes from empty to set: this process is
+    /// about to be replaced, so there is nothing to reset it back to.
+    pub loading: std::sync::Mutex<Option<String>>,
+}
+
+impl WebState {
+    /// Claims this process's one handover for `label`, or `false` when
+    /// something already claimed it. One per process: there is only one
+    /// process to replace, and two racing `execve`s have no useful meaning.
+    pub fn arm_handover(&self, label: &str) -> bool {
+        let mut loading = self.loading.lock().unwrap();
+        if loading.is_some() {
+            return false;
+        }
+        *loading = Some(label.to_string());
+        true
+    }
+
+    /// The model this process is about to be replaced by, if any.
+    pub fn loading_model(&self) -> Option<String> {
+        self.loading.lock().unwrap().clone()
+    }
 }
 
 pub fn build_router(state: Arc<WebState>) -> Router {
@@ -192,6 +231,9 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/messages", post(send_message))
+        // The model manager: list, metadata, download, delete — on the same
+        // port as the chat UI.
+        .merge(models::router())
         // Attachments ride along as base64 in the message JSON, so the
         // default 2 MB body cap is far too small — allow room for a handful
         // of documents (base64 inflates bytes by ~4/3).

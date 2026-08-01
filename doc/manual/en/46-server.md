@@ -504,6 +504,7 @@ slots = 1
 web = 8101
 backend = auto
 role = all
+reexec = yes
 ```
 
 - `models` — the base directory a model spec resolves into: what `list`/
@@ -547,6 +548,15 @@ role = all
   is still tried behind it, for a Mac running MoltenVK. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
+- `reexec` — whether the web console's model manager may load a different
+  model (default `yes`; `no`/`true`/`false`/`on`/`off`/`1`/`0` are all
+  accepted). Loading one restarts this process on it, so a deployment that
+  needs the server it started to stay the server it started — behind a
+  supervisor, or where one specific model is the point of the process — sets
+  `no`, and the console disables its **Load** button accordingly. Ignored
+  where `web = 0` (nothing to disable) and on non-Unix platforms, which have
+  no `execve` and where the button is disabled regardless. See **Loading a
+  different model** below.
 - `role` — `all` (the default), `code`, `review`, `explorer`, or
   `embedding`. See **Roles** below. **Only consulted in `--daemon`
   mode** — same as `model`, and for the same reason: an attached-terminal
@@ -733,6 +743,133 @@ Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.
 
+## Model management
+
+The topbar's **Models** button opens a panel showing the models directory as
+`orangu-server list` prints it — the same numbered table, column for column:
+
+| | |
+| :-- | :-- |
+| `NR` | the row number, the same one `list` gives the same model |
+| `MODEL` | what to pass to `show`/`delete`/`refresh` on the command line |
+| `QUANT` | the quantization the file is stored at, `-` when it says nothing |
+| `SIZE` | summed across every shard |
+| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm-dsa)`, `No (llama, TQ1_0)` |
+
+Those strings come from the same code that prints them in the terminal, so
+the two tables cannot end up saying different things about the same file. A
+model this build cannot load is greyed, exactly as `list` greys it, and a
+file whose header wouldn't parse shows its `error:` in place of the last
+three columns — again as `list` does. The row this server actually loaded is
+tinted and marked **loaded**; a row whose Hugging Face repo has a newer
+revision is marked **Refresh**, `list`'s own marker (`orangu-server refresh`
+is what acts on it).
+
+Above the table sits the loaded model with its architecture, backend, layer
+count, context length, role and slot count, and the models directory with how
+much of its filesystem is used and free.
+
+Two icon buttons per row — hover either for what it does:
+
+| Icon | Tooltip | |
+| :-- | :-- | :-- |
+| play triangle | **Load ...** | serve this model instead — see below |
+| document | **Show ...** | this file's full GGUF metadata — `orangu-server show` |
+| waste basket | **Delete ...** | remove every shard — `orangu-server delete` |
+
+The loaded model's row shows a check mark where its **Load** button would
+be. **Delete** is disabled on it: its weights are memory-mapped by
+the running engine, so removing the file would leave this process reading
+something that no longer has a name. It asks for confirmation naming the
+model and its size, and reclaims the Hugging Face hub-cache blobs too when
+nothing else still references them.
+
+**Show** opens a scrolling pane with the file's metadata, and has two toggles
+of its own — **Include tensors** (`show --tensors`: every tensor's name,
+shape, type and offset) and **Expand truncated arrays** (`show --full`: every
+element, including a 100,000-entry vocabulary) — plus a **Save** button that
+downloads what is on screen as a text file.
+
+Above the table, a text box takes a `user/model:QUANT` Hugging Face repo and
+downloads it. Without `:QUANT` it prefers `Q4_K_M` then `Q8_0`, exactly as
+`orangu-server download` does. The download runs in the background — closing
+the panel, or the browser tab, does not stop it — and reports its progress
+per file, with an overall percentage and ETA, in the panel: the same numbers
+`download`'s own terminal progress board draws, as data rather than as
+in-place-updating text. One download runs at a time; starting a second while
+one is in flight is refused rather than queued, since two fetches into the
+same directory would compete for the same disk and the same free-space
+check. An interrupted one resumes from its `.part` file the next time it is
+asked for.
+
+**Rescan** (the circular arrow in the panel header) re-reads the models
+directory. The panel does not re-read it on its own: opening every GGUF
+header under a directory holding a few dozen models takes seconds, and
+nothing there changes by itself. A delete or a finished download refreshes
+the listing automatically; **Rescan** is for a `.gguf` that arrived some
+other way. The **Refresh** markers come from one Hugging Face request per
+distinct repo, made when the panel opens and when **Rescan** is pressed,
+never on the poll — an unreachable Hub marks nothing, since "unknown" is not
+"behind".
+
+### Loading a different model
+
+**Load** serves a different model without you going back to the terminal.
+It does that by **restarting the server on it** — the process replaces
+itself (`execve`) with a new one started on the chosen model, rather than
+swapping the model inside the running process. That is deliberate: the new
+model is loaded by exactly the same code that loads one at startup, so there
+is no second load path that could behave differently from a normal start.
+
+Three things survive the restart, which is what makes it a handover rather
+than a stop and start:
+
+- **The listening sockets.** Both are kept open across the restart and
+  picked back up by the new process, so neither port is ever unbound.
+  Nothing can take the port in between, and a client connecting during the
+  load simply waits rather than getting "connection refused". Measured on a
+  400-request probe across a live handover: every request answered, except
+  the single one already in flight at the moment of the switch.
+- **The process id.** `execve` replaces the program but keeps the pid, so
+  systemd, a `--daemon` launcher, or a shell job goes on tracking the same
+  process. A `--daemon` server stays detached.
+- **Everything on disk.** Chat history, downloaded models, saved slot
+  KV-caches.
+
+What does not survive is anything held only in memory. Requests in flight
+are cut off, which is why **Load** refuses while any slot is still
+generating — finish or stop the reply, then load. (A request that has
+arrived but has not yet been given a slot can still be caught by the switch;
+the window is small and the client simply retries.)
+
+The server keeps everything about itself that was not the model: the same
+**role**, workspace, host, ports, backend and slot count it was started
+with, whether they came from the command line, the config file, or an
+interactive prompt. Only the model changes.
+
+Before switching, the console checks what it can while the current model is
+still working — that the file resolves, and that its header names an
+architecture and quantization this build can read (the same judgement the
+`SUPPORTED` column reports). Some failures can only be found by actually
+loading: a GPU backend with no kernel for one of the model's tensor types,
+or a model too large for the machine. If that happens the server restarts
+once more on the model it was serving before, and the console says so
+rather than leaving you with a dead port.
+
+The switch is not written anywhere: restart the server and it comes back on
+whatever the command line or `model` in `orangu-server.conf` names. To make
+a choice permanent, set `model` in the config.
+
+Set `reexec = no` in `orangu-server.conf` to turn this off — the **Load**
+buttons are then disabled with a tooltip saying so, and the endpoint behind
+them refuses. It is also unavailable on non-Unix platforms, which have no
+`execve`.
+
+The whole panel is served on the `web` port, which is unauthenticated — like
+the rest of the web UI, and like the file-lifecycle API on the API port, it
+assumes a trusted network. A server reachable from an untrusted one should
+not have `web` enabled at all.
+
 ## Session management
 
 ```sh
@@ -857,6 +994,22 @@ compatible API above, and only reachable at all when `web` is configured:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses |
+| `GET /api/models` | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory |
+| `GET /api/models/updates` | which rows are behind their Hugging Face repo — `list`'s `(Refresh)` marker, one Hub request per distinct repo |
+| `GET /api/models/metadata?model=…` | a model's full GGUF metadata as plain text — `show`'s own output. `&tensors=true` and `&full=true` are `show --tensors`/`--full` |
+| `POST /api/models/select` | restarts the server on a different model, keeping both listening sockets and the pid; answers `202` before it acts, since `execve` leaves nothing to answer from |
+| `POST /api/models/download` | starts a Hugging Face download in the background, returning at once |
+| `DELETE /api/models` | deletes a model, refusing the one currently loaded |
+| `DELETE /api/models/job` | clears a finished download's result |
+
+The three that name a model take `{"model": "..."}` — an `NR`, a `MODEL`
+label, a bare filename, or a path, exactly as the matching subcommand's own
+argument does. The panel sends the `NR`, since that is the only spelling
+that names one row exactly (a repo with several quantizations on disk prints
+the same bare `MODEL` on each of their rows), and for a load or a delete it
+also sends the `path` that row showed. Given both, the server checks they
+still agree before acting: an `NR` is a *position*, and a download finishing
+while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
 

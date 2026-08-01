@@ -553,6 +553,367 @@ button:disabled {
   outline-offset: 1px;
 }
 
+/* ------------------------------------------------------------- models --
+   The model manager (index.html's #models-overlay, driven by app.js): a
+   modal over the whole app, not a dropdown like #history-panel — it owns
+   irreversible actions and a download that runs for minutes, so it stays
+   put until it is closed deliberately. */
+
+#models-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+/* Same specificity trap as #attach-menu — `display: flex` above would
+   otherwise beat the UA `[hidden]` rule and pin the modal open. */
+#models-overlay[hidden] {
+  display: none;
+}
+
+/* While an action is in flight the panel keeps its layout but stops taking
+   clicks, so a double-click can't fire a delete twice. */
+#models-overlay.busy #models-panel {
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+#models-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(920px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+#models-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#models-title {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+/* Secondary text throughout the panel: paths, byte counts, per-file
+   progress. */
+.models-subtle {
+  color: var(--text-dim);
+  font-size: 0.82em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#models-dir {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The panel's own chrome buttons and each row's actions: borderless until
+   hovered, so a row of six icons doesn't read as six boxes. */
+.subtle-btn,
+.row-btn {
+  width: 30px;
+  height: 30px;
+  border-color: transparent;
+  background: none;
+  color: var(--text-dim);
+}
+
+.subtle-btn:hover:not(:disabled),
+.row-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-input);
+  border-color: var(--border);
+}
+
+.row-btn svg,
+.subtle-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.row-btn.danger:hover:not(:disabled) {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+/* A metadata toggle that is currently on. */
+.subtle-btn.pressed {
+  color: var(--text);
+  background: var(--bg-input);
+  border-color: var(--accent);
+}
+
+#models-current {
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.models-current-name {
+  font-weight: 600;
+}
+
+/* Shown under the current model while the server is replacing itself with a
+   different one (see loadModel in app.js). */
+.models-loading {
+  margin-top: 6px;
+  color: var(--accent);
+  font-size: 0.85em;
+}
+
+/* The loaded-model marker is a disabled button (nothing to click — it is
+   already loaded), so it has to opt out of the generic disabled dimming to
+   stay legible as a state indicator. */
+.row-btn.is-loaded:disabled {
+  opacity: 1;
+  color: var(--accent);
+}
+
+#models-download-form {
+  display: flex;
+  gap: 8px;
+}
+
+#models-download-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+#models-download-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.models-notice {
+  padding: 8px 12px;
+  font-size: 0.88em;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.models-notice.error {
+  color: var(--error);
+  border-color: var(--error);
+  /* Server errors are full `anyhow` chains — let them wrap and scroll
+     rather than clipping the one line that names the cause. */
+  white-space: pre-wrap;
+  max-height: 8em;
+  overflow-y: auto;
+}
+
+#models-notice[hidden],
+#models-job[hidden],
+#models-metadata[hidden] {
+  display: none;
+}
+
+#models-job {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.88em;
+}
+
+.models-job-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.models-job-header > span:first-child {
+  font-weight: 600;
+}
+
+.models-job-header > :nth-child(2) {
+  margin-left: auto;
+}
+
+.models-job-failed {
+  color: var(--error);
+  white-space: pre-wrap;
+}
+
+.models-progress {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.models-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s linear;
+}
+
+.models-job-file {
+  display: flex;
+  gap: 10px;
+  font-size: 0.9em;
+}
+
+.models-job-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#models-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+
+#models-table th {
+  text-align: left;
+  /* The CLI's own column names, so the two tables read as the same table. */
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 0.85em;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+#models-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+#models-table tr:last-child td {
+  border-bottom: none;
+}
+
+#models-table tr.loaded {
+  background: var(--user-bubble);
+}
+
+/* A model this build can't load stays listed — its metadata is still worth
+   reading, and it is still deletable — but reads as the lesser row, matching
+   `orangu-server list`'s own dimming of the same rows. */
+#models-table tr.unsupported td {
+  opacity: 0.55;
+}
+
+#models-table th.num,
+#models-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.models-label {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.models-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 0.75em;
+  color: var(--accent-text);
+  background: var(--accent);
+  border-radius: 999px;
+  /* The row itself may be dimmed (`tr.unsupported`); a badge on it is the
+     one thing there that still has to be read. */
+  opacity: 1;
+}
+
+/* An unreadable file's `error:` cell, which replaces QUANT/SIZE/SUPPORTED
+   exactly as `orangu-server list` replaces those columns. */
+.models-row-error {
+  color: var(--error);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 0;
+}
+
+.models-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.models-empty {
+  padding: 16px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+#models-metadata {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+#models-metadata-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#models-metadata-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#models-metadata-body {
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  line-height: 1.45;
+  background: var(--bg-input);
+  border-radius: 8px;
+  /* GGUF metadata lines (a chat template, a 100k-token vocabulary preview)
+     run far past any panel width — scroll them rather than reflowing, so the
+     `key = value` alignment `format_show` produces survives. */
+  white-space: pre;
+}
+
 #footer {
   display: flex;
   align-items: center;

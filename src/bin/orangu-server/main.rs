@@ -36,6 +36,7 @@ mod http;
 mod init;
 mod panic_capture;
 mod prune;
+mod reexec;
 mod refresh;
 mod shell;
 mod suggest;
@@ -326,6 +327,11 @@ fn main() -> ExitCode {
     // concurrently.
     unsafe {
         std::env::set_var("RUST_BACKTRACE", "1");
+        // Same window, same reason: `reexec` reads the two variables a
+        // handover sets and takes them back out of the environment, so
+        // nothing later — a child process, a second handover — can act on a
+        // stale value. Everything afterwards reads the parsed results.
+        reexec::take_inherited();
     }
 
     let mut args = Args::parse();
@@ -374,10 +380,36 @@ fn main() -> ExitCode {
         .then(|| TerminalTitleGuard::new(TERMINAL_TITLE))
         .flatten();
 
+    // `config`/`workspace` are needed again below if this start fails and a
+    // fallback has to be exec'd, and `prepare` consumes `args`.
+    let config_arg = args.config.clone();
+    let workspace_arg = args.workspace.clone();
+    let role_arg = args.role().unwrap_or_default();
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
         Err(err) => {
             eprintln!("error: {err:#}");
+            // This image was exec'd by a handover whose model has just
+            // turned out not to load — a GPU backend with no kernel for one
+            // of its tensor types, a model too large for the machine, or
+            // anything else only a real load can discover. Go back to the
+            // model that *was* working rather than leaving the pid dead with
+            // its port still bound.
+            if let Some(fallback) = reexec::fallback_model() {
+                eprintln!("falling back to '{fallback}'");
+                match reexec::Handover::new(
+                    config_arg,
+                    workspace_arg.unwrap_or_else(|| PathBuf::from(".")),
+                    role_arg,
+                    fallback.to_string(),
+                    reexec::inherited(),
+                ) {
+                    // `None` as the fallback of the fallback: one retry, so a
+                    // pair of models that both fail can't loop forever.
+                    Ok(handover) => eprintln!("error: {:#}", handover.exec(fallback, None)),
+                    Err(err) => eprintln!("error: {err:#}"),
+                }
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -415,6 +447,23 @@ struct Prepared {
     quantization: Option<String>,
     architecture: String,
     backend_label: String,
+    /// The `.gguf` this server loaded — the first shard, for a multi-part
+    /// model. The web UI's model manager marks this row as the loaded one,
+    /// and refuses to delete it: the weights are mapped by the running
+    /// engine, so removing the file would leave this process reading
+    /// something that no longer has a name.
+    model_path: PathBuf,
+    /// `[orangu-server].models`, the directory the model manager lists,
+    /// downloads into and deletes from.
+    models_dir: PathBuf,
+    /// `--config` as given, or `None` when the default search found it —
+    /// see [`reexec::Handover`], which has to reproduce the same choice.
+    config_path: Option<PathBuf>,
+    /// The role this process actually resolved to, flag or prompt.
+    role: config::Role,
+    /// `[orangu-server].reexec`: whether the web console may load a
+    /// different model into this server.
+    reexec: bool,
     /// The GPU kernel/tuning selection this device came up with, and its
     /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
     /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
@@ -445,6 +494,7 @@ struct Prepared {
 /// with its stdout/stderr redirected to `/dev/null`.
 fn prepare(args: Args) -> Result<Prepared> {
     let cli_role = args.role();
+    let config_path = args.config.clone();
     let conf = load_config(args.config, cli_role, args.daemon)?;
     let mut role = conf.role;
     let workspace = resolve_workspace(args.workspace.clone())?;
@@ -630,18 +680,26 @@ fn prepare(args: Args) -> Result<Prepared> {
     // `all` (the default) and its `*` alias become `0.0.0.0` here — see
     // `config::resolve_bind_host`; every other value is a literal address
     // `bind` gets as written.
+    // Bound here, *after* the model is loaded, which is what lets a failed
+    // handover fall back: the overwhelmingly common failure — this model
+    // cannot be loaded — happens above, with the descriptors handed over by
+    // the previous image still untouched and ready to be passed on again.
+    //
+    // `adopt_or_bind`, not `bind`: on a handover these sockets are already
+    // listening and were kept open across the exec, so the port is never
+    // released and nothing can take it in between. On an ordinary start
+    // there is nothing to adopt and it binds.
+    let inherited = reexec::inherited();
     let bind_host = config::resolve_bind_host(&conf.host);
     let api_addr = format!("{bind_host}:{}", conf.port);
-    let api_listener = std::net::TcpListener::bind(&api_addr)
-        .with_context(|| format!("failed to bind {api_addr}"))?;
+    let api_listener = reexec::adopt_or_bind(inherited.api, &api_addr)?;
     api_listener
         .set_nonblocking(true)
         .with_context(|| format!("failed to configure listener on {api_addr}"))?;
 
     let web_listener = if conf.web != 0 {
         let web_addr = format!("{bind_host}:{}", conf.web);
-        let listener = std::net::TcpListener::bind(&web_addr)
-            .with_context(|| format!("failed to bind web UI to {web_addr}"))?;
+        let listener = reexec::adopt_or_bind(inherited.web, &web_addr)?;
         listener
             .set_nonblocking(true)
             .with_context(|| format!("failed to configure web UI listener on {web_addr}"))?;
@@ -660,6 +718,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         quantization,
         architecture,
         backend_label,
+        model_path: path,
+        models_dir: conf.models,
+        config_path,
+        role,
+        reexec: conf.reexec,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -723,6 +786,22 @@ fn daemonize() -> Result<()> {
     Err(anyhow!("--daemon is only supported on Unix-like platforms"))
 }
 
+/// A bound listener's raw descriptor, for [`reexec::Handover`]. Zero on a
+/// platform with no descriptors — where `Handover` is never built anyway,
+/// since [`reexec::supported`] is `false` there.
+fn listener_fd(listener: &tokio::net::TcpListener) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        listener.as_raw_fd()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listener;
+        0
+    }
+}
+
 async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
         engine,
@@ -730,6 +809,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
         quantization,
         architecture,
         backend_label,
+        model_path,
+        models_dir,
+        config_path,
+        role,
+        reexec: reexec_allowed,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -808,13 +892,51 @@ async fn serve(prepared: Prepared) -> Result<()> {
     }
 
     if let Some(web_listener) = web_listener {
+        // Captured here because this is the last point where both listeners
+        // and every resolved setting are in hand at once. Raw descriptor
+        // numbers only — the listeners themselves are about to be moved into
+        // `axum::serve` and stay open for the life of the process, which is
+        // exactly as long as a handover could need them.
+        //
+        // `None` when the config turned it off, or on a platform with no
+        // `execve`; the model manager reads that and disables its Load
+        // button rather than offering something that would only refuse.
+        let handover = (reexec_allowed && reexec::supported())
+            .then(|| {
+                reexec::Handover::new(
+                    config_path,
+                    workspace.clone(),
+                    role,
+                    model_label.clone(),
+                    reexec::InheritedFds {
+                        api: Some(listener_fd(&listener)),
+                        web: Some(listener_fd(&web_listener)),
+                    },
+                )
+                .map(Arc::new)
+                .map_err(|err| {
+                    if !daemon {
+                        println!(
+                            "Note       model loading from the web console is unavailable: {err:#}"
+                        );
+                    }
+                })
+                .ok()
+            })
+            .flatten();
         let web_state = Arc::new(web::WebState {
             engine,
             model_display,
             architecture,
             backend_label,
+            model_path,
+            models_dir,
             workspace,
             version: VERSION,
+            jobs: Default::default(),
+            catalog: Default::default(),
+            handover,
+            loading: Default::default(),
         });
         let web_app = web::build_router(web_state);
         // Not joined: when `serve` returns (any shutdown path below), the
@@ -1170,7 +1292,7 @@ pub(crate) fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
-fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {
+pub(crate) fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String {
     let preview_limit = if full {
         usize::MAX
     } else {

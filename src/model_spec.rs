@@ -186,6 +186,68 @@ pub fn resolve_or_fetch_model(models_dir: &Path, requested: &str) -> Result<Path
         .with_context(|| format!("'{requested}' was not found locally and could not be fetched"))
 }
 
+/// Resolves what a *load* was given — a path, a bare name, an `NR`, or a
+/// `MODEL` label — to the file to open **and** the spec that should stand as
+/// the loaded model's id.
+///
+/// The second half is why this exists rather than [`resolve_or_fetch_model`]
+/// alone. A caller that names a model by `NR` (the web console's model
+/// manager clicks a row, and a row is a position) would otherwise end up
+/// with `"7"` as the model id every response's `model` field reports, the
+/// slot-store fingerprint is built from, and — since loading a model
+/// re-executes the server with that spec in `argv` — the process is
+/// restarted on. A number that means nothing outside the listing it came
+/// from, and a different model as soon as one is added. Taking the resolved
+/// group's own `MODEL` label instead gives the same id a
+/// `orangu-server <repo>` start would have produced for the same file.
+///
+/// A spec that names nothing on disk falls through to
+/// [`resolve_or_fetch_model`] — a Hugging Face repo to fetch first — and
+/// keeps the spec as written, exactly as the CLI does.
+pub fn resolve_load_target(models_dir: &Path, requested: &str) -> Result<(PathBuf, String)> {
+    let Ok(group) = resolve_delete_target(models_dir, requested) else {
+        return Ok((
+            resolve_or_fetch_model(models_dir, requested)?,
+            requested.to_string(),
+        ));
+    };
+
+    // The bare `MODEL` label is the right id whenever it is unambiguous —
+    // it is exactly what a `orangu-server <repo>` start would have produced
+    // for this file. It is *not* unambiguous when a repo has more than one
+    // quantization on disk: those rows all print the same bare label, and
+    // resolving it takes whichever comes first. Handing that back would
+    // resolve row 4 to row 3's file, which for a caller that is about to
+    // restart the server on it means silently loading a different model
+    // than the one asked for.
+    //
+    // So disambiguate, but only then: `<repo>:<quant>` is a spelling
+    // `ModelGroup::matches_label` already accepts, so it resolves straight
+    // back to this exact group.
+    let label = match ambiguous_label(models_dir, &group) {
+        true => group
+            .quantization
+            .as_ref()
+            .and_then(|quant| group.hf_repo.as_ref().map(|repo| format!("{repo}:{quant}")))
+            .unwrap_or(group.label),
+        false => group.label,
+    };
+    Ok((group.representative_path, label))
+}
+
+/// Whether more than one model under `models_dir` answers to `group`'s own
+/// `MODEL` label — two quantizations of one repo, most commonly.
+fn ambiguous_label(models_dir: &Path, group: &ModelGroup) -> bool {
+    let Ok(models) = scan_models_dir(models_dir) else {
+        return false;
+    };
+    group_models(&models)
+        .iter()
+        .filter(|other| other.matches_label(&group.label))
+        .count()
+        > 1
+}
+
 /// Resolves whatever `delete` was given to a full [`ModelGroup`] — every
 /// shard, not just one file — so a multi-shard model is always deleted
 /// atomically regardless of which shard's path happened to be named.
@@ -844,8 +906,10 @@ impl ModelSupport {
 
     /// The `SUPPORTED` cell text, e.g. `Yes (llama)`, `No (glm-dsa)`, or
     /// `No (llama, TQ1_0)` when the architecture is fine but a tensor type
-    /// isn't.
-    fn cell(&self) -> String {
+    /// isn't. Public because the web console's model manager draws the same
+    /// column, and drawing it from the same function is what keeps the two
+    /// from ever disagreeing about the same file.
+    pub fn cell(&self) -> String {
         let arch = self.architecture.as_deref().unwrap_or("unknown");
         match (&self.unsupported_quant, self.supported) {
             (Some(quant), true) => format!("No ({arch}, {quant})"),
@@ -1224,6 +1288,111 @@ mod tests {
 
         let err = resolve_show_target(dir.path(), "no/such-model:Q4_K_M").unwrap_err();
         assert!(err.to_string().contains("was not found"), "{err}");
+    }
+
+    /// The web console's model manager names a row by its `NR` — a
+    /// *position*, useless as a model id, and worse still as the `argv` the
+    /// server is about to be re-executed with. `resolve_load_target` turns
+    /// it back into the same `MODEL` label a `orangu-server <repo>` start
+    /// would have produced for the same file.
+    #[test]
+    fn resolve_load_target_labels_an_nr_with_the_models_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hub_cache_gguf(
+            dir.path(),
+            "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            "rev1",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        );
+
+        let (path, label) = resolve_load_target(dir.path(), "1").unwrap();
+
+        assert_eq!(label, "bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert!(
+            path.ends_with("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "{path:?}"
+        );
+        // And the label it produced resolves back to the same file — which
+        // is what the re-executed process will have to do with it.
+        assert_eq!(resolve_load_target(dir.path(), &label).unwrap().0, path);
+    }
+
+    /// An `NR` names one row exactly — including which quantization of a repo
+    /// that has several on disk, where the bare `MODEL` label they all share
+    /// would take whichever came first.
+    #[test]
+    fn resolve_load_target_picks_the_exact_row_an_nr_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = "bartowski/Llama-3.2-3B-Instruct-GGUF";
+        write_hub_cache_gguf(dir.path(), repo, "rev1", "Llama-3.2-3B-Instruct-IQ3_M.gguf");
+        write_hub_cache_gguf(
+            dir.path(),
+            repo,
+            "rev1",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        );
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 2, "both quantizations should be listed");
+
+        for (index, group) in groups.iter().enumerate() {
+            let (path, _) = resolve_load_target(dir.path(), &(index + 1).to_string()).unwrap();
+            assert_eq!(path, group.representative_path);
+        }
+    }
+
+    /// Two quantizations of one repo print the same bare `MODEL`, so that
+    /// label resolves to whichever comes first. A caller about to *restart
+    /// the server* on the label it is handed back must not be given one that
+    /// resolves to a different file than the row it asked for.
+    #[test]
+    fn resolve_load_target_disambiguates_a_label_two_rows_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = "bartowski/Llama-3.2-3B-Instruct-GGUF";
+        write_hub_cache_gguf(dir.path(), repo, "rev1", "Llama-3.2-3B-Instruct-IQ3_M.gguf");
+        write_hub_cache_gguf(
+            dir.path(),
+            repo,
+            "rev1",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        );
+
+        // Every row's label must resolve back to that row's own file.
+        for nr in ["1", "2"] {
+            let (path, label) = resolve_load_target(dir.path(), nr).unwrap();
+            assert!(
+                label.contains(':'),
+                "NR {nr} needs a quant to be unambiguous: {label}"
+            );
+            assert_eq!(
+                resolve_load_target(dir.path(), &label).unwrap().0,
+                path,
+                "'{label}' must resolve back to the file NR {nr} named"
+            );
+        }
+
+        // And the two rows must not collapse onto the same file.
+        assert_ne!(
+            resolve_load_target(dir.path(), "1").unwrap().0,
+            resolve_load_target(dir.path(), "2").unwrap().0
+        );
+    }
+
+    /// A spec naming nothing on disk is left exactly as written — it is a
+    /// repo to fetch, and the fetch is what decides whether it exists.
+    #[test]
+    fn resolve_load_target_keeps_an_unknown_spec_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("a.gguf"), "llama", None);
+
+        // No network in a test, so this can only fail — but it must fail as a
+        // *download* of the spec as typed, not by resolving it to the one
+        // model that happens to be here.
+        let err = resolve_load_target(dir.path(), "no/such-repo:Q4_K_M").unwrap_err();
+        assert!(
+            err.to_string().contains("no/such-repo:Q4_K_M"),
+            "should have tried to fetch the spec as written: {err:#}"
+        );
     }
 
     #[test]

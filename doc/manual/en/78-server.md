@@ -31,6 +31,10 @@ dependency on llama.cpp/ggml's own compiled code.
   `orangu::workspaces::resolve_workspace_root` that `orangu`'s own
   `-w`/`--workspace` uses), and process wiring
   (Ctrl+C/`SIGINT`/`--daemon`).
+- `reexec.rs` — replacing this process with one serving a different model,
+  for the web console's **Load** button: descriptor hand-over, `argv`
+  reconstruction, the header pre-check, and the one-shot fallback. See
+  below.
 - `refresh.rs` — `refresh`'s own CLI logic: the confirmation, the
   delete-then-download ordering, and the interactive picker that greys
   every already-current row; see below.
@@ -66,10 +70,12 @@ dependency on llama.cpp/ggml's own compiled code.
 - `engine/scheduler.rs`, `engine/generate.rs`, `engine/batch.rs` — the
   multi-slot request scheduler and continuous-batching machinery.
 - `http/{mod,openai,native}.rs` — the HTTP surface.
-- `web/{mod,render,sessions}.rs` — the built-in chat UI. `sessions.rs` also
-  owns the `session.json` activity marker (`mark_active`/`is_active`) and
-  the prune-facing listing/sweep (`list_sessions_for_prune`/
-  `sweep_empty_sessions`/`delete_session_dir`) `prune.rs` calls into.
+- `web/{mod,render,sessions,models,attachments}.rs` — the built-in chat UI.
+  `sessions.rs` also owns the `session.json` activity marker
+  (`mark_active`/`is_active`) and the prune-facing listing/sweep
+  (`list_sessions_for_prune`/`sweep_empty_sessions`/`delete_session_dir`)
+  `prune.rs` calls into. `models.rs` is the model manager's own HTTP
+  surface; see below.
 
 The GGUF-inventory subcommands lean on library modules shared with the rest
 of the workspace rather than binary-local ones: `orangu::gguf` (the GGUF
@@ -1445,11 +1451,11 @@ with a clear message if its variable is unset when the test is run
 ### HTTP layer and web UI
 
 `http::mod` assembles the router and shared `AppState` (model, scheduler
-handle, config, workspace root, start time); `http::openai` and `http::native` hold the
-OpenAI-compatible and native handlers respectively; `http::files` holds the
-file-lifecycle API (see the next section); `/v1/shutdown`
-lives in `http::mod` itself since it's neither. Ctrl+C, `SIGINT`, and
-`POST /v1/shutdown` all converge on the same shutdown path via
+handle, config, workspace root, start time); `http::openai` and
+`http::native` hold the OpenAI-compatible and native handlers respectively;
+`http::files` holds the file-lifecycle API (see the next section);
+`/v1/shutdown` lives in `http::mod` itself since it's neither. Ctrl+C,
+`SIGINT`, and `POST /v1/shutdown` all converge on the same shutdown path via
 `tokio::select!`, mirroring `orangu-coordinator`'s own pattern.
 
 `web::mod` serves a small server-rendered chat UI (vanilla HTML/CSS/JS, no
@@ -1458,6 +1464,141 @@ the API so a chat turn never makes an HTTP hop. `web::render` renders
 markdown to HTML (including syntax-highlighted code blocks) with the same
 `markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
+`web::models` is the model manager (below).
+
+### Loading a different model (`reexec.rs`)
+
+`POST /api/models/select` does not swap the model inside the process. It
+`execve`s this binary again with the new model in `argv`, which means the
+model is loaded by `main::prepare` — the code that already runs at startup —
+and there is never a second load path to keep in step with it. Three
+properties turn that from a restart into a handover:
+
+**The listening sockets survive.** Rust opens every socket `SOCK_CLOEXEC`,
+so `Handover::exec` clears `FD_CLOEXEC` on both listeners before the exec and
+names their descriptors to the new image in `ORANGU_INHERIT_FDS`
+(`api:<fd>[,web:<fd>]`). `prepare` calls `reexec::adopt_or_bind` instead of
+`TcpListener::bind`: given a descriptor it verifies still open (`F_GETFD`,
+so a number recycled after a failed handover can't be adopted by mistake) it
+takes it, otherwise it binds. The port is therefore never released — a client
+connecting mid-load is queued in the listen backlog rather than refused. A
+400-request probe across a live handover saw every request answered but the
+single one already in flight.
+
+**The process identity survives.** `execve` keeps the pid, so a supervisor
+goes on watching the same process, and a `--daemon` server inherits its own
+already-detached session. `Handover::argv` therefore deliberately omits
+`--daemon`: passing it again would fork a second time and orphan the pid
+being watched.
+
+`argv` is rebuilt from what this process *resolved*, not from what it was
+given: the workspace as an absolute path (a `--daemon` process has since
+moved to `/`) and the role as an explicit flag (it may have been answered at
+an interactive prompt). `--config` is passed only if it was passed to this
+process, so a server that found its config by the default search makes the
+new image repeat that search rather than pinning a path it never chose.
+
+**A failed load falls back.** `FALLBACK_MODEL_VAR` carries the previous
+model spec; if the new image's `prepare` fails, `main` execs once more with
+it and *without* the variable, which is what bounds the retry to one. This
+matters because the pre-check cannot be exhaustive: `reexec::precheck` reads
+the header and applies the same judgement as the `SUPPORTED` column
+(architecture resolvable, every tensor type decodable), but a GPU backend
+with no kernel for one of those types, or a model too large for the machine,
+can only be found by loading it. `prepare` binds its listeners *after*
+loading the model precisely so that case leaves the inherited descriptors
+untouched for the fallback to hand on again.
+
+Both environment variables are read once, at the very top of `main`, by
+`reexec::take_inherited`, which also removes them — the same
+only-thread-that-exists-yet window that makes `main`'s own
+`set_var("RUST_BACKTRACE", ...)` sound. Nothing afterwards reads the
+environment for them, so a stale value can't reach a child process or a
+second handover.
+
+`select` answers `202` and arms the handover on a 300 ms timer, because
+`execve` leaves no "after" to answer from. The timer is best-effort UX, not
+correctness: a client whose connection is reset instead of receiving the
+`202` is looking at the same event, and its next poll lands on the new image
+either way. `WebState::arm_handover` allows one per process — there is only
+one process to replace.
+
+`[orangu-server].reexec` (default `true`) and `reexec::supported()`
+(`cfg!(unix)`) gate the whole thing. When either is false `serve` builds no
+`Handover`, `GET /api/models` reports `can_load: false`, and the panel
+disables its Load buttons rather than offering something that would only
+refuse.
+
+### Model manager (`web::models`)
+
+Served on the **web port**: `orangu-server list` as the view, plus `show`,
+`download` and `delete` as the things that can be done from it. Each endpoint
+calls the same shared code the matching subcommand does — `orangu::model_spec`
+for the scan, grouping and delete, `crate::format_show` for the metadata
+dump, `orangu::model_download` for the fetch — rather than a second
+implementation that could drift from it.
+
+That extends to the table itself. `ModelView` is one row of `list`, column
+for column, and carries the **strings the CLI would print**, not the raw
+numbers: `quant` already fell back to `-`, `size` has been through
+`format_bytes`, and `supported` is `ModelSupport::cell` verbatim (`Yes
+(llama)`, `No (llama, TQ1_0)`) — which is why that method is `pub`. The
+client only decides layout. A row this build can't load is greyed, an
+unreadable file's `error:` replaces its last three cells, and a repo behind
+its Hub revision is marked, all exactly as `format_groups` does the same
+three things.
+
+Two things shape the module beyond that:
+
+**The download runs detached.** It takes minutes to hours, so `POST` starts a
+`Job` on a blocking thread and returns `202` immediately; the panel polls
+`GET /api/models` for its progress. `ModelJobs` holds one job slot — a second
+`POST` while one runs is refused with the name of the one holding it, since
+two fetches into one models directory would compete for the same disk and the
+same free-space check. A *finished* job doesn't hold the slot but stays
+readable, so a completed download's result survives a page refresh;
+`DELETE /api/models/job` clears it. There is no cancel: the worker is
+detached precisely so a closed browser tab doesn't abandon a download
+part-way.
+
+Progress comes from `orangu::model_download::DownloadProgress`, a sink the
+existing `ProgressBoard` publishes into. Passing one also turns *all* of the
+board's printing off, interactive and logged alike: a running server has no
+terminal to draw an in-place-updating block on, and the per-file log lines
+would go somewhere nobody is watching.
+
+**The listing is cached, not re-scanned per request.** `GET /api/models`
+costs a `scan_models_dir` plus a `model_support` pass, which between them open
+every GGUF header under the directory *and* every shard of every group —
+seconds on a directory holding a few dozen models. The panel polls once a
+second for download progress, and that progress is in memory, so
+`ModelCatalog` serves a cached scan and only rebuilds on `?rescan=true` (the
+panel opening, its **Rescan** button) or after `invalidate()` (a delete, a
+finished download). Which row is `loaded` is *not* cached — that is about this
+process, not about the directory, so it is decided per request against
+`WebState::model_path`.
+
+Three things are refused rather than attempted:
+
+- **Loading a model while a slot is generating.** The exec would cut the
+  reply off mid-stream. Not airtight and cannot be — a request that has
+  arrived but not yet acquired its slot isn't `busy` yet — but closing that
+  window would mean a barrier between accepting requests and running them,
+  for a button a person presses.
+- **Deleting the loaded model.** Its weights are mapped by the running
+  engine; removing the file leaves this process reading something with no
+  name and the next request generating from whatever the kernel still has
+  cached. `WebState` carries `model_path` for exactly this check (and to mark
+  the row).
+- **Deleting a row number that no longer means what the caller saw.** The
+  panel sends the `path` its listing showed alongside the `NR`, and
+  `ModelRequest::check_still_matches` compares them before anything is
+  removed — an `NR` is a position, and a download finishing while a
+  confirmation dialog is open re-sorts the listing underneath it.
+
+These endpoints are neither authenticated nor loopback-restricted, matching
+the rest of the `web` port and the file-lifecycle API on the API port: the
+whole server assumes a trusted network.
 
 ### File-lifecycle API (`http::files`)
 

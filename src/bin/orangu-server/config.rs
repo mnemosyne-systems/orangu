@@ -183,6 +183,29 @@ pub fn default_backend() -> BackendPreference {
     BackendPreference::Auto
 }
 
+/// Whether the web console may load a different model — see
+/// [`ServerConfiguration::reexec`]. On by default: the console is already
+/// trusted with deleting models, and changing which one is served is the
+/// less destructive of the two.
+pub fn default_reexec() -> bool {
+    true
+}
+
+/// Parses a `yes`/`no`/`true`/`false`/`on`/`off`/`1`/`0` config value.
+/// Every spelling a person might reasonably write for a switch, rather than
+/// only the two Rust's own `bool` parser accepts — this is a hand-edited
+/// `.ini`, not a serialized struct.
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_lowercase().as_str() {
+        "yes" | "true" | "on" | "1" => Ok(true),
+        "no" | "false" | "off" | "0" => Ok(false),
+        other => Err(anyhow!(
+            "invalid value for [{SERVER_SECTION}].{key}: '{other}' \
+             (expected yes/no, true/false, on/off, or 1/0)"
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfiguration {
     /// Directory a model spec is resolved against (and downloaded into, if
@@ -206,6 +229,15 @@ pub struct ServerConfiguration {
     /// where there is no attached terminal to pass a CLI argument to or
     /// prompt on interactively; ignored otherwise.
     pub model: Option<String>,
+    /// Whether the web console's model manager may load a different model
+    /// into this server. `true` (the default) lets it; `false` disables the
+    /// panel's Load button and makes the endpoint behind it refuse.
+    ///
+    /// Loading a model re-executes this process (see `main::reexec`), which
+    /// is exactly what makes it worth a switch: a deployment behind a
+    /// supervisor, or one where a specific model is the point of the
+    /// process, wants the server it started to stay the server it started.
+    pub reexec: bool,
     /// The resolved [`Role`] — whichever CLI flag (`--all`/`--code`/
     /// `--review`/`--explorer`/`--embedding`) was passed to
     /// [`load_server_configuration`]; or, in `--daemon` mode only (same
@@ -316,6 +348,11 @@ pub fn load_server_configuration(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
+    let reexec = match section.get("reexec") {
+        Some(value) => parse_bool("reexec", value)?,
+        None => default_reexec(),
+    };
+
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "auto" => BackendPreference::Auto,
@@ -344,6 +381,7 @@ pub fn load_server_configuration(
         slots,
         web,
         backend,
+        reexec,
     })
 }
 
@@ -367,6 +405,53 @@ mod tests {
         assert_eq!(conf.model, None);
         assert_eq!(conf.backend, BackendPreference::Auto);
         assert_eq!(conf.role, Role::All);
+        // On by default: the web console is already trusted with deleting a
+        // model, and changing which one is served is the milder of the two.
+        assert!(conf.reexec);
+    }
+
+    /// A hand-edited `.ini` gets every spelling of a switch a person might
+    /// reasonably write, not only the two Rust's `bool` parser accepts.
+    #[test]
+    fn parses_every_reexec_spelling() {
+        for (value, expected) in [
+            ("yes", true),
+            ("YES", true),
+            ("true", true),
+            ("on", true),
+            ("1", true),
+            ("no", false),
+            ("No", false),
+            ("false", false),
+            ("off", false),
+            ("0", false),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\nreexec = {value}\n"
+            )
+            .unwrap();
+
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.reexec, expected, "reexec = {value}");
+        }
+    }
+
+    /// A misspelling must not quietly read as "off" — that would silently
+    /// take away a button the config was trying to keep.
+    #[test]
+    fn rejects_an_invalid_reexec_value() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nreexec = maybe\n"
+        )
+        .unwrap();
+
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("reexec"), "{err}");
+        assert!(err.to_string().contains("maybe"), "{err}");
     }
 
     #[test]

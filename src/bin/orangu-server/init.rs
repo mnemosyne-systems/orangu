@@ -15,7 +15,9 @@
 
 //! Interactive `--init` flow that writes `~/.orangu/orangu-server.conf`.
 
-use crate::config::{HOST_ALL, HOST_ALL_ALIAS, Role, default_host, default_port, default_web};
+use crate::config::{
+    HOST_ALL, HOST_ALL_ALIAS, Role, default_host, default_port, default_reexec, default_web,
+};
 use anyhow::{Context, Result, anyhow};
 use rustyline::{
     Config, Context as RlContext, Editor, Helper,
@@ -53,6 +55,17 @@ pub fn run_init() -> Result<()> {
     let host = prompt_host(&default_host())?;
     let port = prompt_line("port", &default_port().to_string())?;
     let web = prompt_line("web", &default_web().to_string())?;
+    // Only worth asking about when there is a web console to ask about it
+    // for: `reexec` governs one button in that console, so a `web = 0`
+    // configuration has nothing to gate.
+    let reexec = if web.trim() == "0" {
+        default_reexec()
+    } else {
+        prompt_bool(
+            "reexec (let the web console load a different model)",
+            default_reexec(),
+        )?
+    };
 
     let mut contents = format!("[orangu-server]\nmodels = {models}\n");
     if !model.is_empty() {
@@ -62,6 +75,11 @@ pub fn run_init() -> Result<()> {
         contents.push_str(&format!("role = {}\n", role.label()));
     }
     contents.push_str(&format!("host = {host}\nport = {port}\nweb = {web}\n"));
+    // Written only when it differs from the default, matching how `role` is
+    // handled above and how `--init` stays terse generally.
+    if reexec != default_reexec() {
+        contents.push_str(&format!("reexec = {}\n", if reexec { "yes" } else { "no" }));
+    }
 
     println!("\nConfiguration to write:\n");
     println!("{contents}");
@@ -596,6 +614,29 @@ fn prompt_line(label: &str, default: &str) -> Result<String> {
     } else {
         value
     })
+}
+
+/// A yes/no prompt whose default is `default` — shown as `[Y/n]` or
+/// `[y/N]` so which way Enter goes is visible, the same convention
+/// `delete`/`refresh`'s own confirmations use.
+fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    let mut editor: Editor<(), DefaultHistory> = Editor::new()?;
+    loop {
+        let value = match editor.readline(&format!("{label} [{hint}]: ")) {
+            Ok(line) => line.trim().to_lowercase(),
+            Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
+                return Err(anyhow!("aborted: reached end of input"));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match value.as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("Please answer yes or no."),
+        }
+    }
 }
 
 fn prompt_bool_yes_default(label: &str) -> Result<bool> {
