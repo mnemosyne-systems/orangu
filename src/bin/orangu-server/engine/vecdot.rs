@@ -46,9 +46,8 @@
 use super::iq_grids::KVALUES_IQ4NL;
 use super::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16,
-    unpack_q3_k_scales,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16, unpack_q3_k_scales,
 };
 
 /// Elements per activation-quantization block — one shared `f32` scale per
@@ -147,11 +146,7 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
         GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL => {
             in_dim.is_multiple_of(32)
         }
-        GGML_TYPE_Q2_K
-        | GGML_TYPE_Q3_K
-        | GGML_TYPE_Q4_K
-        | GGML_TYPE_Q5_K
-        | GGML_TYPE_Q6_K
+        GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
         | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
         _ => false,
     }
@@ -233,10 +228,7 @@ impl Default for UnpackedRow {
 pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedRow) {
     // `Q6_K`, `Q3_K` and `Q2_K` carry a scale per 16; everything else is
     // uniform across a 32-element block.
-    let stride = if matches!(
-        ggml_type,
-        GGML_TYPE_Q6_K | GGML_TYPE_Q3_K | GGML_TYPE_Q2_K
-    ) {
+    let stride = if matches!(ggml_type, GGML_TYPE_Q6_K | GGML_TYPE_Q3_K | GGML_TYPE_Q2_K) {
         GROUP
     } else {
         32
@@ -3528,10 +3520,7 @@ mod tests {
         let mut row = pseudo_bytes(in_dim / block_elems * block_bytes, seed);
         for block in row.chunks_exact_mut(block_bytes) {
             match ggml_type {
-                GGML_TYPE_Q8_0
-                | GGML_TYPE_Q5_0
-                | GGML_TYPE_Q4_0
-                | GGML_TYPE_IQ4_NL
+                GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_IQ4_NL
                 | GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q5_1 | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
@@ -3856,13 +3845,12 @@ mod tests {
 
             let mut row = UnpackedRow::new();
             unpack_row(ggml_type, &block, 256, &mut row);
-            for i in 0..256 {
+            for (i, &w) in want.iter().enumerate().take(256) {
                 let g = i / GROUP;
                 let got = row.scale[g] * row.q[i] as f32 - row.min[g];
                 assert!(
-                    (got - want[i]).abs() <= 1e-3 * want[i].abs().max(1.0),
-                    "type {ggml_type} element {i}: got {got}, want {}",
-                    want[i]
+                    (got - w).abs() <= 1e-3 * w.abs().max(1.0),
+                    "type {ggml_type} element {i}: got {got}, want {w}"
                 );
             }
         }
