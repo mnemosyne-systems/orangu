@@ -97,10 +97,13 @@ pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
             out.push_str("\n\n");
         }
         match &att.text {
-            Some(body) => out.push_str(&format!(
-                "Attached document \"{}\" ({}):\n```\n{}\n```",
-                att.name, att.mime, body
-            )),
+            Some(body) => {
+                let fence = "`".repeat(fence_width(body));
+                out.push_str(&format!(
+                    "Attached document \"{}\" ({}):\n{fence}\n{}\n{fence}",
+                    att.name, att.mime, body
+                ));
+            }
             None => out.push_str(&format!(
                 "[Attached file \"{}\" ({}, {}) — binary content, not included]",
                 att.name,
@@ -110,6 +113,33 @@ pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
         }
     }
     out
+}
+
+/// How many backticks the fence around an attachment's body needs.
+///
+/// Three is only safe for a body that contains no fences of its own, and
+/// documents worth attaching routinely do — a Markdown file with a
+/// ```` ```mermaid ```` block in it being the obvious case. CommonMark ends
+/// a fenced block at the first fence *at least as long* as the opening one,
+/// so a 3-backtick wrapper around such a file is closed by the file's own
+/// closing fence: everything after it escapes the block, and the wrapper's
+/// real closing fence goes on to open a new, unterminated one. The model
+/// then receives the document with its structure scrambled — which is a
+/// good way to get a description of a diagram instead of the diagram.
+///
+/// One longer than the longest run in the body, and never fewer than three.
+fn fence_width(body: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for ch in body.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest.max(2) + 1
 }
 
 enum Kind {
@@ -449,6 +479,52 @@ mod tests {
     #[test]
     fn compose_without_attachments_is_just_the_text() {
         assert_eq!(compose_content("hi", &[]), "hi");
+    }
+
+    #[test]
+    fn fence_width_outgrows_the_body() {
+        assert_eq!(fence_width("plain text"), 3);
+        assert_eq!(fence_width("a ``` fence"), 4);
+        assert_eq!(fence_width("````\nx\n````"), 5);
+        // Inline code shouldn't inflate the fence past what's needed.
+        assert_eq!(fence_width("use `foo` here"), 3);
+    }
+
+    #[test]
+    fn a_document_containing_fences_stays_one_block() {
+        // The real shape that broke this: a Markdown file with a mermaid
+        // block in it. The wrapper has to outlive the file's own fences, or
+        // the document arrives at the model in pieces.
+        let atts = vec![Attachment {
+            name: "entity-diagram.md".into(),
+            mime: "text/markdown".into(),
+            size: 0,
+            text: Some("# Entities\n\n```mermaid\nerDiagram\n    A ||--o{ B : has\n```\n".into()),
+        }];
+        let out = compose_content("Please, render this", &atts);
+
+        // Parsing the composed prompt back must yield exactly one code
+        // block holding the whole document — not the three fragments a
+        // 3-backtick wrapper produced.
+        let tree = markdown::to_mdast(&out, &markdown::ParseOptions::gfm()).unwrap();
+        let markdown::mdast::Node::Root(root) = &tree else {
+            panic!("root")
+        };
+        let blocks: Vec<_> = root
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                markdown::mdast::Node::Code(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 1, "composed prompt: {out}");
+        assert!(
+            blocks[0].value.contains("```mermaid"),
+            "{}",
+            blocks[0].value
+        );
+        assert!(blocks[0].value.contains("erDiagram"), "{}", blocks[0].value);
     }
 
     #[test]

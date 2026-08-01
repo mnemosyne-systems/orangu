@@ -786,6 +786,91 @@ API's own `port`.
 Each assistant reply is rendered from markdown to HTML server-side,
 including syntax-highlighted fenced code blocks.
 
+### Diagrams
+
+A fenced code block tagged `mermaid` (or `mmd`) is drawn as a diagram
+instead of printed as code:
+
+````
+```mermaid
+flowchart TD
+    A[Start] --> B{Is it working?}
+    B -->|Yes| C[Ship it]
+    B -->|No| D[Debug]
+    D --> B
+```
+````
+
+All of [Mermaid](https://mermaid.js.org/)'s diagram families are
+supported — flowcharts, sequence, class, state, ER, Gantt, pie, mindmap,
+gitgraph, journey, timeline, quadrant, sankey, xychart, block,
+requirement, C4, packet, radar, and treemap.
+
+Drawing happens on the server, in Rust, with no browser, Node, or network
+access involved, so diagrams work on a fully offline machine like the rest
+of the console. They follow the light/dark theme toggle, and each diagram
+carries a collapsed **Diagram source** disclosure holding the Mermaid text
+the model wrote, so you can copy it back out.
+
+A diagram doesn't have to be tagged. An **untagged** fence whose first line
+is a Mermaid header — models don't always add the tag — is drawn too. A
+fence tagged as something else is left alone: if the model said `bash`,
+you get `bash`, even when the contents would parse as a diagram.
+
+### Diagrams in attached files
+
+Diagrams are also detected in files you attach, and drawn under that
+message's file chips. Two shapes are recognised:
+
+* **A file that is one diagram** — a `.mmd`/`.mermaid` export, or a plain
+  text file holding nothing but diagram source. There is no fence to go
+  on, so this is recognised from the diagram header itself.
+* **A document containing diagrams** — a Markdown design doc with
+  ```` ```mermaid ```` blocks in it. Untagged blocks are checked the same
+  way replies are; blocks tagged as another language are left alone.
+
+Each attached file the server could read becomes an expandable chip: click
+it to see what was actually sent to the model — any diagrams as pictures,
+then the extracted text itself. It starts collapsed, so a message stays
+readable no matter how large the file was.
+
+A file nothing could be read from — a binary, or a format with no text
+extractor — stays a plain chip with no expand control, since there would
+be nothing behind it.
+
+This matters because an attachment is otherwise invisible to you: its text
+goes to the model, and the message shows only the file's name and size.
+What you attached would have been the one part of your own message you
+couldn't see.
+
+Content appears as soon as the file is sent — you don't need to reload —
+and comes back on a later visit through **History**. Up to 32 diagrams are
+drawn per file; a document with more says so rather than quietly showing
+only the first few.
+
+Diagrams are left-aligned and scaled to fit the message. Real diagrams run
+large — an ER diagram with a dozen entities is around 2700 pixels wide,
+several times a message's width — so each one carries a **download**
+button, the same save icon an answer has, giving you the SVG at full
+resolution. The button saves the variant matching your current theme, and
+the file is the exact diagram on screen.
+
+### Diagrams in the answer
+
+Ask a model to render an attached diagram and it will typically explain it
+in words rather than reproducing the Mermaid — the explanation is useful,
+but on its own it leaves you without the picture. So when an answer holds
+no diagram of its own, the diagrams from that turn's attachments are shown
+beneath it, at full size, each captioned with the file it came from. You
+get the explanation and then the picture.
+
+If the model *does* write a Mermaid block, that is what you see and
+nothing is added — the answer is never second-guessed or duplicated. The
+caption exists so a picture drawn from your file never reads as one the
+model produced, and the reply's saved text stays exactly what the model
+wrote, which is also what **Save as Markdown** and the next turn's context
+see.
+
 While a reply is streaming in, the **Send** button becomes a **Stop** (×)
 button; clicking it cancels the request. Whatever text had already
 streamed in stays on screen, marked as stopped, but since the turn never

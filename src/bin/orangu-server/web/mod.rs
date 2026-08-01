@@ -20,9 +20,11 @@
 //! `~/.orangu/server/sessions/<uuid>.json` (`web::sessions`); each
 //! assistant message is rendered from markdown to syntax-highlighted HTML
 //! server-side (`web::render`), reusing `markdown`/`syntect` — the same
-//! crates `orangu`'s own TUI uses for its terminal rendering.
+//! crates `orangu`'s own TUI uses for its terminal rendering — with
+//! ```` ```mermaid ```` blocks drawn to SVG by `web::mermaid`.
 
 pub mod attachments;
+pub mod mermaid;
 pub mod models;
 pub mod render;
 pub mod sessions;
@@ -429,6 +431,70 @@ struct AttachmentView {
     name: String,
     mime: String,
     size: u64,
+    /// What the server managed to read out of the file — exactly the text
+    /// handed to the model, so the panel shows what was actually sent rather
+    /// than a re-derived approximation. `None` for a format nothing could be
+    /// extracted from (an unrecognised or binary type), which is the signal
+    /// the UI uses to leave out the expand control entirely: there is
+    /// nothing behind it.
+    ///
+    /// Already bounded by `attachments::MAX_TEXT_CHARS`, which marks its own
+    /// truncation inline, so this adds no undisclosed cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// Mermaid diagrams found inside the file, already drawn. An attachment
+    /// is otherwise invisible to the reader — its text goes to the model and
+    /// the UI shows only a chip — so a diagram someone attached would
+    /// otherwise be the one thing they can't see in their own message.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagrams: Vec<DiagramView>,
+    /// Set when the file held more diagrams than [`mermaid::MAX_PER_ATTACHMENT`],
+    /// so the UI can say so rather than quietly showing a prefix.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    diagrams_capped: bool,
+}
+
+/// One drawn diagram as the browser needs it: the two theme variants (see
+/// [`mermaid`] for why there are two) and the source it came from.
+#[derive(Serialize)]
+struct DiagramView {
+    light: String,
+    dark: String,
+    source: String,
+    /// Natural size for the `<img>` — see [`mermaid::Diagram`] for why an
+    /// unsized diagram reflows the transcript when it decodes.
+    width: f64,
+    height: f64,
+}
+
+/// Builds one attachment's view: what was read out of it, plus every
+/// diagram drawn from it.
+///
+/// Called on session load and once per send, never per token — attachment
+/// text doesn't change while a reply streams.
+fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
+    let found = attachment
+        .text
+        .as_deref()
+        .map(mermaid::find_in_text)
+        .unwrap_or_default();
+    AttachmentView {
+        name: attachment.name,
+        mime: attachment.mime,
+        size: attachment.size,
+        text: attachment.text,
+        diagrams_capped: found.len() >= mermaid::MAX_PER_ATTACHMENT,
+        diagrams: found
+            .into_iter()
+            .map(|found| DiagramView {
+                light: found.diagram.light.clone(),
+                dark: found.diagram.dark.clone(),
+                width: found.diagram.width,
+                height: found.diagram.height,
+                source: found.source,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Serialize)]
@@ -439,8 +505,8 @@ struct SessionMessageView {
     html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_ms: Option<u64>,
-    // Metadata only — the extracted text stays server-side; the UI just
-    // needs to render a chip per file.
+    // Name/type/size for the chip, plus any diagrams drawn out of the file.
+    // The extracted text itself stays server-side.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentView>,
 }
@@ -472,15 +538,7 @@ async fn get_session(Path(id): Path<String>) -> impl IntoResponse {
                         content: m.content,
                         html,
                         generation_ms: m.generation_ms,
-                        attachments: m
-                            .attachments
-                            .into_iter()
-                            .map(|a| AttachmentView {
-                                name: a.name,
-                                mime: a.mime,
-                                size: a.size,
-                            })
-                            .collect(),
+                        attachments: m.attachments.into_iter().map(attachment_view).collect(),
                     }
                 })
                 .collect(),
@@ -552,7 +610,25 @@ async fn send_message(
 
     let user_message = req.content;
     let user_attachments = extracted;
+    // What this turn's uploads turned into — extracted text and any drawn
+    // diagrams — built once here rather than per token. Sent before the
+    // first token so the user's own message can show it while the reply is
+    // still generating; on a later visit `get_session` rebuilds the same
+    // views, so a reload isn't what makes it appear. The browser only ever
+    // had the raw bytes, so this is its first sight of what was read.
+    let attachment_views: Vec<AttachmentView> = user_attachments
+        .iter()
+        .cloned()
+        .map(attachment_view)
+        .collect();
+
     let stream = async_stream::stream! {
+        if !attachment_views.is_empty() {
+            yield Ok::<_, Infallible>(
+                axum::response::sse::Event::default()
+                    .data(json!({"type": "attachments", "attachments": attachment_views}).to_string()),
+            );
+        }
         let mut full = String::new();
         loop {
             let Some(event) = rx.recv().await else { break };
@@ -648,4 +724,83 @@ fn render_prompt(
         prompt.push_str(crate::http::openai::EMPTY_THINK_BLOCK);
     }
     Ok(prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn upload(name: &str, mime: &str, body: &str) -> AttachmentView {
+        let incoming = attachments::IncomingAttachment {
+            name: name.to_string(),
+            mime: mime.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+        };
+        attachment_view(attachments::extract(&incoming).expect("extracts"))
+    }
+
+    #[test]
+    fn a_mermaid_file_upload_arrives_as_a_drawn_diagram() {
+        // The whole path an attachment takes: browser bytes -> base64
+        // decode -> text extraction -> diagram detection -> rendered view.
+        // A `.mmd` has no fence around it, so this only works because the
+        // header gate recognises a bare diagram.
+        let view = upload(
+            "architecture.mmd",
+            "",
+            "flowchart TD\n    A[Start] --> B[Done]\n",
+        );
+        assert_eq!(view.diagrams.len(), 1);
+        assert!(
+            view.diagrams[0]
+                .light
+                .starts_with("data:image/svg+xml;base64,")
+        );
+        assert!(view.diagrams[0].source.contains("flowchart TD"));
+        assert!(!view.diagrams_capped);
+    }
+
+    #[test]
+    fn a_markdown_upload_yields_the_diagrams_inside_it() {
+        let view = upload(
+            "design.md",
+            "text/markdown",
+            "# Design\n\nProse.\n\n```mermaid\nsequenceDiagram\n    A->>B: hi\n```\n",
+        );
+        assert_eq!(view.diagrams.len(), 1);
+        assert!(view.diagrams[0].source.contains("sequenceDiagram"));
+    }
+
+    #[test]
+    fn an_ordinary_upload_yields_no_diagrams() {
+        // The common case, and the one a false positive would ruin: this
+        // must stay an ordinary chip with nothing drawn under it.
+        let view = upload("main.rs", "", "fn main() {\n    println!(\"hi\");\n}\n");
+        assert!(view.diagrams.is_empty());
+        assert_eq!(view.name, "main.rs");
+    }
+
+    #[test]
+    fn a_binary_upload_offers_nothing_to_expand() {
+        // `text: None` and no diagrams is what tells the UI to render a
+        // plain chip with no expand control — there would be nothing behind
+        // it. A format we can't read must not advertise otherwise.
+        let incoming = attachments::IncomingAttachment {
+            name: "blob.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2, 255]),
+        };
+        let view = attachment_view(attachments::extract(&incoming).unwrap());
+        assert!(view.text.is_none());
+        assert!(view.diagrams.is_empty());
+    }
+
+    #[test]
+    fn a_readable_upload_carries_its_text_for_the_expand_panel() {
+        // The counterpart: anything we could read must send back exactly
+        // what the model got, so the panel shows what was actually sent.
+        let view = upload("notes.txt", "text/plain", "hello there");
+        assert_eq!(view.text.as_deref(), Some("hello there"));
+    }
 }

@@ -1465,9 +1465,205 @@ handle, config, workspace root, start time); `http::openai` and
 build step) on its own `[web].port`, sharing the same in-process `Engine` as
 the API so a chat turn never makes an HTTP hop. `web::render` renders
 markdown to HTML (including syntax-highlighted code blocks) with the same
-`markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::sessions`
+`markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::mermaid`
+draws ```` ```mermaid ```` blocks (below). `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
 `web::models` is the model manager (below).
+
+### Mermaid diagrams (`web::mermaid`)
+
+Diagrams are rendered by `merman`, a headless Rust implementation of
+Mermaid that parses, lays out, and emits SVG without Node, Puppeteer, or a
+JavaScript runtime — the same requirement that made KaTeX a vendored asset
+rather than a CDN link. It is the opposite arrangement to the math path:
+`$...$` ships raw TeX to the browser because no server-side TeX engine
+exists in Rust, whereas a diagram is finished server-side and the client
+only ever receives a picture.
+
+Three decisions carry the design, each forced by something measured rather
+than assumed:
+
+**The SVG is embedded as an `<img>` data URI, never inlined.** merman
+strips scripts and event-handler attributes from diagram labels, but it
+does not escape a literal `</svg>` inside one: a label of `A["</svg>…"]`
+emits that tag raw. Inlined, the HTML parser reads it as the real end tag,
+closes the diagram early, and lets the rest of the label escape into the
+transcript. An `<img>` makes the SVG a separate document — scripts inert,
+`id`s unable to collide with the page or with a second diagram on it — and
+keeps the same escape-everything stance `web::render` takes for every
+other node kind. Base64 rather than percent-encoding, because an SVG is
+full of `#`, `<`, `"` and `&`, and one missed escape silently truncates
+the image.
+
+**Labels are SVG `<text>`, not `<foreignObject>`.** Mermaid's usual HTML
+labels get no layout engine inside an `<img>` document and would render as
+nothing at all; `HostThemeOutput::resvg_safe_editor` is what converts
+them, and is therefore not optional. A test asserts no `foreignObject`
+survives, since dropping that setting fails silently as blank labels.
+
+**Each diagram is rendered twice, once per theme.** An `<img>` cannot
+inherit the page's CSS variables, so the palette is baked in and `app.css`
+shows whichever of the two finished pictures matches the current theme.
+The theme roles map onto the console's own custom properties, so a diagram
+is styled like the transcript around it rather than arriving in Mermaid's
+stock lavender.
+
+##### Sizing, alignment, and getting the original out
+
+A message is `max-width: 50%` of the transcript and diagrams are large —
+the ER diagram used to shake this out measures 2734×3571 — so the picture
+is scaled to fit with `max-width: 100%`. Rendering at natural size instead
+was tried and is wrong at this width: it puts most of the diagram behind a
+scrollbar inside a half-width bubble. The viewBox dimensions still go on
+the `<img>` as `width`/`height`, not to force full size but so the browser
+reserves the correct aspect ratio before the image decodes rather than
+reflowing the transcript when it lands.
+
+Scaling means the displayed picture is well below full resolution, so each
+diagram carries a download control — a plain anchor onto the same `data:`
+URI the `<img>` already holds, so saving needs no JavaScript and no round
+trip and the file is exactly what is displayed. One per theme, toggled by
+the same rules that pick the image, so the saved SVG matches the screen
+instead of always being the light variant. A test decodes the `href` and
+asserts it is both the image's own URI and a complete SVG document, since
+a broken link here fails silently.
+
+Alignment: the `<img>` is `display: block`. As an inline element it sat in
+a line box, subject to inline alignment and carrying the baseline's
+descender gap beneath it, which pulled diagrams off the left edge; the
+theme rules therefore switch between `block` and `none`, never `inline`.
+`.mermaid-diagram`'s `margin: 0.6em 0` also clears the UA stylesheet's
+`margin-inline: 40px` on `<figure>`, which would indent every diagram.
+
+Two properties of the streaming path shape the rest. The transcript is
+re-rendered from scratch on **every token**, and a diagram costs roughly
+2 ms to lay out — so completed diagrams are cached by source hash
+(failures too, or a mislabelled block would be retried once per token),
+and `render::unterminated_fence_start` withholds the one block the
+document ends inside of.
+
+That second guard matters more than it looks. A half-written diagram
+usually still parses — `flowchart TD` plus one edge is valid Mermaid — so
+without it the reader would watch a diagram redraw, reflow and jump on
+every token until the fence closed, each throwaway state costing a full
+layout the cache can never hit. The guard therefore keys on the fence, not
+on whether the source happens to parse.
+
+A source that doesn't parse falls back to the ordinary highlighted code
+block. This is a common path, not an edge case — models emit near-miss
+Mermaid regularly — and it is why merman was chosen over
+`mermaid-rs-renderer`, the other pure-Rust candidate: the latter answers
+malformed input with a 16×16 blank SVG rather than an error, in strict
+mode as well as lenient, leaving no way to tell a diagram from a failure
+and putting an empty frame where the source should be.
+
+#### Detecting a diagram without a tag
+
+A ```` ```mermaid ```` tag is not always there — models emit diagrams into
+bare fences, and an attached `.mmd` file has no fence at all — so
+`mermaid::looks_like_diagram` decides from the content.
+
+It cannot simply ask merman. Mermaid's parsers are extremely permissive,
+and merman inherits that faithfully: handed the sentence `graph is a data
+structure of nodes and edges`, it detects a flowchart and **renders** one,
+with `is` as a node. `classDiagram is what you want` and a log line
+reading `info: build succeeded` behave the same way. Measured over a
+corpus of realistic non-diagram blocks, merman's own detector produced
+false positives on three of seventeen — and each would have turned
+someone's prose or logs into a nonsense picture.
+
+The gate is therefore a table of the diagram headers with the tokens each
+may be followed by (`flowchart` takes a direction, `pie` takes `title` or
+`showData`, most stand alone). The first meaningful line — after front
+matter and `%%` comments, both legal above a header — must be a bare
+header and nothing else. That admits all 24 header forms tested, including
+`pie title A Very Long Descriptive Title`, and rejects all seventeen
+non-diagrams including the three merman renders. Successful rendering is
+still required on top.
+
+The gate applies only where there is no explicit tag. A block tagged
+`bash` or `json` is left alone even when its contents would parse: the tag
+is the author saying what they wrote, and overriding it is exactly how a
+shell transcript ends up drawn as a flowchart.
+
+#### Diagrams in attachments
+
+`mermaid::find_in_text` runs the same detection over an attachment's
+extracted text, handling both a file that *is* a diagram (no fence — the
+case the header gate exists for) and a document that *contains* them
+(found by parsing as markdown, so fence lengths and info strings follow
+the same CommonMark rules as the transcript). Capped at
+`MAX_PER_ATTACHMENT`, with the cap reported to the reader rather than
+silently truncating.
+
+The results ride on `AttachmentView`, which `get_session` builds on load
+and `send_message` emits as an `attachments` SSE event before the first
+token — so a diagram is on screen while the reply is still generating, and
+a reload is not what makes it appear. Cost is bounded by construction:
+attachment text doesn't change while a reply streams, so this runs once
+per send and once per load, never per token.
+
+The view also carries the extracted text, and the browser turns a chip
+into a collapsed disclosure holding it plus the diagrams. `text: None` —
+a binary or otherwise unreadable format — is what tells the client to
+render a bare chip with no expand control, so one is never offered with
+nothing behind it. The text is what the model received verbatim, already
+bounded by `attachments::MAX_TEXT_CHARS` which marks its own truncation
+inline, so displaying it adds no undisclosed cap.
+
+This closes a real gap rather than adding a flourish. An attachment is
+otherwise invisible to its sender — the text goes to the model and the UI
+shows only a chip with the file's name and size — so a diagram someone
+attached was the one part of their own message they could not see.
+
+#### Fencing an attachment into the prompt
+
+`compose_content` inlines an attachment's text into the prompt as a fenced
+block, and the fence has to outgrow the body: `attachments::fence_width`
+returns one more backtick than the longest run inside it.
+
+Three backticks is only safe for a body containing no fences of its own,
+and the documents most worth attaching do contain them. CommonMark ends a
+fenced block at the first fence *at least as long* as the opening one, so
+a 3-backtick wrapper around a Markdown file holding a ```` ```mermaid ````
+block was closed by that file's own closing fence — the rest of the
+document escaped the block, and the wrapper's real closing fence went on
+to open a new, unterminated one. Measured on a real 200-line file, the
+model received four fence transitions where there should have been two,
+with the document split into fragments. Asked to render the diagram in it,
+the model described it instead. With the fence widened the same file
+parses back out of the composed prompt as exactly one code block with its
+`mermaid` fence intact.
+
+Whether the model then re-emits the diagram is still the model's call —
+nothing here can force that — but it is now working from an intact
+document rather than a scrambled one.
+
+#### Putting the attachment's diagram in the answer
+
+Measured across four sessions against the same file, the answer to
+"Please, render this" contained a Mermaid fence **zero** times. The replies
+open with "Here is the rendered content" and then describe the diagram in
+prose — a correct explanation, and no picture. Only an explicit follow-up
+("You have a Mermaid diagram") produced a fence. Fixing the prompt fencing
+above did not change this; it is how models answer that request.
+
+`appendAttachedDiagramsToAnswer` in `app.js` therefore appends the turn's
+attachment diagrams below the answer. Two rules keep it honest:
+
+* It fires **only when the answer contains no `.mermaid-diagram` of its
+  own**, so a model that does emit Mermaid is never second-guessed or
+  duplicated.
+* Each figure carries a `From <file>` caption, so a picture drawn from the
+  attachment never reads as one the model produced.
+
+Nothing is written into the message. The persisted content stays exactly
+what the model generated, which is also what Save-as-Markdown exports and
+what the next turn's context replays — this is a presentation-layer
+addition, not a rewrite of model output. It runs on the `done` event
+(every token reassigns `innerHTML`, which would wipe an earlier append)
+and again on session load, so a reloaded answer carries the same picture a
+live one did.
 
 ### Loading a different model (`reexec.rs`)
 

@@ -111,15 +111,120 @@
     return chip;
   }
 
-  // Display-only chips shown under a sent (or reloaded) user message.
+  // Display-only attachments under a sent (or reloaded) user message.
+  // Replaces any previous strip, so the `attachments` SSE event can swap
+  // the plain chips this renders at send time for the server's richer
+  // views once the file has actually been read.
   function appendAttachmentChips(el, attachments) {
+    const previous = el.querySelector(":scope > .message-attachments");
+    if (previous) previous.remove();
     if (!attachments || attachments.length === 0) return;
     const container = document.createElement("div");
     container.className = "message-attachments";
     for (const att of attachments) {
-      container.appendChild(makeAttachmentChip(att, null));
+      container.appendChild(makeAttachmentEntry(att));
     }
     el.appendChild(container);
+  }
+
+  // One sent attachment. When the server could read the file, the chip
+  // becomes the summary of a collapsed panel holding what it read —
+  // diagrams as pictures, then the extracted text. When it couldn't (a
+  // binary or unrecognised type: no MIME we can do anything with, nothing
+  // extracted) there is nothing behind an expand control, so the chip stays
+  // a plain chip and no control is offered.
+  //
+  // Collapsed by default: the point of a chip is that a message stays
+  // readable regardless of how much was attached to it.
+  function makeAttachmentEntry(att) {
+    const hasDiagrams = att.diagrams && att.diagrams.length > 0;
+    const hasText = typeof att.text === "string" && att.text.length > 0;
+    if (!hasDiagrams && !hasText) return makeAttachmentChip(att, null);
+
+    const details = document.createElement("details");
+    details.className = "attachment-details";
+
+    const summary = document.createElement("summary");
+    summary.appendChild(makeAttachmentChip(att, null));
+    details.appendChild(summary);
+
+    const body = document.createElement("div");
+    body.className = "attachment-body";
+    if (hasDiagrams) {
+      for (const diagram of att.diagrams) {
+        body.appendChild(makeDiagram(diagram, att.name));
+      }
+      if (att.diagrams_capped) {
+        const note = document.createElement("p");
+        note.className = "diagram-note";
+        note.textContent = `Showing the first ${att.diagrams.length} diagrams in ${att.name}.`;
+        body.appendChild(note);
+      }
+    }
+    if (hasText) {
+      // Exactly the text that went to the model. `textContent`, so an
+      // uploaded file's contents can never be markup here.
+      const pre = document.createElement("pre");
+      pre.className = "attachment-text";
+      const code = document.createElement("code");
+      code.textContent = att.text;
+      pre.appendChild(code);
+      body.appendChild(pre);
+    }
+    details.appendChild(body);
+    return details;
+  }
+
+  // The same markup `render.rs` emits for a diagram in a reply, so one set
+  // of CSS rules covers both: an <img> per theme plus the collapsed source.
+  function makeDiagram(diagram, fileName) {
+    const figure = document.createElement("figure");
+    figure.className = "mermaid-diagram";
+
+    for (const theme of ["light", "dark"]) {
+      const img = document.createElement("img");
+      img.className = `mermaid-${theme}`;
+      img.src = diagram[theme];
+      img.alt = fileName ? `Mermaid diagram from ${fileName}` : "Mermaid diagram";
+      // Natural size, so a wide diagram stays legible and the figure
+      // scrolls instead of scaling it down. See `web::mermaid`.
+      if (diagram.width > 0) {
+        img.width = Math.round(diagram.width);
+        img.height = Math.round(diagram.height);
+      }
+      figure.appendChild(img);
+    }
+
+    // Same download control `render.rs` puts on a diagram in a reply: the
+    // picture is scaled to the message, so this is how the full-resolution
+    // original gets out. One per theme, so the saved file matches what's on
+    // screen. Plain anchors onto the `data:` URI already in the <img>.
+    const actions = document.createElement("div");
+    actions.className = "diagram-actions";
+    for (const theme of ["light", "dark"]) {
+      const link = document.createElement("a");
+      link.className = `diagram-dl diagram-dl-${theme}`;
+      link.href = diagram[theme];
+      link.download = fileName ? `${fileName}.svg` : "orangu-diagram.svg";
+      link.title = "Download SVG";
+      link.setAttribute("aria-label", "Download diagram as SVG");
+      link.innerHTML = SAVE_ICON;
+      actions.appendChild(link);
+    }
+    figure.appendChild(actions);
+
+    const details = document.createElement("details");
+    details.className = "mermaid-source";
+    const summary = document.createElement("summary");
+    summary.textContent = "Diagram source";
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = diagram.source;
+    pre.appendChild(code);
+    details.append(summary, pre);
+    figure.appendChild(details);
+
+    return figure;
   }
 
   // Re-render the staged-attachment strip above the input from
@@ -387,6 +492,36 @@
     }
   }
 
+  // Puts the diagrams from a turn's attachments into that turn's answer.
+  //
+  // Asked to render an attached diagram, models reliably answer "Here is
+  // the rendered content" and then *describe* it in prose — the explanation
+  // is right, but no Mermaid comes back, so there is nothing in the reply
+  // for the renderer to draw. The picture the reader asked for exists; it
+  // just came from the file rather than the model.
+  //
+  // Two rules keep this honest. It only fires when the answer contains no
+  // diagram of its own, so a model that does emit Mermaid is never
+  // second-guessed or duplicated. And each figure is captioned with the
+  // file it came from, so nothing here reads as something the model drew —
+  // the saved message text stays exactly what the model wrote, which is
+  // also what the Save-as-Markdown button and the next turn's context see.
+  function appendAttachedDiagramsToAnswer(assistantEl, attachments) {
+    if (!attachments || attachments.length === 0) return;
+    if (assistantEl.querySelector(".mermaid-diagram")) return;
+
+    for (const att of attachments) {
+      for (const diagram of att.diagrams || []) {
+        const figure = makeDiagram(diagram, att.name);
+        const caption = document.createElement("figcaption");
+        caption.className = "diagram-provenance";
+        caption.textContent = `From ${att.name}`;
+        figure.appendChild(caption);
+        assistantEl.appendChild(figure);
+      }
+    }
+  }
+
   // sendBtn stays enabled throughout a request — while idle it submits the
   // form, while busy its click handler (below) cancels the in-flight
   // request instead, so it can't be disabled the way `input` is.
@@ -431,13 +566,19 @@
     state.sessionId = session.id;
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
+    // Diagrams from the attachments on the turn being answered, so a
+    // reloaded answer carries the same picture a live one did.
+    let pendingTurnDiagrams = [];
     for (const message of session.messages) {
       if (message.role === "assistant") {
         const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content));
         renderMathIn(el);
+        appendAttachedDiagramsToAnswer(el, pendingTurnDiagrams);
         addTimingFooter(el, message.generation_ms, message.content);
+        pendingTurnDiagrams = [];
       } else {
         addMessage(message.role, message.content, message.attachments);
+        pendingTurnDiagrams = message.attachments || [];
       }
     }
     hideHistory();
@@ -508,7 +649,10 @@
     if (!state.sessionId) {
       await newChat();
     }
-    addMessage("user", text, attachments);
+    // Kept so the "attachments" event below can hang diagrams off the user's
+    // own message once the server has drawn them (the browser only has the
+    // raw file bytes; extraction and rendering are server-side).
+    const userEl = addMessage("user", text, attachments);
     const assistantEl = addMessage("assistant", "🤖");
     assistantEl.classList.add("pending");
     setBusy(true);
@@ -525,6 +669,9 @@
     let tpsStartMs = 0;
     let tpsCount = 0;
     let liveFooter = null;
+    // The server's view of this turn's uploads, as sent by the "attachments"
+    // event — kept so the finished answer can carry their diagrams.
+    let turnAttachments = [];
     const tpsText = () => {
       if (!tpsStarted || tpsCount === 0) return null;
       const elapsed = (performance.now() - tpsStartMs) / 1000;
@@ -559,6 +706,17 @@
           const line = raw.split("\n").find((l) => l.startsWith("data: "));
           if (!line) continue;
           const payload = JSON.parse(line.slice("data: ".length));
+          if (payload.type === "attachments") {
+            // Sent before the first token: the browser only ever had the raw
+            // bytes, so this is the first time it learns what the server
+            // read out of them. Swaps the plain chips rendered at send time
+            // for expandable ones. The assistant bubble stays "pending" —
+            // nothing has been generated yet — so this deliberately sits
+            // above the type check below.
+            turnAttachments = payload.attachments || [];
+            appendAttachmentChips(userEl, turnAttachments);
+            continue;
+          }
           assistantEl.classList.remove("pending");
           if (payload.type === "token" || payload.type === "done") {
             assistantEl.innerHTML = payload.html;
@@ -590,6 +748,11 @@
               }
             }
             if (payload.type === "done") {
+              // Only once the answer is final: every token above reassigns
+              // `innerHTML`, which would wipe anything appended earlier, and
+              // an answer still mid-sentence hasn't yet had its chance to
+              // produce a diagram of its own.
+              appendAttachedDiagramsToAnswer(assistantEl, turnAttachments);
               if (payload.truncated) {
                 const notice = document.createElement("p");
                 notice.className = "truncated-notice";

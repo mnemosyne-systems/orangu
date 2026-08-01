@@ -275,6 +275,7 @@ button:disabled {
   border: 1px solid var(--border);
 }
 
+
 @keyframes blink {
   50% {
     opacity: 0.25;
@@ -385,6 +386,196 @@ button:disabled {
   margin: 0.6em 0;
   overflow-x: auto;
   text-align: center;
+}
+
+/* A ```mermaid block, drawn server-side into the two <img> variants
+   `render.rs` emits. Wide diagrams scroll horizontally rather than
+   squashing the transcript, and `max-width: 100%` keeps narrow ones from
+   overflowing on a phone. */
+.mermaid-diagram {
+  /* `margin: 0.6em 0` also clears the UA stylesheet's `margin-inline: 40px`
+     on <figure>, which would indent every diagram. */
+  margin: 0.6em 0;
+  text-align: left;
+}
+
+/* Scaled to fit the message, never wider. A message is half the screen at
+   most, and diagrams run to thousands of pixels — an ER diagram with a
+   dozen entities is ~2700px — so anything else spills out of the bubble or
+   hides most of the picture behind a scrollbar. `render.rs` still puts the
+   diagram's own viewBox width/height on the <img>, which gives the browser
+   the right aspect ratio to reserve before the image decodes; `max-width`
+   scales it down from there and `height: auto` keeps it in proportion.
+   Full resolution is a click away on the download control below. */
+.mermaid-diagram img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  /* Block, not inline. An inline <img> sits in a line box — subject to
+     inline alignment and carrying the baseline's descender gap under it —
+     which is what pulled diagrams off the left edge. A block box starts at
+     the container's left edge unconditionally. The theme rules below keep
+     this by switching between `block` and `none`, never `inline`. */
+  display: block;
+  margin-left: 0;
+  margin-right: auto;
+}
+
+/* An <img> can't inherit the CSS variables above — its SVG is a separate
+   document with the palette already baked in — so the theme is chosen by
+   showing one of two finished pictures. The three blocks mirror the
+   `:root` cascade at the top of this file: light is the baseline, the
+   media query follows the OS, and an explicit `data-theme` from the
+   topbar toggle outranks both. */
+.mermaid-dark {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .mermaid-light {
+    display: none;
+  }
+  .mermaid-dark {
+    display: block;
+  }
+}
+
+:root[data-theme="light"] .mermaid-light,
+:root[data-theme="dark"] .mermaid-dark {
+  display: block;
+}
+
+:root[data-theme="light"] .mermaid-dark,
+:root[data-theme="dark"] .mermaid-light {
+  display: none;
+}
+
+/* Download the diagram at full resolution. The picture above is scaled to
+   the message; this is the unscaled original. Styled like the answer
+   footer's save button so it reads as the same action. */
+.diagram-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 0.3em;
+}
+
+.diagram-dl {
+  color: var(--text-dim);
+  line-height: 0;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.diagram-dl:hover {
+  color: var(--text);
+  background: var(--bg-input);
+}
+
+.diagram-dl svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Only the control matching the visible image, so the saved file is the
+   one on screen. Mirrors the image rules above. */
+.diagram-dl-dark {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .diagram-dl-light {
+    display: none;
+  }
+  .diagram-dl-dark {
+    display: inline-flex;
+  }
+}
+
+:root[data-theme="light"] .diagram-dl-light,
+:root[data-theme="dark"] .diagram-dl-dark {
+  display: inline-flex;
+}
+
+:root[data-theme="light"] .diagram-dl-dark,
+:root[data-theme="dark"] .diagram-dl-light {
+  display: none;
+}
+
+/* The diagram source, collapsed. Turning a code block into an image
+   would otherwise remove the only way to copy the source back out. */
+.mermaid-source {
+  margin-top: 0.3em;
+}
+
+.mermaid-source > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 0.82em;
+  user-select: none;
+}
+
+.diagram-note {
+  color: var(--text-dim);
+  font-size: 0.82em;
+  margin: 0.3em 0 0;
+}
+
+/* Names the file a diagram in an answer came from. The model describes an
+   attached diagram rather than re-emitting it, so the picture below an
+   explanation was drawn from the attachment — this line is what keeps that
+   distinction visible instead of reading as something the model drew. */
+.diagram-provenance {
+  color: var(--text-dim);
+  font-size: 0.78em;
+  margin-top: 0.25em;
+}
+
+/* An attachment whose contents the server could read: the chip becomes the
+   summary of a collapsed panel. Collapsed is the whole point — a message
+   stays readable no matter how large the file was. Attachments with
+   nothing extractable render as a bare chip and never reach these rules,
+   so no empty expand control is ever offered. */
+.attachment-details > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The disclosure triangle, drawn ourselves: the native marker sits outside
+   the chip and can't be aligned with it across browsers. */
+.attachment-details > summary::before {
+  content: "▸";
+  color: var(--text-dim);
+  font-size: 0.8em;
+}
+
+.attachment-details[open] > summary::before {
+  content: "▾";
+}
+
+.attachment-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.attachment-body {
+  margin: 0.4em 0 0.2em;
+  padding-left: 0.6em;
+  border-left: 2px solid var(--border);
+}
+
+/* The extracted text exactly as the model received it. */
+.attachment-text {
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg-input);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0.4em 0 0;
 }
 
 .message table {
