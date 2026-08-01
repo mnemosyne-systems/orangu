@@ -433,6 +433,7 @@ pub enum LocalCommand<'a> {
     ListFiles,
     ShowFile(Cow<'a, str>),
     Tools,
+    Mcp(McpSubcommand<'a>),
     ModelInfo,
     SetModelId(&'a str),
     ServerInfo,
@@ -535,6 +536,21 @@ pub enum LocalCommand<'a> {
     PendingDelete(Option<usize>),
     Skills,
     Graph,
+}
+
+/// `/mcp` manages running HTTP MCP endpoints in the active `orangu.conf`.
+pub enum McpSubcommand<'a> {
+    Status,
+    Refresh,
+    Add {
+        name: Cow<'a, str>,
+        endpoint: Cow<'a, str>,
+    },
+    Modify {
+        name: Cow<'a, str>,
+        endpoint: Cow<'a, str>,
+    },
+    Usage,
 }
 
 pub struct CommandContext<'a> {

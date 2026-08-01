@@ -24,11 +24,21 @@ use std::{
 use crate::tui::Banner;
 use crate::workspaces::WorkspacePlacement;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum McpApprovalMode {
+    Auto,
+    Prompt,
+    Writes,
+    Deny,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
     pub default_server: String,
     pub default_model: Option<String>,
     pub llms: HashMap<String, LlmConfiguration>,
+    /// Running HTTP MCP servers, keyed by configuration section name.
+    pub mcp_servers: HashMap<String, McpServerConfiguration>,
     pub compression: bool,
     pub auto_downsample_lines: usize,
     pub diff_file_cap: usize,
@@ -55,6 +65,20 @@ pub struct ClientAppConfiguration {
     pub word_wrap: bool,
     pub semantic_budget_tokens: usize,
     pub theme: String,
+}
+
+/// A configured Model Context Protocol server that is already running and
+/// exposes a Streamable HTTP endpoint.
+#[derive(Clone, Debug, Serialize)]
+pub struct McpServerConfiguration {
+    pub endpoint: String,
+    pub startup_timeout_seconds: u64,
+    pub tool_timeout_seconds: u64,
+    pub enabled: bool,
+    pub required: bool,
+    pub enabled_tools: Vec<String>,
+    pub disabled_tools: Vec<String>,
+    pub approval_mode: McpApprovalMode,
 }
 
 impl ClientAppConfiguration {
@@ -135,6 +159,10 @@ pub fn default_timeout() -> u64 {
 
 pub fn default_llm_max_tool_rounds() -> usize {
     10
+}
+
+pub fn default_mcp_timeout() -> u64 {
+    30
 }
 
 /// Default `/auto_review` response cap: a verdict plus at most five one-line
@@ -249,6 +277,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     )?;
     let compile_workers = parse_client_field(&client, "compile_workers", default_compile_workers)?;
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
+    let mcp_servers = parse_mcp_profiles(&mut sections)?;
 
     let semantic_budget_tokens = client
         .get("semantic_budget_tokens")
@@ -280,6 +309,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
             system_prompt,
             default_model,
         )?,
+        mcp_servers,
         compression,
         auto_downsample_lines,
         diff_file_cap,
@@ -307,6 +337,223 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         word_wrap,
         theme,
     })
+}
+
+/// Remove and parse the sections reserved for running HTTP MCP servers before the
+/// remaining sections are treated as LLM profiles.
+fn parse_mcp_profiles(
+    sections: &mut HashMap<String, HashMap<String, String>>,
+) -> Result<HashMap<String, McpServerConfiguration>> {
+    let names = sections
+        .keys()
+        .filter_map(|section| section.strip_prefix("mcp.").map(str::to_string))
+        .collect::<Vec<_>>();
+    let mut profiles = HashMap::new();
+
+    for name in names {
+        let section_name = format!("mcp.{name}");
+        let values = sections
+            .remove(&section_name)
+            .expect("MCP section disappeared while parsing");
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(anyhow!(
+                "invalid MCP server name '{name}'; use ASCII letters, digits, '_' or '-'"
+            ));
+        }
+
+        for key in values.keys() {
+            match key.as_str() {
+                "endpoint" | "timeout" | "startup_timeout" | "tool_timeout" | "enabled"
+                | "required" | "enabled_tools" | "disabled_tools" | "approval_mode" => {}
+                _ => return Err(anyhow!("unknown key [{section_name}].{key}")),
+            }
+        }
+
+        let endpoint = values
+            .get("endpoint")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("[{section_name}].endpoint must not be empty"))?;
+        let timeout_seconds = values
+            .get("timeout")
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|err| anyhow!("invalid [{section_name}].timeout: {err}"))
+            })
+            .transpose()?
+            .unwrap_or_else(default_mcp_timeout);
+        let startup_timeout_seconds = values
+            .get("startup_timeout")
+            .map(|value| value.trim().parse::<u64>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid [{section_name}].startup_timeout: {err}"))?
+            .unwrap_or(timeout_seconds);
+        let tool_timeout_seconds = values
+            .get("tool_timeout")
+            .map(|value| value.trim().parse::<u64>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid [{section_name}].tool_timeout: {err}"))?
+            .unwrap_or(timeout_seconds);
+        if startup_timeout_seconds == 0 || tool_timeout_seconds == 0 {
+            return Err(anyhow!(
+                "[{section_name}] MCP timeouts must be greater than zero"
+            ));
+        }
+        let enabled = values
+            .get("enabled")
+            .map(|value| parse_feedback_bool(value))
+            .unwrap_or(true);
+        let required = values
+            .get("required")
+            .map(|value| parse_feedback_bool(value))
+            .unwrap_or(false);
+        let list = |key: &str| -> Vec<String> {
+            values
+                .get(key)
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let approval_mode = match values
+            .get("approval_mode")
+            .map(|value| value.trim().to_lowercase())
+            .as_deref()
+        {
+            None | Some("auto") | Some("approve") => McpApprovalMode::Auto,
+            Some("prompt") => McpApprovalMode::Prompt,
+            Some("writes") => McpApprovalMode::Writes,
+            Some("deny") => McpApprovalMode::Deny,
+            Some(value) => {
+                return Err(anyhow!(
+                    "invalid [{section_name}].approval_mode '{value}'; expected auto, prompt, writes, or deny"
+                ));
+            }
+        };
+
+        profiles.insert(
+            name,
+            McpServerConfiguration {
+                endpoint,
+                startup_timeout_seconds,
+                tool_timeout_seconds,
+                enabled,
+                required,
+                enabled_tools: list("enabled_tools"),
+                disabled_tools: list("disabled_tools"),
+                approval_mode,
+            },
+        );
+    }
+
+    // An opt-in short profile for a service that already exposes MCP over HTTP.
+    let shortcut_names = sections
+        .iter()
+        .filter(|(_, values)| {
+            values
+                .get("mcp")
+                .is_some_and(|value| parse_feedback_bool(value))
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in shortcut_names {
+        let values = sections
+            .remove(&name)
+            .expect("MCP shortcut section disappeared while parsing");
+        if profiles.contains_key(&name) {
+            return Err(anyhow!("MCP server '{name}' is configured more than once"));
+        }
+        for key in values.keys() {
+            match key.as_str() {
+                "mcp" | "endpoint" | "timeout" | "startup_timeout" | "tool_timeout" | "enabled"
+                | "required" | "enabled_tools" | "disabled_tools" | "approval_mode" => {}
+                _ => return Err(anyhow!("unknown key [{name}].{key} for an MCP server")),
+            }
+        }
+        let endpoint = values
+            .get("endpoint")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("[{name}].endpoint must not be empty for HTTP MCP"))?;
+        let timeout_seconds = values
+            .get("timeout")
+            .map(|value| value.trim().parse::<u64>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid [{name}].timeout: {err}"))?
+            .unwrap_or_else(default_mcp_timeout);
+        let startup_timeout_seconds = values
+            .get("startup_timeout")
+            .map(|value| value.trim().parse::<u64>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid [{name}].startup_timeout: {err}"))?
+            .unwrap_or(timeout_seconds);
+        let tool_timeout_seconds = values
+            .get("tool_timeout")
+            .map(|value| value.trim().parse::<u64>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid [{name}].tool_timeout: {err}"))?
+            .unwrap_or(timeout_seconds);
+        if startup_timeout_seconds == 0 || tool_timeout_seconds == 0 {
+            return Err(anyhow!("[{name}] MCP timeouts must be greater than zero"));
+        }
+        let list = |key: &str| {
+            values
+                .get(key)
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let approval_mode = parse_mcp_approval_mode(values.get("approval_mode"), &name)?;
+        profiles.insert(
+            name,
+            McpServerConfiguration {
+                endpoint,
+                startup_timeout_seconds,
+                tool_timeout_seconds,
+                enabled: values
+                    .get("enabled")
+                    .map(|value| parse_feedback_bool(value))
+                    .unwrap_or(true),
+                required: values
+                    .get("required")
+                    .map(|value| parse_feedback_bool(value))
+                    .unwrap_or(false),
+                enabled_tools: list("enabled_tools"),
+                disabled_tools: list("disabled_tools"),
+                approval_mode,
+            },
+        );
+    }
+    Ok(profiles)
+}
+
+fn parse_mcp_approval_mode(value: Option<&String>, section_name: &str) -> Result<McpApprovalMode> {
+    match value.map(|value| value.trim().to_lowercase()).as_deref() {
+        None | Some("auto") | Some("approve") => Ok(McpApprovalMode::Auto),
+        Some("prompt") => Ok(McpApprovalMode::Prompt),
+        Some("writes") => Ok(McpApprovalMode::Writes),
+        Some("deny") => Ok(McpApprovalMode::Deny),
+        Some(value) => Err(anyhow!(
+            "invalid [{section_name}].approval_mode '{value}'; expected auto, prompt, writes, or deny"
+        )),
+    }
 }
 
 pub const DEFAULT_PLATFORM: &str = "github";
@@ -362,6 +609,67 @@ pub fn set_client_theme(path: &Path, new_theme: &str) -> Result<()> {
 
     let new_contents = lines.join("\n") + "\n";
     std::fs::write(path, new_contents)?;
+    Ok(())
+}
+
+/// Add a running HTTP MCP endpoint without rewriting unrelated config.
+pub fn add_mcp_server(path: &Path, name: &str, endpoint: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "invalid MCP server name '{name}'; use ASCII letters, digits, '_' or '-'"
+        ));
+    }
+    if endpoint.trim().is_empty() {
+        return Err(anyhow!("MCP endpoint must not be empty"));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let header = format!("[mcp.{name}]");
+    if contents.lines().any(|line| line.trim() == header) {
+        return Err(anyhow!("MCP server '{name}' is already configured"));
+    }
+    let addition = format!("{header}\nendpoint = {}\n", endpoint.trim());
+    let separator = if contents.is_empty() || contents.ends_with("\n\n") {
+        ""
+    } else if contents.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    std::fs::write(path, format!("{contents}{separator}{addition}"))?;
+    Ok(())
+}
+
+/// Update an existing MCP endpoint. Removal is intentionally not supported at
+/// runtime: disable it in configuration and restart when it must go away.
+pub fn modify_mcp_server(path: &Path, name: &str, endpoint: &str) -> Result<()> {
+    if endpoint.trim().is_empty() {
+        return Err(anyhow!("MCP endpoint must not be empty"));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let header = format!("[mcp.{name}]");
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(start) = lines.iter().position(|line| line.trim() == header) else {
+        return Err(anyhow!("MCP server '{name}' is not configured"));
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim().starts_with('[') && line.trim().ends_with(']'))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+    let replacement = format!("endpoint = {}", endpoint.trim());
+    if let Some(line) = lines[start + 1..end]
+        .iter_mut()
+        .find(|line| line.trim_start().starts_with("endpoint"))
+    {
+        *line = replacement;
+    } else {
+        lines.insert(end, replacement);
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -671,6 +979,51 @@ mod tests {
         assert_eq!(conf.platform, "github");
         // Absent theme keeps the original orangu UI as the named classic theme.
         assert_eq!(conf.theme, "classic");
+    }
+
+    #[test]
+    fn parses_http_mcp_servers_without_treating_them_as_llms() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n\n[mcp.filesystem]\nendpoint = http://localhost:8101/mcp\ntimeout = 12\n"
+        )
+        .unwrap();
+
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(conf.llms.len(), 1);
+        assert_eq!(conf.mcp_servers.len(), 1);
+        let server = &conf.mcp_servers["filesystem"];
+        assert_eq!(server.endpoint, "http://localhost:8101/mcp");
+        assert_eq!(server.startup_timeout_seconds, 12);
+        assert_eq!(server.tool_timeout_seconds, 12);
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_configuration() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n\n[mcp.bad]\ncommand = example\n"
+        )
+        .unwrap();
+        let error = load_client_configuration(file.path()).unwrap_err();
+        assert!(error.to_string().contains("unknown key [mcp.bad].command"));
+    }
+
+    #[test]
+    fn parses_mcp_approval_modes() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n\n[mcp.safe]\nendpoint = http://localhost:8101/mcp\napproval_mode = writes\n"
+        )
+        .unwrap();
+        let conf = load_client_configuration(file.path()).unwrap();
+        assert_eq!(
+            conf.mcp_servers["safe"].approval_mode,
+            McpApprovalMode::Writes
+        );
     }
 
     #[test]
@@ -1035,5 +1388,37 @@ mod tests {
         .unwrap();
         let conf2 = load_client_configuration(file2.path()).unwrap();
         assert_eq!(conf2.embeddings_server().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn adds_and_modifies_mcp_profile_without_touching_other_sections() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu]\nserver = main\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n").unwrap();
+        add_mcp_server(file.path(), "filesystem", "http://localhost:8101/mcp").unwrap();
+        let config = load_client_configuration(file.path()).unwrap();
+        assert_eq!(
+            config.mcp_servers["filesystem"].endpoint,
+            "http://localhost:8101/mcp"
+        );
+
+        modify_mcp_server(file.path(), "filesystem", "http://localhost:8102/mcp").unwrap();
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("[main]"));
+        assert!(contents.contains("endpoint = http://localhost:8102/mcp"));
+    }
+
+    #[test]
+    fn parses_explicit_short_http_mcp_server_profile() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu]\nserver = orangu-server\n\n[orangu-server]\nendpoint = http://localhost:11434/v1\nmodel = model\n\n[qwen-server]\nendpoint = https://example.invalid/v1\nmodel = web-model\n\n[pgmoneta]\nmcp = true\nendpoint = http://localhost:8100/mcp\napproval_mode = writes\n"
+        )
+        .unwrap();
+        let config = load_client_configuration(file.path()).unwrap();
+        assert_eq!(config.llms.len(), 2);
+        let mcp = &config.mcp_servers["pgmoneta"];
+        assert_eq!(mcp.endpoint, "http://localhost:8100/mcp");
+        assert_eq!(mcp.approval_mode, McpApprovalMode::Writes);
     }
 }

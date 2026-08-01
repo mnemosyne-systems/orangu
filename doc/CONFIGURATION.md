@@ -10,12 +10,11 @@ Default lookup order:
 ## Main section
 
 The client section is named `[orangu]`. It selects the default server and
-holds client-wide settings. Each server is described in its own section,
-named by the value of `server`.
+holds client-wide settings.
 
 ```ini
 [orangu]
-server = main-server
+server = orangu-server
 model = ggml-org/gemma-4-E4B-it-GGUF
 timeout = 1800
 max_tool_rounds = 10
@@ -47,12 +46,11 @@ theme = classic
 
 ## Server sections
 
-Each server is declared in its own section. The section name (for example
-`[main-server]`) is what `[orangu].server` points to, and the section carries
-the host information for that server.
+Each server section is a valid value for `[orangu].server` and carries the host
+information for that model. `[orangu-server]` is the name written by `orangu -i`.
 
 ```ini
-[main-server]
+[orangu-server]
 role = all
 endpoint = http://localhost:8100/v1
 model = ggml-org/gemma-4-E4B-it-GGUF
@@ -80,3 +78,11 @@ Use `/server` to switch between the configured servers at runtime; Tab
 completion lists every server section.
 
 The canonical example file is `doc/etc/orangu.conf`.
+
+## MCP servers
+
+`orangu` connects only to already-running Streamable HTTP MCP servers; it never
+starts a command or manages a child process. Their tools are namespaced as
+`mcp__<server>__<tool>`. `/mcp` shows the connected servers, while `/tools`
+shows the model-facing tools. Configure a server in `[mcp.<name>]`, or set
+`mcp = true` in an existing section.

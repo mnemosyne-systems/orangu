@@ -45,6 +45,7 @@ pub(crate) async fn wait_for_response(
     let sm = Arc::clone(&streamed_state);
     let st = Arc::clone(&streamed_state);
     let stc = Arc::clone(&streamed_state);
+    let sta = Arc::clone(&streamed_state);
 
     let handle = tokio::spawn(async move {
         let mut s = real_session;
@@ -76,6 +77,18 @@ pub(crate) async fn wait_for_response(
                     if let Ok(mut state) = stc.lock() {
                         state.native_tool_calls.push(tool_call.clone());
                     }
+                },
+                move |tool_call| {
+                    let (decision, receiver) = std::sync::mpsc::channel();
+                    if let Ok(mut state) = sta.lock() {
+                        state.pending_mcp_approval =
+                            Some(crate::input::McpApprovalRequest { decision });
+                        state.output.push_str(&format!(
+                            "\n\n[MCP approval required: {}. Press y to approve or n to deny.]",
+                            tool_call.function.name
+                        ));
+                    }
+                    receiver.recv().unwrap_or(false)
                 },
             )
             .await;
@@ -283,6 +296,21 @@ async fn drive_handle(
 
                 while event::poll(std::time::Duration::ZERO)? {
                     let event = event::read()?;
+                    if let Some(request) = streamed_state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.pending_mcp_approval.clone())
+                        && let Event::Key(KeyEvent { code: KeyCode::Char(choice), .. }) = event
+                        && matches!(choice, 'y' | 'Y' | 'n' | 'N')
+                    {
+                        let approved = matches!(choice, 'y' | 'Y');
+                        let _ = request.decision.send(approved);
+                        if let Ok(mut state) = streamed_state.lock() {
+                            state.pending_mcp_approval = None;
+                        }
+                        redraw = true;
+                        continue;
+                    }
                     if is_wait_cancel_escape(&event) {
                         if escape_cancel_state.handle_escape(std::time::Instant::now()) {
                             let partial_output = streamed_state

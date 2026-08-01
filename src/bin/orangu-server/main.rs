@@ -624,6 +624,8 @@ struct Prepared {
     /// both for an ordinary build and for a bundled one that was pointed at
     /// a model on disk instead.
     bundle: Option<&'static bundle::Bundle>,
+    /// MCP profiles captured at startup for the web console's read-only view.
+    mcp_servers: Vec<config::McpConfiguration>,
     /// The GPU kernel/tuning selection this device came up with, and its
     /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
     /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
@@ -1109,6 +1111,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             ModelSource::Embedded(bundle) => Some(bundle),
             ModelSource::File(_) => None,
         },
+        mcp_servers: conf.mcp_servers,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -1204,6 +1207,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         reexec: reexec_allowed,
         delete: delete_allowed,
         bundle,
+        mcp_servers,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -1355,6 +1359,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             can_delete: delete_allowed,
             bundled: bundle.is_some(),
             loading: Default::default(),
+            mcp_servers,
         });
         let web_app = web::build_router(web_state);
         // Not joined: when `serve` returns (any shutdown path below), the

@@ -376,7 +376,7 @@ impl ChatSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn prompt<F, G, H, I>(
+    pub async fn prompt<F, G, H, I, J>(
         &mut self,
         user_input: &str,
         profile: &LlmConfiguration,
@@ -385,12 +385,14 @@ impl ChatSession {
         mut on_stream_metrics: G,
         mut on_tool_running: H,
         mut on_tool_call: I,
+        mut on_mcp_approval: J,
     ) -> Result<String>
     where
         F: FnMut(&str),
         G: FnMut(StreamMetrics),
         H: FnMut(bool),
         I: FnMut(&crate::llm::ToolCall),
+        J: FnMut(&crate::llm::ToolCall) -> bool,
     {
         self.compact_transcript();
 
@@ -441,15 +443,21 @@ impl ChatSession {
                         on_tool_running(true);
                         for tool_call in tool_calls {
                             on_tool_call(&tool_call);
-                            let rendered = match tools
-                                .execute(
-                                    &tool_call.function.name,
-                                    &tool_call.function.arguments.into_iter().collect(),
-                                )
-                                .await
+                            let rendered = if tools.requires_mcp_approval(&tool_call.function.name)
+                                && !on_mcp_approval(&tool_call)
                             {
-                                Ok(result) => result,
-                                Err(err) => format!("error: {err:#}"),
+                                "error: MCP tool call denied by user".to_string()
+                            } else {
+                                match tools
+                                    .execute(
+                                        &tool_call.function.name,
+                                        &tool_call.function.arguments.into_iter().collect(),
+                                    )
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(err) => format!("error: {err:#}"),
+                                }
                             };
 
                             self.messages

@@ -849,6 +849,37 @@ button:disabled {
   display: none;
 }
 
+#mcps-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--bg) 65%, transparent);
+}
+
+#mcps-overlay[hidden] { display: none; }
+
+#mcps-panel {
+  width: min(720px, 100%);
+  max-height: min(80vh, 640px);
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  background: var(--surface);
+  box-shadow: 0 1rem 3rem rgba(0, 0, 0, .35);
+}
+
+#mcps-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+#mcps-header h2 { margin: 0; }
+.mcps-note { color: var(--muted); font-size: .9rem; }
+#mcps-table table { width: 100%; border-collapse: collapse; }
+#mcps-table th, #mcps-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
+#mcps-table td:last-child { text-align: right; }
+#mcps-details { white-space: pre-wrap; margin: 1rem 0 0; padding: .75rem; background: var(--bg); border-radius: .5rem; }
+
 /* While an action is in flight the panel keeps its layout but stops taking
    clicks, so a double-click can't fire a delete twice. */
 #models-overlay.busy #models-panel {
