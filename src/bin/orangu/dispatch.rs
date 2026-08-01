@@ -520,6 +520,55 @@ pub(crate) fn handle_command(
             }
         }
         LocalCommand::Tools => Ok(CommandOutcome::Output(format_tools(tools))),
+        LocalCommand::Mcp(command) => match command {
+            McpSubcommand::Status => Ok(CommandOutcome::Output(tools.mcp_status())),
+            McpSubcommand::Refresh => {
+                match orangu::config::load_client_configuration(config_path) {
+                    Ok(config) => {
+                        tools.refresh_mcp(&config.mcp_servers);
+                        Ok(CommandOutcome::Output(
+                            "Refreshing MCP servers…".to_string(),
+                        ))
+                    }
+                    Err(err) => Ok(CommandOutcome::OutputError(format!(
+                        "MCP configuration error: {err:#}"
+                    ))),
+                }
+            }
+            McpSubcommand::Add { name, endpoint } => {
+                orangu::config::add_mcp_server(config_path, &name, &endpoint)
+                    .and_then(|_| orangu::config::load_client_configuration(config_path))
+                    .map(|config| {
+                        tools.refresh_mcp(&config.mcp_servers);
+                        CommandOutcome::Output(
+                            "MCP server added; refreshing MCP servers…".to_string(),
+                        )
+                    })
+                    .or_else(|err| {
+                        Ok(CommandOutcome::OutputError(format!(
+                            "MCP configuration error: {err:#}"
+                        )))
+                    })
+            }
+            McpSubcommand::Modify { name, endpoint } => {
+                orangu::config::modify_mcp_server(config_path, &name, &endpoint)
+                    .and_then(|_| orangu::config::load_client_configuration(config_path))
+                    .map(|config| {
+                        tools.refresh_mcp(&config.mcp_servers);
+                        CommandOutcome::Output(
+                            "MCP server updated; refreshing MCP servers…".to_string(),
+                        )
+                    })
+                    .or_else(|err| {
+                        Ok(CommandOutcome::OutputError(format!(
+                            "MCP configuration error: {err:#}"
+                        )))
+                    })
+            }
+            McpSubcommand::Usage => {
+                Ok(CommandOutcome::OutputError(mcp_usage_message().to_string()))
+            }
+        },
         LocalCommand::ModelInfo => {
             // The active model is marked active (green dot); every other model
             // the server advertises is listed as inactive (red dot).

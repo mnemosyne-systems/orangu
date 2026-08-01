@@ -86,13 +86,13 @@ use anyhow::Error;
 use commands::ReviewLaunch;
 use commands::{
     AutoReviewTarget, BisectSubcommand, BranchSubcommand, CommandContext, CommandOutcome,
-    CommandState, ExportTarget, LocalCommand, LocalError, PruneTarget, StashSubcommand,
-    amend_usage_message, cherry_pick_usage_message, close_usage_message, comment_usage_message,
-    commit_usage_message, create_file_usage_message, delete_file_usage_message,
-    get_comments_usage_message, grep_usage_message, issue_usage_message, merge_usage_message,
-    model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
-    prune_usage_message, pull_usage_message, restore_usage_message, server_usage_message,
-    sorted_model_names, system_prompt,
+    CommandState, ExportTarget, LocalCommand, LocalError, McpSubcommand, PruneTarget,
+    StashSubcommand, amend_usage_message, cherry_pick_usage_message, close_usage_message,
+    comment_usage_message, commit_usage_message, create_file_usage_message,
+    delete_file_usage_message, get_comments_usage_message, grep_usage_message, issue_usage_message,
+    mcp_usage_message, merge_usage_message, model_usage_message, move_file_usage_message,
+    open_file_usage_message, parse_local_command, prune_usage_message, pull_usage_message,
+    restore_usage_message, server_usage_message, sorted_model_names, system_prompt,
 };
 use dispatch::*;
 use git::{
@@ -379,9 +379,11 @@ async fn run() -> Result<()> {
             model_id: active_model_id.clone(),
             endpoint: current_endpoint.clone(),
             llms: &config.llms,
+            mcp_servers: &config.mcp_servers,
             slots: slot_registry.clone(),
         },
-    )?;
+    )
+    .await?;
     // Load the initial tab's branch from session metadata so that Alt+./, and
     // checkout_tab_branch! can restore the right branch on next tab switch.
     if let Some(branch) = load_session_branch(&initial_tab.session_id) {
@@ -431,9 +433,11 @@ async fn run() -> Result<()> {
                         model_id: active_model_id.clone(),
                         endpoint: current_endpoint.clone(),
                         llms: &config.llms,
+                        mcp_servers: &config.mcp_servers,
                         slots: slot_registry.clone(),
                     },
                 )
+                .await
             {
                 if let Some(branch) = load_session_branch(&tab.session_id) {
                     tab.current_branch = Some(branch);
@@ -745,9 +749,12 @@ async fn run() -> Result<()> {
                             model_id: active_model_id.clone(),
                             endpoint: current_endpoint.clone(),
                             llms: &config.llms,
+                            mcp_servers: &config.mcp_servers,
                             slots: slot_registry.clone(),
                         },
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(new_tab) => {
                             // No restore afterward: this is a brand-new
                             // session with nothing saved to restore.
@@ -1457,9 +1464,12 @@ async fn run() -> Result<()> {
                         model_id: active_model_id.clone(),
                         endpoint: current_endpoint.clone(),
                         llms: &config.llms,
+                        mcp_servers: &config.mcp_servers,
                         slots: slot_registry.clone(),
                     },
-                ) {
+                )
+                .await
+                {
                     Ok(new_tab) => {
                         let target = ring.open(current_tab!(), new_tab);
                         load_tab!(target);
@@ -1517,9 +1527,12 @@ async fn run() -> Result<()> {
                             model_id: active_model_id.clone(),
                             endpoint: current_endpoint.clone(),
                             llms: &config.llms,
+                            mcp_servers: &config.mcp_servers,
                             slots: slot_registry.clone(),
                         },
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(new_tab) => {
                             load_tab!(new_tab);
                             restart_sync_tasks!();

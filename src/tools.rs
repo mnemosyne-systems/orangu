@@ -50,6 +50,9 @@ pub struct ToolExecutor {
     /// see `GraphBuildStatus`. Surfaced as the Graph dot in `/auto_review`'s
     /// status bar.
     pub graph_status: Arc<Mutex<GraphBuildStatus>>,
+    /// Optional workspace-scoped MCP services. Read-only executors never
+    /// attach one, so external tools cannot bypass their safety boundary.
+    mcp: Option<Arc<crate::mcp::McpManager>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -141,7 +144,14 @@ impl ToolExecutor {
             tool_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             graph_store: Arc::new(Mutex::new(None)),
             graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
+            mcp: None,
         }
+    }
+
+    /// Attach already-initialized MCP services for this workspace.
+    pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 
     pub fn total_tool_duration(&self) -> std::time::Duration {
@@ -384,11 +394,38 @@ impl ToolExecutor {
             }),
         ));
 
+        if let Some(mcp) = &self.mcp {
+            defs.extend(mcp.definitions());
+        }
         defs
     }
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// Human-readable lifecycle state for configured MCP services.
+    pub fn mcp_status(&self) -> String {
+        self.mcp
+            .as_ref()
+            .map(|mcp| mcp.status())
+            .unwrap_or_else(|| "No MCP servers configured.".to_string())
+    }
+
+    /// Replace the live MCP services after a config change or explicit refresh.
+    pub fn refresh_mcp(
+        &self,
+        configurations: &std::collections::HashMap<String, crate::config::McpServerConfiguration>,
+    ) {
+        if let Some(mcp) = &self.mcp {
+            mcp.refresh_in_background(configurations.clone());
+        }
+    }
+
+    pub fn requires_mcp_approval(&self, name: &str) -> bool {
+        self.mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.requires_approval(name))
     }
 
     /// Expose the session-local file context cache for persistence across runs.
@@ -425,6 +462,13 @@ impl ToolExecutor {
             "run_shell_command" => self.run_shell_command(arguments).await,
             "expand_context" => self.expand_context(arguments).await,
             "graph_lookup" => self.graph_lookup(arguments),
+            _ if self.mcp.as_ref().is_some_and(|mcp| mcp.contains(name)) => {
+                self.mcp
+                    .as_ref()
+                    .expect("MCP presence checked above")
+                    .execute(name, arguments)
+                    .await
+            }
             _ => Err(anyhow!("unknown tool '{}'", name)),
         };
         if result.is_ok()

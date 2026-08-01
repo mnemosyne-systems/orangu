@@ -63,6 +63,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
 
         "/verbosity" => Some(LocalCommand::SetVerbosity("")),
         "/tools" => Some(LocalCommand::Tools),
+        "/mcp" => Some(LocalCommand::Mcp(McpSubcommand::Status)),
         "/session" => Some(LocalCommand::Session(None)),
         "/workspace" => Some(LocalCommand::Workspace(None)),
         "/list_files" => Some(LocalCommand::ListFiles),
@@ -122,6 +123,37 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/skills" => Some(LocalCommand::Skills),
         "/graph" => Some(LocalCommand::Graph),
         _ => {
+            if let Some(args) = input.strip_prefix("/mcp ") {
+                let args = args.trim();
+                if args.eq_ignore_ascii_case("refresh") {
+                    return Some(LocalCommand::Mcp(McpSubcommand::Refresh));
+                }
+                if let Some(rest) = args.strip_prefix("add ") {
+                    let mut words = rest.split_whitespace();
+                    return Some(match (words.next(), words.next()) {
+                        (Some(name), Some(endpoint)) if words.next().is_none() => {
+                            LocalCommand::Mcp(McpSubcommand::Add {
+                                name: Cow::Borrowed(name),
+                                endpoint: Cow::Borrowed(endpoint),
+                            })
+                        }
+                        _ => LocalCommand::Mcp(McpSubcommand::Usage),
+                    });
+                }
+                if let Some(rest) = args.strip_prefix("modify ") {
+                    let mut words = rest.split_whitespace();
+                    return Some(match (words.next(), words.next()) {
+                        (Some(name), Some(endpoint)) if words.next().is_none() => {
+                            LocalCommand::Mcp(McpSubcommand::Modify {
+                                name: Cow::Borrowed(name),
+                                endpoint: Cow::Borrowed(endpoint),
+                            })
+                        }
+                        _ => LocalCommand::Mcp(McpSubcommand::Usage),
+                    });
+                }
+                return Some(LocalCommand::Mcp(McpSubcommand::Usage));
+            }
             if let Some(args) = input.strip_prefix("/session ") {
                 let uuid = args.trim();
                 return Some(LocalCommand::Session(if uuid.is_empty() {

@@ -151,6 +151,7 @@ pub fn run_explorer_subagent<'a>(
                 |_| {},
                 |_| {},
                 |_| {},
+                |_| false,
             )
             .await?;
 
