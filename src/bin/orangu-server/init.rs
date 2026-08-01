@@ -1086,16 +1086,24 @@ mod tests {
     fn hints_the_remainder_of_a_directory_being_typed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("models-directory")).unwrap();
-        let typed = format!("{}/models-dir", dir.path().display());
+        // `MAIN_SEPARATOR`, not a literal `/`: rustyline's own
+        // `filename_complete` splits the typed path on that constant alone,
+        // so on Windows a `/` is not a separator at all — the whole string
+        // reads as one file name in the current directory, nothing matches,
+        // and there is no hint to assert about.
+        let sep = std::path::MAIN_SEPARATOR;
+        let typed = format!("{}{sep}models-dir", dir.path().display());
 
         let history = DefaultHistory::new();
         let ctx = RlContext::new(&history);
         let hint = dir_hinter()
             .hint(&typed, typed.len(), &ctx)
             .expect("a real subdirectory prefix should ghost the rest of its name");
+        // A directory's completion carries a trailing separator of its own,
+        // so this is a prefix check rather than an equality one.
         assert!(
             format!("{typed}{hint}")
-                .starts_with(&format!("{}/models-directory", dir.path().display())),
+                .starts_with(&format!("{}{sep}models-directory", dir.path().display())),
             "hint {hint:?} did not complete {typed:?}"
         );
     }

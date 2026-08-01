@@ -186,6 +186,13 @@ pub fn adopt_or_bind(_fd: Option<i32>, addr: &str) -> Result<std::net::TcpListen
 /// `--daemon` process has since moved to `/`, so a relative one would mean
 /// something else), and the role as an explicit flag (it may have been
 /// answered at an interactive prompt rather than passed at all).
+// Every field below feeds `argv`, and `argv` feeds `exec` — which on a
+// platform without `execve` is a stub that only reports it cannot run. The
+// type still has to exist there (whether a handover is possible is decided
+// at run time, by `supported`), so the fields are genuinely unused rather
+// than merely appearing so, and saying that beats a Windows release build
+// carrying three dead-code warnings from a module that is working correctly.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct Handover {
     /// This binary. `current_exe`, not `argv[0]`, which a caller can set to
     /// anything and a `PATH` lookup may not resolve the same way twice.
@@ -226,6 +233,7 @@ impl Handover {
         &self.current_model
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn argv(&self, model: &str) -> Vec<OsString> {
         let mut argv: Vec<OsString> = vec![model.into()];
         if let Some(config) = &self.config {
@@ -241,6 +249,7 @@ impl Handover {
         argv
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn inherit_value(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(fd) = self.fds.api {
@@ -297,11 +306,17 @@ impl Handover {
     }
 
     #[cfg(not(unix))]
-    pub fn exec(&self, _model: &str, _fallback: Option<&str>) -> anyhow::Error {
-        anyhow!("loading a different model needs execve, which this platform does not have")
+    pub fn exec(&self, model: &str, _fallback: Option<&str>) -> anyhow::Error {
+        // Names both the target and this binary, which is also what keeps
+        // `exe` from reading as dead on a platform whose `exec` is a stub.
+        anyhow!(
+            "cannot load '{model}': replacing {} needs execve, which this platform does not have",
+            self.exe.display()
+        )
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn role_flag(role: Role) -> &'static str {
     match role {
         Role::All => "--all",
