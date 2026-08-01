@@ -249,14 +249,17 @@ impl CpuBackend {
         y
     }
 
-    /// [`Self::matmul_fused`]'s decode form: the GEMV kernel
-    /// ([`vecdot::dot_row`]) for *every* token, whatever `n_tokens` is.
+    /// [`Self::matmul_fused`]'s decode form: the GEMV kernel that function
+    /// would pick at `n_tokens == 1` ([`vecdot::dot_k_row`] or
+    /// [`vecdot::dot_row`]), run once per token whatever `n_tokens` is.
     ///
     /// A decode batch is `n` sequences each contributing a single token, so
     /// each row's result has to match what that sequence would have got
-    /// decoding alone — see [`Backend::matmul_decode`]. Taking the same
-    /// `dot_row` per `(row, token)` pair as the `n_tokens == 1` path makes
-    /// that equality bit-for-bit by construction rather than by tolerance.
+    /// decoding alone — see [`Backend::matmul_decode`]. Taking the same GEMV
+    /// per `(row, token)` pair as the `n_tokens == 1` path makes that equality
+    /// bit-for-bit by construction rather than by tolerance, which is also why
+    /// the kernel choice below has to track `matmul_fused`'s branch for
+    /// branch.
     ///
     /// Only the *unpack* half of the GEMM win is given up, not the whole of
     /// it: the row stays parallelized across workers and each packed row is
@@ -273,22 +276,40 @@ impl CpuBackend {
         }
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
-
-        let acts: Vec<vecdot::ActQ8> = (0..n_tokens)
-            .map(|t| vecdot::quantize_act(&x[t * in_dim..(t + 1) * in_dim]))
-            .collect();
+        let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
 
         // Transposed accumulation and the row-major transpose back, exactly
         // as `matmul_fused` does — see its comments.
         let mut yt = vec![0f32; out_dim * n_tokens];
-        yt.par_chunks_mut(n_tokens)
-            .enumerate()
-            .for_each(|(o, dst)| {
-                let row = &raw[o * row_bytes..(o + 1) * row_bytes];
-                for (slot, act) in dst.iter_mut().zip(&acts) {
-                    *slot = vecdot::dot_row(ggml_type, row, act);
-                }
-            });
+
+        // Which GEMV, branch for branch as `matmul_fused` picks it at
+        // `n_tokens == 1`. The k-row kernel quantizes activations once per
+        // super-block where `dot_row` does it once per 32, so the two do not
+        // round alike — taking the wrong one here would break the very
+        // equality this function exists to guarantee.
+        if vecdot::supports_k_row(ggml_type, in_dim) {
+            let acts: Vec<vecdot::ActQ8KRow> = (0..n_tokens)
+                .map(|t| vecdot::quantize_act_k_row(&x[t * in_dim..(t + 1) * in_dim]))
+                .collect();
+            yt.par_chunks_mut(n_tokens)
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    for (slot, act) in dst.iter_mut().zip(&acts) {
+                        *slot = vecdot::dot_k_row(ggml_type, row(o), act);
+                    }
+                });
+        } else {
+            let acts: Vec<vecdot::ActQ8> = (0..n_tokens)
+                .map(|t| vecdot::quantize_act(&x[t * in_dim..(t + 1) * in_dim]))
+                .collect();
+            yt.par_chunks_mut(n_tokens)
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    for (slot, act) in dst.iter_mut().zip(&acts) {
+                        *slot = vecdot::dot_row(ggml_type, row(o), act);
+                    }
+                });
+        }
 
         if n_tokens == 1 {
             return Some(yt);
@@ -483,9 +504,10 @@ mod tests {
     /// It is [`Backend::matmul_decode`] that owes this, not [`Backend::
     /// matmul`] — the latter is free to pick the faster multi-token GEMM
     /// kernels, which round differently (see `matmul_fused_decode`). Both
-    /// fused kernel families are covered: `Q8_0` reaches the flat GEMM and
-    /// `Q4_K` the K-quant GEMM, and each rounds differently from the GEMV
-    /// in its own way.
+    /// GEMV kernels a decode batch can land on are covered: `Q8_0` takes
+    /// `dot_row`'s per-32 activation scale and `Q4_K` `dot_k_row`'s
+    /// per-super-block one, so a decode path that picks the other one for
+    /// either family fails here.
     #[test]
     fn decode_batch_is_bit_identical_to_deciding_each_token_alone() {
         for (ggml_type, in_dim) in [(GGML_TYPE_Q8_0, 128), (GGML_TYPE_Q4_K, 512)] {
