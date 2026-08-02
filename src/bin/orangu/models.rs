@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelsResponse {
@@ -139,18 +140,91 @@ pub(crate) struct ServerReachability {
     pub available_models: Vec<String>,
 }
 
+/// What each endpoint's last *successful* probe found it to be.
+///
+/// The status refresh runs on a timer — every 60 s idle, and every 500 ms while
+/// the startup git sync is in flight — and `GET /v1/coordinator` is a route
+/// only an orangu-coordinator serves. Asking a plain `orangu-server` every
+/// cycle is a 404 every cycle, and a hosted OpenAI-compatible endpoint answers
+/// it no more usefully. Remembering the answer halves the requests a poll
+/// costs, which is worth little on localhost and rather more over a network.
+///
+/// Deliberately **not** a permanent decision. An entry is dropped the moment an
+/// endpoint stops answering, so whatever comes back at that address — a plain
+/// server restarted as a coordinator, or the coordinator that was not up yet
+/// when the client started — is identified afresh rather than assumed. It is
+/// also dropped by `/server` (see [`forget_endpoint_kind`]), which is where a
+/// user asks about the connection itself.
+///
+/// Keys are the normalized endpoint (see `normalized_openai_endpoint`), since
+/// the same server reaches this both as the live `current_endpoint`, which is
+/// already normalized, and as a raw `profile.endpoint` from startup failover.
+fn endpoint_kind_memo() -> &'static std::sync::Mutex<HashMap<String, bool>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+pub(crate) fn remembered_kind(endpoint: &str) -> Option<bool> {
+    let key = normalized_openai_endpoint(endpoint);
+    endpoint_kind_memo()
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&key).copied())
+}
+
+fn remember_kind(endpoint: &str, is_coordinator: Option<bool>) {
+    let key = normalized_openai_endpoint(endpoint);
+    if let Ok(mut memo) = endpoint_kind_memo().lock() {
+        match is_coordinator {
+            Some(kind) => {
+                memo.insert(key, kind);
+            }
+            None => {
+                memo.remove(&key);
+            }
+        }
+    }
+}
+
+/// Forget what an endpoint was last found to be, so the next status refresh
+/// identifies it again from scratch.
+///
+/// Called by `/server`, in both its forms. Listing the servers or selecting one
+/// is the moment a user is asking about the connection rather than working
+/// through it, and it is also when the answer is most likely to have just
+/// changed — a coordinator started since launch, a plain server restarted as
+/// one. The memo exists to keep an unchanging answer from being re-asked on a
+/// timer, not to outlast a direct question about it.
+pub(crate) fn forget_endpoint_kind(endpoint: &str) {
+    remember_kind(endpoint, None);
+}
+
+/// Seeds the memo for tests in other modules — the real writes only ever
+/// happen in [`probe_server_reachability`], from an answer off the wire.
+#[cfg(test)]
+pub(crate) fn remember_kind_for_test(endpoint: &str, is_coordinator: bool) {
+    remember_kind(endpoint, Some(is_coordinator));
+}
+
 async fn probe_server_reachability(
     http_client: &reqwest::Client,
     endpoint: &str,
     api_key: Option<&str>,
 ) -> ServerReachability {
-    let coordinator = probe_coordinator(http_client, endpoint, api_key).await;
-    if coordinator.is_coordinator {
-        return ServerReachability {
-            is_coordinator: true,
-            reachable: true,
-            available_models: coordinator.models,
-        };
+    // A known-plain endpoint skips the coordinator probe entirely: `/v1/models`
+    // below is then both the model list and the health check, exactly as it
+    // already was on this path.
+    if remembered_kind(endpoint) != Some(false) {
+        let coordinator = probe_coordinator(http_client, endpoint, api_key).await;
+        if coordinator.is_coordinator {
+            remember_kind(endpoint, Some(true));
+            return ServerReachability {
+                is_coordinator: true,
+                reachable: true,
+                available_models: coordinator.models,
+            };
+        }
     }
     match models_request(http_client, endpoint, api_key).send().await {
         Ok(response) if response.status().is_success() => {
@@ -159,17 +233,22 @@ async fn probe_server_reachability(
                 .await
                 .map(|models| models.model_ids())
                 .unwrap_or_default();
+            remember_kind(endpoint, Some(false));
             ServerReachability {
                 is_coordinator: false,
                 reachable: true,
                 available_models,
             }
         }
-        _ => ServerReachability {
-            is_coordinator: false,
-            reachable: false,
-            available_models: Vec::new(),
-        },
+        _ => {
+            // Unreachable says nothing about what will be there next time.
+            remember_kind(endpoint, None);
+            ServerReachability {
+                is_coordinator: false,
+                reachable: false,
+                available_models: Vec::new(),
+            }
+        }
     }
 }
 
@@ -549,6 +628,8 @@ mod tests {
     use orangu::config::load_client_configuration;
     use orangu::tui::HeaderStatus;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A minimal stub that answers `/v1/models` (and any other path) with a
@@ -595,6 +676,151 @@ mod tests {
             model_ok: orangu::tui::ConnStatus::from_bool(model_ok),
             is_coordinator: false,
         }
+    }
+
+    /// A stub that records which paths it was asked for, so a *count* can be
+    /// asserted rather than just an outcome. Returns the endpoint and a handle
+    /// to the log; `alive` can be cleared to make it start refusing.
+    async fn spawn_counting_stub() -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicBool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let (log_task, alive_task) = (log.clone(), alive.clone());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (log, alive) = (log_task.clone(), alive_task.clone());
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("?").to_string();
+                    log.lock().unwrap().push(path.clone());
+                    if !alive.load(Ordering::SeqCst) {
+                        // Refuse the way a stopped server does.
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    // Only `/v1/models` exists here, as on a plain
+                    // orangu-server: `/v1/coordinator` is a 404.
+                    let body = r#"{"object":"list","data":[{"id":"m"}]}"#;
+                    let head = if path.ends_with("/v1/models") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    if path.ends_with("/v1/models") {
+                        let _ = stream.write_all(body.as_bytes()).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), log, alive)
+    }
+
+    fn count(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.contains(needle))
+            .count()
+    }
+
+    /// `GET /v1/coordinator` is a route only an orangu-coordinator serves, and
+    /// the status refresh runs on a timer. Once an endpoint has answered as a
+    /// plain server, asking again every cycle is a 404 every cycle.
+    #[tokio::test]
+    async fn a_plain_server_is_asked_whether_it_is_a_coordinator_only_once() {
+        let (endpoint, log, _alive) = spawn_counting_stub().await;
+        let client = reqwest::Client::new();
+
+        for _ in 0..5 {
+            let r = super::probe_server_reachability(&client, &endpoint, None).await;
+            assert!(r.reachable);
+            assert!(!r.is_coordinator);
+        }
+
+        assert_eq!(
+            count(&log, "/v1/coordinator"),
+            1,
+            "{:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(
+            count(&log, "/v1/models"),
+            5,
+            "the health check must not be skipped"
+        );
+    }
+
+    /// And the memo must not be a permanent verdict: whatever comes back at an
+    /// address after an outage — a coordinator this time, say — has to be
+    /// identified afresh rather than assumed to be what was there before.
+    #[tokio::test]
+    async fn an_outage_makes_the_next_probe_identify_the_endpoint_again() {
+        let (endpoint, log, alive) = spawn_counting_stub().await;
+        let client = reqwest::Client::new();
+
+        super::probe_server_reachability(&client, &endpoint, None).await;
+        assert_eq!(count(&log, "/v1/coordinator"), 1);
+
+        alive.store(false, Ordering::SeqCst);
+        let down = super::probe_server_reachability(&client, &endpoint, None).await;
+        assert!(!down.reachable, "the stub should be refusing now");
+
+        alive.store(true, Ordering::SeqCst);
+        let back = super::probe_server_reachability(&client, &endpoint, None).await;
+        assert!(back.reachable);
+        assert_eq!(
+            count(&log, "/v1/coordinator"),
+            2,
+            "the endpoint was assumed to be what it used to be"
+        );
+    }
+
+    /// `/server` asks a direct question about the connection, so it must beat
+    /// the memo: the endpoint is identified again on the next probe.
+    #[tokio::test]
+    async fn forgetting_an_endpoint_makes_the_next_probe_identify_it_again() {
+        let (endpoint, log, _alive) = spawn_counting_stub().await;
+        let client = reqwest::Client::new();
+
+        super::probe_server_reachability(&client, &endpoint, None).await;
+        super::probe_server_reachability(&client, &endpoint, None).await;
+        assert_eq!(
+            count(&log, "/v1/coordinator"),
+            1,
+            "memo should be in effect"
+        );
+
+        super::forget_endpoint_kind(&endpoint);
+        super::probe_server_reachability(&client, &endpoint, None).await;
+        assert_eq!(
+            count(&log, "/v1/coordinator"),
+            2,
+            "/server did not override the memo"
+        );
+    }
+
+    /// The live connection is normalized and startup failover's is not, so a
+    /// memo keyed on the raw spelling would answer for one and not the other.
+    #[tokio::test]
+    async fn an_endpoint_is_remembered_however_it_is_spelled() {
+        let (endpoint, _log, _alive) = spawn_counting_stub().await;
+        let client = reqwest::Client::new();
+        let unnormalized = endpoint.trim_end_matches("/v1").to_string();
+
+        super::probe_server_reachability(&client, &unnormalized, None).await;
+        assert_eq!(super::remembered_kind(&endpoint), Some(false));
+
+        super::forget_endpoint_kind(&unnormalized);
+        assert_eq!(super::remembered_kind(&endpoint), None);
     }
 
     #[test]

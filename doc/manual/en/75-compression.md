@@ -96,6 +96,32 @@ When processing `git diff` outputs, orangu bypasses raw text truncation and uses
 - **Context Trimming:** Squeezes unchanged lines surrounding additions and deletions down to exactly 2 lines.
 - **Intelligent Hunk Scoring:** Scores diff hunks based on line density and priority keywords (e.g., `error`, `panic`, `secret`), preserving only the most highly-scored blocks.
 
+A hunk that arrives with no `diff --git` header above it is attributed to a
+synthetic `(unnamed)` file rather than discarded, so a hand-built diff still
+gets capped and counted like any other.
+
+### Workspace change notification (`world_state_changes`)
+
+Before each interactive turn, orangu compares the working tree against `HEAD`
+and, when it has changed since the last turn, prepends a `world_state_changes`
+fragment carrying the compressed diff. This is a **change notification**, not a
+document delivery, and it is bounded on three levels:
+
+- **Untracked files** are rendered as proper `diff --git` new-file entries, so
+  the file cap and hunk scoring above apply to them like anything else.
+- A new file larger than **4 KiB** is *announced* (path and size) rather than
+  inlined, and is never read from disk at all — only `stat`ed. Below that
+  threshold, at most **80 lines** are inlined. Reading a large new file is what
+  `show_file` and the other workspace tools are for.
+- The rendered fragment is finally cut to `world_state_max_bytes` in
+  `[orangu]` (default: 8192; `0` disables the cap), on a line boundary, with a
+  marker saying how much was left out.
+
+The budget is a **prompt-size** budget, not a memory one. Every byte in this
+fragment is prefilled by the server on the turn the tree changes, so an
+unbounded diff is unbounded time-to-first-token — a workspace full of large
+untracked notes could otherwise put all of them into every prompt.
+
 ### Array/Log Anchor Selector
 
 For raw shell outputs, if orangu detects a massive JSON array or highly repetitive log lines (determined by matching line prefixes), it activates an Anchor Selector. This perfectly preserves the first 3 lines and the last 3 lines while dynamically dropping the massive middle section.
@@ -106,7 +132,30 @@ All strings processed by orangu (file reads, shell outputs) undergo a fast regex
 
 ### Transcript Compaction (Live Zone)
 
-Orangu continuously grooms the active conversation transcript. Right before sending a prompt to the LLM, it scans backwards and permanently evicts massive tool outputs (like 10,000-line shell errors) that are older than 3 user turns, replacing them with a tiny stub. This guarantees the context window never permanently fills up with dead tool artifacts.
+Right before sending a prompt, orangu grooms the active transcript: tool
+outputs older than 3 user turns (10,000-line shell errors and the like) are
+permanently replaced with a tiny stub, and `world_state_changes` fragments from
+earlier turns are dropped — each described the working tree at a moment that has
+since passed. This keeps the context window from filling with dead artifacts.
+
+**It does not run every turn, and that is deliberate.** Compaction rewrites
+history the *server* has already processed, and a server's prefix cache matches
+on a prefix — so the first rewritten message forces everything after it to be
+prefilled again. Evicting a message also shrinks it, which drags the *next*
+turn's divergence point back towards the start of the transcript. Compacting
+eagerly, one message at a time, therefore costs far more than it saves: measured
+over fourteen tool-using turns it produced **3.5× more prefill work** than never
+compacting at all, with nine consecutive turns reusing almost nothing.
+
+So a pass runs only when it can reclaim at least **half the transcript** (and at
+least 4 KiB). Paying one re-prefill to halve the transcript means the next pass
+cannot come due until it has roughly doubled again, so compaction gets rarer as
+a conversation grows rather than arriving every turn. On the same workload that
+is one expensive turn in fourteen instead of nine, for **2.7× less re-prefill**
+than the eager version — while still bounding the context, which never
+compacting does not.
+
+Nothing about *what* gets compacted changed; only when.
 
 ### Metrics & `/usage`
 

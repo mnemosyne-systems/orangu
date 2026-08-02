@@ -31,6 +31,7 @@
 #![recursion_limit = "256"]
 
 mod config;
+mod device_lost;
 mod engine;
 mod http;
 mod init;

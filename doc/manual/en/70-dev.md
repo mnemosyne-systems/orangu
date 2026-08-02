@@ -14,10 +14,17 @@
 
 ## Prompt Construction & KV Caching
 
-Orangu is specifically optimized for local LLMs (served by `orangu-server`) which rely on exact token prefix matching to reuse KV cache and avoid massive prefill latencies. When developing features that touch `ChatSession`, you must preserve this cache:
+Orangu is optimized for local LLMs (served by `orangu-server`), which reuse a KV cache by matching an exact **token prefix**. When developing features that touch `ChatSession`, the rule that matters is:
 
-1. **Append-Only System Updates**: When updating the system prompt mid-session (e.g., changing workspaces or verbosity), `ChatSession::set_system_prompt()` appends the new instructions as a `user` message with a `[System Update]` prefix. It **never** mutates the initial system message (`messages[0]`). Mutating the first message would instantly destroy the prefix cache for the entire conversation.
-2. **In-Place Tool Eviction**: When context limits are reached, `compact_transcript` replaces old tool outputs with a tiny stub `[Tool output evicted...]`. Because this mutation happens in-place further down the array, it perfectly preserves the KV cache prefix for all messages that preceded it.
+> Editing a message costs a re-prefill of that message **and everything after it**. Appending costs nothing.
+
+Two consequences that are easy to get wrong:
+
+1. **An in-place edit is not free just because it is not the first message.** `compact_transcript` replaces old tool outputs with a stub, and the prefix *before* the edit does survive — but everything after it is processed again. Worse, the stub is *shorter* than what it replaced, so the next turn's divergence point lands even earlier. Compacting eagerly, one message per turn, measured 3.5× more prefill than never compacting at all. Compaction therefore runs only when a pass can reclaim at least half the transcript, so the cost is paid once per doubling rather than once per turn. See the Compression chapter.
+
+2. **Not every edit is worth avoiding.** `set_system_prompt` rewrites `messages[0]`, which does discard the whole conversation's cache. It used to append the new prompt as a `user` message prefixed `[System Update]` to dodge that, and the dodge was worse than the disease: the model got its own instructions in the user's voice while the real system message still held the superseded prompt. The rewrite is affordable because of *when* it runs — only `/server` (which changes endpoint, so that cache is cold anyway) and `/verbosity` (one explicit command, paid once). An unchanged prompt is left untouched.
+
+The general shape: prefer appending; when you must edit, edit rarely and be able to say what the edit buys.
 
 ## Development workflow
 

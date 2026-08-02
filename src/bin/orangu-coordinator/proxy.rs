@@ -133,6 +133,32 @@ pub(crate) fn implied_role_for_path(path: &str) -> Option<&'static str> {
     path.ends_with("/v1/embeddings").then_some("embeddings")
 }
 
+/// One attempt at forwarding the request to `target`, with every header
+/// that isn't hop-by-hop carried over unchanged.
+///
+/// Split out of [`proxy`] so the same attempt can be made twice — see its
+/// retry path — from one description of what "forward it" means, rather
+/// than two copies that could drift apart in which headers they pass on.
+async fn send_upstream(
+    coordinator: &Coordinator,
+    method: &Method,
+    target: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut request = coordinator
+        .http_client()
+        .request(method.clone(), target)
+        .body(body);
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    request.send().await
+}
+
 pub async fn proxy(
     State(coordinator): State<Arc<Coordinator>>,
     method: Method,
@@ -180,25 +206,46 @@ pub async fn proxy(
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let target = format!("{origin}{path_and_query}");
 
-    let mut request = coordinator
-        .http_client()
-        .request(method, &target)
-        .body(body);
-    for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) {
-            continue;
-        }
-        request = request.header(name, value);
-    }
-
-    let upstream = match request.send().await {
+    let upstream = match send_upstream(&coordinator, &method, &target, &headers, body.clone()).await
+    {
         Ok(response) => response,
-        Err(err) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("orangu-coordinator: failed to reach {target}: {err}"),
-            )
-                .into_response();
+        // The child was alive when `ensure_active` checked and gone by the
+        // time this request reached it — the window a profile's
+        // `orangu-server` exiting on its own (a lost GPU device, an OOM
+        // kill, an operator's `kill`) always leaves. Nothing has been
+        // written back to the client yet, so the request is still whole and
+        // safe to send again: bring the profile back up and retry it
+        // exactly once. A second failure is reported rather than retried —
+        // at that point the profile is not coming back on its own, and
+        // retrying forever would just hold the caller open.
+        //
+        // `ensure_reachable`, not `ensure_active`: the child is dead but
+        // has not necessarily been *reported* dead yet this soon after the
+        // connection failed, and asking the question that can lag is how
+        // the retry ends up in the same closed port. See its doc comment.
+        Err(first) => {
+            let Ok(origin) = coordinator.ensure_reachable(&entry).await else {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("orangu-coordinator: failed to reach {target}: {first}"),
+                )
+                    .into_response();
+            };
+            let target = format!("{origin}{path_and_query}");
+            match send_upstream(&coordinator, &method, &target, &headers, body).await {
+                Ok(response) => response,
+                Err(retry) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "orangu-coordinator: failed to reach {target}: {retry} \
+                             (after restarting '{}', which had stopped: {first})",
+                            entry.name
+                        ),
+                    )
+                        .into_response();
+                }
+            }
         }
     };
 
@@ -220,6 +267,197 @@ pub async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in `orangu-server`: answers every request `200 OK` — except
+    /// the `nth_to_drop`-th request to `/v1/chat/completions` and the
+    /// `nth_probe_to_drop`-th to `/v1/models`, whose connections it closes
+    /// without a response, which is exactly what a child that has just
+    /// exited (a lost GPU device, an OOM kill, a stray `kill`) looks like
+    /// from the coordinator's side. Pass `0` for either to never drop it.
+    ///
+    /// Handles requests one at a time, reading each one's `Content-Length`
+    /// body in full — a proxied POST that got a response before its body
+    /// was read would report as its own kind of connection error and prove
+    /// nothing about the retry.
+    async fn flaky_upstream(
+        listener: tokio::net::TcpListener,
+        nth_to_drop: usize,
+        nth_probe_to_drop: usize,
+    ) {
+        let mut chat_requests = 0usize;
+        let mut probes = 0usize;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            loop {
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                // Read exactly the request head; the body (if any) follows.
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => request.push(byte[0]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && stream.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+
+                if head.starts_with("POST /v1/chat/completions") {
+                    chat_requests += 1;
+                    if chat_requests == nth_to_drop {
+                        // Gone: no response at all, connection closed.
+                        drop(stream);
+                        break;
+                    }
+                }
+                if head.starts_with("GET /v1/models") {
+                    probes += 1;
+                    if probes == nth_probe_to_drop {
+                        drop(stream);
+                        break;
+                    }
+                }
+                let payload = b"{\"ok\":true}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_err()
+                    || stream.write_all(payload).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A request that reaches a profile's `orangu-server` just as it goes
+    /// away is sent again once, not reported as a failure.
+    ///
+    /// This is the window `ensure_active`'s liveness check cannot close:
+    /// the child is alive when it is checked and gone microseconds later,
+    /// which is precisely what `orangu-server` exiting on a lost GPU device
+    /// does under a request. Nothing has been written back to the caller at
+    /// that point, so the request is still whole — the fix is to restart and
+    /// resend it, and what the caller sees is a slow answer rather than a
+    /// `502`.
+    #[tokio::test]
+    async fn a_request_that_loses_its_server_is_retried_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The first chat request is dropped; every `/v1/models` probe is
+        // answered, so the profile is still reachable and must NOT be
+        // restarted — the retry alone is the whole recovery.
+        tokio::spawn(flaky_upstream(listener, 1, 0));
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nstartup_timeout = 10\n\n\
+             [main]\nrole = all\nmodel = org/gemma\nhost = 127.0.0.1\nport = {port}\n"
+        )
+        .unwrap();
+        let config = crate::config::load_coordinator_configuration(file.path()).unwrap();
+
+        // A "server" that just stays alive: the fake upstream above is what
+        // actually answers, so the spawned child only has to not exit.
+        use std::os::unix::fs::PermissionsExt;
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        write!(script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let script = script.into_temp_path().keep().unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
+        let response = proxy(
+            State(coordinator.clone()),
+            Method::POST,
+            "/v1/chat/completions".parse::<Uri>().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"org/gemma"}"#),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the dropped request should have been retried, not reported as a 502"
+        );
+
+        coordinator.shutdown().await;
+        std::fs::remove_file(&script).ok();
+    }
+
+    /// The same retry, when the profile really is gone: the request fails,
+    /// the reachability probe that follows fails too, so the profile is
+    /// restarted before the request is sent again.
+    ///
+    /// This is the case `try_wait` alone gets wrong. A child killed
+    /// milliseconds ago is not reported as exited yet, so
+    /// `ensure_active` — which trusts that answer — hands back the origin of
+    /// a process that is already gone, and the retry lands in the same
+    /// closed port. Observed against a real profile before
+    /// `ensure_reachable` existed; this test is that observation, made
+    /// cheap: the second `/v1/models` probe (the reachability check) is
+    /// refused, exactly as a dead child would refuse it.
+    #[tokio::test]
+    async fn a_profile_that_stopped_answering_is_restarted_before_the_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Probe 1 is the initial startup health check (answered); probe 2 is
+        // the reachability check after the dropped chat request (refused,
+        // so a restart follows); probe 3 is the restarted profile's own
+        // health check (answered).
+        tokio::spawn(flaky_upstream(listener, 1, 2));
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nstartup_timeout = 10\n\n\
+             [main]\nrole = all\nmodel = org/gemma\nhost = 127.0.0.1\nport = {port}\n"
+        )
+        .unwrap();
+        let config = crate::config::load_coordinator_configuration(file.path()).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        write!(script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let script = script.into_temp_path().keep().unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
+        let response = proxy(
+            State(coordinator.clone()),
+            Method::POST,
+            "/v1/chat/completions".parse::<Uri>().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"org/gemma"}"#),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unreachable profile must be restarted, then the request re-sent"
+        );
+
+        coordinator.shutdown().await;
+        std::fs::remove_file(&script).ok();
+    }
 
     #[test]
     fn extracts_model_field_from_json_body() {

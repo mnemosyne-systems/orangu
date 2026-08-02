@@ -144,7 +144,6 @@ async fn drive_handle(
     } = wait_context;
 
     let mut handle = handle;
-    let tokenizer = cl100k_base().ok();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut thinking_frame = 0usize;
     let thinking_started = std::time::Instant::now();
@@ -358,7 +357,22 @@ async fn drive_handle(
                                 }
                             }
                             InputResult::Refresh => {}
-                            InputResult::Quit => return Ok(WaitResult::Quit),
+                            InputResult::Quit => {
+                                // Same restore the ESC-cancel branch above
+                                // does, and for the same reason: `session`
+                                // is still the empty placeholder left by the
+                                // `mem::replace` that moved the real one into
+                                // the background task, and the caller saves
+                                // `session.messages()` on the way out. Without
+                                // this, quitting mid-request writes a session
+                                // that does not reflect the conversation —
+                                // and leaves the in-flight prompt as the last
+                                // thing a resume replays.
+                                let mut restored = ChatSession::new("");
+                                restored.restore(saved_messages);
+                                *session = restored;
+                                return Ok(WaitResult::Quit);
+                            }
                             // Park the stream in a background task and switch tabs;
                             // the LLM keeps running while the user works elsewhere.
                             outcome @ (InputResult::WorkspacePrevious
@@ -394,7 +408,6 @@ async fn drive_handle(
                         current_tool_running_since,
                         elapsed,
                         thinking_frame,
-                        tokenizer.as_ref(),
                     );
                     let mut parsed_state = crate::input::OutputState::default();
                     if last_rendered_output.is_empty() {
@@ -686,13 +699,23 @@ fn live_tab_statuses(
         .collect()
 }
 
+/// The left-hand status while a request is in flight: a tool's runtime, the
+/// prefill bar, or the decode rate.
+///
+/// The rate comes from the server (`timings.predicted_per_second`, requested
+/// with `timings_per_token`) and from nowhere else. There used to be a
+/// fallback that re-ran a `tiktoken` encode over the **whole accumulated
+/// answer** on every 50 ms redraw — O(n²) in response length, and wrong
+/// besides: it divided the answer's tokens by the whole *turn's* elapsed
+/// time, prefill included, so a turn with a 12-second prefill and a five-token
+/// answer displayed `0.1t/s`. When the server says nothing, this now says
+/// nothing about the rate rather than making a number up.
 pub(crate) fn render_left_status(
     rendered_output: &str,
     metrics: &StreamMetrics,
     tool_running_since: Option<std::time::Instant>,
     elapsed: std::time::Duration,
     frame: usize,
-    tokenizer: Option<&tiktoken_rs::CoreBPE>,
 ) -> Option<orangu::tui::StatusFragment> {
     if let Some(tool_start) = tool_running_since {
         return Some(render_tool_running_status(frame, tool_start.elapsed()));
@@ -705,23 +728,10 @@ pub(crate) fn render_left_status(
         return Some(render_thinking_status(frame, elapsed));
     }
 
-    if let Some(rate) = metrics
-        .predicted_per_second
-        .filter(|rate| *rate > 0.0 && !rendered_output.is_empty())
-    {
-        return Some(render_working_status(frame, rate, elapsed));
+    match metrics.predicted_per_second.filter(|rate| *rate > 0.0) {
+        Some(rate) => Some(render_working_status(frame, rate, elapsed)),
+        None => Some(render_thinking_status(frame, elapsed)),
     }
-
-    tokenizer.and_then(|tokenizer| {
-        let token_count = tokenizer.encode_with_special_tokens(rendered_output).len();
-        let elapsed_secs = elapsed.as_secs_f64();
-        (token_count > 0 && elapsed_secs > 0.0).then(|| {
-            orangu::tui::StatusFragment::plain(format!(
-                "{:.1}t/s",
-                token_count as f64 / elapsed_secs
-            ))
-        })
-    })
 }
 
 pub(crate) fn is_wait_cancel_escape(event: &Event) -> bool {
@@ -994,7 +1004,6 @@ mod tests {
             None,
             Duration::from_secs(2),
             0,
-            None,
         )
         .expect("prefill status");
         assert!(prefill.rendered.contains("20% cached"));
@@ -1013,7 +1022,6 @@ mod tests {
             None,
             Duration::from_secs(2),
             0,
-            None,
         )
         .expect("thinking status");
         for ch in "Thinking".chars() {
@@ -1032,7 +1040,6 @@ mod tests {
             None,
             Duration::from_secs(2),
             1,
-            None,
         )
         .expect("working status");
         for ch in "Working".chars() {

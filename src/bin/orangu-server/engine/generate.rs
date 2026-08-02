@@ -34,6 +34,7 @@ use super::prefix_cache::PrefixCache;
 use super::sampling::{Sampler, SamplingParams};
 use super::scheduler::SlotPool;
 use super::tokenizer::Tokenizer;
+use super::tool_calls;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinishReason {
@@ -98,6 +99,24 @@ pub struct GenerateRequest {
     /// microseconds and measures only the lookup. It does not stop this
     /// request's own cache from being *stored* for later requests.
     pub cache_prompt: bool,
+    /// Pin this request to one specific slot (llama.cpp's field of the same
+    /// name), waiting for it rather than taking whichever slot is free.
+    ///
+    /// What it buys is cache affinity, not fairness: a slot retains the
+    /// `(tokens, KvCache)` of the last request that ran on it
+    /// (`engine::slot_store`), so a conversation that returns to its own slot
+    /// continues from a warm prefix. Landing on a neighbour instead finds
+    /// another conversation's cache and reprefills the whole prompt — which is
+    /// exactly what happened for as long as this field did not exist and the
+    /// client's `id_slot` was parsed away.
+    ///
+    /// `None` keeps the old behaviour: any free slot.
+    pub id_slot: Option<usize>,
+    /// Emit a [`StreamEvent::Timings`] after every generated token
+    /// (llama.cpp's `timings_per_token`). Off by default: it costs one extra
+    /// channel message per token, which is nothing next to a forward pass but
+    /// is pure waste for a caller that never reads it.
+    pub timings_per_token: bool,
 }
 
 impl Default for GenerateRequest {
@@ -108,12 +127,31 @@ impl Default for GenerateRequest {
             max_tokens: 0,
             stop_token_ids: Vec::new(),
             cache_prompt: true,
+            id_slot: None,
+            timings_per_token: false,
         }
     }
 }
 
 pub enum StreamEvent {
     Token(String),
+    /// Emitted after each prefill chunk, while the prompt is still being
+    /// processed. Until this existed the only progress report was the `Done`
+    /// event at the very end, so a client had nothing to show during the part
+    /// of a turn that takes the longest — a 30-second prefill looked
+    /// identical to a hung server.
+    PromptProgress {
+        total: usize,
+        cached: usize,
+        processed: usize,
+        elapsed: Duration,
+    },
+    /// Emitted after each generated token when the request asked for
+    /// per-token timings. Carries the server's own measurement, so a client
+    /// never has to estimate a decode rate from its own wall clock — or, as
+    /// this project's own client did, by re-tokenising the whole accumulated
+    /// answer on every redraw.
+    Timings(GenerateStats),
     Done {
         stats: GenerateStats,
         finish_reason: FinishReason,
@@ -200,12 +238,43 @@ pub struct Engine {
     pub role: crate::config::Role,
 }
 
+/// What a caught generation panic is reported to the caller as: the panic's
+/// own captured `detail` (message, location, backtrace — see
+/// `crate::panic_capture`), except when the GPU device has been lost.
+///
+/// A lost device is the one panic whose detail tells the caller nothing:
+/// the backtrace names whichever `wgpu` readback happened to be in flight
+/// when the driver reset the device, which is about the driver, not about
+/// their request — and the process is already on its way out
+/// (`crate::device_lost`), so what they actually need to know is that
+/// retrying in a moment will work. The full detail is not lost: it is in
+/// this server's own log, written by `device_lost::fail` before the unwind
+/// even started.
+fn panic_report(detail: String, device_lost: bool) -> String {
+    if device_lost {
+        crate::device_lost::CLIENT_MESSAGE.to_string()
+    } else {
+        detail
+    }
+}
+
 impl Engine {
     /// Starts generating in the background (on tokio's blocking pool) and
     /// returns a channel of [`StreamEvent`]s — waits for a free slot first
     /// if every one is already busy.
     pub async fn generate(&self, req: GenerateRequest) -> UnboundedReceiver<StreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
+        // A request that arrives in the short window between the GPU going
+        // away and this process exiting (`device_lost`) is answered with
+        // the same one sentence the request that hit the loss got, rather
+        // than being started, run into the same dead device, and answered
+        // with a second panic's worth of detail.
+        if crate::device_lost::is_lost() {
+            let _ = tx.send(StreamEvent::Error(
+                crate::device_lost::CLIENT_MESSAGE.to_string(),
+            ));
+            return rx;
+        }
         let model = self.model.clone();
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
@@ -213,8 +282,12 @@ impl Engine {
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
 
+        let id_slot = req.id_slot;
         tokio::spawn(async move {
-            let guard = slots.acquire().await;
+            let guard = match id_slot {
+                Some(index) => slots.acquire_slot(index).await,
+                None => slots.acquire().await,
+            };
             let task_tx = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // `catch_unwind` here (not left to `spawn_blocking`'s own
@@ -244,7 +317,8 @@ impl Engine {
                         crate::panic_capture::take_last_panic_detail().unwrap_or_else(|| {
                             "generation task panicked (no detail captured)".to_string()
                         });
-                    let _ = task_tx.send(StreamEvent::Error(detail));
+                    let message = panic_report(detail, crate::device_lost::is_lost());
+                    let _ = task_tx.send(StreamEvent::Error(message));
                 }
             })
             .await;
@@ -335,11 +409,26 @@ fn run(
     let mut history = req.prompt_tokens.clone();
 
     let prompt_start = Instant::now();
-    let logits = match model.forward(
+    let total_prompt = req.prompt_tokens.len();
+    let progress_tx = tx.clone();
+    let mut on_chunk = |processed: usize| {
+        // Cached tokens never went through a forward pass, so they are
+        // already "processed" as far as a progress bar is concerned —
+        // otherwise a mostly-cached prompt appears to start at zero and jump.
+        let _ = progress_tx.send(StreamEvent::PromptProgress {
+            total: total_prompt,
+            cached: reused_len,
+            processed: reused_len + processed,
+            elapsed: prompt_start.elapsed(),
+        });
+    };
+    let logits = match prefill(
+        model,
         cache.as_mut().expect("cache is always Some here"),
         &req.prompt_tokens[reused_len..],
         reused_len,
         guard.id(),
+        &mut on_chunk,
     ) {
         Ok(l) => l,
         Err(err) => {
@@ -389,12 +478,41 @@ fn run(
         // continued generation stay correct, but are not rendered to the
         // user — otherwise a gemma-4 reply spills literal `<turn|>`/
         // `<channel|>` tokens into the stream (`skip_special_tokens`).
-        if !tokenizer.is_special(next) {
-            let text = tokenizer.decode(&[next]);
-            if tx.send(StreamEvent::Token(text)).is_err() {
-                // Receiver dropped (client disconnected) — stop generating.
-                return Ok(());
-            }
+        let emitted = if tokenizer.is_special(next) {
+            // Almost every special token is structural and stays hidden. The
+            // exception is a tool-call marker: the model writes its call
+            // *between* special tokens, so suppressing them would leave the
+            // arguments as loose prose with nothing to say they were a call.
+            // Rendered back to literal text here and read by
+            // `engine::tool_calls`; the HTTP layer removes the whole span
+            // from what the user sees, so this never reaches a chat client
+            // as content.
+            tokenizer
+                .token_text(next)
+                .and_then(tool_calls::marker_text)
+                .map(str::to_string)
+        } else {
+            Some(tokenizer.decode(&[next]))
+        };
+        if let Some(text) = emitted
+            && tx.send(StreamEvent::Token(text)).is_err()
+        {
+            // Receiver dropped (client disconnected) — stop generating.
+            return Ok(());
+        }
+        // Not after the first token: it was sampled from the prefill's own
+        // logits, so `generate_time` at that point is a few microseconds of
+        // bookkeeping and the "rate" comes out in the tens of thousands of
+        // tokens per second. A rate needs an interval between two tokens
+        // before it means anything.
+        if req.timings_per_token && generated >= 2 {
+            let _ = tx.send(StreamEvent::Timings(GenerateStats {
+                prompt_tokens: req.prompt_tokens.len(),
+                cached_tokens: reused_len,
+                prompt_time,
+                generated_tokens: generated,
+                generate_time: generate_start.elapsed(),
+            }));
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             let partial = GenerateStats {
@@ -596,6 +714,191 @@ fn run(
 /// many trailing tokens must match a earlier spot in the context to trigger a
 /// draft, and `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from
 /// there. See `Self::speculative_next`.
+/// How many prompt tokens go into one forward pass — `ORANGU_PREFILL_BATCH`,
+/// default [`PREFILL_BATCH_DEFAULT`]. `0` means no limit: the whole prompt in
+/// one pass, which is what this code did unconditionally before.
+fn prefill_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("ORANGU_PREFILL_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(PREFILL_BATCH_DEFAULT)
+    })
+}
+
+/// The default prompt-chunk size.
+///
+/// A forward pass's work and scratch both scale with the tokens in it, and
+/// handing the model a whole long prompt at once therefore sizes them by
+/// however much text the caller happened to send. On a GPU that is already
+/// short of memory, that is a promise nothing can keep — and the way it
+/// breaks is not a clean allocation failure but a **device reset**: under
+/// paging pressure a single large submission stops finishing inside
+/// `amdgpu`'s ~10s ring timeout, the kernel resets the ring and names this
+/// process as the guilty context (`ring gfx_0.0.0 timeout … Ring gfx_0.0.0
+/// reset succeeded`), and every buffer on the lost device dies with it (see
+/// `crate::device_lost`).
+///
+/// Measured on a 4 GiB RX 5500M holding 2.5 GiB of weights, with a
+/// 17.5k-token prompt — the size an `orangu` TUI turn reaches once it
+/// carries a workspace diff:
+///
+/// | chunk | outcome |
+/// | :-- | :-- |
+/// | whole prompt at once | device lost after 21s |
+/// | 2048 | device lost after 3m54s |
+/// | 512 | **completed in 4m13s** |
+///
+/// Peak VRAM was the same (3.67 GiB of 4.08) in every case, which is the
+/// point: what changes is how long any *one* submission holds the ring
+/// while the driver pages, not how much is resident. So the chunk is a
+/// timeout budget, not a memory budget, and 512 is the value that kept
+/// every submission comfortably inside it.
+///
+/// It is not a throughput tax either — at an 8k-token prompt on the same
+/// card, 512 measured *faster* than no chunking at all (115.4 vs 105.5
+/// tok/s prefill), since a smaller working set pages less. The matmuls were
+/// already striped at
+/// `engine::backend::vulkan`'s own 128-token submission cap regardless of
+/// this, so what a bigger chunk buys is fewer attention and PLE calls, not
+/// bigger GEMMs.
+///
+/// Prompts shorter than this are unaffected: one chunk *is* the old path.
+/// `ORANGU_PREFILL_BATCH=0` restores it outright, and a machine with VRAM
+/// to spare can raise it — nothing here is specific to one card beyond the
+/// numbers that set it.
+const PREFILL_BATCH_DEFAULT: usize = 512;
+
+/// Runs `tokens` through the model as consecutive [`prefill_batch`]-sized
+/// forward passes, returning the last one's logits — the only ones a caller
+/// wants, since sampling continues from the end of the prompt.
+///
+/// Each chunk is fed at the position the previous chunk ended at, so the KV
+/// cache accumulates exactly as it would from one pass over the whole
+/// prompt: this is the same `(cache, tokens, start_pos)` shape the prefix
+/// cache already uses to resume a prompt it has partly seen, not a new
+/// contract with the architectures.
+fn prefill(
+    model: &dyn ModelForward,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    start_pos: usize,
+    slot_id: usize,
+    on_chunk: &mut dyn FnMut(usize),
+) -> Result<Vec<f32>> {
+    prefill_in_chunks(
+        model,
+        cache,
+        tokens,
+        start_pos,
+        slot_id,
+        prefill_batch(),
+        on_chunk,
+    )
+}
+
+/// [`prefill`] with the chunk size passed in rather than read from the
+/// environment, so the splitting itself is testable — the property that
+/// matters (every token fed exactly once, in order, at the right position)
+/// is the one that silently corrupts a KV cache when it's wrong.
+fn prefill_in_chunks(
+    model: &dyn ModelForward,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    start_pos: usize,
+    slot_id: usize,
+    batch: usize,
+    on_chunk: &mut dyn FnMut(usize),
+) -> Result<Vec<f32>> {
+    // The one shape that needs no bounding: a prompt that fits in a single
+    // chunk *and* starts at position zero is the least work a prefill can be.
+    // `batch == 0` is an explicit opt-out — see [`prefill_batch`].
+    if batch == 0 || (tokens.len() <= batch && start_pos == 0) {
+        let logits = model.forward(cache, tokens, start_pos, slot_id)?;
+        on_chunk(tokens.len());
+        return Ok(logits);
+    }
+
+    let budget = prefill_chunk_budget();
+    let mut logits = Vec::new();
+    let mut pos = start_pos;
+    let mut done = 0usize;
+    // Start with a probe rather than a full-width chunk. Nothing here knows
+    // this machine's cost curve, and a full-width chunk at a deep position is
+    // exactly the submission that hangs the GPU; a probe is cheap at any
+    // depth and turns the next choice into arithmetic instead of a guess.
+    let mut width = PREFILL_PROBE_TOKENS.min(batch);
+    while done < tokens.len() {
+        let n = width.min(tokens.len() - done);
+        let started = Instant::now();
+        logits = model.forward(cache, &tokens[done..done + n], pos, slot_id)?;
+        let elapsed = started.elapsed();
+        pos += n;
+        done += n;
+        // After the forward, not before: progress means work finished.
+        on_chunk(done);
+        width = next_chunk_width(n, elapsed, budget, batch);
+    }
+    Ok(logits)
+}
+
+/// How wide the next chunk should be, given how long a chunk of `n` tokens
+/// just took.
+///
+/// Cost per token is not constant: a prefill chunk attends over everything
+/// before it, so the same 512 tokens that take 2.3 s at position 0 take 10.1 s
+/// at position 6 656 — past the ~10 s the graphics driver allows a single
+/// submission before it resets the device. Sizing by token count alone, as
+/// `ORANGU_PREFILL_BATCH` did on its own, therefore stops protecting anything
+/// once a prompt gets long: the *count* is bounded but the *work* is not.
+///
+/// Scaling the width by the rate just measured keeps the work per submission
+/// roughly constant instead. The rate only drifts upward, and slowly, so
+/// sizing from the previous chunk lands close; the budget is set well under
+/// the driver's limit to absorb what it misses.
+fn next_chunk_width(n: usize, elapsed: Duration, budget: Duration, max_width: usize) -> usize {
+    let per_token = elapsed.as_secs_f64() / (n.max(1) as f64);
+    if per_token <= 0.0 {
+        return max_width;
+    }
+    let fits = (budget.as_secs_f64() / per_token) as usize;
+    // `min(max_width)` on the floor as well: a caller that configured a batch
+    // smaller than the floor asked for chunks that small, and `clamp` panics
+    // outright when its own min exceeds its max.
+    fits.clamp(PREFILL_MIN_CHUNK_TOKENS.min(max_width), max_width)
+}
+
+/// Tokens in the opening probe chunk. Small enough to stay well inside the
+/// driver's limit even at the deepest context this server will accept.
+const PREFILL_PROBE_TOKENS: usize = 16;
+
+/// The floor on an adapted chunk. At a deep enough context even this exceeds
+/// the budget — nothing can be done about that except take longer — but it
+/// keeps the submission small enough that the driver does not give up on it.
+const PREFILL_MIN_CHUNK_TOKENS: usize = 16;
+
+/// Wall-clock target for one prefill submission — `ORANGU_PREFILL_CHUNK_MS`,
+/// default [`PREFILL_CHUNK_BUDGET_MS_DEFAULT`].
+///
+/// This is a *timeout* budget, like `ORANGU_PREFILL_BATCH` before it, not a
+/// memory one. The number that matters is the graphics driver's own limit on
+/// how long one submission may run — around 10 s on the amdgpu/RADV stack this
+/// was measured on, and not queryable from userspace. The default leaves room
+/// for the estimate to be wrong and for the machine to be busier next time.
+fn prefill_chunk_budget() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("ORANGU_PREFILL_CHUNK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(PREFILL_CHUNK_BUDGET_MS_DEFAULT)
+    }))
+}
+
+const PREFILL_CHUNK_BUDGET_MS_DEFAULT: u64 = 3_000;
+
 /// Whether `ORANGU_GPU_TRACE` is set, cached.
 ///
 /// Read once — this sits in the decode loop, which runs once per token.
@@ -837,6 +1140,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 StreamEvent::Token(t) => text.push_str(&t),
+                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Done { .. } => ok = true,
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
             }
@@ -880,6 +1184,8 @@ mod tests {
             max_tokens,
             stop_token_ids: vec![],
             cache_prompt,
+            id_slot: None,
+            timings_per_token: false,
         };
         run(model, tokenizer, None, prefix_cache, None, &guard, req, tx).unwrap();
         drain(rx)
@@ -1077,6 +1383,206 @@ mod tests {
         }
     }
 
+    /// A `ModelForward` that records the `(tokens, start_pos)` of every
+    /// `forward` call instead of computing anything, so a test can see
+    /// exactly how a prompt was fed to the model.
+    struct RecordingModel {
+        config: ModelConfig,
+        calls: std::sync::Mutex<Vec<(Vec<u32>, usize)>>,
+    }
+
+    impl RecordingModel {
+        fn new() -> Self {
+            Self {
+                config: PanickingModel::new().config,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ModelForward for RecordingModel {
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            KvCache::new(1, capacity, 1)
+        }
+
+        fn forward(
+            &self,
+            _cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            _slot_id: usize,
+        ) -> Result<Vec<f32>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tokens.to_vec(), start_pos));
+            // Logits that identify which call produced them, so the caller
+            // can be checked to keep the *last* chunk's.
+            Ok(vec![start_pos as f32 + tokens.len() as f32; 8])
+        }
+
+        fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    /// A prompt longer than one chunk is fed as consecutive `forward`
+    /// calls, each starting where the previous one ended — covering every
+    /// token exactly once, in order, with no gap or overlap. Anything else
+    /// would corrupt the KV cache rather than merely slow things down.
+    #[test]
+    fn a_long_prompt_is_prefilled_in_consecutive_chunks() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (0..25).collect();
+
+        let logits = prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 10, &mut |_| {}).unwrap();
+
+        let calls = model.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ((0..10).collect::<Vec<u32>>(), 0),
+                ((10..20).collect::<Vec<u32>>(), 10),
+                ((20..25).collect::<Vec<u32>>(), 20),
+            ]
+        );
+        // The last chunk's logits are what sampling continues from; an
+        // earlier chunk's would sample from the middle of the prompt.
+        assert_eq!(logits[0], 25.0);
+    }
+
+    /// A prompt that starts partway in (the prefix cache reused its head)
+    /// keeps counting positions from there — the chunk boundaries are
+    /// relative to the prompt, the positions are absolute.
+    #[test]
+    fn chunking_starts_from_the_reused_prefix_position() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (0..7).collect();
+
+        prefill_in_chunks(&model, &mut cache, &tokens, 100, 0, 3, &mut |_| {}).unwrap();
+
+        let starts: Vec<usize> = model
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, pos)| *pos)
+            .collect();
+        assert_eq!(starts, vec![100, 103, 106]);
+    }
+
+    /// The whole point: a chunk that ran long makes the next one smaller, so
+    /// the *work* per submission stays bounded even though the cost per token
+    /// climbs with context. Sizing by token count alone does not — 512 tokens
+    /// cost 2.3 s at position 0 and 10.1 s at position 6 656, past the ~10 s
+    /// the driver allows before it resets the device.
+    #[test]
+    fn a_slow_chunk_shrinks_the_next_one() {
+        let budget = Duration::from_millis(3_000);
+        // 512 tokens took 10.1 s: ~19.7 ms each, so ~152 fit in the budget.
+        let next = next_chunk_width(512, Duration::from_millis(10_069), budget, 512);
+        assert!((140..=165).contains(&next), "sized {next}");
+        // And a fast one is allowed back up to the configured maximum.
+        assert_eq!(
+            next_chunk_width(16, Duration::from_millis(70), budget, 512),
+            512
+        );
+    }
+
+    /// Whatever the measurement says, the width stays inside both bounds — the
+    /// floor keeps a submission the driver can still finish, and the ceiling is
+    /// the operator's own `ORANGU_PREFILL_BATCH`.
+    #[test]
+    fn an_adapted_width_stays_within_its_bounds() {
+        let budget = Duration::from_millis(3_000);
+        // Absurdly slow: would size to zero without the floor.
+        assert_eq!(
+            next_chunk_width(16, Duration::from_secs(600), budget, 512),
+            PREFILL_MIN_CHUNK_TOKENS
+        );
+        // A batch smaller than the floor is honoured, not clamped upward —
+        // and must not panic, which `clamp` does when min exceeds max.
+        assert_eq!(next_chunk_width(3, Duration::from_secs(600), budget, 3), 3);
+        // A free chunk cannot widen past the maximum.
+        assert_eq!(next_chunk_width(8, Duration::ZERO, budget, 128), 128);
+    }
+
+    /// A deep continuation is the shape that used to hang the GPU: a full-width
+    /// chunk submitted at a position where each token costs ten times what it
+    /// did at the start. It must open with the small probe instead.
+    #[test]
+    fn a_continuation_opens_with_a_probe_not_a_full_width_chunk() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(200_000);
+        let tokens: Vec<u32> = (0..600).collect();
+
+        prefill_in_chunks(&model, &mut cache, &tokens, 100_000, 0, 512, &mut |_| {}).unwrap();
+
+        let first = model.calls.lock().unwrap()[0].0.len();
+        assert_eq!(first, PREFILL_PROBE_TOKENS, "opened {first} tokens wide");
+    }
+
+    /// Progress must be reported *after* each chunk's forward and count
+    /// cumulatively, so a client can render a bar that only ever moves
+    /// forward and reaches the total exactly once.
+    #[test]
+    fn every_prefill_chunk_reports_cumulative_progress() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (0..25).collect();
+        let mut seen = Vec::new();
+
+        prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 10, &mut |done| {
+            seen.push((done, model.calls.lock().unwrap().len()))
+        })
+        .unwrap();
+
+        // (tokens done, forwards completed) — the second element proves the
+        // report follows the work rather than announcing it.
+        assert_eq!(seen, vec![(10, 1), (20, 2), (25, 3)]);
+    }
+
+    /// A one-chunk prompt still reports, once, at the total — otherwise a
+    /// short prompt's progress bar would never appear at all.
+    #[test]
+    fn a_single_chunk_prompt_still_reports_once() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (0..5).collect();
+        let mut seen = Vec::new();
+
+        prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 512, &mut |done| {
+            seen.push(done)
+        })
+        .unwrap();
+
+        assert_eq!(seen, vec![5]);
+    }
+
+    /// A prompt that fits in one chunk — and `ORANGU_PREFILL_BATCH=0` at
+    /// any length — is exactly one `forward` call, the same single pass
+    /// this code made before chunking existed.
+    #[test]
+    fn a_short_prompt_is_still_one_forward_call() {
+        for (len, batch) in [(5usize, 512usize), (5000, 0)] {
+            let model = RecordingModel::new();
+            let mut cache = model.new_kv_cache(8192);
+            let tokens: Vec<u32> = (0..len as u32).collect();
+
+            prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, batch, &mut |_| {}).unwrap();
+
+            let calls = model.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "len {len}, batch {batch}");
+            assert_eq!(calls[0].0.len(), len);
+        }
+    }
+
     /// A panic during generation must reach the client as a real,
     /// detailed `StreamEvent::Error` — the panic's own message plus a
     /// captured backtrace (`panic_capture`) — not the generic "task
@@ -1113,6 +1619,8 @@ mod tests {
                 max_tokens: 4,
                 stop_token_ids: vec![],
                 cache_prompt: true,
+                id_slot: None,
+                timings_per_token: false,
             })
             .await;
 
@@ -1136,6 +1644,24 @@ mod tests {
             rx.recv().await.is_none(),
             "the channel must close after the one error event, not send anything further"
         );
+    }
+
+    /// An ordinary panic keeps its full detail (the test above proves that
+    /// end to end); a lost GPU device is replaced by the one sentence that
+    /// is actually actionable. The panic's `wgpu` backtrace is not a
+    /// diagnosis of the caller's request, and it must not be what they get
+    /// instead of an explanation — the detail stays in the server's log.
+    #[test]
+    fn a_device_lost_panic_is_reported_as_one_sentence_not_a_backtrace() {
+        let detail = "panicked at vulkan.rs:6183:\nmapping a buffer failed\n\nbacktrace:\n...";
+
+        let ordinary = panic_report(detail.to_string(), false);
+        assert_eq!(ordinary, detail, "an ordinary panic keeps its detail");
+
+        let lost = panic_report(detail.to_string(), true);
+        assert_eq!(lost, crate::device_lost::CLIENT_MESSAGE);
+        assert!(!lost.contains("backtrace"));
+        assert!(!lost.contains("vulkan.rs"));
     }
 
     #[test]

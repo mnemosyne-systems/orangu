@@ -94,6 +94,32 @@ bin-specific) because both the `orangu` binary's per-cycle header-status
 probe and library code with no `HeaderStatus` of its own (the explorer
 subagent, which reloads its own config from disk) need it.
 
+**Asked once, not every cycle.** The client's status refresh runs on a timer —
+every 60 s idle, every 500 ms while the startup git sync is in flight — and
+this path exists on nothing but a coordinator, so probing it each cycle is a
+404 each cycle against a plain `orangu-server` (and against a hosted
+OpenAI-compatible endpoint). `models::probe_server_reachability` remembers what
+each endpoint answered: a known-plain one skips the probe entirely and lets
+`GET /v1/models` serve as both the model list and the health check, halving the
+requests a poll costs. Over one short session that is 4 coordinator probes down
+to 1, and the saving grows with session length.
+
+The memo is dropped the moment an endpoint stops answering, so a server
+restarted as a coordinator — or a coordinator that simply was not up yet when
+the client started — is identified afresh rather than assumed to be whatever
+was there before. A *confirmed* coordinator is still probed every cycle, since
+for it this endpoint is the health check and `/v1/models` is deliberately never
+called (see above).
+
+`/server` drops it too, in both its forms: listing the servers re-opens the
+question for the active endpoint, and `/server <name>` for the one it selects —
+including when that is the server already in use, matching the model
+re-detection that same command triggers. Listing or selecting a server is the
+moment a user is asking about the connection rather than working through it,
+and the moment the answer is most likely to have just changed. The memo is
+there to keep an unchanging answer from being re-asked on a timer, not to
+outlast a direct question about it; `/server` is how you say "look again".
+
 ### `POST /v1/coordinator/activate`
 
 A pre-warming hint (`proxy::activate`) a caller can send *before* the
@@ -157,7 +183,14 @@ write that profile's own generated `orangu-server.conf`
 `--config <that path> <role flag> <model>`, piped stdout/stderr captured
 into the rolling tail, record `current_pid` immediately (before the
 possibly-long health check), then poll `GET /v1/models` on the new origin
-every 500ms until it succeeds or `startup_timeout` elapses. Only *then* does
+every 500ms until it succeeds or `startup_timeout` elapses. A profile's
+`host` travels into that generated config verbatim, so it takes exactly the
+spellings `orangu-server`'s own `host` does — including the default, `all`.
+`config.rs` resolves that wildcard in the two directions it has to:
+`resolve_bind_host` (`all`/`*` → `0.0.0.0`) for the coordinator's own
+listener, and `resolve_connect_host` (`all`/`*` → `127.0.0.1`) for
+`CoordinatorLlmEntry::origin`, since a wildcard says where a process
+listens, not an address anything can dial. Only *then* does
 `proxy` forward the original request — headers (minus hop-by-hop ones),
 method, and body unchanged — and stream the response back.
 
@@ -169,6 +202,28 @@ convention, and no manual `~` expansion left to reproduce — `orangu-server`
 being a sibling process built from the same source, not an
 independently-installed external tool, is what makes this simplification
 possible.
+
+### Recovering a profile that stopped
+
+`ensure_active` restarts a child it finds dead (`try_wait`), which covers a
+profile that stopped between requests. The proxy handles the case that check
+cannot see: a request that fails to *reach* the child — the window where it
+was alive when checked and gone by the time the request arrived, which is
+what `orangu-server` exiting on a lost GPU device (its own
+`device_lost::EXIT_CODE`, `75`) does under a request. Nothing has been
+written back to the caller at that point, so the request is still whole and
+is sent again exactly once.
+
+The retry goes through `ensure_reachable`, deliberately not `ensure_active`.
+`Child::try_wait` lags a `SIGKILL`ed (or just-exited) child by however long
+tokio's `SIGCHLD` handling takes to run, and a retry that consults it
+milliseconds after a connection failure is told the dead process is fine —
+so the retry lands in the same closed port and the caller gets the `502` the
+retry existed to prevent. That is a measured failure of the first version of
+this code, not a hypothetical. `ensure_reachable` asks the question that
+cannot lag — a `GET /v1/models` probe under `HEALTH_CHECK_TIMEOUT` — and
+restarts only when it goes unanswered, so a transient blip doesn't cost a
+working process and its other in-flight requests.
 
 ### Crash diagnostics
 

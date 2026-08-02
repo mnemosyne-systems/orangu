@@ -63,6 +63,24 @@ const OUTPUT_TAIL_LINES: usize = 20;
 /// is holding it open.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The exit status `orangu-server` uses when it gives up on a GPU device
+/// the driver reset out from under it (its own `device_lost::EXIT_CODE`,
+/// `75`/`EX_TEMPFAIL` — duplicated here rather than shared for the same
+/// reason `config::default_profile_port` is: each binary stands on its own).
+///
+/// A child that exits with it has not crashed: it detected a lost device,
+/// told its caller so in one sentence, and stepped aside precisely so this
+/// coordinator would start it again on a device that works. Recognizing the
+/// number is what lets that be reported as the recovery it is.
+const SERVER_EXIT_DEVICE_LOST: i32 = 75;
+
+/// Whether a stopped child stepped aside over a lost GPU device
+/// ([`SERVER_EXIT_DEVICE_LOST`]) rather than failing. A signal-killed child
+/// has no exit code at all, which is correctly not this.
+fn is_device_lost_exit(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(SERVER_EXIT_DEVICE_LOST)
+}
+
 /// Rolling tail of a process's combined stdout/stderr output.
 type OutputTail = Arc<Mutex<VecDeque<String>>>;
 
@@ -279,7 +297,7 @@ impl Coordinator {
     /// around, and never concurrently. This is what makes it safe for
     /// multiple profiles to share the same `host`/`port` (the default for
     /// every role, since `CoordinatorLlmEntry::host`/`port` both fall back
-    /// to `127.0.0.1`/`8100` when a profile's own config omits them): by
+    /// to `all`/`8100` when a profile's own config omits them): by
     /// the time the new `orangu-server` tries to bind that address, the old
     /// one's listening socket has already been released, not merely asked
     /// to release it.
@@ -294,11 +312,25 @@ impl Coordinator {
                 match active.child.try_wait() {
                     Ok(None) => return Ok(entry.origin()),
                     Ok(Some(status)) if !self.quiet => {
-                        eprintln!(
-                            "warning: '{}' exited unexpectedly while active (status: {status}){}",
-                            entry.name,
-                            format_output_tail(&active.tail).await
-                        );
+                        // A device-loss exit is expected, self-inflicted,
+                        // and fixed by the restart this function is about
+                        // to do — so it's reported as what it is rather
+                        // than as an unexplained crash, and without the
+                        // output tail, whose last lines are the same
+                        // message `orangu-server` already printed.
+                        if is_device_lost_exit(&status) {
+                            eprintln!(
+                                "'{}' exited after losing its GPU device (a driver reset); \
+                                 restarting it on a fresh device",
+                                entry.name
+                            );
+                        } else {
+                            eprintln!(
+                                "warning: '{}' exited unexpectedly while active (status: {status}){}",
+                                entry.name,
+                                format_output_tail(&active.tail).await
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -310,6 +342,62 @@ impl Coordinator {
             Self::stop(guard.take().expect("checked above")).await;
         }
 
+        let (child, tail) = self.start(entry).await?;
+        *guard = Some(ActiveProcess {
+            entry_name: entry.name.clone(),
+            entry_at_start: entry.clone(),
+            child,
+            tail,
+        });
+        Ok(entry.origin())
+    }
+
+    /// Makes sure `entry`'s `orangu-server` is *answering*, not merely
+    /// believed to be running, and returns the origin to (re)send a request
+    /// to. Used by the proxy after a forwarded request failed to reach the
+    /// child at all.
+    ///
+    /// [`Self::ensure_active`] asks `try_wait` whether the child is alive,
+    /// which is the right question everywhere except here. That answer
+    /// lags: a `SIGKILL`ed child is *gone* immediately but is not reported
+    /// as exited until tokio's `SIGCHLD` handling has run, so a retry that
+    /// consults it milliseconds after the connection failed is told the
+    /// dead process is fine and sends the request straight back into the
+    /// same closed port. (Measured, not theorized: killing a live profile
+    /// mid-request did exactly that.)
+    ///
+    /// So this asks the only question that cannot lag — can it be reached —
+    /// with the same short probe a startup health check uses. An answer
+    /// means the failure was transient and nothing should be restarted (a
+    /// restart would throw away a working process and every other request
+    /// on it). No answer means the child is gone whatever `try_wait`
+    /// currently believes, and it is replaced.
+    pub async fn ensure_reachable(&self, entry: &CoordinatorLlmEntry) -> Result<String> {
+        let probe = self
+            .http_client
+            .get(format!("{}/v1/models", entry.origin()))
+            .timeout(HEALTH_CHECK_TIMEOUT)
+            .send()
+            .await;
+        if probe.is_ok_and(|response| response.status().is_success()) {
+            return Ok(entry.origin());
+        }
+
+        let mut guard = self.active.lock().await;
+        if let Some(active) = guard.take() {
+            if !self.quiet {
+                eprintln!(
+                    "'{}' stopped answering on {}; restarting it",
+                    entry.name,
+                    entry.origin()
+                );
+            }
+            // Same ordering rule as `ensure_active`: clear the pid before
+            // reaping, so a concurrent `shutdown` can't signal a number the
+            // OS has already handed to something else.
+            self.current_pid.store(0, Ordering::Relaxed);
+            Self::stop(active).await;
+        }
         let (child, tail) = self.start(entry).await?;
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
@@ -1156,5 +1244,33 @@ mod tests {
         assert!(message.contains("--explorer"), "{message}");
         assert!(message.contains("org/marker-model"), "{message}");
         std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// The exit status `orangu-server` uses for a lost GPU device is
+    /// recognized as the deliberate step-aside it is — so the restart that
+    /// follows is reported as a recovery rather than as a crash. Uses a real
+    /// exited process rather than a hand-built `ExitStatus`, since that
+    /// type's only honest constructor is a process that actually ran.
+    #[tokio::test]
+    async fn a_device_lost_exit_is_told_apart_from_a_crash() {
+        let lost = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {SERVER_EXIT_DEVICE_LOST}"))
+            .status()
+            .await
+            .unwrap();
+        assert!(is_device_lost_exit(&lost));
+
+        // Every other way out is not this: an ordinary failure, a clean
+        // exit, and a signal (which has no exit code at all).
+        for other in ["exit 1", "exit 0", "kill -TERM $$"] {
+            let status = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(other)
+                .status()
+                .await
+                .unwrap();
+            assert!(!is_device_lost_exit(&status), "{other} must not match");
+        }
     }
 }

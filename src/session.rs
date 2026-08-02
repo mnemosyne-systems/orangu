@@ -20,6 +20,53 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 
+/// The contextual fragment compaction expires: a snapshot of the working tree
+/// that was worth its tokens on the turn it announced and worth nothing after.
+const WORLD_STATE_TAG: &str = "world_state_changes";
+
+/// The opening-tag prefix, used as a cheap "is there anything to strip here"
+/// test before doing any real work.
+const FRAGMENT_OPEN: &str = "<world_state_changes";
+
+/// What an evicted tool output is replaced with. Compared against as well as
+/// written, so a second compaction pass does not count an already-evicted
+/// message as more bytes it could reclaim.
+const EVICTED_TOOL_OUTPUT: &str = "[Tool output evicted to save tokens]";
+
+/// Replace a `<tag>…</tag>` contextual fragment inside `content` with a short
+/// stub, in place. Matches [`crate::context::fragments::ContextualFragment`]'s
+/// rendering, including the attribute form (`<tag k="v">`).
+///
+/// Only whole, well-formed fragments are touched; anything else is left
+/// exactly as it was, so a user message that merely mentions the tag name is
+/// never mangled.
+fn strip_stale_fragment(content: &mut String, tag: &str) {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content.as_str();
+    let mut stripped = false;
+    while let Some(start) = rest.find(&open) {
+        // The opening tag must actually end (`>`) before the closing tag does.
+        let after = &rest[start..];
+        let Some(head_end) = after.find('>') else {
+            break;
+        };
+        let Some(end) = after.find(&close) else { break };
+        if end < head_end {
+            break;
+        }
+        out.push_str(&rest[..start]);
+        out.push_str(&format!("[{tag} from an earlier turn, dropped]"));
+        rest = &after[end + close.len()..];
+        stripped = true;
+    }
+    if stripped {
+        out.push_str(rest);
+        *content = out;
+    }
+}
+
 pub struct ChatSession {
     messages: Vec<ChatMessage>,
     /// Cached LLM client, reused across prompts so the underlying HTTP
@@ -116,18 +163,42 @@ impl ChatSession {
         self.assigned_slot
     }
 
+    /// Replace this session's system prompt, in the system message where it
+    /// belongs.
+    ///
+    /// Mid-conversation this used to *append* the new prompt as a **user**
+    /// message prefixed `[System Update]`. That kept the server's prefix cache
+    /// intact, which is the one thing it had going for it, and was wrong in
+    /// every other way: the model was handed its own instructions in the
+    /// user's voice, the original system message still carried the superseded
+    /// prompt so the two contradicted each other, and a second `/verbosity`
+    /// appended a third copy.
+    ///
+    /// Rewriting message zero does cost a re-prefill of the whole
+    /// conversation — see [`Self::compact_transcript`] for why that is not
+    /// done lightly. It is affordable here because of *when* this runs: only
+    /// from `/server` and `/verbosity`,
+    /// both explicit one-off commands. `/server` changes the endpoint, so that
+    /// server's cache is cold regardless and the rewrite is free; `/verbosity`
+    /// pays once, for a command whose entire purpose is to change how the
+    /// model behaves from here on.
+    ///
+    /// An unchanged prompt is left strictly alone, so re-selecting the server
+    /// you are already on — which `/server` explicitly supports — costs
+    /// nothing.
+    ///
+    /// Appending a real `system` message instead was the other candidate and
+    /// is not portable: several widely-used templates (Mistral's among them)
+    /// call `raise_exception` on any system message that is not the first,
+    /// which would turn a `/verbosity` into a failed request.
     pub fn set_system_prompt(&mut self, prompt: &str) {
-        let has_user_turns = self.messages.iter().any(|m| m.role == "user");
-        if has_user_turns {
-            self.messages
-                .push(ChatMessage::user(&format!("[System Update]\n{}", prompt)));
-        } else {
-            match self.messages.first_mut() {
-                Some(message) if message.role == "system" => {
+        match self.messages.first_mut() {
+            Some(message) if message.role == "system" => {
+                if message.content != prompt {
                     message.content = prompt.to_string();
                 }
-                _ => self.messages.insert(0, ChatMessage::system(prompt)),
             }
+            _ => self.messages.insert(0, ChatMessage::system(prompt)),
         }
     }
 
@@ -156,13 +227,95 @@ impl ChatSession {
         self.messages.truncate(checkpoint);
     }
 
+    /// Floor on a compaction pass: below this there is nothing worth the
+    /// disruption, however the ratio below works out.
+    const COMPACT_MIN_RECLAIM_BYTES: usize = 4 * 1024;
+
+    /// Compaction runs only when it can reclaim at least this fraction of the
+    /// transcript — `2` meaning half of it.
+    ///
+    /// Compaction is not free on the server side. It rewrites history the
+    /// server has already prefilled, and the prefix cache matches on a token-id
+    /// *prefix*, so the first rewritten message forces everything after it to
+    /// be processed again. Worse, evicting a message **shrinks** it, which drags
+    /// the next turn's divergence point back to nearly the start of the
+    /// transcript. Compacting whenever something became eligible — one message
+    /// per turn, forever — measured **3.5× more prefill** over fourteen
+    /// tool-using turns than never compacting at all, with nine consecutive
+    /// turns reusing essentially nothing from cache.
+    ///
+    /// A fixed byte threshold is the wrong shape for this: too low and it is
+    /// the old behaviour, too high and eviction never happens and the context
+    /// grows without bound. A *ratio* is self-tuning. Paying one whole
+    /// re-prefill to halve the transcript means the next pass cannot come due
+    /// until it has roughly doubled again, so evictions get geometrically
+    /// rarer as a conversation grows instead of arriving every turn.
+    const COMPACT_MIN_RECLAIM_RATIO: usize = 2;
+
+    /// Rewrite the transcript to drop what is no longer worth its tokens —
+    /// but only once there is enough to drop to justify the re-prefill it
+    /// costs. See [`Self::COMPACT_MIN_RECLAIM_RATIO`].
     pub fn compact_transcript(&mut self) {
+        let reclaimable = self.compactable_bytes();
+        if reclaimable < Self::COMPACT_MIN_RECLAIM_BYTES {
+            return;
+        }
+        let transcript: usize = self.messages.iter().map(|m| m.content.len()).sum();
+        if reclaimable * Self::COMPACT_MIN_RECLAIM_RATIO < transcript {
+            return;
+        }
+        self.apply_compaction();
+    }
+
+    /// What [`Self::apply_compaction`] would remove, in bytes, without
+    /// touching anything.
+    fn compactable_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut user_turns = 0;
+        for msg in self.messages.iter().rev() {
+            if msg.role == "user" {
+                user_turns += 1;
+                // Cheap gate first: only a message that actually carries a
+                // fragment is worth copying to measure.
+                if msg.content.contains(FRAGMENT_OPEN) {
+                    let mut copy = msg.content.clone();
+                    strip_stale_fragment(&mut copy, WORLD_STATE_TAG);
+                    total += msg.content.len().saturating_sub(copy.len());
+                }
+            } else if Self::is_evictable_tool(msg, user_turns) {
+                total += msg.content.len() - EVICTED_TOOL_OUTPUT.len();
+            }
+        }
+        total
+    }
+
+    fn is_evictable_tool(msg: &ChatMessage, user_turns: usize) -> bool {
+        msg.role == "tool"
+            && user_turns > 3
+            && msg.content.len() > 500
+            && msg.content != EVICTED_TOOL_OUTPUT
+    }
+
+    fn apply_compaction(&mut self) {
         let mut user_turns = 0;
         for msg in self.messages.iter_mut().rev() {
             if msg.role == "user" {
                 user_turns += 1;
-            } else if msg.role == "tool" && user_turns > 3 && msg.content.len() > 500 {
-                msg.content = "[Tool output evicted to save tokens]".to_string();
+                // A `world_state_changes` fragment describes what the working
+                // tree looked like at one moment. It is worth its tokens on
+                // the turn it announces and worth nothing afterwards — but
+                // being part of a user message, nothing ever removed it, so
+                // every turn's snapshot stayed in the transcript for the rest
+                // of the session and was re-sent forever. A session that once
+                // took an oversized fragment could not recover from it, even
+                // after the code that produced it was fixed.
+                //
+                // Every user message present here is from an earlier turn:
+                // compaction runs *before* [`Self::prompt`] appends the one
+                // being sent now, so there is no live fragment to protect.
+                strip_stale_fragment(&mut msg.content, WORLD_STATE_TAG);
+            } else if Self::is_evictable_tool(msg, user_turns) {
+                msg.content = EVICTED_TOOL_OUTPUT.to_string();
             }
         }
     }
@@ -322,10 +475,269 @@ impl ChatSession {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatSession;
+    use super::{ChatSession, strip_stale_fragment};
     use crate::config::LlmConfiguration;
+    use crate::context::fragments::ContextualFragment;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// The turn a fragment announces is the only turn it is worth anything
+    /// on. Left in place it was re-sent for the rest of the session, so a
+    /// session that once took an oversized one could never recover — which is
+    /// exactly what a persisted, auto-resumed session did.
+    ///
+    /// The ordering here is the one [`ChatSession::prompt`] uses: compact the
+    /// transcript, *then* append this turn. That is what makes "every
+    /// fragment still in the history is stale" true.
+    #[test]
+    fn an_earlier_turns_world_state_fragment_is_dropped_on_the_next_turn() {
+        let fragment = ContextualFragment::new("world_state_changes", &"x".repeat(100_000));
+        let mut session = ChatSession::new("system");
+        session.push_user(&format!("{}\n\nfirst question", fragment.render()));
+        session
+            .messages
+            .push(crate::llm::ChatMessage::assistant("ok"));
+
+        session.compact_transcript();
+        session.push_user(&format!("{}\n\nsecond question", fragment.render()));
+
+        let first = &session.messages()[1].content;
+        assert!(!first.contains("xxxx"), "earlier fragment survived");
+        assert!(first.contains("first question"), "the question was lost");
+        assert!(first.contains("[world_state_changes from an earlier turn, dropped]"));
+
+        // This turn's fragment is the live one and must reach the model.
+        let newest = &session.messages()[3].content;
+        assert!(newest.contains("xxxx"), "the live fragment was dropped");
+        assert!(newest.contains("second question"));
+    }
+
+    /// The case that was actually on disk: a single resumed turn carrying a
+    /// huge fragment, with nothing after it. It must be recoverable.
+    #[test]
+    fn a_resumed_session_recovers_from_one_oversized_fragment() {
+        let fragment = ContextualFragment::new("world_state_changes", &"x".repeat(400_000));
+        let mut session = ChatSession::new("system");
+        session.push_user(&format!("{}\n\nthe question", fragment.render()));
+        session
+            .messages
+            .push(crate::llm::ChatMessage::assistant(""));
+
+        session.compact_transcript();
+
+        let total: usize = session.messages().iter().map(|m| m.content.len()).sum();
+        assert!(total < 1_000, "session still carries {total} bytes");
+        assert!(session.messages()[1].content.contains("the question"));
+    }
+
+    /// Build a transcript of `turns` tool-using turns, each carrying a tool
+    /// output of `tool_bytes`.
+    fn tool_conversation(turns: usize, tool_bytes: usize) -> ChatSession {
+        let mut session = ChatSession::new("system");
+        for t in 0..turns {
+            session.push_user(&format!("question {t}"));
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant("calling"));
+            let mut tool = crate::llm::ChatMessage::assistant("");
+            tool.role = "tool".into();
+            tool.content = "x".repeat(tool_bytes);
+            session.messages.push(tool);
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant(&format!("answer {t}")));
+        }
+        session
+    }
+
+    fn evicted_count(session: &ChatSession) -> usize {
+        session
+            .messages()
+            .iter()
+            .filter(|m| m.content == super::EVICTED_TOOL_OUTPUT)
+            .count()
+    }
+
+    /// The regression this batching exists for: rewriting history the server
+    /// has already prefilled costs a re-prefill of everything after the edit,
+    /// so a backlog too small to be worth that must be left alone.
+    #[test]
+    fn a_small_backlog_is_not_worth_a_re_prefill_and_is_left_alone() {
+        let mut session = tool_conversation(6, 2_000);
+        assert!(session.compactable_bytes() < ChatSession::COMPACT_MIN_RECLAIM_BYTES);
+
+        let before: Vec<String> = session
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        session.compact_transcript();
+        let after: Vec<String> = session
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+
+        assert_eq!(before, after, "history was rewritten for a small saving");
+        assert_eq!(evicted_count(&session), 0);
+    }
+
+    /// And when the backlog *is* worth it — here most of the transcript is old
+    /// tool output — the whole of it goes in one pass. One expensive turn, not
+    /// one expensive turn per evicted message.
+    #[test]
+    fn a_backlog_worth_half_the_transcript_is_cleared_in_a_single_pass() {
+        let mut session = tool_conversation(12, 8 * 1024);
+        let transcript: usize = session.messages().iter().map(|m| m.content.len()).sum();
+        assert!(
+            session.compactable_bytes() * ChatSession::COMPACT_MIN_RECLAIM_RATIO >= transcript,
+            "test transcript does not actually meet the rule under test"
+        );
+
+        session.compact_transcript();
+        let first = evicted_count(&session);
+        assert!(first >= 8, "only {first} evicted in one pass");
+
+        // Nothing new became eligible, so a second pass must be a no-op —
+        // otherwise every turn would keep paying.
+        let before: Vec<String> = session
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        session.compact_transcript();
+        let after: Vec<String> = session
+            .messages()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(evicted_count(&session), first);
+    }
+
+    /// An already-evicted stub must not be counted as reclaimable, or the rule
+    /// would stay satisfied forever and compaction would run on every single
+    /// turn — exactly what it is meant to stop.
+    #[test]
+    fn an_already_evicted_message_is_not_counted_again() {
+        let mut session = tool_conversation(12, 8 * 1024);
+        session.compact_transcript();
+        assert!(evicted_count(&session) > 0);
+        assert!(
+            session.compactable_bytes() < ChatSession::COMPACT_MIN_RECLAIM_BYTES,
+            "evicted stubs are still being counted as reclaimable"
+        );
+    }
+
+    /// The shape the ratio exists to produce: after a pass, the transcript has
+    /// to grow substantially before another comes due. A rule that fires again
+    /// immediately is the old per-turn behaviour wearing a threshold.
+    #[test]
+    fn a_pass_buys_several_quiet_turns_before_the_next_one() {
+        let mut session = tool_conversation(12, 8 * 1024);
+        session.compact_transcript();
+        let after_first = evicted_count(&session);
+
+        let mut quiet = 0;
+        for t in 0..4 {
+            session.push_user(&format!("later question {t}"));
+            let mut tool = crate::llm::ChatMessage::assistant("");
+            tool.role = "tool".into();
+            tool.content = "y".repeat(8 * 1024);
+            session.messages.push(tool);
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant("ok"));
+            session.compact_transcript();
+            if evicted_count(&session) == after_first {
+                quiet += 1;
+            }
+        }
+        assert!(quiet >= 2, "only {quiet} of 4 follow-up turns were free");
+    }
+
+    /// The system prompt belongs in the system message, mid-conversation or
+    /// not. It used to arrive as a `user` message prefixed `[System Update]`,
+    /// leaving the model with two contradicting sets of instructions — one of
+    /// them apparently spoken by the user.
+    #[test]
+    fn a_mid_conversation_system_prompt_replaces_the_system_message() {
+        let mut session = ChatSession::new("old instructions");
+        session.push_user("a question");
+        session
+            .messages
+            .push(crate::llm::ChatMessage::assistant("an answer"));
+
+        session.set_system_prompt("new instructions");
+
+        let roles: Vec<&str> = session.messages().iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant"],
+            "a message was added"
+        );
+        assert_eq!(session.messages()[0].content, "new instructions");
+        assert!(
+            !session
+                .messages()
+                .iter()
+                .any(|m| m.content.contains("[System Update]")),
+            "the instructions leaked into the conversation as a user message"
+        );
+    }
+
+    /// Re-selecting the server you are already on is something `/server`
+    /// explicitly supports, and it must not throw away the conversation's KV
+    /// cache for nothing.
+    #[test]
+    fn an_unchanged_system_prompt_leaves_the_message_untouched() {
+        let mut session = ChatSession::new("instructions");
+        session.push_user("a question");
+        let before = session.messages().to_vec();
+
+        session.set_system_prompt("instructions");
+
+        let after = session.messages();
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(after) {
+            assert_eq!(b.role, a.role);
+            assert_eq!(b.content, a.content);
+        }
+    }
+
+    /// A session that somehow has no system message gets one, at the front.
+    #[test]
+    fn a_session_without_a_system_message_gains_one_at_the_front() {
+        let mut session = ChatSession::new("system");
+        session.messages.remove(0);
+        session.push_user("a question");
+
+        session.set_system_prompt("instructions");
+
+        assert_eq!(session.messages()[0].role, "system");
+        assert_eq!(session.messages()[0].content, "instructions");
+        assert_eq!(session.messages()[1].role, "user");
+    }
+
+    #[test]
+    fn a_message_merely_naming_the_tag_is_left_alone() {
+        let mut content = "why does <world_state_changes> show up in my prompt?".to_string();
+        let before = content.clone();
+        strip_stale_fragment(&mut content, "world_state_changes");
+        assert_eq!(content, before);
+    }
+
+    #[test]
+    fn a_fragment_with_attributes_is_still_recognised() {
+        let mut content = ContextualFragment::new("world_state_changes", "body")
+            .with_attribute("hash", "abc")
+            .render();
+        strip_stale_fragment(&mut content, "world_state_changes");
+        assert_eq!(
+            content,
+            "[world_state_changes from an earlier turn, dropped]"
+        );
+    }
 
     fn test_profile(endpoint: &str) -> LlmConfiguration {
         LlmConfiguration {

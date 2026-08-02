@@ -138,6 +138,8 @@ Selects the server `orangu` talks to.
 
 With no argument it lists the configured servers — each `[section]` in the configuration file identified as a server — with the active one in green and the others in red. With a name it switches to that server and re-detects an available model on it, so the model status in the header is refreshed automatically. Pressing `Tab` after `/server ` cycles through the configured server names.
 
+Either form also re-checks whether the server is an orangu-coordinator rather than a plain `orangu-server`, instead of reusing what it was last found to be. A coordinator started since orangu launched is therefore picked up by running `/server`, without restarting.
+
 ### Examples
 
 List the configured servers:

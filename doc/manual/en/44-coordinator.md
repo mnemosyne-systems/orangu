@@ -43,22 +43,37 @@ Generate a configuration interactively:
 orangu-coordinator --init
 ```
 
-This walks every `[orangu-coordinator]` setting (including the shared
-`models` directory every profile's `orangu-server` uses), then asks for a
-model, host, and port role by role — `all` is mandatory, `code`/`review`/
-`explorer`/`embeddings` are optional (leave the model prompt blank to skip
-one). It's written to `~/.orangu/orangu-coordinator.conf` — tersely: only
-`host`/`port` and each profile's `model` are always present, every other
-answer left at its default is simply omitted.
+It behaves exactly like `orangu-server --init`. It walks every
+`[orangu-coordinator]` setting (including the shared `models` directory
+every profile's `orangu-server` uses), then asks for a model, host, and port
+role by role — `all` is mandatory, `code`/`review`/`explorer`/`embeddings`
+are optional (leave the model prompt blank to skip one). It's written to
+`~/.orangu/orangu-coordinator.conf` — tersely: only `host`/`port` and each
+profile's `model` are always present, every other answer left at its default
+is simply omitted.
 
-Both the `models` prompt and every role's `model` prompt offer inline
-ghost-text suggestions and TAB completion: `models` completes real
-filesystem paths, and each `model` prompt (once `models` is set) completes
-over every installed model's user-facing label — the same label
-`orangu-server list` prints in its `MODEL` column, not a raw filename or
-its `NR` shorthand (a coordinator profile's `model` is written once and
-read back indefinitely, so only the stable label is offered). Nothing
-offered is required — typing anything else (a path, an undownloaded
+Every prompt that has something to offer offers it inline, in grey, as you
+type — press Right Arrow (or TAB, which also lists every candidate) to
+accept:
+
+- `models` completes real filesystem paths, and defaults to the Hugging Face
+  cache (`~/.cache/huggingface/hub`) that `orangu-server` itself scans. A
+  directory that doesn't exist yet is created.
+- Every `host` prompt — the coordinator's own and each role's — completes
+  over `all` (the default: every network interface), its `*` alias, and
+  every address your machine's interfaces actually have, each labelled with
+  the interface it belongs to.
+- Every role's `model` prompt (once `models` is set) completes over every
+  installed model, offering both the `NR` shorthand and the
+  `MODEL:QUANT` label `orangu-server list` prints — `QUANT` included, so a
+  repo you have in several quantizations resolves to the exact one you
+  picked rather than whichever came first. An `NR` is only a shorthand for
+  typing: it's written out as that row's `MODEL:QUANT` label, since a
+  profile's `model` is read back for as long as the file lives and is also
+  the id clients match against. A models directory holding exactly one model
+  is taken for the mandatory `all` role without asking.
+
+Nothing offered is required — typing anything else (a path, an undownloaded
 Hugging Face spec) works too.
 
 A minimal hand-written configuration looks like this:
@@ -79,15 +94,19 @@ role = explorer
 model = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
 ```
 
-Neither profile sets `host`/`port` here — both default to `127.0.0.1:8100`,
-which is fine even though they're identical: only one profile's
-`orangu-server` is ever active at a time, and swapping always fully stops
-the old one before starting the new one, so there's never a real conflict
-over the port.
+Neither profile sets `host`/`port` here — both default to `all:8100` (the
+same default `orangu-server` itself uses: `all` means every network
+interface, and the coordinator reaches the profile it started over
+loopback). Sharing one address across profiles is fine even though they're
+identical: only one profile's `orangu-server` is ever active at a time, and
+swapping always fully stops the old one before starting the new one, so
+there's never a real conflict over the port. Set a profile's `host` to
+`127.0.0.1` if you want its `orangu-server` reachable from this machine
+only.
 
 | Key | Section | Required | Description |
 | :-- | :-- | :-- | :-- |
-| `host` | `[orangu-coordinator]` | No | Host the proxy listens on. Defaults to `127.0.0.1` |
+| `host` | `[orangu-coordinator]` | No | Host the proxy listens on: `all` (every interface), its `*` alias, or a literal address such as `127.0.0.1`. Defaults to `all` |
 | `port` | `[orangu-coordinator]` | No | Port the proxy listens on. Defaults to `9000` |
 | `models` | `[orangu-coordinator]` | Yes | Models directory forwarded to every profile's own `orangu-server` (`[orangu-server].models`) — one shared directory across every profile |
 | `startup_timeout` | `[orangu-coordinator]` | No | Seconds to wait for a newly started `orangu-server` to answer `GET /v1/models` before giving up. Defaults to `180` |
@@ -96,7 +115,7 @@ over the port.
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag |
 | `model` | profile | Yes | A model spec — local `.gguf` path, `NR`/`MODEL` label, or `<user>/<model>[:quant]` Hugging Face repo — the same shape `orangu-server`'s own positional `MODEL` argument accepts |
-| `host` | profile | No | Host this profile's `orangu-server` listens on. Defaults to `127.0.0.1` |
+| `host` | profile | No | Host this profile's `orangu-server` listens on — written straight into its generated config, so it takes the same `all`/`*`/address spellings. Defaults to `all` |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set |
@@ -203,6 +222,13 @@ the first one pays the same cold start as any other request.
   because the very first detection attempt gave up too early.
 - **Dynamic Hot-Reloading**: The coordinator watches `orangu-coordinator.conf` and hot-reloads changes automatically (polled every ~5 seconds) without needing a restart.
 - **Fallback Routing**: If a requested profile fails to load (e.g. out of memory), the coordinator automatically falls back to starting the `all`-role profile rather than failing the request entirely.
+- **Crash recovery**: a profile whose `orangu-server` has stopped — it lost
+  its GPU device to a driver reset (see the Server chapter), was OOM-killed,
+  or was killed by hand — is simply started again on the next request. A
+  request that was in flight when it stopped is sent again once, after that
+  restart, rather than failed: nothing had been written back to you yet, so
+  the request was still whole. What you see is a slow answer, not an error.
+  A second failure is reported rather than retried.
 - On shutdown (`Ctrl+C` or the internal `GET /v1/coordinator/shutdown` API), the coordinator gracefully stops whatever `orangu-server`
   process is currently active — or still starting up — so nothing is left
   running in the background.

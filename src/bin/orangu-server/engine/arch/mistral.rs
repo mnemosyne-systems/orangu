@@ -797,10 +797,10 @@ mod real_model_tests {
             .expect("model has a chat template");
         let prompt = crate::engine::chat_template::ChatTemplate::new(template_source)
             .render(
-                &[crate::engine::chat_template::ChatMessage {
-                    role: "user".to_string(),
-                    content: "What is the capital of France? Answer in one word.".to_string(),
-                }],
+                &[crate::engine::chat_template::ChatMessage::text(
+                    "user",
+                    "What is the capital of France? Answer in one word.",
+                )],
                 true,
                 tokenizer
                     .bos_token

@@ -652,13 +652,34 @@ impl Tokenizer {
     /// the end of its reply, spilling raw turn/channel control tokens into
     /// the output. Callers that must ignore EOS (raw benchmark decode) skip
     /// this and pass their own empty set instead.
+    /// A vocabulary can also carry an end token the GGUF metadata never names.
+    /// gemma-4 is the case in hand: its `tokenizer.ggml.eos_token_id` is 106
+    /// (`<turn|>`, the end-of-turn marker) and it declares no
+    /// `eot_token_id` — but the vocabulary *also* holds a token whose text is
+    /// literally `<eos>` (id 1), typed `NORMAL` rather than `CONTROL`, and the
+    /// model emits it to end a tool call. Typed normal it is not suppressed
+    /// either, so it arrived as the literal five characters `<eos>` in the
+    /// answer.
+    ///
+    /// Matching on the vocabulary's own name for the token is not a guess
+    /// about content: no model emits `<eos>` as prose. A vocabulary without
+    /// such a token is unaffected.
+    const NAMED_END_TOKENS: [&'static str; 1] = ["<eos>"];
+
     pub fn stop_token_ids(&self) -> Vec<u32> {
-        let mut ids = Vec::with_capacity(2);
+        let mut ids = Vec::with_capacity(3);
         ids.extend(self.eos_token);
         if let Some(eot) = self.eot_token
             && Some(eot) != self.eos_token
         {
             ids.push(eot);
+        }
+        for name in Self::NAMED_END_TOKENS {
+            if let Some(&id) = self.token_to_id.get(name)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
         }
         ids
     }

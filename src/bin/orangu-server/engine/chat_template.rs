@@ -20,13 +20,49 @@
 //! templates (Llama 3, Qwen2.5) call them.
 
 use anyhow::{Result, anyhow};
-use minijinja::{Environment, context};
+use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone)]
+/// One message as the OpenAI Chat Completions API shapes it.
+///
+/// Everything past `role`/`content` exists for tool calling and is carried
+/// through to the chat template untouched — a template is the only thing that
+/// knows how its model wants a tool call written, and every mainstream one
+/// reads these exact field names (`message.get('tool_calls')`,
+/// `follow.get('tool_call_id')`, `follow.get('name')`). Dropping them, as this
+/// struct used to, does not merely lose formatting: a model that called a tool
+/// on turn N sees no record of having done so on turn N+1, and calls it again.
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    /// Assistant messages: the calls this turn made. Left as raw JSON rather
+    /// than a typed struct because templates reach into it in
+    /// model-specific ways (`function['arguments']` as a mapping *or* a
+    /// pre-serialized string, `tool_call['id']`, vendor extensions), and
+    /// re-shaping it here would only lose whatever a given template needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool messages: which call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool messages: the function's name. Some templates use it directly;
+    /// others resolve it from `tool_call_id` against the preceding assistant
+    /// message, so both are carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// A plain text message — the shape every non-tool caller wants.
+    pub fn text(role: &str, content: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 pub struct ChatTemplate {
@@ -49,6 +85,33 @@ impl ChatTemplate {
     /// passing `None`/`null` through — a template checking `is defined`
     /// would otherwise see a *defined* (if null) variable and take the
     /// wrong branch. Harmless no-op for a template that doesn't check it.
+    ///
+    /// `tools`, when `Some`, is the request's OpenAI-shaped tool array, passed
+    /// into the template as the same-named variable every tool-capable
+    /// template gates on (`{%- if tools -%}`). `None` omits the variable
+    /// entirely rather than passing an empty list, so a template that only
+    /// checks truthiness and one that checks `is defined` both behave as if
+    /// the caller never mentioned tools — the same care
+    /// [`Self::render`]'s `enable_thinking` takes, and for the same reason.
+    pub fn render_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        bos_token: &str,
+        eos_token: &str,
+        enable_thinking: Option<bool>,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        self.render_inner(
+            messages,
+            add_generation_prompt,
+            bos_token,
+            eos_token,
+            enable_thinking,
+            tools,
+        )
+    }
+
     pub fn render(
         &self,
         messages: &[ChatMessage],
@@ -56,6 +119,25 @@ impl ChatTemplate {
         bos_token: &str,
         eos_token: &str,
         enable_thinking: Option<bool>,
+    ) -> Result<String> {
+        self.render_inner(
+            messages,
+            add_generation_prompt,
+            bos_token,
+            eos_token,
+            enable_thinking,
+            None,
+        )
+    }
+
+    fn render_inner(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        bos_token: &str,
+        eos_token: &str,
+        enable_thinking: Option<bool>,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         let mut env = Environment::new();
         env.add_function("raise_exception", |msg: String| {
@@ -76,22 +158,25 @@ impl ChatTemplate {
         env.add_template("chat", &self.source)
             .map_err(|err| anyhow!("invalid chat template: {err}"))?;
         let tmpl = env.get_template("chat").expect("just added");
-        let rendered = match enable_thinking {
-            Some(enable_thinking) => tmpl.render(context! {
-                messages => messages,
-                add_generation_prompt => add_generation_prompt,
-                bos_token => bos_token,
-                eos_token => eos_token,
-                enable_thinking => enable_thinking,
-            }),
-            None => tmpl.render(context! {
-                messages => messages,
-                add_generation_prompt => add_generation_prompt,
-                bos_token => bos_token,
-                eos_token => eos_token,
-            }),
-        };
-        rendered.map_err(|err| anyhow!("failed to render chat template: {err}"))
+        // Built additively rather than as one `context!` per combination:
+        // two optional variables that must each be *absent* (not null) when
+        // unset would otherwise need four literals kept in step.
+        let mut ctx = std::collections::BTreeMap::<&str, minijinja::Value>::new();
+        ctx.insert("messages", minijinja::Value::from_serialize(messages));
+        ctx.insert(
+            "add_generation_prompt",
+            minijinja::Value::from(add_generation_prompt),
+        );
+        ctx.insert("bos_token", minijinja::Value::from(bos_token));
+        ctx.insert("eos_token", minijinja::Value::from(eos_token));
+        if let Some(enable_thinking) = enable_thinking {
+            ctx.insert("enable_thinking", minijinja::Value::from(enable_thinking));
+        }
+        if let Some(tools) = tools {
+            ctx.insert("tools", minijinja::Value::from_serialize(tools));
+        }
+        tmpl.render(minijinja::Value::from_serialize(&ctx))
+            .map_err(|err| anyhow!("failed to render chat template: {err}"))
     }
 }
 
@@ -169,10 +254,7 @@ mod tests {
              {% if add_generation_prompt %}assistant:{% endif %}"
                 .to_string(),
         );
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::text("user", "hi")];
         let out = tmpl.render(&messages, true, "<s>", "</s>", None).unwrap();
         assert_eq!(out, "user: hi\nassistant:");
     }
@@ -198,12 +280,86 @@ mod tests {
              {% endfor %}"
                 .to_string(),
         );
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::text("user", "hi")];
         let out = tmpl.render(&messages, false, "", "", None).unwrap();
         assert_eq!(out, "user=default ");
+    }
+
+    /// The whole point of T1: a tool-capable template gates its declaration
+    /// block on `{%- if tools -%}`, so a server that never passes `tools`
+    /// renders a prompt in which no tool exists — and the model, correctly,
+    /// never calls one.
+    #[test]
+    fn tools_reach_the_template_and_gate_its_declaration_block() {
+        let tmpl = ChatTemplate::new(
+            "{% if tools %}{% for t in tools %}TOOL:{{ t.function.name }};{% endfor %}\
+             {% else %}NONE{% endif %}"
+                .to_string(),
+        );
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "show_file"}},
+            {"type": "function", "function": {"name": "run_shell_command"}},
+        ]);
+        let with = tmpl
+            .render_with_tools(&[], false, "", "", None, Some(&tools))
+            .unwrap();
+        assert_eq!(with, "TOOL:show_file;TOOL:run_shell_command;");
+
+        let without = tmpl
+            .render_with_tools(&[], false, "", "", None, None)
+            .unwrap();
+        assert_eq!(without, "NONE");
+    }
+
+    /// A template must be able to tell "no tools were offered" from "tools
+    /// were offered", `is defined` included — the same distinction
+    /// `enable_thinking` needs and for the same reason.
+    #[test]
+    fn absent_tools_are_undefined_rather_than_null() {
+        let tmpl = ChatTemplate::new(
+            "{% if tools is defined %}DEFINED{% else %}UNDEFINED{% endif %}".to_string(),
+        );
+        assert_eq!(
+            tmpl.render_with_tools(&[], false, "", "", None, None)
+                .unwrap(),
+            "UNDEFINED"
+        );
+    }
+
+    /// Turn N+1 has to show the model that turn N called a tool and what came
+    /// back. With `tool_calls`/`tool_call_id` dropped from `ChatMessage`, the
+    /// transcript said only that the assistant produced empty content — so
+    /// the model called the same tool again, forever.
+    #[test]
+    fn a_tool_call_and_its_result_survive_into_the_next_turn() {
+        let tmpl = ChatTemplate::new(
+            "{% for m in messages %}\
+             {% if m.get('tool_calls') %}CALL:{{ m.tool_calls[0].function.name }};{% endif %}\
+             {% if m.role == 'tool' %}RESULT[{{ m.get('name') }}/{{ m.get('tool_call_id') }}]\
+             ={{ m.content }};{% endif %}\
+             {% endfor %}"
+                .to_string(),
+        );
+        let messages = vec![
+            ChatMessage::text("user", "weather?"),
+            ChatMessage {
+                role: "assistant".into(),
+                tool_calls: Some(serde_json::json!([
+                    {"id": "call-1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}}
+                ])),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "17C".into(),
+                tool_call_id: Some("call-1".into()),
+                name: Some("get_weather".into()),
+                ..Default::default()
+            },
+        ];
+        let out = tmpl.render(&messages, false, "", "", None).unwrap();
+        assert_eq!(out, "CALL:get_weather;RESULT[get_weather/call-1]=17C;");
     }
 
     #[test]
@@ -212,10 +368,7 @@ mod tests {
             "{% if messages[0].role != 'system' %}{{ raise_exception('need a system message') }}{% endif %}"
                 .to_string(),
         );
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::text("user", "hi")];
         assert!(tmpl.render(&messages, false, "", "", None).is_err());
     }
 

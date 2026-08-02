@@ -136,6 +136,23 @@ theme = classic
 | `system_prompt` | No | Override the base system prompt sent to the model. When empty (the default) orangu uses its built-in coding-assistant prompt. The discovered Agent Skills index is appended to whichever prompt is in effect |
 | `model_verbosity` | No | Set the model's chattiness. Defaults to `normal`. Options: `terse`, `normal`, `verbose` |
 | `review_confidence_threshold` | No | Minimum confidence score (0–100) for `/auto_review` findings; findings below this threshold are silently dropped. Defaults to `80`. Set to `0` to disable filtering |
+| `diff_file_cap` | No | Maximum number of files kept when a `git diff` is compressed. Defaults to `20`. See the Compression chapter |
+| `world_state_max_bytes` | No | Ceiling on the `world_state_changes` fragment prepended to a turn when the working tree has changed, in bytes. Defaults to `8192`; `0` disables the cap. See [Workspace change budget](#workspace-change-budget) |
+
+### Workspace change budget
+
+Every interactive turn taken after the working tree changed carries a
+`world_state_changes` fragment describing the change. That fragment is
+**prefilled by the server**, so its size is response latency, not just context:
+on a small local model a few hundred bytes cost milliseconds and a few hundred
+kilobytes cost minutes.
+
+`world_state_max_bytes` is the hard ceiling on it. Raise it if you want the
+model to see more of a large working diff without asking; lower it if the first
+turn after each edit feels slow. Two lower limits apply before it — untracked
+files above 4 KiB are announced rather than inlined, and smaller ones are cut to
+80 lines — so the ceiling is rarely the binding constraint in an ordinary
+workspace. The Compression chapter describes the whole path.
 
 ### Response-token caps
 

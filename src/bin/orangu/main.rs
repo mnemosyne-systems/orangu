@@ -2271,6 +2271,7 @@ async fn run() -> Result<()> {
         if let Some((hash, diff)) = orangu::context::world_state::get_current_workspace_diff(
             &workspace,
             config.diff_file_cap,
+            config.world_state_max_bytes,
         )
         .await
             && hash != last_git_diff_hash

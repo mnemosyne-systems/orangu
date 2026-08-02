@@ -32,6 +32,7 @@ pub struct ClientAppConfiguration {
     pub compression: bool,
     pub auto_downsample_lines: usize,
     pub diff_file_cap: usize,
+    pub world_state_max_bytes: usize,
     pub quotes: String,
     pub width: usize,
     #[serde(skip)]
@@ -173,6 +174,14 @@ pub fn default_diff_file_cap() -> usize {
     20
 }
 
+/// Ceiling on the `world_state_changes` fragment prepended to a turn, in
+/// bytes. This is a prompt-size budget, not a memory one: every byte here is
+/// prefilled by the server on the turn the working tree changes, so an
+/// unbounded diff is unbounded response latency. `0` disables the cap.
+pub fn default_world_state_max_bytes() -> usize {
+    crate::context::world_state::DEFAULT_WORLD_STATE_MAX_BYTES
+}
+
 pub fn default_compression() -> bool {
     true
 }
@@ -233,6 +242,11 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         default_auto_downsample_lines,
     )?;
     let diff_file_cap = parse_client_field(&client, "diff_file_cap", default_diff_file_cap)?;
+    let world_state_max_bytes = parse_client_field(
+        &client,
+        "world_state_max_bytes",
+        default_world_state_max_bytes,
+    )?;
     let compile_workers = parse_client_field(&client, "compile_workers", default_compile_workers)?;
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
 
@@ -269,6 +283,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         compression,
         auto_downsample_lines,
         diff_file_cap,
+        world_state_max_bytes,
         quotes: client.get("quotes").cloned().unwrap_or_default(),
         width,
         banner: client

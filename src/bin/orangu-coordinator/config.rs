@@ -25,6 +25,52 @@ use std::{collections::HashMap, path::Path, path::PathBuf};
 
 pub const CLIENT_SECTION: &str = "orangu-coordinator";
 
+/// The `host` value meaning "every network interface on this machine" — the
+/// default, and what `--init`'s `host` prompts offer first. `*` is accepted
+/// as an alias for it. Mirrors `orangu-server`'s own `config::HOST_ALL`/
+/// `HOST_ALL_ALIAS` (duplicated for the same reason [`default_profile_port`]
+/// is: each binary's config module stands on its own) so a coordinator
+/// config's `host` accepts exactly the spellings an `orangu-server` config's
+/// does — including in the per-profile `host` this coordinator writes
+/// straight into the `orangu-server.conf` it generates.
+pub const HOST_ALL: &str = "all";
+pub const HOST_ALL_ALIAS: &str = "*";
+
+/// Whether `host` is the wildcard — [`HOST_ALL`] or its `*` alias.
+fn is_host_all(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case(HOST_ALL) || host == HOST_ALL_ALIAS
+}
+
+/// Turns a configured `host` into an address [`std::net::TcpListener::bind`]
+/// actually understands: the wildcard becomes `0.0.0.0`, so the listener
+/// answers on every interface rather than only the loopback one; anything
+/// else is passed through untouched and left for `bind` itself to reject if
+/// it isn't one of this machine's. Same rule — and the same spelling —
+/// `orangu-server`'s own `config::resolve_bind_host` applies.
+pub fn resolve_bind_host(host: &str) -> &str {
+    if is_host_all(host) {
+        "0.0.0.0"
+    } else {
+        host.trim()
+    }
+}
+
+/// Turns a configured `host` into an address a *client* can connect to,
+/// which the wildcard is not: `all` (or `*`) says where a profile's
+/// `orangu-server` listens, not where to reach it, so a URL built from it
+/// has to name a concrete address. Loopback is that address — the
+/// coordinator and the `orangu-server` it spawns are always the same
+/// machine — and a wildcard listener answers on it by definition. Anything
+/// else is already connectable and passes through untouched.
+pub fn resolve_connect_host(host: &str) -> &str {
+    if is_host_all(host) {
+        "127.0.0.1"
+    } else {
+        host.trim()
+    }
+}
+
 /// The conventional roles `orangu.conf` itself documents, in the order they
 /// are listed there. Used both to report a model for every role in
 /// [`CoordinatorConfiguration::models_by_role`] (not just the ones a given
@@ -56,7 +102,9 @@ pub fn role_server_flag(role: &str) -> Option<&'static str> {
 
 #[derive(Clone, Debug)]
 pub struct CoordinatorConfiguration {
-    /// Host the proxy listens on, e.g. `127.0.0.1`.
+    /// Host the proxy listens on: [`HOST_ALL`] (the default), its `*`
+    /// alias, or a literal interface address such as `127.0.0.1`. See
+    /// [`resolve_bind_host`], which is what [`Self::listen_addr`] binds.
     pub host: String,
     /// Port the proxy listens on.
     pub port: u16,
@@ -83,9 +131,11 @@ pub struct CoordinatorConfiguration {
 }
 
 impl CoordinatorConfiguration {
-    /// The `host:port` string to bind the proxy's listener to.
+    /// The `host:port` string to bind the proxy's listener to, with
+    /// [`HOST_ALL`] (and its `*` alias) resolved to the wildcard address
+    /// `bind` understands.
     pub fn listen_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", resolve_bind_host(&self.host), self.port)
     }
 
     /// The model each of [`KNOWN_ROLES`] resolves to: the model of the
@@ -130,8 +180,12 @@ pub struct CoordinatorLlmEntry {
     /// not already cached). This is the model id a client request must
     /// carry (in its JSON `model` field) to be routed to this entry.
     pub model: String,
-    /// Host this profile's `orangu-server` will listen on. Defaults to
-    /// `127.0.0.1` when absent.
+    /// Host this profile's `orangu-server` will listen on — written
+    /// verbatim into the `orangu-server.conf` this coordinator generates for
+    /// it, so it accepts every spelling that file's own `host` does.
+    /// Defaults to [`HOST_ALL`] when absent, the same default
+    /// `orangu-server` itself applies. [`Self::origin`] resolves it back to
+    /// a connectable address.
     pub host: String,
     /// Port this profile's `orangu-server` will listen on. Defaults to
     /// `8100` — the same default `orangu-server` itself uses — when absent.
@@ -162,9 +216,11 @@ pub struct CoordinatorLlmEntry {
 
 impl CoordinatorLlmEntry {
     /// The origin (`http://host:port`) requests are proxied to once this
-    /// entry's `orangu-server` is active.
+    /// entry's `orangu-server` is active, with [`HOST_ALL`] (and its `*`
+    /// alias) resolved to loopback — see [`resolve_connect_host`] for why a
+    /// wildcard can't be dialed as written.
     pub fn origin(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        format!("http://{}:{}", resolve_connect_host(&self.host), self.port)
     }
 }
 
@@ -176,8 +232,13 @@ pub(crate) fn default_max_body_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+/// The `host` both the coordinator's own listener and every profile's
+/// `orangu-server` fall back to — [`HOST_ALL`], the same default
+/// `orangu-server`'s own `config::default_host` uses, so a coordinator
+/// config that says nothing about `host` is reachable from exactly where an
+/// `orangu-server` config that says nothing about it is.
 pub(crate) fn default_host() -> String {
-    "127.0.0.1".to_string()
+    HOST_ALL.to_string()
 }
 
 pub(crate) fn default_port() -> u16 {
@@ -420,11 +481,15 @@ mod tests {
         .unwrap();
 
         let conf = load_coordinator_configuration(file.path()).unwrap();
-        assert_eq!(conf.listen_addr(), "127.0.0.1:9000");
+        // `host` is omitted above, so it falls back to `all` — resolved
+        // to the wildcard address `bind` understands.
+        assert_eq!(conf.listen_addr(), "0.0.0.0:9000");
         assert_eq!(conf.models, PathBuf::from("/srv/models"));
         assert_eq!(conf.startup_timeout_seconds, 180);
         assert_eq!(conf.default_entry, "main");
-        assert_eq!(conf.llms["main"].host, "127.0.0.1");
+        assert_eq!(conf.llms["main"].host, HOST_ALL);
+        // A wildcard is where it listens, not somewhere to dial: the origin
+        // resolves it back to loopback.
         assert_eq!(conf.llms["main"].origin(), "http://127.0.0.1:8100");
         assert_eq!(conf.llms["main"].model, "org/gemma");
         assert_eq!(conf.llms["main"].backend, None);
@@ -447,7 +512,7 @@ mod tests {
         .unwrap();
 
         let conf = load_coordinator_configuration(file.path()).unwrap();
-        assert_eq!(conf.host, "127.0.0.1");
+        assert_eq!(conf.host, HOST_ALL);
         assert_eq!(conf.port, 9000);
         assert_eq!(conf.startup_timeout_seconds, 180);
         assert_eq!(conf.max_body_bytes, 64 * 1024 * 1024);
@@ -456,7 +521,7 @@ mod tests {
 
         let main = &conf.llms["main"];
         assert_eq!(main.role, "all");
-        assert_eq!(main.host, "127.0.0.1");
+        assert_eq!(main.host, HOST_ALL);
         assert_eq!(main.port, 8100);
         assert_eq!(main.backend, None);
         assert_eq!(main.slots, None);
@@ -655,7 +720,40 @@ mod tests {
         .unwrap();
 
         let conf = load_coordinator_configuration(file.path()).unwrap();
-        assert_eq!(conf.llms["main"].host, "127.0.0.1");
+        assert_eq!(conf.llms["main"].host, HOST_ALL);
+    }
+
+    /// `all`, its `*` alias, and any casing of either all mean the same
+    /// listener — and none of them is a spelling anything can dial, so a
+    /// URL built from one names loopback instead. An ordinary address is
+    /// untouched by both.
+    #[test]
+    fn resolves_the_wildcard_for_binding_and_for_connecting() {
+        for wildcard in [HOST_ALL, HOST_ALL_ALIAS, "ALL", " all "] {
+            assert_eq!(resolve_bind_host(wildcard), "0.0.0.0");
+            assert_eq!(resolve_connect_host(wildcard), "127.0.0.1");
+        }
+        assert_eq!(resolve_bind_host("192.168.1.10"), "192.168.1.10");
+        assert_eq!(resolve_connect_host("192.168.1.10"), "192.168.1.10");
+    }
+
+    /// A config that spells its `host` `*` binds and dials exactly as one
+    /// that spells it `all` does — including for a profile, whose `host`
+    /// travels on into the generated `orangu-server.conf`.
+    #[test]
+    fn the_star_alias_behaves_exactly_like_all() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-coordinator]\nhost = *\nmodels = /srv/models\n\n[main]\nrole = all\nmodel = org/gemma\nhost = *\n"
+        )
+        .unwrap();
+
+        let conf = load_coordinator_configuration(file.path()).unwrap();
+        assert_eq!(conf.listen_addr(), "0.0.0.0:9000");
+        // Written through verbatim — `orangu-server` accepts `*` too.
+        assert_eq!(conf.llms["main"].host, "*");
+        assert_eq!(conf.llms["main"].origin(), "http://127.0.0.1:8100");
     }
 
     #[test]
@@ -671,7 +769,7 @@ mod tests {
         assert_eq!(conf.listen_addr(), "0.0.0.0:9100");
         assert_eq!(conf.startup_timeout_seconds, 30);
         assert_eq!(conf.llms.len(), 2);
-        assert_eq!(conf.llms["main"].host, "127.0.0.1");
+        assert_eq!(conf.llms["main"].host, HOST_ALL);
         assert_eq!(conf.llms["explorer"].origin(), "http://192.168.1.20:8200");
         assert_eq!(conf.llms["explorer"].model, "org/qwen");
         assert_eq!(conf.llms["explorer"].backend.as_deref(), Some("vulkan"));

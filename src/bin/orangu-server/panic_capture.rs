@@ -53,6 +53,17 @@ pub fn install() {
             .map(|l| l.to_string())
             .unwrap_or_else(|| "<unknown location>".to_string());
         let message = panic_payload_string(info.payload());
+        // Before anything else: a panic that says the GPU device is gone is
+        // this process's death notice, whichever thread it happened on.
+        // `wgpu` does not always report a lost device as an `Err` the engine
+        // can funnel through `device_lost::fail` — `Device::poll` panics from
+        // inside `wgpu` itself — and a panic on a thread nothing catches
+        // (a rayon worker, say) would otherwise leave the process up with a
+        // dead GPU and no explanation. Recording it here means the request's
+        // `catch_unwind` finds `device_lost::is_lost()` already set and
+        // sends the caller one sentence, and the exit that lets the
+        // supervisor restart on a fresh device is armed either way.
+        crate::device_lost::note_panic(&message);
         let backtrace = std::backtrace::Backtrace::force_capture();
         let detail = format!("panicked at {location}:\n{message}\n\nbacktrace:\n{backtrace}");
         LAST_PANIC.with(|cell| *cell.borrow_mut() = Some(detail));
@@ -106,6 +117,43 @@ mod tests {
         );
         assert!(detail.contains("backtrace:"), "got: {detail}");
         assert!(detail.contains("panic_capture.rs"), "got: {detail}");
+    }
+
+    /// The hook recognizes `wgpu`'s own device-lost panic and marks the
+    /// device lost, *without* the engine having caught anything.
+    ///
+    /// This wiring is the whole point: `wgpu`'s `Device::poll` panics from
+    /// inside `wgpu` (`handle_error_fatal`) rather than returning the `Err`
+    /// `device_lost::fail` funnels, so a real driver reset reached the
+    /// client as a raw Rust backtrace and left the process up with a dead
+    /// GPU — until this hook started reading the message. The panic text
+    /// here is verbatim from a real reset.
+    #[test]
+    fn the_hook_recognizes_a_wgpu_device_lost_panic() {
+        install();
+        assert!(!crate::device_lost::is_lost());
+
+        let result = std::panic::catch_unwind(|| {
+            panic!(
+                "Error in Device::poll: Validation Error\n\nCaused by:\n  Parent device is lost"
+            );
+        });
+        assert!(result.is_err());
+        assert!(
+            crate::device_lost::is_lost(),
+            "the hook must mark the device lost for the request's catch_unwind to find"
+        );
+        crate::device_lost::reset_for_test();
+    }
+
+    /// ...and leaves every other panic alone, which is most of them.
+    #[test]
+    fn the_hook_leaves_an_ordinary_panic_alone() {
+        install();
+        let _ = std::panic::catch_unwind(|| {
+            panic!("PANIC_CAPTURE_ORDINARY_TEST_PANIC");
+        });
+        assert!(!crate::device_lost::is_lost());
     }
 
     /// `take_last_panic_detail` clears the stash — a second call right

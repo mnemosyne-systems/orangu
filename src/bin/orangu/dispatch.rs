@@ -573,6 +573,12 @@ pub(crate) fn handle_command(
             })))
         }
         LocalCommand::ServerInfo => {
+            // Asking about the servers re-opens the question of what this one
+            // is: the next status refresh identifies the active endpoint again
+            // instead of reusing what it was last found to be.
+            if let Some(endpoint) = current_endpoint.as_deref() {
+                crate::models::forget_endpoint_kind(endpoint);
+            }
             // The active server is marked active (green dot); every other
             // configured server is listed as inactive (red dot).
             let lines: Vec<String> = sorted_model_names(llms)
@@ -601,6 +607,10 @@ pub(crate) fn handle_command(
             }
             let profile = &llms[name];
             let endpoint = orangu::llm::normalized_openai_endpoint(&profile.endpoint);
+            // Selecting a server re-opens the question of what it is, even when
+            // it is the server we were already on — the same reasoning as the
+            // model re-detection below.
+            crate::models::forget_endpoint_kind(&endpoint);
             *active_model = name.to_string();
             *active_model_id = profile.model.clone();
             *current_endpoint = Some(endpoint);
@@ -2138,6 +2148,9 @@ mod tests {
         let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
         let mut session = ChatSession::new("system");
         let mut detect_model = false;
+        // The status refresh remembers what an endpoint was last found to be;
+        // selecting a server has to re-open that question.
+        crate::models::remember_kind_for_test("https://api.openai.com/v1", false);
 
         let outcome = handle_command(
             "/server gpt-4.1",
@@ -2184,6 +2197,11 @@ mod tests {
         );
         // Selecting a server requests model auto-detection against it.
         assert!(detect_model);
+        assert_eq!(
+            crate::models::remembered_kind("https://api.openai.com/v1"),
+            None,
+            "the selected server must be identified again, not assumed"
+        );
     }
 
     #[test]
@@ -2394,6 +2412,7 @@ mod tests {
         let mut active_model_id = "model-b".to_string();
         let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8200/v1"));
         let mut session = ChatSession::new("system");
+        crate::models::remember_kind_for_test("http://localhost:8200/v1", false);
 
         let outcome = handle_command(
             "/server",
@@ -2439,6 +2458,12 @@ mod tests {
             }
             _ => panic!("expected output from /server"),
         }
+        // Asking about the servers also re-opens what the active one is.
+        assert_eq!(
+            crate::models::remembered_kind("http://localhost:8200/v1"),
+            None,
+            "the active endpoint must be identified again, not assumed"
+        );
     }
 
     #[test]

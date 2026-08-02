@@ -1252,6 +1252,8 @@ only (set to `1`), except where noted.
 
 | Variable | Default | Effect |
 | :-- | :-- | :-- |
+| `ORANGU_PREFILL_BATCH` | `512` (integer, not a presence flag) | **Ceiling** on how many prompt tokens go into one forward pass; the actual width is chosen per chunk by `ORANGU_PREFILL_CHUNK_MS` below and never exceeds this. `0` disables chunking entirely — the whole prompt in one submission, which is what prefill did unconditionally before this existed and which loses the device on any long prompt. Measured on a 4 GiB RX 5500M holding 2.5 GiB of weights, with a 17.5k-token prompt — no chunking: device lost after 21s; `2048`: device lost after 3m54s; `512`: completed in 4m13s, with peak VRAM identical (3.67 GiB) in all three. Not a throughput tax: at 8k tokens on the same card `512` prefilled at 115.4 tok/s against 105.5 unchunked, since a smaller working set pages less. |
+| `ORANGU_PREFILL_CHUNK_MS` | `3000` (integer) | Wall-clock target for one prefill submission. A chunk is timed and the next is scaled by the rate just measured, because cost per token climbs with context: a fixed 512-token chunk measured 2.3 s at position 512 and **10.1 s at position 6 656**, past the ~10 s `amdgpu` allows before it resets the device (see *Losing the GPU device*). A token-count limit alone therefore stops protecting anything on a long prompt. With this, a 48 000-token prompt that used to reset the device at position 7 680 completes with a slowest submission of 3.3 s. Lower it if resets still happen; the default leaves room for the estimate to lag a rate that only rises. |
 | `ORANGU_NO_MLP_UNROLL` | unset (block-unroll **on**) | Set to **disable** the block-unroll reduce kernel for K-quant (`Q4_K`/`Q5_K`/`Q6_K`) decode and fall back to the scalar per-element reduce kernel. The block-unroll iterates whole super-blocks, loading each block header once and issuing several weight/activation loads before the dependent dot; it is the default decode path. |
 | `ORANGU_NO_DUAL_NIBBLE` | unset (dual **on** for `Q4_K` and `Q6_K` decode) | Set to **disable** the dual decode kernels for both `Q4_K` and `Q6_K` and fall back to the two-wave block-unroll. Each two-wave kernel splits a 64-thread workgroup into two halves that re-read shared weight bytes — `Q4_K` streams every qs byte twice (once per nibble half), `Q6_K` re-reads every `qh` byte (once per `w_lo` half). The dual kernels use a 32-thread (single-subgroup) workgroup that loads each such byte once, cutting decode GPU-execution time (~22% for `Q4_K`, a further ~4–8% for `Q6_K`) with identical greedy output. They reorder the per-lane float adds, so they cross-check against the CPU backend within a tolerance rather than bit-for-bit. No effect on `Q4_K` when `ORANGU_PACKED_DOT=1`, or on either when `ORANGU_NO_MLP_UNROLL=1`. |
 | `ORANGU_NO_Q6K_DUAL` | unset (`Q6_K` dual **on**) | Set to **disable** only the `Q6_K` dual kernel (reverting `Q6_K` tensors — e.g. `ffn_down` — to the two-wave block-unroll) while leaving the `Q4_K` dual kernel on. For A/B isolation of the `Q6_K` kernel; `ORANGU_NO_DUAL_NIBBLE=1` disables both. |
@@ -1418,6 +1420,55 @@ call is made and no `libcuda.so` is found. `CudaBackend::try_init` runs
 silenced for the call) specifically so a non-NVIDIA machine gets the same
 graceful `None`/CPU-fallback outcome every other missing-backend path
 already has, not a crashed server.
+
+### Losing the GPU device (`device_lost.rs`)
+
+Every `wgpu` readback in `VulkanBackend` funnels its failure paths through
+one place, `crate::device_lost::fail`, which records the loss, writes the
+real detail to the server's log, arms a `75`/`EX_TEMPFAIL` exit two seconds
+out, and panics to unwind the request that was in flight. Three things it
+replaced are worth naming, because each was a separate way the old code
+made a driver reset worse than it had to be:
+
+- **`map_async` callbacks called `.expect()` in place.** `wgpu` runs that
+  callback from inside `poll` — or, on the failure path a lost device takes,
+  synchronously from inside `map_async` itself — while `wgpu-core` holds its
+  own locks, so the unwind went straight through them. The callbacks now
+  only record two bits (`MapWait`), and the waiter reports from its own
+  frame, with a stack that names which readback was in flight.
+- **A failed poll, a failed map, and the `READBACK_WAIT_TIMEOUT` deadline
+  each panicked with their own wording.** All three are the same event seen
+  from three angles; all three now report it as one.
+- **Two of the callbacks discarded their result entirely** (the striped
+  matmul and the batch readback's `|_| {}`), so a device that died partway
+  through a set of buffers was noticed only later, by whatever read the
+  unmapped memory next. Each set now shares one `MapWait` and is checked
+  once after its single poll.
+
+One funnel is not enough on its own, though, because `wgpu` does not always
+hand a lost device back as an `Err` at all: `Device::poll` routes it through
+`handle_error_fatal`, which **panics from inside `wgpu`** (`Error in
+Device::poll: Validation Error / Caused by: Parent device is lost`), so the
+`Result` the engine checks never arrives. Every `wgpu` call made after the
+device dies ends that way. `panic_capture`'s hook therefore reads every
+panic's message and calls `device_lost::note_panic`, which marks the loss and
+arms the same exit without panicking again — process-wide, so a `wgpu` panic
+on a thread nothing catches (a rayon worker) still takes the process down
+cleanly instead of leaving it up with a dead GPU. The message match is on the
+condition (`device is lost`, `DeviceLost`), not on any one call's name.
+
+`engine::generate`'s `catch_unwind` recognizes the loss (`device_lost::
+is_lost`) and swaps the panic's captured detail — meaningless to a caller,
+since the backtrace describes the driver rather than their request — for
+`device_lost::CLIENT_MESSAGE` (`panic_report`). Requests that arrive in the
+window before the process exits get that same sentence without being
+started at all.
+
+The exit code is the contract with `orangu-coordinator`, which names the
+same number (`process::SERVER_EXIT_DEVICE_LOST`) so it can report the
+restart as the recovery it is instead of an unexplained crash. Nothing
+about the mechanism is Vulkan-specific: `MetalBackend` is the same engine,
+so a lost Metal device takes the identical path.
 
 ### Correctness testing
 

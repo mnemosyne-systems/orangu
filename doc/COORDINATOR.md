@@ -207,13 +207,13 @@ backend = vulkan
 slots = 4
 ```
 
-Neither profile above sets `host`/`port` — both fall back to
-`127.0.0.1:8100`, which is fine (see below); set them explicitly only if a
-profile needs something different.
+Neither profile above sets `host`/`port` — both fall back to `all:8100`
+(the same default `orangu-server` itself applies), which is fine (see
+below); set them explicitly only if a profile needs something different.
 
 | Key | Section | Required | Description |
 | :-- | :-- | :-- | :-- |
-| `host` | `[orangu-coordinator]` | No | Host the proxy listens on. Defaults to `127.0.0.1` |
+| `host` | `[orangu-coordinator]` | No | Host the proxy listens on: `all` (every network interface), its `*` alias, or a literal interface address such as `127.0.0.1`. Defaults to `all`, the same default and the same spellings `orangu-server`'s own `host` uses |
 | `port` | `[orangu-coordinator]` | No | Port the proxy listens on. Defaults to `9000` |
 | `models` | `[orangu-coordinator]` | Yes | Models directory forwarded to every profile's own `orangu-server` (its `[orangu-server].models` key) — one shared directory across every profile, same as pointing plain `orangu-server` at one `models` directory. Supports a leading `~`/`~/...` |
 | `startup_timeout` | `[orangu-coordinator]` | No | Seconds to wait for a newly started `orangu-server` to answer `GET /v1/models` before giving up. Defaults to `180` |
@@ -222,7 +222,7 @@ profile needs something different.
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag; anything else is rejected at load time |
 | `model` | profile | Yes | A model spec in the same shape `orangu-server`'s own positional `MODEL` argument accepts: a local `.gguf` path, an `NR`/`MODEL` label already under the shared `models` directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first start if not already cached). This is the model id a client request's `model` field matches against — profiles *may* share one, e.g. the same model configured once per role; `resolve_entry` breaks any resulting tie by profile name |
-| `host` | profile | No | Host this profile's `orangu-server` listens on. Defaults to `127.0.0.1` |
+| `host` | profile | No | Host this profile's `orangu-server` listens on, written verbatim into its generated config so it takes the same `all`/`*`/address spellings. Defaults to `all`. The coordinator reaches a wildcard-bound profile over loopback |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set. Defaults to `orangu-server`'s own default (`auto`) |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set. Defaults to `orangu-server`'s own role-based default |
@@ -234,14 +234,15 @@ overwritten on every start) carrying its `models`/`host`/`port` and whichever
 of `backend`/`slots`/`web` were set — inspect that file directly to see
 exactly what a given profile's `orangu-server` last ran with.
 
-Every profile defaulting to `127.0.0.1:8100` — the same address, not a
-distinct one per role — is intentional and safe: at most one profile's
+Every profile defaulting to `all:8100` — the same address, not a distinct
+one per role — is intentional and safe: at most one profile's
 `orangu-server` is ever alive under the coordinator (its whole invariant),
 and swapping to a different profile always fully stops whichever one is
 currently running before starting the new one, so the new process never
 races the old one for the same port. Give a profile its own explicit
-`host`/`port` only if you actually want its `orangu-server` reachable
-directly, bypassing the coordinator.
+`host`/`port` only if you want its `orangu-server` somewhere specific — a
+`host` of `127.0.0.1` to keep it off the network entirely, or a distinct
+`port` to reach it directly, bypassing the coordinator.
 
 Default lookup order for the config file, same as `orangu.conf`:
 
@@ -285,11 +286,13 @@ silently in the background. There is no PID file: find the process with
 orangu-coordinator --init
 ```
 
-Mirrors `orangu --init`: it walks every `[orangu-coordinator]` key showing
-its default (including the required `models` directory), then asks for a
-model and a port role by role — `all` is mandatory, `code`/`review`/
-`explorer`/`embeddings` are skipped by leaving the model prompt blank. It
-shows the resulting file and asks for confirmation before writing
+Behaves the same way `orangu-server --init` does: it walks every
+`[orangu-coordinator]` key showing its default (including the `models`
+directory, which defaults to the Hugging Face cache
+`~/.cache/huggingface/hub` and is created if it isn't there yet), then asks
+for a model, host, and port role by role — `all` is mandatory, `code`/
+`review`/`explorer`/`embeddings` are skipped by leaving the model prompt
+blank. It shows the resulting file and asks for confirmation before writing
 `~/.orangu/orangu-coordinator.conf` (creating the directory if needed, and
 overwriting any existing file).
 
@@ -298,18 +301,33 @@ The written file is kept terse: only `host`/`port` (in
 every other answer left at its default is simply omitted, since the loader
 already falls back to the exact same value on its own.
 
-Both the `models` directory prompt and every role's `model` prompt offer
-inline ghost-text suggestions and TAB completion as you type: `models`
-completes real filesystem paths, and once it's set, each `model` prompt
-completes over every installed model's user-facing Hugging Face-style label
-— the same label `orangu-server list`'s `MODEL` column prints (e.g.
-`unsloth/gemma-4-E2B-it-GGUF:Q4_K_M`), not the raw on-disk filename, and
-deliberately *not* its `NR` shorthand either: unlike `orangu-server`'s own
-`--init`, a coordinator profile's `model` is written once and read back
-indefinitely (and is also the literal string clients match against), so
-only a stable identifier is ever offered. Neither prompt requires typing an
-offered value — a local path or a not-yet-downloaded
-`<user>/<model>[:quant]` spec is equally valid.
+Every prompt with something to offer shows it inline as grey ghost text
+while you type, and completes it on TAB (which also lists every candidate),
+exactly as `orangu-server --init` does:
+
+- `models` completes real filesystem paths.
+- Every `host` prompt — `[orangu-coordinator]`'s own and each profile's —
+  completes over `all`, its `*` alias, and every address this machine's
+  interfaces actually have, each annotated with the interface it belongs to
+  in the TAB list. An empty line ghosts `all`.
+- Each `model` prompt (once `models` is set) completes over every installed
+  model: both its `NR` shorthand and its `MODEL:QUANT` label — the same
+  pairing `orangu-server list` prints (e.g.
+  `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M`), not the raw on-disk filename. The
+  quantization is part of the offered label on purpose: a repo present in
+  several quantizations otherwise lists one name once per row and resolves
+  to whichever came first. Only the labels are ghosted; an `NR` is a
+  shorthand to type, not a model to preview.
+- An `NR` answer is written into the file as that row's own `MODEL:QUANT`
+  label. A coordinator profile's `model` is read back for as long as the
+  file lives *and* is the literal string clients match against, so a
+  scan-order-dependent digit must never be persisted — it would silently
+  start naming a different model as soon as the `models` directory changes.
+- A `models` directory holding exactly one model is taken for the mandatory
+  `all` role without asking, echoed as `model/all: <label>`.
+
+No prompt requires typing an offered value — a local path or a
+not-yet-downloaded `<user>/<model>[:quant]` spec is equally valid.
 
 ## Pointing orangu.conf at it
 
@@ -359,6 +377,34 @@ coordinator. Behind a confirmed coordinator, those sections' own `role` and
   and owns the lifecycle of itself.
 - **Dynamic Hot-Reloading**: The coordinator watches `orangu-coordinator.conf` and hot-reloads changes automatically (polled every ~5 seconds) without needing a restart. Any change to the active profile's settings — not just its model — restarts its `orangu-server`.
 - **Fallback Routing**: If a requested profile fails to load (e.g. out of memory), the coordinator automatically falls back to starting the `all`-role profile rather than failing the request entirely.
+- **Crash recovery and one retry**: `ensure_active` restarts a profile whose
+  child process it finds dead, so a stopped `orangu-server` costs the next
+  request a cold load rather than an error. That check can't close the
+  window where the child is alive when checked and gone microseconds later
+  — which is exactly what `orangu-server` exiting on a lost GPU device does
+  under a request — so a forwarded request that fails to *reach* the child
+  is retried exactly once. It's safe because nothing has been streamed back
+  to the caller at that point; a second failure is reported as a `502`
+  rather than retried again.
+- **The retry asks whether the profile answers, not whether it is running**:
+  `ensure_reachable` (not `ensure_active`) precedes it, because
+  `Child::try_wait` lags. A `SIGKILL`ed child is gone immediately but is not
+  *reported* as exited until tokio's `SIGCHLD` handling has run, so a retry
+  that consults it milliseconds after the connection failed is told the dead
+  process is fine and sends the request straight back into the same closed
+  port — measured against a real profile, not theorized. `ensure_reachable`
+  instead probes `GET /v1/models` with the same short health-check timeout:
+  an answer means the failure was transient and nothing is restarted (a
+  restart would throw away a working process and every other request on it);
+  no answer means the child is gone whatever `try_wait` believes, and it is
+  replaced before the request is re-sent.
+- **A lost GPU device is a recognized exit, not a crash**: `orangu-server`
+  exits with `75` (`EX_TEMPFAIL`) when a driver reset destroys its GPU
+  device, after telling the caller so in one sentence. The coordinator names
+  the same status (`process::SERVER_EXIT_DEVICE_LOST`) and reports the
+  restart as the recovery it is — `'main' exited after losing its GPU device
+  (a driver reset); restarting it on a fresh device` — rather than as an
+  unexplained crash with an output tail attached.
 - The first request after a swap waits for the new model to finish loading;
   size `startup_timeout` generously for large models.
 - Once orangu confirms it's talking to a coordinator, it shows "Automatic"

@@ -63,6 +63,18 @@ struct OpenAiStreamResponse {
     timings: Option<OpenAiTimings>,
     #[serde(default)]
     prompt_progress: Option<OpenAiPromptProgress>,
+    /// An error the server ran into *after* it had already answered `200 OK`
+    /// and started streaming — the only channel it has left to say so.
+    ///
+    /// This is not an exotic case: it is how `orangu-server` reports
+    /// anything that goes wrong during generation (`StreamEvent::Error`,
+    /// e.g. a lost GPU device), and llama.cpp/OpenAI use the same event with
+    /// an object payload instead of a string. Without this field the event
+    /// parsed cleanly into a response with no choices, was ignored, and the
+    /// stream then ended — so the failure reached the user as a blank reply
+    /// with nothing said about it. See [`stream_error_message`].
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +298,12 @@ where
     }
 
     let response: OpenAiStreamResponse = serde_json::from_str(&payload)?;
+    // Reported before anything else in the event is looked at: a server that
+    // sends one is done with this response, and whatever text arrived before
+    // it is a partial answer, not an answer.
+    if let Some(error) = &response.error {
+        return Err(anyhow!("{}", stream_error_message(error)));
+    }
     let metrics = stream_metrics_from_response(&response);
     if !metrics.is_empty() {
         on_stream_metrics(metrics);
@@ -302,6 +320,22 @@ where
     }
 
     Ok(false)
+}
+
+/// The human-readable text of a server-sent `error` event, whichever shape
+/// the server uses for it: `orangu-server` sends the message as a bare
+/// string (`{"error": "..."}`), OpenAI and llama.cpp send an object with a
+/// `message` field (`{"error": {"message": "...", "type": "..."}}`). Any
+/// other shape is rendered as its own JSON rather than swallowed — an
+/// unhelpful message still says more than no message.
+fn stream_error_message(error: &serde_json::Value) -> String {
+    if let Some(text) = error.as_str() {
+        return text.to_string();
+    }
+    if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+        return message.to_string();
+    }
+    error.to_string()
 }
 
 fn stream_metrics_from_response(response: &OpenAiStreamResponse) -> StreamMetrics {
@@ -400,6 +434,79 @@ mod tests {
         assert_eq!(rendered, "Hello");
         assert!(tool_calls.is_empty());
         assert!(metrics.is_empty());
+    }
+
+    /// An error event mid-stream is an error, not an empty event. Before
+    /// this, `{"error": ...}` parsed into a response with no choices, was
+    /// ignored, and the stream ended right after — so a failed generation
+    /// (a lost GPU device, an over-long prompt, ...) reached the user as a
+    /// blank reply with no explanation at all.
+    #[test]
+    fn stream_event_reports_a_server_sent_error() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        let err = process_stream_event(
+            // `orangu-server`'s own shape: the message as a bare string.
+            &[r#"{"error":"the server lost its GPU device"}"#.to_string()],
+            &mut content,
+            &mut tool_calls,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .expect_err("a server-sent error event must fail the request");
+        assert!(
+            err.to_string().contains("lost its GPU device"),
+            "got: {err}"
+        );
+    }
+
+    /// Whatever text arrived before the error is *not* returned as the
+    /// answer: a truncated reply presented as a complete one is worse than
+    /// an error, because nothing marks it as partial.
+    #[test]
+    fn a_partial_reply_before_an_error_is_not_returned_as_the_answer() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut rendered = String::new();
+
+        let ok = process_stream_event(
+            &[r#"{"choices":[{"delta":{"content":"Here is the plan"}}]}"#.to_string()],
+            &mut content,
+            &mut tool_calls,
+            &mut |text| rendered.push_str(text),
+            &mut |_| {},
+        );
+        assert!(matches!(ok, Ok(false)));
+
+        assert!(
+            process_stream_event(
+                &[r#"{"error":{"message":"context lost","type":"server_error"}}"#.to_string()],
+                &mut content,
+                &mut tool_calls,
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .is_err()
+        );
+    }
+
+    /// Both shapes a server may send, plus one nobody documents.
+    #[test]
+    fn stream_error_message_reads_either_shape() {
+        assert_eq!(
+            stream_error_message(&serde_json::json!("plain string")),
+            "plain string"
+        );
+        assert_eq!(
+            stream_error_message(&serde_json::json!({"message": "object with a message"})),
+            "object with a message"
+        );
+        // Nothing recognizable: the raw JSON, rather than silence.
+        assert_eq!(
+            stream_error_message(&serde_json::json!({"code": 500})),
+            r#"{"code":500}"#
+        );
     }
 
     #[test]

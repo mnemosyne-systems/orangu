@@ -4,6 +4,17 @@
 
 `orangu` exposes local workspace tools to the active model.
 
+Tools are sent as OpenAI `tools` on every chat request, and the model asks for
+one by answering with `tool_calls`; `orangu` runs it in the workspace, feeds the
+result back as a `tool` message, and lets the model continue. `max_tool_rounds`
+in `[orangu]` bounds how many such rounds one prompt may take.
+
+Whether this works depends on the **model**, not on orangu: a model whose chat
+template has no tool support never sees the declarations and will say it has no
+tools available. `orangu-server` passes the array through to the template and
+translates the answer back — see **Tool calling** in the Inference server
+chapter for which answer formats it recognises.
+
 ## Available tools
 
 | Tool | Purpose | Key arguments |

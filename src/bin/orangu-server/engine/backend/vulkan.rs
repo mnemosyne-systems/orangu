@@ -2385,11 +2385,70 @@ fn busy_poll() -> bool {
 }
 
 /// How long [`VulkanBackend::wait_mapped`] keeps polling for a buffer's map
-/// callback before it treats the device as lost and panics, rather than
-/// blocking a request forever. A real readback resolves in well under a
-/// millisecond; this only ever bounds a wedged or lost device, so it is set
-/// far above any legitimate wait.
+/// callback before it treats the device as lost, rather than blocking a
+/// request forever. A real readback resolves in well under a millisecond;
+/// this only ever bounds a wedged or lost device, so it is set far above any
+/// legitimate wait.
 const READBACK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One pending `map_async`'s outcome, recorded for whoever is waiting on it
+/// ([`VulkanBackend::wait_mapped`], or a `poll` plus [`MapWait::check`] when
+/// several buffers of one submission share a single poll).
+///
+/// The callback **records** a failure rather than reporting it, on purpose.
+/// `wgpu` runs the callback either from inside `poll` or — on the failure
+/// path a lost device takes — synchronously from inside `map_async` itself,
+/// with `wgpu-core`'s own locks held; panicking from there unwinds straight
+/// through them. So the callback only ever stores two bits, and
+/// [`crate::device_lost::fail`] is called from our own frame afterwards,
+/// with a stack that says which readback was in flight.
+///
+/// This is why a lost device used to show up as a backtrace through
+/// `wgpu_core::resource::Buffer::map_async`: the old callbacks called
+/// `.expect()` in place.
+#[derive(Default)]
+struct MapWait {
+    /// Set once the callback has run, whatever it reported — the condition
+    /// `wait_mapped` polls for.
+    done: std::sync::atomic::AtomicBool,
+    /// Set when that callback reported a `BufferAsyncError`.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl MapWait {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// The `map_async` callback that records into this wait. Takes an
+    /// `Arc<Self>` since `map_async` requires a `'static` callback.
+    fn callback(
+        self: &std::sync::Arc<Self>,
+    ) -> impl FnOnce(Result<(), wgpu::BufferAsyncError>) + Send + 'static {
+        let state = self.clone();
+        move |result| {
+            use std::sync::atomic::Ordering;
+            if result.is_err() {
+                state.failed.store(true, Ordering::Release);
+            }
+            // After `failed`, never before: a waiter that sees `done` must
+            // already be able to see why.
+            state.done.store(true, Ordering::Release);
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reports a failed map as a lost device, naming what was being read
+    /// back. Returns normally when the map is still pending or succeeded.
+    fn check(&self, context: &str) {
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            crate::device_lost::fail(context, "the buffer map failed (BufferAsyncError)");
+        }
+    }
+}
 
 /// Whether `ORANGU_PREFILL_TRACE` is set, cached — the same switch
 /// `GemmaModel::forward` reads for its per-stage lines, read here too so a
@@ -4187,19 +4246,14 @@ impl VulkanBackend {
             let (wx, wy, wz) = Self::workgroup_dims((out_dim * n_tokens) as u32);
             pass.dispatch_workgroups(wx, wy, wz);
         }
+        const CONTEXT: &str = "reading back an mmvq matmul";
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, output_len);
         self.queue.submit(Some(encoder.finish()));
-        readback.slice(..).map_async(wgpu::MapMode::Read, |r| {
-            r.expect("mmvq readback map failed")
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("mmvq poll failed");
+        let wait = self.map_read(&readback);
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
         let out: Vec<f32> = {
-            let data = readback
-                .slice(..)
-                .get_mapped_range()
-                .expect("mmvq readback buffer was not mapped");
+            let data = self.mapped_bytes(&readback, CONTEXT);
             bytemuck::cast_slice(&data).to_vec()
         };
         readback.unmap();
@@ -4398,18 +4452,22 @@ impl VulkanBackend {
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        const CONTEXT: &str = "reading back a striped matmul";
+        // Every buffer's map is recorded into one shared `MapWait` — a
+        // single `check` after the single poll then covers all of them, so
+        // a device that dies partway through the set is still reported
+        // (the callbacks here used to discard their result outright).
+        let wait = MapWait::new();
         for (_, readback, _) in &outs {
-            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, wait.callback());
         }
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll striped matmul readback");
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
         outs.iter()
             .map(|(_, readback, len)| {
-                let slice = readback.slice(..);
-                let data = slice
-                    .get_mapped_range()
-                    .expect("striped matmul readback mapped by the poll above");
+                let data = self.mapped_bytes(readback, CONTEXT);
                 let out = bytemuck::cast_slice::<u8, f32>(&data)[..*len].to_vec();
                 drop(data);
                 readback.unmap();
@@ -4534,32 +4592,27 @@ impl VulkanBackend {
         // Every readback buffer's `map_async` is fired before the single
         // `poll(Wait)` below — that one poll drains every callback bound to
         // this submission, not just one buffer's, which is what turns
-        // `ops.len()` waits into one.
+        // `ops.len()` waits into one. They share one `MapWait`, so the
+        // single `check` after that poll covers every buffer in the batch.
+        const CONTEXT: &str = "reading back a matmul batch";
+        let wait = MapWait::new();
         for guard in &guards {
             guard
                 .readback_buffer
                 .as_ref()
                 .expect("ensured above")
                 .slice(..)
-                .map_async(wgpu::MapMode::Read, |result| {
-                    result.expect("mapping a matmul batch readback buffer failed");
-                });
+                .map_async(wgpu::MapMode::Read, wait.callback());
         }
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling the device for the matmul batch readback failed");
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
 
         guards
             .iter()
             .map(|guard| {
-                let slice = guard
-                    .readback_buffer
-                    .as_ref()
-                    .expect("ensured above")
-                    .slice(..);
-                let data = slice.get_mapped_range().expect(
-                    "matmul batch readback buffer was not mapped after a successful \
-                     map_async + poll",
+                let data = self.mapped_bytes(
+                    guard.readback_buffer.as_ref().expect("ensured above"),
+                    CONTEXT,
                 );
                 let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
                 drop(data);
@@ -6156,6 +6209,7 @@ impl VulkanBackend {
         src_offset: u64,
         len_f32: usize,
     ) -> (Vec<f32>, ReadbackSplit) {
+        const CONTEXT: &str = "reading back a fused layer's output";
         let byte_len = (len_f32 as u64) * 4;
         let t_alloc = TraceClock::start();
         let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -6175,21 +6229,11 @@ impl VulkanBackend {
         // `wait_mapped` so this readback is not left carrying the single-poll
         // race that method's doc comment describes.
         let t_wait = TraceClock::start();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_cb = done.clone();
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                result.expect("mapping a generic readback buffer failed");
-                done_cb.store(true, std::sync::atomic::Ordering::Release);
-            });
-        self.wait_mapped(&done);
+        let wait = self.map_read(&readback_buffer);
+        self.wait_mapped(&wait, CONTEXT);
         let wait_ms = t_wait.ms();
         let t_copy = TraceClock::start();
-        let data = readback_buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("generic readback buffer was not mapped after a successful map_async + poll");
+        let data = self.mapped_bytes(&readback_buffer, CONTEXT);
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         readback_buffer.unmap();
@@ -6227,10 +6271,11 @@ impl VulkanBackend {
     /// The blocking path parks the thread on `PollType::Wait`; the
     /// `ORANGU_BUSY_POLL` path spins on non-blocking `PollType::Poll` to keep
     /// the calling core hot (see [`busy_poll`]). Either way the loop is
-    /// bounded by [`READBACK_WAIT_TIMEOUT`] so a lost device panics with a
-    /// clear message instead of hanging the request forever.
-    fn wait_mapped(&self, done: &std::sync::atomic::AtomicBool) {
-        use std::sync::atomic::Ordering;
+    /// bounded by [`READBACK_WAIT_TIMEOUT`], and every way out that isn't a
+    /// completed map — a failed map, a failed poll, or that deadline —
+    /// reports a lost device through [`crate::device_lost::fail`] rather
+    /// than hanging the request forever.
+    fn wait_mapped(&self, wait: &MapWait, context: &str) {
         let spin = busy_poll();
         let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
         loop {
@@ -6239,16 +6284,17 @@ impl VulkanBackend {
             } else {
                 wgpu::PollType::wait_indefinitely()
             };
-            self.device
-                .poll(poll_type)
-                .expect("polling for a GPU readback failed");
-            if done.load(Ordering::Acquire) {
+            self.poll_blocking_with(poll_type, context);
+            wait.check(context);
+            if wait.is_done() {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!(
-                    "GPU readback map did not complete within {READBACK_WAIT_TIMEOUT:?}; \
-                     the device may be lost"
+                crate::device_lost::fail(
+                    context,
+                    format_args!(
+                        "the buffer map did not complete within {READBACK_WAIT_TIMEOUT:?}"
+                    ),
                 );
             }
             if spin {
@@ -6262,11 +6308,50 @@ impl VulkanBackend {
         }
     }
 
+    /// `poll(Wait)` until every callback bound to the last submission has
+    /// run, reporting a failed poll as a lost device (it is the other half
+    /// of the same symptom a failed map is: once the driver resets the
+    /// device, both stop working) rather than as a bare `expect`.
+    fn poll_blocking(&self, context: &str) {
+        self.poll_blocking_with(wgpu::PollType::wait_indefinitely(), context);
+    }
+
+    /// [`Self::poll_blocking`] with the poll mode chosen by the caller —
+    /// [`Self::wait_mapped`]'s busy-poll path needs `PollType::Poll`.
+    fn poll_blocking_with(&self, poll_type: wgpu::PollType, context: &str) {
+        if let Err(err) = self.device.poll(poll_type) {
+            crate::device_lost::fail(context, err);
+        }
+    }
+
+    /// Maps `buffer`'s whole range for reading and hands back the
+    /// [`MapWait`] its callback will record into — pair it with
+    /// [`Self::wait_mapped`] (one buffer) or [`Self::poll_blocking`] plus
+    /// [`MapWait::check`] (several buffers sharing one poll).
+    fn map_read(&self, buffer: &wgpu::Buffer) -> std::sync::Arc<MapWait> {
+        let wait = MapWait::new();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, wait.callback());
+        wait
+    }
+
+    /// The mapped bytes of `buffer`'s whole range, after a completed
+    /// [`Self::map_read`] — a failure here means the map that just reported
+    /// success is gone, which only a lost device does.
+    fn mapped_bytes(&self, buffer: &wgpu::Buffer, context: &str) -> wgpu::BufferView {
+        buffer
+            .slice(..)
+            .get_mapped_range()
+            .unwrap_or_else(|err| crate::device_lost::fail(context, err))
+    }
+
     pub fn submit_and_readback_u32(
         &self,
         mut encoder: wgpu::CommandEncoder,
         src: &wgpu::Buffer,
     ) -> u32 {
+        const CONTEXT: &str = "reading back a sampled token id";
         let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server u32 readback"),
             size: 4,
@@ -6277,19 +6362,9 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_cb = done.clone();
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                result.expect("mapping a u32 readback buffer failed");
-                done_cb.store(true, std::sync::atomic::Ordering::Release);
-            });
-        self.wait_mapped(&done);
-        let data = readback_buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("u32 readback buffer was not mapped after a successful map_async + poll");
+        let wait = self.map_read(&readback_buffer);
+        self.wait_mapped(&wait, CONTEXT);
+        let data = self.mapped_bytes(&readback_buffer, CONTEXT);
         let result: u32 = bytemuck::cast_slice::<u8, u32>(&data)[0];
         drop(data);
         readback_buffer.unmap();
@@ -9822,18 +9897,11 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
-                result.expect("mapping the attention readback buffer failed");
-            });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling the device for the attention readback failed");
-        let data = readback_buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("attention readback buffer was not mapped after a successful map_async + poll");
+        const CONTEXT: &str = "reading back an attention result";
+        let wait = self.map_read(&readback_buffer);
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
+        let data = self.mapped_bytes(&readback_buffer, CONTEXT);
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         readback_buffer.unmap();
@@ -11997,25 +12065,17 @@ impl VulkanBackend {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let submit_elapsed = submit_start.map(|t| t.elapsed());
 
+        const CONTEXT: &str = "reading back a cached matmul";
         let map_async_start = fine.then(std::time::Instant::now);
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_cb = done.clone();
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                result.expect("mapping the cached matmul readback buffer failed");
-                done_cb.store(true, std::sync::atomic::Ordering::Release);
-            });
+        let wait = self.map_read(&readback_buffer);
         let map_async_elapsed = map_async_start.map(|t| t.elapsed());
 
         let poll_start = fine.then(std::time::Instant::now);
-        self.wait_mapped(&done);
+        self.wait_mapped(&wait, CONTEXT);
         let poll_elapsed = poll_start.map(|t| t.elapsed());
 
         let readback_start = fine.then(std::time::Instant::now);
-        let data = readback_buffer.slice(..).get_mapped_range().expect(
-            "cached matmul readback buffer was not mapped after a successful map_async + poll",
-        );
+        let data = self.mapped_bytes(&readback_buffer, CONTEXT);
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         readback_buffer.unmap();
@@ -12105,22 +12165,20 @@ impl VulkanBackend {
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        const CONTEXT: &str = "reading back a batched decode step";
+        let wait = MapWait::new();
         for readback in &readback_buffers {
-            readback.slice(..).map_async(wgpu::MapMode::Read, |result| {
-                result.expect("mapping a batched decode readback buffer failed");
-            });
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, wait.callback());
         }
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling for the batched decode readback failed");
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
 
         readback_buffers
             .iter()
             .map(|readback| {
-                let data = readback.slice(..).get_mapped_range().expect(
-                    "batched decode readback buffer was not mapped after a successful \
-                     map_async + poll",
-                );
+                let data = self.mapped_bytes(readback, CONTEXT);
                 let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
                 drop(data);
                 readback.unmap();
@@ -12233,18 +12291,11 @@ impl VulkanBackend {
         let t = guard
             .as_ref()
             .expect("report_timestamps called without a prior timestamp_query_set this step");
-        t.readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |result| {
-                result.expect("mapping the timestamp readback buffer failed");
-            });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling for the timestamp readback failed");
-        let data =
-            t.readback_buffer.slice(..).get_mapped_range().expect(
-                "timestamp readback buffer was not mapped after a successful map_async + poll",
-            );
+        const CONTEXT: &str = "reading back GPU timestamps";
+        let wait = self.map_read(&t.readback_buffer);
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
+        let data = self.mapped_bytes(&t.readback_buffer, CONTEXT);
         let ticks: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         t.readback_buffer.unmap();

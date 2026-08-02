@@ -605,6 +605,10 @@ async fn send_message(
             max_tokens: MAX_TOKENS,
             stop_token_ids,
             cache_prompt: true,
+            // The web console keeps one conversation per session but has no
+            // notion of a slot; any free one is right.
+            id_slot: None,
+            timings_per_token: false,
         })
         .await;
 
@@ -633,6 +637,7 @@ async fn send_message(
         loop {
             let Some(event) = rx.recv().await else { break };
             match event {
+                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Token(text) => {
                     full.push_str(&text);
                     let html = render::render_markdown_to_html(&full);
@@ -680,15 +685,17 @@ fn render_prompt(
     let mut messages: Vec<ChatMessage> = session
         .messages
         .iter()
-        .map(|m: &SessionMessage| ChatMessage {
-            role: m.role.clone(),
-            content: attachments::compose_content(&m.content, &m.attachments),
+        .map(|m: &SessionMessage| {
+            ChatMessage::text(
+                &m.role,
+                &attachments::compose_content(&m.content, &m.attachments),
+            )
         })
         .collect();
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: attachments::compose_content(new_message, new_attachments),
-    });
+    messages.push(ChatMessage::text(
+        "user",
+        &attachments::compose_content(new_message, new_attachments),
+    ));
 
     let bos = state
         .engine

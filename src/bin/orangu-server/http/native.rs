@@ -274,6 +274,9 @@ pub struct CompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stream: bool,
+    /// See `openai::ChatCompletionRequest::id_slot`.
+    #[serde(default)]
+    id_slot: Option<usize>,
 }
 
 fn default_n_predict() -> usize {
@@ -294,6 +297,9 @@ pub async fn completion(
         )
             .into_response();
     }
+    if let Some(rejection) = super::openai::reject_unknown_slot(&state, req.id_slot) {
+        return rejection;
+    }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
     let sampling = sampling_from(&req, state.engine.role);
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
@@ -305,6 +311,8 @@ pub async fn completion(
             max_tokens: req.n_predict,
             stop_token_ids,
             cache_prompt: req.cache_prompt,
+            id_slot: req.id_slot,
+            timings_per_token: false,
         })
         .await;
 
@@ -313,6 +321,7 @@ pub async fn completion(
         let mut timings = serde_json::Value::Null;
         while let Some(event) = rx.recv().await {
             match event {
+                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Token(text) => content.push_str(&text),
                 StreamEvent::Done { stats, .. } => {
                     timings = super::openai::timings_json(&stats);
@@ -334,6 +343,7 @@ pub async fn completion(
     let stream = async_stream::stream! {
         while let Some(event) = rx.recv().await {
             match event {
+                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Token(text) => {
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default()

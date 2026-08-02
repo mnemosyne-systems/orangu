@@ -2788,7 +2788,6 @@ pub(crate) async fn run_auto_review_request(
     let streamed_state = Arc::new(Mutex::new(StreamRenderState::default()));
     let prompt_output = Arc::clone(&streamed_state);
     let prompt_metrics = Arc::clone(&streamed_state);
-    let tokenizer = cl100k_base().ok();
     let mut future = Box::pin(scratch.prompt_without_tools(
         prompt,
         profile,
@@ -2922,7 +2921,6 @@ pub(crate) async fn run_auto_review_request(
                     None,
                     started.elapsed(),
                     frame,
-                    tokenizer.as_ref(),
                 );
                 // The reviewed file's white dot blinks at ~1Hz on the 120ms
                 // frame clock: four frames on, four frames off.

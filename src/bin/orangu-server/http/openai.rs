@@ -28,6 +28,7 @@ use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::loader::PoolingType;
 use crate::engine::sampling::SamplingParams;
+use crate::engine::tool_calls;
 
 /// OpenAI's `usage` object.
 pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
@@ -113,6 +114,27 @@ pub struct ChatCompletionRequest {
     /// full prefill.
     #[serde(default = "default_cache_prompt")]
     cache_prompt: bool,
+    /// Pin this request to one specific slot (llama.cpp's field name), so a
+    /// conversation returns to the slot holding its own KV cache instead of
+    /// reprefilling on a stranger's. See `engine::generate::GenerateRequest`.
+    #[serde(default)]
+    id_slot: Option<usize>,
+    /// llama.cpp's field: attach a `timings` object to every streamed chunk,
+    /// not only the last one. A client showing a live decode rate has no
+    /// other honest source for it.
+    #[serde(default)]
+    timings_per_token: bool,
+    /// llama.cpp's field: emit `prompt_progress` chunks *during* prefill, so
+    /// a client can show how far a long prompt has got instead of an
+    /// indefinite spinner.
+    #[serde(default)]
+    return_progress: bool,
+    /// OpenAI's tool array, handed to the chat template as `tools`. Kept as
+    /// raw JSON: what a tool declaration must contain is the template's
+    /// business, and every field this server invented an opinion about would
+    /// be one a model's own template could no longer see.
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
 }
 
 pub(crate) fn default_cache_prompt() -> bool {
@@ -132,6 +154,57 @@ pub(crate) fn default_cache_prompt() -> bool {
 /// is the other half of this approximation and *does* generalize to any
 /// template that checks for it).
 pub(crate) const EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
+
+/// Reject an `id_slot` this server has no slot for, rather than silently
+/// ignoring it and quietly reprefilling every turn — the exact failure the
+/// field was added to end. Same shape `POST /slots/{id}` already answers with.
+pub(crate) fn reject_unknown_slot(
+    state: &AppState,
+    id_slot: Option<usize>,
+) -> Option<axum::response::Response> {
+    let index = id_slot?;
+    (index >= state.engine.slots.total()).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "id_slot {index} out of range (server has {} slots)\n",
+                state.engine.slots.total()
+            ),
+        )
+            .into_response()
+    })
+}
+
+/// OpenAI's `tool_calls` array. `index` is what a streaming client
+/// accumulates deltas by, so it counts calls across the whole response rather
+/// than restarting per chunk. Each call carries a whole `function` object in
+/// one delta — this server recognises a call only once it is completely
+/// written, so there is never a partial one to stream.
+fn tool_calls_json_from(
+    calls: &[tool_calls::ParsedToolCall],
+    created: u64,
+    first_index: usize,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(n, call)| {
+                let index = first_index + n;
+                json!({
+                    "index": index,
+                    "id": format!("call-{created}-{index}"),
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                })
+            })
+            .collect(),
+    )
+}
+
+fn tool_calls_json(calls: &[tool_calls::ParsedToolCall], created: u64) -> serde_json::Value {
+    tool_calls_json_from(calls, created, 0)
+}
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
@@ -154,6 +227,9 @@ pub async fn chat_completions(
         )
             .into_response();
     };
+    if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
+        return rejection;
+    }
     let template = ChatTemplate::new(template_source.clone());
     let (bos, eos) = (
         state
@@ -169,12 +245,20 @@ pub async fn chat_completions(
             .and_then(|id| state.engine.tokenizer.token_text(id))
             .unwrap_or(""),
     );
-    let mut prompt = match template.render(
+    // An empty `tools: []` is treated as no tools: a template gating on
+    // `{%- if tools -%}` would agree, and passing it through only invites a
+    // template to emit an empty declaration block.
+    let tools = req
+        .tools
+        .as_ref()
+        .filter(|t| !matches!(t.as_array(), Some(a) if a.is_empty()));
+    let mut prompt = match template.render_with_tools(
         &req.messages,
         true,
         bos,
         eos,
         state.engine.role.enable_thinking(),
+        tools,
     ) {
         Ok(p) => p,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
@@ -207,6 +291,8 @@ pub async fn chat_completions(
             max_tokens,
             stop_token_ids,
             cache_prompt: req.cache_prompt,
+            id_slot: req.id_slot,
+            timings_per_token: req.stream && req.timings_per_token,
         })
         .await;
 
@@ -218,6 +304,10 @@ pub async fn chat_completions(
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
+                // Progress and per-token timings only mean something to a
+                // reader watching the stream; a whole response already
+                // carries the final `timings`/`usage`.
+                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Done {
                     finish_reason: fr,
                     stats,
@@ -236,6 +326,15 @@ pub async fn chat_completions(
             .engine
             .tokenizer
             .clean_up_tokenization_spaces(&content);
+        let split = tool_calls::split(&content);
+        let mut message = json!({"role": "assistant", "content": split.content});
+        if split.has_calls() {
+            message["tool_calls"] = tool_calls_json(&split.calls, created);
+            // OpenAI's contract: a turn that called tools finishes for that
+            // reason, whatever the sampler stopped on. A client keying off
+            // `"stop"` would treat the calls as a finished answer.
+            finish_reason = "tool_calls";
+        }
         return Json(json!({
             "id": format!("chatcmpl-{created}"),
             "object": "chat.completion",
@@ -243,7 +342,7 @@ pub async fn chat_completions(
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": finish_reason,
             }],
             "usage": usage,
@@ -252,27 +351,104 @@ pub async fn chat_completions(
         .into_response();
     }
 
+    let return_progress = req.return_progress;
     let stream = async_stream::stream! {
         let id = format!("chatcmpl-{created}");
+        // Tool-call syntax has to be recognised before it is forwarded, and a
+        // delimiter arrives a few tokens at a time. `pending` holds back text
+        // that might still turn into a call; everything else streams straight
+        // through, so an ordinary answer is not delayed at all.
+        let mut pending = String::new();
+        let mut emitted_calls = 0usize;
+        let mut saw_calls = false;
         loop {
             let Some(event) = rx.recv().await else { break };
             match event {
-                StreamEvent::Token(text) => {
+                StreamEvent::PromptProgress { total, cached, processed, elapsed } => {
+                    if return_progress {
+                        // llama.cpp's shape, so a client reads mid-prefill
+                        // progress from either server the same way.
+                        let chunk = json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                            "prompt_progress": {
+                                "total": total,
+                                "cache": cached,
+                                "processed": processed,
+                                "time_ms": elapsed.as_millis() as i64,
+                            },
+                        });
+                        yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                    }
+                }
+                StreamEvent::Timings(stats) => {
+                    // A chunk of its own rather than riding along with the
+                    // next content delta: content can be held back for a
+                    // while by the tool-call splitter above, and a decode
+                    // rate that arrives in bursts is worse than none.
                     let chunk = json!({
                         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                        "timings": timings_json(&stats),
                     });
-                    yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                    yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                }
+                StreamEvent::Token(text) => {
+                    pending.push_str(&text);
+                    if tool_calls::may_be_partial(&pending) {
+                        continue;
+                    }
+                    let split = tool_calls::split(&pending);
+                    pending.clear();
+                    if !split.content.is_empty() {
+                        let chunk = json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": split.content}, "finish_reason": null}],
+                        });
+                        yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                    }
+                    if split.has_calls() {
+                        saw_calls = true;
+                        let calls = tool_calls_json_from(&split.calls, created, emitted_calls);
+                        emitted_calls += split.calls.len();
+                        let chunk = json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}],
+                        });
+                        yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                    }
                 }
                 StreamEvent::Done { finish_reason, stats } => {
+                    // Whatever is still held back never became a call. It is
+                    // the model's output and belongs in the answer.
+                    if !pending.is_empty() {
+                        let split = tool_calls::split(&pending);
+                        if !split.content.is_empty() {
+                            let chunk = json!({
+                                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"content": split.content}, "finish_reason": null}],
+                            });
+                            yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                        }
+                        if split.has_calls() {
+                            saw_calls = true;
+                            let calls = tool_calls_json_from(&split.calls, created, emitted_calls);
+                            let chunk = json!({
+                                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}],
+                            });
+                            yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                        }
+                    }
                     // The final chunk carries what the request cost, in both
                     // OpenAI's shape (`usage`) and llama.cpp's (`timings`,
                     // `prompt_progress`) — a streaming client otherwise has
                     // only its own wall clock, which cannot separate prefill
                     // from decode or a cache hit from real work.
+                    let reason = if saw_calls { "tool_calls" } else { finish_reason_str(finish_reason) };
                     let chunk = json!({
                         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason_str(finish_reason)}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
                         "usage": usage_json(&stats),
                         "timings": timings_json(&stats),
                         "prompt_progress": prompt_progress_json(&stats),
@@ -310,6 +486,9 @@ pub struct CompletionsRequest {
     /// this `false` so each timed run prefills for real.
     #[serde(default = "default_cache_prompt")]
     cache_prompt: bool,
+    /// See [`ChatCompletionRequest::id_slot`].
+    #[serde(default)]
+    id_slot: Option<usize>,
 }
 
 pub async fn completions(
@@ -325,6 +504,9 @@ pub async fn completions(
             ),
         )
             .into_response();
+    }
+    if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
+        return rejection;
     }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
     let mut sampling = SamplingParams::default_for_role(state.engine.role);
@@ -350,6 +532,8 @@ pub async fn completions(
             max_tokens,
             stop_token_ids,
             cache_prompt: req.cache_prompt,
+            id_slot: req.id_slot,
+            timings_per_token: false,
         })
         .await;
 
@@ -358,6 +542,7 @@ pub async fn completions(
             loop {
                 let Some(event) = rx.recv().await else { break };
                 match event {
+                    StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                     StreamEvent::Token(text) => {
                         let chunk = json!({
                             "id": format!("cmpl-{created}"), "object": "text_completion", "created": created,
@@ -397,6 +582,7 @@ pub async fn completions(
     let mut timings = serde_json::Value::Null;
     while let Some(event) = rx.recv().await {
         match event {
+            StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
             StreamEvent::Token(t) => text.push_str(&t),
             StreamEvent::Done {
                 finish_reason: fr,

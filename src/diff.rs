@@ -65,6 +65,23 @@ pub fn compress_git_diff(output: &str, file_cap: usize) -> String {
             file_idx += 1;
             hunk_idx = 0;
         } else if line.starts_with("@@ ") {
+            // A hunk with no `diff --git` above it still belongs to *some*
+            // file. Left unattributed it used to be dropped outright — the
+            // `current_hunk.take()` below runs whether or not there is a file
+            // to attach it to — so a hand-built diff missing that header lost
+            // its content silently. Open a synthetic file instead, so the
+            // hunk is capped and counted like every other one.
+            if current_file.is_none() {
+                current_file = Some(DiffFile {
+                    header_lines: vec!["diff --git a/(unnamed) b/(unnamed)".to_string()],
+                    hunks: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                    original_index: file_idx,
+                });
+                file_idx += 1;
+                hunk_idx = 0;
+            }
             if let (Some(h), Some(f)) = (current_hunk.take(), current_file.as_mut()) {
                 f.additions += h.additions;
                 f.deletions += h.deletions;
@@ -260,6 +277,18 @@ mod tests {
         let compressed = compress_git_diff(&diff, 20);
         let count = compressed.matches("diff --git").count();
         assert_eq!(count, 20);
+    }
+
+    #[test]
+    fn a_hunk_with_no_file_header_is_kept_not_dropped() {
+        // A diff whose first line is a hunk header has no `diff --git` to
+        // attach to. That used to discard every line of it — the compressor
+        // returned an empty string and the caller had no way to tell that
+        // from "nothing changed".
+        let diff = "@@ -0,0 +1,2 @@\n+alpha\n+beta\n";
+        let compressed = compress_git_diff(diff, 20);
+        assert!(compressed.contains("+alpha"), "{compressed}");
+        assert!(compressed.contains("+beta"), "{compressed}");
     }
 
     #[test]

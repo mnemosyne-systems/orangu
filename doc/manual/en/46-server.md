@@ -771,6 +771,78 @@ back to the CPU, for when GPU inference was asked for specifically.
 Startup prints which backend actually ran the model (see **Quick start**
 above).
 
+### When the GPU device is lost
+
+A graphics driver can reset the device out from under a running process —
+a GPU hang, a compositor crash, `amdgpu` recovering a wedged queue. Vulkan
+(and Metal) surface this as a *lost device*: every buffer map, poll, and
+submission on it fails from then on, and the API offers no way to
+re-create it in place. The weights uploaded to that device are gone with
+it, and no request in flight can finish correctly.
+
+`orangu-server` treats it as exactly that — a fault it cannot repair, and
+one that a fresh process does not have. It is detected however the graphics
+API reports it: as an error where `wgpu` returns one, and otherwise from
+`wgpu`'s own fatal panic, which is what `Device::poll` raises instead of
+returning:
+
+1. The request that hit it is failed with one sentence: *"the server lost
+   its GPU device (the graphics driver reset it) and is restarting; retry
+   in a moment"*. No panic text, no backtrace.
+2. The real detail — which readback was in flight, the driver's own error
+   — is written to `orangu-server`'s own log, which is where a diagnosis is
+   made. Check `dmesg` there too; a device is rarely lost without the
+   kernel saying why.
+3. The process exits with status `75` (`EX_TEMPFAIL`, "retry later") about
+   two seconds later, once that error has reached the client.
+
+What causes it here is worth knowing, because it is preventable rather than
+random. The reset is a **job timeout**: `amdgpu` gives a submission ~10
+seconds on the ring, and one that stops finishing in time gets the ring reset
+with this process named as the guilty context — `radv/amdgpu: The CS has been
+cancelled because the context is lost` in the log.
+
+`orangu-server` therefore feeds a prompt to the model in chunks. A chunk is
+bounded by **time**, not just by token count, because the two are not
+proportional: a prefill chunk attends over everything before it, so the cost of
+a token climbs with how deep into the prompt it is. Measured on a 4 GiB
+RX 5500M, a fixed 512-token chunk took
+
+| position | chunk time |
+| ---: | ---: |
+| 512 | 2.3 s |
+| 3 584 | 5.1 s |
+| 6 656 | **10.1 s** |
+| 7 680 | **11.7 s** → device reset |
+
+so a token-count limit alone stops protecting anything past a few thousand
+tokens. Each chunk is now timed, and the next one is scaled by the rate just
+measured to hold roughly `ORANGU_PREFILL_CHUNK_MS` (default 3000) per
+submission; `ORANGU_PREFILL_BATCH` (default 512) remains the ceiling. A prompt
+opens with a small probe chunk rather than a full-width one, since nothing
+knows the machine's cost curve in advance and a full-width chunk at a deep
+position is exactly the submission that hangs.
+
+On the same card, a 48 000-token prompt that previously reset the device at
+position 7 680 now completes in 163 chunks with a slowest submission of 3.3 s,
+the width falling 512 → 382 → 297 → 239 → 192 as the context grows. Prefill
+throughput at ordinary prompt lengths is unchanged (227 / 201 / 164 tok/s at
+4k / 8k / 16k, against 229 / 209 / 161 before).
+
+If you still see resets, lower `ORANGU_PREFILL_CHUNK_MS`.
+
+Under `orangu-coordinator` that is the whole recovery: it restarts a
+profile whose `orangu-server` has stopped on the very next request, so the
+model comes back on a working device at full speed, and a request that was
+in flight during the swap is retried once rather than failed (see the
+Coordinator chapter). Run standalone, `orangu-server` needs a supervisor —
+systemd's `Restart=on-failure`, a container restart policy, or a shell
+loop — to come back on its own.
+
+Earlier versions had no such handling: a lost device surfaced as a Rust
+panic and backtrace *as the reply text*, and the process stayed up with a
+dead GPU, so every request after it failed the same way.
+
 ## Web UI
 
 Add a `[web]` section to the config (or answer `Add web console` in
@@ -1054,14 +1126,44 @@ from generation, nor a cache hit from real work:
   `predicted_per_second` and their per-token equivalents. These are the same
   figures the per-request console log prints.
 - **`prompt_progress`** (llama.cpp's shape) — `total`, `cache`, `processed`,
-  `time_ms`. llama-server emits this repeatedly *during* prefill; this server
-  has no mid-prefill progress event and sends it once, with the finished
-  request's totals.
+  `time_ms`, reported once per prefill chunk while the prompt is still being
+  processed (see `return_progress` below).
 
 On a streaming response they ride on the final chunk (the one carrying
 `finish_reason`), immediately before `[DONE]`; on a non-streaming response they
 are top-level fields. `orangu-bench --pp` reads them to report prefill
 throughput, and the orangu client reads them for its status-line rates.
+
+### `timings_per_token` and `return_progress`
+
+Both are llama.cpp field names, both apply to a **streaming**
+`/v1/chat/completions`, and both exist for the same reason: the longest part of
+a turn is the part a client otherwise knows nothing about.
+
+`return_progress: true` emits a `prompt_progress` chunk after every prefill
+chunk (`ORANGU_PREFILL_BATCH` tokens, 512 by default) rather than only at the
+end. `processed` counts cached tokens as already done, so a mostly-cached prompt
+does not appear to start from zero. On a 2712-token prompt that is six updates
+across a 12.8-second prefill:
+
+```
+ 512/2712   2725 ms      2048/2712   9573 ms
+1024/2712   4996 ms      2560/2712  11904 ms
+1536/2712   7274 ms      2712/2712  12845 ms
+```
+
+`timings_per_token: true` attaches a `timings` object to every generated token,
+not just the last chunk, so a client can display a live decode rate measured by
+the server. The first token is deliberately skipped: it was sampled from the
+prefill's own logits, so a rate computed there is a division by a few
+microseconds and comes out in the tens of thousands of tokens per second.
+
+Each arrives as its own chunk with an empty `delta`, which is what lets them
+keep flowing while content is briefly held back by the tool-call splitter.
+
+The `orangu` client requests both. They are what its status line shows: a
+`n/total tok` prefill bar while the prompt is processing, then the server's
+`predicted_per_second` while the answer streams.
 
 ### `cache_prompt`
 
@@ -1079,19 +1181,98 @@ processing thousands of tokens per second while doing almost nothing —
 exactly how much was skipped. The flag governs only what a request *reads*: the
 resulting cache is still stored for later requests either way.
 
+### Tool calling
+
+`/v1/chat/completions` accepts OpenAI's `tools` array and answers with OpenAI's
+`tool_calls`. Nothing about the tools themselves is interpreted here: the array
+is handed to the model's own `tokenizer.chat_template` as the `tools` variable,
+which is what every tool-capable template gates its declaration block on
+(`{%- if tools -%}`). A model whose template has no tool support simply ignores
+it. An empty `tools: []` counts as no tools.
+
+Messages carry the other half of the conversation:
+
+| Field | On | Meaning |
+| :-- | :-- | :-- |
+| `tool_calls` | `assistant` | the calls that turn made, passed to the template verbatim |
+| `tool_call_id` | `tool` | which call this message answers |
+| `name` | `tool` | the function's name; some templates use it directly, others resolve it from `tool_call_id` |
+
+All three are required for a **multi-turn** tool conversation. Without them the
+transcript replayed on turn N+1 shows an assistant message with empty content
+and no record of any call, and the model calls the same tool again.
+
+**Reading the model's answer back.** There is no standard for how a model
+*writes* a call — its template teaches it one. Three delimiter-anchored forms
+are recognised:
+
+| Family | Form |
+| :-- | :-- |
+| gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens) |
+| Qwen / Hermes | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+| Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
+
+Only these delimiters count. A bare JSON object that merely *looks* like a call
+is left as ordinary content — an answer that explains an API must not be
+mistaken for a request to invoke one. A span that opens and never closes, or one
+that cannot be parsed, is also left as content rather than silently dropped.
+
+A turn that produced calls reports `finish_reason: "tool_calls"` and carries
+them in `choices[0].message.tool_calls` (non-streaming) or in a
+`delta.tool_calls` chunk (streaming). `function.arguments` is a JSON **string**,
+as OpenAI specifies. Streaming emits each call complete in one delta rather than
+character by character, since a call is only recognised once it is fully
+written.
+
+### `id_slot`
+
+`/v1/chat/completions`, `/v1/completions` and `/completion` accept `id_slot`
+(llama.cpp's field name), pinning a request to one specific slot instead of
+letting it take whichever is free. An unknown slot number is a `400`, not a
+silent fallback.
+
+What it buys is **cache affinity**. A slot retains the `(tokens, KV cache)` of
+the last request that ran on it, so a conversation that returns to its own slot
+continues from a warm prefix and prefills only the new turn. Landing on a
+neighbour instead finds another conversation's cache there and reprefills the
+whole prompt — and since an idle server hands out the *lowest* free slot, two
+alternating conversations otherwise both land on slot 0 and evict each other
+every turn.
+
+Two conversations interleaved on a two-slot server, three turns each
+(`gemma-4-E2B-it:Q4_K_M`, ~430-token prompts):
+
+| | tokens actually prefilled | prefill time |
+| --- | ---: | ---: |
+| without `id_slot` | 2 567 | 13.4 s |
+| with `id_slot` | **889** | **5.0 s** |
+
+Steady-state per turn is where it shows: 2.0 s of prefill becomes 0.25 s, because
+the whole previous turn is served from the slot's own cache
+(`cached_tokens` 417 of 433, rather than 7).
+
+A pinned request **waits** for its slot rather than being bounced to a free one
+— that is the point, and it is a trade the caller has already chosen. Waiting
+costs no one else any concurrency: a queued request holds nothing.
+
+The `orangu` client does this automatically. Each workspace tab probes `/props`
+once per endpoint, takes a slot round-robin, and pins every request in that tab
+to it, so tabs stop evicting each other. One-shot requests (`orangu -p`) do not
+pin — there is no later turn to keep a cache warm for.
+
 ## Endpoint reference
 
 | Endpoint | |
 | :-- | :-- |
 | `GET /v1/models` | |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
-| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; disabled under `--embedding` |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; OpenAI `tools`/`tool_calls`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
+| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
 | `GET /health` | |
 | `GET /props` | model + server metadata, including the `backend` and device the model is running on |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
-| `POST /completion` | native, streaming; disabled under `--embedding` |
+| `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /tokenize` / `POST /detokenize` | |
 | `POST /embedding` | native embeddings |
 | `POST /apply-template` | renders the chat template without generating |
