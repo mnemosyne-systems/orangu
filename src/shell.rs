@@ -182,18 +182,35 @@ mod tests {
         );
     }
 
+    /// Plants a PowerShell where the lookup should find it, returning the
+    /// file's path.
+    ///
+    /// Built with the same component-by-component joins as
+    /// [`windows_powershell_path`], deliberately. Writing the layout as one
+    /// `"System32/WindowsPowerShell/v1.0"` string works on Windows — the API
+    /// accepts either separator — but leaves the forward slashes *in the
+    /// string*, so an otherwise-correct result compares unequal against the
+    /// backslashes the real code produces. That cost a red Windows CI run.
+    fn plant_powershell(root: &Path) -> std::path::PathBuf {
+        let exe = windows_powershell_path(root);
+        std::fs::create_dir_all(exe.parent().expect("parent")).expect("layout");
+        std::fs::write(&exe, b"").expect("stub");
+        exe
+    }
+
     /// The whole point of the change: when PowerShell is where it should be,
     /// it is named absolutely so no `PATH` lookup is involved.
     #[test]
     fn a_present_powershell_resolves_to_its_absolute_path() {
         let root = tempfile::tempdir().expect("tempdir");
-        let dir = root.path().join("System32/WindowsPowerShell/v1.0");
-        std::fs::create_dir_all(&dir).expect("layout");
-        std::fs::write(dir.join("powershell.exe"), b"").expect("stub");
+        let planted = plant_powershell(root.path());
 
         let resolved = super::resolve_powershell([root.path().as_os_str().to_os_string()]);
-        assert_eq!(resolved, dir.join("powershell.exe").to_string_lossy());
+        // Semantic checks first — these hold whatever the separators look
+        // like, and are what actually matters to `Command::new`.
         assert!(Path::new(&resolved).is_absolute());
+        assert!(Path::new(&resolved).is_file());
+        assert_eq!(Path::new(&resolved), planted);
     }
 
     /// A root that doesn't hold PowerShell must not be returned as if it
@@ -214,15 +231,13 @@ mod tests {
     fn the_first_root_that_has_it_wins() {
         let empty = tempfile::tempdir().expect("tempdir");
         let real = tempfile::tempdir().expect("tempdir");
-        let dir = real.path().join("System32/WindowsPowerShell/v1.0");
-        std::fs::create_dir_all(&dir).expect("layout");
-        std::fs::write(dir.join("powershell.exe"), b"").expect("stub");
+        let planted = plant_powershell(real.path());
 
         let resolved = super::resolve_powershell([
             empty.path().as_os_str().to_os_string(),
             real.path().as_os_str().to_os_string(),
         ]);
-        assert_eq!(resolved, dir.join("powershell.exe").to_string_lossy());
+        assert_eq!(Path::new(&resolved), planted);
     }
 
     /// A resolved path must still be spawnable as a program — an argument
