@@ -106,9 +106,10 @@ jobs:
           # (installers expect the executables at the archive root).
           cp manual-dist/orangu-en.pdf manual-dist/orangu-en.html "$BINDIR"/
           # The whole stack: the editor plus the coordinator and inference
-          # server, and the manual in both formats.
+          # server, the benchmarking tool, and the manual in both formats.
           tar -czf "$ARCHIVE" -C "$BINDIR" \
-            orangu orangu-coordinator orangu-server orangu-en.pdf orangu-en.html
+            orangu orangu-coordinator orangu-server orangu-bench \
+            orangu-en.pdf orangu-en.html
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -119,11 +120,12 @@ jobs:
           $archive = "orangu-${{ github.ref_name }}-${{ matrix.target }}.zip"
           Copy-Item manual-dist\orangu-en.pdf,manual-dist\orangu-en.html $bindir
           # The whole stack: the editor plus the coordinator and inference
-          # server, and the manual in both formats.
+          # server, the benchmarking tool, and the manual in both formats.
           $items = @(
             "$bindir\orangu.exe",
             "$bindir\orangu-coordinator.exe",
             "$bindir\orangu-server.exe",
+            "$bindir\orangu-bench.exe",
             "$bindir\orangu-en.pdf",
             "$bindir\orangu-en.html"
           )
