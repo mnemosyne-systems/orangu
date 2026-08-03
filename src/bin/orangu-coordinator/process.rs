@@ -796,6 +796,32 @@ fn kill_pid(pid: u32) {
 #[cfg(not(unix))]
 fn kill_pid(_pid: u32) {}
 
+/// Writes a `#!/bin/sh` script with `body` as its content to a fresh
+/// temp file, makes it executable, and leaks it (never auto-deleted) so
+/// the returned path stays valid for as long as a test needs to exec
+/// it — standing in for "a real `orangu-server`-shaped executable"
+/// wherever a test needs `orangu-coordinator` to spawn specific,
+/// controlled behavior (hang, crash with a specific stderr, echo an
+/// argument back, etc.) without needing a real `orangu-server` binary
+/// or model. Pointed at via `Coordinator::new`'s
+/// `server_binary_override`, never a shared environment variable — see
+/// that field's own doc comment for why (parallel test threads would
+/// otherwise race on a process-wide env var).
+///
+/// Unix-only, and so is every test that spawns one: a shell script is not an
+/// executable on Windows. Shared with `proxy`'s tests, which need the same
+/// "a server that just stays alive" stand-in.
+#[cfg(all(test, unix))]
+pub(crate) fn fake_server_script(body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "#!/bin/sh\n{body}").unwrap();
+    let path = file.into_temp_path().keep().unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,27 +829,6 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// Writes a `#!/bin/sh` script with `body` as its content to a fresh
-    /// temp file, makes it executable, and leaks it (never auto-deleted) so
-    /// the returned path stays valid for as long as a test needs to exec
-    /// it — standing in for "a real `orangu-server`-shaped executable"
-    /// wherever a test needs `orangu-coordinator` to spawn specific,
-    /// controlled behavior (hang, crash with a specific stderr, echo an
-    /// argument back, etc.) without needing a real `orangu-server` binary
-    /// or model. Pointed at via `Coordinator::new`'s
-    /// `server_binary_override`, never a shared environment variable — see
-    /// that field's own doc comment for why (parallel test threads would
-    /// otherwise race on a process-wide env var).
-    #[cfg(unix)]
-    fn fake_server_script(body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "#!/bin/sh\n{body}").unwrap();
-        let path = file.into_temp_path().keep().unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
 
     fn minimal_config(extra_client: &str, profiles: &str) -> CoordinatorConfiguration {
         let mut file = tempfile::NamedTempFile::new().unwrap();

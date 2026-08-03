@@ -267,6 +267,8 @@ pub async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the two Unix-only retry tests below drive a socket by hand.
+    #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A stand-in `orangu-server`: answers every request `200 OK` — except
@@ -280,6 +282,7 @@ mod tests {
     /// body in full — a proxied POST that got a response before its body
     /// was read would report as its own kind of connection error and prove
     /// nothing about the retry.
+    #[cfg(unix)]
     async fn flaky_upstream(
         listener: tokio::net::TcpListener,
         nth_to_drop: usize,
@@ -354,7 +357,12 @@ mod tests {
     /// that point, so the request is still whole — the fix is to restart and
     /// resend it, and what the caller sees is a slow answer rather than a
     /// `502`.
+    ///
+    /// Unix-only: the stand-in server it spawns is a shell script, which
+    /// Windows cannot execute. What is under test is the coordinator's retry
+    /// logic, which is platform-independent.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_request_that_loses_its_server_is_retried_once() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -375,11 +383,7 @@ mod tests {
 
         // A "server" that just stays alive: the fake upstream above is what
         // actually answers, so the spawned child only has to not exit.
-        use std::os::unix::fs::PermissionsExt;
-        let mut script = tempfile::NamedTempFile::new().unwrap();
-        write!(script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let script = script.into_temp_path().keep().unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = crate::process::fake_server_script("sleep 30\n");
 
         let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
         let response = proxy(
@@ -413,7 +417,10 @@ mod tests {
     /// `ensure_reachable` existed; this test is that observation, made
     /// cheap: the second `/v1/models` probe (the reachability check) is
     /// refused, exactly as a dead child would refuse it.
+    ///
+    /// Unix-only for the same reason as the test above.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_profile_that_stopped_answering_is_restarted_before_the_retry() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -433,11 +440,7 @@ mod tests {
         .unwrap();
         let config = crate::config::load_coordinator_configuration(file.path()).unwrap();
 
-        use std::os::unix::fs::PermissionsExt;
-        let mut script = tempfile::NamedTempFile::new().unwrap();
-        write!(script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let script = script.into_temp_path().keep().unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = crate::process::fake_server_script("sleep 30\n");
 
         let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
         let response = proxy(

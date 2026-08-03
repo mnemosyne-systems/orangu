@@ -267,7 +267,7 @@ fn detect_machine() -> Option<String> {
 /// Joins the vendor and product strings, dropping the vendor when the
 /// product name already starts with it (`LENOVO` + `LENOVO ThinkPad` would
 /// otherwise read twice) and tolerating either half being missing.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn machine_label(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
     match (vendor, product) {
         (Some(vendor), Some(product)) => {

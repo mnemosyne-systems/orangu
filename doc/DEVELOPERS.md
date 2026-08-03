@@ -29,6 +29,16 @@ full suite on `ubuntu-latest`, `macos-latest` and `windows-latest`, because
 whether the code compiles and behaves identically is the one thing that is
 genuinely per-platform.
 
+The Windows job is the one that catches Unix-only code, and a test counts as
+code: `#[cfg(unix)]` belongs on any test that spawns a shell script, sets a
+file mode, creates a symlink, or signals a PID, not only on the production
+code that does those things. `orangu-coordinator`'s tests reach for
+`process::fake_server_script` — itself `#[cfg(all(test, unix))]` — whenever
+they need a stand-in `orangu-server` to spawn, so the gate travels with the
+helper. Anything a gated test alone uses (a fixture, an import) needs the
+same gate, or Windows builds it and warns that it is unused. A local
+`cargo test` cannot see any of this; only the Windows job can.
+
 ### The cached model
 
 The `#[ignore]`d real-model tests need a GGUF, and re-downloading ~4 GB from
