@@ -10,6 +10,8 @@
   const historyBtn = document.getElementById("history-btn");
   const historyPanel = document.getElementById("history-panel");
   const historyList = document.getElementById("history-list");
+  const historyFooter = document.getElementById("history-footer");
+  const historyClearBtn = document.getElementById("history-clear-btn");
   const themeToggleBtn = document.getElementById("theme-toggle-btn");
   const attachBtn = document.getElementById("attach-btn");
   const attachMenu = document.getElementById("attach-menu");
@@ -551,11 +553,18 @@
     return res.json();
   }
 
-  async function newChat() {
+  // Swaps the empty transcript in without touching History's own
+  // visibility — the delete paths below need exactly this and must not
+  // close the panel out from under someone tidying up several chats.
+  async function startFreshSession() {
     const session = await createSession();
     state.sessionId = session.id;
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
+  }
+
+  async function newChat() {
+    await startFreshSession();
     hideHistory();
   }
 
@@ -588,10 +597,17 @@
     return new Date(unixSeconds * 1000).toLocaleString();
   }
 
+  function historyTitle(session) {
+    return session.title || "New chat";
+  }
+
   async function refreshHistory() {
     const res = await fetch("/api/sessions");
     if (!res.ok) return;
     const sessions = await res.json();
+    // Nothing to clear is the only reason the footer ever hides — deleting
+    // sessions is unconditional, unlike the model manager's own Delete.
+    historyFooter.hidden = sessions.length === 0;
     historyList.innerHTML = "";
     if (sessions.length === 0) {
       const empty = document.createElement("div");
@@ -603,19 +619,82 @@
     for (const session of sessions) {
       const item = document.createElement("div");
       item.className = "history-item";
+      const text = document.createElement("div");
+      text.className = "history-item-text";
       const title = document.createElement("div");
       title.className = "history-title";
-      title.textContent = session.title || "New chat";
+      title.textContent = historyTitle(session);
       const date = document.createElement("div");
       date.className = "history-date";
       date.textContent = formatDate(session.updated_at);
-      item.appendChild(title);
-      item.appendChild(date);
+      text.appendChild(title);
+      text.appendChild(date);
+      item.appendChild(text);
       item.addEventListener("click", () => {
         loadSession(session.id).catch((err) => console.error(err));
       });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "history-delete";
+      remove.innerHTML = ICON.close;
+      remove.title = `Delete "${historyTitle(session)}"`;
+      remove.setAttribute("aria-label", remove.title);
+      remove.addEventListener("click", (event) => {
+        // The row itself opens the chat — without this, deleting one would
+        // load it on the way out.
+        event.stopPropagation();
+        deleteSession(session).catch((err) => console.error(err));
+      });
+      item.appendChild(remove);
       historyList.appendChild(item);
     }
+  }
+
+  // Deleting the session a reply is still streaming into would otherwise
+  // see the server write the finished turn back out on "done" —
+  // `save_session` recreates the directory — and the chat someone just
+  // deleted would reappear a few seconds later. Stopping first is exactly
+  // what the Stop button does: the turn never completes, so nothing is
+  // persisted.
+  function stopIfGeneratingInto(id) {
+    if (state.busy && id === state.sessionId) stopGeneration();
+  }
+
+  // Both delete paths keep the panel open and re-list afterwards, so the
+  // row disappearing is the confirmation. If what went was the chat
+  // currently on screen, a fresh empty session takes its place — the
+  // transcript would otherwise go on showing a conversation that no longer
+  // exists, and the next message sent would 404 against its id.
+  async function deleteSession(session) {
+    if (
+      !window.confirm(`Delete "${historyTitle(session)}"?\n\nThis cannot be undone.`)
+    ) {
+      return;
+    }
+    stopIfGeneratingInto(session.id);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      console.error("failed to delete session", await res.text());
+      return;
+    }
+    if (session.id === state.sessionId) await startFreshSession();
+    await refreshHistory();
+  }
+
+  async function clearHistory() {
+    if (!window.confirm("Delete every saved chat?\n\nThis cannot be undone.")) return;
+    stopIfGeneratingInto(state.sessionId);
+    const res = await fetch("/api/sessions", { method: "DELETE" });
+    if (!res.ok) {
+      console.error("failed to clear history", await res.text());
+      return;
+    }
+    // Unconditionally, not just when the current chat was in the list: an
+    // unsent new chat isn't listed but its directory went with the rest.
+    await startFreshSession();
+    await refreshHistory();
   }
 
   function showHistory() {
@@ -897,6 +976,10 @@
     } else {
       hideHistory();
     }
+  });
+
+  historyClearBtn.addEventListener("click", () => {
+    clearHistory().catch((err) => console.error(err));
   });
 
   // ---------------------------------------------------------------- models

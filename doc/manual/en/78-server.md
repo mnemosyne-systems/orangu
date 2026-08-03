@@ -1829,6 +1829,28 @@ process, not about the directory, so it is decided per request against
 `[web].delete` (default `true`) gates removal the same way, reported as
 `can_delete`.
 
+**It gates models only.** History's own `DELETE /api/sessions/{id}` and
+`DELETE /api/sessions` (its per-row cross and **Clear all** footer) are
+unconditional, and `GET /api/sessions` carries no capability flag for the
+page to check. The two are not the same kind of thing: a model is a file on
+disk that a download, or a human with `scp`, put there, and a deployment can
+reasonably want that directory read-only while still allowing a model
+switch. A chat session is this console's own scratch data, written by the
+page that is now asking to delete it — a console unable to clear its own
+transcripts is not a posture worth a config key.
+
+`Clear all` does not spare an active session the way `sweep_empty_sessions`
+does. The console's own current chat is one of the rows being cleared, and
+leaving behind exactly the one the user is looking at is not what the button
+says; the browser starts a fresh session immediately afterwards, so nothing
+goes on writing into a directory that just went away. Both delete paths also
+replace the on-screen transcript when what went was the session it belongs
+to — otherwise the next message would `POST` against an id that no longer
+resolves. And both stop generation first when a reply is still streaming
+into the session being removed: `save_session` on the stream's `done` event
+recreates the directory, so the chat would otherwise reappear seconds after
+being deleted.
+
 Both switches **remove** their button rather than disabling it. A disabled
 control with a tooltip is the right shape for something conditional — a
 handover already in flight, a model this build can't load — where the same

@@ -199,6 +199,9 @@ pub struct WebState {
     /// false the panel draws no Delete button at all — unlike **Load**,
     /// which is drawn disabled with a tooltip, because there is nothing
     /// conditional here to explain: this server simply doesn't do that.
+    ///
+    /// Models only. History's own delete controls are unconditional — see
+    /// [`delete_session`]/[`clear_sessions`].
     pub can_delete: bool,
     /// The model a handover has been accepted for, once one has — see
     /// `models::select`. Only ever goes from empty to set: this process is
@@ -235,8 +238,22 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/static/katex/fonts/{name}", get(katex_font))
         .route("/api/asset-version", get(asset_version_handler))
         .route("/api/system-report", get(system_report))
-        .route("/api/sessions", post(create_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(get_session))
+        // `delete` on both: one row's cross, and History's **Clear all**
+        // footer. Unconditional — unlike the model manager's own Delete
+        // (`[web].delete`), which owns files on disk that nothing else put
+        // there. A chat session is this console's own scratch data, and
+        // being unable to tidy up your own transcripts is not a deployment
+        // posture anyone asked for.
+        .route(
+            "/api/sessions",
+            post(create_session)
+                .get(list_sessions)
+                .delete(clear_sessions),
+        )
+        .route(
+            "/api/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/sessions/{id}/messages", post(send_message))
         // The model manager: list, metadata, download, delete — on the same
         // port as the chat UI.
@@ -423,6 +440,28 @@ async fn list_sessions() -> impl IntoResponse {
     match sessions::list_sessions() {
         Ok(list) => Json(list).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// Removes one chat session, directory and all — History's per-row cross.
+/// A missing or malformed id is a 404 rather than a 500: the row it came
+/// from is stale either way, and the browser's answer to both is the same
+/// (re-list, and the row is gone).
+async fn delete_session(Path(id): Path<String>) -> impl IntoResponse {
+    match sessions::delete_session_dir(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => (StatusCode::NOT_FOUND, format!("{err:#}")).into_response(),
+    }
+}
+
+/// Removes every chat session — History's **Clear all** footer. Reports how
+/// many went, so the browser can say so; see
+/// [`sessions::delete_all_sessions`] for why the caller's own current
+/// session is not spared.
+async fn clear_sessions() -> impl IntoResponse {
+    match sessions::delete_all_sessions() {
+        Ok(removed) => Json(json!({ "removed": removed })).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response(),
     }
 }
 

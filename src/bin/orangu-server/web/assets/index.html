@@ -41,8 +41,15 @@
     </div>
   </header>
 
+  <!-- History. #history-list is the part that scrolls; the footer below it
+       stays put, so Clear all is reachable without scrolling to the oldest
+       chat first. It starts hidden only because an empty history has
+       nothing to clear — app.js shows it as soon as there is a row. -->
   <nav id="history-panel" hidden>
     <div id="history-list"></div>
+    <div id="history-footer" hidden>
+      <button id="history-clear-btn" type="button">Clear all</button>
+    </div>
   </nav>
 
   <!-- The model manager. A modal dialog rather than a dropdown like

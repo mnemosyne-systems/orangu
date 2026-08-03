@@ -267,6 +267,10 @@ pub struct ServerConfiguration {
     /// the one irreversible thing the console can do, and a deployment may
     /// well want to allow a model switch while keeping the models directory
     /// read-only.
+    ///
+    /// Models only — it says nothing about chat sessions. History's own
+    /// delete controls are unconditional: a session is the console's own
+    /// scratch data, not a file on disk something else put there.
     pub delete: bool,
     /// `[web].reexec`: whether the web console's model manager may load a
     /// different model into this server. `true` (the default) lets it;

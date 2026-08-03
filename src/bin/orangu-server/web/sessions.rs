@@ -382,6 +382,44 @@ pub fn delete_session_dir(id: &str) -> Result<()> {
     fs::remove_dir_all(&dir).with_context(|| format!("failed to delete {}", dir.display()))
 }
 
+/// Deletes every session directory under `sessions_dir()` — the web
+/// console's **Clear all**. Best-effort per entry: a directory that can't
+/// be removed (a permission problem, a file another process still holds
+/// open on Windows) is skipped rather than abandoning the rest, since the
+/// button's promise is "clear the history," and stopping at the first
+/// obstacle would leave a list that's neither cleared nor intact. Returns
+/// how many were removed.
+///
+/// Unlike [`sweep_empty_sessions`] this does *not* spare an active session:
+/// the console's own current chat is one of the rows being cleared, and
+/// leaving exactly the one the user is looking at behind is not what the
+/// button says. The browser starts a fresh session immediately afterwards,
+/// so nothing goes on writing into a directory that just went away.
+pub fn delete_all_sessions() -> Result<usize> {
+    let dir = sessions_dir()?;
+    let mut removed = 0;
+    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Only UUID-named directories, the same guard every other path
+        // here applies — anything else under `sessions/` was not put there
+        // by this code and is not this button's to delete.
+        if Uuid::parse_str(id).is_err() {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Appends `user_message`/`assistant_message` to `session`, deriving its
 /// title from the first user message if it doesn't have one yet, and saves
 /// it to disk. `generation_ms` is however long the engine took to produce
@@ -748,6 +786,44 @@ mod tests {
 
             let err = delete_session_dir("not-a-uuid").unwrap_err();
             assert!(err.to_string().contains("not a valid session id"));
+        });
+    }
+
+    #[test]
+    fn delete_all_sessions_removes_every_one_including_active() {
+        with_temp_home(|| {
+            // Both are active — `create_session` marked them for this very
+            // process. Clear all must still take them: the console's own
+            // current chat is one of the rows being cleared.
+            let empty = create_session().unwrap();
+            let mut used = create_session().unwrap();
+            used.messages.push(SessionMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                generation_ms: None,
+                attachments: Vec::new(),
+            });
+            save_session(&used).unwrap();
+
+            assert_eq!(delete_all_sessions().unwrap(), 2);
+            assert!(load_session(&empty.id).is_err());
+            assert!(load_session(&used.id).is_err());
+            assert!(list_sessions().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn delete_all_sessions_leaves_non_session_entries_alone() {
+        with_temp_home(|| {
+            let session = create_session().unwrap();
+            // Anything not named like a session id was not put here by this
+            // code, and is not Clear all's to remove.
+            let stray = sessions_dir().unwrap().join("notes");
+            fs::create_dir_all(&stray).unwrap();
+
+            assert_eq!(delete_all_sessions().unwrap(), 1);
+            assert!(load_session(&session.id).is_err());
+            assert!(stray.is_dir());
         });
     }
 }

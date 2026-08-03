@@ -609,10 +609,12 @@ delete = yes
 - `delete` — whether the console's model manager may delete models (default
   `yes`, same spellings). Set `no` and every row's **Delete** button is
   gone, and the endpoint behind it refuses. Its own key rather than riding
-  on `reexec` because the two are
-  genuinely separate wishes: deleting a model is the one irreversible thing
-  the console can do, and a deployment may well want a model switch allowed
-  while the models directory stays read-only.
+  on `reexec` because the two are genuinely separate wishes: deleting a
+  model is the one irreversible thing the console can do, and a deployment
+  may well want a model switch allowed while the models directory stays
+  read-only. It governs **models only** — History's own delete controls are
+  unconditional, since a chat session is the console's own scratch data
+  rather than a file on disk something else put there.
 
 `web = <port>` under `[orangu-server]` is what this replaced, and still
 works: a configuration written against it goes on serving the console on
@@ -952,6 +954,14 @@ reload or revisit it from **History**.
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.
+
+History can clean them up too: each row carries a **cross** that deletes
+that one chat, and the dropdown's footer a small **Clear all** that deletes
+every one. Both confirm first, and neither is gated by `[web].delete` —
+that switch is about models, files on disk something else put there, while
+a chat session is the console's own scratch data. Deleting the chat
+currently on screen starts a fresh empty one in its place; the dropdown
+stays open, so several can be cleared in a row.
 
 ## Model management
 
@@ -1314,6 +1324,8 @@ configured:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses |
+| `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
+| `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
 | `GET /api/models` | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory |
 | `GET /api/models/updates` | which rows are behind their Hugging Face repo — `list`'s `(Refresh)` marker, one Hub request per distinct repo |
 | `GET /api/models/metadata?model=…` | a model's full GGUF metadata as plain text — `show`'s own output. `&tensors=true` and `&full=true` are `show --tensors`/`--full` |
