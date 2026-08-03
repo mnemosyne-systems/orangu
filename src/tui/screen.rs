@@ -576,7 +576,7 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         })
         .collect::<Vec<_>>();
 
-    let (scroll_offset, mut visible_lines) = with_transcript_render_cache(
+    let (_scroll_offset, visible_lines) = with_transcript_render_cache(
         args.transcript,
         args.transcript_epoch,
         inner_width,
@@ -584,19 +584,10 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         &theme,
         |cache| {
             let total_lines = cache.lines.len() + pending_lines.len();
-            let has_status_line = args.left_status.is_some() || args.pending_count > 0;
-            let max_scroll_offset = if has_status_line {
-                total_lines.saturating_sub(available_output_rows.saturating_sub(1))
-            } else {
-                total_lines.saturating_sub(available_output_rows)
-            };
+            let max_scroll_offset = total_lines.saturating_sub(available_output_rows);
             let scroll_offset = args.scroll_offset.min(max_scroll_offset);
 
-            let text_rows = if has_status_line && scroll_offset == 0 {
-                available_output_rows.saturating_sub(1)
-            } else {
-                available_output_rows
-            };
+            let text_rows = available_output_rows;
 
             let visible_end = total_lines.saturating_sub(scroll_offset);
             let visible_start = visible_end.saturating_sub(text_rows);
@@ -643,30 +634,9 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         },
     );
 
-    // Append status line directly at the end of the transcript view if we are scrolled to bottom
-    if scroll_offset == 0 {
-        let mut left_spans = Vec::new();
-        let mut left_used = 0;
-        if let Some(left) = &args.left_status {
-            if let Ok(mut text) = ansi_to_tui::IntoText::into_text(&left.rendered)
-                && let Some(line) = text.lines.pop()
-            {
-                left_spans.extend(line.spans);
-            }
-            left_used += left.visible_width;
-        } else if args.pending_count > 0 {
-            let pending = format!("Pending: {}", args.pending_count);
-            left_spans.push(ratatui::text::Span::styled(
-                pending,
-                ratatui::style::Style::default().fg(ratatui::style::Color::Rgb(220, 220, 100)),
-            ));
-            left_used += format!("Pending: {}", args.pending_count).chars().count();
-        }
-
-        if left_used > 0 {
-            visible_lines.push(ratatui::text::Line::from(left_spans));
-        }
-    }
+    // The activity status (Working/Thinking) and the pending count live on the
+    // status line under the input window only — the output window shows the
+    // transcript and nothing else.
 
     frame.render_widget(
         ratatui::widgets::Paragraph::new(visible_lines),

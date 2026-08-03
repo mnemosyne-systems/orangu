@@ -148,6 +148,38 @@ fn reverse_search_ghosts_the_match_and_shows_its_prompt() {
     );
 }
 
+/// The activity status belongs to the status line under the input window and
+/// nowhere else: the output window used to repeat it on its last row, so
+/// `Thinking`/`Working` appeared twice on screen at once.
+#[test]
+fn activity_status_appears_only_on_the_status_line() {
+    let mut terminal = setup_test_terminal(80, 24);
+    let mut args = default_render_args();
+
+    let transcript = vec![TranscriptLine::Plain("answer".to_string())];
+    args.transcript = &transcript;
+    args.left_status = Some(StatusFragment::plain("Thinking (2s)".to_string()));
+    args.pending_count = 3;
+
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, 80, 24);
+
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("Thinking")).count(),
+        1,
+        "the status should be drawn once, on the status line: {rows:?}"
+    );
+    assert!(
+        rows.last().expect("status row").contains("Thinking (2s)"),
+        "the one occurrence should be the status line: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("Pending: 3")).count(),
+        1,
+        "the pending count should not be repeated in the output window: {rows:?}"
+    );
+}
+
 #[test]
 fn test_render_cursor_position() {
     let mut terminal = setup_test_terminal(80, 24);
