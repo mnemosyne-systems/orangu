@@ -28,7 +28,7 @@ Tab completion offers the workspaces seen in earlier sessions first, then comple
 
 It is handled locally and works regardless of server or model state.
 
-### Examples
+**Examples**
 
 ```text
 /workspace
@@ -55,7 +55,7 @@ switch workspace ~/projects/orangu
 
 Both are handled locally and work regardless of server or model state.
 
-### Examples
+**Examples**
 
 ```text
 /create_workspace ~/projects/orangu

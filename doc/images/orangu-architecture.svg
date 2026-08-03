@@ -50,18 +50,20 @@
   <line x1="450" y1="562" x2="450" y2="583" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
 
   <!-- backends layer -->
-  <rect x="195" y="587" width="510" height="60" rx="16" fill="#faf7f1" stroke="#ddd2c0" stroke-width="1.5"/>
+  <rect x="148" y="587" width="604" height="60" rx="16" fill="#faf7f1" stroke="#ddd2c0" stroke-width="1.5"/>
   <g font-size="13.5" font-weight="bold" fill="#5a5248" text-anchor="middle">
-    <rect x="211" y="600" width="82" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="252" y="622">CPU</text>
-    <rect x="303" y="600" width="92" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="349" y="622">Vulkan</text>
-    <rect x="405" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="447" y="622">CUDA</text>
-    <rect x="499" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="541" y="622">ROCm</text>
-    <rect x="593" y="600" width="96" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
-    <text x="641" y="622">OpenCL</text>
+    <rect x="164" y="600" width="82" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="205" y="622">CPU</text>
+    <rect x="256" y="600" width="92" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="302" y="622">Vulkan</text>
+    <rect x="358" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="400" y="622">ROCm</text>
+    <rect x="452" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="494" y="622">CUDA</text>
+    <rect x="546" y="600" width="84" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="588" y="622">Metal</text>
+    <rect x="640" y="600" width="96" height="34" rx="17" fill="#f3ede2" stroke="#d8cdba" stroke-width="1.5"/>
+    <text x="688" y="622">OpenCL</text>
   </g>
   <text x="450" y="672" text-anchor="middle" font-size="12.5" font-weight="bold" font-style="italic" fill="#8a7f70">One native stack — fully local, fully private, entirely your own</text>
 </svg>

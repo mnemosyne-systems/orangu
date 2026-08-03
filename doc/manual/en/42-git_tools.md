@@ -16,7 +16,7 @@ Shows the working-tree status with color highlighting.
 
 It runs `git status --branch --short`. Added files and untracked entries are shown in green, deleted entries in red, and modified entries in the default terminal color; the branch line is shown in a muted color. `gh` has no equivalent, so this always uses plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /status
@@ -38,7 +38,7 @@ Shows the commit log.
 
 If a `lg` alias is found in `~/.gitconfig` it runs `git lg`, otherwise it falls back to `git log --graph --oneline --decorate`. Pass an optional number to limit the output to the latest that many commits. Below the log it appends a highlighted summary of the working tree — either `● Working tree clean` or, when there are pending changes, `● N change(s)` broken down into uncommitted (tracked) and untracked counts. See the optional tools chapter for the recommended `git lg` alias setup.
 
-### Examples
+**Examples**
 
 Show the full log:
 
@@ -69,7 +69,7 @@ Shows a single commit — its header (author, date, message) followed by its dif
 
 Without an argument it shows the current `HEAD`; pass a commit to show a specific one (any revision `git show` accepts: an abbreviated hash, a tag, `HEAD~2`, a branch name, …). Inside a Git repository it applies any configured non-interactive Git pager such as `delta`, exactly like `/diff`. Tab completion after `/show ` (or the natural-language forms `git show ` / `show commit `) offers the abbreviated hashes of the latest 25 commits on the current branch — newest first, so the most recent commit previews as the inline ghost.
 
-### Examples
+**Examples**
 
 Show the latest commit:
 
@@ -100,7 +100,7 @@ Shows a color unified diff.
 
 Without a branch it shows unstaged changes; with a branch it runs `git diff <branch>...HEAD` to show the commits on the current branch that are not yet in the specified branch. Inside a Git repository it applies any configured non-interactive Git pager such as `delta`. Tab completion after `/diff ` (or the natural-language form `diff against `) offers local and remote branch names.
 
-### Examples
+**Examples**
 
 Show unstaged changes:
 
@@ -138,7 +138,7 @@ Searches the workspace for a pattern with `git grep`.
 
 It searches all tracked files and requires a Git repository. Output is piped through the configured non-interactive pager (`pager.grep`, then `core.pager`) when one is set — if `delta` is configured it will colorize and format the results. Exit code 1 (no matches) is handled gracefully. `gh` has no equivalent, so it always uses plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /grep TODO
@@ -165,7 +165,7 @@ A path that already exists is **overwritten**. That is the same on every surface
 
 Tab completion after `/create_file ` offers untracked directories first, then untracked files; already-tracked content is excluded.
 
-### Examples
+**Examples**
 
 ```text
 /create_file notes.md
@@ -197,7 +197,7 @@ This command was `/remove_file` before the file-lifecycle commands were unified;
 
 Tab completion after `/delete_file ` offers tracked directories first, then tracked files; untracked content is excluded.
 
-### Examples
+**Examples**
 
 ```text
 /delete_file old.rs
@@ -256,7 +256,7 @@ Renames or moves a tracked file with `git mv`.
 
 Tab completion for the first argument offers tracked directories first, then tracked files; the second argument completes from all workspace paths.
 
-### Examples
+**Examples**
 
 ```text
 /move_file old.rs new.rs
@@ -282,7 +282,7 @@ Discards working-tree changes to a file with `git restore <file>`, or unstages i
 
 With `--staged` it runs `git restore --staged <file>` to unstage the file without changing its contents. `gh` has no equivalent, so it always uses plain Git.
 
-### Examples
+**Examples**
 
 Discard local changes to a file:
 
@@ -310,7 +310,7 @@ Commits all tracked changes with `git commit -a -m <message>`.
 
 `gh` has no equivalent, so it always uses plain Git. The message may be bare or quoted; quote it when it contains spaces or shell-significant characters such as the `[#42]` issue prefix.
 
-### Examples
+**Examples**
 
 ```text
 /commit Fix the parser
@@ -333,7 +333,7 @@ Rewrites the last commit message with `git commit --amend -m <message>`.
 
 The message is mandatory and may be bare or quoted. `gh` has no equivalent, so it always uses plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /amend Fix the parser
@@ -358,7 +358,7 @@ Squashes all commits on the current branch into a single commit, reusing the old
 
 The branch is compared against `origin/main`, `origin/master`, `main`, or `master`, tried in that order. At least two commits are required, and squashing on `main` or `master` is blocked. `gh` has no equivalent, so it always uses plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /squash
@@ -386,7 +386,7 @@ Saves and restores uncommitted changes on the stash stack.
 
 `gh` has no stash equivalent, so all four operations always use plain Git. Running `/stash` with a clean working tree produces an error from Git.
 
-### Examples
+**Examples**
 
 ```text
 /stash
@@ -420,7 +420,7 @@ Runs a binary-search session to find the commit that introduced a bug.
 
 All subcommands run plain `git bisect <sub>`; there is no `gh` equivalent.
 
-### Examples
+**Examples**
 
 ```text
 /bisect start
@@ -467,7 +467,7 @@ Lists, switches, creates, renames, or deletes branches.
 
 Tab completion after `/branch ` offers local branch names. `gh` has no equivalent, so all operations always use plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /branch
@@ -499,7 +499,7 @@ Fetches from a remote with `git fetch <remote>`.
 
 `gh`/`glab` have no fetch that improves on Git, so it always uses plain Git. With no argument it fetches from the first configured remote (`origin` is floated to the front of `git remote`, so it is the default when present); pass a remote name to fetch from a specific one. Tab completion after `/fetch ` (or the natural-language forms `fetch ` / `git fetch `) offers the configured remotes, with the default offered first and previewed as the grey inline ghost, so `/fetch u` then Tab completes to `/fetch upstream`. It errors when the repository has no remotes or the named remote is unknown.
 
-### Examples
+**Examples**
 
 ```text
 /fetch
@@ -523,7 +523,7 @@ Merges a branch into the current branch.
 
 If `gh` is installed it uses `gh pr merge --merge`; otherwise it uses `git merge`.
 
-### Examples
+**Examples**
 
 ```text
 /merge feature/login
@@ -552,7 +552,7 @@ A target argument rebases onto a specific branch, resolved against the configure
 
 Tab completion after `/rebase ` (or the natural-language forms `rebase ` / `git rebase `) offers, in order, local branch names (from `git branch`), then the configured remotes (from `git remote`, with `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`). The first local branch is previewed as the grey inline ghost.
 
-### Examples
+**Examples**
 
 ```text
 /rebase
@@ -578,7 +578,7 @@ Cherry-picks a commit onto the current branch with `git cherry-pick`.
 
 `gh` has no equivalent, so it always uses plain Git. Tab completion offers abbreviated commit hashes from the default branch (`origin/main`, `origin/master`, `main`, or `master`, tried in that order).
 
-### Examples
+**Examples**
 
 ```text
 /cherry_pick abc1234
@@ -600,7 +600,7 @@ Initializes a Git repository in the workspace with `git init`.
 
 It works both inside and outside an existing Git repository — reinitializing an existing repo is safe. `gh` has no equivalent, so it always uses plain Git.
 
-### Examples
+**Examples**
 
 ```text
 /init_repo
@@ -622,7 +622,7 @@ Pushes the current branch to `origin` with `git push origin <branch>`.
 
 `gh` has no equivalent, so it always uses plain Git. `--force` (or `-f`, or `force`) runs `git push -f origin <branch>` but is blocked on `main` and `master` to prevent accidental history rewrites. After a successful push it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the branch needs a `/rebase` and/or `/squash`.
 
-### Examples
+**Examples**
 
 ```text
 /push
@@ -650,7 +650,7 @@ Checks out a GitHub pull request on a dedicated branch.
 
 If `gh` is installed it uses `gh pr checkout`; otherwise it fetches the pull request directly from `origin`. After the checkout it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the pull request needs a `/rebase` and/or `/squash`.
 
-### Examples
+**Examples**
 
 ```text
 /pull 58
@@ -675,7 +675,7 @@ Before creating the pull request it runs several pre-flight checks: it blocks on
 
 The checks can be bypassed by setting `auto_rebase = on` or `auto_squash = on` in the `[orangu]` configuration section, which triggers the corresponding fix automatically before continuing.
 
-### Examples
+**Examples**
 
 ```text
 /pull_request
@@ -714,7 +714,7 @@ It runs `gh issue comment <number> --body <body>` (or the GitLab equivalent). Wi
 
 Tab completion (and the inline grey ghost) after `/comment <number> ` offers the template files from `~/.orangu/comments/` first — an existing template keeps its priority — followed by the report keywords. Each keyword is only offered once the matching review has actually been run in the session: before any `/review`, `with review` is ignored by completion (and likewise `with auto review` before any `/auto_review`), so the hints never suggest a report that does not exist. Typing `with ` narrows the hint to the available keywords.
 
-### Examples
+**Examples**
 
 Inline comment body:
 
@@ -759,7 +759,7 @@ Closes a GitHub/GitLab issue or pull request. Requires the `gh` or `glab` CLI.
 - `-i <number>` runs `gh issue close <number>` (or `glab issue close <number>`) to close an issue.
 - `-p <number>` runs `gh pr close <number>` (or `glab mr close <number>`) to close a pull request or merge request.
 
-### Examples
+**Examples**
 
 ```text
 /close -i 51
@@ -803,7 +803,7 @@ Every part Tab-completes (and shows the inline ghost hint):
 
 The candidate lists are fetched once at startup (via `gh`/`glab`) and cached, so completion never shells out on a keystroke. The `<number>` is typed directly (no completion). So `/issue re<TAB> 114 je<TAB>` expands to `/issue reviewer 114 jesperpedersen`.
 
-### Examples
+**Examples**
 
 ```text
 /issue reviewer 114 jesperpedersen
@@ -835,7 +835,7 @@ Each comment is shown as a block: a grey `● <date> <author>` header line, then
   Merged.
 ```
 
-### Examples
+**Examples**
 
 ```text
 /get_comments -i 51

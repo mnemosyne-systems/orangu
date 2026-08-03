@@ -14,7 +14,7 @@ The viewer, its layout, and its key bindings are described in the Built-in manua
 
 It is handled locally and works regardless of server or model state.
 
-### Examples
+**Examples**
 
 ```text
 /manual
@@ -46,7 +46,7 @@ The report covers:
 - tool invocation statistics (counts, percentages), and
 - skill invocation statistics (counts, percentages).
 
-### Examples
+**Examples**
 
 ```text
 /usage
@@ -67,7 +67,7 @@ Clears the current conversation.
 
 The in-memory conversation history is dropped so the next prompt starts a fresh exchange. The session itself is preserved — only the conversation context is cleared. (To also return to the configured model and server, use `/reload`.)
 
-### Examples
+**Examples**
 
 ```text
 /clear
@@ -95,7 +95,7 @@ orangu --resume 550e8400-e29b-41d4-a716-446655440000
 
 so you can return to exactly this session later. The resume command is not printed when the session had no LLM interaction (zero tokens generated) and was on `main`, `master`, or outside a Git repository; in that case the session directory is deleted silently. See the Sessions section of the Terminal interface chapter for the full cleanup rules.
 
-### Examples
+**Examples**
 
 ```text
 /quit

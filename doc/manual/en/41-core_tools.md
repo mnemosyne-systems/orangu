@@ -14,7 +14,7 @@ Shows the list of available commands with a one-line description of each, groupe
 
 It is the fastest way to rediscover a command name or its arguments without leaving the prompt, and it works regardless of server or model state.
 
-### Examples
+**Examples**
 
 ```text
 /help
@@ -46,7 +46,7 @@ orangu injects the skill instructions into the next model request in a
 structured wrapper that also identifies the skill directory and any bundled
 resource files.
 
-### Examples
+**Examples**
 
 ```text
 /skills
@@ -66,7 +66,7 @@ Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`
 
 `/tools` is purely informational: it shows what the model is able to do in the current workspace, not what you can type at the prompt. In particular it is separate from the local `/list_files` convenience command.
 
-### Examples
+**Examples**
 
 ```text
 /tools
@@ -89,7 +89,7 @@ Selects the model used for requests on the active server.
 
 With no argument it lists the selected server's models, with the active model shown in green and the others in red. With a name it switches to that model. Pressing `Tab` after `/model ` cycles through the models the server reports.
 
-### Examples
+**Examples**
 
 List the available models:
 
@@ -140,7 +140,7 @@ With no argument it lists the configured servers — each `[section]` in the con
 
 Either form also re-checks whether the server is an orangu-coordinator rather than a plain `orangu-server`, instead of reusing what it was last found to be. A coordinator started since orangu launched is therefore picked up by running `/server`, without restarting.
 
-### Examples
+**Examples**
 
 List the configured servers:
 
@@ -187,7 +187,7 @@ That override is restored when the session is resumed or when you switch back to
 
 Pressing `Tab` after `/theme ` completes the built-in themes, `random`, and any user theme files found in `~/.orangu/themes/`.
 
-### Examples
+**Examples**
 
 ```text
 /theme classic
@@ -234,7 +234,7 @@ Each row:
 
 A native endpoint outside `/slots`/`/metrics` that is unreachable (connection refused, timeout) or answers with an unexpected status is reported the same way as one the server never implemented — `/information` only distinguishes "the server told us it's disabled" (`HTTP 501`) from "the server doesn't know this path" (`HTTP 404`) from any other response, shown as its raw HTTP status.
 
-### Examples
+**Examples**
 
 ```text
 /information
@@ -309,7 +309,7 @@ A current streak counts today if you've already used orangu today, or ends at ye
 
 See [`/export statistics`](#export) to save the same report — plus a two-layer table of contents, per-year and per-month heatmaps, Authors breakdowns, and bar charts, and a per-author appendix — to a PDF.
 
-### Examples
+**Examples**
 
 ```text
 /statistics
@@ -361,7 +361,7 @@ Scheduled jobs (~/.orangu/schedule, times UTC):
 
 With no schedule file (or an empty one) it says how to create one.
 
-### Examples
+**Examples**
 
 ```text
 /schedule
@@ -382,7 +382,7 @@ Disconnects from the current server.
 
 After disconnecting, the server status in the header turns red and free-form prompts are blocked, but every local command in this manual continues to work. Use `/server` or `/reload` to reconnect.
 
-### Examples
+**Examples**
 
 ```text
 /disconnect
@@ -402,7 +402,7 @@ Restores the configured model and server from the configuration file, undoing an
 
 `/reload` also clears the in-memory conversation history, so it doubles as a way to start a clean exchange while returning to the configured defaults.
 
-### Examples
+**Examples**
 
 ```text
 /reload
@@ -426,7 +426,7 @@ The current session is saved first, then the running process is replaced via `ex
 
 When the binary was rebuilt while running, the original on-disk path may be reported as deleted; `/restart` resolves the real path so it relaunches the freshly built binary. Only if that path is gone entirely does it fall back to staging a runnable copy under `~/.orangu/last`, a scratch directory that is cleared on every startup.
 
-### Examples
+**Examples**
 
 ```text
 /restart
@@ -449,7 +449,7 @@ With a UUID it deletes that single session. With `all` it deletes every session 
 
 Tab completion after `/prune ` cycles through session UUIDs newest-first.
 
-### Examples
+**Examples**
 
 Delete a single session by UUID:
 
@@ -506,7 +506,7 @@ The argument is resolved in order:
 
 Tab completion after `/session ` (with a trailing space) cycles through all session UUIDs newest first, then the distinct workspace paths recorded across sessions; when the typed text matches neither, it falls back to filesystem directory completion so a new workspace can be navigated to one segment at a time (`/session ~/co<Tab>/pr<Tab>`).
 
-### Examples
+**Examples**
 
 List every session:
 
@@ -550,7 +550,7 @@ Lists the workspace files as a tree.
 
 This is a local convenience command for quickly orienting yourself in the workspace; it is separate from the model-facing `list_directory` tool that the model uses to explore files on its own.
 
-### Examples
+**Examples**
 
 ```text
 /list_files
@@ -577,7 +577,7 @@ Tab completion after `/open_file ` searches the workspace recursively for file p
 
 The same `/open_file <path>` (and `open <path>`) form also works inside the `/review` and `/auto_review` split views, where it opens any project file — not only the changed ones — in your editor, with the same whole-workspace `Tab` completion. In `/review` it is available the whole time; in `/auto_review` it works once the run has finished. See the `/review` and `/auto_review` tools for the details.
 
-### Examples
+**Examples**
 
 ```text
 /open_file README.md
@@ -611,7 +611,7 @@ Tab completion for the first positional argument offers workspace file paths rec
 
 Because source lines may be wider than the terminal, `/show_file` output is laid out on the full virtual canvas and can be panned horizontally with `Alt+Left`/`Alt+Right` without reflowing.
 
-### Examples
+**Examples**
 
 Show the current file:
 
@@ -661,7 +661,7 @@ The target **Tab-completes** (and shows the inline ghost hint): after `/build `,
 
 `<compile_workers>` is the `[orangu].compile_workers` value. It defaults to `0`, which means unused: no job flag is passed at all, and each toolchain falls back to its own default (Cargo's own automatic parallelism, a bare serial `make`, `meson compile`'s ninja default, `go build`'s own `-p` default). Setting it above `0` passes an explicit job count to every backend above — Rust, the C/C++ backends, plain make, and Go. Java and Python are unaffected: Maven and `pip` have no directly equivalent per-compile job flag.
 
-### Examples
+**Examples**
 
 ```text
 /build
@@ -701,7 +701,7 @@ The command exits non-zero the same way it would at a real terminal — `/shell`
 
 Tab completion after `/shell ` completes the token being typed against files in the workspace, one path segment at a time, exactly like a real shell: `/shell ./te` offers `./test/`, and once inside that directory `/shell ./test/c` offers `./test/check.sh`. Only the last word of the command line completes this way — the program name and any earlier arguments are left alone. The inline ghost hint previews the same completion.
 
-### Examples
+**Examples**
 
 ```text
 /shell ls -la
@@ -809,7 +809,7 @@ Otherwise you can type into the input window normally, and move through the sele
 
 The review status marks and line comments are kept for the duration of the review session and are not persisted after exit.
 
-### Examples
+**Examples**
 
 ```text
 /review
@@ -986,7 +986,7 @@ When the diff popup is open it is modal:
 | `Alt+Left` / `Alt+Right` | Pan the diff horizontally for long lines |
 | `Esc` | Close the popup, returning to the report |
 
-### Examples
+**Examples**
 
 ```text
 /auto_review
@@ -1079,7 +1079,7 @@ So on a branch the report answers *"does my branch duplicate code that already e
 
 The output window prints a summary (files scanned, functions analysed, the threshold, and the number of candidate pairs) followed by each pair: its similarity percentage, the two function names, and for each function its `path:start–end` location. To save the same report as a PDF, use `/export duplicates` (see the `/export` tool).
 
-### Examples
+**Examples**
 
 Scan with the default 80% threshold:
 
@@ -1154,7 +1154,7 @@ The **statistics** export has the most pages of the six, since most of the work 
 
 `statistics total` renders the Total page, table of contents, and year/month sections aggregated across every workspace's turn log instead of just the current one (with the Total heading noting it covers "all workspaces"), but without the Authors breakdowns or appendix — `total` has no one workspace's `git log` to read.
 
-### Examples
+**Examples**
 
 Export the output window (the default):
 
@@ -1220,7 +1220,7 @@ Inside the visualization you can:
 
 Nodes are automatically clustered and color-coded based on the file they belong to, helping you easily visualize architectural boundaries and module dependencies.
 
-### Examples
+**Examples**
 
 ```text
 /graph
@@ -1301,7 +1301,7 @@ on when it responds. To dedicate a server to embeddings, give its section
 embeddings, `/search` explains how to enable it and existing retrieval (`/grep`,
 the Knowledge Graph) is unaffected.
 
-### Examples
+**Examples**
 
 ```text
 /search where is the retry backoff computed
