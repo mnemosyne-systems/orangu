@@ -26,9 +26,19 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The short commit this was built from, `-dirty` when tracked files differed
-/// from it, or `unknown` when built without git and without an override. See
-/// `build.rs`.
-pub const COMMIT: &str = env!("ORANGU_BUILD_COMMIT");
+/// from it, or `unknown` when it could not be resolved. See `build.rs`.
+///
+/// `option_env!`, not `env!`, and that is the whole point: `env!` makes the
+/// *build script* a hard dependency of the library compiling at all. A tree
+/// without it — a vendored copy, a re-packaged source drop, or a checkout
+/// where `build.rs` was left untracked — then fails with "environment variable
+/// not defined" on every target at once, which is a build failure for a
+/// provenance string. It is not worth that: an unresolved commit is a fact to
+/// report, not a reason to refuse to compile.
+pub const COMMIT: &str = match option_env!("ORANGU_BUILD_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
 
 /// `1.2.0 (52c0443ab)` — the two together, as one string for a banner, a
 /// report header or a series label.

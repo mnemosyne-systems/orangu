@@ -2,6 +2,9 @@
 name = "orangu"
 version = "1.2.0"
 edition = "2024"
+# Not the default `./build.rs`: all source in this package lives under `src/`,
+# and a build script is source.
+build = "src/build.rs"
 license = "GPL-3.0-or-later"
 description = "A coding environment for OpenAI-compatible servers"
 authors = ["Jesper Pedersen <jesperpedersen.db@gmail.com>"]
