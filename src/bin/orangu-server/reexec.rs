@@ -200,6 +200,8 @@ pub struct Handover {
     /// `--config`, when one was given. Omitted otherwise so the new image
     /// runs the same default-path search this one did.
     config: Option<PathBuf>,
+    /// `--host`/`--port`/`--web`, when they were given.
+    listen: Listen,
     /// `--workspace`, always passed, always absolute.
     workspace: PathBuf,
     /// `--all`/`--code`/`--review`/`--explorer`/`--embedding`.
@@ -210,9 +212,24 @@ pub struct Handover {
     fds: InheritedFds,
 }
 
+/// The `--host`/`--port`/`--web` overrides this run was started with, if any.
+///
+/// Normally moot on a handover — both listeners are inherited, so nothing is
+/// bound and no address is consulted. It matters in exactly the case the
+/// adoption check exists for: a descriptor that didn't survive, where the
+/// new image binds instead. Without these it would bind whatever its config
+/// file names, which is not where this server has been answering.
+#[derive(Clone, Debug, Default)]
+pub struct Listen {
+    pub host: Option<String>,
+    pub api: Option<u16>,
+    pub web: Option<u16>,
+}
+
 impl Handover {
     pub fn new(
         config: Option<PathBuf>,
+        listen: Listen,
         workspace: PathBuf,
         role: Role,
         current_model: String,
@@ -221,6 +238,7 @@ impl Handover {
         Ok(Self {
             exe: std::env::current_exe()?,
             config,
+            listen,
             workspace,
             role,
             current_model,
@@ -239,6 +257,18 @@ impl Handover {
         if let Some(config) = &self.config {
             argv.push("--config".into());
             argv.push(config.into());
+        }
+        if let Some(host) = &self.listen.host {
+            argv.push("--host".into());
+            argv.push(host.into());
+        }
+        if let Some(port) = self.listen.api {
+            argv.push("--port".into());
+            argv.push(port.to_string().into());
+        }
+        if let Some(web) = self.listen.web {
+            argv.push("--web".into());
+            argv.push(web.to_string().into());
         }
         argv.push("--workspace".into());
         argv.push((&self.workspace).into());
@@ -385,6 +415,11 @@ mod tests {
         let handover = Handover {
             exe: PathBuf::from("/usr/bin/orangu-server"),
             config: Some(PathBuf::from("/etc/orangu-server.conf")),
+            listen: Listen {
+                host: Some("0.0.0.0".to_string()),
+                api: Some(9100),
+                web: Some(9200),
+            },
             workspace: PathBuf::from("/srv/project"),
             role: Role::Review,
             current_model: "user/old".to_string(),
@@ -406,6 +441,12 @@ mod tests {
                 "user/new:Q4_K_M",
                 "--config",
                 "/etc/orangu-server.conf",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9100",
+                "--web",
+                "9200",
                 "--workspace",
                 "/srv/project",
                 "--review",
@@ -422,6 +463,7 @@ mod tests {
         let handover = Handover {
             exe: PathBuf::from("/usr/bin/orangu-server"),
             config: None,
+            listen: Listen::default(),
             workspace: PathBuf::from("/srv"),
             role: Role::All,
             current_model: "user/old".to_string(),
@@ -438,6 +480,12 @@ mod tests {
             .collect();
 
         assert!(!argv.iter().any(|arg| arg == "--config"), "{argv:?}");
+        // Same reasoning for the address: this run took its config file's, so
+        // the new image has to do its own lookup rather than be pinned to a
+        // host or port that was never asked for.
+        assert!(!argv.iter().any(|arg| arg == "--host"), "{argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "--port"), "{argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "--web"), "{argv:?}");
         // Web UI disabled — only the API descriptor travels.
         assert_eq!(handover.inherit_value().as_deref(), Some("api:3"));
     }

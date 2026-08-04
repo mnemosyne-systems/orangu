@@ -46,6 +46,38 @@ as `release` itself changes. The binary lands at
 `target/release-with-debug/<name>` (Cargo names the output directory
 after the profile, not `release`).
 
+## Single-file bundles
+
+A release build of `orangu-server` can write a copy of itself with a model
+embedded in it — one executable that serves without a models directory or an
+`orangu-server.conf`:
+
+```sh
+cargo build --release
+./target/release/orangu-server bundle unsloth/gemma-4-E2B-it-GGUF:Q4_K_M --all -y
+./orangu-server-bundle-x86_64
+```
+
+The bundle is a file operation on an already-built binary, not a build step:
+nothing is recompiled, and the model is appended rather than linked in, so a
+multi-gigabyte model never goes through `rustc`. Bundling for another platform
+is the same command with `--binary` naming the cross-compiled executable:
+
+```sh
+cargo build --release --target aarch64-unknown-linux-gnu
+./target/release/orangu-server bundle <model> --all -y \
+    --binary target/aarch64-unknown-linux-gnu/release/orangu-server
+# -> ./orangu-server-bundle-aarch64
+```
+
+The architecture in the default name is read out of the binary being bundled,
+not out of the host, so cross-bundled output names itself correctly without an
+`--output` for each target.
+
+Releases ship the ordinary binaries only — a bundle is as large as the model
+inside it, so it is built locally from whichever model suits the machine. See
+the *Bundling* section of [SERVER.md](SERVER.md).
+
 ## AVX2 / SSE4.2
 
 `.cargo/config.toml` sets `-C target-feature=+avx2,+fma,+sse4.2` for

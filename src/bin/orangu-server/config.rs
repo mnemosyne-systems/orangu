@@ -71,6 +71,99 @@ pub fn default_web_port() -> u16 {
     8101
 }
 
+/// The address a bundled server binds when it was started with no config
+/// file at all (see [`bundled_configuration`]) — the loopback interface,
+/// not [`HOST_ALL`].
+///
+/// A bundle is one file somebody downloaded and ran, quite possibly on a
+/// laptop on a network they don't administer. The ordinary `orangu-server`
+/// default of every interface is a deliberate choice made in a config file
+/// somebody wrote; it should not be what a binary does because it was
+/// double-clicked. Writing an `orangu-server.conf` with `host = all` is all
+/// it takes to opt back in.
+pub const BUNDLED_HOST: &str = "127.0.0.1";
+
+/// The web console port a bundled server takes, alongside
+/// [`default_port`]'s `8100` for the API. Far enough from the API's port to
+/// leave the usual `8101`, `8102`, … free for the other servers a machine
+/// running several models ends up with.
+pub fn bundled_web_port() -> u16 {
+    8200
+}
+
+/// Where a bundle listens by default: whatever `bundle`'s own
+/// `--host`/`--port`/`--web` were given, recorded in the bundle and read back
+/// at startup.
+///
+/// Every field is optional, and an absent one means the built-in default
+/// ([`BUNDLED_HOST`], [`default_port`], [`bundled_web_port`]) rather than
+/// nothing — a bundle built before these existed, or built without them,
+/// keeps exactly the behaviour it had.
+///
+/// This is the same idea as the bundle's role: a bundle is a server somebody
+/// will run *without a config file*, so anything that would otherwise need
+/// one has to be decidable when it is built. Without it, a bundle meant for a
+/// LAN would need `--host all` typed at it on every start, on every machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BundledListen {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub web: Option<u16>,
+}
+
+/// The configuration a bundled `orangu-server` runs on when it finds no
+/// config file: `127.0.0.1:8100` for the API, `127.0.0.1:8200` for the web
+/// console, and the role the bundle was built with — each overridden by
+/// whatever `listen` records.
+///
+/// This is what "no configuration required" actually means — not a config
+/// file written on first run (which would then have to be found, kept in
+/// step with the binary, and explained), but a set of answers the binary
+/// already has. A config file that *is* present still wins, in full and
+/// unchanged: a bundle is a starting point, not a locked-down appliance.
+///
+/// `models` is still needed even though the served model is embedded: the
+/// web console's model manager lists it, `download` fetches into it, and a
+/// bundled server can be pointed at an ordinary model like any other. It
+/// need not exist — an empty listing is the correct answer for a machine
+/// that has only ever run the bundle.
+pub fn bundled_configuration(
+    models: PathBuf,
+    role: Role,
+    listen: &BundledListen,
+) -> ServerConfiguration {
+    let host = listen
+        .host
+        .clone()
+        .unwrap_or_else(|| BUNDLED_HOST.to_string());
+    ServerConfiguration {
+        models,
+        // The console follows the API's address, baked-in or default —
+        // `bundle --host all` means "expose this bundle", not "expose half
+        // of it". `--web 0` at build time, or at run time, is how a bundle
+        // exposes only the API.
+        web_host: host.clone(),
+        host,
+        port: listen.port.unwrap_or_else(default_port),
+        slots: role.default_slots(),
+        web: listen.web.unwrap_or_else(bundled_web_port),
+        // Nothing wrote a `[web].host` here, so `--host` at run time moves
+        // the console along with the API — which is what makes `--host all`
+        // on a bundle do the one thing somebody would reach for it to do.
+        web_host_explicit: false,
+        backend: default_backend(),
+        // The bundle's own model is not a spec resolved against `models`, so
+        // it is not this key — `main::prepare` reaches for it directly. Left
+        // `None` so `--daemon` doesn't try to resolve a repo name against the
+        // Hub for a model that is already in the file.
+        model: None,
+        delete: default_delete(),
+        reexec: default_reexec(),
+        role_key: Some(role),
+        role,
+    }
+}
+
 /// A hint at which of `orangu-server`'s features matter for this
 /// deployment — set via one of `--all`/`--code`/`--review`/`--explorer`/
 /// `--embedding` (mutually exclusive; `--all` is the default) or the
@@ -247,6 +340,17 @@ pub struct ServerConfiguration {
     /// which is the point of being able to set it: an API on `all` for the
     /// machines that consume it, with the console kept on `127.0.0.1`.
     pub web_host: String,
+    /// Whether `[web].host` was set *explicitly*, as opposed to
+    /// [`web_host`](Self::web_host) having fallen back to
+    /// [`host`](Self::host).
+    ///
+    /// Only `--host` needs the distinction, and it needs it badly: that flag
+    /// moves the console along with the API, since the two share an address
+    /// unless something says otherwise — but a config that deliberately
+    /// separated them (an API on the network, the console kept on loopback)
+    /// must not have the console quietly dragged onto `0.0.0.0` by a flag
+    /// aimed at the API. An explicit key stands; an inherited one follows.
+    pub web_host_explicit: bool,
     /// Which `Backend` runs the forward pass — CPU, a named GPU API, or
     /// (the default) whichever GPU this platform finds first, falling back
     /// to CPU.
@@ -398,7 +502,7 @@ pub fn load_server_configuration(
     // written against it goes on working untouched — but only when there is
     // no `[web]` section to take precedence over it.
     let web_section = sections.remove(WEB_SECTION);
-    let (web, web_host, reexec, delete) = match web_section {
+    let (web, web_host, web_host_explicit, reexec, delete) = match web_section {
         Some(web_section) => {
             let port = match web_section.get("port") {
                 Some(value) => value
@@ -409,11 +513,11 @@ pub fn load_server_configuration(
             };
             // Only worth spelling out when the console should be reachable
             // somewhere the API isn't; unset, the two share an address.
-            let web_host = web_section
+            let explicit = web_section
                 .get("host")
                 .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| host.clone());
+                .filter(|value| !value.is_empty());
+            let web_host = explicit.clone().unwrap_or_else(|| host.clone());
             let reexec = match web_section.get("reexec") {
                 Some(value) => parse_bool(WEB_SECTION, "reexec", value)?,
                 None => default_reexec(),
@@ -422,7 +526,7 @@ pub fn load_server_configuration(
                 Some(value) => parse_bool(WEB_SECTION, "delete", value)?,
                 None => default_delete(),
             };
-            (port, web_host, reexec, delete)
+            (port, web_host, explicit.is_some(), reexec, delete)
         }
         None => {
             let port = match section.get("web") {
@@ -432,7 +536,15 @@ pub fn load_server_configuration(
                     .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].web: {err}"))?,
                 None => default_web(),
             };
-            (port, host.clone(), default_reexec(), default_delete())
+            // The pre-section spelling has no `[web].host` to be explicit
+            // with, so the console has always followed the API's address.
+            (
+                port,
+                host.clone(),
+                false,
+                default_reexec(),
+                default_delete(),
+            )
         }
     };
 
@@ -470,6 +582,7 @@ pub fn load_server_configuration(
         slots,
         web,
         web_host,
+        web_host_explicit,
         backend,
         reexec,
         delete,
@@ -499,6 +612,44 @@ mod tests {
         // Both on by default.
         assert!(conf.reexec);
         assert!(conf.delete);
+    }
+
+    /// The whole promise of a bundle: no config file, and it still comes up
+    /// somewhere reachable — on the loopback interface only, and with the
+    /// web console on.
+    #[test]
+    fn a_bundle_needs_no_config_file_to_know_where_to_listen() {
+        let conf = bundled_configuration(
+            PathBuf::from("/srv/models"),
+            Role::Code,
+            &BundledListen::default(),
+        );
+
+        assert_eq!(conf.host, "127.0.0.1");
+        assert_eq!(conf.port, 8100);
+        assert_eq!(conf.web_host, "127.0.0.1");
+        assert_eq!(conf.web, 8200);
+        // Not the wildcard: a binary somebody downloaded and ran should not
+        // put itself on every interface of a network it knows nothing about.
+        assert_eq!(resolve_bind_host(&conf.host), "127.0.0.1");
+        assert_eq!(resolve_bind_host(&conf.web_host), "127.0.0.1");
+    }
+
+    /// The role a bundle was built with is the role it serves in, and it
+    /// carries through to the settings a role decides.
+    #[test]
+    fn a_bundles_role_decides_its_slot_count_like_any_other() {
+        assert_eq!(
+            bundled_configuration(PathBuf::new(), Role::Embedding, &BundledListen::default()).slots,
+            Role::Embedding.default_slots()
+        );
+        let conf = bundled_configuration(PathBuf::new(), Role::Review, &BundledListen::default());
+        assert_eq!(conf.role, Role::Review);
+        assert_eq!(conf.role_key, Some(Role::Review));
+        assert_eq!(conf.slots, Role::Review.default_slots());
+        // The embedded model is not a spec to resolve against `models`, so
+        // `--daemon` must not find one here and go looking for it.
+        assert_eq!(conf.model, None);
     }
 
     /// A hand-edited `.ini` gets every spelling of a switch a person might
@@ -637,6 +788,51 @@ mod tests {
         let conf = load_server_configuration(file.path(), None, false).unwrap();
         assert_eq!(conf.web_host, "192.168.1.10");
         assert_eq!(conf.host, conf.web_host);
+    }
+
+    /// `--host` moves the console along with the API when the console was
+    /// only following it anyway, and leaves it alone when a config put it
+    /// somewhere on purpose. Exposing the API must never be a way to expose
+    /// the console by accident, which is the whole reason this flag is
+    /// recorded rather than inferred from the two addresses matching.
+    #[test]
+    fn only_an_inherited_web_host_is_flagged_as_following_the_api() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = 127.0.0.1\n\n[web]\nport = 8101\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web_host, "127.0.0.1");
+        assert!(!conf.web_host_explicit);
+
+        // The same two addresses, but one of them was asked for by name.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = 127.0.0.1\n\n[web]\nport = 8101\nhost = 127.0.0.1\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.web_host, "127.0.0.1");
+        assert!(conf.web_host_explicit);
+
+        // No `[web]` section at all, and the legacy `[orangu-server].web`
+        // spelling, both predate there being a key to be explicit with.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\nweb = 8200\n").unwrap();
+        assert!(
+            !load_server_configuration(file.path(), None, false)
+                .unwrap()
+                .web_host_explicit
+        );
+
+        // And a bundle, which has no config file to have written one.
+        assert!(
+            !bundled_configuration(PathBuf::new(), Role::All, &BundledListen::default())
+                .web_host_explicit
+        );
     }
 
     /// And overrides it when it does — the case this exists for: an API

@@ -529,6 +529,29 @@ impl ExpertQuantMatrix {
     }
 }
 
+/// Where one shard's bytes live: the file to map, and how far into it the
+/// shard's GGUF structure starts.
+///
+/// `offset` is `0` for every ordinary model — a `.gguf` file is a shard that
+/// starts where its file does. It is non-zero only for a bundled
+/// `orangu-server` (`crate::bundle`), where the shards are appended to the
+/// executable one after another and each therefore begins somewhere in the
+/// middle of the file being mapped.
+struct ShardSource {
+    path: std::path::PathBuf,
+    offset: u64,
+}
+
+/// Every shard of the model at `path`, in shard order, as plain files —
+/// [`shard_paths`] with the zero offsets an on-disk model always has.
+fn shard_sources(path: &Path) -> Result<Vec<ShardSource>> {
+    let gguf = GgufFile::open(path)?;
+    Ok(shard_paths(path, &gguf)?
+        .into_iter()
+        .map(|path| ShardSource { path, offset: 0 })
+        .collect())
+}
+
 /// Every file making up this model, in shard order — just `[path]` for an
 /// ordinary single-file GGUF.
 ///
@@ -544,7 +567,7 @@ impl ExpertQuantMatrix {
 /// COUNT`) rather than from globbing the directory, so a stray file that
 /// merely looks like a shard can't join the set. The filename pattern is
 /// upstream's `llama_split_path` format, `%s-%05d-of-%05d.gguf`.
-fn shard_paths(path: &Path, gguf: &GgufFile) -> Result<Vec<std::path::PathBuf>> {
+pub(crate) fn shard_paths(path: &Path, gguf: &GgufFile) -> Result<Vec<std::path::PathBuf>> {
     let count = metadata_u64(gguf, "split.count").unwrap_or(0);
     if count <= 1 {
         return Ok(vec![path.to_path_buf()]);
@@ -600,7 +623,34 @@ impl LoadedModel {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let gguf = GgufFile::open(path)?;
+        Self::open_shards(&shard_sources(path)?)
+    }
+
+    /// Loads a model whose shards are byte ranges inside one file that is
+    /// not itself a `.gguf` — a bundled `orangu-server`, where the model was
+    /// appended to the executable (see `crate::bundle`). Every shard names
+    /// the same `path` and differs only in where it starts.
+    ///
+    /// Nothing downstream can tell the difference: the mapping is of the
+    /// whole carrying file either way, and a tensor's `start` was always a
+    /// byte offset into its shard's mapping rather than a file position of
+    /// its own.
+    pub fn open_bundled(path: &Path, offsets: &[u64]) -> Result<Self> {
+        let sources: Vec<ShardSource> = offsets
+            .iter()
+            .map(|&offset| ShardSource {
+                path: path.to_path_buf(),
+                offset,
+            })
+            .collect();
+        Self::open_shards(&sources)
+    }
+
+    fn open_shards(shards: &[ShardSource]) -> Result<Self> {
+        let first = shards
+            .first()
+            .ok_or_else(|| anyhow!("a model needs at least one shard"))?;
+        let gguf = GgufFile::open_at(&first.path, first.offset)?;
         let architecture = metadata_string(&gguf, "general.architecture")
             .ok_or_else(|| anyhow!("GGUF file is missing general.architecture"))?;
         resolve_arch_family(&architecture)?;
@@ -610,16 +660,16 @@ impl LoadedModel {
         // Every shard's tensor directory, merged. A single-file model is
         // just the one-shard case of this.
         let mut tensors = HashMap::with_capacity(gguf.tensors.len());
-        let shards = shard_paths(path, &gguf)?;
         let mut total_tensors = 0usize;
-        for (index, shard_path) in shards.iter().enumerate() {
+        for (index, shard) in shards.iter().enumerate() {
+            let shard_path = shard.path.as_path();
             // Shard 1's header is already parsed; the rest still need
             // reading. Only shard 1 carries the model's hyperparameters —
             // the others hold `split.*` and their own tensor directory.
             let shard_gguf = if index == 0 {
                 None
             } else {
-                Some(GgufFile::open(shard_path)?)
+                Some(GgufFile::open_at(shard_path, shard.offset)?)
             };
             let shard_gguf = shard_gguf.as_ref().unwrap_or(&gguf);
 
@@ -640,7 +690,13 @@ impl LoadedModel {
                 let len = quant::tensor_byte_size(tensor.ggml_type, element_count)
                     .with_context(|| format!("tensor '{}'", tensor.name))?
                     as usize;
-                let start = shard_gguf.data_offset as usize + tensor.offset as usize;
+                // `data_offset` is relative to where this shard's GGUF
+                // structure begins, which for a bundled model is not where
+                // the mapped file begins — hence the segment's own offset on
+                // top. Zero for a plain `.gguf`, where the two coincide.
+                let start = shard.offset as usize
+                    + shard_gguf.data_offset as usize
+                    + tensor.offset as usize;
                 if start + len > mmap.len() {
                     bail!(
                         "tensor '{}' extends past the end of {}",
@@ -1138,6 +1194,116 @@ mod tests {
     fn resolve_arch_family_rejects_unknown_architectures() {
         let err = resolve_arch_family("bert").unwrap_err();
         assert!(err.to_string().contains("not yet supported"), "{err}");
+    }
+
+    /// A complete, loadable single-tensor `llama` GGUF: the five
+    /// hyperparameters `read_model_config` requires, and a `token_embd.
+    /// weight` whose 32 `F32` values are `0.0, 1.0, 2.0, …` so a byte range
+    /// that is off by anything at all is visible rather than merely wrong.
+    fn minimal_llama_gguf() -> Vec<u8> {
+        fn string(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        fn u32_kv(buf: &mut Vec<u8>, key: &str, value: u32) {
+            string(buf, key);
+            buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&6u64.to_le_bytes()); // metadata_kv_count
+
+        string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
+        string(&mut buf, "llama");
+        u32_kv(&mut buf, "llama.embedding_length", 8);
+        u32_kv(&mut buf, "llama.block_count", 1);
+        u32_kv(&mut buf, "llama.attention.head_count", 2);
+        u32_kv(&mut buf, "llama.context_length", 16);
+        u32_kv(&mut buf, "llama.vocab_size", 4);
+
+        string(&mut buf, "token_embd.weight");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        buf.extend_from_slice(&8u64.to_le_bytes());
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // F32
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset within the data
+
+        // Pad to the 32-byte alignment the reader computes `data_offset` at,
+        // then the tensor data itself.
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        for value in 0..32u32 {
+            buf.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        buf
+    }
+
+    /// The load path a bundled `orangu-server` takes has to produce exactly
+    /// what the ordinary one does — same hyperparameters, same tensor, same
+    /// bytes — from the same model sitting at a non-zero offset inside a
+    /// larger file. This is the whole correctness claim of `crate::bundle`,
+    /// and the one thing a wrong offset would silently turn into plausible
+    /// nonsense at generation time rather than an error at load time.
+    #[test]
+    fn a_model_embedded_in_a_larger_file_loads_identically_to_one_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gguf = minimal_llama_gguf();
+
+        let plain = dir.path().join("model.gguf");
+        std::fs::write(&plain, &gguf).expect("write model");
+
+        // What `bundle` writes: a program image, padding to a page boundary,
+        // then the model — and trailing bytes after it, which nothing that
+        // reads the model may notice.
+        const OFFSET: u64 = 4096;
+        let mut carrier = vec![0xAAu8; OFFSET as usize];
+        carrier.extend_from_slice(&gguf);
+        carrier.extend_from_slice(b"manifest and footer go here");
+        let embedded = dir.path().join("orangu-server-bundle");
+        std::fs::write(&embedded, &carrier).expect("write bundle");
+
+        let from_disk = LoadedModel::open(&plain).expect("load from disk");
+        let from_bundle =
+            LoadedModel::open_bundled(&embedded, &[OFFSET]).expect("load from bundle");
+
+        assert_eq!(from_disk.config.n_embd, from_bundle.config.n_embd);
+        assert_eq!(from_disk.config.n_layer, from_bundle.config.n_layer);
+        assert_eq!(from_disk.config.n_vocab, from_bundle.config.n_vocab);
+        assert_eq!(from_disk.config.n_ctx_train, from_bundle.config.n_ctx_train);
+        assert_eq!(from_disk.metadata.len(), from_bundle.metadata.len());
+
+        let disk_tensor = &from_disk.tensors["token_embd.weight"];
+        let bundle_tensor = &from_bundle.tensors["token_embd.weight"];
+        assert_eq!(disk_tensor.len, bundle_tensor.len);
+        assert_eq!(disk_tensor.dims, bundle_tensor.dims);
+        // The offsets are deliberately *not* equal — the point is that the
+        // bytes they land on are.
+        assert_eq!(bundle_tensor.start, disk_tensor.start + OFFSET as usize);
+        assert_eq!(
+            &disk_tensor.bytes[disk_tensor.start..disk_tensor.start + disk_tensor.len],
+            &bundle_tensor.bytes[bundle_tensor.start..bundle_tensor.start + bundle_tensor.len],
+        );
+        // And that they are the values that were written, not merely two
+        // copies of the same wrong range.
+        let first = f32::from_le_bytes(
+            bundle_tensor.bytes[bundle_tensor.start..bundle_tensor.start + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        assert_eq!(first, 0.0);
+        let last_start = bundle_tensor.start + bundle_tensor.len - 4;
+        let last = f32::from_le_bytes(
+            bundle_tensor.bytes[last_start..last_start + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        assert_eq!(last, 31.0);
     }
 
     /// A header-only `GgufFile` (no tensor data) carrying one architecture

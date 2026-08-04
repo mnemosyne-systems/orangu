@@ -20,8 +20,10 @@ dependency on llama.cpp/ggml's own compiled code.
 ### Module layout
 
 - `main.rs` — CLI parsing (serving plus the `system`/`suggest`/`list`/
-  `show`/`download`/`delete`/`refresh`/`prune` subcommands), model-spec
-  resolution, GPU backend selection (`select_backend`), `format_show`/
+  `show`/`download`/`delete`/`refresh`/`bundle`/`prune` subcommands),
+  model-spec resolution (`ModelSource`, which is either a `.gguf` on disk or
+  a byte range inside this executable), GPU backend selection
+  (`select_backend`), `format_show`/
   `DEFAULT_ARRAY_PREVIEW` (for `show`), `select_model_for_deletion`/
   `confirm` (for `delete`, and reused by `prune`/`refresh`), the two
   helpers every table-printing subcommand shares (`check_for_updates`, one
@@ -31,6 +33,8 @@ dependency on llama.cpp/ggml's own compiled code.
   `orangu::workspaces::resolve_workspace_root` that `orangu`'s own
   `-w`/`--workspace` uses), and process wiring
   (Ctrl+C/`SIGINT`/`--daemon`).
+- `bundle.rs` — `bundle`: writing an executable that carries both this
+  server and a model, and finding one at startup (`embedded`). See below.
 - `reexec.rs` — replacing this process with one serving a different model,
   for the web console's **Load** button: descriptor hand-over, `argv`
   reconstruction, the header pre-check, and the one-shot fallback. See
@@ -1716,6 +1720,117 @@ addition, not a rewrite of model output. It runs on the `done` event
 and again on session load, so a reloaded answer carries the same picture a
 live one did.
 
+### Bundling a model into the binary (`bundle.rs`)
+
+`orangu-server bundle` writes a new executable: this binary's program image,
+byte for byte, then the model's `.gguf` bytes, then a JSON manifest and a
+fixed 32-byte footer.
+
+```text
+[ program image                       ]  base_len bytes, byte-identical
+[ padding to a 4 KiB boundary         ]
+[ shard 1 .gguf                       ]
+[ padding, shard 2 .gguf, ...         ]  only a split model has these
+[ manifest (JSON)                     ]
+[ manifest_offset: u64                ]  ─┐
+[ manifest_len:    u64                ]   ├ the footer
+[ MAGIC:           16 bytes           ]  ─┘
+```
+
+The obvious alternative, `include_bytes!`, would put a multi-gigabyte array
+through `rustc` on every build, tie one binary to one model at compile time,
+and make a bundle something only whoever can build the project could produce.
+Appending instead makes the bundle a *file operation* on a finished binary,
+so anyone with one can make a bundle in seconds — and, because the manifest
+records `base_len`, a bundle can be bundled again, replacing its model rather
+than stacking a second one behind the first.
+
+The footer being fixed-size and last is what makes "is this a bundle?" a
+seek and a 32-byte read at startup regardless of payload size — cheap enough
+that `bundle::embedded()` runs unconditionally on every start. A file whose
+footer matches but whose manifest doesn't parse is reported on `stderr` and
+then treated as unbundled: a corrupt bundle should not take away the one
+thing that might still work, `orangu-server <model>` against a real file.
+
+Alignment is why each shard starts on a 4 KiB boundary. The mapping is of the
+executable, not of a `.gguf`, and a model should not read differently for
+having been carried in one — a page-aligned start gives every tensor the same
+alignment relative to a page that it has in a file of its own.
+
+Reading it back needed two small generalizations rather than a second load
+path:
+
+- `orangu::gguf::GgufFile::open_at(path, offset)` parses the GGUF structure
+  that begins `offset` bytes into a file. `data_offset` stays relative to the
+  segment, so the caller that knows where the segment starts is the one that
+  adds `offset` back.
+- `engine::loader::LoadedModel` now resolves shards as `ShardSource { path,
+  offset }` instead of bare paths, and a tensor's `start` is
+  `shard.offset + shard_gguf.data_offset + tensor.offset`. Every on-disk
+  model is the `offset == 0` case, so nothing else changed:
+  `LoadedModel::open_bundled` differs from `open` only in that every shard
+  names the same file at a different offset.
+
+At startup `main::prepare` picks a `ModelSource` — `File` or `Embedded` —
+and everything past it is written against the result. A bundled binary with
+no config file uses `config::bundled_configuration`: `127.0.0.1:8100`,
+`127.0.0.1:8200`, the Hugging Face hub cache as `models`, and the bundle's
+own role. Loopback rather than `all` because a bundle is a binary somebody
+downloaded and ran, not a deployment somebody configured; `--host all` is how
+that gets opted out of for one run.
+
+`bundle` records `--host`/`--port`/`--web` in the manifest as
+`config::BundledListen`, which `bundled_configuration` then layers over those
+defaults. Every field is `Option` and `#[serde(default, skip_serializing_if)]`,
+so a bundle written before they existed parses unchanged and keeps exactly the
+behaviour it had — the manifest is a format other builds read, and adding a key
+to it must never be a reason an older bundle stops starting. The value is a
+default, not a lock: a run-time flag and a config file both still win over it.
+`bundle` validates the host itself (`all`/`*` or a literal `IpAddr`) rather
+than leaving it to the target machine's `bind`, since the machine that would
+report the failure is not the machine that could fix it.
+
+`--host` is also why `ServerConfiguration` carries `web_host_explicit`. The
+console follows the API's address unless something says otherwise, so `--host`
+has to move it too — but a config that *deliberately* separated them (an API on
+the network, the console on loopback) must keep them separated, or exposing the
+API would be a way to expose the console by accident. The two addresses being
+equal cannot answer that question, so whether the key was written is recorded
+rather than inferred.
+
+The bundle's default output name, `orangu-server-bundle-<arch>`, comes from
+`bundle::detect_target`, which reads the architecture out of the **binary being
+bundled** — ELF `e_machine`, Mach-O `cputype` (a fat binary with more than one
+slice is `universal`), PE `Machine`, which also decides the `.exe` suffix.
+Reading the header rather than using `std::env::consts::ARCH` is what makes
+`--binary` honest: cross-bundling an `aarch64` build on an `x86_64` host has to
+produce a file named for the machine that can run it. An unrecognized format
+falls back to the host's own architecture rather than failing — the name is a
+label, and nothing resolves against it.
+
+Two interactions are worth naming. A handover
+(`reexec.rs`, below) that fails and falls back must not name the embedded
+model by its label — that is a Hugging Face repo id, and the fallback would
+go to the network for a model already inside the file it is falling back
+into — so `bundle::EMBEDDED_SPEC` (`"bundled"`) is a reserved spec meaning
+"the model in this binary", and that is what travels in
+`FALLBACK_MODEL_VAR`. And the model manager's listing has no row for the
+embedded model, since it isn't a file in the models directory: nothing is
+marked loaded and no Delete button exists for it, so `CurrentView.bundled`
+tells the panel to say `bundled` rather than leave an unexplained gap.
+
+On macOS the copied program image is re-signed ad-hoc (`codesign --force
+--sign -`), and the ordering is the point: `codesign` writes the new
+signature at the end of the image it is pointed at, so it runs *before* a
+single payload byte follows, leaving the model outside the signed range where
+the kernel never looks. Signing can change the image's length, so the length
+the image actually ended up with — not the `base_len` asked for — is what the
+manifest records and what a re-bundle truncates back to. ELF and PE images
+need none of this. Failure is noisy but not fatal: the file is written and
+correct, `codesign` is the one step that depends on the developer tools being
+installed, and the manifest is read back off disk afterwards, which is also
+what would catch a `codesign` that rewrote more than it was asked to.
+
 ### Loading a different model (`reexec.rs`)
 
 `POST /api/models/select` does not swap the model inside the process. It
@@ -1746,7 +1861,12 @@ given: the workspace as an absolute path (a `--daemon` process has since
 moved to `/`) and the role as an explicit flag (it may have been answered at
 an interactive prompt). `--config` is passed only if it was passed to this
 process, so a server that found its config by the default search makes the
-new image repeat that search rather than pinning a path it never chose.
+new image repeat that search rather than pinning a path it never chose;
+`--host`/`--port`/`--web` follow the same rule (`reexec::Listen`). The address
+is normally moot on a handover — both listeners are inherited, so nothing is
+bound — but it matters in the one case the adoption check exists for, a
+descriptor that didn't survive, where the new image binds instead and must bind
+where this server has been answering.
 
 **A failed load falls back.** `FALLBACK_MODEL_VAR` carries the previous
 model spec; if the new image's `prepare` fails, `main` execs once more with

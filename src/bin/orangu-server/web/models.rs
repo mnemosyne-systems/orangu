@@ -279,6 +279,14 @@ struct CurrentView {
     n_ctx: usize,
     role: &'static str,
     slots: usize,
+    /// Whether the served model is embedded in the server executable (see
+    /// `crate::bundle`) rather than being one of the files listed below.
+    ///
+    /// It is therefore not a row: nothing in the table is marked loaded, and
+    /// there is no Delete button for it anywhere — the model cannot be
+    /// removed without removing the binary that is running. The panel says
+    /// so, since a listing with no loaded row otherwise looks like a bug.
+    bundled: bool,
 }
 
 #[derive(Serialize)]
@@ -356,6 +364,7 @@ async fn list(
             n_ctx: cfg.n_ctx_train,
             role: state.engine.role.label(),
             slots: state.engine.slots.total(),
+            bundled: state.bundled,
         },
         can_load: state.handover.is_some(),
         can_delete: state.can_delete,

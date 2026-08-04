@@ -30,6 +30,7 @@
 // remedy and costs nothing but a deeper proof search.
 #![recursion_limit = "256"]
 
+mod bundle;
 mod config;
 mod device_lost;
 mod engine;
@@ -122,37 +123,15 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    version = VERSION,
-    about = "Serve a GGUF model over a llama.cpp-compatible HTTP API",
-    long_about = "Serve a GGUF model over a llama.cpp-compatible HTTP API.",
-    group(clap::ArgGroup::new("role").args(["all", "code", "review", "explorer", "embedding"]).multiple(false))
-)]
-struct Args {
-    /// A local .gguf path, an NR/MODEL label already under the configured
-    /// models directory, or a <user>/<model>[:quant] Hugging Face repo
-    /// (fetched first if not already cached). Omit it to list the models
-    /// under the configured models directory and pick one interactively.
-    /// Ignored when a subcommand is given.
-    model: Option<String>,
-    /// Path to orangu-server.conf. Defaults to ./orangu-server.conf, then
-    /// ~/.orangu/orangu-server.conf.
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-    /// Root directory this server is allowed to operate in. Defaults to the
-    /// current working directory.
-    #[arg(short, long)]
-    workspace: Option<PathBuf>,
-    /// Interactively create ~/.orangu/orangu-server.conf.
-    #[arg(short, long)]
-    init: bool,
-    /// Print the shell completion script for the detected shell and exit.
-    #[arg(short = 's', long = "shell-completions")]
-    shell_completions: bool,
-    /// Run in the background, detached from the terminal.
-    #[arg(short, long)]
-    daemon: bool,
+/// The five mutually exclusive role flags, as one reusable block.
+///
+/// Shared rather than written twice because `bundle` needs exactly the same
+/// five: the role a bundle is built with is the role its server comes up in,
+/// so it is chosen the same way and spelled the same way. Flattening keeps
+/// them a set clap enforces the exclusivity of, in both places at once.
+#[derive(clap::Args, Debug, Default)]
+#[group(required = false, multiple = false)]
+struct RoleFlags {
     /// General-purpose. The default role.
     #[arg(long)]
     all: bool,
@@ -168,6 +147,114 @@ struct Args {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
+}
+
+impl RoleFlags {
+    /// The flag that was actually given, if any — `None` when none was, so
+    /// the caller can fall back to a config file's own `role` key (or a
+    /// bundle's) rather than silently assuming `--all` was meant.
+    fn role(&self) -> Option<config::Role> {
+        if self.all {
+            Some(config::Role::All)
+        } else if self.code {
+            Some(config::Role::Code)
+        } else if self.review {
+            Some(config::Role::Review)
+        } else if self.explorer {
+            Some(config::Role::Explorer)
+        } else if self.embedding {
+            Some(config::Role::Embedding)
+        } else {
+            None
+        }
+    }
+}
+
+/// Where to listen, as three flags — the other block shared between serving
+/// and `bundle`, for the same reason [`RoleFlags`] is.
+///
+/// Serving, they override the config file for this run. Bundling, they are
+/// recorded *in* the bundle and become its defaults, exactly as the role is:
+/// a bundle is a server somebody will run without a config file, so the
+/// address it comes up on has to be decidable when it is built, not only when
+/// it is started.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct ListenFlags {
+    /// Address to bind: "all" (or "*") for every network interface, or a
+    /// literal address such as 0.0.0.0 or 127.0.0.1. Serving, it overrides
+    /// [orangu-server].host (and [web].host unless that is set explicitly);
+    /// on `bundle`, it is the address the bundle binds by default.
+    #[arg(long)]
+    host: Option<String>,
+    /// Port the HTTP API listens on. Serving, it overrides
+    /// [orangu-server].port; on `bundle`, it is the bundle's own default
+    /// (8100 either way).
+    #[arg(short, long)]
+    port: Option<u16>,
+    /// Port the web console listens on, or 0 to disable it. Serving, it
+    /// overrides [web].port; on `bundle`, it is the bundle's own default
+    /// (8200).
+    #[arg(long)]
+    web: Option<u16>,
+}
+
+impl ListenFlags {
+    /// These flags as the record a bundle stores, or `None` per field where
+    /// nothing was given.
+    fn bundled(&self) -> config::BundledListen {
+        config::BundledListen {
+            host: self.host.clone(),
+            port: self.port,
+            web: self.web,
+        }
+    }
+
+    /// `self` where it names something, falling back to `other` field by
+    /// field — how a flag after the subcommand wins over the same flag
+    /// before it without either one having to be all-or-nothing.
+    fn or(&self, other: &ListenFlags) -> ListenFlags {
+        ListenFlags {
+            host: self.host.clone().or_else(|| other.host.clone()),
+            port: self.port.or(other.port),
+            web: self.web.or(other.web),
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    version = VERSION,
+    about = "Serve a GGUF model over a llama.cpp-compatible HTTP API",
+    long_about = "Serve a GGUF model over a llama.cpp-compatible HTTP API."
+)]
+struct Args {
+    /// A local .gguf path, an NR/MODEL label already under the configured
+    /// models directory, or a <user>/<model>[:quant] Hugging Face repo
+    /// (fetched first if not already cached). Omit it to list the models
+    /// under the configured models directory and pick one interactively.
+    /// Ignored when a subcommand is given.
+    model: Option<String>,
+    /// Path to orangu-server.conf. Defaults to ./orangu-server.conf, then
+    /// ~/.orangu/orangu-server.conf.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    listen: ListenFlags,
+    /// Root directory this server is allowed to operate in. Defaults to the
+    /// current working directory.
+    #[arg(short, long)]
+    workspace: Option<PathBuf>,
+    /// Interactively create ~/.orangu/orangu-server.conf.
+    #[arg(short, long)]
+    init: bool,
+    /// Print the shell completion script for the detected shell and exit.
+    #[arg(short = 's', long = "shell-completions")]
+    shell_completions: bool,
+    /// Run in the background, detached from the terminal.
+    #[arg(short, long)]
+    daemon: bool,
+    #[command(flatten)]
+    roles: RoleFlags,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -179,9 +266,13 @@ struct Args {
 /// at all), exactly as before this enum existed, so `orangu-server
 /// <model>` keeps working unchanged. The one collision this admits: a local
 /// `.gguf` file whose bare name is exactly `system`/`suggest`/`list`/
-/// `show`/`download`/`refresh` would be parsed as that subcommand instead of
-/// a model spec — resolvable by passing a path (`./system`) instead of the
-/// bare name.
+/// `show`/`download`/`refresh`/`bundle` would be parsed as that subcommand
+/// instead of a model spec — resolvable by passing a path (`./system`)
+/// instead of the bare name.
+///
+/// `bundle` is the odd one out: it neither loads a model nor binds a
+/// listener either, but what it produces is a *server* — see
+/// [`crate::bundle`].
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Detect the machine's CPU and GPU(s) and print their statistics.
@@ -237,6 +328,36 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Write a single executable carrying both this server and a model,
+    /// which then runs with no models directory and no configuration file.
+    Bundle {
+        /// The model to embed: a local .gguf path, an NR/MODEL label from
+        /// `list`, or a <user>/<model>[:quant] Hugging Face repo (fetched
+        /// first if not already cached). Omit it to pick one interactively.
+        model: Option<String>,
+        /// Where to write the bundle. Defaults to
+        /// ./orangu-server-bundle-<ARCH>, naming the architecture the
+        /// bundled binary was built for (plus .exe for a Windows one).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// The executable to bundle the model into. Defaults to this one;
+        /// pass a build for another platform to bundle that instead.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Skip the confirmation prompt, and take the default role rather
+        /// than asking for one.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// The role the bundle comes up in. Also accepted before the
+        /// subcommand (`orangu-server --code bundle ...`); omit both to be
+        /// asked for one.
+        #[command(flatten)]
+        roles: RoleFlags,
+        /// Where the bundle listens by default, baked into it. Also accepted
+        /// before the subcommand (`orangu-server --host all bundle ...`).
+        #[command(flatten)]
+        listen: ListenFlags,
+    },
     /// Delete chat sessions from ~/.orangu/server/sessions/. Every
     /// invocation, regardless of its own argument, first removes any
     /// non-active session with an empty chat history.
@@ -265,30 +386,17 @@ impl Command {
             Command::Download { .. } => "download",
             Command::Delete { .. } => "delete",
             Command::Refresh { .. } => "refresh",
+            Command::Bundle { .. } => "bundle",
             Command::Prune { .. } => "prune",
         }
     }
 }
 
 impl Args {
-    /// The CLI role flag that was actually given, if any — `None` when
-    /// none of `--all`/`--code`/`--review`/`--explorer`/`--embedding` was
-    /// passed, letting the caller fall back to the config file's own
-    /// `role` key rather than silently assuming `--all` was meant.
+    /// The CLI role flag that was actually given, if any — see
+    /// [`RoleFlags::role`].
     fn role(&self) -> Option<config::Role> {
-        if self.all {
-            Some(config::Role::All)
-        } else if self.code {
-            Some(config::Role::Code)
-        } else if self.review {
-            Some(config::Role::Review)
-        } else if self.explorer {
-            Some(config::Role::Explorer)
-        } else if self.embedding {
-            Some(config::Role::Embedding)
-        } else {
-            None
-        }
+        self.roles.role()
     }
 }
 
@@ -360,7 +468,12 @@ fn main() -> ExitCode {
 
     if let Some(command) = args.command.take() {
         let _terminal_title_guard = TerminalTitleGuard::new(&terminal_title(command.mode()));
-        return match run_command(args.config, command) {
+        // Only `bundle` reads these — it is the one subcommand that decides
+        // how the server it writes will start, so the role and the address
+        // are settings it records rather than settings for this run.
+        let cli_role = args.role();
+        let cli_listen = args.listen.clone();
+        return match run_command(args.config, cli_role, &cli_listen, command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -386,6 +499,11 @@ fn main() -> ExitCode {
     let config_arg = args.config.clone();
     let workspace_arg = args.workspace.clone();
     let role_arg = args.role().unwrap_or_default();
+    let listen_arg = reexec::Listen {
+        host: args.listen.host.clone(),
+        api: args.listen.port,
+        web: args.listen.web,
+    };
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -400,6 +518,7 @@ fn main() -> ExitCode {
                 eprintln!("falling back to '{fallback}'");
                 match reexec::Handover::new(
                     config_arg,
+                    listen_arg,
                     workspace_arg.unwrap_or_else(|| PathBuf::from(".")),
                     role_arg,
                     fallback.to_string(),
@@ -460,6 +579,10 @@ struct Prepared {
     /// `--config` as given, or `None` when the default search found it —
     /// see [`reexec::Handover`], which has to reproduce the same choice.
     config_path: Option<PathBuf>,
+    /// `--host`/`--port`/`--web` as given, for the same reason `config_path`
+    /// is kept: a handover has to come back up on the same addresses this run
+    /// chose, not on the ones its config file names.
+    listen_override: reexec::Listen,
     /// The role this process actually resolved to, flag or prompt.
     role: config::Role,
     /// `[web].reexec`: whether the web console may load a different model
@@ -467,6 +590,12 @@ struct Prepared {
     reexec: bool,
     /// `[web].delete`: whether the web console may delete models.
     delete: bool,
+    /// The model inside this executable, when that is what is being served
+    /// — for the startup banner, and for naming this model to a handover
+    /// that has to fall back to it (see [`bundle::EMBEDDED_SPEC`]). `None`
+    /// both for an ordinary build and for a bundled one that was pointed at
+    /// a model on disk instead.
+    bundle: Option<&'static bundle::Bundle>,
     /// The GPU kernel/tuning selection this device came up with, and its
     /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
     /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
@@ -488,6 +617,78 @@ struct Prepared {
     daemon: bool,
 }
 
+/// Which model this process is about to serve, and where its bytes are.
+///
+/// The two cases differ in exactly one place — the file that gets mapped and
+/// how far into it the model starts — so everything past [`prepare`] is
+/// written against the result rather than against this.
+enum ModelSource {
+    /// A `.gguf` on disk: a path given on the command line, named by the
+    /// config file, or picked at the prompt.
+    File(PathBuf),
+    /// The model inside this executable. See [`crate::bundle`].
+    Embedded(&'static bundle::Bundle),
+}
+
+impl ModelSource {
+    /// The file the weights are read out of — the model itself, or the
+    /// executable carrying it. This is what the web console shows as the
+    /// loaded model's path and refuses to delete; for a bundle that is this
+    /// binary, which is both true and the right thing to refuse.
+    fn path(&self) -> &Path {
+        match self {
+            ModelSource::File(path) => path,
+            ModelSource::Embedded(bundle) => &bundle.exe,
+        }
+    }
+
+    /// The model's header: metadata, tokenizer, and tensor directory.
+    fn gguf(&self) -> Result<GgufFile> {
+        match self {
+            ModelSource::File(path) => GgufFile::open(path),
+            ModelSource::Embedded(bundle) => {
+                let offset = *bundle
+                    .shard_offsets
+                    .first()
+                    .ok_or_else(|| anyhow!("the embedded model has no shards"))?;
+                GgufFile::open_at(&bundle.exe, offset)
+            }
+        }
+    }
+
+    /// The mapped weights.
+    fn load(&self) -> Result<LoadedModel> {
+        match self {
+            ModelSource::File(path) => LoadedModel::open(path),
+            ModelSource::Embedded(bundle) => {
+                LoadedModel::open_bundled(&bundle.exe, &bundle.shard_offsets)
+            }
+        }
+    }
+}
+
+/// Resolves a model spec — whatever was passed on the command line, or read
+/// from `[orangu-server].model` — to the model it names.
+///
+/// [`bundle::EMBEDDED_SPEC`] is the one spec not resolved against the models
+/// directory: it names the model already in this file. In a binary with no
+/// bundle it isn't reserved at all and resolves like any other name, which
+/// is the honest outcome — there is nothing embedded for it to mean.
+fn resolve_model_spec(
+    models_dir: &Path,
+    spec: &str,
+    bundled: Option<&'static bundle::Bundle>,
+) -> Result<(ModelSource, String)> {
+    if spec == bundle::EMBEDDED_SPEC
+        && let Some(bundle) = bundled
+    {
+        return Ok((ModelSource::Embedded(bundle), bundle.model.clone()));
+    }
+    let path = orangu::model_spec::resolve_or_fetch_model(models_dir, spec)
+        .with_context(|| format!("resolving model '{spec}'"))?;
+    Ok((ModelSource::File(path), spec.to_string()))
+}
+
 /// Resolves the config and model, builds the engine, and binds both
 /// listeners — all synchronously (no tokio runtime yet) and, when
 /// `--daemon` is set, all *before* [`daemonize`] detaches from the
@@ -501,24 +702,35 @@ fn prepare(args: Args) -> Result<Prepared> {
     let conf = load_config(args.config, cli_role, args.daemon)?;
     let mut role = conf.role;
     let workspace = resolve_workspace(args.workspace.clone())?;
+    let bundled = bundle::embedded();
 
-    let (path, model_label) = if args.daemon {
-        let spec = conf.model.clone().ok_or_else(|| {
-            anyhow!(
+    let (source, model_label) = if args.daemon {
+        // The positional argument first, then `[orangu-server].model`: a
+        // spec that was typed is not a spec to ignore, and a bundled
+        // `--daemon` start with neither would otherwise have no way to be
+        // pointed at a different model at all.
+        match (args.model.clone().or_else(|| conf.model.clone()), bundled) {
+            (Some(spec), _) => resolve_model_spec(&conf.models, &spec, bundled)?,
+            // A bundle answers the question `--daemon` otherwise has no way
+            // to answer: which model, with no terminal to ask on and no
+            // config file required to have been written.
+            (None, Some(bundle)) => (ModelSource::Embedded(bundle), bundle.model.clone()),
+            (None, None) => bail!(
                 "--daemon requires [{}].model to be set in the config file (see --init); \
                  there is no attached terminal to prompt on",
                 config::SERVER_SECTION
-            )
-        })?;
-        let path = orangu::model_spec::resolve_or_fetch_model(&conf.models, &spec)
-            .with_context(|| format!("resolving model '{spec}'"))?;
-        (path, spec)
+            ),
+        }
     } else {
         match args.model {
-            Some(spec) => {
-                let path = orangu::model_spec::resolve_or_fetch_model(&conf.models, &spec)
-                    .with_context(|| format!("resolving model '{spec}'"))?;
-                (path, spec)
+            Some(spec) => resolve_model_spec(&conf.models, &spec, bundled)?,
+            // A bundled binary serves what it carries. There is nothing to
+            // choose between — that is what was downloaded — so nothing is
+            // asked, which is what lets a bundle start on a double-click.
+            // Naming a model on the command line still overrides it, above.
+            None if bundled.is_some() => {
+                let bundle = bundled.expect("checked in the guard");
+                (ModelSource::Embedded(bundle), bundle.model.clone())
             }
             None => {
                 let selected = select_model_interactively(&conf.models, conf.model.as_deref())?;
@@ -546,21 +758,43 @@ fn prepare(args: Args) -> Result<Prepared> {
                     role = init::prompt_role("Role: ", default)?;
                     init::echo_answer("Role: ", role.label());
                 }
-                selected
+                let (path, label) = selected;
+                (ModelSource::File(path), label)
             }
         }
     };
 
-    let gguf = GgufFile::open(&path)?;
-    // Only when the label doesn't already name a tag itself (`-m
-    // user/model:Q4_K_M`), so the banner never reads `...:Q4_K_M:Q4_K_M`.
-    let quantization = (!label_carries_tag(&model_label))
-        .then(|| orangu::model_spec::quantization_for_file(&path, &gguf))
-        .flatten();
+    // A bundled server comes up in the role its bundle was built with,
+    // unless this run says otherwise — an explicit flag (handled by
+    // `load_config`, which never reaches here), or the config file's own
+    // `role` key, which a bundle-only start has as `Some(bundle.role)`
+    // anyway (`config::bundled_configuration`). A config file that names a
+    // role therefore still wins over the bundle, which is the right way
+    // round: one was written for this machine, the other was baked in
+    // wherever the bundle was made.
+    if let ModelSource::Embedded(bundle) = &source
+        && cli_role.is_none()
+    {
+        role = conf.role_key.unwrap_or(bundle.role);
+    }
+    let path = source.path().to_path_buf();
+
+    let gguf = source.gguf()?;
+    let quantization = match &source {
+        // Recorded when the bundle was made, from the file it was made from
+        // — the executable it now lives in says nothing about quantization,
+        // and there is no file name left to read one off.
+        ModelSource::Embedded(bundle) => bundle.quantization.clone(),
+        // Only when the label doesn't already name a tag itself (`-m
+        // user/model:Q4_K_M`), so the banner never reads `...:Q4_K_M:Q4_K_M`.
+        ModelSource::File(path) => (!label_carries_tag(&model_label))
+            .then(|| orangu::model_spec::quantization_for_file(path, &gguf))
+            .flatten(),
+    };
     let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
     let chat_template_source = metadata_string(&gguf, "tokenizer.chat_template");
 
-    let loaded = LoadedModel::open(&path).context("loading model weights")?;
+    let loaded = source.load().context("loading model weights")?;
     let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(conf.backend)?;
     // Captured here, while the concrete backend is still in hand, because the
     // `wgpu` engine is the only thing that knows which of its kernels feature
@@ -700,17 +934,34 @@ fn prepare(args: Args) -> Result<Prepared> {
     // released and nothing can take it in between. On an ordinary start
     // there is nothing to adopt and it binds.
     let inherited = reexec::inherited();
-    let bind_host = config::resolve_bind_host(&conf.host);
-    let api_addr = format!("{bind_host}:{}", conf.port);
+    // `--host`/`--port`/`--web` override whatever the config file (or, for a
+    // bundle, `config::bundled_configuration`) resolved to. Where to listen is
+    // the setting that is routinely per-*run* rather than per-machine — a
+    // second server alongside one already on 8100, a port a firewall happens
+    // to allow, a bundle that should be reachable from the LAN for one
+    // afternoon — and for a bundle there may be no config file to edit at all.
+    let host = args.listen.host.as_deref().unwrap_or(&conf.host);
+    // The console follows `--host` only when it was following the API's
+    // address anyway. A config that deliberately put it somewhere else keeps
+    // it there — see `ServerConfiguration::web_host_explicit`; exposing the
+    // API must never be a way to expose the console by accident.
+    let web_host = match conf.web_host_explicit {
+        true => conf.web_host.as_str(),
+        false => host,
+    };
+    let bind_host = config::resolve_bind_host(host);
+    let api_port = args.listen.port.unwrap_or(conf.port);
+    let web_port = args.listen.web.unwrap_or(conf.web);
+    let api_addr = format!("{bind_host}:{api_port}");
     let api_listener = reexec::adopt_or_bind(inherited.api, &api_addr)?;
     api_listener
         .set_nonblocking(true)
         .with_context(|| format!("failed to configure listener on {api_addr}"))?;
 
-    let web_listener = if conf.web != 0 {
+    let web_listener = if web_port != 0 {
         // `[web].host` when it names one, else the API's own — see
         // `ServerConfiguration::web_host`.
-        let web_addr = format!("{}:{}", config::resolve_bind_host(&conf.web_host), conf.web);
+        let web_addr = format!("{}:{web_port}", config::resolve_bind_host(web_host));
         let listener = reexec::adopt_or_bind(inherited.web, &web_addr)?;
         listener
             .set_nonblocking(true)
@@ -733,9 +984,18 @@ fn prepare(args: Args) -> Result<Prepared> {
         model_path: path,
         models_dir: conf.models,
         config_path,
+        listen_override: reexec::Listen {
+            host: args.listen.host.clone(),
+            api: args.listen.port,
+            web: args.listen.web,
+        },
         role,
         reexec: conf.reexec,
         delete: conf.delete,
+        bundle: match source {
+            ModelSource::Embedded(bundle) => Some(bundle),
+            ModelSource::File(_) => None,
+        },
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -825,9 +1085,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
         model_path,
         models_dir,
         config_path,
+        listen_override,
         role,
         reexec: reexec_allowed,
         delete: delete_allowed,
+        bundle,
         gpu_tuning,
         gpu_tuning_summary,
         wgpu_backend,
@@ -892,6 +1154,17 @@ async fn serve(prepared: Prepared) -> Result<()> {
         if let Some(summary) = &gpu_tuning_summary {
             println!("Kernels    {summary}");
         }
+        // Where the weights came from, when the answer isn't a file somebody
+        // can point at: this binary is the model. Worth a line of its own —
+        // it explains both why no models directory was needed and why the
+        // executable is the size it is.
+        if let Some(bundle) = bundle {
+            println!(
+                "Bundled    {} embedded in {}",
+                orangu::format::format_bytes(bundle.bytes),
+                bundle.exe.display()
+            );
+        }
         match &web_listener {
             Some(l) => println!("UI         http://{}", l.local_addr()?),
             None => println!("UI         disabled"),
@@ -919,9 +1192,20 @@ async fn serve(prepared: Prepared) -> Result<()> {
             .then(|| {
                 reexec::Handover::new(
                     config_path,
+                    listen_override.clone(),
                     workspace.clone(),
                     role,
-                    model_label.clone(),
+                    // The spec this process would be started with again. For
+                    // an embedded model that is the reserved
+                    // `bundle::EMBEDDED_SPEC`, not its label: the label names
+                    // a Hugging Face repo, and a fallback that went to the
+                    // network for a model already inside the file it is
+                    // falling back into would fail exactly when the network
+                    // is what's missing.
+                    match bundle {
+                        Some(_) => bundle::EMBEDDED_SPEC.to_string(),
+                        None => model_label.clone(),
+                    },
                     reexec::InheritedFds {
                         api: Some(listener_fd(&listener)),
                         web: Some(listener_fd(&web_listener)),
@@ -951,6 +1235,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             catalog: Default::default(),
             handover,
             can_delete: delete_allowed,
+            bundled: bundle.is_some(),
             loading: Default::default(),
         });
         let web_app = web::build_router(web_state);
@@ -993,18 +1278,56 @@ async fn serve(prepared: Prepared) -> Result<()> {
     Ok(())
 }
 
+/// The configuration for this run: the file `--config` names, else the one
+/// the default search finds, else — **only for a bundled binary** — the
+/// built-in answers [`config::bundled_configuration`] holds.
+///
+/// That last case is the whole point of a bundle. An ordinary
+/// `orangu-server` has nothing to serve and nowhere to look for one without
+/// being told, so a missing config file is a plain error and always has
+/// been; a bundled one is carrying its model, and needs a config file for
+/// nothing but the things it already has defaults for.
 fn load_config(
     explicit: Option<PathBuf>,
     cli_role: Option<config::Role>,
     daemon: bool,
 ) -> Result<ServerConfiguration> {
-    let path = explicit.or_else(default_server_config_path).ok_or_else(|| {
-        anyhow!(
-            "Missing config file; pass --config or add ./orangu-server.conf or ~/.orangu/orangu-server.conf (see --init)"
-        )
-    })?;
+    let path = match explicit.or_else(default_server_config_path) {
+        Some(path) => path,
+        None => {
+            let bundle = bundle::embedded().ok_or_else(|| {
+                anyhow!(
+                    "Missing config file; pass --config or add ./orangu-server.conf or ~/.orangu/orangu-server.conf (see --init)"
+                )
+            })?;
+            return Ok(config::bundled_configuration(
+                default_models_dir(),
+                cli_role.unwrap_or(bundle.role),
+                &bundle.listen,
+            ));
+        }
+    };
     load_server_configuration(&path, cli_role, daemon)
         .with_context(|| format!("loading {}", path.display()))
+}
+
+/// Where models live for a run with no config file to say: the Hugging Face
+/// hub cache, the same directory `--init` offers first and the one a
+/// `huggingface-cli`/`llama.cpp` download already went to. `./models` only
+/// when there is no home directory to hang it off, which is a broken
+/// environment rather than a supported layout — an empty listing there is
+/// still a better answer than refusing to start.
+fn default_models_dir() -> PathBuf {
+    init::huggingface_cache_dir().unwrap_or_else(|| PathBuf::from("models"))
+}
+
+/// `[orangu-server].models` when a config file can be found and read, and
+/// [`default_models_dir`] otherwise — for `bundle`, which needs somewhere to
+/// resolve and fetch a model spec but no configuration of its own.
+fn models_dir_or_default(config_arg: Option<PathBuf>) -> PathBuf {
+    load_config(config_arg, None, false)
+        .map(|conf| conf.models)
+        .unwrap_or_else(|_| default_models_dir())
 }
 
 fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
@@ -1068,7 +1391,12 @@ pub(crate) fn model_support(
 /// serving path uses, via the same [`load_config`] — `cli_role`/`daemon` are
 /// passed as `None`/`false` since neither matters to a subcommand that never
 /// serves anything.
-fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
+fn run_command(
+    config_arg: Option<PathBuf>,
+    cli_role: Option<config::Role>,
+    cli_listen: &ListenFlags,
+    command: Command,
+) -> Result<()> {
     match command {
         Command::System => {
             let mut os = orangu::os::detect();
@@ -1174,6 +1502,33 @@ fn run_command(config_arg: Option<PathBuf>, command: Command) -> Result<()> {
             let conf = load_config(config_arg, None, false)?;
             refresh::run(&conf.models, model, yes)
         }
+        Command::Bundle {
+            model,
+            output,
+            binary,
+            yes,
+            roles,
+            listen,
+        } => bundle::run(bundle::Request {
+            // Unlike every other subcommand, a missing config file is not an
+            // error here: `bundle` exists to produce a server for a machine
+            // that has none, and is quite reasonably run on one. The models
+            // directory is only where a spec is resolved and downloaded, and
+            // the default download location is a fine answer for that.
+            models_dir: models_dir_or_default(config_arg),
+            model,
+            // After the subcommand first, since that is where it reads most
+            // naturally (`bundle <model> --code`); before it still works, so
+            // a habit formed on the serving flags carries over.
+            role: roles.role().or(cli_role),
+            // Same precedence as the role: after the subcommand first, then
+            // before it — so `bundle --host all` and `--host all bundle`
+            // both bake the address in.
+            listen: listen.or(cli_listen).bundled(),
+            output,
+            binary,
+            yes,
+        }),
         Command::Prune { identifier, yes } => prune::run(identifier, yes),
     }
 }
@@ -1662,6 +2017,15 @@ mod tests {
             Command::Refresh {
                 model: None,
                 yes: false,
+            }
+            .mode(),
+            Command::Bundle {
+                model: None,
+                output: None,
+                binary: None,
+                yes: false,
+                roles: Default::default(),
+                listen: Default::default(),
             }
             .mode(),
             Command::Prune {

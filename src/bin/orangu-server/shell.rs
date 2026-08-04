@@ -15,7 +15,8 @@
 
 //! Hand-written shell completion scripts, mirroring `orangu`'s own
 //! `-s`/`--shell-completions` (`src/bin/orangu/shell.rs`): the positional
-//! `model` argument (and `show`'s/`delete`'s/`refresh`'s own arguments) are
+//! `model` argument (and `show`'s/`delete`'s/`refresh`'s/`bundle`'s own
+//! arguments) are
 //! completed by shelling back out to `orangu-server list` itself and reading
 //! its first two columns (NR and MODEL). This only ever depends on
 //! `orangu-server` itself being on `$PATH` — no clap-generated completion
@@ -40,7 +41,7 @@ pub const BASH: &str = r#"# bash completion for orangu-server
 #   orangu-server -s > ~/.local/share/bash-completion/completions/orangu-server
 
 # Completes the positional MODEL argument (and `show`'s/`delete`'s/
-# `refresh`'s own arguments) with every NR and MODEL from
+# `refresh`'s/`bundle`'s own arguments) with every NR and MODEL from
 # `orangu-server list`'s output.
 _orangu_server_models() {
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
@@ -73,8 +74,13 @@ _orangu_server() {
         return 0
     fi
 
+    if [[ "$prev" == "bundle" ]]; then
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
+        return 0
+    fi
+
     case "$prev" in
-        -c|--config)
+        -c|--config|-o|--output|--binary)
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -84,17 +90,24 @@ _orangu_server() {
             compopt -o filenames 2>/dev/null
             return 0
             ;;
+        --host)
+            COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
+            return 0
+            ;;
+        -p|--port|--web)
+            return 0
+            ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -w --workspace -i --init -s --shell-completions -d --daemon \
-             --all --code --review --explorer --embedding -y --yes -h --help -V --version" -- "$cur") )
+            "-c --config -w --workspace --host -p --port --web -i --init -s --shell-completions -d --daemon \
+             --all --code --review --explorer --embedding -o --output --binary -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete refresh prune help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete refresh bundle prune help" -- "$cur") )
         return 0
     fi
 }
@@ -113,7 +126,7 @@ pub const ZSH: &str = r#"#compdef orangu-server
 #   # ~/.zshrc: fpath=(~/.zsh/completions $fpath) && autoload -Uz compinit && compinit
 
 # Completes the positional MODEL argument (and `show`'s/`delete`'s/
-# `refresh`'s own arguments) with every NR and MODEL from
+# `refresh`'s/`bundle`'s own arguments) with every NR and MODEL from
 # `orangu-server list`'s output.
 _orangu_server_models() {
     local -a candidates
@@ -140,6 +153,7 @@ _orangu_server_commands() {
         'download[Download a GGUF model from Hugging Face]' \
         'delete[Delete a GGUF model from disk]' \
         'refresh[Delete a GGUF model and download it again]' \
+        'bundle[Write a self-contained executable carrying the server and a model]' \
         'prune[Delete chat sessions]' \
         'help[Print this message or the help of the given subcommand(s)]'
 }
@@ -150,6 +164,9 @@ _orangu_server() {
     _arguments -C \
         '(-c --config)'{-c,--config}'[Path to the configuration file (orangu-server.conf)]:config file:_files' \
         '(-w --workspace)'{-w,--workspace}'[Root directory the server operates in (default: the current directory)]:workspace:_files -/' \
+        '--host[Address to bind: all, 0.0.0.0, or a literal address (overrides the config file)]:host:(all 0.0.0.0 127.0.0.1)' \
+        '(-p --port)'{-p,--port}'[Port the HTTP API listens on (overrides the config file)]:port:' \
+        '--web[Port the web console listens on, 0 to disable it (overrides the config file)]:port:' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-d --daemon)'{-d,--daemon}'[Run in the background, detached from the terminal]' \
@@ -158,7 +175,9 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding)--review[Code review role]' \
         '(--all --code --review --explorer --embedding)--explorer[Exploration role]' \
         '(--all --code --review --explorer --embedding)--embedding[Embeddings-only role]' \
-        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/refresh'"'"'s confirmation prompt]' \
+        '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
+        '--binary[The executable bundle embeds the model into]:binary:_files' \
+        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/refresh'"'"'s/bundle'"'"'s confirmation prompt]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
         '1: :->command' \
@@ -172,7 +191,7 @@ _orangu_server() {
                 'commands:command:_orangu_server_commands'
             ;;
         arg)
-            [[ ${line[1]} == show || ${line[1]} == delete || ${line[1]} == refresh ]] && _orangu_server_models
+            [[ ${line[1]} == show || ${line[1]} == delete || ${line[1]} == refresh || ${line[1]} == bundle ]] && _orangu_server_models
             [[ ${line[1]} == prune ]] && _orangu_server_sessions
             ;;
     esac
@@ -190,7 +209,7 @@ pub const FISH: &str = r#"# fish completion for orangu-server
 #   orangu-server -s > ~/.config/fish/completions/orangu-server.fish
 
 # Completes the positional MODEL argument (and `show`'s/`delete`'s/
-# `refresh`'s own arguments) with every NR and MODEL from
+# `refresh`'s/`bundle`'s own arguments) with every NR and MODEL from
 # `orangu-server list`'s output.
 function __orangu_server_models
     orangu-server list 2>/dev/null | awk 'NR>1 {print $1; print $2}'
@@ -213,15 +232,20 @@ complete -c orangu-server -n '__fish_use_subcommand' -a show     -d 'Print a GGU
 complete -c orangu-server -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
 complete -c orangu-server -n '__fish_use_subcommand' -a delete   -d 'Delete a GGUF model from disk'
 complete -c orangu-server -n '__fish_use_subcommand' -a refresh  -d 'Delete a GGUF model and download it again'
+complete -c orangu-server -n '__fish_use_subcommand' -a bundle   -d 'Write a self-contained executable carrying the server and a model'
 complete -c orangu-server -n '__fish_use_subcommand' -a prune    -d 'Delete chat sessions'
 complete -c orangu-server -n '__fish_use_subcommand' -a help     -d 'Print this message or the help of the given subcommand(s)'
 complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from refresh' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from bundle' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from prune' -a '(__orangu_server_sessions)'
 
 complete -c orangu-server -s c -l config              -r -d 'Path to the configuration file (orangu-server.conf)'
 complete -c orangu-server -s w -l workspace -x -a '(__fish_complete_directories)' -d 'Root directory the server operates in (default: the current directory)'
+complete -c orangu-server      -l host                -x -a 'all 0.0.0.0 127.0.0.1' -d 'Address to bind (overrides the config file)'
+complete -c orangu-server -s p -l port                -x -d 'Port the HTTP API listens on (overrides the config file)'
+complete -c orangu-server      -l web                 -x -d 'Port the web console listens on, 0 to disable it (overrides the config file)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
 complete -c orangu-server -s s -l shell-completions       -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-server -s d -l daemon                  -d 'Run in the background, detached from the terminal'
@@ -230,7 +254,9 @@ complete -c orangu-server      -l code                    -d 'Coding role'
 complete -c orangu-server      -l review                  -d 'Code review role'
 complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
-complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/refresh\'s confirmation prompt'
+complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
+complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
+complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/refresh\'s/bundle\'s confirmation prompt'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
 "#;

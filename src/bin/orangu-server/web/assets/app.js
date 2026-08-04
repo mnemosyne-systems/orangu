@@ -1135,8 +1135,15 @@
     detail.className = "models-subtle";
     detail.textContent =
       `${current.architecture} · ${current.backend} · ${current.n_layer} layers · ` +
-      `${current.n_ctx} ctx · ${current.role} · ${current.slots} slot(s)`;
-    detail.title = current.path;
+      `${current.n_ctx} ctx · ${current.role} · ${current.slots} slot(s)` +
+      // A bundled server's model is inside the executable rather than in the
+      // directory below, so it has no row to be marked "loaded" on and no
+      // Delete button anywhere — which needs saying, or the listing reads as
+      // if none of these models were serving anything.
+      (current.bundled ? " · bundled" : "");
+    detail.title = current.bundled
+      ? `embedded in ${current.path}`
+      : current.path;
     modelsCurrentEl.append(name, detail);
     if (loading) {
       const notice = document.createElement("div");

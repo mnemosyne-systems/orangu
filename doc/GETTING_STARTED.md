@@ -9,6 +9,15 @@ Run a local `orangu-server` instance; it serves an OpenAI-compatible endpoint
 orangu-server --all /path/to/model.gguf
 ```
 
+Or take the server and a model as one self-contained executable — no models
+directory and no `orangu-server.conf`, listening on `127.0.0.1:8100` with the
+web console on `127.0.0.1:8200`:
+
+```sh
+orangu-server bundle unsloth/gemma-4-E2B-it-GGUF:Q4_K_M --all -y
+./orangu-server-bundle-x86_64
+```
+
 ## 2. Create a client configuration
 
 The quickest way is the interactive wizard, which asks for the LLM URL,

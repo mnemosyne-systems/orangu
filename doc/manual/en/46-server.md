@@ -27,6 +27,10 @@ exists for each Hugging Face-backed model already on disk (see **`list` and
 `show`** below). If the Hub is unreachable, `list` still prints the table;
 it just skips the check silently rather than failing the command.
 
+One further subcommand is neither serving nor inventory: `bundle` writes a
+single executable carrying both this server and a model, which then runs with
+no models directory and no configuration file at all. See **Bundling** below.
+
 ## Quick start
 
 ```sh
@@ -490,6 +494,223 @@ didn't come from Hugging Face has no repo to refresh from; naming one is an
 error, raised before anything is deleted. Confirmation and `-y`/`--yes` work
 exactly as in `delete`.
 
+## Bundling: the server and a model as one file
+
+```sh
+orangu-server bundle unsloth/gemma-4-E2B-it-GGUF:Q4_K_M --all -y
+```
+
+```
+Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (2.89 GiB)
+Role       all
+Binary     /usr/local/bin/orangu-server (57.10 MiB, x86_64)
+Output     ./orangu-server-bundle-x86_64 (2.95 GiB)
+Wrote ./orangu-server-bundle-x86_64 (2.95 GiB)
+```
+
+`bundle` writes a **new executable** carrying both this server and the model
+it should serve. Running it needs nothing else — no models directory, no
+download step, and no `orangu-server.conf`:
+
+```sh
+chmod +x orangu-server-bundle-x86_64
+./orangu-server-bundle-x86_64
+```
+
+```
+Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, CPU/AVX2, 30 layers, 32768 ctx)
+Bundled    2.89 GiB embedded in /home/you/orangu-server-bundle-x86_64
+UI         http://127.0.0.1:8200
+API        http://127.0.0.1:8100
+Workspace  /home/you
+```
+
+One file to copy to a machine, and a working OpenAI-compatible server on it.
+The model is *inside* the binary — not downloaded on first run, not extracted
+to a cache directory, not referenced from one — so the binary is as large as
+the model, and copying it copies everything.
+
+### Choosing the model and the role
+
+Both come from the command line, or from the same prompts an ordinary
+interactive `orangu-server` start uses:
+
+```sh
+orangu-server bundle                                    # prompts for model, then role
+orangu-server bundle 3 --code                           # NR from `list`, coding role
+orangu-server bundle ./my-model.gguf -o ./my-server     # a local file, a chosen output name
+orangu-server bundle unsloth/gemma-4-E2B-it-GGUF:Q4_K_M # a repo, fetched first if not cached
+```
+
+With no model argument, `bundle` prints the same table `list` does and
+prompts for one, with `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` ghosted as the
+answer an empty line takes. Unlike the serving picker, an empty (or missing)
+`models` directory is not an error: nothing has to be installed to bundle,
+since the answer is a spec and a spec that names a Hugging Face repo is
+fetched.
+
+The role prompt follows, exactly as at startup, unless
+`--all`/`--code`/`--review`/`--explorer`/`--embedding` was passed. Those work
+both after the subcommand (`bundle <model> --code`) and before it
+(`--code bundle <model>`). `-y`/`--yes` skips the role prompt as well as the
+confirmation, taking `all`. The role travels *with* the bundle: a `--code`
+bundle comes up in the coding role wherever it's run, with no flag needed.
+
+`-o`/`--output` chooses where to write; the default is
+`./orangu-server-bundle-<arch>`, never the running binary's own name, so a
+`bundle` run in a directory holding one can't overwrite it. `--binary` names a
+*different* executable to bundle into — a build for another platform, which
+can't be run here to bundle itself.
+
+### Baking in the address
+
+`bundle` takes `--host`, `--port` and `--web` too, and records them *in* the
+bundle — exactly as it records the role. A bundle is started without a config
+file, so where it listens has to be decidable when it is built, not only when
+it is run:
+
+```sh
+orangu-server bundle <model> --all --host all -y   # LAN-reachable wherever it lands
+orangu-server --host all bundle <model> --all -y   # the same, before the subcommand
+orangu-server bundle <model> --all --web 0 -y      # API only, no web console
+```
+
+```
+Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (2.89 GiB)
+Role       all
+Listen     API all:8100, console all:8200
+```
+
+The `Listen` line spells out in full what the bundle will be reachable on,
+defaults included. Without any of these flags a bundle keeps the built-in
+`127.0.0.1:8100` and `127.0.0.1:8200`.
+
+The address is checked at build time rather than left for the target machine's
+`bind` to reject: `--host` accepts `all`, `*`, or a literal IP address, and a
+hostname or a typo is an error while there is still somebody to tell. Whatever
+is baked in is a *default*, not a lock — the same `--host`/`--port`/`--web`
+flags at run time still override it, and so does a config file.
+
+### The architecture is in the name
+
+The default output is `orangu-server-bundle-x86_64`,
+`orangu-server-bundle-aarch64`, `orangu-server-bundle-x86_64.exe`, and so on.
+A bundle is a file that gets copied around, and its one hard requirement is a
+machine that can run it, so a directory holding bundles for three platforms has
+to stay readable; three files called `orangu-server-bundle` would not be. It
+also stops a cross-bundling run from writing over the bundle it made a moment
+ago for a different target.
+
+The architecture is read out of the **binary being bundled**, not taken from
+the machine doing the bundling — ELF's `e_machine`, Mach-O's `cputype` (a
+universal binary is named `universal`), or PE's `Machine`, which also decides
+the `.exe` suffix. That is what makes `--binary` work: cross-bundling an
+`aarch64` build on an `x86_64` host produces `orangu-server-bundle-aarch64`,
+not a mislabelled `x86_64`. `bundle` prints the detected architecture on its
+`Binary` line, so a wrong reading is visible before anything is written. An
+executable format it doesn't recognize falls back to this machine's own
+architecture rather than refusing to bundle.
+
+### What a bundled server does differently
+
+Only what it has to:
+
+- **No config file is required.** With none found, a bundled server uses the
+  address it was bundled with — `127.0.0.1:8100` for the API and
+  `127.0.0.1:8200` for the web console unless `bundle` was given
+  `--host`/`--port`/`--web` — plus the Hugging Face hub cache as its `models`
+  directory, and the role the bundle was built with. Loopback rather than the usual `all`: a binary somebody
+  downloaded and ran should not put itself on every interface of a network
+  it knows nothing about. An `orangu-server.conf` that *is* found is used in
+  full, exactly as for any other server — including `host = all` to opt back
+  in.
+- **It serves its own model without asking.** There is nothing to choose
+  between, so no model prompt and no role prompt appear. Naming a model on
+  the command line still overrides it
+  (`./orangu-server-bundle-x86_64 ./other.gguf`), and `--daemon` works with no
+  `[orangu-server].model` key, since the bundle answers the question that
+  key exists for.
+- **The embedded model can't be deleted.** It isn't a file in the models
+  directory, so it has no row in the web console's model manager and no
+  Delete button anywhere; the console marks the header `bundled` instead of
+  leaving an unexplained gap. Removing it means removing the binary.
+- **Loading a different model still works.** The console's **Load** button
+  re-executes the bundle with another model, as always; if that model fails
+  to load, the fallback comes back to the embedded one rather than going to
+  the network for it.
+
+Everything else — endpoints, roles, backends, the web console, sessions — is
+the same server, because it *is* the same binary with bytes after it.
+
+### Overriding the address and ports
+
+`--host`, `--port` and `--web` override whatever the config file (or, for a
+bundle, the built-in defaults) resolved to:
+
+```sh
+./orangu-server-bundle-x86_64 --host all              # every interface, not just loopback
+./orangu-server-bundle-x86_64 --host 0.0.0.0          # the same thing, spelled out
+./orangu-server-bundle-x86_64 --port 9100 --web 9300  # both listeners moved
+./orangu-server-bundle-x86_64 --web 0                 # web console off
+```
+
+`--host` takes `all` (or `*`) for every network interface, or a literal
+address — the same values `[orangu-server].host` accepts. It is how a bundle
+that was not built with an address of its own gets exposed to the network for
+one run, without writing a config file for it; to make that a bundle's
+*default*, pass the same flags to `bundle` itself (see **Baking in the
+address** above).
+
+It moves the **web console with the API**, since the two share an address
+unless something says otherwise. The one exception is a config file that set
+`[web].host` explicitly: that address stands, so an API deliberately separated
+from the console cannot be exposed in a way that quietly exposes the console
+too. Use `--web 0` to turn the console off entirely when only the API should be
+reachable.
+
+Where to listen is the setting that is routinely per-*run* rather than
+per-machine — a second server alongside one already on 8100, a port a firewall
+happens to allow, a bundle that should be reachable from the LAN for one
+afternoon — and a bundle may have no config file to edit. All three flags apply
+to an ordinary `orangu-server` too.
+
+### How it works
+
+The bundle is the server's program image, byte for byte, with the model's
+`.gguf` bytes appended after it and a manifest and 32-byte footer after
+those:
+
+```text
+[ program image      ]  unchanged — the OS loader reads this and stops
+[ padding to 4 KiB   ]
+[ shard 1 .gguf      ]  and further shards for a split model
+[ manifest (JSON)    ]  model, quantization, role, where each shard landed
+[ manifest offset+len, magic ]
+```
+
+Appending to an executable leaves it runnable: the loader reads the program
+headers at the front and never looks past what they describe. At startup the
+server seeks to the last 32 bytes of its own file, and either finds the magic
+— in which case the model is memory-mapped straight out of the executable,
+with no copy and no unpacking — or doesn't, in which case it is an ordinary
+`orangu-server`. Shards start on a 4 KiB boundary, so a bundled model's
+tensor data is aligned exactly as it would be in a file of its own.
+
+Because the manifest records where the program image ends, a bundle can be
+bundled again: `./orangu-server-bundle-x86_64 bundle <other-model>` replaces the
+model rather than stacking a second one behind the first.
+
+On macOS the copied program image is re-signed ad-hoc (`codesign --force
+--sign -`) *before* the model is appended to it — `codesign` writes the new
+signature at the end of the image it is given, so signing afterwards would
+write it straight over the payload. Signing first leaves the model outside
+the signed range, where the kernel never looks. If `codesign` isn't
+available, `bundle` says so and names the command to run — without it macOS
+kills the bundle on sight.
+
+Releases ship the ordinary `orangu-server`, which includes `bundle`; the
+bundles themselves are built locally, from whichever model suits the machine.
+
 ## Configuration
 
 `orangu-server.conf`:
@@ -521,8 +742,10 @@ reexec = yes
 - `model` — a model spec, the same shape as the CLI's positional argument
   (a local `.gguf` path, an `NR`/`MODEL` label, or a `<user>/<model>
   [:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
-  terminal to prompt on. An attached run still takes its model from the CLI
-  argument when one is given; when none is, the interactive picker
+  terminal to prompt on — unless the binary is a bundle, which carries its
+  own model and so needs no key to name one. A `--daemon` run that *is* given
+  a positional model argument uses that instead of this key. An attached run
+  still takes its model from the CLI argument when one is given; when none is, the interactive picker
   **pre-selects this one** — its `NR` is shown as the prompt's default and
   ghosted on the empty line, so a config that already names a model is one
   Enter away rather than a row to find. Type a different `NR` (or a label,
@@ -546,7 +769,11 @@ reexec = yes
   just that one. `-i`/`--init` prompts for it with TAB-completion (and an
   inline grey ghost suggestion) over `all`, `*`, and every address this
   machine's interfaces actually have, each shown with the interface it
-  belongs to.
+  belongs to. `--host` on the command line overrides this for one run
+  (`--host all` exposes a server a config keeps on loopback, and moves
+  `[web].host` with it unless that key was set explicitly), `-p`/`--port`
+  overrides `port`, and `--web` overrides `[web].port` — see **Overriding the
+  address and ports** above.
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.

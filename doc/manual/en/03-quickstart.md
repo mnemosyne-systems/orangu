@@ -48,6 +48,18 @@ http://localhost:8100/v1
 See the *Inference server* chapter for host/port configuration, GPU backend
 selection, and the model-inventory subcommands.
 
+To move a working server to another machine without repeating any of this,
+bundle it and its model into one executable:
+
+```sh
+orangu-server bundle unsloth/gemma-4-E2B-it-GGUF:Q4_K_M --all -y
+```
+
+Copy the resulting `orangu-server-bundle-<arch>` over, `chmod +x` it, and run it: no
+models directory, no download, and no `orangu-server.conf` — the API comes up
+on `127.0.0.1:8100` and the web console on `127.0.0.1:8200`. See *Bundling* in
+the *Inference server* chapter.
+
 ## Create a configuration
 
 The fastest path is the interactive wizard, which auto-detects a model from the

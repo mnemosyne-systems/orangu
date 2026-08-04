@@ -28,7 +28,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -158,8 +158,28 @@ pub struct GgufFile {
 
 impl GgufFile {
     pub fn open(path: &Path) -> Result<GgufFile> {
-        let file =
+        Self::open_at(path, 0)
+    }
+
+    /// Reads the GGUF structure that begins `offset` bytes into `path`.
+    ///
+    /// `0` — [`open`](Self::open) — is the ordinary case: a `.gguf` file
+    /// whose model starts where the file does. A non-zero offset is what a
+    /// bundled `orangu-server` needs (`bundle::Bundle`): there the model is
+    /// appended to the executable, so every structure the format defines sits
+    /// at its usual place *relative to the segment*, not to the start of the
+    /// file it happens to be carried in.
+    ///
+    /// [`data_offset`](Self::data_offset) stays relative to the segment for
+    /// the same reason it is relative to the file here: the caller that knows
+    /// where the segment starts is the one that adds `offset` back.
+    pub fn open_at(path: &Path, offset: u64) -> Result<GgufFile> {
+        let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        if offset != 0 {
+            file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("failed to seek to {offset} in {}", path.display()))?;
+        }
         Self::read(BufReader::new(file))
             .with_context(|| format!("failed to parse GGUF file {}", path.display()))
     }

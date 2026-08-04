@@ -130,8 +130,11 @@ pub fn run_init() -> Result<()> {
 /// same directory llama.cpp's own `-hf` falls back to when
 /// `LLAMA_CACHE`/`HF_HUB_CACHE`/etc. aren't set. Offered as `--init`'s
 /// default `models` value so pointing `orangu-server` at whatever's likely
-/// already there is just pressing Enter.
-fn huggingface_cache_dir() -> Option<PathBuf> {
+/// already there is just pressing Enter — and taken outright, for the same
+/// reason, as the models directory of a bundled server started with no
+/// config file (`config::bundled_configuration`) and of a `bundle` run that
+/// has no config file to read one from.
+pub(crate) fn huggingface_cache_dir() -> Option<PathBuf> {
     Some(
         home::home_dir()?
             .join(".cache")

@@ -203,6 +203,12 @@ pub struct WebState {
     /// Models only. History's own delete controls are unconditional — see
     /// [`delete_session`]/[`clear_sessions`].
     pub can_delete: bool,
+    /// Whether the served model is embedded in this executable (see
+    /// `crate::bundle`). It has no row in the model manager's listing and no
+    /// Delete button: a bundled model cannot be removed from a running
+    /// server — only the whole binary can be. `models::CurrentView` reports
+    /// it so the panel can say that rather than leave an unexplained gap.
+    pub bundled: bool,
     /// The model a handover has been accepted for, once one has — see
     /// `models::select`. Only ever goes from empty to set: this process is
     /// about to be replaced, so there is nothing to reset it back to.
