@@ -1604,7 +1604,21 @@ mod tests {
     }
 
     fn argv(spec: &RunSpec) -> Vec<String> {
-        build_argv(spec, FsPath::new("/runs/1")).expect("builds")
+        build_argv(spec, RUN_DIR.as_ref()).expect("builds")
+    }
+
+    const RUN_DIR: &str = "/runs/1";
+
+    /// `--bundle <run dir>/bundle.json`, spelled with **this platform's**
+    /// separator.
+    ///
+    /// The paths are built by `Path::join`, which writes `\` on Windows —
+    /// so an assertion containing a hard-coded `/` passes everywhere the
+    /// developer looked and fails in CI on one platform, describing a defect
+    /// that is not there. Building the expectation the same way the code does
+    /// keeps the test about *what goes where* rather than about separators.
+    fn flag(name: &str, file: &str) -> String {
+        format!("{name} {}", FsPath::new(RUN_DIR).join(file).display())
     }
 
     #[test]
@@ -1617,7 +1631,10 @@ mod tests {
         assert!(joined.contains("--gen 128"), "{joined}");
         assert!(joined.contains("--reps 3"), "{joined}");
         // Always, because the summary table is read back out of it.
-        assert!(joined.contains("--bundle /runs/1/bundle.json"), "{joined}");
+        assert!(
+            joined.contains(&flag("--bundle", "bundle.json")),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -1657,13 +1674,13 @@ mod tests {
         s.flamegraph = true;
         let joined = argv(&s).join(" ");
         assert!(
-            joined.contains("--flamegraph /runs/1/flamegraph.svg"),
+            joined.contains(&flag("--flamegraph", "flamegraph.svg")),
             "{joined}"
         );
         assert!(joined.contains("--flamegraph-png"), "{joined}");
         assert!(joined.contains("--flamegraph-call-graph fp"), "{joined}");
         // The chart is on by default and gets the same treatment.
-        assert!(joined.contains("--chart /runs/1/chart.svg"), "{joined}");
+        assert!(joined.contains(&flag("--chart", "chart.svg")), "{joined}");
         assert!(joined.contains("--chart-png"), "{joined}");
     }
 
@@ -1683,7 +1700,7 @@ mod tests {
         // run is started, with the parser's own reason.
         let mut s = spec();
         s.points = "128-4096".to_string();
-        let err = build_argv(&s, FsPath::new("/runs/1")).expect_err("capped");
+        let err = build_argv(&s, RUN_DIR.as_ref()).expect_err("capped");
         assert!(err.to_string().contains("more than"), "{err}");
     }
 
@@ -1699,19 +1716,19 @@ mod tests {
     fn a_bad_spec_is_refused_before_anything_runs() {
         let mut s = spec();
         s.url = "file:///etc/passwd".to_string();
-        assert!(build_argv(&s, FsPath::new("/runs/1")).is_err());
+        assert!(build_argv(&s, RUN_DIR.as_ref()).is_err());
 
         let mut s = spec();
         s.mode = "rm -rf".to_string();
-        assert!(build_argv(&s, FsPath::new("/runs/1")).is_err());
+        assert!(build_argv(&s, RUN_DIR.as_ref()).is_err());
 
         let mut s = spec();
         s.points = "512; rm -rf /".to_string();
-        assert!(build_argv(&s, FsPath::new("/runs/1")).is_err());
+        assert!(build_argv(&s, RUN_DIR.as_ref()).is_err());
 
         let mut s = spec();
         s.points = " ".to_string();
-        assert!(build_argv(&s, FsPath::new("/runs/1")).is_err());
+        assert!(build_argv(&s, RUN_DIR.as_ref()).is_err());
     }
 
     #[test]
@@ -1774,7 +1791,7 @@ mod tests {
             s.reps = preset.reps;
             s.bucket = preset.bucket;
             s.pp_continue_base = preset.pp_continue_base;
-            let argv = build_argv(&s, FsPath::new("/runs/1"))
+            let argv = build_argv(&s, RUN_DIR.as_ref())
                 .unwrap_or_else(|e| panic!("{mode} preset does not run: {e}"));
             // A scaling test is a sweep, so it has to leave more than the one
             // point the bare defaults measure.
