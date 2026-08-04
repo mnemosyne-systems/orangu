@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>orangu-bench</title>
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  // Applied before first paint so a saved preference doesn't flash the
+  // wrong theme for a frame — the rest of the toggle lives in app.js.
+  // Shared key with orangu-server's console: the two are one product, and
+  // a developer running both on the same machine sets the theme once.
+  (() => {
+    const saved = localStorage.getItem("orangu-theme");
+    if (saved) document.documentElement.setAttribute("data-theme", saved);
+  })();
+</script>
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div id="brand">orangu-bench</div>
+    <!-- The server under test, once there is one. Empty until then: the brand
+         beside it already says what this is. -->
+    <div id="target"></div>
+    <div id="topbar-actions">
+      <button id="new-run-btn" class="icon-btn" type="button" aria-label="New run" title="New run">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </button>
+      <button id="history-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="Past runs" title="Past runs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/></svg>
+      </button>
+      <button id="theme-toggle-btn" class="icon-btn" type="button" aria-label="Switch to light mode" title="Switch to light mode"></button>
+    </div>
+  </header>
+
+  <!-- Past runs. Every run this console has ever started, newest first,
+       read back off disk — so a result outlives the console process that
+       produced it. #history-list is the part that scrolls; the footer below
+       it stays put, so Clear all is reachable without scrolling to the oldest
+       run first. It starts hidden only because an empty list has nothing to
+       clear. -->
+  <nav id="history-panel" hidden>
+    <div id="history-list"></div>
+    <div id="history-footer" hidden>
+      <button id="history-clear-btn" type="button">Clear all</button>
+    </div>
+  </nav>
+
+  <div id="body">
+    <!-- Left: the run definition. Everything here is typed or chosen; the
+         console builds the command line, never the browser. -->
+    <aside id="panel">
+      <form id="run-form">
+        <h2>Define a run</h2>
+
+        <label class="field">
+          <span>Server URL</span>
+          <input id="f-url" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8100">
+        </label>
+
+        <label class="field">
+          <span>Measurement</span>
+          <select id="f-mode">
+            <option value="tg">Decode — tok/s by context depth</option>
+            <option value="pp">Prefill — prompt processing tok/s</option>
+            <option value="pg">Combined — prefill + decode in one turn</option>
+            <option value="pp-continue">Continuation prefill — added tokens</option>
+            <option value="curve">Decode curve — one pass, bucketed</option>
+            <option value="streams">Concurrency — aggregate tok/s</option>
+            <option value="embed">Embeddings — forward-pass tok/s</option>
+            <option value="decode-cpu">Decode CPU — server ms per token</option>
+          </select>
+        </label>
+        <p id="mode-help" class="help"></p>
+
+        <!-- The scaling test for the measurement above: a ready-made sweep,
+             named by the range it covers. "None" is the default and leaves
+             every field below free — a one-off measurement, or an A/B against
+             one hand-picked depth, is not a scaling test. -->
+        <label class="field">
+          <span>Scaling test</span>
+          <select id="f-preset">
+            <option value="">None — choose the points yourself</option>
+          </select>
+        </label>
+        <p id="preset-help" class="help" hidden></p>
+
+        <label class="field" id="wrap-points">
+          <span id="points-label">Context depths</span>
+          <input id="f-points" type="text" autocomplete="off" spellcheck="false" placeholder="0,512,1024,2048 — or a range: 128-2048*2">
+        </label>
+
+        <div class="row">
+          <label class="field" id="wrap-gen">
+            <span id="gen-label">Tokens to generate</span>
+            <input id="f-gen" type="number" min="1" step="1">
+          </label>
+          <label class="field" id="wrap-reps">
+            <span>Repetitions</span>
+            <input id="f-reps" type="number" min="1" step="1">
+          </label>
+        </div>
+
+        <div class="row">
+          <label class="field" id="wrap-bucket" hidden>
+            <span>Bucket width</span>
+            <input id="f-bucket" type="number" min="1" step="1">
+          </label>
+          <label class="field" id="wrap-base" hidden>
+            <span>Cached base tokens</span>
+            <input id="f-base" type="number" min="1" step="1">
+          </label>
+        </div>
+
+        <div class="row">
+          <label class="field">
+            <span>Label <em>(optional)</em></span>
+            <input id="f-label" type="text" autocomplete="off" spellcheck="false" placeholder="the server's model">
+          </label>
+          <label class="field">
+            <span>Model <em>(optional)</em></span>
+            <input id="f-model" type="text" autocomplete="off" spellcheck="false" placeholder="server's default">
+          </label>
+        </div>
+
+        <label class="check">
+          <input id="f-warmup" type="checkbox">
+          <span>Warm up first</span>
+        </label>
+        <label class="check">
+          <input id="f-chart" type="checkbox">
+          <span>Chart (SVG + PNG)</span>
+        </label>
+        <label class="check">
+          <input id="f-flamegraph" type="checkbox">
+          <span>Flamegraph (SVG + PNG)</span>
+        </label>
+        <p id="flamegraph-note" class="help" hidden></p>
+
+        <div id="flamegraph-options" hidden>
+          <div class="row">
+            <label class="field">
+              <span>Sampling Hz</span>
+              <input id="f-freq" type="number" min="1" step="1">
+            </label>
+            <label class="field">
+              <span>Call graph</span>
+              <select id="f-call-graph">
+                <option value="fp">fp</option>
+                <option value="dwarf">dwarf</option>
+              </select>
+            </label>
+          </div>
+          <label class="field">
+            <span>Profile PID <em>(optional)</em></span>
+            <input id="f-pid" type="number" min="1" step="1" placeholder="the URL port's owner">
+          </label>
+        </div>
+
+        <details id="advanced">
+          <summary>Advanced</summary>
+          <div class="row">
+            <label class="field">
+              <span>Request timeout (s)</span>
+              <input id="f-timeout" type="number" min="1" step="1">
+            </label>
+            <label class="field">
+              <span>Delay between points (s)</span>
+              <input id="f-delay" type="number" min="0" step="1">
+            </label>
+          </div>
+          <p class="help">A card that heats up through a sweep reports a falling curve that looks exactly like the effect these sweeps are run to find. The delay lets it come back down.</p>
+        </details>
+
+        <div id="form-actions">
+          <button id="run-btn" type="submit">Run benchmark</button>
+          <button id="cancel-btn" type="button" class="danger" hidden>Cancel</button>
+        </div>
+        <p id="form-error" class="notice error" hidden></p>
+      </form>
+    </aside>
+
+    <!-- Right: the result. Summary table first — it is the answer — then the
+         flamegraph, the chart, and the log that produced them. -->
+    <main id="results">
+      <div id="empty" class="placeholder">
+        <p>Define a run on the left and press <strong>Run benchmark</strong>.</p>
+        <p class="help">Point it at a running <code>orangu-server</code>, or at any OpenAI-compatible server — every one of them is measured through the same path.</p>
+      </div>
+
+      <section id="run-status" hidden>
+        <div id="status-line">
+          <span id="status-badge" class="badge"></span>
+          <span id="status-text"></span>
+        </div>
+        <div id="status-meta"></div>
+      </section>
+
+      <!-- Every area that holds a result — the two images and the two text
+           panes — carries the same save control at its lower right: the
+           orangu-server console's own save icon, in its own dimmed footer
+           bar. `download` on a plain anchor, so what lands on disk is the
+           byte-identical file the run wrote, not a re-render of it. -->
+      <section id="summary-section" hidden>
+        <header class="section-header">
+          <h2>Summary</h2>
+          <!-- An action, not a save: it *builds* the document (on the click,
+               not on every run) and then saves it. So it sits in the header
+               where an action is looked for, rather than among the dimmed
+               save links under the table. -->
+          <button id="report-btn" class="header-btn" type="button" aria-label="Build and save a PDF report of this run" title="Build a PDF report of this run — provenance, measurements, chart and flamegraph in one file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>Report</span>
+          </button>
+        </header>
+        <div id="summary-env"></div>
+        <div class="table-scroll"><table id="summary-table"></table></div>
+        <div class="area-actions">
+          <a id="report-dl" hidden download></a>
+          <a id="bundle-dl" class="save-btn" download aria-label="Save the run bundle" title="Save the run bundle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>bundle.json</span>
+          </a>
+        </div>
+      </section>
+
+      <!-- This run against an earlier one: what differed in the two
+           configurations, what each measured, the ratio, and one chart with
+           both. The whole point of every run archiving a bundle. -->
+      <section id="compare-section" hidden>
+        <header class="section-header">
+          <h2>Compare</h2>
+          <select id="compare-with" aria-label="Compare with an earlier run">
+            <option value="">Compare with an earlier run…</option>
+          </select>
+        </header>
+        <p id="compare-error" class="notice error" hidden></p>
+        <div id="compare-result" hidden>
+          <img id="compare-img" alt="This run against an earlier one">
+          <pre id="compare-text"></pre>
+          <div class="area-actions">
+            <a id="compare-svg-dl" class="save-btn" download aria-label="Save the comparison chart as SVG" title="Save the comparison chart as SVG">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>SVG</span>
+            </a>
+            <a id="compare-png-dl" class="save-btn" download aria-label="Save the comparison chart as PNG" title="Save the comparison chart as PNG">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>PNG</span>
+            </a>
+            <a id="compare-pdf-dl" class="save-btn" download aria-label="Save the comparison as a PDF report" title="Save the comparison as a PDF report">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>compare.pdf</span>
+            </a>
+            <a id="compare-txt-dl" class="save-btn" download aria-label="Save the comparison" title="Save the comparison">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>compare.txt</span>
+            </a>
+          </div>
+        </div>
+      </section>
+
+      <section id="flamegraph-section" hidden>
+        <header class="section-header">
+          <h2>Flamegraph</h2>
+        </header>
+        <div id="flamegraph-stats"></div>
+        <!-- A frame, not an <img>: the rendered SVG carries its own script —
+             click a frame to zoom, click the title to reset, Ctrl-F to
+             highlight — and an <img> would serve it dead. -->
+        <iframe id="flamegraph-frame" title="Flamegraph" src="about:blank"></iframe>
+        <div class="area-actions">
+          <a id="flamegraph-svg-dl" class="save-btn" download aria-label="Save the flamegraph as SVG" title="Save the flamegraph as SVG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>SVG</span>
+          </a>
+          <a id="flamegraph-png-dl" class="save-btn" download aria-label="Save the flamegraph as PNG" title="Save the flamegraph as PNG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>PNG</span>
+          </a>
+        </div>
+      </section>
+
+      <section id="chart-section" hidden>
+        <header class="section-header">
+          <h2>Chart</h2>
+        </header>
+        <img id="chart-img" alt="Throughput chart">
+        <div class="area-actions">
+          <a id="chart-svg-dl" class="save-btn" download aria-label="Save the chart as SVG" title="Save the chart as SVG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>SVG</span>
+          </a>
+          <a id="chart-png-dl" class="save-btn" download aria-label="Save the chart as PNG" title="Save the chart as PNG">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>PNG</span>
+          </a>
+        </div>
+      </section>
+
+      <section id="log-section" hidden>
+        <header class="section-header">
+          <h2>Log</h2>
+        </header>
+        <pre id="log"></pre>
+        <div class="area-actions">
+          <a id="log-dl" class="save-btn" download aria-label="Save the log" title="Save the log">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>log.txt</span>
+          </a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer id="footer">
+    <span>Powered by <a href="https://mnemosyne-systems.github.io/orangu/" target="_blank" rel="noopener noreferrer">orangu</a> {{VERSION}}</span>
+    <span>{{YEAR}} <a href="https://mnemosyne-systems.ai" target="_blank" rel="noopener noreferrer">mnemosyne-systems.ai</a></span>
+  </footer>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

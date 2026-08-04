@@ -16,3 +16,12 @@ doc/perf/
 perf/
 target-fp/
 
+# Source is never ignored. The patterns above are for build output and the
+# scratch files a working tree collects (`*.html`, `*.svg`, `*.txt`, `*.pdf`,
+# `*.log`), and they swallowed a web console's own `index.html`: `git add`
+# skipped it without a word, and the binary that `include_str!`s it then failed
+# to compile — in CI, on every platform at once. Anything under `src/` is part
+# of the program.
+!src/**/*.html
+!src/**/*.svg
+!src/**/*.txt
