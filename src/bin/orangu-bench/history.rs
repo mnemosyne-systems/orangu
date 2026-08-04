@@ -33,7 +33,7 @@ use std::io::Write as _;
 
 /// The column header written when a history file is created, so a file found
 /// on its own is self-describing. Read back as a comment and skipped.
-const HEADER: &str = "#date\tlabel\tmode\tn\tbest\tmean\tsd";
+const HEADER: &str = "#date\tlabel\tmode\tn\tbest\tmean\tsd\tsd_sample";
 
 /// One measurement: what was measured, of what, when, and how fast it went.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,7 +56,15 @@ pub struct Record {
     /// contaminated by an unrelated process getting scheduled mid-run.
     pub best: f64,
     pub mean: f64,
+    /// Population standard deviation (÷ n) — what this column has meant since
+    /// the file was created, and therefore what it means for every row in it.
+    /// A column in an append-only record is not redefined; a new one is added.
     pub sd: f64,
+    /// Sample standard deviation (÷ n-1), the standard estimator — the figure
+    /// that can be put beside a `±` from another benchmark. Written as an
+    /// eighth column, empty where a run of one repetition leaves it undefined
+    /// and absent from every row written before it existed.
+    pub sd_sample: Option<f64>,
 }
 
 impl Record {
@@ -64,8 +72,18 @@ impl Record {
         let mut s = String::new();
         let _ = write!(
             s,
-            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
-            self.date, self.label, self.mode, self.n, self.best, self.mean, self.sd
+            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{}",
+            self.date,
+            self.label,
+            self.mode,
+            self.n,
+            self.best,
+            self.mean,
+            self.sd,
+            // Empty rather than `0.00`: one repetition has no sample spread,
+            // and a zero would claim it was measured.
+            self.sd_sample
+                .map_or_else(String::new, |sd| format!("{sd:.2}"))
         );
         s
     }
@@ -80,6 +98,10 @@ impl Record {
             best: f.next()?.trim().parse().ok()?,
             mean: f.next()?.trim().parse().ok()?,
             sd: f.next()?.trim().parse().ok()?,
+            // Absent on every row written before this column existed, and
+            // empty on a single-repetition row. Neither is a malformed row:
+            // the file is append-only, so old rows stay exactly as they were.
+            sd_sample: f.next().and_then(|v| v.trim().parse().ok()),
         };
         Some(rec)
     }
@@ -128,6 +150,23 @@ pub fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// The moment a run was measured, as `2026-08-04T09:34:21Z`.
+///
+/// A date alone cannot separate two runs on the same afternoon, which is
+/// exactly when an A/B is taken — so the *bundle* records this while the
+/// history file keeps its date column. UTC and RFC 3339 so a bundle carried to
+/// another machine, in another zone, still sorts and still means one instant.
+pub fn now_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let day = secs % 86_400;
+    let (hh, mm, ss) = (day / 3600, (day % 3600) / 60, day % 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
 /// Days since 1970-01-01 to a `(year, month, day)` civil date (proleptic
 /// Gregorian). Howard Hinnant's `civil_from_days`, which shifts the epoch to
 /// 0000-03-01 so leap days land at the end of the era's 400-year cycle and the
@@ -148,6 +187,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The timestamp has to be the same instant as the date, and shaped so it
+    /// sorts as text — a bundle's whole job is to be read back later, often
+    /// beside another one.
+    #[test]
+    fn the_timestamp_agrees_with_the_date_and_sorts() {
+        let stamp = now_utc();
+        assert!(stamp.starts_with(&today()), "{stamp} vs {}", today());
+        assert!(stamp.ends_with('Z') && stamp.len() == 20, "{stamp}");
+        assert!("2026-08-04T09:34:21Z" < "2026-08-04T09:34:22Z");
+        assert!("2026-08-04T23:59:59Z" < "2026-08-05T00:00:00Z");
+    }
 
     #[test]
     fn civil_from_days_matches_known_dates() {
@@ -172,9 +223,33 @@ mod tests {
             n: 1024,
             best: 81.75,
             mean: 81.40,
+            sd_sample: Some(0.31),
             sd: 0.26,
         };
         assert_eq!(Record::from_row(&r.to_row()), Some(r));
+    }
+
+    /// Every row written before `sd_sample` existed has seven columns, and
+    /// this file is append-only: those rows are the record of what was
+    /// measured and are never rewritten. So a short row must read back as
+    /// "not recorded" — not as a parse failure that silently drops years of
+    /// history from a chart.
+    #[test]
+    fn a_row_written_before_the_sample_column_still_reads() {
+        let old = "2026-07-25\torangu af7c767\tpp\t1120\t81.75\t81.40\t0.26";
+        let parsed = Record::from_row(old).expect("an older row still parses");
+        assert_eq!(parsed.n, 1120);
+        assert!((parsed.sd - 0.26).abs() < 1e-9);
+        assert_eq!(parsed.sd_sample, None);
+
+        // And a single-repetition row written by *this* build leaves the
+        // column empty rather than claiming a zero spread.
+        let one_rep = Record {
+            sd_sample: None,
+            ..parsed.clone()
+        };
+        assert!(one_rep.to_row().ends_with('\t'), "{:?}", one_rep.to_row());
+        assert_eq!(Record::from_row(&one_rep.to_row()), Some(one_rep));
     }
 
     #[test]
@@ -189,7 +264,7 @@ mod tests {
              \n\
              2026-07-25\torangu\tpp\t1024\t81.75\t81.40\t0.26\n\
              this is not a row\n\
-             2026-07-25\tllama.cpp\tpp\t1024\t1061.66\t1049.40\t8.84\n",
+             2026-07-25\treference\tpp\t1024\t1061.66\t1049.40\t8.84\n",
         )
         .unwrap();
         let recs = read(p).unwrap();
@@ -213,6 +288,7 @@ mod tests {
             best: 43.07,
             mean: 42.75,
             sd: 0.26,
+            sd_sample: Some(0.31),
         };
         append(p, std::slice::from_ref(&r)).unwrap();
         append(p, std::slice::from_ref(&r)).unwrap();

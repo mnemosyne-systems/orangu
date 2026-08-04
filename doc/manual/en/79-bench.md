@@ -10,14 +10,13 @@ performance work: *how fast does token generation (decode) run, how does that
 rate change as the context grows, and how fast is prompt processing
 (prefill)?*
 
-It is the HTTP-client analogue of `llama.cpp`'s `llama-bench -n` (its `tg`,
-token-generation, test). Rather than embedding an inference engine, it points
-at a **running OpenAI-compatible server** over HTTP and measures the tokens
-per second it streams back. Because both `orangu-server` and `llama-server`
-speak `POST /v1/completions` with SSE streaming, the *same* tool measures both
-through the *same* path — the only way to get a genuinely apples-to-apples
-comparison (in-process `llama-bench` numbers and an ad-hoc `curl` of orangu are
-not comparable).
+Rather than embedding an inference engine, it points at a **running
+OpenAI-compatible server** over HTTP and measures the tokens per second it
+streams back. Any server that speaks `POST /v1/completions` with SSE streaming
+is measured through the *same* path by the *same* tool — which is the only way
+to get a genuinely apples-to-apples comparison between two engines, since an
+in-process benchmark on one side and an ad-hoc `curl` on the other are not
+comparable.
 
 ### What it measures
 
@@ -25,14 +24,45 @@ For each run, `orangu-bench` sends one streaming completion and times the
 window **from the first streamed token to the last**. Prompt processing
 (prefill) and time-to-first-token are therefore *excluded* from the reported
 rate — the number is steady-state decode throughput, `(tokens - 1) /
-decode_seconds`, exactly the quantity `llama-bench`'s `tg` reports. Time to
-first token is printed separately (`ttft_ms`) so prefill cost is still visible.
+decode_seconds`, the standard token-generation (`tg`) quantity. Time to first
+token is printed separately (`ttft_ms`) so prefill cost is still visible.
 
 To see how decode scales with context, it sweeps **depths**: each depth pads
 the prompt with filler so generation begins at roughly that many tokens of
-context, mirroring `llama-bench -d`. A flat curve across depths means decode is
+context. A flat curve across depths means decode is
 context-insensitive; a curve that falls with depth means attention or KV
 traffic is growing per token.
+
+#### Ranges
+
+Anywhere a list of points is accepted — `--depths`, `--pp`, `--pg`,
+`--pp-continue`, `--embed`, `--streams` — an item may be a range instead of a
+number, in the three forms the wider ecosystem's benchmarks use, so a sweep can
+be copied between them:
+
+| form | means | example |
+| :-- | :-- | :-- |
+| `first-last*mult` | multiply until past `last` | `128-2048*2` → 128, 256, 512, 1024, 2048 |
+| `first-last+step` | step until past `last` | `0-2048+512` → 0, 512, 1024, 1536, 2048 |
+| `first-last` | every value, stepping by one | `1-8` → 1, 2, 3, 4, 5, 6, 7, 8 |
+
+Ranges and numbers mix: `--depths 0,128-512*2,3072`. The end is a bound, not a
+member — `128-3000*2` stops at 2048.
+
+A range is expanded **before the first request**, so a mistyped one costs
+nothing: `2048-128` ("ends before it starts"), `128-2048*1` ("would never reach
+its end") and `128-4096` ("expands to more than 256 points — did a doubling
+sweep lose its `*2`?") are all refused with their reason rather than run. That
+last cap is deliberate: `128-4096` is legal and means 3969 measurements, which
+looks exactly like a doubling sweep missing its multiplier.
+
+#### Letting the card cool (`--delay`)
+
+`--delay <seconds>` waits between measured points — between them only, never
+before the first or after the last. On a laptop card a sweep that heats through
+its own run reports a falling curve that looks exactly like the effect these
+sweeps are run to find. The clock and DPM state printed in the header make the
+cause visible after the fact; this is what avoids it.
 
 > The depth padding is approximate — it appends `~depth` filler words
 > (≈ one BPE token each) rather than exact tokens, because the tool has no
@@ -47,8 +77,7 @@ Start the server you want to measure, then run the tool against its base URL.
 # orangu-server (default port 8100): sweep decode rate across context depths
 orangu-bench --url http://127.0.0.1:8100 --depths 0,512,1024,2048,3072 --gen 128
 
-# llama-server on port 8300, identical harness (uses the OpenAI-compat endpoint)
-llama-server -m model.gguf -ngl 99 --port 8300 -c 4096
+# another OpenAI-compatible server on port 8300, identical harness
 orangu-bench --url http://127.0.0.1:8300 --depths 0,512,1024,2048,3072 --gen 128
 ```
 
@@ -63,10 +92,171 @@ orangu-bench → http://127.0.0.1:8100
     2048 |   128 |     980 |      128 |    20.10 |    19.95 ±  0.20
 ```
 
+### The web console (`--web`)
+
+Everything below is also available from a browser. `--web` serves a console —
+the same vanilla HTML/CSS/JS, embedded in the binary with no build step, that
+`orangu-server`'s own web UI is built from, and deliberately the same
+palette — where a run is **defined in a form** and its result comes back as a
+**summary table**, a **flamegraph** and a **chart**:
+
+```sh
+orangu-bench --web                        # http://127.0.0.1:8300
+orangu-bench --web --port 9000
+orangu-bench --web --host all             # reachable from another machine
+orangu-bench --web --host 192.168.1.10    # or one specific interface
+```
+
+```text
+orangu-bench 1.2.0
+Console  http://127.0.0.1:8300
+Runs     /home/you/.orangu/orangu-bench/runs
+```
+
+The banner is one aligned table: labels padded to a common width, and a value
+too long for the terminal continued under its own column rather than back at
+the left margin. A value is only ever broken at a space, so an address or a
+path stays in one piece — an address split across two lines cannot be copied,
+and copying it is what the line is for. Bound off loopback there is a third
+row, `Note`, saying so.
+
+Pick the measurement (decode, prefill, combined, continuation prefill, curve,
+concurrency, embeddings, decode CPU), give it the server URL and its sweep
+points, and press **Run benchmark**. The console then shows, live:
+
+- the tool's own output as it measures, one row per point as the row is taken,
+  with anything it wrote to stderr — a retried send, a profile that
+  undercounted — kept visibly apart from the measurements;
+- a **summary table**: best, mean and ± sd per point, above the model, backend,
+  server pid/uptime and GPU clock state that were live *while measuring*;
+- the **flamegraph**, in the page and interactive (click a frame to zoom, the
+  title to reset, Ctrl-F to highlight), with **both `.svg` and `.png`** to
+  download, and the sample count, window, cores-busy and GPU-wait share beside
+  it — a flamegraph is normalised to its own total, so only those numbers say
+  how much time there was to divide;
+- the **chart**, likewise as `.svg` and `.png`;
+- a **Report** button beside the summary table, which builds the whole run as
+  one PDF (see *The run as a document* below) and saves it. It is built on the
+  click rather than by every run: most runs are never sent anywhere, and a
+  document written every time is a directory full of PDFs nobody opened.
+  Everything it needs is already archived, so it can be built at any time —
+  including from a run measured weeks ago;
+- the run's `bundle.json`, which is what all of the above was read back from.
+
+Every image and every text pane carries a **save control at its lower right**
+— the same dimmed footer with the same icon `orangu-server`'s console puts
+under an answer and under a rendered diagram. What lands on disk is the
+byte-identical file the run wrote, named after the run (`orangu-bench-<id>-
+flamegraph.png`), so two arms of an A/B saved from two tabs do not both arrive
+as `flamegraph.png`.
+
+A run's directory holds what cannot be regenerated from it: the bundle, the
+chart and flamegraph (SVG, their PNG twins, and the collapsed `.folded` a
+profile can be re-rendered or compared from), the log, and the console's own
+`run.json`. The PDF is built on demand and the comparison's working copies are
+deleted once the comparison is made.
+
+Every run gets a directory under `~/.orangu/orangu-bench/runs/<id>/`, so a
+result outlives the console process that produced it: the **Past runs** button
+lists them newest first, and opening one re-loads its table, its artifacts and
+the form that produced it — which is how a second A/B arm gets defined, one
+field away from the first.
+
+The topbar's **New** and the history panel's **Clear all** are
+`orangu-server`'s console's own, doing the same thing to runs that they do to
+chats there. **New** empties the result pane and lets go of the run it was
+showing — deliberately leaving the form alone, since the next run is almost
+always the last one with one field changed, which is exactly what an A/B arm
+is. It is remembered, so a reload after it comes back to an empty pane rather
+than reopening the newest run; a row's own **✕** does the same for one run.
+
+**Clear all** deletes every kept run. A run that is still measuring is **not**
+one of them: it is kept, named in the reply, and the console follows it —
+tidying a list of finished results should never be the thing that ends a
+twenty-minute sweep, and Cancel is one button away and says what it does.
+
+#### Scaling tests: the sweeps this project actually ran
+
+Under **Measurement** sits **Scaling test**, a second drop-down whose entries
+are named for the range they cover — "Prefill" plus "128 to 3072". Choosing one
+fills in the points, the token count and the repetitions, and locks them, so
+the sweep about to run is on screen rather than implied. The default is
+**None**, which leaves every field free: a one-off measurement, or an A/B
+against one hand-picked depth, is not a scaling test.
+
+The ranges are not round numbers. Each one is the sweep this repository used to
+find what it found, so a run lands beside an existing baseline rather than
+beside nothing:
+
+| Measurement | Scaling test | Where it comes from |
+| :-- | :-- | :-- |
+| Decode | `0 to 2048` | the tracked series in `perf-history.tsv`; `PERF-GAP.md`'s standard harness, best of 3 |
+| Prefill | `128 to 3072` | the tracked `pp` series — every recorded prefill row came from these lengths |
+| Combined | `128 to 3072` | the tracked prefill lengths with the tracked decode length, timed as one turn |
+| Continuation prefill | `10 to 130 added` | `PERF-GAP.md` increment 7, the sweep that found the 2× cooperative-GEMM cliff between 50 and 66 tokens |
+| Decode curve | `0 to 3072 in one pass` | the curve invocation this manual documents below |
+| Concurrency | `1 to 8 streams` | `PERF-GAP.md` item 7 — 99% engine occupancy at two streams against a generic path stuck at 66% with eight |
+| Embeddings | `64 to 256` | `embeddinggemma-300M`'s own sweep, 15 reps |
+| Decode CPU | `0 to 1024` | the depths that separated a claimed +58% CPU-per-token growth from the real +8.8% |
+
+#### Comparing against an earlier run
+
+The question a benchmark is usually run to answer is not "how fast is this?"
+but "is this faster than what I had?" — so every finished run offers a
+**Compare** panel listing every earlier run this console has kept. Pick one and
+the console runs `orangu-bench --read-bundle old,new` against the two archived
+bundles and shows what it prints:
+
+- **what differed** between the two configurations — model, backend, kernels,
+  host, GPU clocks — because a throughput comparison is only readable once you
+  know whether the two runs were the same experiment;
+- **where the GPU time went** per decode stage, when both runs recorded it;
+- **what each measured**, point by point, with the percentage against the older
+  run;
+- **one chart holding both**, saveable as SVG and PNG like every other image;
+- **`compare.pdf`** — the same comparison as a document, which is the artifact
+  most likely to be attached to a pull request.
+
+The two bundles are copied into the newer run's directory as `old-<id>.json`
+and `new-<id>.json` before being compared, and the copies' series labels are
+tagged `old ·` / `new ·`. Both halves matter: every run's bundle is called
+`bundle.json`, so the table's two columns would otherwise both read "bundle",
+and two runs of the same server carry the same series label, so the chart would
+draw them as one line. The runs' own bundles are not touched.
+
+Comparing is allowed while a benchmark is running, unlike starting a second
+run: it reads two files that were written when their runs ended and talks to no
+server, so it cannot disturb a measurement in flight.
+
+Two things it does on purpose:
+
+- **One run at a time.** A second run pressed while one is going is refused
+  rather than queued or allowed: two benchmarks sharing a server measure each
+  other's interference.
+- **It runs `orangu-bench`, it does not reimplement it.** Each run re-executes
+  this same binary with the flags the form describes — the first line of the
+  log is that command line, quoted so it can be pasted straight into a
+  terminal. A console with its own copy of the harness could disagree with the
+  command line about the same workload, and a benchmark tool that gives two
+  answers for one question is worse than none.
+
+The console is **unauthenticated**, like `orangu-server`'s, and assumes a
+trusted network. It differs in its default: loopback, where that console
+defaults to every interface — because this one starts processes rather than
+answering requests. `--host all` (or `*`, or a literal interface address)
+opens it up for the case that wants it, which is real and common in
+performance work: the machine with the GPU is rarely the machine you are
+sitting at. Bound anywhere but loopback it says so at startup, because from
+then on anyone who can route to the port can start runs on that machine.
+
+`--sweep` is the one mode with no place in the UI at all: a sweep's whole
+input is a shell command to start a server with, and this console never takes
+one.
+
 ### Prefill mode (`--pp`) — prompt processing, not decode
 
 `--pp` sweeps *prompt lengths* and reports **prompt-processing** throughput —
-`llama-bench`'s `pp` test to the default's `tg`. Each run sends a prompt of
+the standard `pp` test to the default's `tg`. Each run sends a prompt of
 roughly the requested length and generates a single token, so what is timed is
 prefill and nothing else.
 
@@ -94,16 +284,53 @@ Two columns exist to keep the number honest:
 - **`cached`** is how much of the prompt came from the server's prefix cache
   and so never went through a forward pass. A cached prompt "prefills"
   instantly and would otherwise look like a spectacular result. Every run
-  sends `cache_prompt: false`, which both `orangu-server` and `llama-server`
-  honour, so this column should read `0`; if it ever climbs toward `n_tok`,
+  sends `cache_prompt: false`, which any server implementing a prefix cache
+  honours, so this column should read `0`; if it ever climbs toward `n_tok`,
   the server ignored the flag and the row is measuring a cache lookup rather
   than prefill.
 
-A server that reports no `timings` at all (an older `orangu-server`, or a
-llama-server built without them) gets a row marked `no server timings (ttft
-only)`, carrying wall-clock time-to-first-token instead. That figure includes
+A server that reports no `timings` at all (an older `orangu-server`, or one
+built without them) gets a row marked `no server timings (ttft only)`, carrying wall-clock time-to-first-token instead. That figure includes
 queueing and the first decode step, so it is not comparable with the rest — the
 row says so rather than quietly printing a smaller number.
+
+### Combined mode (`--pg`) — the whole turn, timed as one thing
+
+Every other mode here splits the turn on purpose: `--pp` times prefill with a
+single token generated, the default sweep times generation with prefill
+excluded. That is what a *diagnosis* needs — the two halves have different
+bottlenecks and move for different reasons.
+
+`--pg` answers the other question, the one a user actually experiences: how
+long the whole turn takes. It sends one request that prefills a prompt of
+roughly the given length and generates `--gen` tokens, times it from before the
+send to the last streamed token, and reports `(prompt + generated) / total`.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --pg 128,512,1024 --gen 128
+```
+
+```text
+      pp |   n_tok |     gen | prompt_ms |  total_ms |     best |   mean ± sd(n-1)
+---------------------------------------------------------------------------------
+      64 |      71 |      40 |      12.5 |      63.3 |  1754.89 |  1749.80 ±  7.20
+     128 |     146 |      40 |      12.5 |      63.6 |  2951.57 |  2938.98 ± 17.81
+```
+
+This figure **cannot be reconstructed** from a `--pp` run and a decode run:
+neither carries the queueing and the hand-off between prefill and the first
+token, which is exactly the part a combined number includes. It is also the
+figure most third-party comparisons quote.
+
+`prompt_ms` is the server's own prefill time, so the split inside the turn
+stays visible; `n_tok` is what the server said it processed, and the rate is
+computed from that rather than from the requested length. `cache_prompt: false`
+as everywhere else — a cached prompt would make the prefill half vanish and
+quietly turn this into a decode measurement.
+
+The swept axis is the **prompt**; the generated length comes from `--gen`, so
+one invocation is one generation length. That keeps `n` meaning one thing per
+mode in the history file, where these rows are recorded under mode `pg`.
 
 ### Continuation-prefill mode (`--pp-continue`) — the narrow-batch regime
 
@@ -220,8 +447,8 @@ orangu-bench --url http://127.0.0.1:8300 --embed 64,128,256 --reps 15  # the ref
 ```
 
 `n_tok` is the count from the response's `usage.prompt_tokens` — the length the
-forward pass actually ran, not the requested target — and both
-`orangu-server` and `llama-server` report it. A server that omits it gets a row
+forward pass actually ran, not the requested target — which `orangu-server`
+and every other conformant server reports. A server that omits it gets a row
 marked `no usage.prompt_tokens (latency only)`: an embedding response carries
 no other clue to its token count, so there is no rate to print and the row is
 not recorded.
@@ -260,9 +487,25 @@ What to do about it:
 
 ### What was measured
 
-Every run opens with the server's model and backend (from `GET /props`) and,
-on Linux with an AMD card, each GPU's current core clock and DPM mode read from
-`/sys/class/drm/card*/device/`. This is not decoration: a card left at
+Every run opens with the server's model, backend and **build** (from
+`GET /props`) and, on Linux with an AMD card, each GPU's current core clock and
+DPM mode read from `/sys/class/drm/card*/device/`.
+
+```text
+  model    unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+  backend  Vulkan/AMD Radeon RX 5500M (RADV NAVI14) (Vulkan)
+  build    1.2.0 (52c04435f-dirty)
+  server   pid 48219 up 12s
+```
+
+The `build` line is `version` plus the git commit the server was compiled
+from, `-dirty` when tracked files differed from that commit. A version alone
+cannot separate two builds during performance work — every build between two
+releases carries the same one — and a run whose engine is identified only by a
+hand-typed `--label` is a run whose provenance depends on someone having
+remembered. The bundle archives both fields, so `--read-bundle` names a build
+change in **what differed** before it shows what moved. A server that reports
+neither (an older `orangu-server`, or another engine) simply gets no such line. This is not decoration: a card left at
 `power_dpm_force_performance_level = auto` can idle its clock down between
 requests, which moves throughput by more than the difference most benchmarks
 are run to detect. A rate recorded without the device and clock state beside it
@@ -281,6 +524,7 @@ Options:
       --url <URL>          Base URL of the server [default: http://127.0.0.1:8100]
       --depths <DEPTHS>    Comma-separated context depths to sweep [default: 0]
       --pp <PP>            Prefill mode: comma-separated prompt lengths to sweep, reporting prompt-processing throughput
+      --pg <PG>            Combined mode: comma-separated prompt lengths, each prefilled and generated from in one request
       --pp-continue <LENS> Continuation-prefill mode: comma-separated *added* token counts to sweep
       --decode-cpu         Report the server's CPU time per generated token, with prefill excluded
       --streams <N>        Concurrency mode: comma-separated stream counts; reports aggregate tok/s
@@ -292,6 +536,7 @@ Options:
       --reps <REPS>        Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
       --no-warmup          Skip the initial warmup run
       --timeout <TIMEOUT>  Per-request timeout in seconds [default: 600]
+      --delay <SECONDS>    Wait between measured points, for a card that heats up [default: 0]
       --model <MODEL>      Model id to request
       --json               Emit machine-readable JSON
       --history <HISTORY>  Append each measured point to this tab-separated history file
@@ -308,15 +553,45 @@ Options:
       --flamegraph-call-graph <MODE>  Call-graph mode for --flamegraph: fp or dwarf [default: fp]
       --flamegraph-png                Also render a PNG beside the flamegraph SVG
       --compare-profiles <FILES>      Compare already-collapsed .folded profiles side by side; measure nothing
+      --report <FILE.pdf>  Write the run — provenance, measurements, chart and flamegraph — to one PDF
+      --web                Serve the web console instead of measuring
+      --host <HOST>        Address the web console binds: "all" (or "*") for every interface [default: 127.0.0.1]
+      --port <PORT>        Port the web console listens on [default: 8300]
   -h, --help               Print help
   -V, --version            Print version
 ```
 
 Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
-`--depths` is comma-separated (e.g. `0,512,1024,2048`); `--reps` reports the
+`--depths` is comma-separated and accepts ranges (e.g. `0,512,1024,2048` or
+`128-2048*2`, see *Ranges* above); `--reps` reports the
 best (fastest) run with mean ± standard deviation alongside; warmup (one short
 generation) is on unless `--no-warmup`; `--json` emits one JSON object per depth
 instead of the table.
+
+#### Which standard deviation
+
+The `±` printed beside the mean is the **sample** standard deviation — the sum
+of squares divided by `n - 1` — which is the standard estimator and the one
+every other benchmark reports. The column says so: `mean ± sd(n-1)`. A run of
+one repetition has none, and the row reads `—` rather than `0.00`, which would
+claim a spread was measured and found to be zero.
+
+The history file and the bundle carry **both**. Their `sd` column is the
+*population* estimator (divided by `n`), which is what it has meant since the
+file was created — a column in an append-only record is not redefined, so a new
+one, `sd_sample`, was added beside it. Rows written before that column existed
+read back with it empty, not as parse failures.
+
+The difference is not cosmetic: at the default three repetitions the sample
+figure is `sqrt(3/2)` — 22% — larger than the population one, which is bigger
+than most of the differences this tool is run to detect. Quoting one against the
+other would be a systematic error, which is exactly why both are recorded and
+the printed one is the comparable one.
+
+The **headline is still the best run**, not the mean, in the table, the report
+and the history file. A best is always the flattering statistic, so the PDF
+report says so on the page and the console's table heads its column `± sd (n−1)`
+for the same reason.
 
 ### Profiling what was measured (`--flamegraph`)
 
@@ -331,8 +606,8 @@ was busy.
 `--flamegraph FILE.svg` records a CPU profile of the server **over exactly the
 measured window**: sampling starts after warmup and stops when the last
 repetition finishes, so the flamegraph and the tok/s printed above it describe
-the same seconds of the same process. `llama-server` goes through the same path,
-so the two engines' profiles are as comparable as their two rates.
+the same seconds of the same process. Any other server goes through the same
+path, so two engines' profiles are as comparable as their two rates.
 
 Collapsing and rendering are done **in this binary**, so `perf` is the only
 external program involved. The rendered SVG is interactive on its own: click a
@@ -344,9 +619,9 @@ matching a substring and report what share of samples matched.
 orangu-bench --url http://127.0.0.1:8100 --depths 0 --gen 512 --reps 2 \
              --flamegraph perf/gemma4-e2b-orangu-decode.svg --flamegraph-png
 
-# llama-server, the same workload through the same harness
+# the reference engine on :8300, the same workload through the same harness
 orangu-bench --url http://127.0.0.1:8300 --depths 0 --gen 512 --reps 2 \
-             --flamegraph perf/gemma4-e2b-llama-decode.svg --flamegraph-png
+             --flamegraph perf/gemma4-e2b-reference-decode.svg --flamegraph-png
 ```
 
 Three files come out of one `--flamegraph out.svg`:
@@ -437,11 +712,11 @@ and puts them in one table — the `--chart-only` of profiling, no server and no
 re-run:
 
 ```sh
-orangu-bench --compare-profiles perf/gemma4-e2b-orangu-decode.folded,perf/gemma4-e2b-llama-decode.folded
+orangu-bench --compare-profiles perf/gemma4-e2b-orangu-decode.folded,perf/gemma4-e2b-reference-decode.folded
 ```
 
 ```text
-bucket         | gemma-orangu-decode | gemma-llama-decode
+bucket         | gemma-orangu-decode | gemma-reference-decode
 ------------------------------------------------------------
 app/other      |               22.5% |              66.2%
 kernel         |               33.5% |              10.4%
@@ -466,8 +741,8 @@ read from the `.meta.json` written beside the profile; a `.folded` carried off
 the machine alone shows `?`.
 
 **`gpu-wait` and `pool-idle` are why an occupancy number was needed at all.**
-The two engines wait for the GPU in different ways — `llama-server` spins on
-`_mm_pause`, `orangu-server` blocks — and a blocked thread produces no samples
+Two engines can wait for the GPU in different ways — one spinning on
+`_mm_pause`, `orangu-server` blocking — and a blocked thread produces no samples
 while a spinning one produces them at full rate. Read naively, that makes the
 engine wasting a whole core look busy with useful work and the one yielding it
 look idle. Both are therefore detected from the **stack**, not the leaf, and
@@ -499,9 +774,9 @@ answer. Merging them would charge a threading problem to the GPU.
     cargo build --profile release-with-debug --bin orangu-server
   ```
   A binary you do not control needs `--flamegraph-call-graph dwarf` instead.
-  (`llama-server` as packaged happens to keep frame pointers, so `fp` works for
-  it too — worth checking rather than assuming, since a broken unwind looks like
-  a real result.)
+  (Some third-party builds keep frame pointers, so `fp` works for them too —
+  worth checking rather than assuming, since a broken unwind looks like a real
+  result.)
 
 `--flamegraph-pid` is only needed when neither route to the pid works. The tool
 asks the server for its own pid first (`orangu-server` reports one), and
@@ -599,7 +874,7 @@ A rate on its own says nothing. The two things it needs to be read against —
 invocation, so `--history` appends each measured point to a tab-separated file
 that accumulates across runs, and `--chart` draws the chart from **that file**
 rather than from the run that produced it. A run measuring only orangu still
-redraws llama.cpp's line beside it.
+redraws the reference engine's line beside it.
 
 ```sh
 # orangu, recorded as its own series
@@ -607,7 +882,7 @@ orangu-bench --url http://127.0.0.1:8100 --label "orangu $(git rev-parse --short
              --pp 128,512,1024,2048 --history perf-history.tsv --chart perf-history.svg
 
 # the reference, same harness, same file
-orangu-bench --url http://127.0.0.1:8300 --label "llama.cpp b10104" \
+orangu-bench --url http://127.0.0.1:8300 --label "reference b10104" \
              --depths 0,512,1024,2048 --history perf-history.tsv --chart perf-history.svg
 
 # redraw after hand-editing the file — no server needed
@@ -617,15 +892,15 @@ orangu-bench --chart-only --history perf-history.tsv --chart perf-history.svg
 The file is plain TSV with a `#` header, so it diffs in review and is
 hand-editable; blank lines, comments and unparseable rows are skipped rather
 than fatal. Each row is `date`, `label`, `mode` (`pp`, `tg`, `curve`, `cpu` or
-`embed` — each drawn as its own chart panel, since an embedding pass and a
+`pg`, `embed` — each drawn as its own chart panel, since an embedding pass and a
 generative model's prefill are not the same measurement, and two of the five
-are not even in tokens/second), `n`, and the best / mean / sd of the run's
-repetitions:
+are not even in tokens/second), `n`, and the best / mean / both standard
+deviations of the run's repetitions (see *Which standard deviation* above):
 
 ```text
-#date	label	mode	n	best	mean	sd
-2026-07-25	orangu af7c767	pp	1120	81.75	81.40	0.26
-2026-07-25	llama.cpp b10104	pp	1120	1061.66	1049.40	8.84
+#date	label	mode	n	best	mean	sd	sd_sample
+2026-07-25	orangu af7c767	pp	1120	81.75	81.40	0.26	0.32
+2026-07-25	reference b10104	pp	1120	1061.66	1049.40	8.84	10.83
 ```
 
 Nothing is ever rewritten — a row is a measurement that was taken, and a later
@@ -668,6 +943,55 @@ run reports its best repetition. Series colours are assigned in first-seen order
 recycled; past the last slot a label is dropped from the chart rather than
 given a colour another series already owns.
 
+### The run as a document (`--report`)
+
+A rate travels badly. It goes into a pull request, an issue, or a mail to
+someone with different hardware — and the parts that make it *checkable* are
+the parts a terminal cannot carry: the chart it sits on and the profile that
+explains it. `--report FILE.pdf` writes all of it as one file:
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --depths 0,512,1024 --gen 128 \
+             --chart run.svg --flamegraph run-profile.svg \
+             --report run.pdf
+```
+
+The document holds, in order:
+
+- **What produced it** — the URL, model, backend, the server's **build**
+  (version and commit, see *What was measured* above), its pid and uptime, the
+  GPU kernels it selected, each card's clock and DPM mode, the host, the
+  workload spelled out, **when it was measured** (to the second, in UTC) and
+  this tool's own build. A date alone cannot separate two runs taken on the
+  same afternoon, which is when an A/B is usually taken — so the bundle records
+  the instant, and a report rebuilt from it reads that instant back.
+- **What it measured** — best, mean and ± sd per point, with the unit column,
+  under a line saying that the headline is the *best* of the repetitions.
+  A card measured at `power_dpm_force_performance_level = auto` adds a caution
+  here, because that alone makes the numbers incomparable with a pinned run.
+- **Throughput** — the chart, embedded.
+- **Where the time went** — the profile's samples, window, cores busy and what
+  it was waiting on, its self-time buckets, and the flamegraph, embedded.
+
+The same document can be rebuilt later from what the run archived:
+
+```sh
+orangu-bench --read-bundle run/bundle.json --report run.pdf
+```
+
+A single `--read-bundle` with `--report` writes a *run* report rather than a
+comparison — one bundle is not a comparison — and looks for the pictures beside
+the bundle, which is exactly how a run's directory is laid out. That is what
+the console's **Report** button runs.
+
+A PDF rather than a markdown table for exactly one reason: **it folds the PNGs
+in**. The chart and the flamegraph are written as SVG (the canonical artifact)
+and rasterized beside them; the report embeds the raster, rendering it on
+demand, so `--report` needs neither `--chart-png` nor `--flamegraph-png` to
+produce a complete document. On a machine with no `rsvg-convert` the report is
+still written, with a line where each image would have been — the measurements
+are the deliverable and are never withheld because a picture could not be made.
+
 ### Curve mode (`--curve`) — decode scaling without prefill
 
 The depth sweep pads the *prompt* to reach a context depth, which means a large,
@@ -675,8 +999,8 @@ slow, VRAM-heavy prefill on orangu (its multi-hundred-token prefill is
 CPU-orchestrated). `--curve N` avoids that entirely: it does **one** generation
 of `N` tokens, timestamps each streamed token, and reports the instantaneous
 decode rate per `--bucket`-token context window. That is the cleanest way to see
-decode-vs-context scaling, and it works identically against orangu-server and
-llama-server.
+decode-vs-context scaling, and it works identically against any
+OpenAI-compatible server.
 
 ```sh
 orangu-bench --curve 3072 --bucket 256   # decode rate at ctx 0, 256, 512, …, 2816
@@ -730,8 +1054,8 @@ which reads as a clean "this change did nothing" result rather than as a broken
 measurement. Keeping both builds named `orangu-server` in separate directories
 avoids it; checking the pid proves it.
 
-`llama-server` does not report these fields, so the line is omitted for it —
-there, check the process yourself.
+A server that does not report these fields gets no such line — there, check
+the process yourself.
 
 ### Interpreting a comparison
 
@@ -775,8 +1099,8 @@ throughput number.
 
 - Use `temperature 0` semantics: the tool always sends `temperature: 0` so runs
   are deterministic and comparable.
-- It sends both `max_tokens` (OpenAI) and `n_predict` (llama.cpp native) so a
-  server honors whichever it recognizes.
+- It sends both `max_tokens` (OpenAI) and `n_predict` (the widely-used native
+  spelling) so a server honors whichever it recognizes.
 - Force the GPU to a stable clock state before benchmarking, or the numbers
   reflect the governor, not the code (see `orangu-server`'s startup power-state
   advisory).

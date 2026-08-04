@@ -1,0 +1,757 @@
+/* The same design tokens as orangu-server's web console — the two are one
+   product, and a developer with both open should not see two palettes. Light
+   is the baseline; the dark media query and an explicit data-theme attribute
+   (set by the topbar toggle, see app.js) both override it — an attribute
+   selector on :root outranks a plain :root inside @media, so the explicit
+   choice always wins regardless of source order. */
+:root {
+  --bg: #f5f6f8;
+  --bg-raised: #ffffff;
+  --bg-input: #eef0f3;
+  --border: #d7dbe0;
+  --text: #1b1e23;
+  --text-dim: #62697a;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --error: #d92d20;
+  --ok: #1a7f37;
+  --radius: 10px;
+
+  /* The "orangu" brand brown — the header/footer bars, deliberately the
+     same in light and dark mode (a brand color, not a theme color). */
+  --brand-bg: #5c3a21;
+  --brand-border: #432911;
+  --brand-text: #f3e6d8;
+  --brand-text-dim: #cbb49b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1e23;
+    --bg-raised: #23272e;
+    --bg-input: #2a2f38;
+    --border: #343a45;
+    --text: #e6e8eb;
+    --text-dim: #9aa3b2;
+    --accent: #5b9dff;
+    --accent-text: #0c1420;
+    --error: #ff6b6b;
+    --ok: #4ac26b;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --bg-raised: #ffffff;
+  --bg-input: #eef0f3;
+  --border: #d7dbe0;
+  --text: #1b1e23;
+  --text-dim: #62697a;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --error: #d92d20;
+  --ok: #1a7f37;
+}
+
+:root[data-theme="dark"] {
+  --bg: #1b1e23;
+  --bg-raised: #23272e;
+  --bg-input: #2a2f38;
+  --border: #343a45;
+  --text: #e6e8eb;
+  --text-dim: #9aa3b2;
+  --accent: #5b9dff;
+  --accent-text: #0c1420;
+  --error: #ff6b6b;
+  --ok: #4ac26b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--brand-bg);
+  border-bottom: 1px solid var(--brand-border);
+  flex-shrink: 0;
+}
+
+#brand {
+  color: var(--brand-text);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+#target {
+  color: var(--brand-text-dim);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+#topbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  padding: 0;
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* The header sits outside the light/dark toggle's scope, so its buttons get
+   their own fixed brand-brown styling. */
+#topbar-actions button {
+  border-color: var(--brand-border);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--brand-text);
+}
+
+#topbar-actions button:hover {
+  border-color: var(--brand-text-dim);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* Past runs: a drop-down under the topbar, over the content. Only
+   #history-list scrolls, so the Clear all footer stays pinned under it
+   rather than sitting past the bottom of a long list. */
+#history-panel {
+  position: absolute;
+  top: 50px;
+  right: 16px;
+  z-index: 20;
+  width: min(460px, calc(100vw - 32px));
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+#history-list {
+  overflow-y: auto;
+  padding: 6px;
+}
+
+#history-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+}
+
+#history-footer[hidden] {
+  display: none;
+}
+
+#history-clear-btn {
+  font: inherit;
+  font-size: 0.78em;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-dim);
+}
+
+#history-clear-btn:hover {
+  color: var(--error);
+  background: var(--bg-input);
+}
+
+#history-panel[hidden] {
+  display: none;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.history-row:hover {
+  background: var(--bg-input);
+}
+
+.history-row.current {
+  border: 1px solid var(--accent);
+}
+
+.history-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-sub {
+  font-size: 0.82em;
+  color: var(--text-dim);
+}
+
+.history-empty {
+  padding: 12px;
+  color: var(--text-dim);
+}
+
+#body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+#panel {
+  width: 360px;
+  flex-shrink: 0;
+  padding: 16px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+
+#panel h2,
+.section-header h2 {
+  margin: 0 0 12px;
+  font-size: 1.05em;
+}
+
+#run-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.field > span {
+  font-size: 0.85em;
+  color: var(--text-dim);
+}
+
+.field em {
+  font-style: normal;
+  opacity: 0.7;
+}
+
+.field[hidden] {
+  display: none;
+}
+
+input[type="text"],
+input[type="number"],
+select {
+  width: 100%;
+  padding: 8px 10px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* A field a scaling test owns: shown, so what is about to run is on screen,
+   but not editable — editing it would mean the sweep no longer matches the
+   name in the drop-down. */
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+}
+
+/* A row whose children are all hidden would still take its own gap. */
+.row:not(:has(> :not([hidden]))) {
+  display: none;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.92em;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.help {
+  margin: -4px 0 0;
+  font-size: 0.82em;
+  color: var(--text-dim);
+}
+
+.help[hidden] {
+  display: none;
+}
+
+#advanced summary {
+  cursor: pointer;
+  font-size: 0.85em;
+  color: var(--text-dim);
+}
+
+#advanced .field {
+  margin-top: 10px;
+}
+
+#flamegraph-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#flamegraph-options[hidden] {
+  display: none;
+}
+
+#form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+#run-btn {
+  flex: 1;
+  background: var(--brand-bg);
+  color: #ffffff;
+  border-color: var(--brand-bg);
+  font-weight: 600;
+}
+
+button.danger {
+  color: var(--error);
+  border-color: var(--error);
+  background: none;
+}
+
+.notice {
+  padding: 8px 12px;
+  margin: 0;
+  font-size: 0.88em;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* Errors carry the tool's own message verbatim — let them wrap rather
+     than clipping the line that names the cause. */
+  white-space: pre-wrap;
+}
+
+.notice.error {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.notice[hidden] {
+  display: none;
+}
+
+#results {
+  flex: 1;
+  min-width: 0;
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.placeholder {
+  margin: auto;
+  max-width: 32em;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.placeholder[hidden] {
+  display: none;
+}
+
+section[hidden] {
+  display: none;
+}
+
+#results section {
+  padding: 14px 16px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.section-header h2 {
+  flex: 1;
+}
+
+/* The save bar under an image or a text pane: dimmed, small, at the lower
+   right — the same footer `orangu-server`'s console puts under an answer and
+   under a rendered diagram, so saving means the same thing and looks the same
+   in both consoles. */
+.area-actions {
+  margin-top: 0.5em;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 0.72em;
+  opacity: 0.65;
+}
+
+.save-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  text-decoration: none;
+}
+
+.save-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+
+/* An action in a section header: readable at a glance, and clearly a control
+   rather than one of the dimmed save links under the content. */
+.header-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 0.85em;
+}
+
+.header-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.header-btn[hidden] {
+  display: none;
+}
+
+/* The format beside the icon, because two identical save icons cannot say
+   which of them is the PNG. */
+.save-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.save-btn[hidden] {
+  display: none;
+}
+
+#status-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.badge {
+  padding: 2px 10px;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.badge.running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.badge.ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.badge.failed,
+.badge.cancelled {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+#status-meta {
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: var(--text-dim);
+}
+
+#summary-env {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin-bottom: 12px;
+  font-size: 0.85em;
+}
+
+#summary-env .k {
+  color: var(--text-dim);
+}
+
+#summary-env .v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+
+th, td {
+  padding: 6px 10px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th:first-child, td:first-child,
+th.left, td.left {
+  text-align: left;
+}
+
+thead th {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+td.num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* The measured rate, and the reason the table exists: the one column the eye
+   should land on. */
+td.best {
+  font-weight: 600;
+}
+
+#flamegraph-stats,
+#chart-section img {
+  margin-top: 4px;
+}
+
+#flamegraph-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-bottom: 10px;
+  font-size: 0.85em;
+  color: var(--text-dim);
+}
+
+#flamegraph-stats b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Tall enough to read a real stack, resizable because how deep one is varies
+   by an order of magnitude between engines. White behind it because the
+   rendered flamegraph is light in every theme — it is the same file the run
+   wrote to disk, and a dark backdrop would show through as a slab beside it. */
+#flamegraph-frame {
+  width: 100%;
+  height: 560px;
+  min-height: 200px;
+  resize: vertical;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #ffffff;
+}
+
+/* No plate under this one: the chart SVG carries its own light/dark rules
+   (see chart.rs), so a forced white background would sit behind a chart that
+   had already drawn itself dark. */
+#chart-img,
+#compare-img {
+  width: 100%;
+  border-radius: var(--radius);
+}
+
+/* The comparison: its chart, then the tables the tool printed — what
+   differed between the two runs, and what each measured. Monospace, because
+   they are columns. */
+#compare-section .section-header select {
+  width: auto;
+  max-width: 60%;
+  font-size: 0.9em;
+}
+
+#compare-text {
+  max-height: 460px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  line-height: 1.45;
+  white-space: pre;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+#compare-result[hidden],
+#compare-img[hidden] {
+  display: none;
+}
+
+#log {
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* stderr, kept apart from stdout rather than flattened into it: a retried
+   send or a profile that undercounted is a caveat on the number above it. */
+#log .err {
+  color: var(--error);
+}
+
+#footer {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  /* One span at each end, as `orangu-server`'s console footer sits. It used
+     to be spread by a middle element; with that gone the ends have to say so
+     themselves. */
+  justify-content: space-between;
+  padding: 6px 16px;
+  font-size: 0.78em;
+  background: var(--brand-bg);
+  border-top: 1px solid var(--brand-border);
+  color: var(--brand-text-dim);
+  flex-shrink: 0;
+}
+
+#footer a {
+  color: var(--brand-text);
+}
+
+/* Narrow windows: the form stops being a sidebar and becomes the first
+   block of one column. */
+@media (max-width: 860px) {
+  #body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  #panel {
+    width: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    overflow: visible;
+  }
+
+  #results {
+    overflow: visible;
+  }
+}

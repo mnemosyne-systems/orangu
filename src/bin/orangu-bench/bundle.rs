@@ -19,7 +19,7 @@
 //! # The problem this exists for
 //!
 //! `--history` already carries measurements between machines, but a history row
-//! is seven columns: date, label, mode, n, best, mean, sd. It says a number was
+//! is eight columns: date, label, mode, n, best, mean, sd, sd_sample. It says a number was
 //! 163.3 and nothing whatsoever about what produced it. That is fine while
 //! every row comes off the same desk. It stops being fine the moment the
 //! interesting comparison is against a GPU nobody local can boot — a different
@@ -81,6 +81,14 @@ pub struct Bundle {
     pub run: serde_json::Value,
     /// The GPU timestamp breakdown for the measured window, or `Null`.
     pub gpu_timings: serde_json::Value,
+    /// The harness build that took the measurement — `orangu-bench 1.2.0
+    /// (52c0443)`. Kept because a report rebuilt from this file must credit
+    /// the tool that *measured* it, not the one drawing the page. `None` for a
+    /// bundle written before the field carried a commit.
+    pub tool: Option<String>,
+    /// When it was measured, `2026-08-04T09:34:21Z`. `None` for a bundle
+    /// written before the field existed — those carry only [`Bundle::date`].
+    pub measured_at: Option<String>,
     pub records: Vec<Record>,
 }
 
@@ -117,7 +125,16 @@ pub fn write(
 ) -> anyhow::Result<()> {
     let doc = serde_json::json!({
         "schema": SCHEMA,
-        "tool": format!("orangu-bench {}", env!("CARGO_PKG_VERSION")),
+        // The harness's own build, not just its version. The measurement is
+        // as much a product of the tool as of the server: this file exists
+        // because "which build produced this number" has to be answerable
+        // months later, and that question has two halves — `props.version`
+        // and `props.commit` are the other one.
+        "tool": format!("orangu-bench {}", orangu::build_info::id()),
+        // *When*, to the second and in UTC. The records carry a date, which
+        // cannot separate two runs taken on the same afternoon — which is
+        // precisely when an A/B is taken.
+        "measured_at": crate::history::now_utc(),
         "props": props,
         "host": host,
         "run": run,
@@ -133,6 +150,11 @@ pub fn write(
             "best": r.best,
             "mean": r.mean,
             "sd": r.sd,
+            // Both estimators: `sd` is what this file has always carried
+            // (population, ÷ n), `sd_sample` is the standard one (÷ n-1) that
+            // a `±` from another benchmark can be put beside. `null` where one
+            // repetition leaves it undefined.
+            "sd_sample": r.sd_sample,
         })).collect::<Vec<_>>(),
     });
     // Pretty-printed on purpose: a bundle's whole job is to be read months
@@ -177,6 +199,11 @@ pub fn read(path: &str) -> anyhow::Result<Bundle> {
             .get("gpu_timings")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        tool: doc.get("tool").and_then(|v| v.as_str()).map(str::to_string),
+        measured_at: doc
+            .get("measured_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         records,
     })
 }
@@ -195,6 +222,9 @@ fn record_from(v: &serde_json::Value) -> Option<Record> {
         best: f("best")?,
         mean: f("mean")?,
         sd: f("sd")?,
+        // Absent from a bundle written before this field existed, which is
+        // read back as "not recorded" rather than as zero.
+        sd_sample: f("sd_sample"),
     })
 }
 
@@ -279,6 +309,7 @@ mod tests {
             best: mean + 1.0,
             mean,
             sd: 0.5,
+            sd_sample: Some(0.61),
         }
     }
 

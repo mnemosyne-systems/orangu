@@ -16,18 +16,18 @@
 //! `orangu-bench` — a small developer tool that measures the throughput of a
 //! running OpenAI-compatible server over HTTP. Point it at any server that
 //! speaks `POST /v1/completions` with SSE streaming — **both `orangu-server`
-//! and `llama-server`** do — and it reports either:
+//! and every other conformant server** do — and it reports either:
 //!
 //! - **decode** (the default, and `--curve`): steady-state token-generation
 //!   tok/s at one or more context depths, timed from the first streamed token
-//!   to the last so prefill and TTFT are excluded — `llama-bench`'s `tg`.
+//!   to the last so prefill and TTFT are excluded — the standard `tg` test.
 //! - **prefill** (`--pp`): prompt-processing tok/s, taken from the server's
 //!   own `timings` so the token count is exact and a prefix-cache hit is
-//!   visible rather than disguised as a fast run — `llama-bench`'s `pp`.
+//!   visible rather than disguised as a fast run — the standard `pp` test.
 //!
 //! It exists because "how fast is decode, and how does it scale with context?"
 //! needs the *same* measurement applied to both engines through the *same*
-//! path — not `llama-bench` (in-process) compared against an ad-hoc HTTP curl
+//! path — not an in-process benchmark compared against an ad-hoc HTTP curl
 //! of orangu. This tool is that apples-to-apples harness.
 //!
 //! This is a **developer tool**, not part of the served product; it is
@@ -37,13 +37,14 @@
 //! ```text
 //! # orangu-server on :8100, sweep decode rate across context depths
 //! orangu-bench --url http://127.0.0.1:8100 --depths 0,512,1024,2048,3072 --gen 128
-//! # llama-server on :8300, same harness (uses the OpenAI-compat endpoint)
+//! # another OpenAI-compatible server on :8300, same harness
 //! orangu-bench --url http://127.0.0.1:8300 --depths 0,512,1024,2048,3072 --gen 128
 //! # prefill throughput at a few prompt lengths
 //! orangu-bench --url http://127.0.0.1:8100 --pp 128,512,1024,2048
 //! ```
 
 use std::io::{BufRead, BufReader};
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
@@ -52,8 +53,11 @@ mod bundle;
 mod chart;
 mod flamegraph;
 mod history;
+mod points;
 mod profile;
+mod report;
 mod sweep;
+mod web;
 
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
@@ -64,30 +68,57 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8100")]
     url: String,
 
-    /// Comma-separated context depths to sweep.
-    #[arg(long, default_value = "0", value_delimiter = ',')]
+    /// Comma-separated context depths to sweep. Ranges too: `0-2048+512`.
+    #[arg(long = "depths", default_value = "0", value_delimiter = ',')]
+    depths_spec: Vec<String>,
+
+    /// [`Args::depths_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
     depths: Vec<u32>,
 
     /// Prefill mode: comma-separated prompt lengths (in tokens) to sweep,
     /// reporting **prompt-processing** throughput instead of the decode sweep
-    /// — `llama-bench`'s `pp` to the default `tg`. Rates come from the
+    /// — the standard `pp` test to the default `tg`. Rates come from the
     /// server's own `timings`, so the token count is exact rather than
     /// inferred from the requested length, and the reported cache hit makes a
     /// prompt that was never actually processed impossible to mistake for a
     /// fast one.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = "pp", value_delimiter = ',')]
+    pp_spec: Vec<String>,
+
+    /// [`Args::pp_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
     pp: Vec<u32>,
 
     /// Continuation-prefill mode: comma-separated *added* token counts to sweep.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = "pp-continue", value_delimiter = ',')]
+    pp_continue_spec: Vec<String>,
+
+    /// [`Args::pp_continue_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
     pp_continue: Vec<u32>,
+
+    /// Combined mode: comma-separated prompt lengths, each prefilled **and**
+    /// generated from in one request, reporting `(prompt + generated) / total`
+    /// — the whole turn, which is what a user waits for and what most
+    /// third-party comparisons quote. The generated length is `--gen`.
+    #[arg(long = "pg", value_delimiter = ',')]
+    pg_spec: Vec<String>,
+
+    /// [`Args::pg_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
+    pg: Vec<u32>,
 
     /// Report the server's CPU time per generated token, with prefill excluded.
     #[arg(long, default_value_t = false)]
     decode_cpu: bool,
 
     /// Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = "streams", value_delimiter = ',')]
+    streams_spec: Vec<String>,
+
+    /// [`Args::streams_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
     streams: Vec<u32>,
 
     /// Prompt length (tokens) to prime the prefix cache with for `--pp-continue`.
@@ -103,10 +134,14 @@ struct Args {
     /// default decode sweep and `--pp` fail outright on it: `embeddinggemma-
     /// 300M` is a supported, working model that this tool simply could not
     /// measure. Rates come from the response's `usage.prompt_tokens` — which
-    /// both `orangu-server` and `llama-server` report — so the token count is
+    /// every conformant server reports — so the token count is
     /// the one the forward pass actually ran, not an estimate from the prompt
     /// text.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = "embed", value_delimiter = ',')]
+    embed_spec: Vec<String>,
+
+    /// [`Args::embed_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
     embed: Vec<u32>,
 
     /// Number of tokens to generate per timed run.
@@ -232,11 +267,74 @@ struct Args {
     /// because no rasterizer was installed at the time.
     #[arg(long)]
     render_profile: Option<String>,
+
+    /// Write the run — provenance, measurements, chart and flamegraph — to
+    /// one PDF.
+    #[arg(long)]
+    report: Option<String>,
+
+    /// Serve the web console instead of measuring: define runs in a browser
+    /// and read back the summary table, the flamegraph and the chart.
+    #[arg(long, default_value_t = false)]
+    web: bool,
+
+    /// Address the web console binds: "all" (or "*") for every interface.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port the web console listens on.
+    #[arg(long, default_value_t = 8300)]
+    port: u16,
+
+    /// Seconds to wait between measured points, for a card that heats up.
+    #[arg(long, default_value_t = 0)]
+    delay: u64,
+}
+
+impl Args {
+    /// Turn every list flag's text into the numbers it names, once, before
+    /// anything is measured.
+    ///
+    /// Done here rather than in a `value_parser` because one item can expand
+    /// to many — `128-2048*2` is five points from one argument — which clap's
+    /// one-value-per-argument parsing cannot express. Failing here also means
+    /// a mistyped range costs nothing: the error arrives before the first
+    /// request, not twenty minutes into a sweep.
+    fn expand_lists(&mut self) -> anyhow::Result<()> {
+        for (what, spec, out) in [
+            ("--depths", &self.depths_spec, &mut self.depths),
+            ("--pp", &self.pp_spec, &mut self.pp),
+            ("--pg", &self.pg_spec, &mut self.pg),
+            (
+                "--pp-continue",
+                &self.pp_continue_spec,
+                &mut self.pp_continue,
+            ),
+            ("--embed", &self.embed_spec, &mut self.embed),
+            ("--streams", &self.streams_spec, &mut self.streams),
+        ] {
+            *out = points::expand_list(spec).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Wait out `--delay` before the next measured point.
+    ///
+    /// Between points, never before the first or after the last: the delay is
+    /// there to let a card cool between measurements, and padding the ends
+    /// only makes the run longer. A laptop GPU that heats through a sweep
+    /// reports a falling curve that looks exactly like the thing these sweeps
+    /// are run to find, which is why this exists at all.
+    fn settle(&self) {
+        if self.delay > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(self.delay));
+        }
+    }
 }
 
 /// POST `body` to `endpoint`, retrying once on a connection-level failure.
 ///
-/// Not defensive programming — a specific, reproduced failure. `llama-server`
+/// Not defensive programming — a specific, reproduced failure. A server
 /// closes an idle keep-alive connection on its own schedule, and a client that
 /// reuses it at the wrong moment gets a reset. In a long sweep that surfaces as
 /// one lost measurement out of hundreds, aborting the run: four of eight models'
@@ -268,6 +366,67 @@ fn post_with_one_retry(
                 // dropped a connection mid-sweep, and those need different
                 // responses — the difference cost an afternoon once.
                 .map_err(|e| anyhow::anyhow!("Error sending request to url ({endpoint}): {e}"))
+        }
+    }
+}
+
+/// What one measured point reports across its repetitions.
+///
+/// Two standard deviations, on purpose. `sd` divides by `n` (the *population*
+/// estimator) and is what `perf-history.tsv`'s `sd` column has held since the
+/// file was created — a column in an append-only record means one thing
+/// forever, so it keeps that meaning. `sd_sample` divides by `n - 1`, which is
+/// the standard estimator and the one every other benchmark reports; without
+/// it a `±` figure from this tool could not be put beside a `±` figure from
+/// anywhere else. At the default three repetitions the two differ by
+/// `sqrt(3/2)` — 22% — which is larger than most of the differences this tool
+/// is run to detect.
+#[derive(Clone, Copy, Debug)]
+struct Stats {
+    /// The best of the repetitions: the largest rate, or the smallest where
+    /// lower is better (`--decode-cpu` reports milliseconds).
+    best: f64,
+    mean: f64,
+    /// Population standard deviation (÷ n).
+    sd: f64,
+    /// Sample standard deviation (÷ n-1). `None` for a single repetition,
+    /// where it is undefined — reported as `—` rather than as `0.00`, which
+    /// would claim a spread was measured and found to be zero.
+    sd_sample: Option<f64>,
+}
+
+impl Stats {
+    fn of(values: &[f64], lower_is_better: bool) -> Stats {
+        let n = values.len();
+        if n == 0 {
+            return Stats {
+                best: 0.0,
+                mean: 0.0,
+                sd: 0.0,
+                sd_sample: None,
+            };
+        }
+        let best = if lower_is_better {
+            values.iter().copied().fold(f64::INFINITY, f64::min)
+        } else {
+            values.iter().copied().fold(0.0_f64, f64::max)
+        };
+        let mean = values.iter().sum::<f64>() / n as f64;
+        let sum_sq: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
+        Stats {
+            best,
+            mean,
+            sd: (sum_sq / n as f64).sqrt(),
+            sd_sample: (n > 1).then(|| (sum_sq / (n - 1) as f64).sqrt()),
+        }
+    }
+
+    /// The `±` figure as printed: the sample standard deviation, or `—` when
+    /// one repetition makes it undefined.
+    fn plus_minus(&self, width: usize, precision: usize) -> String {
+        match self.sd_sample {
+            Some(sd) => format!("{sd:>width$.precision$}"),
+            None => format!("{:>width$}", "—"),
         }
     }
 }
@@ -447,7 +606,7 @@ impl PrefillSample {
 /// `cache_prompt: false` is what keeps the plain sweep honest: without it the
 /// second and later reps would find their prompt already in the server's prefix
 /// cache and report the speed of a cache lookup. Both `orangu-server` and
-/// `llama-server` honour it; the `cached` column the caller prints is the check
+/// other engines honour it; the `cached` column the caller prints is the check
 /// that whatever server answered actually did.
 ///
 /// `--pp-continue` passes `true` instead, because a cache hit is precisely what
@@ -473,7 +632,7 @@ fn run_prefill_once(
         // only for `--pp-continue`, whose whole subject is the prefill that
         // happens *after* a hit.
         "cache_prompt": cache_prompt,
-        // llama-server only attaches `timings` to its OpenAI-compatible
+        // Some servers only attach `timings` to their OpenAI-compatible
         // responses when asked; orangu-server always sends them.
         "timings_per_token": true,
     });
@@ -583,7 +742,7 @@ impl EmbedSample {
 /// but small beside a forward pass — and identical on both engines, since the
 /// same client sends both. It is the same trade `doc/perf/embed_bench.sh`
 /// made with `curl`; the difference here is that the token count comes from
-/// the server rather than from a separate `llama-tokenize` run.
+/// the server rather than from a separate tokenizer run.
 ///
 /// No `stream`: neither server streams embeddings, and there is no first
 /// token to time to.
@@ -646,7 +805,7 @@ fn run_once(
     let mut body = serde_json::json!({
         "prompt": prompt,
         "max_tokens": n_gen,
-        // llama.cpp's native field name, harmless to OpenAI servers that
+        // The native (non-OpenAI) field name, harmless to servers that
         // ignore it — sending both maximizes cross-server compatibility.
         "n_predict": n_gen,
         "temperature": 0,
@@ -655,7 +814,7 @@ fn run_once(
         // Generate exactly `n_gen` tokens regardless of content — without this a
         // greedy model handed a depth-padded (repetitive) prompt emits EOS on
         // the first token, so the non-zero-depth rows timed **0** tokens. This
-        // is the same "measure decode, not content" contract `llama-bench -d`
+        // is the same "measure decode, not content" contract a depth sweep
         // uses.
         "ignore_eos": true,
     });
@@ -712,7 +871,7 @@ fn stream_and_time(
             Ok(v) => v,
             Err(_) => continue,
         };
-        // OpenAI `choices[0].text`, or llama.cpp native `content`.
+        // OpenAI `choices[0].text`, or the native `content`.
         let text = v
             .get("choices")
             .and_then(|c| c.get(0))
@@ -739,7 +898,12 @@ fn stream_and_time(
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Err(e) = args.expand_lists() {
+        eprintln!("orangu-bench: {e}");
+        std::process::exit(1);
+    }
+    let args = args;
     if let Err(e) = run(&args) {
         // A single clean line (e.g. a refused connection), not anyhow's
         // multi-line "Error: … Caused by: …" chain.
@@ -749,6 +913,13 @@ fn main() {
 }
 
 fn run(args: &Args) -> anyhow::Result<()> {
+    // First of all the modes: the console starts nothing of its own and
+    // measures nothing itself — it runs *this* binary, once per benchmark the
+    // browser defines, so every other branch below is reachable through it.
+    if args.web {
+        return web::serve(&args.host, args.port);
+    }
+
     // Chart-only never touches the network, so it works on a history file
     // carried off the machine that produced it — and, more usefully, after a
     // hand-edit of that file, without needing a server up to redraw.
@@ -854,9 +1025,16 @@ fn run(args: &Args) -> anyhow::Result<()> {
     env.gpu_timings = take_gpu_timings(&client, &args.url);
     report_gpu_timings(&env.gpu_timings, args);
 
+    // Kept, not just printed: `--report` folds the profile's own numbers
+    // (samples, window, cores busy, what it was waiting on) in beside the
+    // picture, and they exist nowhere else once this scope ends.
+    let mut profile = None;
     if let Some(recorder) = recorder {
         match recorder.finish() {
-            Ok(summary) => report_profile(&summary, args),
+            Ok(summary) => {
+                report_profile(&summary, args);
+                profile = Some(summary);
+            }
             // The rate is the deliverable; a profile that failed to render is
             // reported and does not discard the measurement that just ran.
             Err(e) => eprintln!("orangu-bench: flamegraph not written: {e}"),
@@ -865,7 +1043,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     let measured = measured?;
     write_bundle(args, args.bundle.as_deref(), &env, &measured)?;
-    record_and_chart(args, &measured)
+    record_and_chart(args, &measured)?;
+    write_report(args, &env, &measured, profile.as_ref())
 }
 
 /// Write `--bundle`, if asked for.
@@ -891,6 +1070,7 @@ fn write_bundle(
         "workload": workload_name(args),
         "depths": args.depths,
         "pp": args.pp,
+        "pg": args.pg,
         "pp_continue": args.pp_continue,
         "embed": args.embed,
         "streams": args.streams,
@@ -914,6 +1094,378 @@ fn write_bundle(
         println!("  bundle   {path} ({} rows)", records.len());
     }
     Ok(())
+}
+
+/// `--report`: the whole run as one PDF — what produced it, what it measured,
+/// and the pictures.
+///
+/// A PDF rather than a markdown table because **the pictures are the point**:
+/// a rate quoted without the chart it sits on, or without the profile that
+/// explains it, is a number a reader has to take on trust. The chart and the
+/// flamegraph are already written as SVG and PNG; this is what puts them in
+/// one file with the numbers and the provenance.
+///
+/// The PNG is what gets embedded (a PDF cannot carry an SVG), so a run that
+/// asked for a report renders the raster twin even when `--chart-png` /
+/// `--flamegraph-png` were not passed. A machine with no rasterizer says so
+/// once and the report is written without that image rather than not at all.
+fn write_report(
+    args: &Args,
+    env: &Environment,
+    records: &[history::Record],
+    profile: Option<&profile::Summary>,
+) -> anyhow::Result<()> {
+    let Some(path) = &args.report else {
+        return Ok(());
+    };
+    let blocks = run_report_blocks(&ReportSource {
+        provenance: provenance_fields(args, env),
+        records,
+        reps: args.reps.max(1),
+        drifting: env
+            .gpus
+            .iter()
+            .filter(|gpu| gpu.power_level.eq_ignore_ascii_case("auto"))
+            .map(|gpu| gpu.card.clone())
+            .collect(),
+        chart_png: args.chart.as_deref().and_then(raster_twin),
+        chart_caption: chart_caption(args),
+        profile: profile.map(ProfileFacts::from_summary),
+        flamegraph_png: profile.and_then(|s| {
+            s.png
+                .clone()
+                .or_else(|| raster_twin(&s.svg.display().to_string()))
+        }),
+    });
+
+    let path = std::path::Path::new(path);
+    report::write(
+        path,
+        "orangu-bench report",
+        &format!("{} · {}", workload_name(args), history::today()),
+        &format!("orangu-bench {}", orangu::build_info::id()),
+        &blocks,
+    )?;
+    if !args.json {
+        println!("  report   {}", path.display());
+    }
+    Ok(())
+}
+
+/// Everything a run report is made of, whichever side it came from — a run
+/// that just finished, or a bundle read back off disk months later.
+///
+/// One layout, two sources. A second copy of the page would drift, and the
+/// two would disagree about the same run.
+struct ReportSource<'a> {
+    provenance: Vec<(String, String)>,
+    records: &'a [history::Record],
+    reps: u32,
+    /// Cards measured at `auto`, which invalidates a comparison rather than
+    /// qualifying it.
+    drifting: Vec<String>,
+    chart_png: Option<PathBuf>,
+    chart_caption: String,
+    profile: Option<ProfileFacts>,
+    flamegraph_png: Option<PathBuf>,
+}
+
+/// The profile's own numbers, from either a live capture or the `meta.json`
+/// written beside a flamegraph.
+struct ProfileFacts {
+    samples: u64,
+    seconds: f64,
+    cores_busy: f64,
+    gpu_wait: f64,
+    pool_idle: f64,
+    buckets: Vec<(String, f64)>,
+}
+
+impl ProfileFacts {
+    fn from_summary(s: &profile::Summary) -> ProfileFacts {
+        ProfileFacts {
+            samples: s.samples,
+            seconds: s.seconds,
+            cores_busy: s.cores_busy,
+            gpu_wait: s.gpu_wait,
+            pool_idle: s.pool_idle,
+            buckets: s
+                .buckets
+                .iter()
+                .map(|(name, share)| ((*name).to_string(), *share))
+                .collect(),
+        }
+    }
+
+    /// Read back from `<flamegraph>.meta.json` — the sidecar
+    /// `profile::Recorder::finish` leaves precisely so these numbers outlive
+    /// the process that measured them. Bucket shares are not in it, so a
+    /// reconstructed report carries the totals and the picture without the
+    /// self-time table.
+    fn from_meta(path: &FsPath) -> Option<ProfileFacts> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let meta: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let num = |key: &str| meta.get(key).and_then(serde_json::Value::as_f64);
+        Some(ProfileFacts {
+            samples: meta.get("samples").and_then(serde_json::Value::as_u64)?,
+            seconds: num("seconds")?,
+            cores_busy: num("cores_busy").unwrap_or(0.0),
+            gpu_wait: num("gpu_wait_pct").unwrap_or(0.0),
+            pool_idle: num("pool_idle_pct").unwrap_or(0.0),
+            buckets: Vec::new(),
+        })
+    }
+}
+
+/// The run report's blocks, in the order they are laid out.
+fn run_report_blocks(source: &ReportSource) -> Vec<report::Block> {
+    let mut blocks = vec![
+        report::Block::Heading("What produced it".to_string()),
+        report::Block::Fields(source.provenance.clone()),
+        report::Block::Heading("What it measured".to_string()),
+        report::Block::Table {
+            columns: vec![
+                report::Column::left("measurement"),
+                report::Column::right("n"),
+                report::Column::right("best"),
+                report::Column::right("mean"),
+                report::Column::right("± sd (n-1)"),
+                report::Column::left("unit"),
+            ],
+            rows: source.records.iter().map(record_row).collect(),
+        },
+        // The headline is the *best* run, not the mean, and a reader comparing
+        // this against a number produced elsewhere has to know that: a best is
+        // always the flattering one. Said on the page, since the page is what
+        // travels.
+        report::Block::Note(format!(
+            "best of {} repetitions, with the mean and the sample standard deviation \
+             (divided by n-1, the standard estimator) beside it. The n column is what the \
+             server reported processing, not what was requested.",
+            source.reps
+        )),
+    ];
+
+    // A card left on `auto` idles its clock down between requests, which moves
+    // throughput by more than most of the differences this tool is run to
+    // detect — and it is invisible in the rate itself.
+    if !source.drifting.is_empty() {
+        blocks.push(report::Block::Note(format!(
+            "Caution: {} was measured at power_dpm_force_performance_level = auto, so its clock \
+             was free to idle down between requests. These rates are not comparable with rates \
+             taken on a pinned clock.",
+            source.drifting.join(", ")
+        )));
+    }
+
+    if let Some(png) = &source.chart_png {
+        blocks.push(report::Block::Heading("Throughput".to_string()));
+        blocks.push(report::Block::Image {
+            caption: format!("{} — every recorded point", source.chart_caption),
+            path: png.clone(),
+        });
+    }
+
+    if let Some(profile) = &source.profile {
+        blocks.push(report::Block::Heading("Where the time went".to_string()));
+        blocks.push(report::Block::Fields(vec![
+            ("samples".to_string(), profile.samples.to_string()),
+            ("window".to_string(), format!("{:.1} s", profile.seconds)),
+            (
+                "cores busy".to_string(),
+                format!("{:.2}", profile.cores_busy),
+            ),
+            (
+                "of which waiting".to_string(),
+                format!(
+                    "{:.1}% GPU, {:.1}% pool-idle",
+                    profile.gpu_wait, profile.pool_idle
+                ),
+            ),
+        ]));
+        // A flamegraph is normalised to its own total, so the buckets are the
+        // only part of it that survives being quoted on its own.
+        if !profile.buckets.is_empty() {
+            blocks.push(report::Block::Table {
+                columns: vec![
+                    report::Column::left("bucket"),
+                    report::Column::right("self"),
+                ],
+                rows: profile
+                    .buckets
+                    .iter()
+                    .map(|(name, share)| vec![name.clone(), format!("{share:.1}%")])
+                    .collect(),
+            });
+        }
+    }
+    if let Some(png) = &source.flamegraph_png {
+        blocks.push(report::Block::Image {
+            caption: "CPU profile over the measured window".to_string(),
+            path: png.clone(),
+        });
+    }
+    blocks
+}
+
+/// The provenance block: everything a reader needs to know whether two
+/// reports are comparable, in the order they would ask.
+fn provenance_fields(args: &Args, env: &Environment) -> Vec<(String, String)> {
+    let text = |key: &str| -> Option<String> {
+        env.props
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let mut fields = vec![("url".to_string(), args.url.clone())];
+    for (label, key) in [("model", "model"), ("backend", "backend")] {
+        if let Some(value) = text(key) {
+            fields.push((label.to_string(), value));
+        }
+    }
+    if let Some(build) = server_build(Some(&env.props)) {
+        fields.push(("server build".to_string(), build));
+    }
+    if let Some(pid) = env.props.get("pid").and_then(serde_json::Value::as_u64) {
+        let uptime = env
+            .props
+            .get("uptime_seconds")
+            .and_then(serde_json::Value::as_u64);
+        fields.push((
+            "server process".to_string(),
+            match uptime {
+                Some(up) => format!("pid {pid}, up {up}s"),
+                None => format!("pid {pid}"),
+            },
+        ));
+    }
+    for line in format_gpu_tuning(env.props.get("gpu")) {
+        // `format_gpu_tuning` returns "label  value" pairs already padded for
+        // a terminal; the report's own columns replace that padding.
+        if let Some((label, value)) = line.split_once("  ") {
+            fields.push((label.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    for gpu in &env.gpus {
+        fields.push((
+            gpu.card.clone(),
+            format!("sclk {} ({})", gpu.sclk, gpu.power_level),
+        ));
+    }
+    fields.push((
+        "host".to_string(),
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    ));
+    fields.push(("workload".to_string(), workload_detail(args)));
+    // To the second, in UTC. Two runs of an A/B are usually the same
+    // afternoon, and a date cannot tell them apart.
+    fields.push(("measured".to_string(), history::now_utc()));
+    fields.push((
+        "harness".to_string(),
+        format!("orangu-bench {}", orangu::build_info::id()),
+    ));
+    fields
+}
+
+/// One row of the summary table. `cpu` is milliseconds per token and every
+/// other mode is tokens per second — the unit column is what stops the two
+/// being read as one.
+fn record_row(record: &history::Record) -> Vec<String> {
+    let unit = if record.mode == "cpu" {
+        "ms/token"
+    } else {
+        "tok/s"
+    };
+    vec![
+        measurement_name(&record.mode).to_string(),
+        record.n.to_string(),
+        format!("{:.2}", record.best),
+        format!("{:.2}", record.mean),
+        // The sample estimator, so this figure can be read against one from
+        // another benchmark; `—` where a single repetition leaves it
+        // undefined. The population figure stays in the bundle and the
+        // history file, where the column has always meant that.
+        record
+            .sd_sample
+            .map_or_else(|| "—".to_string(), |sd| format!("{sd:.2}")),
+        unit.to_string(),
+    ]
+}
+
+/// A record's `mode` in words. The bundle and the history file keep the short
+/// form (they are data); a report has room to say it.
+fn measurement_name(mode: &str) -> &str {
+    match mode {
+        "tg" => "decode",
+        "pp" => "prefill",
+        "pg" => "prefill + decode",
+        "curve" => "decode @ context",
+        "cpu" => "decode CPU",
+        "embed" => "embedding",
+        other => other,
+    }
+}
+
+/// The sweep behind the run, spelled out for the provenance block.
+fn workload_detail(args: &Args) -> String {
+    let list = |values: &[u32]| {
+        values
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let points = if !args.pg.is_empty() {
+        format!("prompt lengths {}", list(&args.pg))
+    } else if !args.pp.is_empty() {
+        format!("prompt lengths {}", list(&args.pp))
+    } else if !args.pp_continue.is_empty() {
+        format!(
+            "added tokens {} on a {}-token base",
+            list(&args.pp_continue),
+            args.pp_continue_base
+        )
+    } else if !args.embed.is_empty() {
+        format!("prompt lengths {}", list(&args.embed))
+    } else if !args.streams.is_empty() {
+        format!("streams {}", list(&args.streams))
+    } else if args.curve > 0 {
+        format!("{} tokens in {}-token buckets", args.curve, args.bucket)
+    } else {
+        format!("context depths {}", list(&args.depths))
+    };
+    format!(
+        "{} · {points} · {} tokens, best of {}{}",
+        workload_name(args),
+        args.n_gen,
+        args.reps.max(1),
+        if args.no_warmup { ", no warmup" } else { "" }
+    )
+}
+
+fn chart_caption(args: &Args) -> String {
+    match &args.history {
+        Some(path) => path.to_string(),
+        None => "this run".to_string(),
+    }
+}
+
+/// The `.png` beside an `.svg`, rendering it if it is not there yet.
+///
+/// A report needs the raster: PDF has no way to carry an SVG. Rendering it
+/// here rather than requiring `--chart-png`/`--flamegraph-png` is what makes
+/// `--report` a complete instruction on its own.
+fn raster_twin(svg: &str) -> Option<std::path::PathBuf> {
+    let svg = std::path::Path::new(svg);
+    let png = svg.with_extension("png");
+    if png.is_file() {
+        return Some(png);
+    }
+    if !svg.is_file() {
+        return None;
+    }
+    profile::render_png(svg).ok().flatten()
 }
 
 /// `--sweep`: one server per value of one tuning variable, measured in turn.
@@ -1241,7 +1793,282 @@ fn compare_bundles(args: &Args) -> anyhow::Result<()> {
 
     // The records of every bundle, so one chart holds every machine.
     let records: Vec<history::Record> = bundles.iter().flat_map(|b| b.records.clone()).collect();
-    write_chart(args, &records)
+    write_chart(args, &records)?;
+    write_comparison_report(args, &bundles)
+}
+
+/// `--read-bundle one.json --report out.pdf`: a run's report, rebuilt from
+/// what the run archived.
+///
+/// Everything the live path knows is in the bundle — `props`, `host`, the
+/// records, the workload — except the pictures, which are files. Those are
+/// looked for **beside the bundle**, because that is how a run's directory is
+/// laid out: `bundle.json`, `chart.svg`/`.png`, `flamegraph.svg`/`.png` and
+/// the profile's `meta.json` in one place. A missing picture leaves a line in
+/// the document rather than failing it.
+fn write_report_from_bundle(
+    args: &Args,
+    bundle: &bundle::Bundle,
+    path: &FsPath,
+) -> anyhow::Result<()> {
+    let dir = args
+        .read_bundle
+        .first()
+        .map(|p| {
+            FsPath::new(p)
+                .parent()
+                .unwrap_or(FsPath::new("."))
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| FsPath::new(".").to_path_buf());
+    let beside = |name: &str| -> Option<PathBuf> {
+        let png = dir.join(name).with_extension("png");
+        if png.is_file() {
+            return Some(png);
+        }
+        // Not rendered yet: the SVG is the canonical artifact, so make its
+        // raster twin now rather than leaving a hole in the document.
+        raster_twin(&dir.join(name).with_extension("svg").display().to_string())
+    };
+
+    let text = |key: &str| -> Option<String> {
+        bundle
+            .props
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let mut provenance = Vec::new();
+    if let Some(url) = bundle.run.get("url").and_then(|v| v.as_str()) {
+        provenance.push(("url".to_string(), url.to_string()));
+    }
+    for (label, key) in [("model", "model"), ("backend", "backend")] {
+        if let Some(value) = text(key) {
+            provenance.push((label.to_string(), value));
+        }
+    }
+    if let Some(build) = server_build(Some(&bundle.props)) {
+        provenance.push(("server build".to_string(), build));
+    }
+    for line in format_gpu_tuning(bundle.props.get("gpu")) {
+        if let Some((label, value)) = line.split_once("  ") {
+            provenance.push((label.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    // The clocks the *run* saw, from its own host block — not this machine's,
+    // which is very likely a different one.
+    let clocks = bundle.host.get("clocks").and_then(|c| c.as_array());
+    for gpu in clocks.into_iter().flatten() {
+        let field = |key: &str| gpu.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+        provenance.push((
+            field("card").to_string(),
+            format!("sclk {} ({})", field("sclk"), field("power_level")),
+        ));
+    }
+    if let (Some(os), Some(arch)) = (
+        bundle.host.get("os").and_then(|v| v.as_str()),
+        bundle.host.get("arch").and_then(|v| v.as_str()),
+    ) {
+        provenance.push(("host".to_string(), format!("{os}/{arch}")));
+    }
+    if let Some(workload) = bundle.run.get("workload").and_then(|v| v.as_str()) {
+        provenance.push(("workload".to_string(), workload.to_string()));
+    }
+    provenance.push((
+        "measured".to_string(),
+        // The instant the bundle recorded; its date only for one written
+        // before the field existed.
+        bundle
+            .measured_at
+            .clone()
+            .unwrap_or_else(|| bundle.date.clone()),
+    ));
+    provenance.push((
+        "harness".to_string(),
+        // The build that *measured* it, not the one drawing this page.
+        bundle
+            .tool
+            .clone()
+            .unwrap_or_else(|| format!("orangu-bench {}", orangu::build_info::id())),
+    ));
+
+    let drifting: Vec<String> = clocks
+        .into_iter()
+        .flatten()
+        .filter(|gpu| {
+            gpu.get("power_level")
+                .and_then(|v| v.as_str())
+                .is_some_and(|level| level.eq_ignore_ascii_case("auto"))
+        })
+        .filter_map(|gpu| gpu.get("card").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    let blocks = run_report_blocks(&ReportSource {
+        provenance,
+        records: &bundle.records,
+        reps: bundle
+            .run
+            .get("reps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32,
+        drifting,
+        chart_png: beside("chart"),
+        chart_caption: "this run".to_string(),
+        profile: ProfileFacts::from_meta(&dir.join("flamegraph.meta.json")),
+        flamegraph_png: beside("flamegraph"),
+    });
+
+    report::write(
+        path,
+        "orangu-bench report",
+        &format!(
+            "{} · {}",
+            bundle
+                .run
+                .get("workload")
+                .and_then(|v| v.as_str())
+                .unwrap_or(bundle.label()),
+            bundle.date
+        ),
+        &format!("orangu-bench {}", orangu::build_info::id()),
+        &blocks,
+    )?;
+    if !args.json {
+        println!("  report   {}", path.display());
+    }
+    Ok(())
+}
+
+/// `--read-bundle A,B --report out.pdf`: the comparison as a document.
+///
+/// The same two tables the terminal prints — what differed between the
+/// configurations, then what each measured with the ratio — plus the chart
+/// holding both runs. Written here rather than left to the measuring path
+/// because a comparison is the thing most likely to be *sent to someone*, and
+/// a `--report` that was silently ignored on this route would be worse than
+/// one that did not exist.
+fn write_comparison_report(args: &Args, bundles: &[bundle::Bundle]) -> anyhow::Result<()> {
+    let Some(path) = &args.report else {
+        return Ok(());
+    };
+    let Some((first, rest)) = bundles.split_first() else {
+        return Ok(());
+    };
+    // One bundle is not a comparison — it is a run, read back. Reporting it as
+    // "what was compared: one thing" would be a document about nothing, so it
+    // takes the run-report path instead. This is what makes a report producible
+    // *after* the fact, from what a run archived, rather than only at the
+    // moment it finished.
+    if rest.is_empty() {
+        return write_report_from_bundle(args, first, std::path::Path::new(path));
+    }
+
+    let mut blocks = vec![report::Block::Heading("What was compared".to_string())];
+    blocks.push(report::Block::Fields(
+        bundles
+            .iter()
+            .map(|b| (b.name.clone(), format!("{} · {}", b.label(), b.date)))
+            .collect(),
+    ));
+
+    for b in rest {
+        let fields = bundle::diff(first, b);
+        blocks.push(report::Block::Heading(format!(
+            "What differed: {} → {}",
+            first.name, b.name
+        )));
+        if fields.is_empty() {
+            // Worth saying out loud, exactly as the terminal does: "same
+            // configuration" is a finding, and an empty space is not.
+            blocks.push(report::Block::Note(
+                "Nothing — same configuration.".to_string(),
+            ));
+        } else {
+            blocks.push(report::Block::Table {
+                columns: vec![
+                    report::Column::left("field"),
+                    report::Column::left(&first.name),
+                    report::Column::left(&b.name),
+                ],
+                rows: fields
+                    .into_iter()
+                    .map(|(key, left, right)| vec![key, left, right])
+                    .collect(),
+            });
+        }
+    }
+
+    // One row per measured point, one column per bundle, and the ratio against
+    // the first — the number the comparison was run for.
+    let per_bundle: Vec<_> = bundles.iter().map(bundle::Bundle::by_point).collect();
+    let mut points: Vec<(String, u32)> = per_bundle
+        .iter()
+        .flat_map(|b| b.keys().cloned())
+        .collect::<Vec<_>>();
+    points.sort_unstable();
+    points.dedup();
+    let mut columns = vec![
+        report::Column::left("measurement"),
+        report::Column::right("n"),
+    ];
+    for b in bundles {
+        columns.push(report::Column::right(&b.name));
+    }
+    let rows = points
+        .iter()
+        .map(|(mode, n)| {
+            let mut row = vec![measurement_name(mode).to_string(), n.to_string()];
+            let base = per_bundle[0].get(&(mode.clone(), *n)).copied();
+            for got in &per_bundle {
+                row.push(match (got.get(&(mode.clone(), *n)), base) {
+                    (Some(v), Some(b0)) if b0 > 0.0 => {
+                        format!("{v:.2}  {:+.1}%", (v / b0 - 1.0) * 100.0)
+                    }
+                    (Some(v), _) => format!("{v:.2}"),
+                    (None, _) => "—".to_string(),
+                });
+            }
+            row
+        })
+        .collect();
+    blocks.push(report::Block::Heading("What it measured".to_string()));
+    blocks.push(report::Block::Table { columns, rows });
+    blocks.push(report::Block::Note(format!(
+        "Mean of each run's repetitions, as a percentage against {}.",
+        first.name
+    )));
+
+    if let Some(chart) = &args.chart
+        && let Some(png) = raster_twin(chart)
+    {
+        blocks.push(report::Block::Heading("Throughput".to_string()));
+        blocks.push(report::Block::Image {
+            caption: "Both runs on one chart".to_string(),
+            path: png,
+        });
+    }
+
+    let path = std::path::Path::new(path);
+    report::write(
+        path,
+        "orangu-bench comparison",
+        &format!(
+            "{} against {} · {}",
+            rest.iter()
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            first.name,
+            history::today()
+        ),
+        &format!("orangu-bench {}", orangu::build_info::id()),
+        &blocks,
+    )?;
+    if !args.json {
+        println!("  report   {}", path.display());
+    }
+    Ok(())
 }
 
 /// The timed part of a run, split out so [`run`] can bracket exactly this with
@@ -1257,6 +2084,10 @@ fn measure(
     // unrelated tables under one header.
     if !args.embed.is_empty() {
         return run_embed(client, args, label);
+    }
+
+    if !args.pg.is_empty() {
+        return run_pg(client, args, label);
     }
 
     if !args.pp.is_empty() {
@@ -1282,6 +2113,213 @@ fn measure(
     run_tg(client, args, label)
 }
 
+/// One combined measurement: the whole turn, prompt through last token.
+struct PgSample {
+    /// What the server said it processed, or the requested length when it
+    /// reported no `timings`.
+    prompt_tokens: u32,
+    /// Counted off the stream, not requested — a server that stopped early
+    /// must not be credited with tokens it never sent.
+    gen_tokens: u32,
+    /// Prefill wall time, from the server's own `timings`, for the split
+    /// column. `None` when it reports none.
+    prompt_ms: Option<f64>,
+    /// Send to last token: prefill, queueing and generation together.
+    total_s: f64,
+}
+
+impl PgSample {
+    /// `(prompt + generated) / total` — the whole turn over the whole time,
+    /// which is the quantity a combined test exists to report.
+    fn tok_per_s(&self) -> f64 {
+        if self.total_s > 0.0 {
+            f64::from(self.prompt_tokens + self.gen_tokens) / self.total_s
+        } else {
+            0.0
+        }
+    }
+}
+
+/// `--pg`: prefill *and* generate in one request, timed as one thing.
+///
+/// Every other mode here splits the turn deliberately — `--pp` times prefill
+/// with a single token generated, the decode sweep times generation with
+/// prefill excluded — because that is what a diagnosis needs. This mode is the
+/// opposite and answers the other question: what a user actually waits for. It
+/// is also the figure most third-party comparisons quote, and it could not be
+/// reconstructed from the two halves, since neither carries the queueing and
+/// hand-off between them.
+///
+/// The generated length is `--gen`, so the swept axis is the prompt — matching
+/// `--pp`, and keeping one meaning for `n` per mode in the history file.
+fn run_pg(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    if !args.json {
+        println!(
+            "{:>8} | {:>7} | {:>7} | {:>9} | {:>9} | {:>8} | {:>16}",
+            "pp", "n_tok", "gen", "prompt_ms", "total_ms", "best", "mean ± sd(n-1)"
+        );
+        println!("{}", "-".repeat(81));
+    }
+
+    for (point, &len) in args.pg.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
+        let prompt = build_prompt(len);
+        let mut rates = Vec::new();
+        let mut last: Option<PgSample> = None;
+        for _ in 0..args.reps.max(1) {
+            let s = run_pg_once(client, &args.url, &prompt, len, args.n_gen, &args.model)?;
+            rates.push(s.tok_per_s());
+            last = Some(s);
+        }
+        let stats = Stats::of(&rates, false);
+        let s = last.expect("at least one rep ran");
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pg": len,
+                    "prompt_tokens": s.prompt_tokens,
+                    "gen_tokens": s.gen_tokens,
+                    "prompt_ms": s.prompt_ms,
+                    "total_ms": s.total_s * 1000.0,
+                    "tok_per_s_best": stats.best,
+                    "tok_per_s_mean": stats.mean,
+                    "tok_per_s_sd": stats.sd,
+                    "tok_per_s_sd_sample": stats.sd_sample,
+                })
+            );
+        } else {
+            println!(
+                "{:>8} | {:>7} | {:>7} | {:>9} | {:>9.1} | {:>8.2} | {:>8.2} ± {}",
+                len,
+                s.prompt_tokens,
+                s.gen_tokens,
+                s.prompt_ms
+                    .map_or_else(|| "—".to_string(), |ms| format!("{ms:.1}")),
+                s.total_s * 1000.0,
+                stats.best,
+                stats.mean,
+                stats.plus_minus(5, 2)
+            );
+        }
+
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "pg".to_string(),
+            // The prompt the server says it processed, as `--pp` records —
+            // the requested length is a target, the processed count is what
+            // the rate was computed from.
+            n: s.prompt_tokens,
+            best: stats.best,
+            mean: stats.mean,
+            sd: stats.sd,
+            sd_sample: stats.sd_sample,
+        });
+    }
+
+    Ok(records)
+}
+
+/// One combined request: prompt of roughly `len` tokens, `n_gen` generated,
+/// timed from before the send to the last streamed token.
+///
+/// `cache_prompt: false` for the same reason the plain prefill sweep sets it:
+/// a cached prompt would make the prefill half of this number vanish, and the
+/// combined figure would quietly become a decode figure.
+fn run_pg_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    prompt: &str,
+    requested: u32,
+    n_gen: u32,
+    model: &Option<String>,
+) -> anyhow::Result<PgSample> {
+    let mut body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": n_gen,
+        "n_predict": n_gen,
+        "temperature": 0,
+        "stream": true,
+        "cache_prompt": false,
+        "ignore_eos": true,
+        "timings_per_token": true,
+    });
+    if let Some(m) = model {
+        body["model"] = serde_json::Value::String(m.clone());
+    }
+
+    let endpoint = format!("{url}/v1/completions");
+    let t0 = Instant::now();
+    let resp = post_with_one_retry(client, &endpoint, &body)?;
+    if !resp.status().is_success() {
+        anyhow::bail!("server returned HTTP {}", resp.status());
+    }
+
+    let mut reader = BufReader::new(resp);
+    let mut line = String::new();
+    let mut last = t0;
+    let mut gen_tokens = 0u32;
+    let mut prompt_tokens = None;
+    let mut prompt_ms = None;
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let payload = match line.trim_start().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload == "[DONE]" {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let text = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .or_else(|| v.get("content").and_then(|t| t.as_str()))
+            .unwrap_or("");
+        if !text.is_empty() {
+            last = Instant::now();
+            gen_tokens += 1;
+        }
+        if let Some(t) = v.get("timings") {
+            if let Some(n) = t.get("prompt_n").and_then(serde_json::Value::as_u64) {
+                prompt_tokens = Some(n as u32);
+            }
+            if let Some(ms) = t.get("prompt_ms").and_then(serde_json::Value::as_f64) {
+                prompt_ms = Some(ms);
+            }
+        }
+    }
+
+    Ok(PgSample {
+        // The requested length only when the server reported nothing — an
+        // approximation, and the row's `n_tok` column shows which it is.
+        prompt_tokens: prompt_tokens.unwrap_or(requested),
+        gen_tokens,
+        prompt_ms,
+        total_s: (last - t0).as_secs_f64(),
+    })
+}
+
 /// The decode sweep: one row per requested context depth.
 fn run_tg(
     client: &reqwest::blocking::Client,
@@ -1293,12 +2331,17 @@ fn run_tg(
     if !args.json {
         println!(
             "{:>8} | {:>5} | {:>7} | {:>8} | {:>8} | {:>16}",
-            "depth", "gen", "ttft_ms", "n_tok", "best", "mean ± sd"
+            "depth", "gen", "ttft_ms", "n_tok", "best", "mean ± sd(n-1)"
         );
         println!("{}", "-".repeat(67));
     }
 
-    for &depth in &args.depths {
+    for (point, &depth) in args.depths.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let prompt = build_prompt(depth);
         let mut rates = Vec::new();
         let mut last_sample: Option<Sample> = None;
@@ -1307,10 +2350,7 @@ fn run_tg(
             rates.push(s.tok_per_s());
             last_sample = Some(s);
         }
-        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
-        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
-        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&rates, false);
         let s = last_sample.expect("at least one rep ran");
 
         if args.json {
@@ -1320,16 +2360,27 @@ fn run_tg(
                     "depth": depth,
                     "n_gen": args.n_gen,
                     "ttft_ms": s.ttft_ms,
-                    "tok_per_s_best": best,
-                    "tok_per_s_mean": mean,
-                    "tok_per_s_sd": sd,
+                    "tok_per_s_best": stats.best,
+                    "tok_per_s_mean": stats.mean,
+                    // Unchanged meaning: the population estimator, as every
+                    // consumer of this stream has always read it.
+                    "tok_per_s_sd": stats.sd,
+                    // The standard estimator, for putting this number beside
+                    // one from another benchmark.
+                    "tok_per_s_sd_sample": stats.sd_sample,
                     "gen_tokens": s.gen_tokens,
                 })
             );
         } else {
             println!(
-                "{:>8} | {:>5} | {:>7.0} | {:>8} | {:>8.2} | {:>8.2} ± {:>5.2}",
-                depth, args.n_gen, s.ttft_ms, s.gen_tokens, best, mean, sd
+                "{:>8} | {:>5} | {:>7.0} | {:>8} | {:>8.2} | {:>8.2} ± {}",
+                depth,
+                args.n_gen,
+                s.ttft_ms,
+                s.gen_tokens,
+                stats.best,
+                stats.mean,
+                stats.plus_minus(5, 2)
             );
         }
 
@@ -1338,9 +2389,10 @@ fn run_tg(
             label: label.to_string(),
             mode: "tg".to_string(),
             n: depth,
-            best,
-            mean,
-            sd,
+            best: stats.best,
+            mean: stats.mean,
+            sd: stats.sd,
+            sd_sample: stats.sd_sample,
         });
     }
 
@@ -1352,7 +2404,7 @@ fn run_tg(
 ///
 /// Drawing from the file rather than from `records` is what makes the chart a
 /// history rather than a snapshot: a run that measured only orangu still
-/// redraws llama.cpp's line beside it.
+/// redraws the reference engine's line beside it.
 fn record_and_chart(args: &Args, records: &[history::Record]) -> anyhow::Result<()> {
     if let Some(path) = &args.history
         && !records.is_empty()
@@ -1434,6 +2486,34 @@ fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The build the server under test is running, as `1.2.0 (52c0443ab)`, from
+/// its own `/props`.
+///
+/// `None` when the server reports neither field — an older `orangu-server`, or
+/// another engine entirely. The header then omits the line rather than
+/// printing `unknown`, the same rule `pid`/`uptime` already follow: a report
+/// should say what it knows and be silent about the rest, because a line that
+/// reads "unknown" gets skimmed as a failure.
+///
+/// Version alone is accepted (a release build that could not resolve a commit
+/// still knows its version); a commit alone is not, since a bare hash with no
+/// version is less legible than the pid already printed beside it.
+fn server_build(props: Option<&serde_json::Value>) -> Option<String> {
+    let text = |key: &str| -> Option<String> {
+        props
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "unknown")
+            .map(str::to_string)
+    };
+    let version = text("version")?;
+    match text("commit") {
+        Some(commit) => Some(format!("{version} ({commit})")),
+        None => Some(version),
+    }
 }
 
 /// The series name for a server that was not given one: its model id, which is
@@ -1591,8 +2671,8 @@ fn start_profile(
 /// Which process to sample: the one the server names, else the one the
 /// operating system says owns the port under test.
 ///
-/// The second route is not a fallback for tidiness — `llama-server` reports no
-/// pid at all, and it is half of every comparison this tool exists to make.
+/// The second route is not a fallback for tidiness — a third-party server may
+/// report no pid at all, and it is half of every comparison this tool exists to make.
 /// Both routes identify the process that *answered these requests*, which is
 /// the only definition that cannot profile the wrong binary.
 fn resolve_server_pid(client: &reqwest::blocking::Client, args: &Args) -> anyhow::Result<u32> {
@@ -1628,7 +2708,9 @@ fn url_port(url: &str) -> Option<u16> {
 /// carries its own workload rather than depending on its filename.
 fn workload_name(args: &Args) -> String {
     let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    if !args.pp.is_empty() {
+    if !args.pg.is_empty() {
+        format!("prefill+decode pg {} gen {}", list(&args.pg), args.n_gen)
+    } else if !args.pp.is_empty() {
         format!("prefill pp {}", list(&args.pp))
     } else if !args.pp_continue.is_empty() {
         format!(
@@ -1713,12 +2795,17 @@ fn run_pp(
     if !args.json {
         println!(
             "{:>8} | {:>7} | {:>7} | {:>9} | {:>8} | {:>16}",
-            "pp", "n_tok", "cached", "prompt_ms", "best", "mean ± sd"
+            "pp", "n_tok", "cached", "prompt_ms", "best", "mean ± sd(n-1)"
         );
         println!("{}", "-".repeat(70));
     }
 
-    for &len in &args.pp {
+    for (point, &len) in args.pp.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let prompt = build_prompt(len);
         let mut rates = Vec::new();
         let mut last: Option<PrefillSample> = None;
@@ -1727,10 +2814,7 @@ fn run_pp(
             rates.push(s.tok_per_s());
             last = Some(s);
         }
-        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
-        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
-        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&rates, false);
         let s = last.expect("at least one rep ran");
 
         if args.json {
@@ -1741,16 +2825,27 @@ fn run_pp(
                     "prompt_tokens": s.prompt_tokens,
                     "cached_tokens": s.cached_tokens,
                     "prompt_ms": s.prompt_ms,
-                    "tok_per_s_best": best,
-                    "tok_per_s_mean": mean,
-                    "tok_per_s_sd": sd,
+                    "tok_per_s_best": stats.best,
+                    "tok_per_s_mean": stats.mean,
+                    // Unchanged meaning: the population estimator, as every
+                    // consumer of this stream has always read it.
+                    "tok_per_s_sd": stats.sd,
+                    // The standard estimator, for putting this number beside
+                    // one from another benchmark.
+                    "tok_per_s_sd_sample": stats.sd_sample,
                     "server_reported": s.server_reported,
                 })
             );
         } else if s.server_reported {
             println!(
-                "{:>8} | {:>7} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
-                len, s.prompt_tokens, s.cached_tokens, s.prompt_ms, best, mean, sd
+                "{:>8} | {:>7} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {}",
+                len,
+                s.prompt_tokens,
+                s.cached_tokens,
+                s.prompt_ms,
+                stats.best,
+                stats.mean,
+                stats.plus_minus(5, 2)
             );
         } else {
             // No server timings: the only honest thing to print is the
@@ -1770,9 +2865,10 @@ fn run_pp(
                 label: label.to_string(),
                 mode: "pp".to_string(),
                 n: s.prompt_tokens,
-                best,
-                mean,
-                sd,
+                best: stats.best,
+                mean: stats.mean,
+                sd: stats.sd,
+                sd_sample: stats.sd_sample,
             });
         }
     }
@@ -1812,7 +2908,12 @@ fn run_streams(
         println!("{}", "-".repeat(48));
     }
 
-    for &n in &args.streams {
+    for (point, &n) in args.streams.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let n = n.max(1);
         let mut aggregate = Vec::new();
         let mut total_tokens = 0u32;
@@ -1845,31 +2946,28 @@ fn run_streams(
             aggregate.push(f64::from(tokens) / wall);
             total_tokens = tokens;
         }
-        let best = aggregate.iter().cloned().fold(0.0_f64, f64::max);
-        let mean = aggregate.iter().sum::<f64>() / aggregate.len() as f64;
-        let var =
-            aggregate.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / aggregate.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&aggregate, false);
 
         if args.json {
             println!(
                 "{}",
                 serde_json::json!({
                     "streams": n,
-                    "aggregate_tok_per_s_best": best,
-                    "aggregate_tok_per_s_mean": mean,
-                    "aggregate_tok_per_s_sd": sd,
-                    "per_stream_tok_per_s": mean / f64::from(n),
+                    "aggregate_tok_per_s_best": stats.best,
+                    "aggregate_tok_per_s_mean": stats.mean,
+                    "aggregate_tok_per_s_sd": stats.sd,
+                    "aggregate_tok_per_s_sd_sample": stats.sd_sample,
+                    "per_stream_tok_per_s": stats.mean / f64::from(n),
                     "tokens": total_tokens,
                 })
             );
         } else {
             println!(
-                "{:>8} | {:>6.2} ± {:>4.2} | {:>11.2} | {:>8}",
+                "{:>8} | {:>6.2} ± {} | {:>11.2} | {:>8}",
                 n,
-                mean,
-                sd,
-                mean / f64::from(n),
+                stats.mean,
+                stats.plus_minus(4, 2),
+                stats.mean / f64::from(n),
                 total_tokens
             );
         }
@@ -1879,9 +2977,10 @@ fn run_streams(
             label: label.to_string(),
             mode: "tg".to_string(),
             n,
-            best,
-            mean,
-            sd,
+            best: stats.best,
+            mean: stats.mean,
+            sd: stats.sd,
+            sd_sample: stats.sd_sample,
         });
     }
     Ok(records)
@@ -1928,7 +3027,12 @@ fn run_decode_cpu(
         println!("{}", "-".repeat(58));
     }
 
-    for &depth in &args.depths {
+    for (point, &depth) in args.depths.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let prompt = build_prompt(depth);
         let mut per_token = Vec::new();
         let mut rate = 0.0;
@@ -1948,11 +3052,7 @@ fn run_decode_cpu(
             rate = s.tok_per_s();
             reported = (primed.prompt_tokens, primed.processed_tokens());
         }
-        let best = per_token.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mean = per_token.iter().sum::<f64>() / per_token.len() as f64;
-        let var =
-            per_token.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / per_token.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&per_token, true);
 
         if args.json {
             println!(
@@ -1961,16 +3061,22 @@ fn run_decode_cpu(
                     "depth": depth,
                     "prompt_tokens": reported.0,
                     "prefilled_tokens": reported.1,
-                    "cpu_ms_per_token_best": best,
-                    "cpu_ms_per_token_mean": mean,
-                    "cpu_ms_per_token_sd": sd,
+                    "cpu_ms_per_token_best": stats.best,
+                    "cpu_ms_per_token_mean": stats.mean,
+                    "cpu_ms_per_token_sd": stats.sd,
+                    "cpu_ms_per_token_sd_sample": stats.sd_sample,
                     "tok_per_s": rate,
                 })
             );
         } else {
             println!(
-                "{:>8} | {:>7} | {:>9} | {:>6.3} ± {:>4.3} | {:>8.2}",
-                depth, reported.0, reported.1, mean, sd, rate
+                "{:>8} | {:>7} | {:>9} | {:>6.3} ± {} | {:>8.2}",
+                depth,
+                reported.0,
+                reported.1,
+                stats.mean,
+                stats.plus_minus(4, 3),
+                rate
             );
         }
 
@@ -1982,9 +3088,10 @@ fn run_decode_cpu(
             label: label.to_string(),
             mode: "cpu".to_string(),
             n: reported.0,
-            best,
-            mean,
-            sd,
+            best: stats.best,
+            mean: stats.mean,
+            sd: stats.sd,
+            sd_sample: stats.sd_sample,
         });
     }
     Ok(records)
@@ -2038,13 +3145,18 @@ fn run_pp_continue(
     if !args.json {
         println!(
             "{:>8} | {:>7} | {:>7} | {:>9} | {:>9} | {:>8} | {:>16}",
-            "added", "n_tok", "cached", "processed", "prompt_ms", "best", "mean ± sd"
+            "added", "n_tok", "cached", "processed", "prompt_ms", "best", "mean ± sd(n-1)"
         );
         println!("{}", "-".repeat(82));
     }
 
     let base = build_prompt(args.pp_continue_base);
-    for &added in &args.pp_continue {
+    for (point, &added) in args.pp_continue.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let mut rates = Vec::new();
         let mut last: Option<PrefillSample> = None;
         for rep in 0..args.reps.max(1) as usize {
@@ -2056,10 +3168,7 @@ fn run_pp_continue(
             rates.push(s.continuation_tok_per_s());
             last = Some(s);
         }
-        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
-        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
-        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&rates, false);
         let s = last.expect("at least one rep ran");
         let processed = s.processed_tokens();
 
@@ -2072,16 +3181,28 @@ fn run_pp_continue(
                     "cached_tokens": s.cached_tokens,
                     "processed_tokens": processed,
                     "prompt_ms": s.prompt_ms,
-                    "tok_per_s_best": best,
-                    "tok_per_s_mean": mean,
-                    "tok_per_s_sd": sd,
+                    "tok_per_s_best": stats.best,
+                    "tok_per_s_mean": stats.mean,
+                    // Unchanged meaning: the population estimator, as every
+                    // consumer of this stream has always read it.
+                    "tok_per_s_sd": stats.sd,
+                    // The standard estimator, for putting this number beside
+                    // one from another benchmark.
+                    "tok_per_s_sd_sample": stats.sd_sample,
                     "server_reported": s.server_reported,
                 })
             );
         } else if s.server_reported {
             println!(
-                "{:>8} | {:>7} | {:>7} | {:>9} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
-                added, s.prompt_tokens, s.cached_tokens, processed, s.prompt_ms, best, mean, sd
+                "{:>8} | {:>7} | {:>7} | {:>9} | {:>9.1} | {:>8.2} | {:>8.2} ± {}",
+                added,
+                s.prompt_tokens,
+                s.cached_tokens,
+                processed,
+                s.prompt_ms,
+                stats.best,
+                stats.mean,
+                stats.plus_minus(5, 2)
             );
         } else {
             println!(
@@ -2109,9 +3230,10 @@ fn run_pp_continue(
             label: label.to_string(),
             mode: "pp".to_string(),
             n: processed,
-            best,
-            mean,
-            sd,
+            best: stats.best,
+            mean: stats.mean,
+            sd: stats.sd,
+            sd_sample: stats.sd_sample,
         });
     }
     Ok(records)
@@ -2122,7 +3244,7 @@ fn run_pp_continue(
 /// Reported as tok/s so the number lines up with the `pp` column of a
 /// generative model — an embedding forward pass is prompt processing without
 /// the decode that follows it, and that is the comparison worth making
-/// (`embeddinggemma-300M` against `llama-server` on the same file).
+/// (`embeddinggemma-300M` against the reference engine on the same file).
 fn run_embed(
     client: &reqwest::blocking::Client,
     args: &Args,
@@ -2132,12 +3254,17 @@ fn run_embed(
     if !args.json {
         println!(
             "{:>8} | {:>7} | {:>9} | {:>8} | {:>16}",
-            "embed", "n_tok", "wall_ms", "best", "mean ± sd"
+            "embed", "n_tok", "wall_ms", "best", "mean ± sd(n-1)"
         );
         println!("{}", "-".repeat(60));
     }
 
-    for &len in &args.embed {
+    for (point, &len) in args.embed.iter().enumerate() {
+        // Between points, so a card that heats up through a sweep is
+        // given time to come back down — see `Args::settle`.
+        if point > 0 {
+            args.settle();
+        }
         let prompt = build_prompt(len);
         let mut rates = Vec::new();
         let mut last: Option<EmbedSample> = None;
@@ -2146,10 +3273,7 @@ fn run_embed(
             rates.push(s.tok_per_s());
             last = Some(s);
         }
-        let best = rates.iter().cloned().fold(0.0_f64, f64::max);
-        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
-        let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rates.len() as f64;
-        let sd = var.sqrt();
+        let stats = Stats::of(&rates, false);
         let s = last.expect("at least one rep ran");
 
         if args.json {
@@ -2159,16 +3283,26 @@ fn run_embed(
                     "embed": len,
                     "prompt_tokens": s.prompt_tokens,
                     "wall_ms": s.wall_ms,
-                    "tok_per_s_best": best,
-                    "tok_per_s_mean": mean,
-                    "tok_per_s_sd": sd,
+                    "tok_per_s_best": stats.best,
+                    "tok_per_s_mean": stats.mean,
+                    // Unchanged meaning: the population estimator, as every
+                    // consumer of this stream has always read it.
+                    "tok_per_s_sd": stats.sd,
+                    // The standard estimator, for putting this number beside
+                    // one from another benchmark.
+                    "tok_per_s_sd_sample": stats.sd_sample,
                     "server_reported": s.server_reported,
                 })
             );
         } else if s.server_reported {
             println!(
-                "{:>8} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {:>5.2}",
-                len, s.prompt_tokens, s.wall_ms, best, mean, sd
+                "{:>8} | {:>7} | {:>9.1} | {:>8.2} | {:>8.2} ± {}",
+                len,
+                s.prompt_tokens,
+                s.wall_ms,
+                stats.best,
+                stats.mean,
+                stats.plus_minus(5, 2)
             );
         } else {
             // Same rule as `run_pp`: without the token count there is no rate,
@@ -2188,9 +3322,10 @@ fn run_embed(
                 // only approximates a token target, and two servers tokenizing
                 // the same text can disagree.
                 n: s.prompt_tokens,
-                best,
-                mean,
-                sd,
+                best: stats.best,
+                mean: stats.mean,
+                sd: stats.sd,
+                sd_sample: stats.sd_sample,
             });
         }
     }
@@ -2220,7 +3355,7 @@ struct Environment {
 ///
 /// Silent when the server has no such endpoint: this is the only profiling
 /// instrument that works on a platform without `perf`, but it is still
-/// optional, and llama-server does not have it at all.
+/// optional, and another engine may not have it at all.
 fn take_gpu_timings(client: &reqwest::blocking::Client, url: &str) -> serde_json::Value {
     client
         .get(format!("{url}/gpu-timings"))
@@ -2276,8 +3411,12 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
     let backend = field("backend");
     let pid = num("pid");
     let uptime = num("uptime_seconds");
+    // Which build answered. Absent from a server too old to report it, and
+    // from any other engine — hence `Option`, and hence the line below is
+    // omitted rather than printed as "unknown".
+    let build = server_build(props.as_ref());
     let gpus = gpu_clock_states();
-    // `null` from llama-server and from orangu-server on a non-`wgpu`
+    // `null` from a server without one, and from orangu-server on a non-`wgpu`
     // backend; a full `VulkanBackend::tuning_report` otherwise.
     let gpu_tuning = props.as_ref().and_then(|p| p.get("gpu")).cloned();
 
@@ -2289,6 +3428,8 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
                 "url": args.url,
                 "model": model,
                 "backend": backend,
+                // The one field that tells two builds of one version apart.
+                "build": build,
                 "pid": pid,
                 "uptime_seconds": uptime,
                 "gpus": gpus,
@@ -2303,10 +3444,16 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         println!("orangu-bench → {}", args.url);
         println!("  model    {model}");
         println!("  backend  {backend}");
+        // Above the pid line, because it answers the same question one level
+        // up: `pid`/`uptime` prove *which process* answered, this proves
+        // *which build* it is running.
+        if let Some(build) = &build {
+            println!("  build    {build}");
+        }
         for line in format_gpu_tuning(gpu_tuning.as_ref()) {
             println!("  {line}");
         }
-        // Only for a server that reports them; llama-server does not, and a
+        // Only for a server that reports them; not every server does, and a
         // missing field is not worth a line of output.
         if pid.is_some() || uptime.is_some() {
             let show = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
@@ -2343,8 +3490,8 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
 }
 
 /// The `gpu` block of `/props` (`VulkanBackend::tuning_report`) as header
-/// lines, or nothing at all when the server did not report one — llama-server
-/// never does, and neither does orangu-server on a CPU/CUDA/OpenCL/ROCm
+/// lines, or nothing at all when the server did not report one — most engines
+/// never do, and neither does orangu-server on a CPU/CUDA/OpenCL/ROCm
 /// backend.
 ///
 /// Every A/B in this project's history has at some point been confounded by a
@@ -2441,7 +3588,7 @@ fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
 /// different `--gen` would look different for a reason that has nothing to do
 /// with either. The mean is the comparable figure.
 ///
-/// Nothing at all when the server reports no timings — llama-server has no
+/// Nothing at all when the server reports no timings — most engines have no
 /// such endpoint, and orangu-server has none unless `ORANGU_GPU_TIMESTAMPS=1`
 /// is set and the adapter has the query. That absence is why the "steps" count
 /// is printed: zero steps says "not measured", which is a different statement
@@ -2801,6 +3948,9 @@ fn run_curve(
             best: rate,
             mean: rate,
             sd: 0.0,
+            // One sample: a sample standard deviation is undefined, and the
+            // sentence above is the reason this mode is kept apart from `tg`.
+            sd_sample: None,
         });
         lo = hi;
     }
@@ -2811,8 +3961,95 @@ fn run_curve(
 mod tests {
     use super::*;
 
+    /// Two standard deviations, and the difference between them is not
+    /// cosmetic: at three repetitions the sample estimator is 22% larger than
+    /// the population one, which is bigger than most of the differences this
+    /// tool is run to detect. A `±` quoted against another benchmark's `±`
+    /// has to be the same estimator, and everyone else reports `n-1`.
+    #[test]
+    fn both_estimators_are_reported_and_they_are_not_the_same_number() {
+        let stats = Stats::of(&[10.0, 12.0, 14.0], false);
+        assert_eq!(stats.best, 14.0);
+        assert!((stats.mean - 12.0).abs() < 1e-9);
+        // population: sqrt(8/3) = 1.632…, sample: sqrt(8/2) = 2.0
+        assert!(
+            (stats.sd - (8.0_f64 / 3.0).sqrt()).abs() < 1e-9,
+            "{stats:?}"
+        );
+        assert!(
+            (stats.sd_sample.expect("defined") - 2.0).abs() < 1e-9,
+            "{stats:?}"
+        );
+        assert!(stats.sd_sample.expect("defined") > stats.sd);
+    }
+
+    /// One repetition has no spread to report. `0.00` would say one was
+    /// measured and found to be zero, which is a different — and false —
+    /// claim; the row says `—` instead.
+    #[test]
+    fn a_single_repetition_has_no_sample_deviation() {
+        let stats = Stats::of(&[41.0], false);
+        assert_eq!(stats.best, 41.0);
+        assert_eq!(stats.mean, 41.0);
+        assert_eq!(stats.sd, 0.0);
+        assert_eq!(stats.sd_sample, None);
+        assert_eq!(stats.plus_minus(5, 2).trim(), "—");
+    }
+
+    /// `--decode-cpu` reports milliseconds per token, where the best run is
+    /// the *smallest*. A shared statistic that always maximised would quietly
+    /// report the worst row of that table as its headline.
+    #[test]
+    fn the_best_of_a_lower_is_better_measurement_is_the_smallest() {
+        assert_eq!(Stats::of(&[15.3, 14.4, 15.7], true).best, 14.4);
+        assert_eq!(Stats::of(&[15.3, 14.4, 15.7], false).best, 15.7);
+    }
+
+    /// The build line is the answer to "which build produced this number", so
+    /// what it does when it *cannot* answer matters as much as what it prints
+    /// when it can: an older `orangu-server` and every other engine report
+    /// neither field, and inventing "unknown
+    /// (unknown)" for them would put a
+    /// failure-shaped line in every such report.
+    #[test]
+    fn the_build_line_says_what_it_knows_and_nothing_else() {
+        let props = |json| serde_json::from_str::<serde_json::Value>(json).expect("json");
+
+        assert_eq!(
+            server_build(Some(&props(r#"{"version":"1.2.0","commit":"52c0443ab"}"#))).as_deref(),
+            Some("1.2.0 (52c0443ab)")
+        );
+        // A release built from a tarball knows its version and nothing more —
+        // that is the whole truth available, so it is what gets printed.
+        assert_eq!(
+            server_build(Some(&props(r#"{"version":"1.2.0","commit":"unknown"}"#))).as_deref(),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            server_build(Some(&props(r#"{"version":"1.2.0"}"#))).as_deref(),
+            Some("1.2.0")
+        );
+        // A dirty build must say so — the commit alone would be a lie about
+        // what was measured.
+        assert_eq!(
+            server_build(Some(&props(
+                r#"{"version":"1.2.0","commit":"52c0443ab-dirty"}"#
+            )))
+            .as_deref(),
+            Some("1.2.0 (52c0443ab-dirty)")
+        );
+        // No line at all: an older server, another engine, or no `/props`.
+        assert_eq!(server_build(Some(&props(r#"{"model":"x"}"#))), None);
+        assert_eq!(server_build(Some(&props(r#"{"version":""}"#))), None);
+        assert_eq!(
+            server_build(Some(&props(r#"{"commit":"52c0443ab"}"#))),
+            None
+        );
+        assert_eq!(server_build(None), None);
+    }
+
     /// A server that reports no `gpu` block gets no header lines — not a row
-    /// of `?`s. llama-server is the case that matters: this tool is pointed at
+    /// of `?`s. A server without a pid is the case that matters: this tool is pointed at
     /// it for every cross-implementation comparison, and four lines of unknowns
     /// under its name would read as "orangu-server's kernels, unreadable"
     /// rather than "a different server, which has none of these".

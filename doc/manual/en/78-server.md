@@ -15,7 +15,7 @@ Face-backed model for a newer commit (see `latest_commits` below) — swallowing
 than failing when the Hub can't be reached. It does real tensor computation
 itself for serving — GGUF loading, dequantization, the transformer forward
 pass, sampling, and request scheduling are implemented in Rust with no
-dependency on llama.cpp/ggml's own compiled code.
+dependency on any C or C++ inference library.
 
 ### Module layout
 
@@ -152,8 +152,8 @@ the `Q4_K` ggml type for most tensors, differing only in which few tensors
 
 `scan_models_dir` walks the configured directory with
 `walkdir::WalkDir::new(dir).follow_links(true)`. This is not optional:
-Hugging Face's own hub cache — the layout llama.cpp's `-hf`/`--hf-repo`
-itself downloads into — names every file under `snapshots/<rev>/` as a
+Hugging Face's own hub cache — the layout an `-hf`/`--hf-repo` download
+produces — names every file under `snapshots/<rev>/` as a
 symlink into `blobs/`. Without `follow_links`, `entry.file_type().is_file()`
 reports the symlink itself (never `true`), and every such model is silently
 skipped rather than listed.
@@ -172,11 +172,11 @@ grouping, so only unique models are ever counted or listed:
   so without this step a single physical download could count twice.
 - **Multimodal projector ("mmproj") exclusion.** After a file parses
   successfully, `GgufFile::is_clip_projector` is checked
-  (`general.architecture == "clip"`, identified the same way llama.cpp's
-  own `clip.cpp` loader does) and, if true, the file is skipped entirely —
+  (`general.architecture == "clip"`, identified the same way the reference
+  `clip.cpp` loader does) and, if true, the file is skipped entirely —
   it's excluded before it ever reaches `ModelSummary`/`group_models`. An
   mmproj sidecar accompanies a base model rather than standing in as one
-  (llama.cpp loads it via `--mmproj`, separately from the base checkpoint),
+  (it is loaded via `--mmproj`, separately from the base checkpoint),
   so it shouldn't inflate the count of "models" a directory holds. This
   exclusion only affects `list`'s counting/grouping — `resolve_model_path`'s
   direct-path and bare-filename lookups (the first thing `show` tries) are
@@ -194,17 +194,17 @@ one model merge, with `size_bytes` summed and `type_totals` combined across
 every shard before picking one dominant type (a single shard's own tensors
 are only part of the whole model).
 
-`shard_group_label` and `hf_tag_from_label` deliberately mirror llama.cpp's
-own resolver in `common/download.cpp` byte-for-byte, rather than
+`shard_group_label` and `hf_tag_from_label` deliberately mirror the reference
+implementation's resolver in `common/download.cpp` byte-for-byte, rather than
 reinventing the convention:
 
 - The shard suffix regex, `-\d{5}-of-\d{5}$`, matches
   `get_gguf_split_info`'s `re_split`.
-- The quant-tag regex, `[-.]([A-Z0-9_]+)$` in llama.cpp's `re_tag`, is
+- The quant-tag regex, `[-.]([A-Z0-9_]+)$` in the reference `re_tag`, is
   reimplemented as `hf_tag_from_label`: the trailing run of
   alphanumeric/underscore characters after the *last* `-` or `.` in the
-  (shard-stripped) name, uppercased. It comes from the filename llama.cpp
-  itself would match against, not from the tensor types, so it can say
+  (shard-stripped) name, uppercased. It comes from the filename the reference
+  resolver would match against, not from the tensor types, so it can say
   `Q4_K_M` where the ggml-type accounting can only say `Q4_K`. `QUANT` uses
   the same tag, narrowed by `quant_tag_from_label`/`is_quant_tag` to tags
   that really name a quantization (`hf_tag_from_label` alone would offer
@@ -230,9 +230,9 @@ ancestor directories for one matching `models--<user>--<model>` (checking
 every ancestor, not just the immediate parent, since real files sit under
 `snapshots/<rev>/`, sometimes with a further per-quant subfolder). This
 directory-naming convention — `folder_name = "models--" + repo_id.replace("/",
-"--")` — is Hugging Face's own, confirmed directly against llama.cpp's
-README ("models downloaded with `-hf` are now stored in the standard
-Hugging Face cache directory"). A file outside that layout has no
+"--")` — is Hugging Face's own, and is where a `-hf` download is documented to
+land ("models downloaded with `-hf` are now stored in the standard Hugging Face
+cache directory"). A file outside that layout has no
 `repo_id` to recover, so `group_models` falls back to the bare
 shard-stripped label.
 
@@ -359,10 +359,10 @@ row is a better pick than another.
 ### Downloading from Hugging Face (`orangu::model_download`)
 
 `download_model` implements `orangu-server download <user>/<model>[:quant]`
-by directly mirroring llama.cpp's own `common/download.cpp` and
+by directly mirroring the reference implementation's `common/download.cpp` and
 `common/hf-cache.cpp` — read from that source rather than reimplemented
 from a guess at the Hugging Face API, since the whole point is producing a
-cache llama.cpp itself recognizes as already downloaded.
+cache other GGUF tools recognize as already downloaded.
 
 **Resolving the commit.** `resolve_commit` calls
 `GET /api/models/<repo>/refs`, which returns `{"branches": [{"name", "targetCommit"}, ...]}`;
@@ -395,14 +395,14 @@ like the real Hugging Face cache does.
   immediately followed by `.` or `-` anywhere in a candidate's path (so
   `"Q4_K_M"` matches both `model-Q4_K_M.gguf` and
   `model-Q4_K_M-00001-of-00004.gguf`) — the same non-anchored rule
-  llama.cpp's own resolver uses, deliberately different from
+  the reference resolver uses, deliberately different from
   `orangu::model_spec::hf_tag_from_label`'s anchored *extraction* of an
   unknown tag from a filename, since here the tag is already known and
   being searched for. A file only matches as a **primary** if it's shard 1
   (or unsharded); a later shard never stands in for the whole model on its
   own.
 - Without a `:quant`, `DEFAULT_TAG_PREFERENCE` (`["Q4_K_M", "Q8_0"]`, in
-  that order — llama.cpp's own default) is tried before falling back to
+  that order — the ecosystem's default) is tried before falling back to
   the first model file found at all.
 - Once a primary file is chosen, `shard_info` (the same
   `-NNNNN-of-NNNNN` suffix regex `orangu::model_spec::shard_group_label`
@@ -412,7 +412,7 @@ like the real Hugging Face cache does.
 
 **Choosing a multimodal projector, if any.** After the primary model file is
 picked, `find_best_mmproj` (calling the generic `find_best_sibling` with
-`keyword = "mmproj"`) directly mirrors llama.cpp's own `find_best_sibling`/
+`keyword = "mmproj"`) directly mirrors the reference `find_best_sibling`/
 `find_best_mmproj`: among every `.gguf` path containing `mmproj`, it prefers
 the one sharing the deepest directory prefix with the primary file's own
 path (rejecting any candidate whose directory list isn't a prefix of the
@@ -888,8 +888,8 @@ exactly why it's safe to use as a completion source and `prune` isn't.
 ### GGUF loading and dequantization
 
 `engine::loader` memory-maps the file and reads hyperparameters using the
-same `<arch>.*` key names llama.cpp itself reads (confirmed directly
-against `llama.cpp/src/llama-arch.cpp`'s `LLM_KV_*` table). Weight tensors
+same `<arch>.*` key names every GGUF loader reads (confirmed directly
+against the reference `llama-arch.cpp`'s `LLM_KV_*` table). Weight tensors
 are **not** eagerly dequantized into RAM — each row is read straight from
 the `mmap` and dequantized on demand, so even a large model's memory
 footprint stays close to its file size.
@@ -897,7 +897,7 @@ footprint stays close to its file size.
 `engine::quant`'s dequantization struct layouts and algorithms are taken
 directly from ggml's own `ggml-common.h`/`ggml-quants.c`
 (`dequantize_row_*`), not reimplemented from a description, so the CPU
-path is bit-for-bit compatible with what llama.cpp itself reads. Supported
+path is bit-for-bit compatible with what other GGUF loaders read. Supported
 types: the floats (`F32`, `F16`, `BF16`), the legacy quants (`Q4_0`,
 `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole K-quant family (`Q2_K` through
 `Q6_K`), and the `IQ*` codebook quants (`IQ1_S`, `IQ1_M`, `IQ2_XXS`,
@@ -1008,7 +1008,7 @@ plus per-group scale metadata **once per matmul rather than once per
 (row, token)**, which is what stops prefill from re-unpacking the same row
 for every token in the batch.
 
-Quantizing activations to `int8` is lossy, exactly as it is in llama.cpp —
+Quantizing activations to `int8` is lossy, exactly as it is anywhere else —
 that is the accepted tradeoff of this kernel family, not an oversight. The
 tests check every kernel against `quant::dequantize` plus an exact `f32`
 dot, to within the error `int8` activation quantization can introduce, and
@@ -1023,7 +1023,7 @@ mod`), so adding a family is additive rather than a rewrite:
 
 - `llama.rs` — grouped-query attention, RoPE, RMSNorm, SwiGLU: the shape
   shared by `llama`/`qwen2`/`qwen3`/`mistral`/`qwen3vl` GGUFs (tensor names
-  confirmed against `llama.cpp/src/llama-arch.cpp`'s `LLM_TENSOR_NAMES`
+  confirmed against the reference `llama-arch.cpp`'s `LLM_TENSOR_NAMES`
   table for `LLM_ARCH_LLAMA`).
 
   These architectures share a block shape but **do not share a RoPE
@@ -1043,7 +1043,7 @@ mod`), so adding a family is additive rather than a rewrite:
   (`get_rope_factors`' first branch), and so does this module. It only
   moves the lowest frequencies, so it matters at long context rather than
   in a short prompt.
-- `gemma.rs` — targets `gemma4` (confirmed against upstream `llama.cpp`'s
+- `gemma.rs` — targets `gemma4` (confirmed against the reference
   `src/models/gemma4.cpp`), with `gemma`/`gemma2`/`gemma3` as subsets of
   its hyperparameter set: soft-capping, sliding-window attention,
   per-layer embeddings (PLE), and GEGLU.
@@ -1087,7 +1087,7 @@ mod`), so adding a family is additive rather than a rewrite:
   `engine::generate` caps a sequence at the model's own `n_ctx_train` — so
   `n_ctx_train` is what the comparison uses. For Phi-4-mini (131072
   trained, 4096 original) that selects the long factors, matching
-  `llama-server -c 0`; note upstream's CLI default of `-c 4096` selects
+  a server started with `-c 0`; note the common CLI default of `-c 4096` selects
   the short ones instead, so a logit-level comparison has to pass a
   matching `-c`.
 
@@ -1122,11 +1122,11 @@ concurrency.
 ### Durable slot persistence (`engine::slot_store`)
 
 `orangu-server` implements the `POST /slots/{id_slot}?action=save|restore`
-endpoints — its equivalent of llama.cpp's `--slot-save-path` prompt-cache
+endpoints — its equivalent of the `--slot-save-path` prompt-cache
 save/restore, and the receiving end of the orangu client's per-session slot
 persistence (`orangu::llm::SlotRegistry`, driven from tab park/activate).
 
-The important structural difference from llama.cpp is that an orangu-server
+The important structural difference from that design is that an orangu-server
 slot is a *concurrency permit* (`SlotPool`), not a long-lived owner of one KV
 cache. A completed request's cache otherwise survives only inside the in-RAM
 `engine::prefix_cache` pool (opt-in, bounded, cross-slot). `engine::slot_store`
@@ -1160,7 +1160,7 @@ safe path component before touching the filesystem.
 
 The feature is **on by default**; set `ORANGU_NO_SLOT_SAVE` to disable it (it
 also stays off when `$HOME` can't be resolved). While off, the endpoints report
-"not supported" exactly as a llama.cpp server started without `--slot-save-path`
+"not supported" exactly as a server started without `--slot-save-path`
 does — which the orangu client already degrades against, falling back to a full
 reprefill. The opt-out exists for the same reason `ORANGU_PREFIX_CACHE` is
 itself opt-in — a bug in prefix reuse would produce a silently *wrong*
@@ -1268,7 +1268,7 @@ only (set to `1`), except where noted.
 | `ORANGU_ATTN_SPLIT_K` | `8` (must be a power of two, `1..=32`) | Split-k factor for decode attention: how many workgroups each query head's KV-position range is split across (`n_head × k_num` phase-1 workgroups, merged by a phase-2 pass). Each head attends a KV range that *grows with context*, so more splits expose more parallelism the longer a generation runs, at the cost of more phase-2 merge overhead when the range is short. Raised from `4` to `8` after re-sweeping in the full decode chain at real context lengths (the earlier sweep was on the isolated dispatch at short context): on real `E2B`/`RX 5500M`, `k_num=8` cut per-token GPU time at ~245 tokens of context from 35.6 to 32.4 ms while staying neutral at short context, and had the best end-to-end throughput of `{4,8,16}`; `16` wins only once context is very long. Byte-identical output across values. Workloads dominated by very long contexts may prefer `16`. Pure runtime uniform — no shader rebuild. |
 | `ORANGU_PACKED_DOT` | unset (off) | Dequantizes `Q4_K` weight elements in pairs and accumulates the dot product as `vec2<f16>` instead of two scalar `f32` multiplies. Requires an adapter with WGSL `f16` support. When set together with the block-unroll, selects the combined unroll+packed `Q4_K` decode kernel. |
 | `ORANGU_WIDE_LOAD` | unset (off) | Binds the weight buffer as `array<vec4<u32>>` (16-byte reads) instead of `array<u32>` (byte-wise reads), consolidating each `Q4_K`/`Q5_K` block header into one 16-byte read. Covers all supported quant types. |
-| `ORANGU_NO_KV_F16` | unset (`f16` **on** when the adapter supports it) | Set to **disable** storing the per-request KV-cache GPU mirror as `f16` and fall back to `f32`. `f16` (the default on an adapter with WGSL `f16` support) halves KV-read memory traffic per attention dispatch, with a per-write cast, and matches llama.cpp's own default KV cache type. |
+| `ORANGU_NO_KV_F16` | unset (`f16` **on** when the adapter supports it) | Set to **disable** storing the per-request KV-cache GPU mirror as `f16` and fall back to `f32`. `f16` (the default on an adapter with WGSL `f16` support) halves KV-read memory traffic per attention dispatch, with a per-write cast, and matches the ecosystem's default KV cache type. |
 | `ORANGU_KV_Q8_0` | unset (off) | Set to store the per-request KV-cache GPU mirror as `q8_0` (8-bit block-quantized) instead of `f16`, dequantized inline in the attention shader. Halves KV-read bytes again vs `f16`, directly cutting attention's cost at long context — measured **−32%** attention GPU time at ~295 tokens on real `E2B`/`RX 5500M` (5.87 → 3.99 ms), the saving growing with context, at a slight cost at short context (per-write quantize overhead). Takes precedence over `f16`. **Lossy** (unlike `f16`), so off by default; the recommended lever for long-context / long-generation workloads, where per-token decode slows as the KV cache grows. |
 | `ORANGU_NO_TILED_PREFILL` | unset (tiled prefill **on**) | Set to **disable** the `16×64`-output-tile GEMM for prefill (`n_tokens >= 64`) and fall back to the plain cooperative kernel (one workgroup per output row, looping over the whole prompt internally) — measured on real hardware to drive real requests into GPU-driver hangs at ordinary prompt lengths (~170-450 tokens) and, even where both complete, ~10x slower. Not recommended; kept for A/B comparison. |
 | `ORANGU_COOP_MIN_TOKENS` | `64` (integer, `>= 1`) | The token count at or above which a matmul takes the weight-amortizing tiled-GEMM path instead of the reduce family. The reduce kernels dispatch `n_row_groups × n_tokens` workgroups, so **each token re-streams the whole weight matrix** (their cost grows with `n_tokens`); the tiled kernel loads a `16×in_dim` weight tile into shared memory once and reuses it across a `64`-wide token tile (cost ~flat in `n_tokens`). Below the threshold the per-token re-stream is cheaper because it keeps far more wavefronts in flight to hide this GPU's weight-load latency. Lowering it to route the "missing middle" (K ≈ 2…63, e.g. speculative or small-chunk prefill) onto the tiled path was measured **slower on `RX 5500M`** (this matmul is latency-bound, not bandwidth-bound — see `SERVER_ROADMAP.md` Step 13), so the default keeps that split at `64`; exposed as a knob for GPUs where the crossover sits lower and as the A/B harness for a future small-K kernel. `1` forces every matmul tiled; a value past the longest batch keeps everything on the reduce path. |

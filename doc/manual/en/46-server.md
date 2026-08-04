@@ -10,7 +10,7 @@ native ones (`/health`, `/props`, `/slots`, `/metrics`, `/completion`,
 
 `orangu-server` *is* the inference engine: GGUF loading, tokenization, the
 transformer forward pass, sampling, and request scheduling are implemented
-directly in Rust, with no dependency on llama.cpp/ggml's own compiled code.
+directly in Rust, with no dependency on any C or C++ inference library.
 `orangu-coordinator` (see the Coordinator chapter) sits in front of it,
 starting and stopping an `orangu-server` process on demand for machines
 that only have the resources to keep one model resident at a time — this
@@ -130,11 +130,11 @@ to a terminal (`orangu-server list > models.txt`, or under `--daemon`), and
 is cleared again when the command finishes.
 
 **`download`** fetches a model from Hugging Face into the configured
-`models` directory, laid out **exactly** the way llama.cpp's own
+`models` directory, laid out **exactly** the way the standard GGUF
 `-hf`/`--hf-repo` downloads into —
 `models--<user>--<model>/{blobs,refs,snapshots}`, content-addressed blobs
 with a relative symlink per file — so `list`/`show` already read what this
-writes, and llama.cpp itself recognizes it as already downloaded rather
+writes, and other GGUF tools recognize it as already downloaded rather
 than fetching it again:
 
 ```sh
@@ -962,8 +962,8 @@ Five GPU backends are available, chosen via `backend` in the config (or
   the same way, wherever a working Vulkan driver is installed — no Vulkan
   SDK is needed to *build* `orangu-server`, only a Vulkan driver to *run*
   it on a GPU. Verified end-to-end against real AMD hardware. Still
-  meaningfully behind llama.cpp's own tuned Vulkan backend on the same
-  model and hardware — a real, ongoing, and openly tracked performance
+  meaningfully behind the reference implementation's tuned Vulkan backend on
+  the same model and hardware — a real, ongoing, and openly tracked performance
   gap, not a hidden one.
 - **Metal** (`backend = metal`, Apple GPUs; the default on macOS) — the
   Vulkan backend's engine and its kernels, running on Apple hardware. Not
@@ -1358,11 +1358,11 @@ from generation, nor a cache hit from real work:
 - **`usage`** (OpenAI's shape) — `prompt_tokens`, `completion_tokens`,
   `total_tokens`, and `prompt_tokens_details.cached_tokens` for the part of the
   prompt served from the prefix cache.
-- **`timings`** (llama.cpp's shape, field for field) — `prompt_n`,
+- **`timings`** (the ecosystem's shape, field for field) — `prompt_n`,
   `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
   `predicted_per_second` and their per-token equivalents. These are the same
   figures the per-request console log prints.
-- **`prompt_progress`** (llama.cpp's shape) — `total`, `cache`, `processed`,
+- **`prompt_progress`** (likewise) — `total`, `cache`, `processed`,
   `time_ms`, reported once per prefill chunk while the prompt is still being
   processed (see `return_progress` below).
 
@@ -1373,7 +1373,7 @@ throughput, and the orangu client reads them for its status-line rates.
 
 ### `timings_per_token` and `return_progress`
 
-Both are llama.cpp field names, both apply to a **streaming**
+Both are the ecosystem's field names, both apply to a **streaming**
 `/v1/chat/completions`, and both exist for the same reason: the longest part of
 a turn is the part a client otherwise knows nothing about.
 
@@ -1405,7 +1405,7 @@ The `orangu` client requests both. They are what its status line shows: a
 ### `cache_prompt`
 
 `/v1/chat/completions`, `/v1/completions`, and `/completion` accept
-`cache_prompt` (llama.cpp's field name, default `true`). It controls whether a
+`cache_prompt` (the ecosystem's field name, default `true`). It controls whether a
 request may **reuse** an already-computed KV cache for whatever prefix of its
 prompt one exists for — the cross-slot prefix pool, or a slot's own retained
 cache. Leaving it at the default is what makes a growing conversation cheap:
@@ -1464,7 +1464,7 @@ written.
 ### `id_slot`
 
 `/v1/chat/completions`, `/v1/completions` and `/completion` accept `id_slot`
-(llama.cpp's field name), pinning a request to one specific slot instead of
+(likewise a shared field name), pinning a request to one specific slot instead of
 letting it take whichever is free. An unknown slot number is a `400`, not a
 silent fallback.
 
@@ -1506,7 +1506,7 @@ pin — there is no later turn to keep a cache warm for.
 | `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
 | `GET /health` | |
-| `GET /props` | model + server metadata, including the `backend` and device the model is running on |
+| `GET /props` | model + server metadata: the `backend` and device the model is running on, and `version`/`commit` — which build is answering |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
 | `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
@@ -1618,7 +1618,7 @@ first request.
 
 Six further types load that upstream cannot read at all: `Q4_0_4_4`,
 `Q4_0_4_8`, `Q4_0_8_8`, and the `IQ4_NL_4_4`/`_4_8`/`_8_8` equivalents.
-ggml retired those ids and `llama.cpp` refuses such a file outright
+ggml retired those ids and upstream refuses such a file outright
 ("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime repacking"). They are
 ARM-SIMD *pre-repacked* `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
 rows, and for the `Q4_0` family also flips a bit per nibble. That is a

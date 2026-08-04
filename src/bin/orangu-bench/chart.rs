@@ -565,6 +565,7 @@ mod tests {
             best,
             mean: best,
             sd: 0.0,
+            sd_sample: None,
         }
     }
 
@@ -648,8 +649,8 @@ mod tests {
             &[
                 rec("2026-07-25", "orangu", "pp", 158, 89.0),
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
-                rec("2026-07-25", "llama.cpp", "pp", 158, 818.0),
-                rec("2026-07-25", "llama.cpp", "pp", 1120, 1062.0),
+                rec("2026-07-25", "reference", "pp", 158, 818.0),
+                rec("2026-07-25", "reference", "pp", 1120, 1062.0),
             ],
             "t",
             None,
@@ -670,7 +671,7 @@ mod tests {
             );
             assert!(!tag.contains(".f"), "a line must not wear a fill class");
         }
-        assert!(svg.contains(">orangu<") && svg.contains(">llama.cpp<"));
+        assert!(svg.contains(">orangu<") && svg.contains(">reference<"));
     }
 
     /// The file accumulates every run; the chart is only ever the newest date
@@ -709,7 +710,7 @@ mod tests {
         let svg = render_labelled(
             &[
                 rec("2026-07-25", "orangu", "pp", 1120, 112.0),
-                rec("2026-07-25", "llama.cpp", "pp", 1120, 1062.0),
+                rec("2026-07-25", "reference", "pp", 1120, 1062.0),
             ],
             "t",
             None,

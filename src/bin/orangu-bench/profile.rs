@@ -26,7 +26,7 @@
 //! [`Recorder`] closes that gap. It brackets exactly the measured window — it
 //! starts after warmup and stops when the last repetition finishes — so the
 //! flamegraph and the tok/s on the line above it describe the same seconds of
-//! the same process. The same applies to `llama-server`: it is profiled through
+//! the same process. The same applies to any other engine: it is profiled through
 //! this same path, over the same prompt, at the same clock, so the two profiles
 //! are comparable as well as the two rates.
 //!
@@ -47,7 +47,7 @@
 //! the hot leaf, which renders as a flamegraph of a process doing nothing:
 //! build the profiled server with
 //! `RUSTFLAGS="-C force-frame-pointers=yes"`. A binary you do not control —
-//! `llama-server` from a distribution package — needs `--call-graph dwarf`
+//! a server from a distribution package — needs `--call-graph dwarf`
 //! instead, which is why the mode is an option rather than a constant.
 
 use std::collections::HashMap;
@@ -641,7 +641,7 @@ const KERNEL_MARK: &str = "_[k]";
 /// spinning or by blocking.
 ///
 /// This is what makes two engines' CPU costs comparable, and getting it wrong
-/// inverts the answer. `llama-server` waits by spinning on `_mm_pause`, which
+/// inverts the answer. An engine can wait by spinning on `_mm_pause`, which
 /// samples at full rate; `orangu-server` waits by blocking, which samples not at
 /// all. Read naively, that makes the engine which wastes a whole core look busy
 /// with useful work and the one which yields it look idle. Naming the wait
@@ -816,7 +816,7 @@ fn classify(frame: &str) -> &'static str {
 /// The pid listening on `port`, found by matching the listening socket's inode
 /// against every process's open descriptors.
 ///
-/// `llama-server` reports no pid over HTTP, and profiling needs one. Asking the
+/// A server may report no pid over HTTP, and profiling needs one. Asking the
 /// operating system which process owns the port under test is both accurate and
 /// self-checking: it names the process that answered the benchmark's requests,
 /// not a process that merely has a matching name — which is the exact
@@ -976,7 +976,7 @@ mod tests {
         // that wait differently. Counting only one of them is what makes the
         // engine that burns a core look like the busier worker.
         let folded = concat!(
-            "llama;ggml_vk_wait_for_fence;_mm_pause 50\n",
+            "other-engine;ggml_vk_wait_for_fence;_mm_pause 50\n",
             "orangu;wgpu;wait_mapped;futex_wait_[k];schedule_[k] 30\n",
             "orangu;compute;my_own_code 20\n",
         );

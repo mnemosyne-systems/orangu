@@ -644,7 +644,7 @@ w 1 [0] 2.0: 1 cycles:
 
     #[test]
     fn an_over_wide_title_is_shortened_from_the_middle_keeping_the_file_name() {
-        let long = "/mnt/ai/jews/llama.cpp/models--bartowski--Llama-3.2-1B-Instruct-GGUF/\
+        let long = "/mnt/ai/jews/models/models--bartowski--Llama-3.2-1B-Instruct-GGUF/\
                     snapshots/067b946cf014b7c697f3654f621d577a3e3afd1c/\
                     Llama-3.2-1B-Instruct-Q4_K_M.gguf · prefill pp 1024";
         let fitted = fit_title(long);

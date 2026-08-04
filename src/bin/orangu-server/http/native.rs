@@ -43,6 +43,14 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "model": state.model_label,
         "backend": state.backend_label,
+        // Which build answered. `version` dates the release; `commit` is the
+        // only field that tells two builds of one version apart, which during
+        // performance work is every pair of builds that matters — see
+        // `orangu::build_info`. A benchmark archives both (`orangu-bench`'s
+        // bundle) so a stored result says what produced it without anyone
+        // having remembered to write it down.
+        "version": orangu::build_info::VERSION,
+        "commit": orangu::build_info::COMMIT,
         // `null` on a backend with no kernel selection to report — see
         // `AppState::gpu_tuning`.
         "gpu": state.gpu_tuning,

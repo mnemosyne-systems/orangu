@@ -9,7 +9,7 @@ cooperating programs written end to end in Rust: the coding environment
 (`orangu`), an on-demand model manager (`orangu-coordinator`, see the *Coordinator*
 chapter), and a native, pure-Rust GGUF inference server (`orangu-server`, see the
 *Inference server* chapter) that implements the transformer forward pass itself,
-with no dependency on llama.cpp/ggml's compiled code and no Python. Every layer
+with no dependency on any C or C++ inference library and no Python. Every layer
 speaks the OpenAI-compatible API. See *A complete stack* below.
 
 **orangu** is named after the [Orangutan](https://en.wikipedia.org/wiki/Orangutan) - the smartest ape.
@@ -18,7 +18,7 @@ speaks the OpenAI-compatible API. See *A complete stack* below.
 
 ## Features
 
-* A complete Rust stack — the `orangu` editor, the `orangu-coordinator` model manager, and the native `orangu-server` GGUF inference engine, with no llama.cpp, ggml, or Python dependency
+* A complete Rust stack — the `orangu` editor, the `orangu-coordinator` model manager, and the native `orangu-server` GGUF inference engine, with no C/C++ inference library and no Python dependency
 * OpenAI-compatible chat completions served by the built-in `orangu-server` — fully local, no Internet connection required after setup
 * Interactive code review (`/review`) and LLM-driven auto review (`/auto_review`) of the changes on your branch, with a category-grouped report you can export or post to an issue
 * Workspace-scoped file tools — show, create, modify, move, and delete files and directories, staged through Git as the change is made
@@ -56,7 +56,7 @@ OpenAI-compatible API to the next:
   running more than one server at once. See the *Coordinator* chapter.
 * **`orangu-server`** — *is* the inference engine: GGUF loading, tokenization,
   the transformer forward pass, sampling, and request scheduling implemented
-  directly in Rust with no dependency on llama.cpp/ggml's compiled code, running
+  directly in Rust with no dependency on any C or C++ inference library, running
   on CPU or GPU (Vulkan, Metal, CUDA, ROCm, OpenCL). Besides the OpenAI-compatible and
   native endpoints it offers a workspace-scoped file API and an optional
   browser chat console, and it serves as the machine's GGUF inventory —
@@ -69,7 +69,7 @@ server over HTTP and charts it over time. See the *Benchmarking* chapter.
 
 Because every layer talks to the next over the OpenAI-compatible API, the pieces
 stay cleanly separated, yet they ship and run as one. The result is a fully
-local, fully private, single-language AI coding stack — no Python, no llama.cpp,
+local, fully private, single-language AI coding stack — no Python, no C/C++ engine,
 no cloud.
 
 ## Community

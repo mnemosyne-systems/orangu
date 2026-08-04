@@ -283,7 +283,7 @@ pub fn wait_until_serving(
              owns the port, and every point of this sweep would have measured it",
             server.pid()
         ),
-        // llama-server does not report a pid. Sweeping `ORANGU_*` against it
+        // A third-party server may report no pid. Sweeping `ORANGU_*` against it
         // is meaningless anyway, so this is a mistake worth naming rather
         // than a case to support.
         None => anyhow::bail!(

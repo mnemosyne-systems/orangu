@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod agents;
+pub mod build_info;
 pub mod compression;
 pub mod compression_cache;
 pub mod config;
