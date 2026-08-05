@@ -42,9 +42,12 @@ thread_local! {
 /// Installs the capturing hook, chained after whatever hook was already
 /// registered (the default one, unless something else installed its own
 /// first) so existing behavior — printing the panic to stderr — is
-/// unchanged; this only adds the stash. Call once, as early as possible in
-/// `main`, before any thread that might panic (in particular, any
-/// `spawn_blocking` closure) starts.
+/// unchanged for ordinary panics. A lost-device panic is the one exception:
+/// it is already turned into `device_lost`'s own one-paragraph log entry and
+/// process exit, so forwarding the original `wgpu` panic would only add a
+/// redundant backtrace. Call once, as early as possible in `main`, before
+/// any thread that might panic (in particular, any `spawn_blocking`
+/// closure) starts.
 pub fn install() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -53,6 +56,7 @@ pub fn install() {
             .map(|l| l.to_string())
             .unwrap_or_else(|| "<unknown location>".to_string());
         let message = panic_payload_string(info.payload());
+        let forward_to_previous = should_forward_to_previous_hook(&message);
         // Before anything else: a panic that says the GPU device is gone is
         // this process's death notice, whichever thread it happened on.
         // `wgpu` does not always report a lost device as an `Err` the engine
@@ -67,8 +71,14 @@ pub fn install() {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let detail = format!("panicked at {location}:\n{message}\n\nbacktrace:\n{backtrace}");
         LAST_PANIC.with(|cell| *cell.borrow_mut() = Some(detail));
-        previous(info);
+        if forward_to_previous {
+            previous(info);
+        }
     }));
+}
+
+fn should_forward_to_previous_hook(message: &str) -> bool {
+    !crate::device_lost::is_device_lost_message(message)
 }
 
 fn panic_payload_string(payload: &(dyn std::any::Any + Send)) -> String {
@@ -144,6 +154,20 @@ mod tests {
             "the hook must mark the device lost for the request's catch_unwind to find"
         );
         crate::device_lost::reset_for_test();
+    }
+
+    #[test]
+    fn a_device_lost_panic_is_not_forwarded_to_the_previous_hook() {
+        assert!(!should_forward_to_previous_hook(
+            "Error in Device::poll: Validation Error\n\nCaused by:\n  Parent device is lost"
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_panic_is_still_forwarded_to_the_previous_hook() {
+        assert!(should_forward_to_previous_hook(
+            "called `Option::unwrap()` on a `None` value"
+        ));
     }
 
     /// ...and leaves every other panic alone, which is most of them.
