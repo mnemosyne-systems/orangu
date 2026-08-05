@@ -340,7 +340,7 @@ mod tests {
         let backend = RecordingBackend {
             calls: Mutex::new(Vec::new()),
         };
-        let w = test_quant_matrix(&vec![0; 4 * 3 * 2], GGML_TYPE_F32, 3, 2);
+        let w = test_quant_matrix(&[0; 4 * 3 * 2], GGML_TYPE_F32, 3, 2);
         let n_tokens = MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT + 6;
         let x = vec![0.0; n_tokens * w.in_dim];
 
