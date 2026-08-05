@@ -2009,40 +2009,14 @@ impl CachedOpResources {
 /// Sweepable as `ORANGU_COOP_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
 const COOP_MIN_N_TOKENS: usize = 24;
 
-/// The most tokens `Backend::matmul_batch` will ever put in one GPU
-/// submission — a prefill call with more tokens than this gets split into
-/// consecutive stripes, each its own encoder/submit/poll cycle. A single
-/// very large multi-token matmul dispatch's own GPU execution time grows
-/// with `n_tokens`, and on some GPU/driver combinations under sustained
-/// load a long-running submission can be killed outright by the driver's
-/// own hang-detection/recovery mechanism well before it would ever finish
-/// correctly — a real crash, not just a slowdown, and independent of
-/// `tiled_prefill`'s own *per-workgroup* bound, since a driver's hang
-/// timeout is a property of one *submission's* total wall time, not of
-/// any one workgroup within it. Not swept against alternative values yet
-/// — chosen with a wide safety margin below where dispatches at this
-/// shape risk that timeout, not tuned for throughput.
-const MAX_MATMUL_TOKENS_PER_SUBMISSION_DEFAULT: usize = 128;
-
-/// [`MAX_MATMUL_TOKENS_PER_SUBMISSION_DEFAULT`], overridable per run with
-/// `ORANGU_MAX_TOKENS_PER_SUBMISSION`.
-///
-/// The default was picked for the hang-timeout safety margin its constant
-/// documents and never swept, so the value it costs in throughput was never
-/// known. Every stripe is a full encoder/submit/map/poll cycle plus its own
-/// upload and readback, and a 1224-token prompt at 128 is ten of them per
-/// weight per layer — so the knob exists to *measure* that overhead before
-/// anything is concluded about it. Raising it trades the driver's hang-timeout
-/// margin away; a value that survives a sweep here is not thereby safe under
-/// sustained load on another GPU, which is why the default is unchanged.
+/// The shared backend-wide token cap, but never below the Vulkan tiled/reduce
+/// crossover. Other backends can split at any positive width; the `wgpu`
+/// prefill paths need at least [`COOP_MIN_N_TOKENS`] so a tuned run cannot
+/// accidentally push a wide stripe onto the "small batch" shape everywhere.
 fn max_matmul_tokens_per_submission() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n >= COOP_MIN_N_TOKENS)
-            .unwrap_or(MAX_MATMUL_TOKENS_PER_SUBMISSION_DEFAULT)
+        crate::engine::backend::max_multi_token_phase_tokens().max(COOP_MIN_N_TOKENS)
     })
 }
 

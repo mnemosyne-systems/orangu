@@ -760,7 +760,7 @@ fn prefill_batch() -> usize {
 /// card, 512 measured *faster* than no chunking at all (115.4 vs 105.5
 /// tok/s prefill), since a smaller working set pages less. The matmuls were
 /// already striped at
-/// `engine::backend::vulkan`'s own 128-token submission cap regardless of
+/// `engine::backend::vulkan`'s own per-phase submission cap regardless of
 /// this, so what a bigger chunk buys is fewer attention and PLE calls, not
 /// bigger GEMMs.
 ///
@@ -856,18 +856,26 @@ fn prefill_in_chunks(
 /// Scaling the width by the rate just measured keeps the work per submission
 /// roughly constant instead. The rate only drifts upward, and slowly, so
 /// sizing from the previous chunk lands close; the budget is set well under
-/// the driver's limit to absorb what it misses.
+/// the driver's limit to absorb what it misses, and the estimate itself aims
+/// below that budget again because the *next* chunk always starts deeper into
+/// the prompt than the one just timed.
 fn next_chunk_width(n: usize, elapsed: Duration, budget: Duration, max_width: usize) -> usize {
     let per_token = elapsed.as_secs_f64() / (n.max(1) as f64);
     if per_token <= 0.0 {
         return max_width;
     }
-    let fits = (budget.as_secs_f64() / per_token) as usize;
+    let fits = (budget.as_secs_f64() * PREFILL_BUDGET_HEADROOM / per_token) as usize;
     // `min(max_width)` on the floor as well: a caller that configured a batch
     // smaller than the floor asked for chunks that small, and `clamp` panics
     // outright when its own min exceeds its max.
     fits.clamp(PREFILL_MIN_CHUNK_TOKENS.min(max_width), max_width)
 }
+
+/// Only a fraction of the configured budget is spent when sizing the next
+/// chunk. The measured chunk just completed at a shallower position than the
+/// next one will start from, so using the full budget as the target leaves no
+/// room for the cost curve to rise between them.
+const PREFILL_BUDGET_HEADROOM: f64 = 0.75;
 
 /// Tokens in the opening probe chunk. Small enough to stay well inside the
 /// driver's limit even at the deepest context this server will accept.
@@ -1485,9 +1493,10 @@ mod tests {
     #[test]
     fn a_slow_chunk_shrinks_the_next_one() {
         let budget = Duration::from_millis(3_000);
-        // 512 tokens took 10.1 s: ~19.7 ms each, so ~152 fit in the budget.
+        // 512 tokens took 10.1 s: ~19.7 ms each, so ~114 fit once the next
+        // chunk leaves headroom for starting deeper in the prompt.
         let next = next_chunk_width(512, Duration::from_millis(10_069), budget, 512);
-        assert!((140..=165).contains(&next), "sized {next}");
+        assert!((105..=125).contains(&next), "sized {next}");
         // And a fast one is allowed back up to the configured maximum.
         assert_eq!(
             next_chunk_width(16, Duration::from_millis(70), budget, 512),

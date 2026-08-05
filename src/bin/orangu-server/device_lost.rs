@@ -135,10 +135,7 @@ pub fn note_panic(message: &str) {
         return;
     }
     if set_lost() {
-        report(
-            "a wgpu call",
-            "the device was reported lost by wgpu itself",
-        );
+        report("a wgpu call", "the device was reported lost by wgpu itself");
     }
 }
 

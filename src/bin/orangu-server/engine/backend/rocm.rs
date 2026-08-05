@@ -786,7 +786,11 @@ impl Backend for RocmBackend {
 
     fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
         ops.iter()
-            .map(|op| self.matmul(op.x, op.n_tokens, op.w))
+            .map(|op| {
+                crate::engine::backend::guarded_matmul_op(op, |x, n_tokens, w| {
+                    self.matmul(x, n_tokens, w)
+                })
+            })
             .collect()
     }
 }

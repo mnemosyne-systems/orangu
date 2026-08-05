@@ -119,6 +119,53 @@ pub struct MatmulOp<'a> {
     pub w: &'a QuantMatrix,
 }
 
+/// The shared token cap for one multi-token backend phase, across every
+/// backend. `wgpu` backends may clamp it upward to their own kernel
+/// crossover where needed, but this is the one default policy the model
+/// code and the non-`wgpu` backends all share.
+pub(crate) const MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT: usize = 64;
+
+/// `ORANGU_MAX_TOKENS_PER_SUBMISSION`, shared above every backend-specific
+/// implementation.
+///
+/// The name comes from the original Vulkan-only tuning, but the intent is
+/// backend-agnostic now: one bound on how many prompt tokens any single
+/// multi-token backend phase should process at once unless a backend has a
+/// stricter floor of its own.
+pub(crate) fn max_multi_token_phase_tokens() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT)
+    })
+}
+
+/// Runs one prefill-style matmul op in token stripes when it exceeds the
+/// shared multi-token phase cap, concatenating the per-stripe outputs back to
+/// `[n_tokens, out_dim]`.
+pub(crate) fn guarded_matmul_op(
+    op: &MatmulOp<'_>,
+    mut run: impl FnMut(&[f32], usize, &QuantMatrix) -> Vec<f32>,
+) -> Vec<f32> {
+    let max_tokens = max_multi_token_phase_tokens();
+    if op.n_tokens <= max_tokens {
+        return run(op.x, op.n_tokens, op.w);
+    }
+
+    let in_dim = op.w.in_dim;
+    let mut out = Vec::with_capacity(op.n_tokens * op.w.out_dim);
+    let mut start = 0usize;
+    while start < op.n_tokens {
+        let end = (start + max_tokens).min(op.n_tokens);
+        out.extend(run(&op.x[start * in_dim..end * in_dim], end - start, op.w));
+        start = end;
+    }
+    out
+}
+
 pub trait Backend: Send + Sync {
     /// `y[t, o] = sum_i x[t, i] * w.row(o)[i]` — `x` is `[n_tokens,
     /// w.in_dim]`, `y` is `[n_tokens, w.out_dim]`. `w`'s rows are
@@ -127,15 +174,16 @@ pub trait Backend: Send + Sync {
 
     /// Runs several *independent* matmuls (no result of one feeds another
     /// — see [`MatmulOp`]) as a batch, returning results in the same
-    /// order. The default implementation just calls `matmul` once per op;
-    /// only a backend that actually benefits from batching (a GPU backend,
-    /// which can submit one command buffer and block on it once instead of
-    /// once per op) needs to override it. `CpuBackend` doesn't: its
-    /// `matmul` is already parallelized internally and has no per-call
+    /// order. The default implementation also enforces the shared multi-token
+    /// phase cap by splitting a long op into token stripes before calling
+    /// `matmul`; only a backend that actually benefits from batching (a GPU
+    /// backend, which can submit one command buffer and block on it once
+    /// instead of once per op) needs to override it. `CpuBackend` doesn't:
+    /// its `matmul` is already parallelized internally and has no per-call
     /// dispatch/sync overhead to amortize.
     fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
         ops.iter()
-            .map(|op| self.matmul(op.x, op.n_tokens, op.w))
+            .map(|op| guarded_matmul_op(op, |x, n_tokens, w| self.matmul(x, n_tokens, w)))
             .collect()
     }
 
@@ -239,7 +287,9 @@ pub fn unsupported_tensor_types<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL};
+    use std::sync::Mutex;
 
     /// A backend that accepts everything except the listed types, standing
     /// in for a real GPU backend's `SUPPORTED_TYPES` gap without needing a
@@ -272,6 +322,40 @@ mod tests {
             &Picky(&[GGML_TYPE_IQ4_NL, GGML_TYPE_IQ1_S]),
         );
         assert_eq!(found, vec!["IQ1_S".to_string(), "IQ4_NL".to_string()]);
+    }
+
+    struct RecordingBackend {
+        calls: Mutex<Vec<usize>>,
+    }
+
+    impl Backend for RecordingBackend {
+        fn matmul(&self, _x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+            self.calls.lock().unwrap().push(n_tokens);
+            vec![0.0; n_tokens * w.out_dim]
+        }
+    }
+
+    #[test]
+    fn default_matmul_batch_stripes_a_long_op_for_any_backend() {
+        let backend = RecordingBackend {
+            calls: Mutex::new(Vec::new()),
+        };
+        let w = test_quant_matrix(&vec![0; 4 * 3 * 2], GGML_TYPE_F32, 3, 2);
+        let n_tokens = MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT + 6;
+        let x = vec![0.0; n_tokens * w.in_dim];
+
+        let ys = backend.matmul_batch(&[MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &w,
+        }]);
+
+        assert_eq!(ys.len(), 1);
+        assert_eq!(ys[0].len(), n_tokens * w.out_dim);
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            vec![MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT, 6]
+        );
     }
 
     /// `CpuBackend` keeps the permissive default, so a file it can decode
