@@ -177,7 +177,7 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding)--embedding[Embeddings-only role]' \
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
-        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/refresh'"'"'s/bundle'"'"'s confirmation prompt]' \
+        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/bundle'"'"'s/prune'"'"'s confirmation prompt]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
         '1: :->command' \
@@ -256,7 +256,7 @@ complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
-complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/refresh\'s/bundle\'s confirmation prompt'
+complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/bundle\'s/prune\'s confirmation prompt'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
 "#;

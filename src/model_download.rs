@@ -24,7 +24,8 @@
 //! (verified directly against that source, not guessed): the same two Hub
 //! API calls (`/api/models/<repo>/refs` for the commit, `/api/models/<repo>/tree/<commit>?recursive=true`
 //! for the file listing), the same file-selection rules (excluding
-//! `mmproj`/`imatrix`/`mtp-` files from being treated as "the model", the
+//! `mmproj`/`imatrix`/`mtp-` files and draft sidecars such as
+//! `dflash-`/`dspark-`/`eagle3-` from being treated as "the model", the
 //! same `["Q4_K_M", "Q8_0"]` default tag preference when no `:quant` is
 //! given, the same shard-sibling collection for a multi-part model), the
 //! same best-matching-`mmproj`-sibling selection (`find_best_sibling`:
@@ -80,6 +81,12 @@ pub struct DownloadFile {
     /// `retrying`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoUpdateInfo {
+    pub commit: String,
+    pub files: Vec<RepoFile>,
 }
 
 /// Where a download is right now, for a caller with no terminal to draw a
@@ -274,7 +281,7 @@ fn build_client(timeout: Option<std::time::Duration>) -> Result<reqwest::blockin
 /// can't fail the whole command. Each request is capped with a short
 /// timeout for the same reason — an unreachable Hub shouldn't make `list`
 /// hang.
-pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, String> {
+pub fn latest_repo_updates(repos: &[String]) -> std::collections::HashMap<String, RepoUpdateInfo> {
     if repos.is_empty() {
         return std::collections::HashMap::new();
     }
@@ -288,8 +295,16 @@ pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, Str
         .par_iter()
         .filter_map(|repo| {
             let commit = resolve_commit(&client, repo, token.as_deref()).ok()?;
-            Some((repo.clone(), commit))
+            let files = list_repo_files(&client, repo, &commit, token.as_deref()).ok()?;
+            Some((repo.clone(), RepoUpdateInfo { commit, files }))
         })
+        .collect()
+}
+
+pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, String> {
+    latest_repo_updates(repos)
+        .into_iter()
+        .map(|(repo, update)| (repo, update.commit))
         .collect()
 }
 
@@ -386,7 +401,7 @@ struct LfsInfo {
     size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RepoFile {
     pub path: String,
     /// The content hash this file is stored under — the LFS oid (sha256)
@@ -444,15 +459,20 @@ fn authed_get(
 }
 
 /// Whether `path` names a standalone model file rather than a companion
-/// sidecar — excludes multimodal projectors, imatrix calibration data, and
-/// multi-token-prediction draft heads, exactly like llama.cpp's own
-/// `gguf_filename_is_model`.
+/// sidecar — excludes multimodal projectors, imatrix calibration data,
+/// multi-token-prediction draft heads, and draft sidecars such as
+/// `dflash`/`dspark`/`eagle3`.
 fn is_model_gguf(path: &str) -> bool {
     if !path.to_lowercase().ends_with(".gguf") {
         return false;
     }
     let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
-    !filename.contains("mmproj") && !filename.contains("imatrix") && !filename.starts_with("mtp-")
+    !filename.contains("mmproj")
+        && !filename.contains("imatrix")
+        && !filename.starts_with("mtp-")
+        && !filename.starts_with("dflash-")
+        && !filename.starts_with("dspark-")
+        && !filename.starts_with("eagle3-")
 }
 
 /// Parses a GGUF shard suffix (`-NNNNN-of-NNNNN.gguf`), returning
@@ -477,7 +497,7 @@ fn shard_info(path: &str) -> Option<(String, u32, u32)> {
 /// exists, falling further back to the first model file found at all), plus
 /// every other shard belonging to that same multi-part model. Mirrors
 /// llama.cpp's `find_best_model` + `get_split_files`.
-fn select_files_to_download<'a>(
+pub(crate) fn select_files_to_download<'a>(
     files: &'a [RepoFile],
     tag: Option<&str>,
 ) -> Result<Vec<&'a RepoFile>> {
@@ -1623,6 +1643,9 @@ mod tests {
         assert!(!is_model_gguf("mmproj-model-bf16.gguf"));
         assert!(!is_model_gguf("model.imatrix.gguf"));
         assert!(!is_model_gguf("mtp-model-q8_0.gguf"));
+        assert!(!is_model_gguf("dflash-model-q8_0.gguf"));
+        assert!(!is_model_gguf("dspark-model-q8_0.gguf"));
+        assert!(!is_model_gguf("eagle3-model-q8_0.gguf"));
         assert!(!is_model_gguf("README.md"));
     }
 

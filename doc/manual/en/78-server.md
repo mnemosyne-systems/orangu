@@ -65,7 +65,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,qwen35moe,qwen35}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -1055,6 +1055,90 @@ mod`), so adding a family is additive rather than a rewrite:
   full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
   `llm_build_delta_net_base` upstream), but a plain SwiGLU FFN in place of
   MoE routing.
+- `qwen3next.rs` — Qwen3-Next (confirmed against upstream `src/models/
+  qwen3next.cpp`), e.g. `unsloth/Qwen3-Coder-Next-GGUF`: the same full-
+  attention and MoE FFN shape as `qwen35moe.rs`, but with `ssm_beta_alpha`
+  packed into one tensor and legacy recurrent `ssm_in.weight` support.
+- `deepseek4.rs` — DeepSeek-V4 (`general.architecture = "deepseek4"`),
+  e.g. `unsloth/DeepSeek-V4-Flash-0731-GGUF:IQ1_M`, confirmed against
+  upstream `src/models/deepseek4.cpp` and the block planner in
+  `src/llama-kv-cache-dsv4.cpp`. Four things are unlike anything else here:
+  **hyper-connections** (the residual stream is `hyper_connection.count`
+  parallel streams; each half-layer collapses them to one vector and
+  expands the result back out, with per-token weights the layer predicts
+  from the streams themselves and a Sinkhorn-normalized stream-combination
+  matrix); **a single shared key/value vector per token**
+  (`head_count_kv = 1`, and the value *is* the key, so the attention output
+  carries the keys' rotations and is de-RoPEd at the query's position
+  before the grouped low-rank output projection); **compressed attention**
+  (`attention.compress_ratios` per layer: `0` is the plain
+  `attention.sliding_window`, `128` adds one pooled key per completed
+  128-token block, `4` adds one per completed *overlapping* 8-token window
+  of which only the `attention.indexer.top_k` best-scoring are attended,
+  scored by the lightning indexer's own narrower compressed cache); and
+  **hash-routed experts** on the first `hash_layer_count` layers, whose
+  expert selection is the `I32` `ffn_gate_tid2eid` table indexed by token
+  id rather than anything the router scores. Upstream's Hadamard key
+  rotation is deliberately not carried over — it is orthonormal and
+  self-inverse and is applied to query and key alike, so it changes no dot
+  product; it exists there for quantized KV caches. Compressed blocks live
+  in `KvCache::layers` like any other key, in slots whose rows each stand
+  for `ratio` tokens (`LayerCache::stride`), which is what keeps rollback,
+  prefix reuse and slot persistence exact for them.
+- `glm.rs` — GLM with DeepSeek sparse attention (`general.architecture =
+  "glm-dsa"`), e.g. `unsloth/GLM-5.2-GGUF`, confirmed against upstream
+  `src/models/glm-dsa.cpp` and the DSA `build_attn` overload in
+  `src/llama-graph.cpp`. The block shape is an ordinary pre-norm
+  transformer and the FFN is `qwen35moe`'s routed-plus-shared MoE (dense
+  for the first `leading_dense_block_count` layers); the attention is what
+  earns it a module. **MLA, absorbed**: one `kv_lora_rank`-wide compressed
+  vector per token plus a shared rotary part is the whole layer's K and V
+  for every head, and instead of decompressing it, the query goes through
+  the per-head key-decompression matrix (`attn_k_b`) and the output comes
+  back through `attn_v_b`. The cache is therefore K-only — the value is the
+  leading `kv_lora_rank` of the same row, which is what
+  `arch::attend`'s `value_dim` parameter exists for. **The lightning
+  indexer**: a 32-head, 128-wide attention with its own per-token key cache
+  scores every earlier position, and the layer attends only the
+  `indexer.top_k` best; `attention.indexer.types` says which layers score
+  and which reuse the last scoring layer's choice, defaulted from the
+  reference config for the GLM-5.2 quants that omit the key. The scoring
+  pass is skipped below `indexer.top_k` positions, where it provably cannot
+  change the mask. Note the two normalizations that differ from everything
+  around them: the indexer key is **LayerNorm**ed (mean-centred, with a
+  bias) rather than RMS-normed, and the attention scale follows
+  `key_length_mla`, not the wider absorbed query/key width. The
+  multi-token-prediction block (`blk.78`) is not run, as in `deepseek4.rs`.
+- `kimi3.rs` — Kimi-K3 (`general.architecture = "kimi-k3"`), e.g.
+  `unsloth/Kimi-K3-GGUF`, transcribed from `src/models/kimi-k3.cpp` in
+  upstream's Kimi-K3 pull request (ggml-org/llama.cpp#26185), the
+  `LLM_FFN_SITU` arm it adds to `build_moe_ffn`, and the delta-net
+  recurrence in `src/models/delta-net-base.cpp` that the released tree
+  already carries for Kimi-Linear. `attention.head_count_kv` is a per-layer
+  *array* here: `0` marks a **KDA** layer (three in four), anything else a
+  **MLA** layer. The KDA layer is `qwen35moe.rs`'s delta rule with two
+  differences — a short causal convolution over each of Q/K/V before it
+  (the three kernels are concatenated into one depthwise pass, so
+  `RecurrentLayerState::conv_step` is reused unchanged), and a decay that is
+  **per key dimension** rather than one scalar per head, from
+  `kda.gate_lower_bound * sigmoid(exp(A_log) * (f + dt_bias))`. The MLA
+  layer is `glm.rs`'s absorbed form with the RoPE removed (nothing is
+  rotated) and a sigmoid gate on the output. Beyond those: **cross-layer
+  residual attention** (`res_mix`/checkpoint banking — note the scores use
+  RMS-normalized values while the weighted sum uses the raw ones), **latent
+  MoE** (routed experts at `expert_latent_length`, router scoring the
+  full-width input), and the **situ** activation. The delta-net state is
+  the memory cost of this architecture: `kda.head_dim` squared per head per
+  recurrent layer, fixed and independent of context.
+- `dflash.rs` — DeepSeek draft sidecars (`general.architecture =
+  "dflash"`), e.g. the `dspark-` file in
+  `unsloth/DeepSeek-V4-Flash-0731-GGUF`. There is no standalone model in
+  these files: no `token_embd`, no `output`, and the graph reads the target
+  model's hidden states (`dflash.target_layers`). `main::
+  auto_pair_dflash_target` therefore resolves the paired target from the
+  same Hugging Face repo and serves *that* — for the DeepSeek-V4-Flash
+  sidecar, the `deepseek4` model above. This module is only the error for a
+  draft handed over directly with no repo to pair it from.
 - `mistral.rs` — `mistral3` (Mistral 3 / Ministral-3), confirmed against
   upstream `src/models/mistral3.cpp`. The block shape is `llama.rs`'s node
   for node; what earns it a module is four hyperparameters that are

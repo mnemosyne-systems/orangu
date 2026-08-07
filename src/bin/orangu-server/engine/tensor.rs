@@ -881,6 +881,57 @@ pub fn rope_apply_params_inplace(
     }
 }
 
+/// Inverse of [`rope_apply_params_inplace`]: applies the same RoPE with the
+/// sine term negated, which is the transpose of the 2x2 rotation block and
+/// therefore its exact inverse.
+pub fn rope_apply_params_inverse_inplace(
+    x: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
+    pos: usize,
+    freq_factors: Option<&[f32]>,
+    params: &RopeParams,
+) {
+    debug_assert_eq!(x.len(), n_head * head_dim);
+    let rope_dim = params.rope_dim;
+    let half = rope_dim / 2;
+    let (corr_lo, corr_hi, mscale) = params.yarn_terms();
+
+    let mut rot = Vec::with_capacity(half);
+    for i in 0..half {
+        let mut freq = params.freq_base.powf(-2.0 * i as f32 / rope_dim as f32);
+        if let Some(ff) = freq_factors {
+            freq /= ff[i];
+        }
+        let theta_extrap = pos as f32 * freq;
+        let theta = if params.ext_factor != 0.0 {
+            let y = (i as f32 - corr_lo) / (corr_hi - corr_lo).max(0.001);
+            let ramp = 1.0 - y.clamp(0.0, 1.0);
+            let mix = ramp * params.ext_factor;
+            let theta_interp = params.freq_scale * theta_extrap;
+            theta_interp * (1.0 - mix) + theta_extrap * mix
+        } else {
+            params.freq_scale * theta_extrap
+        };
+        let (sin, cos) = theta.sin_cos();
+        rot.push((-sin * mscale, cos * mscale));
+    }
+
+    for h in 0..n_head {
+        let head = &mut x[h * head_dim..(h + 1) * head_dim];
+        for (i, &(sin, cos)) in rot.iter().enumerate() {
+            let (lo, hi) = match params.layout {
+                RopeLayout::Neox => (i, i + half),
+                RopeLayout::Norm => (2 * i, 2 * i + 1),
+            };
+            let a = head[lo];
+            let b = head[hi];
+            head[lo] = a * cos - b * sin;
+            head[hi] = a * sin + b * cos;
+        }
+    }
+}
+
 /// Adds `bias` (`[dim]`) to every row of `x` (`[n_rows, dim]`) — a
 /// projection bias, e.g. Qwen2/Qwen3's `attn_q.bias`/`attn_k.bias`/
 /// `attn_v.bias` (plain Llama/Mistral GGUFs have no such tensors at all).
@@ -1176,6 +1227,23 @@ mod tests {
         rope_apply_inplace(&mut x, 1, 4, 4, 5, 10000.0);
         let norm_after = (x[0] * x[0] + x[2] * x[2]).sqrt();
         assert!((norm_before - norm_after).abs() < 1e-5);
+    }
+
+    #[test]
+    fn inverse_rope_round_trips_back_to_the_input() {
+        let params = RopeParams {
+            rope_dim: 8,
+            freq_base: 10000.0,
+            layout: RopeLayout::Norm,
+            ..RopeParams::default()
+        };
+        let mut x = [1.0f32, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0];
+        let original = x;
+        rope_apply_params_inplace(&mut x, 1, 8, 7, None, &params);
+        rope_apply_params_inverse_inplace(&mut x, 1, 8, 7, None, &params);
+        for (got, want) in x.iter().zip(original.iter()) {
+            assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+        }
     }
 
     /// `attn_factor` (ggml's `mscale`) scales both `cos_theta` and

@@ -83,6 +83,7 @@ use crate::engine::backend::vulkan_replay::{
 use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
+use crate::engine::moe_stats;
 use crate::engine::tensor;
 use rayon::prelude::*;
 
@@ -986,6 +987,9 @@ impl GemmaModel {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let mut x = x0.to_vec();
+        // A pass that ended early must not leave a prediction behind for the
+        // next one to be credited with.
+        crate::engine::route_ahead::reset();
 
         // Hoisted scratch, refilled (clear + extend/resize) each layer
         // rather than freshly allocated — the prefill's dominant CPU cost was
@@ -1317,7 +1321,15 @@ impl GemmaModel {
                     // sequence's `n_tokens` is its prompt length — nothing to
                     // stay bit-identical to. (At `n_tokens == 1` the backend
                     // takes the GEMV kernel anyway.)
-                    let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n_tokens, false);
+                    // One layer ahead, before this layer's experts run: the
+                    // whole point is to decide early enough to matter.
+                    if crate::engine::route_ahead::enabled()
+                        && let Some(next) = self.layers.get(il + 1)
+                        && let Some(next_moe) = &next.moe
+                    {
+                        self.predict_next_routing(il + 1, next_moe, &x, n_tokens);
+                    }
+                    let mut ffn_out = self.moe_ffn_result(il, layer, moe, &x, n_tokens, false);
                     tensor::rmsnorm_inplace(
                         &mut ffn_out,
                         &layer.ffn_post_norm,
@@ -2435,7 +2447,13 @@ impl ModelForward for GemmaModel {
             // across the `n` sequences instead of a prompt's positions. `x`
             // is the post-attention residual at this point.
             if let Some(moe) = &layer.moe {
-                let mut ffn_out = self.moe_ffn_result(layer, moe, &x, n, true);
+                if crate::engine::route_ahead::enabled()
+                    && let Some(next) = self.layers.get(il + 1)
+                    && let Some(next_moe) = &next.moe
+                {
+                    self.predict_next_routing(il + 1, next_moe, &x, n);
+                }
+                let mut ffn_out = self.moe_ffn_result(il, layer, moe, &x, n, true);
                 tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
                 tensor::add_inplace(&mut x, &ffn_out);
             } else {
@@ -2684,8 +2702,53 @@ impl GemmaModel {
     /// The routed-expert branch below takes every `(token, expert)` pair as
     /// its own `tensor::dot` already, so it is `n_tokens`-independent by
     /// construction and needs no flag.
+    /// Runs `next`'s router on the residual stream as it stands *now*, one
+    /// layer early, and records what it would have picked.
+    ///
+    /// Wrong by exactly the sub-layers it skips — this layer's own FFN and the
+    /// next layer's attention — which is the whole question a prefetcher rests
+    /// on and the reason `engine::route_ahead` exists to measure it rather
+    /// than assume it. Measurement only: nothing acts on the guess yet.
+    fn predict_next_routing(&self, next_layer: usize, next: &GemmaMoe, x: &[f32], n_tokens: usize) {
+        let n_expert = next.gate_inp.out_dim;
+        let logits = self.moe_router_logits(next, x, n_tokens, false);
+        let predicted: Vec<Vec<usize>> = (0..n_tokens)
+            .map(|t| {
+                let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
+                tensor::softmax_inplace(&mut probs);
+                super::top_k_indices(&probs, self.n_expert_used)
+            })
+            .collect();
+        // Fetch only the narrow head of the prediction, if asked: precision
+        // falls off fast with rank, and every expert named costs its bytes
+        // whether or not the router agrees later. See
+        // `route_ahead::prefetch_width` for the measured curve.
+        let width = crate::engine::route_ahead::prefetch_width();
+        if width > 0 {
+            let mut wanted: Vec<usize> = Vec::new();
+            for picks in &predicted {
+                for &expert in picks.iter().take(width) {
+                    if !wanted.contains(&expert) {
+                        wanted.push(expert);
+                    }
+                }
+            }
+            let store = crate::engine::expert_store::global();
+            match &next.gate_up {
+                GemmaExpertGateUp::Fused { gate_up, .. } => store.prefetch(gate_up, &wanted),
+                GemmaExpertGateUp::Separate { gate, up, .. } => {
+                    store.prefetch(gate, &wanted);
+                    store.prefetch(up, &wanted);
+                }
+            }
+            store.prefetch(&next.down_exps, &wanted);
+        }
+        crate::engine::route_ahead::predict(next_layer, predicted);
+    }
+
     fn moe_ffn_result(
         &self,
+        il: usize,
         layer: &GemmaLayer,
         moe: &GemmaMoe,
         attn_out: &[f32],
@@ -2738,104 +2801,150 @@ impl GemmaModel {
         // Route every token first (cheap, sequential): softmax its logits,
         // take the top `n_expert_used`, renormalize their weights over the
         // selection (clamped like the reference's `ggml_clamp` against a zero
-        // denominator). Flatten into a `(token, expert, weight)` work list.
-        let mut work: Vec<(usize, usize, f32)> = Vec::with_capacity(n_tokens * self.n_expert_used);
-        for t in 0..n_tokens {
-            let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
-            tensor::softmax_inplace(&mut probs);
-            let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            indexed.truncate(self.n_expert_used);
-            let weight_sum: f32 = indexed
-                .iter()
-                .map(|(_, w)| w)
-                .sum::<f32>()
-                .max(6.103_515_6e-5);
-            for (expert, weight) in indexed {
-                work.push((t, expert, weight / weight_sum));
+        // denominator). One `(expert, weight)` list per position, in the order
+        // the router picked them.
+        let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
+            .map(|t| {
+                let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
+                tensor::softmax_inplace(&mut probs);
+                let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.truncate(self.n_expert_used);
+                let weight_sum: f32 = indexed
+                    .iter()
+                    .map(|(_, w)| w)
+                    .sum::<f32>()
+                    .max(6.103_515_6e-5);
+                indexed
+                    .into_iter()
+                    .map(|(expert, weight)| (expert, weight / weight_sum))
+                    .collect()
+            })
+            .collect();
+
+        // Scored before the experts run: this is the routing a lookahead was
+        // trying to guess, and the guess is worth nothing once the weights
+        // have already been fetched.
+        crate::engine::route_ahead::score(il, &selection);
+
+        let mut experts = match &moe.gate_up {
+            GemmaExpertGateUp::Fused { gate_up, .. } => {
+                moe_stats::LayerRecorder::for_tensors(&[gate_up, &moe.down_exps])
             }
+            GemmaExpertGateUp::Separate { gate, up, .. } => {
+                moe_stats::LayerRecorder::for_tensors(&[gate, up, &moe.down_exps])
+            }
+        };
+        // Trim to the expert budget before anything is recorded or read.
+        match &moe.gate_up {
+            GemmaExpertGateUp::Fused { gate_up, .. } => {
+                super::apply_expert_budget(&mut selection, gate_up);
+            }
+            GemmaExpertGateUp::Separate { gate, .. } => {
+                super::apply_expert_budget(&mut selection, gate);
+            }
+        }
+        for picks in &selection {
+            picks.iter().for_each(|&(expert, _)| experts.select(expert));
         }
 
         // Evaluate each selected expert in parallel — this is the routed
         // FFN's dominant cost and the only part of the MoE forward still on
         // the CPU (per-row `Q*_0` dequant + dot; the shared MLP, attention,
-        // and router all dispatch to the GPU backend). Each `(token, expert)`
-        // pair is independent (reads shared weights + its own token's input,
-        // writes its own contribution vector), so they fan out across every
-        // core; the tiny weighted sum back into `moe_out` stays sequential.
-        let contribs: Vec<(usize, Vec<f32>)> = work
-            .par_iter()
-            .map(|&(t, expert, weight)| {
-                let x_t = &expert_in[t * n_embd..(t + 1) * n_embd];
+        // and router all dispatch to the GPU backend). One task per *distinct*
+        // expert rather than per `(token, expert)` pair: the rows are
+        // dequantized once and dotted with every token that routed to this
+        // expert. See `super::evaluate_routed_experts`, including why the
+        // contributions come back in selection order.
+        let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
+            // gate/up projection (fused or separate), dequantized once for
+            // every token that routed here. A per-expert `.scale`, if present,
+            // multiplies that expert's raw gate/up *output* before the GELU
+            // (matches `build_lora_mm_id`) — applied to the dot products
+            // below, never folded into the rows here. `(x · row) * s` and
+            // `x · (row * s)` are different `f32`s: one rounds a single
+            // product, the other rounds every term of the accumulation. The
+            // first is what this architecture computed before, so it is what
+            // it has to keep computing.
+            let inputs: Vec<&[f32]> = members
+                .iter()
+                .map(|&(t, _)| &expert_in[t * n_embd..(t + 1) * n_embd])
+                .collect();
 
-                // gate/up projection (fused or separate). A per-expert
-                // `.scale`, if present, multiplies that expert's raw gate/up
-                // output *before* the GELU (matches `build_lora_mm_id`).
-                let (mut gate, up) = match &moe.gate_up {
-                    GemmaExpertGateUp::Fused { gate_up, scale } => {
-                        let n_ff = gate_up.out_dim / 2;
-                        let mut gate: Vec<f32> = (0..n_ff)
-                            .map(|o| tensor::dot(x_t, &gate_up.row(expert, o)))
-                            .collect();
-                        let mut up: Vec<f32> = (0..n_ff)
-                            .map(|o| tensor::dot(x_t, &gate_up.row(expert, n_ff + o)))
-                            .collect();
-                        if let Some(s) = scale {
-                            let se = s[expert];
-                            gate.iter_mut().for_each(|v| *v *= se);
-                            up.iter_mut().for_each(|v| *v *= se);
-                        }
-                        (gate, up)
-                    }
-                    GemmaExpertGateUp::Separate {
-                        gate,
-                        up,
-                        gate_scale,
-                        up_scale,
-                    } => {
-                        let mut g: Vec<f32> = (0..gate.out_dim)
-                            .map(|o| tensor::dot(x_t, &gate.row(expert, o)))
-                            .collect();
-                        let mut u: Vec<f32> = (0..up.out_dim)
-                            .map(|o| tensor::dot(x_t, &up.row(expert, o)))
-                            .collect();
-                        if let Some(s) = gate_scale {
-                            let se = s[expert];
-                            g.iter_mut().for_each(|v| *v *= se);
-                        }
-                        if let Some(s) = up_scale {
-                            let se = s[expert];
-                            u.iter_mut().for_each(|v| *v *= se);
-                        }
-                        (g, u)
-                    }
-                };
-                tensor::gelu_inplace(&mut gate);
-                tensor::mul_inplace(&mut gate, &up);
-                let h = gate;
+            // The fused tensor's first half is the gate and its second half
+            // the up, so the two are the same matrix under two row ranges.
+            let (mut gate, mut up, gate_scale, up_scale) = match &moe.gate_up {
+                GemmaExpertGateUp::Fused { gate_up, scale } => {
+                    let n_ff = gate_up.out_dim / 2;
+                    let scale = scale.as_ref().map(|s| s[expert]);
+                    (
+                        super::project_expert(gate_up, expert, 0, n_ff, &inputs),
+                        super::project_expert(gate_up, expert, n_ff, n_ff, &inputs),
+                        scale,
+                        scale,
+                    )
+                }
+                GemmaExpertGateUp::Separate {
+                    gate,
+                    up,
+                    gate_scale,
+                    up_scale,
+                } => (
+                    super::project_expert(gate, expert, 0, gate.out_dim, &inputs),
+                    super::project_expert(up, expert, 0, up.out_dim, &inputs),
+                    gate_scale.as_ref().map(|s| s[expert]),
+                    up_scale.as_ref().map(|s| s[expert]),
+                ),
+            };
+            if let Some(scale) = gate_scale {
+                gate.iter_mut()
+                    .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
+            }
+            if let Some(scale) = up_scale {
+                up.iter_mut()
+                    .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
+            }
 
-                // Down projection, then the per-expert down `.scale` (if any)
-                // and the routing weight — both scalars, folded into one.
-                // Row-parallel *within* the expert as well: decode routes only
-                // `n_expert_used` (8) tokens' worth of work, too few to fill
-                // every core from the outer fan-out alone, so the down
-                // projection's `n_embd` rows fan out too (rayon's work-stealing
-                // keeps this from oversubscribing when the outer list is
-                // already wide, e.g. during prefill).
-                let dscale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]) * weight;
-                let contrib: Vec<f32> = (0..moe.down_exps.out_dim)
-                    .into_par_iter()
-                    .map(|o| dscale * tensor::dot(&h, &moe.down_exps.row(expert, o)))
-                    .collect();
-                (t, contrib)
+            let hidden: Vec<Vec<f32>> = gate
+                .into_iter()
+                .zip(up)
+                .map(|(mut gate, up)| {
+                    tensor::gelu_inplace(&mut gate);
+                    tensor::mul_inplace(&mut gate, &up);
+                    gate
+                })
+                .collect();
+            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+
+            // Down projection, then the per-expert down `.scale` (if any) and
+            // the routing weight — both scalars, folded into one.
+            let down_scale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]);
+            super::project_expert(
+                &moe.down_exps,
+                expert,
+                0,
+                moe.down_exps.out_dim,
+                &hidden_refs,
+            )
+            .into_iter()
+            .zip(members)
+            .map(|(mut contribution, &(_, weight))| {
+                let dscale = down_scale * weight;
+                contribution.iter_mut().for_each(|v| *v *= dscale);
+                contribution
             })
-            .collect();
+            .collect()
+        });
+        experts.loaded_once_per_distinct_expert();
+        experts.commit(n_tokens);
 
         let mut moe_out = vec![0f32; n_tokens * n_embd];
-        for (t, contrib) in &contribs {
+        for (t, picks) in contribs.iter().enumerate() {
             let dst = &mut moe_out[t * n_embd..(t + 1) * n_embd];
-            for (d, v) in dst.iter_mut().zip(contrib) {
-                *d += v;
+            for contrib in picks {
+                for (d, v) in dst.iter_mut().zip(contrib) {
+                    *d += v;
+                }
             }
         }
         tensor::rmsnorm_inplace(&mut moe_out, &moe.post_norm_2, n_tokens, n_embd, eps);

@@ -95,6 +95,95 @@ pub async fn gpu_timings(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }))
 }
 
+/// `GET /moe-stats` — the accumulated mixture-of-experts counters since the
+/// last call, and **reset**.
+///
+/// Same drain-on-read contract as [`gpu_timings`], for the same reason: read
+/// once before the workload to discard the warmup, run it, read again to get
+/// exactly that window.
+///
+/// This is what makes work on models too large for RAM scoreable. Throughput
+/// cannot separate a change that moves fewer bytes from one that moves the
+/// same bytes faster, and on a model whose weights stream from disk it cannot
+/// see either one over the I/O. `stats.union_ratio` is the redundancy in
+/// today's per-token expert loop, and `process.major_faults_window` is the
+/// only honest signal that the weights came from the disk rather than the
+/// page cache — see `engine::moe_stats` and `BIG.md`.
+///
+/// `stats.layer_calls: 0` means no MoE layer ran in the window — a dense
+/// model, or an empty window. Reported as zero *calls* rather than zero bytes
+/// so "not measured" cannot be read as "moved nothing", exactly as
+/// [`gpu_timings`] reports zero steps. `process` is `null` off Linux, where
+/// there is no `/proc/self` to read it from.
+pub async fn moe_stats() -> impl IntoResponse {
+    let stats = crate::engine::moe_stats::take();
+    let process = crate::engine::moe_stats::take_process_memory();
+    let store = crate::engine::expert_store::global().take_stats();
+    let route_ahead = crate::engine::route_ahead::take();
+    Json(serde_json::json!({
+        "stats": stats.to_json(),
+        "process": process.map(|p| p.to_json()),
+        // Where the expert weights were when they were asked for. `hit_rate`
+        // is `null` unless `ORANGU_EXPERT_RESIDENCY=1` asked the kernel — see
+        // `engine::expert_store`, which reports "not measured" rather than
+        // "not resident" when it did not look.
+        "store": store.to_json(),
+        // How well the next layer's routing could be guessed one layer early.
+        // `accuracy` is `null` unless `ORANGU_ROUTE_AHEAD=1` — see
+        // `engine::route_ahead`, which measures this before anything is built
+        // on it.
+        "route_ahead": route_ahead.to_json(),
+    }))
+}
+
+/// `GET /model-cache` — how much of the model's weights are in RAM right now.
+///
+/// Not drain-on-read: this is a state, not a window. A benchmark records it
+/// beside its numbers so a later reader can tell a cold run from a warm one
+/// instead of assuming — on a model larger than memory those are different
+/// experiments and their rates are not comparable.
+///
+/// `resident_bytes` is `null` where the platform cannot measure it, never
+/// zero: "nothing is cached" and "this machine cannot say" would otherwise be
+/// the same answer, and only one of them means the run was cold.
+pub async fn model_cache() -> impl IntoResponse {
+    let shards = crate::engine::page_cache::residency();
+    let (bytes, resident) = crate::engine::page_cache::residency_totals(&shards);
+    Json(serde_json::json!({
+        "model_bytes": bytes,
+        "resident_bytes": resident,
+        "shards": shards.iter().map(crate::engine::page_cache::ShardResidency::to_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// `POST /model-cache/drop` — evict the model's weights from the page cache,
+/// so the next request reads them from the disk.
+///
+/// Loopback-only, like `/v1/shutdown`: it makes the server dramatically slower
+/// on purpose, which is not something an arbitrary network peer should be able
+/// to do to it.
+///
+/// The response reports residency **before and after** rather than a success
+/// flag, because a partial drop is the realistic failure and it reads exactly
+/// like a successful one from the outside — see `engine::page_cache` for why
+/// dropping takes two different calls in a specific order.
+pub async fn drop_model_cache(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    if !addr.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "dropping the model cache is only available from localhost",
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(crate::engine::page_cache::drop_model_page_cache().to_json()),
+    )
+}
+
 /// `&dyn Backend` → the `wgpu` engine behind it, if it is one.
 ///
 /// A free function rather than an inline closure only because

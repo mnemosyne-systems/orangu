@@ -271,12 +271,20 @@ pub trait Backend: Send + Sync {
 /// as reading the header. Runs after `quant::supports_type`'s own check
 /// (`loader::model_load_support`), so a type reported here is one this
 /// build *can* read on the CPU but not on the selected device.
+///
+/// Some MoE tensors stay on the CPU today:
+/// - `ExpertQuantMatrix` stacks are dequantized and dotted directly.
+/// - Qwen shared-expert matrices can fall back to `CpuBackend` when the
+///   selected backend lacks a quant kernel.
+///
+/// Rejecting a GPU backend for a type that appears only in those tensors
+/// would therefore be a false negative at startup.
 pub fn unsupported_tensor_types<'a>(
     tensors: impl Iterator<Item = (&'a str, u32)>,
     backend: &dyn Backend,
 ) -> Vec<String> {
     let mut names: Vec<String> = tensors
-        .filter(|(_, ggml_type)| !backend.supports_type(*ggml_type))
+        .filter(|(name, ggml_type)| !is_cpu_only_tensor(name) && !backend.supports_type(*ggml_type))
         .map(|(_, ggml_type)| orangu::gguf::ggml_type_name(ggml_type))
         .collect();
     names.sort_unstable();
@@ -284,11 +292,22 @@ pub fn unsupported_tensor_types<'a>(
     names
 }
 
+fn is_cpu_only_tensor(name: &str) -> bool {
+    name.ends_with(".ffn_gate_exps.weight")
+        || name.ends_with(".ffn_up_exps.weight")
+        || name.ends_with(".ffn_down_exps.weight")
+        || name.ends_with(".ffn_gate_up_exps.weight")
+        || name.ends_with(".ffn_gate_shexp.weight")
+        || name.ends_with(".ffn_up_shexp.weight")
+        || name.ends_with(".ffn_down_shexp.weight")
+        || name.ends_with(".ffn_gate_tid2eid.weight")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::loader::test_quant_matrix;
-    use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL};
+    use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4};
     use std::sync::Mutex;
 
     /// A backend that accepts everything except the listed types, standing
@@ -322,6 +341,21 @@ mod tests {
             &Picky(&[GGML_TYPE_IQ4_NL, GGML_TYPE_IQ1_S]),
         );
         assert_eq!(found, vec!["IQ1_S".to_string(), "IQ4_NL".to_string()]);
+    }
+
+    #[test]
+    fn unsupported_tensor_types_ignores_cpu_only_moe_tensors() {
+        let tensors = [
+            ("blk.0.ffn_gate_exps.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_up_exps.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_down_exps.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_gate_up_exps.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_gate_shexp.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_up_shexp.weight", GGML_TYPE_MXFP4),
+            ("blk.0.ffn_down_shexp.weight", GGML_TYPE_MXFP4),
+        ];
+        let found = unsupported_tensor_types(tensors.iter().copied(), &Picky(&[GGML_TYPE_MXFP4]));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     struct RecordingBackend {

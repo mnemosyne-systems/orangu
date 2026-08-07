@@ -182,6 +182,43 @@ pub fn render_labelled(
             "Embeddings — forward pass",
             axes.x.as_deref().unwrap_or("prompt length (tokens)"),
         ),
+        // The three mixture-of-experts mechanism panels (`super::moe`). Each
+        // is a count rather than a rate, and none is in tokens/second, so
+        // none can share a panel with the ones above — the whole reason they
+        // exist is that a rate cannot express what they measure.
+        //
+        // Registered here in the same commit that first writes them: this
+        // list is the only thing that decides whether a mode is drawn, and a
+        // mode missing from it is filtered out below without a word, leaving
+        // a panel with a legend and no plot. See
+        // `a_mode_the_chart_does_not_know_about_is_silently_dropped`.
+        (
+            // Above 1.0 is redundant expert work: how many times the average
+            // expert's weights were read within one layer call.
+            "moe_union",
+            "MoE — expert weight re-reads per layer call (1.0 = none)",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
+        (
+            "moe_mb",
+            "MoE — expert MB dequantized per token per layer",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
+        (
+            // Lower is better, like `cpu` — and on its own panel for the same
+            // reason.
+            "moe_majflt",
+            "Storage — major faults per repetition",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
+        (
+            // Percent, not tok/s. Only present when the server was asked to
+            // measure residency; the page cache's own rate until a tiered
+            // store has one to compare against.
+            "moe_hit",
+            "Experts — resident when asked (%)",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
     ] {
         // `(label, date) -> context -> best`.
         let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
@@ -554,6 +591,32 @@ mod tests {
             "expected a marker per point, got {}",
             svg.matches("<circle").count()
         );
+    }
+
+    /// The same trap, for the three modes `super::moe` writes. Registering a
+    /// mode in the panel list is a separate edit from emitting its rows, and
+    /// forgetting it costs nothing at write time and everything at read time
+    /// — the rows land in the history file and simply never appear.
+    #[test]
+    fn every_moe_mode_is_plotted_rather_than_filtered_away() {
+        for (mode, expected) in [
+            ("moe_union", "expert weight re-reads"),
+            ("moe_mb", "dequantized per token"),
+            ("moe_majflt", "major faults"),
+            ("moe_hit", "resident when asked"),
+        ] {
+            let recs = [
+                rec("2026-08-08", "orangu", mode, 128, 1.4),
+                rec("2026-08-08", "orangu", mode, 512, 3.2),
+            ];
+            let svg = render_labelled(&recs, "test", None, Labels::default());
+            assert!(svg.contains(expected), "the {mode} panel is missing");
+            assert!(
+                svg.matches("<circle").count() >= 2,
+                "{mode}: expected a marker per point, got {}",
+                svg.matches("<circle").count()
+            );
+        }
     }
 
     fn rec(date: &str, label: &str, mode: &str, n: u32, best: f64) -> Record {

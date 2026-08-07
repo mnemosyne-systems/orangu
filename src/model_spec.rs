@@ -467,6 +467,35 @@ fn hf_repo_root_from_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn hf_snapshot_relative_path(path: &Path) -> Option<String> {
+    let components: Vec<&str> = path
+        .components()
+        .map(|c| c.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let snapshots = components.iter().position(|c| *c == "snapshots")?;
+    let start = snapshots + 2;
+    (start < components.len()).then(|| components[start..].join("/"))
+}
+
+fn hf_blob_oid_from_path(path: &Path) -> Option<String> {
+    std::fs::read_link(path)
+        .ok()
+        .and_then(|target| {
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            std::fs::canonicalize(path).ok().and_then(|target| {
+                target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+        })
+}
+
 /// Whether any symlink still left under `repo_root`'s own `snapshots/`
 /// resolves to `blob` — scoped to just this one repo (blobs are already
 /// repo-scoped by construction, nested under `models--<user>--<model>/
@@ -574,24 +603,56 @@ impl ModelGroup {
         }
     }
 
-    /// Whether this group's repo has moved on since it was downloaded: its
-    /// own [`local_commit`] differs from the commit `latest_commits` (from
-    /// [`crate::model_download::latest_commits`]) says the Hub's `main`
-    /// resolves to now. Compared per row rather than per repo, so one stale
-    /// `:quant` row doesn't mark a sibling row of the same repo that's
-    /// already current. Always `false` for a model outside the hub-cache
-    /// layout (no repo to compare against) and for a repo the lookup didn't
-    /// reach — an unreachable Hub means "unknown", never "behind".
+    /// Whether this group's downloadable files differ from the latest repo
+    /// tree. Compared per row rather than per repo, so a commit that touched
+    /// only another quantization does not mark this row `(Refresh)`. Always
+    /// `false` for a model outside the hub-cache layout and for a repo the
+    /// lookup did not reach - an unreachable Hub means "unknown", never
+    /// "behind".
     ///
     /// Both what `list` marks `(Refresh)` and what `refresh` leaves
     /// un-greyed, so the two always agree on which rows are worth acting on.
     ///
     /// [`local_commit`]: ModelGroup::local_commit
-    pub fn is_behind(&self, latest_commits: &HashMap<String, String>) -> bool {
-        self.hf_repo.as_deref().is_some_and(|repo| {
-            latest_commits
-                .get(repo)
-                .is_some_and(|latest| Some(latest.as_str()) != self.local_commit.as_deref())
+    pub fn is_behind(
+        &self,
+        latest_updates: &HashMap<String, crate::model_download::RepoUpdateInfo>,
+    ) -> bool {
+        let Some(repo) = self.hf_repo.as_deref() else {
+            return false;
+        };
+        let Some(update) = latest_updates.get(repo) else {
+            return false;
+        };
+        let stem = self
+            .representative_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let tag = hf_tag_from_label(shard_group_label(stem));
+        let Ok(latest_files) =
+            crate::model_download::select_files_to_download(&update.files, tag.as_deref())
+        else {
+            return false;
+        };
+        if latest_files.len() != self.paths.len() {
+            return true;
+        }
+        let latest_by_path: HashMap<&str, &str> = latest_files
+            .iter()
+            .map(|file| (file.path.as_str(), file.oid.as_str()))
+            .collect();
+        self.paths.iter().any(|path| {
+            let Some(relative) = hf_snapshot_relative_path(path) else {
+                return true;
+            };
+            let Some(local_oid) = hf_blob_oid_from_path(path) else {
+                return true;
+            };
+            match latest_by_path.get(relative.as_str()) {
+                Some(oid) => **oid != local_oid,
+                None => true,
+            }
         })
     }
 
@@ -782,6 +843,10 @@ fn hf_repo_id_from_path(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+pub fn hf_repo_for_path(path: &Path) -> Option<String> {
+    hf_repo_id_from_path(path)
 }
 
 /// The commit sha a Hugging Face hub-cache path was downloaded at: the name
@@ -977,16 +1042,17 @@ pub enum Dimming {
     /// `list`/`show`/`delete`: grey the rows whose architecture this build
     /// can't load. Needs a non-empty `support` slice to have any effect.
     Unsupported,
-    /// `refresh`: grey the rows already at their repo's latest commit, so
-    /// only the `NR`s worth refreshing — the ones marked `(Refresh)` — stand
-    /// out. Needs a non-empty `latest_commits` map to have any effect.
+    /// `refresh`: grey the rows already at their latest downloadable file
+    /// set, so only the `NR`s worth refreshing - the ones marked
+    /// `(Refresh)` - stand out. Needs a non-empty `latest_updates` map to
+    /// have any effect.
     UpToDate,
 }
 
 /// The `list` table for every `.gguf` model found, with no Hugging Face
 /// update check and no `SUPPORTED` column — the plain, fully offline
 /// rendering used by callers (tests) that don't need either. `list` itself
-/// calls [`format_groups`] directly so it can pass `latest_commits` and the
+/// calls [`format_groups`] directly so it can pass `latest_updates` and the
 /// per-group [`ModelSupport`].
 pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
     if models.is_empty() {
@@ -1001,15 +1067,14 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
     )
 }
 
-/// Renders the `list` table from already-grouped models. `latest_commits`
-/// maps each [`ModelGroup::hf_repo`] id to the commit sha the Hub's `main`
-/// branch currently resolves to — a row gets a trailing `(Refresh)` marker,
-/// appended after `SIZE`, exactly when its own `local_commit` differs from
-/// that repo's entry (comparing per row, not per repo, so one stale
-/// `:quant` row doesn't mark a sibling row of the same repo that's already
-/// current). The marker sits after `SIZE` rather than inside `MODEL` so a
-/// consumer that reads `list`'s output by column position (e.g. the shell
-/// completion scripts, which only read `NR`/`MODEL`) is unaffected.
+/// Renders the `list` table from already-grouped models. `latest_updates`
+/// maps each [`ModelGroup::hf_repo`] id to the latest downloadable file
+/// state the Hub reports for that repo. A row gets a trailing `(Refresh)`
+/// marker, appended after `SIZE`, exactly when the latest file set or blob
+/// oids for that row differ from what is on disk. The marker sits after
+/// `SIZE` rather than inside `MODEL` so a consumer that reads `list`'s
+/// output by column position (e.g. the shell completion scripts, which only
+/// read `NR`/`MODEL`) is unaffected.
 ///
 /// `support`, when non-empty, adds a trailing `SUPPORTED` column reading
 /// `Yes (<arch>)`/`No (<arch>)` per row (aligned to `groups` by index — see
@@ -1020,7 +1085,7 @@ pub fn format_list(models: &[ModelSummary], base: &Path) -> String {
 pub fn format_groups(
     groups: &[ModelGroup],
     base: &Path,
-    latest_commits: &HashMap<String, String>,
+    latest_updates: &HashMap<String, crate::model_download::RepoUpdateInfo>,
     support: &[ModelSupport],
     dim: Dimming,
 ) -> String {
@@ -1072,7 +1137,7 @@ pub fn format_groups(
     }
     for (index, group) in groups.iter().enumerate() {
         let nr = index + 1;
-        let refresh = group.is_behind(latest_commits);
+        let refresh = group.is_behind(latest_updates);
         if !group.errors.is_empty() {
             // An error row carries neither `SIZE` nor `SUPPORTED`, so there's
             // no `(Refresh)` marker to hang off the end of it — but `refresh`
@@ -1159,6 +1224,22 @@ mod tests {
             .unwrap()
             .write_all(&buf)
             .unwrap();
+    }
+
+    fn write_cached_minimal_gguf(snapshot_path: &Path, architecture: &str, oid: &str) {
+        let repo_root = snapshot_path
+            .ancestors()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("models--"))
+            })
+            .unwrap();
+        let blob = repo_root.join("blobs").join(oid);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        write_minimal_gguf(&blob, architecture, None);
+        std::os::unix::fs::symlink(&blob, snapshot_path).unwrap();
     }
 
     #[test]
@@ -1749,26 +1830,32 @@ mod tests {
     #[test]
     fn format_groups_marks_a_row_whose_local_commit_is_behind() {
         let dir = tempfile::tempdir().unwrap();
-        let repo_dir = dir
+        let snapshot = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        write_minimal_gguf(
-            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        write_cached_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
             "llama",
-            None,
+            "blob-1",
         );
         write_minimal_gguf(&dir.path().join("plain.gguf"), "llama", None);
 
         let models = scan_models_dir(dir.path()).unwrap();
         let groups = group_models(&models);
-        let mut latest_commits = HashMap::new();
-        latest_commits.insert(
+        let mut latest_updates = HashMap::new();
+        latest_updates.insert(
             "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            "rev2".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev2".to_string(),
+                files: vec![crate::model_download::RepoFile {
+                    path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                    oid: "blob-2".to_string(),
+                    size: 1,
+                }],
+            },
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::Off);
 
         let mut lines = output.lines().skip(1); // header
         assert!(lines.next().unwrap().ends_with("(Refresh)"));
@@ -1778,27 +1865,67 @@ mod tests {
     #[test]
     fn format_groups_does_not_mark_a_row_already_at_the_latest_commit() {
         let dir = tempfile::tempdir().unwrap();
-        let repo_dir = dir
+        let snapshot = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        write_minimal_gguf(
-            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        write_cached_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
             "llama",
-            None,
+            "blob-1",
         );
 
         let models = scan_models_dir(dir.path()).unwrap();
         let groups = group_models(&models);
-        let mut latest_commits = HashMap::new();
-        latest_commits.insert(
+        let mut latest_updates = HashMap::new();
+        latest_updates.insert(
             "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            "rev1".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev1".to_string(),
+                files: vec![crate::model_download::RepoFile {
+                    path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                    oid: "blob-1".to_string(),
+                    size: 1,
+                }],
+            },
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::Off);
 
         assert!(!output.lines().nth(1).unwrap().contains("(Refresh)"));
+    }
+
+    #[test]
+    fn format_groups_does_not_mark_a_row_when_only_the_repo_commit_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
+        write_cached_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "llama",
+            "blob-1",
+        );
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        let mut latest_updates = HashMap::new();
+        latest_updates.insert(
+            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev2".to_string(),
+                files: vec![crate::model_download::RepoFile {
+                    path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                    oid: "blob-1".to_string(),
+                    size: 1,
+                }],
+            },
+        );
+
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::Off);
+        assert!(
+            !output.lines().nth(1).unwrap().contains("(Refresh)"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -1811,31 +1938,43 @@ mod tests {
         let old_dir = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
-        std::fs::create_dir_all(&old_dir).unwrap();
-        write_minimal_gguf(
+        write_cached_minimal_gguf(
             &old_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
             "llama",
-            None,
+            "blob-1",
         );
         let current_dir = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev2");
-        std::fs::create_dir_all(&current_dir).unwrap();
-        write_minimal_gguf(
+        write_cached_minimal_gguf(
             &current_dir.join("Llama-3.2-3B-Instruct-Q8_0.gguf"),
             "llama",
-            None,
+            "blob-2",
         );
 
         let models = scan_models_dir(dir.path()).unwrap();
         let groups = group_models(&models);
-        let mut latest_commits = HashMap::new();
-        latest_commits.insert(
+        let mut latest_updates = HashMap::new();
+        latest_updates.insert(
             "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            "rev2".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev2".to_string(),
+                files: vec![
+                    crate::model_download::RepoFile {
+                        path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                        oid: "blob-9".to_string(),
+                        size: 1,
+                    },
+                    crate::model_download::RepoFile {
+                        path: "Llama-3.2-3B-Instruct-Q8_0.gguf".to_string(),
+                        oid: "blob-2".to_string(),
+                        size: 1,
+                    },
+                ],
+            },
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::Off);
 
         let mut lines = output.lines().skip(1); // header
         let q4 = lines.next().unwrap(); // Q4_K_M, sorted before Q8_0
@@ -1851,25 +1990,31 @@ mod tests {
     #[test]
     fn the_refresh_marker_is_one_space_off_the_preceding_column() {
         let dir = tempfile::tempdir().unwrap();
-        let repo_dir = dir
+        let snapshot = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        write_minimal_gguf(
-            &repo_dir.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        write_cached_minimal_gguf(
+            &snapshot.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
             "llama",
-            None,
+            "blob-1",
         );
 
         let models = scan_models_dir(dir.path()).unwrap();
         let groups = group_models(&models);
-        let mut latest_commits = HashMap::new();
-        latest_commits.insert(
+        let mut latest_updates = HashMap::new();
+        latest_updates.insert(
             "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            "rev2".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev2".to_string(),
+                files: vec![crate::model_download::RepoFile {
+                    path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                    oid: "blob-2".to_string(),
+                    size: 1,
+                }],
+            },
         );
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::Off);
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::Off);
 
         let row = output.lines().nth(1).unwrap();
         assert!(row.ends_with(" (Refresh)"), "unexpected row: {row:?}");
@@ -1884,32 +2029,48 @@ mod tests {
         let stale = dir
             .path()
             .join("models--bartowski--Llama-3.2-3B-Instruct-GGUF/snapshots/rev1");
-        std::fs::create_dir_all(&stale).unwrap();
-        write_minimal_gguf(
+        write_cached_minimal_gguf(
             &stale.join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
             "llama",
-            None,
+            "blob-1",
         );
         let current = dir
             .path()
             .join("models--ggml-org--gemma-4-12B-it-GGUF/snapshots/rev9");
-        std::fs::create_dir_all(&current).unwrap();
-        write_minimal_gguf(&current.join("gemma-4-12B-it-Q4_K_M.gguf"), "gemma4", None);
+        write_cached_minimal_gguf(
+            &current.join("gemma-4-12B-it-Q4_K_M.gguf"),
+            "gemma4",
+            "blob-9",
+        );
 
         let models = scan_models_dir(dir.path()).unwrap();
         let groups = group_models(&models);
-        let latest_commits = HashMap::from([
+        let latest_updates = HashMap::from([
             (
                 "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-                "rev2".to_string(),
+                crate::model_download::RepoUpdateInfo {
+                    commit: "rev2".to_string(),
+                    files: vec![crate::model_download::RepoFile {
+                        path: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+                        oid: "blob-2".to_string(),
+                        size: 1,
+                    }],
+                },
             ),
             (
                 "ggml-org/gemma-4-12B-it-GGUF".to_string(),
-                "rev9".to_string(),
+                crate::model_download::RepoUpdateInfo {
+                    commit: "rev9".to_string(),
+                    files: vec![crate::model_download::RepoFile {
+                        path: "gemma-4-12B-it-Q4_K_M.gguf".to_string(),
+                        oid: "blob-9".to_string(),
+                        size: 1,
+                    }],
+                },
             ),
         ]);
 
-        let output = format_groups(&groups, dir.path(), &latest_commits, &[], Dimming::UpToDate);
+        let output = format_groups(&groups, dir.path(), &latest_updates, &[], Dimming::UpToDate);
 
         let mut lines = output.lines().skip(1); // header
         let stale_row = lines.next().unwrap(); // bartowski, sorted first
@@ -1964,7 +2125,7 @@ mod tests {
         );
     }
 
-    /// An mmproj sidecar is in no group: `delete` synthesizes a one-file
+    /// A companion sidecar is in no group: `delete` synthesizes a one-file
     /// group for it, but there's no such thing as downloading one on its own.
     #[test]
     fn refresh_rejects_an_mmproj_sidecar_named_directly() {

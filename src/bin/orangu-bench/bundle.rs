@@ -121,6 +121,7 @@ pub fn write(
     host: serde_json::Value,
     run: serde_json::Value,
     gpu_timings: &serde_json::Value,
+    model_cache: &serde_json::Value,
     records: &[Record],
 ) -> anyhow::Result<()> {
     let doc = serde_json::json!({
@@ -142,6 +143,11 @@ pub fn write(
         // server reports it. The one profiling instrument that works on a
         // platform without `perf` — see `report_gpu_timings`.
         "gpu_timings": gpu_timings,
+        // How much of the model was in RAM when the run started. On a model
+        // that does not fit, this decides what the rates below even mean: the
+        // same build measured cold and warm produces two numbers that must
+        // not be compared, and nothing else here would record which was taken.
+        "model_cache": model_cache,
         "records": records.iter().map(|r| serde_json::json!({
             "date": r.date,
             "label": r.label,
@@ -342,6 +348,7 @@ mod tests {
             serde_json::json!({"os": "linux"}),
             serde_json::json!({"pp": [1024]}),
             &serde_json::json!({"steps": 3, "per_step_ms": {"total": 30.0}}),
+            &serde_json::json!({"model_bytes": 1024, "resident_bytes": 512}),
             records,
         )
         .unwrap();

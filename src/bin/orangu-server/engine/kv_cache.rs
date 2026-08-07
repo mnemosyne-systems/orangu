@@ -71,6 +71,19 @@ pub struct LayerCache {
     kv_dim: usize,
     capacity: usize,
     pub len: usize,
+    /// How many token positions one stored row stands for. `1` for an
+    /// ordinary per-token key/value slot — every layer of every
+    /// architecture except the block-compressed ones.
+    ///
+    /// `engine::arch::deepseek4` keeps its compressed attention blocks in
+    /// slots of this same type, and a block covers `ratio` (4 or 128)
+    /// consecutive tokens rather than one. The rows are still positional
+    /// (row `b` is the block over tokens `[b*stride, b*stride + stride)`),
+    /// so rollback and prefix reuse stay exact — they just have to convert
+    /// a *token* count to a row count, which is what this field is for.
+    /// Nothing else changes: [`Self::push`] appends one row per completed
+    /// block exactly as a per-token slot appends one row per token.
+    stride: usize,
     /// GPU-resident mirror of `k`/`v`, built lazily on the first call that
     /// needs it (a Vulkan-backed decode step) — `None` for every other
     /// backend/request. See [`Self::sync_gpu`].
@@ -287,13 +300,23 @@ impl GpuLayerCache {
 
 impl LayerCache {
     fn new(capacity: usize, kv_dim: usize) -> Self {
+        Self::new_strided(capacity, kv_dim, 1)
+    }
+
+    /// A slot whose rows each stand for `stride` token positions — see
+    /// [`Self::stride`]. `capacity` is still given in *tokens*, so a caller
+    /// sizes every slot of a sequence from the one context budget.
+    fn new_strided(capacity: usize, kv_dim: usize, stride: usize) -> Self {
+        assert!(stride > 0, "a KV slot's stride must be at least one token");
+        let rows = capacity.div_ceil(stride);
         Self {
-            k: vec![0.0; capacity * kv_dim],
-            v: vec![0.0; capacity * kv_dim],
+            k: vec![0.0; rows * kv_dim],
+            v: vec![0.0; rows * kv_dim],
             kv_dim,
-            capacity,
+            capacity: rows,
             len: 0,
             gpu: None,
+            stride,
         }
     }
 
@@ -313,6 +336,10 @@ impl LayerCache {
             capacity: len,
             len,
             gpu: None,
+            // A restored layer is only ever a `copy_prefix_from` *source*,
+            // and only the destination's stride governs how many rows a
+            // token count means, so this never needs the original's.
+            stride: 1,
         }
     }
 
@@ -328,6 +355,7 @@ impl LayerCache {
             capacity: self.capacity,
             len: self.len,
             gpu: None,
+            stride: self.stride,
         }
     }
 
@@ -344,7 +372,12 @@ impl LayerCache {
     /// positions that get written over the rolled-back range. Used to discard a
     /// speculative draft's rejected tail after verification keeps only its
     /// accepted prefix.
+    ///
+    /// `new_len` is a **token** count, converted to a row count through
+    /// [`Self::stride`]: a block-compressed slot keeps only the blocks that
+    /// are wholly inside the retained tokens.
     pub fn truncate(&mut self, new_len: usize) {
+        let new_len = new_len / self.stride;
         if new_len >= self.len {
             return;
         }
@@ -611,11 +644,17 @@ impl LayerCache {
     /// already bounds `len` by the *maximum* `len` across every layer
     /// precisely so a real owning layer's `src.len` is never smaller than
     /// `len` — only a permanently-dead donor slot can still be `0` here.
+    ///
+    /// `len` is a **token** count, converted to a row count through
+    /// [`Self::stride`] exactly as [`Self::truncate`] does, so a
+    /// block-compressed slot carries over only the blocks wholly inside the
+    /// reused prefix.
     fn copy_prefix_from(&mut self, src: &LayerCache, len: usize) {
         debug_assert_eq!(self.kv_dim, src.kv_dim);
         if src.len == 0 {
             return;
         }
+        let len = len / self.stride;
         assert!(
             len <= self.capacity,
             "reused prefix ({len}) exceeds this request's own KV capacity ({})",
@@ -658,6 +697,23 @@ impl KvCache {
             layers: kv_dims
                 .iter()
                 .map(|&dim| LayerCache::new(capacity, dim))
+                .collect(),
+            recurrent: Vec::new(),
+        }
+    }
+
+    /// Like [`KvCache::new_with_dims`], but each slot also carries a
+    /// *stride*: how many token positions one of its rows stands for (see
+    /// [`LayerCache::stride`]). `capacity` stays a token count for every
+    /// slot. `engine::arch::deepseek4` uses this to keep its
+    /// block-compressed attention state (one row per 4- or 128-token block)
+    /// in the same positional cache as its per-token keys, so rollback,
+    /// prefix reuse, and slot persistence apply to all of it unchanged.
+    pub fn new_with_strided_dims(capacity: usize, kv_dims: &[(usize, usize)]) -> Self {
+        Self {
+            layers: kv_dims
+                .iter()
+                .map(|&(dim, stride)| LayerCache::new_strided(capacity, dim, stride))
                 .collect(),
             recurrent: Vec::new(),
         }
@@ -1039,6 +1095,63 @@ mod tests {
         // head_dim=3, kv_head=1 -> elements [3..6).
         assert_eq!(cache.key_at(0, 1, 3), &[4.0, 5.0, 6.0]);
         assert_eq!(cache.value_at(0, 0, 3), &[6.0, 5.0, 4.0]);
+    }
+
+    /// A strided slot (`engine::arch::deepseek4`'s compressed blocks) is
+    /// sized, rolled back, and prefix-copied in *token* units like every
+    /// other slot, while storing one row per `stride` tokens.
+    #[test]
+    fn a_strided_slot_converts_token_counts_to_row_counts() {
+        // 10 tokens at stride 4 is room for 3 blocks (the last is partial).
+        let mut cache = LayerCache::new_strided(10, 2, 4);
+        assert_eq!(cache.capacity(), 3);
+        for b in 0..3 {
+            cache.push(&[b as f32, 0.0], &[0.0, b as f32]);
+        }
+        assert_eq!(cache.len, 3);
+
+        // Rolling back to 9 tokens keeps the two blocks wholly inside them.
+        cache.truncate(9);
+        assert_eq!(cache.len, 2);
+        // ...and to 4 tokens, only the first.
+        cache.truncate(4);
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.key_at(0, 0, 2), &[0.0, 0.0]);
+        cache.truncate(3);
+        assert_eq!(cache.len, 0);
+    }
+
+    #[test]
+    fn a_strided_slot_reuses_only_the_blocks_inside_the_reused_prefix() {
+        let mut src = LayerCache::new_strided(12, 2, 4);
+        for b in 0..3 {
+            src.push(&[10.0 + b as f32, 0.0], &[0.0, 0.0]);
+        }
+        let mut dst = LayerCache::new_strided(12, 2, 4);
+        // 11 tokens of prefix: blocks 0 and 1 are inside it, block 2 is not.
+        dst.copy_prefix_from(&src, 11);
+        assert_eq!(dst.len, 2);
+        assert_eq!(dst.key_at(0, 0, 2), &[10.0, 0.0]);
+        assert_eq!(dst.key_at(1, 0, 2), &[11.0, 0.0]);
+    }
+
+    /// Mixing strides in one cache is the point: a deepseek4 sequence keeps
+    /// per-token keys and per-block compressed keys side by side, and one
+    /// token count has to mean the right thing for both.
+    #[test]
+    fn a_mixed_stride_cache_rolls_every_slot_back_to_the_same_token_count() {
+        let mut cache = KvCache::new_with_strided_dims(8, &[(2, 1), (2, 4)]);
+        for t in 0..8 {
+            cache.layers[0].push(&[t as f32, 0.0], &[0.0, 0.0]);
+            if (t + 1) % 4 == 0 {
+                cache.layers[1].push(&[t as f32, 0.0], &[0.0, 0.0]);
+            }
+        }
+        assert_eq!(cache.committed_len(), 8);
+        assert_eq!(cache.layers[1].len, 2);
+        cache.truncate(5);
+        assert_eq!(cache.layers[0].len, 5);
+        assert_eq!(cache.layers[1].len, 1);
     }
 
     /// A GPU-resident prefill commits a whole batch at once, and the host copy

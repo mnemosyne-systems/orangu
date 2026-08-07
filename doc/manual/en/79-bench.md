@@ -536,6 +536,7 @@ Options:
       --curve <N>                      Curve mode: one generation of this many tokens, bucketed by context; 0 disables [default: 0]
       --bucket <N>                     Bucket width (in context tokens) for `--curve` [default: 256]
       --reps <N>                       Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
+      --drop-model-cache               Evict the model from the page cache before every repetition
       --no-warmup                      Skip the initial warmup run
       --timeout <SECONDS>              Per-request timeout in seconds [default: 600]
       --model <ID>                     Model id to request
@@ -576,6 +577,39 @@ Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
 best (fastest) run with mean ± standard deviation alongside; warmup (one short
 generation) is on unless `--no-warmup`; `--json` emits one JSON object per depth
 instead of the table.
+
+#### Mixture-of-experts models, and models that do not fit
+
+On a MoE model whose weights are larger than RAM, a rate is not enough to score
+a change. One that moves fewer expert bytes and one that moves the same bytes
+faster report the same tok/s, and once the weights stream from disk neither is
+visible over the I/O at all. So against an `orangu-server` that reports them,
+each measured `--pp` and decode point carries three mechanism figures beside its
+rate, printed as a `moe` line and recorded in the history file and the bundle:
+
+| history mode | what it is |
+| :-- | :-- |
+| `moe_union` | how many times the average expert's weights were read inside one layer call, against reading each distinct expert once. `1.0` is the floor. The server also reports `selection_ratio` — the routing's own redundancy, which is the ceiling on what grouping by expert can save and which no implementation moves |
+| `moe_mb` | expert weight megabytes dequantized per token per MoE layer |
+| `moe_majflt` | major faults per repetition — the only honest signal that weights came off the disk rather than out of the page cache |
+
+They are exact counts, not repeated measurements: `best` and `mean` are the same
+number and the `sd` columns are empty, and each is drawn on its own chart panel
+for that reason. A dense model writes none of them, rather than writing zeros
+that would read as "no redundancy".
+
+The run header also reports how much of the model was in the page cache when it
+started (`GET /model-cache`). That is not context — on a model that does not
+fit, a cold run and a warm run of the same build are two different experiments,
+and their rates must not be compared. `--drop-model-cache` evicts the model
+before **every repetition**, so a `--reps 3` run measures three cold ones rather
+than one cold and two warm; without it, whatever the previous run left behind is
+what is being measured.
+
+> `--drop-model-cache` is silent against a server without the endpoint, which
+> would produce warm numbers under a cold heading. The residency figure in the
+> header is what catches that, which is why it is printed and archived rather
+> than merely available.
 
 #### Which standard deviation
 

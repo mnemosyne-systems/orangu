@@ -23,15 +23,16 @@
 //! so the new revision is a full second copy on disk, not a cheap
 //! blob-sharing snapshot. Deleting first means a 17 GiB model needs 17 GiB
 //! of free space to refresh, not 34. The cost is that an interrupted
-//! download leaves the model missing rather than stale — which is why the
-//! confirmation line says so, and why `download`'s own resume (a `.part`
-//! file picked up on the next run) is what recovers it.
+//! download leaves the model missing rather than stale, and `download`'s
+//! own resume (a `.part` file picked up on the next run) is what recovers it.
 //!
 //! With no argument it prints `list`'s table with every already-current row
 //! greyed ([`orangu::model_spec::Dimming::UpToDate`]) and prompts for an
-//! `NR`, so the rows worth refreshing are the only ones standing out.
+//! `NR`, so the rows worth refreshing are the only ones standing out. When
+//! every reachable repo is already current, it exits without opening the
+//! picker.
 
-use crate::{check_for_updates, confirm, dimming, model_support};
+use crate::{check_for_updates, dimming, model_support};
 use anyhow::{Context, Result, anyhow, bail};
 use orangu::model_spec::{Dimming, ModelGroup};
 use std::{io::Write, path::Path};
@@ -41,10 +42,13 @@ use std::{io::Write, path::Path};
 /// one row is an error rather than a first-match (see
 /// [`orangu::model_spec::resolve_refresh_target`]); omitting it picks one
 /// interactively.
-pub fn run(models_dir: &Path, model: Option<String>, yes: bool) -> Result<()> {
+pub fn run(models_dir: &Path, model: Option<String>, _yes: bool) -> Result<()> {
     let group = match model {
         Some(spec) => orangu::model_spec::resolve_refresh_target(models_dir, &spec)?,
-        None => select_model_to_refresh(models_dir)?,
+        None => match select_model_to_refresh(models_dir)? {
+            Some(group) => group,
+            None => return Ok(()),
+        },
     };
 
     // A model outside the Hugging Face hub-cache layout — a `.gguf` copied
@@ -59,18 +63,6 @@ pub fn run(models_dir: &Path, model: Option<String>, yes: bool) -> Result<()> {
     })?;
 
     let plural = if group.paths.len() == 1 { "" } else { "s" };
-    if !yes {
-        let confirmed = confirm(&format!(
-            "Refresh '{spec}' ({} file{plural}, {})? The local copy is deleted first, then downloaded again. [y/N]: ",
-            group.paths.len(),
-            orangu::format::format_bytes(group.size_bytes),
-        ))?;
-        if !confirmed {
-            println!("Aborted. Nothing deleted.");
-            return Ok(());
-        }
-    }
-
     orangu::model_spec::delete_model(models_dir, &group)?;
     println!(
         "Deleted '{}' ({} file{plural}, {})",
@@ -93,7 +85,7 @@ pub fn run(models_dir: &Path, model: Option<String>, yes: bool) -> Result<()> {
 /// An unreachable Hub greys nothing (no row is *known* to be behind), which
 /// reads correctly: with no update information, no row is more worth picking
 /// than another.
-fn select_model_to_refresh(models_dir: &Path) -> Result<ModelGroup> {
+fn select_model_to_refresh(models_dir: &Path) -> Result<Option<ModelGroup>> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
     let mut groups = orangu::model_spec::group_models(&models);
@@ -101,6 +93,14 @@ fn select_model_to_refresh(models_dir: &Path) -> Result<ModelGroup> {
         bail!("no .gguf models found under {}", models_dir.display());
     }
     let latest_commits = check_for_updates(&groups);
+    let behind = groups
+        .iter()
+        .filter(|group| group.is_behind(&latest_commits))
+        .count();
+    if behind == 0 && !latest_commits.is_empty() {
+        return Ok(None);
+    }
+
     print!(
         "{}",
         orangu::model_spec::format_groups(
@@ -111,14 +111,6 @@ fn select_model_to_refresh(models_dir: &Path) -> Result<ModelGroup> {
             dimming(Dimming::UpToDate),
         )
     );
-    let behind = groups
-        .iter()
-        .filter(|group| group.is_behind(&latest_commits))
-        .count();
-    if behind == 0 {
-        println!("\nEvery model is at its repository's latest revision.");
-    }
-
     print!("\nSelect a model to refresh (NR): ");
     std::io::stdout().flush().ok();
     let mut input = String::new();
@@ -132,6 +124,6 @@ fn select_model_to_refresh(models_dir: &Path) -> Result<ModelGroup> {
     let count = groups.len();
     nr.checked_sub(1)
         .filter(|index| *index < count)
-        .map(|index| groups.swap_remove(index))
+        .map(|index| Some(groups.swap_remove(index)))
         .ok_or_else(|| anyhow!("no model with NR {nr} ({count} model(s) listed)"))
 }

@@ -53,6 +53,7 @@ mod bundle;
 mod chart;
 mod flamegraph;
 mod history;
+mod moe;
 mod points;
 mod profile;
 mod report;
@@ -148,6 +149,10 @@ struct Args {
     /// Repetitions per depth; the reported rate is the best run with mean±sd.
     #[arg(long, default_value_t = 3, value_name = "N")]
     reps: u32,
+
+    /// Evict the model from the page cache before every repetition.
+    #[arg(long, default_value_t = false)]
+    drop_model_cache: bool,
 
     /// Skip the initial warmup run.
     #[arg(long, default_value_t = false)]
@@ -307,6 +312,26 @@ impl Args {
     fn settle(&self) {
         if self.delay > 0 {
             std::thread::sleep(std::time::Duration::from_secs(self.delay));
+        }
+    }
+
+    /// Evict the model from the server's page cache, if `--drop-model-cache`
+    /// asked for it.
+    ///
+    /// Before *every repetition*, not once per point: the first read of a
+    /// weight warms it for every later one, so a point whose cache was
+    /// dropped once measures one cold repetition and two warm ones, and
+    /// reports the best of them — which is the warm number, under a cold
+    /// heading.
+    ///
+    /// Silent when the server has no such endpoint. That is a real risk worth
+    /// naming: `--drop-model-cache` against an engine that ignores it
+    /// produces warm numbers labelled cold. The residency figure recorded
+    /// alongside the run (see [`moe::residency_line`]) is what catches it,
+    /// which is why it is printed and archived rather than merely available.
+    fn drop_page_cache(&self, client: &reqwest::blocking::Client) {
+        if self.drop_model_cache {
+            let _ = moe::drop_cache(client, &self.url);
         }
     }
 }
@@ -1068,7 +1093,15 @@ fn write_bundle(
             "card": g.card, "sclk": g.sclk, "power_level": g.power_level,
         })).collect::<Vec<_>>(),
     });
-    bundle::write(path, &env.props, host, run, &env.gpu_timings, records)?;
+    bundle::write(
+        path,
+        &env.props,
+        host,
+        run,
+        &env.gpu_timings,
+        &env.model_cache,
+        records,
+    )?;
     if !args.json {
         println!("  bundle   {path} ({} rows)", records.len());
     }
@@ -2324,11 +2357,15 @@ fn run_tg(
         let prompt = build_prompt(depth);
         let mut rates = Vec::new();
         let mut last_sample: Option<Sample> = None;
+        // Discarded, for the reason `run_pp` documents.
+        let _ = moe::take_stats(client, &args.url);
         for _ in 0..args.reps.max(1) {
+            args.drop_page_cache(client);
             let s = run_once(client, &args.url, &prompt, args.n_gen, &args.model)?;
             rates.push(s.tok_per_s());
             last_sample = Some(s);
         }
+        let moe_stats = moe::take_stats(client, &args.url);
         let stats = Stats::of(&rates, false);
         let s = last_sample.expect("at least one rep ran");
 
@@ -2373,6 +2410,12 @@ fn run_tg(
             sd: stats.sd,
             sd_sample: stats.sd_sample,
         });
+        records.extend(moe::records(&moe_stats, label, depth, args.reps.max(1)));
+        if !args.json
+            && let Some(line) = moe::summary_line(&moe_stats)
+        {
+            println!("{line}");
+        }
     }
 
     Ok(records)
@@ -2788,11 +2831,16 @@ fn run_pp(
         let prompt = build_prompt(len);
         let mut rates = Vec::new();
         let mut last: Option<PrefillSample> = None;
+        // Discarded: drains the previous point's (or the warmup's) counters,
+        // so what the read after the loop returns is this point alone.
+        let _ = moe::take_stats(client, &args.url);
         for _ in 0..args.reps.max(1) {
+            args.drop_page_cache(client);
             let s = run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
             rates.push(s.tok_per_s());
             last = Some(s);
         }
+        let moe_stats = moe::take_stats(client, &args.url);
         let stats = Stats::of(&rates, false);
         let s = last.expect("at least one rep ran");
 
@@ -2849,6 +2897,20 @@ fn run_pp(
                 sd: stats.sd,
                 sd_sample: stats.sd_sample,
             });
+            // Keyed on the token count the server reported, exactly as the
+            // rate row is, so a mechanism figure and the rate it explains sit
+            // at the same `n` on two panels of the same chart.
+            records.extend(moe::records(
+                &moe_stats,
+                label,
+                s.prompt_tokens,
+                args.reps.max(1),
+            ));
+        }
+        if !args.json
+            && let Some(line) = moe::summary_line(&moe_stats)
+        {
+            println!("{line}");
         }
     }
     Ok(records)
@@ -3321,6 +3383,12 @@ struct Environment {
     /// The GPU timestamp breakdown for the measured window — see
     /// [`take_gpu_timings`]. `Null` unless the server reports one.
     gpu_timings: serde_json::Value,
+    /// How much of the model was in the page cache when the run started —
+    /// `GET /model-cache`. On a model larger than memory this is not context,
+    /// it is half the measurement: the same build measured cold and warm
+    /// produces two rates that must not be compared, and nothing else in a
+    /// bundle records which one was taken.
+    model_cache: serde_json::Value,
 }
 
 /// Drain the server's accumulated GPU timestamp breakdown.
@@ -3398,6 +3466,10 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
     // `null` from a server without one, and from orangu-server on a non-`wgpu`
     // backend; a full `VulkanBackend::tuning_report` otherwise.
     let gpu_tuning = props.as_ref().and_then(|p| p.get("gpu")).cloned();
+    // Probed here, before the workload: this is the state the run *started*
+    // from. Read after it, a streaming model would report itself warm no
+    // matter how cold it began.
+    let model_cache = moe::take_residency(client, &args.url);
 
     if args.json {
         println!(
@@ -3417,6 +3489,7 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
                 // six months ago is only re-interpretable if the whole
                 // configuration travelled with it.
                 "gpu_tuning": gpu_tuning,
+                "model_cache": model_cache,
             })
         );
     } else {
@@ -3457,6 +3530,13 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         if gpus.is_empty() && !backend.starts_with("CPU") {
             println!("  gpu      clocks unreadable on this platform — no drift evidence");
         }
+        // Beside the clock line, and for the same reason: a number taken with
+        // the model on the disk and one taken with it in RAM are as
+        // incomparable as two taken at different core clocks, and neither
+        // difference is visible in the rate itself.
+        if let Some(line) = moe::residency_line(&model_cache) {
+            println!("{line}");
+        }
     }
     Environment {
         props: props.unwrap_or(serde_json::Value::Null),
@@ -3465,6 +3545,7 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         // before it. Reported here as `Null` rather than as an absent field so
         // a bundle's shape does not depend on whether timestamps were on.
         gpu_timings: serde_json::Value::Null,
+        model_cache,
     }
 }
 

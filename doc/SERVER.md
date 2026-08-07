@@ -1466,6 +1466,23 @@ the API and (if enabled) the web UI listener stop together.
 | `GET /props` | model + server metadata |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
+| `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, the per-layer-call union, rows and bytes dequantized, plus the process's fault and RSS figures. Drain once before a workload and again after to measure exactly that window. Dense models report `layer_calls: 0` |
+| `orangu-server plan <model> [--deep]` | (a subcommand, not an endpoint) Reports what a model would need to run here **without loading it** — dense vs routed-expert bytes, experts streamed per token, and a verdict. Reads only the GGUF tensor tables, so a 434 GiB 11-shard model takes well under a second. `--deep` also checks every shard is present and the architecture supported |
+| `GET /model-cache` | how many of the model's bytes are in the page cache right now. `resident_bytes` is `null` where the platform cannot measure it — never `0`, which would make "unknowable" read as "cold" |
+| `POST /model-cache/drop` | evict the model from the page cache so the next request reads it from disk; loopback-only. Reports residency before and after rather than a success flag, because a partial drop is the realistic failure and looks identical from outside |
+
+`/moe-stats` also carries a `store` block describing where routed experts'
+weights came from. Three environment variables govern it, all off by default:
+
+| variable | effect |
+| :-- | :-- |
+| `ORANGU_EXPERT_CACHE_GB` | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory |
+| `ORANGU_EXPERT_READ` | Where the expert cache's copies are read from: `mmap` (default — a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM |
+| `ORANGU_EXPERT_CACHE_POLICY` | `lfru` selects frequency-first replacement with colibri's admission margin. The default is plain LRU, which measured better at every budget tried on real MoE routing — by 12x at a small budget — because the margin declines almost every newcomer and the cache stops adapting |
+| `ORANGU_PREFIX_CACHE_DIR` | Directory for a durable snapshot of the prefix-cache pool, so a conversation survives a restart instead of re-prefilling. Needs `ORANGU_PREFIX_CACHE` as well. A snapshot carries the model's fingerprint and is refused for any other model — a KV cache from elsewhere would match on token ids and answer from the wrong state. Sized per entry as a whole KV cache (~330 KB per position on a 26B MoE), so it is opt-in |
+| `ORANGU_EXPERT_BUDGET` | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes** — the only setting here that does — and is off by default. Never applied to prefill, and never leaves a position with nothing routed |
+| `ORANGU_ROUTE_AHEAD` / `ORANGU_PREFETCH_K` | Measure how predictable the next layer's routing is, and prefetch the top `k` of that prediction. `k` above 2 wastes more than 20% of what it fetches on the model this was measured on |
+| `ORANGU_EXPERT_RESIDENCY` | `1` asks the kernel (`mincore`) whether each expert's bytes were in RAM at the moment they were wanted. Off by default because it is one syscall per expert per layer; with it off, acquisitions report as `unmeasured` rather than as misses |
 | `POST /completion` | native, streaming; disabled under `--embedding` |
 | `POST /tokenize` / `POST /detokenize` | |
 | `POST /embedding` | native embeddings |
@@ -1530,7 +1547,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for six
+Text-in/text-out GGUF chat, completion, and embedding models, for ten
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -1538,7 +1555,18 @@ the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
 embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`),
 Qwen3.5 dense (`qwen35` — the same hybrid full-attention/gated-DeltaNet layer
-shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing), and Phi-3
+shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing), Qwen3-Next
+(`qwen3next`), DeepSeek-V4 (`deepseek4`, e.g.
+`unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
+per token, one shared key/value vector serving every query head, compressed
+attention blocks on top of a sliding window, and hash-routed experts),
+GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
+attention over a compressed key/value cache, with a lightning indexer
+choosing which positions each layer attends), Kimi-K3 (`kimi-k3`, e.g.
+`unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
+latent attention, cross-layer residuals, and experts running in a latent
+space), and
+Phi-3
 (`phi3`, covering Phi-3 and Phi-4-mini — Llama-style attention and SwiGLU,
 but with the query/key/value projections fused into one `attn_qkv` tensor,
 the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
@@ -1546,13 +1574,14 @@ frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
 e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
 width read from `attention.key_length` rather than derived from
 `n_embd / n_head`, and an attention temperature scale) — using
-`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
 across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
 shard — the shard count comes from the `split.count` metadata key, and each
-shard is mapped separately. Runs on CPU or,
+shard is mapped separately. Runs
+on CPU or,
 via `backend = vulkan`/`metal`/`cuda`/`opencl`/`rocm`/`auto`
 (see **GPU backend** above), a Vulkan/Metal/CUDA/OpenCL/ROCm-capable GPU —
 Vulkan and Metal are the same engine and are the only ones with real
@@ -1560,6 +1589,85 @@ fused/GPU-resident
 optimizations beyond a basic matmul kernel, verified against real AMD
 and Apple hardware respectively; the other three are real but
 smaller-scoped and unverified on real hardware.
+
+Kimi-K3 (`kimi-k3`) runs on the CPU path only. Three layers in every four
+are Kimi Delta Attention — a gated delta-net whose per-token state is a
+matrix rather than a growing key/value list, so those layers cost nothing
+per token of context — and every fourth is absorbed multi-head latent
+attention like `glm-dsa`'s, minus the RoPE (this model rotates nothing; the
+`rope.dimension_count` key only names how the cached key splits) and plus a
+sigmoid gate on the attention output. Four further mechanisms have no
+counterpart elsewhere here. **Cross-layer residual attention**: every
+`attn_res.block_size`th layer banks its raw input and the residual stream
+restarts from that layer's attention output, with each half-layer re-mixing
+the stream against every banked checkpoint by a softmax over per-checkpoint
+scores. **Latent MoE**: the routed experts run at `expert_latent_length`
+rather than at `n_embd`, so the FFN input is projected down, run, normed and
+projected back up — while the *router* still scores the full-width input.
+**The situ activation** replaces SwiGLU throughout: a soft-clipped SiLU on
+the gate branch, and the same soft clip on the up branch when
+`activation.situ_linear_beta` is positive. **A full-rank KDA gate**, where
+Kimi-Linear factors the same gate into two matrices. The delta-net state is
+what dominates memory: a fixed `kda.head_dim`-squared matrix per head per
+recurrent layer, about 440 MiB per sequence for Kimi-K3, allocated up front
+and independent of context length. The multimodal projector these repos ship
+alongside the text weights (`mmproj-*.gguf`) is not used; multimodal input is
+out of scope for every architecture here.
+
+GLM with DeepSeek sparse attention (`glm-dsa`) runs on the CPU path only.
+Its block shape is an ordinary pre-norm transformer, and its FFN is the same
+routed-experts-plus-shared-expert MoE as `qwen35moe` (dense for the first
+`leading_dense_block_count` layers); what is different is the attention.
+Keys and values are stored *compressed*: one `attention.kv_lora_rank`-wide
+vector per token plus a shared rotary part serves every head, so even
+GLM-5.2's 79 layers keep a small cache. Rather than decompressing that back into
+per-head keys, the query is pushed through the key-decompression matrix
+(`attn_k_b`) so it can be dotted against the compressed vector directly, and
+the attention output is pushed back through `attn_v_b` afterwards — which is
+also why the cache is K-only, the value being the leading part of the same
+row. On top of that, a lightning indexer (a small 32-head attention with its
+own per-token key cache) scores every earlier position and the real
+attention attends only the `attention.indexer.top_k` best; only some layers
+score, the rest reusing the previous scoring layer's choice
+(`attention.indexer.types`, defaulted from the reference config when the
+file omits it, as GLM-5.2's quants do). Below `indexer.top_k` positions the
+selection cannot change the answer — every visible position is chosen — so
+the scoring pass is skipped there. The multi-token-prediction block these
+files carry (`blk.78` in GLM-5.2) is a draft head and is not run.
+
+DeepSeek-V4 (`deepseek4`) runs on the CPU path only, and differs from every
+other family here in four ways at once: the residual stream is
+`hyper_connection.count` parallel streams rather than one, mixed down and
+back out per half-layer by weights the model predicts per token (the
+out-mix is made doubly stochastic by a Sinkhorn normalization);
+`attention.head_count_kv` is 1 and the value *is* the key, so all 64 query
+heads attend one shared vector per token, whose trailing RoPE dimensions are
+rotated back out of the attention output again; `attention.compress_ratios`
+gives each layer a sliding window plus either whole 128-token compressed
+blocks or 4-token blocks chosen by the model's own lightning indexer, both
+pooled by a per-dimension softmax over their members; and the first
+`hash_layer_count` layers pick their experts from an integer
+`ffn_gate_tid2eid` table indexed by token id rather than by score. Its
+compressed blocks live in the same positional KV cache as its per-token
+keys — one row per block — so context rollback, prefix reuse, and slot
+persistence cover all of it. That cache is wide: on top of the shared
+512-wide key each layer keeps its compressor's per-token value/score rows,
+which for `DeepSeek-V4-Flash-0731` works out to roughly half a megabyte per
+token of context across all 43 layers, allocated up front for the
+prompt-plus-`max_tokens` budget of each request.
+
+`orangu-server list` also recognizes `dflash` draft GGUFs such as the
+DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no
+output projection — it reads the target model's hidden states (the layers
+`dflash.target_layers` names) and drafts through the target's own embedding
+table and LM head — so there is no standalone model in the file to serve.
+Selecting one therefore serves the *paired target model* from the same
+Hugging Face repo, downloading it first if the models directory does not
+have it yet; the startup banner names the model actually being served.
+Running a draft as an actual draft would
+need a second-model speculative path, which this server does not have: its
+speculative decoding drafts by prompt lookup against the served model
+itself.
 
 A quantization label names the file's *dominant* type, not its only one. A
 K-quant block is 256 elements wide, so every tensor it covers needs a row

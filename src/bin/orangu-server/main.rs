@@ -50,10 +50,15 @@ use config::{
     BackendPreference, ServerConfiguration, default_server_config_path, load_server_configuration,
 };
 use engine::arch::ModelForward;
+use engine::arch::deepseek4::Deepseek4Model;
+use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
+use engine::arch::glm::GlmModel;
+use engine::arch::kimi3::Kimi3Model;
 use engine::arch::llama::LlamaModel;
 use engine::arch::mistral::MistralModel;
 use engine::arch::phi::PhiModel;
+use engine::arch::qwen3next::Qwen3NextModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::{Backend, CpuBackend, CudaBackend, MetalBackend, VulkanBackend};
@@ -285,6 +290,19 @@ enum Command {
     Suggest,
     /// List every .gguf file found under the configured models directory.
     List,
+    /// Report what a model would need to run here — **without loading it**.
+    ///
+    /// Reads only the GGUF tensor tables, so a plan for a model far larger
+    /// than this machine costs seconds rather than a thirty-minute load.
+    Plan {
+        /// A path to a .gguf file, a bare name resolved against the
+        /// configured models directory, an NR from `list`, or a MODEL name.
+        file: Option<String>,
+        /// Also check that every shard is present and readable, and that the
+        /// architecture is one this build implements.
+        #[arg(long)]
+        deep: bool,
+    },
     /// Print a GGUF file's full metadata.
     Show {
         /// A path to a .gguf file, a bare name resolved against the
@@ -327,7 +345,7 @@ enum Command {
         /// more than one on disk), a bare name, or a path. Omit it to pick
         /// one interactively.
         model: Option<String>,
-        /// Skip the confirmation prompt.
+        /// Accepted for compatibility; refresh no longer prompts.
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -385,6 +403,7 @@ impl Command {
             Command::System => "system",
             Command::Suggest => "suggest",
             Command::List => "list",
+            Command::Plan { .. } => "plan",
             Command::Show { .. } => "show",
             Command::Download { .. } => "download",
             Command::Delete { .. } => "delete",
@@ -561,6 +580,12 @@ fn main() -> ExitCode {
 /// loop.
 struct Prepared {
     engine: Arc<Engine>,
+    /// Where to write the prefix-cache snapshot on the way out, and the model
+    /// identity that snapshot is only valid for. `None` unless
+    /// `ORANGU_PREFIX_CACHE_DIR` asked for it — carried here rather than
+    /// re-derived at shutdown so the fingerprint that reads a snapshot back is
+    /// provably the one that wrote it.
+    prefix_cache_snapshot: Option<(PathBuf, String)>,
     model_label: String,
     /// The quantization the resolved file is stored at
     /// ([`orangu::model_spec::quantization_for_file`]), for the startup
@@ -692,6 +717,42 @@ fn resolve_model_spec(
     Ok((ModelSource::File(path), spec.to_string()))
 }
 
+fn auto_pair_dflash_target(
+    models_dir: &Path,
+    source: ModelSource,
+    label: String,
+) -> Result<(ModelSource, String)> {
+    let ModelSource::File(path) = &source else {
+        return Ok((source, label));
+    };
+    let gguf = GgufFile::open(path)?;
+    if metadata_string(&gguf, "general.architecture").as_deref() != Some("dflash") {
+        return Ok((source, label));
+    }
+    let repo = orangu::model_spec::hf_repo_for_path(path).ok_or_else(|| {
+        anyhow!(
+            "dflash draft model {} is not under a Hugging Face cache repo, so its paired target model cannot be resolved automatically",
+            path.display()
+        )
+    })?;
+    if let Ok(models) = orangu::model_spec::scan_models_dir(models_dir) {
+        let groups = orangu::model_spec::group_models(&models);
+        if let Some(target) = groups.iter().find_map(|group| {
+            (group.hf_repo.as_deref() == Some(repo.as_str()) && group.representative_path != *path)
+                .then_some(group.representative_path.clone())
+        }) {
+            return Ok((ModelSource::File(target), repo));
+        }
+    }
+    let target = orangu::model_download::download_model(models_dir, &repo).with_context(|| {
+        format!(
+            "selected dflash draft sidecar {}, but failed to fetch its paired target model from {repo}",
+            path.display()
+        )
+    })?;
+    Ok((ModelSource::File(target), repo))
+}
+
 /// Resolves the config and model, builds the engine, and binds both
 /// listeners — all synchronously (no tokio runtime yet) and, when
 /// `--daemon` is set, all *before* [`daemonize`] detaches from the
@@ -780,6 +841,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     {
         role = conf.role_key.unwrap_or(bundle.role);
     }
+    let (source, model_label) = auto_pair_dflash_target(&conf.models, source, model_label)?;
     let path = source.path().to_path_buf();
 
     let gguf = source.gguf()?;
@@ -847,6 +909,23 @@ fn prepare(args: Args) -> Result<Prepared> {
         ArchFamily::Qwen35 => Arc::new(
             Qwen35Model::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
+        ArchFamily::Qwen3Next => Arc::new(
+            Qwen3NextModel::load_with_backend(&loaded, backend.clone())
+                .context("building model")?,
+        ),
+        ArchFamily::DFlash => {
+            Arc::new(DFlashModel::load_with_backend(&loaded).context("building model")?)
+        }
+        ArchFamily::Deepseek4 => Arc::new(
+            Deepseek4Model::load_with_backend(&loaded, backend.clone())
+                .context("building model")?,
+        ),
+        ArchFamily::GlmDsa => Arc::new(
+            GlmModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::KimiK3 => Arc::new(
+            Kimi3Model::load_with_backend(&loaded, backend.clone()).context("building model")?,
+        ),
         ArchFamily::Phi3 => Arc::new(
             PhiModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
@@ -885,6 +964,36 @@ fn prepare(args: Args) -> Result<Prepared> {
     let prefix_cache = std::env::var_os("ORANGU_PREFIX_CACHE")
         .is_some()
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
+
+    // Durable version of that pool (`ORANGU_PREFIX_CACHE_DIR=<dir>`), so a
+    // conversation survives a restart instead of re-prefilling. On a model
+    // whose experts stream, a re-prefill is not just recomputed attention: it
+    // re-reads every expert the replayed positions touched, which is the
+    // dominant cost. Separately opt-in from the pool itself because a snapshot
+    // is a whole `KvCache` per entry — hundreds of MB at real context lengths,
+    // and nobody should discover that by finding their disk full.
+    //
+    // The fingerprint is `slot_store`'s, so a snapshot can never be read back
+    // for a different model: that would match on token ids and answer from
+    // another model's state, which is plausible-looking rather than obviously
+    // broken.
+    let prefix_cache_dir = std::env::var_os("ORANGU_PREFIX_CACHE_DIR")
+        .filter(|_| prefix_cache.is_some())
+        .map(std::path::PathBuf::from);
+    let prefix_fingerprint = engine::slot_store::SlotStore::fingerprint(
+        &architecture,
+        &model_label,
+        &model.new_kv_cache(1).structure_tag(),
+    );
+    if let (Some(pool), Some(dir)) = (prefix_cache.as_ref(), prefix_cache_dir.as_ref()) {
+        let loaded = pool.load_from(dir, &prefix_fingerprint);
+        if loaded > 0 {
+            eprintln!(
+                "orangu-server: prefix cache restored {loaded} entries from {}",
+                dir.display()
+            );
+        }
+    }
 
     // Durable per-slot KV-cache persistence (`engine::slot_store`), backing
     // the `POST /slots/{id}?action=save|restore` endpoints. **On by default**;
@@ -980,6 +1089,7 @@ fn prepare(args: Args) -> Result<Prepared> {
 
     Ok(Prepared {
         engine,
+        prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
         model_label,
         quantization,
         architecture,
@@ -1081,6 +1191,7 @@ fn listener_fd(listener: &tokio::net::TcpListener) -> i32 {
 async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
         engine,
+        prefix_cache_snapshot,
         model_label,
         quantization,
         architecture,
@@ -1101,6 +1212,10 @@ async fn serve(prepared: Prepared) -> Result<()> {
         web_listener,
         daemon,
     } = prepared;
+
+    // A handle to the pool taken before `engine` is moved into the router's
+    // state, so the snapshot can still be written once serving has stopped.
+    let prefix_cache_for_snapshot = engine.prefix_cache.clone();
 
     let listener = tokio::net::TcpListener::from_std(api_listener)
         .context("failed to attach listener to the async runtime")?;
@@ -1278,6 +1393,24 @@ async fn serve(prepared: Prepared) -> Result<()> {
         }
     }
 
+    // Written on the way out rather than after every turn: a snapshot is a
+    // whole `KvCache` per entry, and paying that on each request would cost
+    // more than the re-prefill it saves on any model small enough to hold.
+    // The trade-off inverts on a streaming model, and if it ever needs to be
+    // taken per turn, `save_to` is already crash-safe (temp file, rename).
+    if let (Some(pool), Some((dir, fingerprint))) = (
+        prefix_cache_for_snapshot.as_ref(),
+        prefix_cache_snapshot.as_ref(),
+    ) {
+        match pool.save_to(dir, fingerprint) {
+            Ok(n) if !daemon => println!("prefix cache saved {n} entries to {}", dir.display()),
+            Ok(_) => {}
+            // A snapshot that could not be written costs a cold start next
+            // time, which is exactly the status quo — never a failed exit.
+            Err(err) => eprintln!("orangu-server: prefix cache not saved: {err}"),
+        }
+    }
+
     Ok(())
 }
 
@@ -1443,6 +1576,51 @@ fn run_command(
             );
             Ok(())
         }
+        Command::Plan { file, deep } => {
+            let conf = load_config(config_arg, None, false)?;
+            let path = match file {
+                Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
+                None => select_model_for_show(&conf.models)?,
+            };
+            let plan = engine::plan::analyze(&path)?;
+            let cpu = orangu::hardware::detect_cpu();
+            let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+            let vram = gpus.iter().filter_map(|g| g.vram_total_bytes).max();
+            print!(
+                "{}",
+                engine::plan::format_plan(&plan, cpu.available_memory_bytes, vram)
+            );
+            if deep {
+                // Everything the plan assumed, checked. A plan is only worth
+                // acting on if the files it described are actually there and
+                // this build can actually read them.
+                let gguf = GgufFile::open(&path)?;
+                let shards = engine::loader::shard_paths(&path, &gguf)?;
+                let mut problems = Vec::new();
+                for shard in &shards {
+                    match std::fs::metadata(shard) {
+                        Ok(meta) if meta.len() > 0 => {}
+                        Ok(_) => problems.push(format!("{} is empty", shard.display())),
+                        Err(err) => problems.push(format!("{}: {err}", shard.display())),
+                    }
+                }
+                if let Err(err) = engine::loader::resolve_arch_family(&plan.architecture) {
+                    problems.push(format!("architecture: {err}"));
+                }
+                if problems.is_empty() {
+                    println!(
+                        "Check      {} shard(s) readable, architecture supported",
+                        shards.len()
+                    );
+                } else {
+                    for problem in &problems {
+                        println!("Problem    {problem}");
+                    }
+                    anyhow::bail!("{} problem(s) found", problems.len());
+                }
+            }
+            Ok(())
+        }
         Command::Show {
             file,
             full,
@@ -1536,23 +1714,24 @@ fn run_command(
     }
 }
 
-/// The Hub's current `main` commit for every distinct Hugging Face repo
-/// `groups` came from — deduped by repo id, so a repo with several `:quant`
+/// The latest downloadable state for every distinct Hugging Face repo
+/// `groups` came from - deduped by repo id, so a repo with several `:quant`
 /// rows costs one lookup, not one per row. Shared by `list` (which marks
-/// every row behind its repo `(Refresh)`) and `refresh` (which greys every
-/// row that isn't), so the two always agree on what's stale. Failures are
-/// swallowed per repo by [`orangu::model_download::latest_commits`] itself:
-/// an unreachable Hub yields an empty map, never an error.
+/// rows `(Refresh)` only when that row's own files changed) and `refresh`
+/// (which greys the ones that did not), so the two always agree on what is
+/// stale. Failures are swallowed per repo by
+/// [`orangu::model_download::latest_repo_updates`] itself: an unreachable
+/// Hub yields an empty map, never an error.
 pub(crate) fn check_for_updates(
     groups: &[orangu::model_spec::ModelGroup],
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, orangu::model_download::RepoUpdateInfo> {
     let repos: Vec<String> = groups
         .iter()
         .filter_map(|g| g.hf_repo.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    orangu::model_download::latest_commits(&repos)
+    orangu::model_download::latest_repo_updates(&repos)
 }
 
 /// `mode` when stdout is a terminal, [`Dimming::Off`] when it isn't — every
@@ -2002,6 +2181,11 @@ mod tests {
             Command::System.mode(),
             Command::Suggest.mode(),
             Command::List.mode(),
+            Command::Plan {
+                file: None,
+                deep: false,
+            }
+            .mode(),
             Command::Show {
                 file: None,
                 full: false,

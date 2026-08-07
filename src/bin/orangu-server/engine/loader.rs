@@ -96,6 +96,34 @@ pub enum ArchFamily {
     /// shape as [`ArchFamily::Qwen35Moe`], but a plain dense SwiGLU FFN
     /// instead of MoE routing. See `engine::arch::qwen35`.
     Qwen35,
+    /// Qwen3-Next - the same hybrid full-attention/gated-DeltaNet block
+    /// family as Qwen3.5, but with the Qwen3-Next MoE tensor layout. See
+    /// `engine::arch::qwen3next`.
+    Qwen3Next,
+    /// GLM with DeepSeek sparse attention (`glm-dsa`, e.g. GLM-5.2) —
+    /// absorbed multi-head latent attention over a compressed key/value
+    /// cache, a lightning indexer that picks which positions each layer
+    /// attends, leading dense layers, and sigmoid-routed experts. See
+    /// `engine::arch::glm`.
+    GlmDsa,
+    /// Kimi-K3 (`kimi-k3`) — three-in-four Kimi Delta Attention layers
+    /// (a gated delta-net with a per-dimension decay) alternating with
+    /// absorbed multi-head latent attention, cross-layer residual
+    /// attention, routed experts running in a latent space, and the situ
+    /// activation in place of SwiGLU. See `engine::arch::kimi3`.
+    KimiK3,
+    /// DeepSeek draft sidecars (`dflash`/DSpark) — recognized by the
+    /// inventory, and served by resolving the paired target model they
+    /// draft for (`main::auto_pair_dflash_target`). They carry no token
+    /// embeddings and no output projection, so there is no standalone model
+    /// to run; see `engine::arch::dflash`.
+    DFlash,
+    /// DeepSeek-V4 (`deepseek4`) — four-stream hyper-connections, one
+    /// shared key/value vector per token across all query heads, per-layer
+    /// compressed attention (128-token blocks, or indexer-selected 4-token
+    /// blocks) on top of a sliding window, and hash-routed experts on the
+    /// first layers. See `engine::arch::deepseek4`.
+    Deepseek4,
     /// Phi-3 / Phi-4-mini — GQA + RoPE + RMSNorm + SwiGLU like
     /// [`ArchFamily::LlamaStyle`], but with a fused QKV projection, a fused
     /// gate/up FFN projection, partial NEOX RoPE carrying LongRoPE
@@ -148,6 +176,20 @@ const QWEN35MOE_ARCHITECTURES: &[&str] = &["qwen35moe"];
 /// `qwen35` (e.g. `unsloth/Ornith-1.0-9B-GGUF`) — the dense sibling of
 /// `qwen35moe`; see [`ArchFamily::Qwen35`].
 const QWEN35_ARCHITECTURES: &[&str] = &["qwen35"];
+/// `qwen3next` (e.g. `unsloth/Qwen3-Coder-Next-GGUF`) - Qwen3-Next's
+/// hybrid attention and MoE architecture.
+const QWEN3NEXT_ARCHITECTURES: &[&str] = &["qwen3next"];
+const DFLASH_ARCHITECTURES: &[&str] = &["dflash"];
+const DEEPSEEK4_ARCHITECTURES: &[&str] = &["deepseek4"];
+/// `glm-dsa` (e.g. `unsloth/GLM-5.2-GGUF`) — GLM's transformer block with
+/// DeepSeek's sparse (indexer-selected) latent attention. Plain `glm4`/
+/// `glm4moe` are *not* here: they are ordinary GQA models with none of
+/// this module's MLA or indexer machinery.
+const GLM_DSA_ARCHITECTURES: &[&str] = &["glm-dsa"];
+/// `kimi-k3` (e.g. `unsloth/Kimi-K3-GGUF`). `kimi-linear` is *not* here:
+/// it shares the delta-net attention but none of K3's cross-layer
+/// residuals, latent MoE, or situ activation.
+const KIMI_K3_ARCHITECTURES: &[&str] = &["kimi-k3"];
 /// `phi3` covers both Phi-3 and Phi-4-mini (e.g. `unsloth/Phi-4-mini-
 /// instruct-GGUF`) — upstream converts both under the one
 /// `general.architecture` string, and `llama_model_phi3` serves both from
@@ -171,6 +213,21 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if QWEN35_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Qwen35);
     }
+    if QWEN3NEXT_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Qwen3Next);
+    }
+    if DFLASH_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::DFlash);
+    }
+    if DEEPSEEK4_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Deepseek4);
+    }
+    if GLM_DSA_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::GlmDsa);
+    }
+    if KIMI_K3_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::KimiK3);
+    }
     if PHI3_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Phi3);
     }
@@ -185,6 +242,11 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(GEMMA_ARCHITECTURES)
             .chain(QWEN35MOE_ARCHITECTURES)
             .chain(QWEN35_ARCHITECTURES)
+            .chain(QWEN3NEXT_ARCHITECTURES)
+            .chain(DFLASH_ARCHITECTURES)
+            .chain(DEEPSEEK4_ARCHITECTURES)
+            .chain(GLM_DSA_ARCHITECTURES)
+            .chain(KIMI_K3_ARCHITECTURES)
             .chain(PHI3_ARCHITECTURES)
             .chain(MISTRAL_ARCHITECTURES)
             .cloned()
@@ -219,7 +281,13 @@ pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
     let unsupported = gguf
         .tensors
         .iter()
-        .find(|t| !quant::supports_type(t.ggml_type))
+        .find(|t| {
+            !quant::supports_type(t.ggml_type)
+                && !matches!(
+                    (t.ggml_type, t.name.as_str()),
+                    (26, name) if name.ends_with(".ffn_gate_tid2eid.weight")
+                )
+        })
         .map(|t| orangu::gguf::ggml_type_name(t.ggml_type));
     (architecture, unsupported)
 }
@@ -504,6 +572,13 @@ pub(crate) fn test_quant_matrix(
 /// entirely wasted work, not just wasted memory.
 #[derive(Clone)]
 pub struct ExpertQuantMatrix {
+    /// The tensor's GGUF name (`blk.7.ffn_gate_exps.weight`).
+    ///
+    /// Carried because the runtime identity [`Self::tensor_id`] returns is an
+    /// *address*, which is meaningless once the process exits. Anything that
+    /// remembers something about an expert across restarts — routing history,
+    /// in `engine::expert_store` — has to key on a name instead.
+    name: Arc<str>,
     bytes: TensorBytes,
     ggml_type: u32,
     start: usize,
@@ -514,7 +589,122 @@ pub struct ExpertQuantMatrix {
     pub n_expert: usize,
 }
 
+/// An `F32` [`ExpertQuantMatrix`] over deterministic generated values, for
+/// tests that need a real per-expert tensor rather than a real model.
+///
+/// `F32` on purpose: a test of *how rows are read* must not also depend on a
+/// quantization kernel, or a failure in either one looks like a failure in the
+/// other. Values are distinct across `(expert, row, column)` so a projection
+/// that reads the wrong expert, the wrong row or the wrong offset produces a
+/// wrong number rather than a coincidentally right one.
+#[cfg(test)]
+pub(crate) fn test_expert_matrix(
+    n_expert: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> ExpertQuantMatrix {
+    test_expert_matrix_named("test.exps.weight", n_expert, out_dim, in_dim)
+}
+
+/// [`test_expert_matrix`] with a chosen tensor name, for tests about anything
+/// that keys on the name rather than on the runtime address.
+#[cfg(test)]
+pub(crate) fn test_expert_matrix_named(
+    name: &str,
+    n_expert: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> ExpertQuantMatrix {
+    let mut bytes = Vec::with_capacity(n_expert * out_dim * in_dim * 4);
+    for expert in 0..n_expert {
+        for row in 0..out_dim {
+            for column in 0..in_dim {
+                let value = (expert * 1000 + row * 31 + column) as f32 * 0.017 - 1.0;
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    let matrix = test_quant_matrix(
+        &bytes,
+        crate::engine::quant::GGML_TYPE_F32,
+        in_dim,
+        n_expert * out_dim,
+    );
+    ExpertQuantMatrix {
+        name: Arc::from(name),
+        bytes: matrix.bytes,
+        ggml_type: matrix.ggml_type,
+        start: 0,
+        row_bytes: in_dim * 4,
+        expert_stride: out_dim * in_dim * 4,
+        in_dim,
+        out_dim,
+        n_expert,
+    }
+}
+
 impl ExpertQuantMatrix {
+    /// One expert's own weight bytes in this tensor, still quantized —
+    /// `out_dim` rows of `row_bytes`. What reading that expert costs, which
+    /// `engine::moe_stats` multiplies out per routed selection.
+    ///
+    /// Deliberately the rows' own extent rather than `expert_stride`: the
+    /// stride is where the *next* expert starts and would fold any padding
+    /// between them into a figure meant to be comparable against bytes a
+    /// batch-union implementation would move.
+    pub fn expert_bytes(&self) -> u64 {
+        (self.row_bytes * self.out_dim) as u64
+    }
+
+    /// The tensor's GGUF name — stable across runs, unlike
+    /// [`Self::tensor_id`].
+    pub fn name(&self) -> &Arc<str> {
+        &self.name
+    }
+
+    /// This tensor's stable process-lifetime identity — the address its
+    /// mapped bytes begin at, which is what the GPU backends already key a
+    /// weight on. Two views of one tensor agree; two different tensors do
+    /// not collide, since the mappings are held for the model's whole life.
+    pub fn tensor_id(&self) -> usize {
+        self.bytes.as_ptr() as usize + self.start
+    }
+
+    /// One expert's still-quantized bytes, as they lie in the mapping.
+    ///
+    /// The unit a residency policy works in: `engine::expert_store` asks the
+    /// kernel whether *this* range is in RAM, which is a question about a
+    /// slice of a tensor rather than about the whole shard.
+    pub fn expert_span(&self, expert: usize) -> &[u8] {
+        let offset = self.start + expert * self.expert_stride;
+        &self.bytes[offset..offset + self.row_bytes * self.out_dim]
+    }
+
+    /// [`Self::row_into`], but reading from `span` — one expert's bytes as
+    /// [`Self::expert_span`] lays them out — rather than from the mapping.
+    ///
+    /// What lets a residency tier serve a row from its own copy: the bytes
+    /// are the same bytes, so the values are the same values, and nothing
+    /// downstream can tell which side of the tier they came from.
+    pub fn row_from(&self, span: &[u8], index: usize, out: &mut Vec<f32>) {
+        let offset = index * self.row_bytes;
+        let bytes = &span[offset..offset + self.row_bytes];
+        quant::dequantize_into(self.ggml_type, bytes, self.in_dim, out)
+            .expect("row byte range was validated when this ExpertQuantMatrix was constructed");
+    }
+
+    /// [`Self::row`] into a caller-owned buffer, reusing its capacity.
+    ///
+    /// The allocating form is fine for a one-off, and wrong for the MoE
+    /// expert loop, which reads every row of an expert's three matrices and
+    /// would otherwise allocate `in_dim` floats thousands of times per layer.
+    pub fn row_into(&self, expert: usize, index: usize, out: &mut Vec<f32>) {
+        let offset = self.start + expert * self.expert_stride + index * self.row_bytes;
+        let bytes = &self.bytes[offset..offset + self.row_bytes];
+        quant::dequantize_into(self.ggml_type, bytes, self.in_dim, out)
+            .expect("row byte range was validated when this ExpertQuantMatrix was constructed");
+    }
+
     /// Dequantizes row `index` of expert `expert` (`in_dim` values).
     pub fn row(&self, expert: usize, index: usize) -> Vec<f32> {
         debug_assert!(
@@ -684,6 +874,10 @@ impl LoadedModel {
                 unsafe { Mmap::map(&file) }
                     .with_context(|| format!("failed to mmap {}", shard_path.display()))?,
             );
+            // So `engine::page_cache` can measure how much of this shard is in
+            // RAM, and evict it — the two halves of telling a cold run from a
+            // warm one on a model too large to hold.
+            super::page_cache::register_shard(shard_path, &mmap);
 
             for tensor in &shard_gguf.tensors {
                 let element_count: u64 = tensor.dims.iter().product();
@@ -824,6 +1018,15 @@ impl LoadedModel {
             (*k == key).then_some(v).and_then(|v| match v {
                 GgufValue::F32(f) => Some(*f),
                 GgufValue::F64(f) => Some(*f as f32),
+                // Signed integers are matched before `as_u64`, which
+                // refuses negative values — and a negative whole number is
+                // exactly what some of these keys hold
+                // (`kimi-k3.kda.gate_lower_bound = -5`). Falling through to
+                // `None` there would silently substitute a default.
+                GgufValue::I8(i) => Some(*i as f32),
+                GgufValue::I16(i) => Some(*i as f32),
+                GgufValue::I32(i) => Some(*i as f32),
+                GgufValue::I64(i) => Some(*i as f32),
                 other => other.as_u64().map(|i| i as f32),
             })
         })
@@ -842,6 +1045,27 @@ impl LoadedModel {
         })
     }
 
+    /// A `<arch>.<suffix>` array metadata value, each element widened to
+    /// `f32`.
+    pub fn metadata_array_f32(&self, suffix: &str) -> Option<Vec<f32>> {
+        let key = format!("{}.{suffix}", self.config.architecture);
+        self.metadata.iter().find_map(|(k, v)| {
+            (*k == key).then_some(v).and_then(|v| match v {
+                GgufValue::Array(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|i| match i {
+                            GgufValue::F32(f) => Some(*f),
+                            GgufValue::F64(f) => Some(*f as f32),
+                            other => other.as_u64().map(|u| u as f32),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+        })
+    }
+
     /// Dequantizes tensor `name` to `f32`, in GGUF's own (reversed-from-
     /// row-major) dimension order — callers index it the same way ggml
     /// tensor shapes are documented (`dims[0]` is the fastest-varying).
@@ -854,6 +1078,23 @@ impl LoadedModel {
         let element_count: u64 = loc.dims.iter().product();
         let values = quant::dequantize(loc.ggml_type, bytes, element_count as usize)
             .with_context(|| format!("tensor '{name}'"))?;
+        Ok((values, &loc.dims))
+    }
+
+    pub fn tensor_i32(&self, name: &str) -> Result<(Vec<i32>, &[u64])> {
+        let loc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("model is missing tensor '{name}'"))?;
+        anyhow::ensure!(
+            loc.ggml_type == crate::engine::quant::GGML_TYPE_I32,
+            "tensor '{name}' is not an I32 tensor"
+        );
+        let bytes = &loc.bytes[loc.start..loc.start + loc.len];
+        let values = bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
         Ok((values, &loc.dims))
     }
 
@@ -921,6 +1162,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(ExpertQuantMatrix {
+            name: Arc::from(name),
             bytes: loc.bytes.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
@@ -1171,6 +1413,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_arch_family_accepts_qwen3next() {
+        for arch in QWEN3NEXT_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen3Next);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_dflash() {
+        for arch in DFLASH_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::DFlash);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_deepseek4() {
+        for arch in DEEPSEEK4_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Deepseek4);
+        }
+    }
+
+    #[test]
     fn resolve_arch_family_accepts_phi3() {
         for arch in PHI3_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Phi3);
@@ -1306,6 +1569,43 @@ mod tests {
         assert_eq!(last, 31.0);
     }
 
+    /// A negative whole-numbered hyperparameter written as an integer
+    /// must read back as itself, not as the caller's default:
+    /// `as_u64` refuses negatives, so this is the one arm of
+    /// `metadata_f32`'s integer fallback that a plain `.as_u64()` misses.
+    #[test]
+    fn metadata_f32_reads_negative_integers() {
+        let model = LoadedModel {
+            config: ModelConfig {
+                architecture: "kimi-k3".to_string(),
+                n_vocab: 0,
+                n_embd: 0,
+                n_layer: 0,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: 1,
+                n_ctx_train: 0,
+                rope_dim: 0,
+                rope_freq_base: 0.0,
+                rms_eps: 0.0,
+                pooling_type: PoolingType::Mean,
+            },
+            metadata: vec![
+                (
+                    "kimi-k3.kda.gate_lower_bound".to_string(),
+                    GgufValue::I32(-5),
+                ),
+                ("kimi-k3.situ_beta".to_string(), GgufValue::F32(4.0)),
+                ("kimi-k3.positive".to_string(), GgufValue::U32(7)),
+            ],
+            tensors: HashMap::new(),
+        };
+        assert_eq!(model.metadata_f32("kda.gate_lower_bound"), Some(-5.0));
+        assert_eq!(model.metadata_f32("situ_beta"), Some(4.0));
+        assert_eq!(model.metadata_f32("positive"), Some(7.0));
+        assert_eq!(model.metadata_f32("absent"), None);
+    }
+
     /// A header-only `GgufFile` (no tensor data) carrying one architecture
     /// key and the given tensor names — enough to exercise `model_load_support`.
     fn header_only(architecture: &str, tensor_names: &[&str]) -> GgufFile {
@@ -1356,6 +1656,49 @@ mod tests {
         assert_eq!(bad_quant, None);
     }
 
+    #[test]
+    fn model_load_support_accepts_a_qwen3next_model() {
+        let (arch, bad_quant) =
+            model_load_support(&header_only("qwen3next", &["blk.0.ssm_beta_alpha.weight"]));
+        assert_eq!(arch.as_deref(), Some("qwen3next"));
+        assert_eq!(bad_quant, None);
+    }
+
+    #[test]
+    fn model_load_support_accepts_qwen3next_mxfp4_tensors() {
+        let mut gguf = header_only("qwen3next", &["blk.0.ssm_beta_alpha.weight"]);
+        gguf.tensors[0].ggml_type = crate::engine::quant::GGML_TYPE_MXFP4;
+        let (arch, bad_quant) = model_load_support(&gguf);
+        assert_eq!(arch.as_deref(), Some("qwen3next"));
+        assert_eq!(bad_quant, None);
+    }
+
+    #[test]
+    fn model_load_support_accepts_dflash() {
+        let (arch, bad_quant) = model_load_support(&header_only("dflash", &["fc.weight"]));
+        assert_eq!(arch.as_deref(), Some("dflash"));
+        assert_eq!(bad_quant, None);
+    }
+
+    #[test]
+    fn model_load_support_accepts_deepseek4_hash_routing_tables() {
+        let mut gguf = header_only("deepseek4", &["blk.0.ffn_gate_tid2eid.weight"]);
+        gguf.tensors[0].ggml_type = 26;
+        let (arch, bad_quant) = model_load_support(&gguf);
+        assert_eq!(arch.as_deref(), Some("deepseek4"));
+        assert_eq!(bad_quant, None);
+    }
+
+    #[test]
+    fn model_load_support_accepts_deepseek4_hash_routing_tables_without_arch_metadata() {
+        let mut gguf = header_only("llama", &["blk.0.ffn_gate_tid2eid.weight"]);
+        gguf.metadata.clear();
+        gguf.tensors[0].ggml_type = 26;
+        let (arch, bad_quant) = model_load_support(&gguf);
+        assert_eq!(arch, None);
+        assert_eq!(bad_quant, None);
+    }
+
     /// A recognised architecture whose tensors are quantized to a type this
     /// build has no dequantizer for. The header alone says `llama`, so
     /// checking only the architecture would advertise a load that dies on
@@ -1371,10 +1714,27 @@ mod tests {
 
     #[test]
     fn model_load_support_reports_an_unknown_arch_unsupported() {
-        let (arch, bad_quant) = model_load_support(&header_only("glm-dsa", &[]));
-        assert_eq!(arch.as_deref(), Some("glm-dsa"));
+        let (arch, bad_quant) = model_load_support(&header_only("kimi-linear", &[]));
+        assert_eq!(arch.as_deref(), Some("kimi-linear"));
         // Unreadable because of its *architecture*, not its tensor types.
         assert_eq!(bad_quant, None);
-        assert!(resolve_arch_family("glm-dsa").is_err());
+        assert!(resolve_arch_family("kimi-linear").is_err());
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_kimi_k3() {
+        assert_eq!(resolve_arch_family("kimi-k3").unwrap(), ArchFamily::KimiK3);
+        // Kimi-Linear shares K3's delta-net attention but none of its
+        // cross-layer residuals, latent MoE or situ activation, so it is
+        // deliberately not routed here.
+        assert!(resolve_arch_family("kimi-linear").is_err());
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_glm_dsa() {
+        assert_eq!(resolve_arch_family("glm-dsa").unwrap(), ArchFamily::GlmDsa);
+        // Plain GLM is a different architecture entirely, and not one this
+        // build reads — `glm.rs` is the sparse-attention variant only.
+        assert!(resolve_arch_family("glm4").is_err());
     }
 }

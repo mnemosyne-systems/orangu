@@ -26,6 +26,7 @@
 //! style win, not just a same-session one) — matching is plain token-id
 //! comparison, with no notion of "session" involved at all.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use super::kv_cache::KvCache;
@@ -157,6 +158,128 @@ impl PrefixCache {
         }
         entries.push(CachedPrefill { tokens, cache });
     }
+
+    /// Writes the pool to `dir`, one file per entry, so a restart can reopen
+    /// a conversation warm instead of re-prefilling it.
+    ///
+    /// **Why this is worth bytes on disk.** Re-prefilling a conversation is
+    /// not just recomputing attention: on a model whose experts stream, every
+    /// replayed position pulls its experts off the disk again, and that is the
+    /// dominant cost rather than a rounding error. colibri measures a second
+    /// turn reusing 82% of its prompt at **61 s instead of 320 s** on
+    /// DeepSeek V4.
+    ///
+    /// `fingerprint` is the model identity `slot_store` already computes. A
+    /// snapshot is refused rather than misread if it does not match: a KV
+    /// cache from another model is not corrupt data, it is *plausible* data,
+    /// which is worse.
+    ///
+    /// Each entry is written through a temporary file and renamed, and the
+    /// directory is swept of anything that is not one of this pool's files —
+    /// so a crash mid-write leaves the previous snapshot rather than a
+    /// half-written one that still loads.
+    pub fn save_to(&self, dir: &Path, fingerprint: &str) -> std::io::Result<usize> {
+        let entries = self.entries.lock().unwrap();
+        std::fs::create_dir_all(dir)?;
+        let mut written = 0usize;
+        let mut keep: Vec<std::ffi::OsString> = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            // Only the committed prefix is worth storing, and `tokens` can run
+            // one ahead of the cache — the same off-by-one
+            // `reusable_prefix_len` caps for live matching. Storing the extra
+            // token would make a reloaded entry claim a position the cache
+            // does not hold.
+            let committed = entry.reusable_prefix_len(&entry.tokens);
+            if committed == 0 {
+                continue;
+            }
+            let name = std::ffi::OsString::from(format!("prefix-{index}.bin"));
+            let path = dir.join(&name);
+            let temp = dir.join(format!("prefix-{index}.tmp"));
+            let mut blob = Vec::new();
+            blob.extend_from_slice(PREFIX_FILE_MAGIC);
+            let fp = fingerprint.as_bytes();
+            blob.extend_from_slice(&(fp.len() as u32).to_le_bytes());
+            blob.extend_from_slice(fp);
+            blob.extend_from_slice(&(committed as u32).to_le_bytes());
+            for token in &entry.tokens[..committed] {
+                blob.extend_from_slice(&token.to_le_bytes());
+            }
+            blob.extend_from_slice(&entry.cache.to_bytes());
+            std::fs::write(&temp, &blob)?;
+            std::fs::rename(&temp, &path)?;
+            keep.push(name);
+            written += 1;
+        }
+        // Anything left from a larger previous snapshot would otherwise be
+        // reloaded forever.
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for stale in read.flatten() {
+                if !keep.contains(&stale.file_name()) {
+                    let _ = std::fs::remove_file(stale.path());
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Reloads a snapshot written by [`Self::save_to`], skipping any file that
+    /// is missing, truncated, or was written for a different model.
+    ///
+    /// Every failure here is silent and costs a cold start, which is the
+    /// status quo. A prefix cache is an optimisation; it must never be the
+    /// reason a server refuses to come up.
+    pub fn load_from(&self, dir: &Path, fingerprint: &str) -> usize {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut paths: Vec<_> = read.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        let mut loaded = 0usize;
+        for path in paths {
+            let Ok(blob) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(entry) = decode_entry(&blob, fingerprint) else {
+                continue;
+            };
+            self.store(entry.tokens, entry.cache);
+            loaded += 1;
+        }
+        loaded
+    }
+}
+
+/// Marks a file as this pool's, so a stray file in the directory is skipped
+/// rather than parsed as a truncated entry.
+const PREFIX_FILE_MAGIC: &[u8] = b"ORGUPFX1";
+
+/// Parses one entry, or `None` for anything that is not exactly one written by
+/// this build for this model.
+fn decode_entry(blob: &[u8], fingerprint: &str) -> Option<CachedPrefill> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let out = blob.get(at..at + n)?;
+        at += n;
+        Some(out)
+    };
+    if take(PREFIX_FILE_MAGIC.len())? != PREFIX_FILE_MAGIC {
+        return None;
+    }
+    let fp_len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    if take(fp_len)? != fingerprint.as_bytes() {
+        // A cache built for another model would match on token ids and answer
+        // from the wrong state — the exact silent failure this whole design is
+        // shaped to avoid.
+        return None;
+    }
+    let n_tokens = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let mut tokens = Vec::with_capacity(n_tokens);
+    for _ in 0..n_tokens {
+        tokens.push(u32::from_le_bytes(take(4)?.try_into().ok()?));
+    }
+    let cache = KvCache::from_bytes(&blob[at..]).ok()?;
+    Some(CachedPrefill { tokens, cache })
 }
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
@@ -181,6 +304,119 @@ mod tests {
             }
         }
         c
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "orangu-prefix-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The point of the whole task: a conversation survives a restart, so
+    /// turn two does not re-prefill turn one — which on a streaming model
+    /// means not re-reading every expert that turn touched.
+    #[test]
+    fn a_saved_pool_still_serves_its_prefix_after_a_reload() {
+        let dir = temp_dir("roundtrip");
+        let tokens = vec![7u32, 8, 9, 10];
+
+        let saved = PrefixCache::new(4);
+        saved.store(tokens.clone(), cache(2, 8, 4, 4));
+        assert_eq!(saved.save_to(&dir, "fp-abc").unwrap(), 1);
+
+        let reloaded = PrefixCache::new(4);
+        assert_eq!(reloaded.load_from(&dir, "fp-abc"), 1);
+        let (prefix_len, entry) = reloaded
+            .take_best_match(&[7, 8, 9, 11])
+            .expect("the reloaded entry matches");
+        assert_eq!(prefix_len, 3);
+        assert_eq!(entry.tokens[..3], tokens[..3]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The failure this format exists to prevent.** A KV cache from another
+    /// model would match on token ids and answer from a state that belongs to
+    /// a different model — not corrupt data, *plausible* data, which is the
+    /// worse kind. The fingerprint must refuse it.
+    #[test]
+    fn a_snapshot_from_another_model_is_refused_not_misread() {
+        let dir = temp_dir("fingerprint");
+        let saved = PrefixCache::new(4);
+        saved.store(vec![1, 2, 3], cache(2, 8, 4, 3));
+        saved.save_to(&dir, "model-A").unwrap();
+
+        let reloaded = PrefixCache::new(4);
+        assert_eq!(
+            reloaded.load_from(&dir, "model-B"),
+            0,
+            "another model's cache was loaded"
+        );
+        assert!(reloaded.take_best_match(&[1, 2, 3]).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anything that is not one of these files — a stray file, a truncated
+    /// write — costs a cold start and nothing else.
+    #[test]
+    fn rubbish_in_the_directory_is_skipped_rather_than_parsed() {
+        let dir = temp_dir("rubbish");
+        std::fs::write(dir.join("not-ours.bin"), b"hello").unwrap();
+        std::fs::write(dir.join("prefix-9.bin"), b"ORGUPFX1truncated").unwrap();
+
+        let reloaded = PrefixCache::new(4);
+        assert_eq!(reloaded.load_from(&dir, "fp"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shrinking pool must not leave older, larger snapshots behind for the
+    /// next start to reload alongside the current ones.
+    #[test]
+    fn a_smaller_snapshot_sweeps_away_the_larger_one_it_replaces() {
+        let dir = temp_dir("sweep");
+        let big = PrefixCache::new(4);
+        big.store(vec![1, 2, 3], cache(2, 8, 4, 3));
+        big.store(vec![4, 5, 6], cache(2, 8, 4, 3));
+        assert_eq!(big.save_to(&dir, "fp").unwrap(), 2);
+
+        let small = PrefixCache::new(4);
+        small.store(vec![7, 8, 9], cache(2, 8, 4, 3));
+        assert_eq!(small.save_to(&dir, "fp").unwrap(), 1);
+
+        let reloaded = PrefixCache::new(4);
+        assert_eq!(reloaded.load_from(&dir, "fp"), 1, "a stale file survived");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tokens` can run one ahead of what the cache actually committed. A
+    /// saved entry that claimed the extra token would, on reload, promise a
+    /// position it cannot serve.
+    #[test]
+    fn only_the_committed_prefix_is_written() {
+        let dir = temp_dir("committed");
+        let saved = PrefixCache::new(4);
+        // Four token ids, but only three positions committed.
+        saved.store(vec![1, 2, 3, 4], cache(2, 8, 4, 3));
+        saved.save_to(&dir, "fp").unwrap();
+
+        let reloaded = PrefixCache::new(4);
+        reloaded.load_from(&dir, "fp");
+        let (_, entry) = reloaded.take_best_match(&[1, 2, 3, 4]).expect("matches");
+        assert_eq!(
+            entry.tokens,
+            vec![1, 2, 3],
+            "an uncommitted token was saved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

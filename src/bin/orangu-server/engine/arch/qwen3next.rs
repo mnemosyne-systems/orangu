@@ -13,49 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! Qwen3.5/3.6-MoE (`general.architecture = "qwen35moe"`), confirmed
-//! against real upstream `llama.cpp` source (`src/models/qwen35moe.cpp`,
-//! `src/models/delta-net-base.cpp`, `src/llama-graph.cpp`'s
-//! `build_moe_ffn`, and the relevant `ggml-cpu/ops.cpp` compute kernels —
-//! fetched and read directly, not guessed) — a genuinely different shape
-//! from both `engine::arch::llama` and `engine::arch::gemma`:
+//! Qwen3-Next (`general.architecture = "qwen3next"`).
 //!
-//! - **Layers alternate between two kinds** (`full_attention_interval`,
-//!   normally every 4th layer is full attention, the rest are linear
-//!   attention): a standard pre-norm transformer block either way
-//!   (`x += sub(rmsnorm(x)); x += moe_ffn(rmsnorm(x))`), only the
-//!   attention sub-layer itself differs.
-//! - **Full-attention layers**: a *joint* query+gate projection (`wq`'s
-//!   output is `[Q_h, gate_h]` interleaved per head), Q/K-norm, partial
-//!   rotary (`rope.dimension_count` is a quarter of `attention.key_length`
-//!   here), standard GQA, then the attention output is gated by
-//!   `sigmoid(gate)` before the output projection.
-//! - **Linear-attention (gated-DeltaNet) layers**: a joint QKV projection
-//!   through a causal depthwise conv1d + SiLU, per-head L2-normed Q/K, a
-//!   scalar-per-head softplus-gated decay, and a delta-rule recurrent
-//!   state update — implemented here only in its *autoregressive*
-//!   (one-token-at-a-time) form, not the chunked/parallel form real
-//!   llama.cpp also has: the two are mathematically identical (chunking is
-//!   a prefill-throughput optimization, not different math — confirmed by
-//!   reading `build_delta_net_chunking` and `build_delta_net_autoregressive`
-//!   side by side), so this is a real, deliberate, documented scope
-//!   reduction (slower prompt processing on long prompts, not a
-//!   correctness gap), not a shortcut.
-//! - **MoE FFN on every layer**: standard softmax top-k routing
-//!   (renormalized) over routed experts, plus a separately-gated
-//!   (`sigmoid`) shared expert whose output adds in.
-//!
-//! **Not implemented**: NextN/MTP (speculative-decoding-only extra decoder
-//! blocks beyond `block_count`) — this module only ever reads `config.
-//! n_layer` (`block_count`) layers; any MTP blocks in the file are simply
-//! never touched. Multi-section RoPE ("IMRoPE") is implemented as plain
-//! NEOX rope: for text-only input every rope "position channel" (t/h/w/e)
-//! carries the same linear position, at which point the sections mechanism
-//! (confirmed by reading `ggml_mrope_cache_init`) is a no-op — it only
-//! matters for genuinely multi-axis (vision/video) position input, which
-//! this engine doesn't accept.
+//! This reuses the same full-attention and MoE FFN shape as `qwen35moe`.
+//! The recurrent path differs in two places:
+//! - `ssm_ba.weight` packs beta and alpha together.
+//! - older checkpoints can store recurrent QKV and z in `ssm_in.weight`
+//!   instead of the split `attn_qkv.weight` and `attn_gate.weight`.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use super::ModelForward;
@@ -65,17 +31,11 @@ use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMa
 use crate::engine::moe_stats;
 use crate::engine::tensor;
 
-/// Shared by both layer kinds: routed top-k softmax experts (renormalized)
-/// plus one always-on, separately-gated shared expert.
 struct MoeFfn {
     gate_inp: QuantMatrix,
     gate_exps: ExpertQuantMatrix,
     up_exps: ExpertQuantMatrix,
     down_exps: ExpertQuantMatrix,
-    /// `[n_embd]` — a matmul weight with `out_dim == 1` in the reference
-    /// graph (produces one shared-expert gate scalar per token); tiny, so
-    /// eagerly resident and dot-producted directly rather than routed
-    /// through `QuantMatrix`.
     gate_inp_shexp: Vec<f32>,
     gate_shexp: QuantMatrix,
     up_shexp: QuantMatrix,
@@ -84,8 +44,6 @@ struct MoeFfn {
 
 struct FullAttnLayer {
     attn_norm: Vec<f32>,
-    /// Joint query+gate projection: per head, `[Q(head_dim), gate(head_dim)]`
-    /// interleaved — `out_dim == 2 * n_head * head_dim`.
     wq: QuantMatrix,
     attn_q_norm: Vec<f32>,
     wk: QuantMatrix,
@@ -94,31 +52,21 @@ struct FullAttnLayer {
     wo: QuantMatrix,
     post_attention_norm: Vec<f32>,
     ffn: MoeFfn,
-    /// Dense index into `KvCache::layers` (every full-attention layer has
-    /// its own cache — no cross-layer sharing in this architecture).
     cache_index: usize,
 }
 
 struct RecurrentLayer {
     attn_norm: Vec<f32>,
-    /// Joint Q/K/V mix: `[q(key_dim), k(key_dim), v(value_dim)]`.
     wqkv: QuantMatrix,
     wqkv_gate: QuantMatrix,
-    /// `[conv_channels, d_conv]`, channel-major (ggml's own tensor order).
+    ssm_beta_alpha: QuantMatrix,
     ssm_conv1d: Vec<f32>,
-    /// `[num_v_heads]` — added to the alpha projection before softplus.
     ssm_dt_bias: Vec<f32>,
-    /// `[num_v_heads]` — per-head learned decay scale (typically negative;
-    /// `exp(softplus(alpha + dt_bias) * ssm_a)` is the per-head decay).
     ssm_a: Vec<f32>,
-    ssm_beta: QuantMatrix,
-    ssm_alpha: QuantMatrix,
-    /// `[head_v_dim]` — the gated output RMSNorm's learned weight.
     ssm_norm: Vec<f32>,
     ssm_out: QuantMatrix,
     post_attention_norm: Vec<f32>,
     ffn: MoeFfn,
-    /// Dense index into `KvCache::recurrent`.
     cache_index: usize,
 }
 
@@ -127,7 +75,7 @@ enum Layer {
     Recurrent(RecurrentLayer),
 }
 
-pub struct Qwen35MoeModel {
+pub struct Qwen3NextModel {
     config: ModelConfig,
     backend: Arc<dyn Backend>,
     tok_embeddings: QuantMatrix,
@@ -140,22 +88,14 @@ pub struct Qwen35MoeModel {
     rope_freq_base: f32,
     rms_eps: f32,
     n_expert_used: usize,
-    /// SSM/gated-delta-net dimensions (`qwen35moe.ssm.*` metadata).
     ssm_d_conv: usize,
-    /// `head_k_dim == head_v_dim` for gated-DeltaNet (required by the
-    /// recurrence itself — see the module doc comment).
     ssm_head_dim: usize,
-    /// Number of K/V "groups" the causal conv1d/Q/K live in
-    /// (`ssm.group_count`) — smaller than `ssm_dt_rank` (the number of
-    /// value heads); a K/V group is reused (tiled, not block-grouped —
-    /// confirmed against `ggml_compute_forward_repeat_f32`) across
-    /// `ssm_dt_rank / ssm_n_group` value heads.
     ssm_n_group: usize,
     ssm_dt_rank: usize,
     layers: Vec<Layer>,
 }
 
-impl Qwen35MoeModel {
+impl Qwen3NextModel {
     pub fn load_with_backend(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
         let config = loaded.config.clone();
         let n_layer = config.n_layer;
@@ -169,7 +109,6 @@ impl Qwen35MoeModel {
         let head_dim = loaded
             .metadata_u64("attention.key_length")
             .context("missing attention.key_length")? as usize;
-
         let ssm_d_conv = loaded
             .metadata_u64("ssm.conv_kernel")
             .context("missing ssm.conv_kernel")? as usize;
@@ -182,6 +121,22 @@ impl Qwen35MoeModel {
         let ssm_dt_rank = loaded
             .metadata_u64("ssm.time_step_rank")
             .context("missing ssm.time_step_rank")? as usize;
+        let ssm_inner_size = loaded
+            .metadata_u64("ssm.inner_size")
+            .context("missing ssm.inner_size")? as usize;
+
+        anyhow::ensure!(
+            ssm_dt_rank > 0 && ssm_n_group > 0,
+            "ssm.time_step_rank and ssm.group_count must be nonzero"
+        );
+        anyhow::ensure!(
+            ssm_dt_rank % ssm_n_group == 0,
+            "ssm.time_step_rank {ssm_dt_rank} must be a multiple of ssm.group_count {ssm_n_group}"
+        );
+        anyhow::ensure!(
+            ssm_inner_size == ssm_head_dim * ssm_dt_rank,
+            "qwen3next expects ssm.inner_size ({ssm_inner_size}) = ssm.state_size ({ssm_head_dim}) * ssm.time_step_rank ({ssm_dt_rank})"
+        );
 
         let full_attention_interval =
             loaded.metadata_u64("full_attention_interval").unwrap_or(4) as usize;
@@ -207,6 +162,9 @@ impl Qwen35MoeModel {
         } else {
             tok_embeddings.clone()
         };
+
+        let key_dim = ssm_head_dim * ssm_n_group;
+        let value_dim = ssm_head_dim * ssm_dt_rank;
 
         let mut layers = Vec::with_capacity(n_layer);
         let mut n_full_attn = 0usize;
@@ -246,15 +204,44 @@ impl Qwen35MoeModel {
             if is_recr.get(i).copied().unwrap_or(false) {
                 let cache_index = n_recurrent;
                 n_recurrent += 1;
+                let (wqkv, wqkv_gate) = if loaded.has_tensor(&format!("blk.{i}.attn_qkv.weight")) {
+                    (
+                        get_matrix("attn_qkv.weight")?,
+                        get_matrix("attn_gate.weight")?,
+                    )
+                } else {
+                    let mixed = get_matrix("ssm_in.weight")?;
+                    let qkv_out_dim = 2 * key_dim + value_dim;
+                    anyhow::ensure!(
+                        mixed.out_dim == qkv_out_dim + value_dim,
+                        "blk.{i}.ssm_in.weight has out_dim {}, expected {}",
+                        mixed.out_dim,
+                        qkv_out_dim + value_dim,
+                    );
+                    (
+                        mixed.rows(0, qkv_out_dim),
+                        mixed.rows(qkv_out_dim, value_dim),
+                    )
+                };
+                let ssm_beta_alpha = if loaded.has_tensor(&format!("blk.{i}.ssm_ba.weight")) {
+                    get_matrix("ssm_ba.weight")?
+                } else {
+                    get_matrix("ssm_beta_alpha.weight")?
+                };
+                anyhow::ensure!(
+                    ssm_beta_alpha.out_dim == 2 * ssm_dt_rank,
+                    "blk.{i}.ssm_ba.weight has out_dim {}, expected {}",
+                    ssm_beta_alpha.out_dim,
+                    2 * ssm_dt_rank,
+                );
                 layers.push(Layer::Recurrent(RecurrentLayer {
                     attn_norm: get("attn_norm.weight")?,
-                    wqkv: get_matrix("attn_qkv.weight")?,
-                    wqkv_gate: get_matrix("attn_gate.weight")?,
+                    wqkv,
+                    wqkv_gate,
+                    ssm_beta_alpha,
                     ssm_conv1d: get("ssm_conv1d.weight")?,
                     ssm_dt_bias: get("ssm_dt.bias")?,
                     ssm_a: get("ssm_a")?,
-                    ssm_beta: get_matrix("ssm_beta.weight")?,
-                    ssm_alpha: get_matrix("ssm_alpha.weight")?,
                     ssm_norm: get("ssm_norm.weight")?,
                     ssm_out: get_matrix("ssm_out.weight")?,
                     post_attention_norm: get("post_attention_norm.weight")?,
@@ -277,12 +264,6 @@ impl Qwen35MoeModel {
                     cache_index,
                 }));
             }
-
-            if loaded.has_tensor(&format!("blk.{i}.nextn.eh_proj.weight")) {
-                bail!(
-                    "blk.{i} has NextN/MTP tensors — speculative-decoding blocks are not yet supported by orangu-server"
-                );
-            }
         }
 
         Ok(Self {
@@ -291,7 +272,7 @@ impl Qwen35MoeModel {
             tok_embeddings,
             output_norm,
             output_weight,
-            n_head: 0, // set below, only meaningful when there's a full-attn layer
+            n_head: 0,
             n_head_kv: 0,
             head_dim,
             rope_dim: 0,
@@ -316,9 +297,6 @@ impl Qwen35MoeModel {
         self
     }
 
-    /// `(n_full_attn, n_recurrent)` layer counts, and each layer's
-    /// `(conv_channels, key_dim, value_dim)` for the recurrent ones — used
-    /// to size a fresh [`KvCache`].
     fn cache_layout(&self) -> (usize, usize) {
         let n_full_attn = self
             .layers
@@ -342,7 +320,31 @@ impl Qwen35MoeModel {
     }
 }
 
-impl ModelForward for Qwen35MoeModel {
+fn split_beta_alpha(
+    mixed: &[f32],
+    n_tokens: usize,
+    n_k_heads: usize,
+    n_v_heads: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let group = n_v_heads / n_k_heads;
+    let mut beta = vec![0f32; n_tokens * n_v_heads];
+    let mut alpha = vec![0f32; n_tokens * n_v_heads];
+    for t in 0..n_tokens {
+        let src = &mixed[t * 2 * n_v_heads..(t + 1) * 2 * n_v_heads];
+        let beta_t = &mut beta[t * n_v_heads..(t + 1) * n_v_heads];
+        let alpha_t = &mut alpha[t * n_v_heads..(t + 1) * n_v_heads];
+        for kh in 0..n_k_heads {
+            let src_off = kh * 2 * group;
+            let dst_off = kh * group;
+            beta_t[dst_off..dst_off + group].copy_from_slice(&src[src_off..src_off + group]);
+            alpha_t[dst_off..dst_off + group]
+                .copy_from_slice(&src[src_off + group..src_off + 2 * group]);
+        }
+    }
+    (beta, alpha)
+}
+
+impl ModelForward for Qwen3NextModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
         self.backend.as_wgpu()
     }
@@ -400,16 +402,15 @@ impl ModelForward for Qwen35MoeModel {
 
         let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
         tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, eps);
-        let logits = self.backend.matmul(last, 1, &self.output_weight);
-        Ok(logits)
+        Ok(self.backend.matmul(last, 1, &self.output_weight))
     }
 
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
-        anyhow::bail!("embeddings are not yet supported for Qwen3.5-MoE models")
+        anyhow::bail!("embeddings are not yet supported for Qwen3-Next models")
     }
 }
 
-impl Qwen35MoeModel {
+impl Qwen3NextModel {
     fn forward_full_attn_layer(
         &self,
         layer: &FullAttnLayer,
@@ -428,10 +429,6 @@ impl Qwen35MoeModel {
         let mut normed = x.to_vec();
         tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
 
-        // Joint Q+gate projection, K, and V are all independent projections
-        // of the same normed input — one batched dispatch instead of three
-        // sequential round-trips (see `Backend::matmul_batch`). Per head,
-        // the Q+gate projection is [Q(head_dim), gate(head_dim)].
         let mut qgkv = self.backend.matmul_batch(&[
             MatmulOp {
                 x: &normed,
@@ -502,9 +499,7 @@ impl Qwen35MoeModel {
             );
         }
 
-        // Plain causal attention, on the GPU when the batch is wide enough --
-        // `engine::attention` owns that choice for every architecture.
-        let mut attn_out: Vec<f32> = Vec::new();
+        let mut attn_out = Vec::new();
         crate::engine::attention::attention(
             &mut attn_out,
             &q,
@@ -522,7 +517,6 @@ impl Qwen35MoeModel {
             },
             |t| (0, start_pos + t),
         );
-        // Gate the attention output (sigmoid), then project.
         for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
             *o *= tensor::sigmoid(g);
         }
@@ -561,10 +555,7 @@ impl Qwen35MoeModel {
         let mut normed = x.to_vec();
         tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
 
-        // All four are independent projections of the same normed input —
-        // one batched dispatch instead of four sequential round-trips (see
-        // `Backend::matmul_batch`).
-        let mut mixed_z_beta_alpha = self.backend.matmul_batch(&[
+        let mut mixed_z_ba = self.backend.matmul_batch(&[
             MatmulOp {
                 x: &normed,
                 n_tokens,
@@ -578,19 +569,14 @@ impl Qwen35MoeModel {
             MatmulOp {
                 x: &normed,
                 n_tokens,
-                w: &layer.ssm_beta,
-            },
-            MatmulOp {
-                x: &normed,
-                n_tokens,
-                w: &layer.ssm_alpha,
+                w: &layer.ssm_beta_alpha,
             },
         ]);
-        let alpha = mixed_z_beta_alpha.pop().unwrap();
-        let mut beta = mixed_z_beta_alpha.pop().unwrap();
-        let z = mixed_z_beta_alpha.pop().unwrap();
-        let qkv_mixed = mixed_z_beta_alpha.pop().unwrap();
-        for b in beta.iter_mut() {
+        let mixed_ba = mixed_z_ba.pop().unwrap();
+        let z = mixed_z_ba.pop().unwrap();
+        let qkv_mixed = mixed_z_ba.pop().unwrap();
+        let (mut beta, alpha) = split_beta_alpha(&mixed_ba, n_tokens, n_k_heads, n_v_heads);
+        for b in &mut beta {
             *b = tensor::sigmoid(*b);
         }
         let mut decay = vec![0f32; n_tokens * n_v_heads];
@@ -608,12 +594,11 @@ impl Qwen35MoeModel {
             let mixed =
                 &qkv_mixed[t * (2 * key_dim + value_dim)..(t + 1) * (2 * key_dim + value_dim)];
             let mut conv_out = ssm_state.conv_step(mixed, &layer.ssm_conv1d);
-            for v in conv_out.iter_mut() {
+            for v in &mut conv_out {
                 *v = tensor::silu(*v);
             }
             let (q_conv, rest) = conv_out.split_at_mut(key_dim);
             let (k_conv, v_conv) = rest.split_at_mut(key_dim);
-            debug_assert_eq!(v_conv.len(), value_dim);
 
             for h in 0..n_k_heads {
                 tensor::l2_norm_inplace(&mut q_conv[h * head_dim..(h + 1) * head_dim], eps);
@@ -625,10 +610,6 @@ impl Qwen35MoeModel {
 
             let mut attn_out = vec![0f32; value_dim];
             for vh in 0..n_v_heads {
-                // Tiled (not block-grouped) broadcast — matches
-                // `ggml_compute_forward_repeat_f32`'s tiling semantics for
-                // this specific mismatched-head-count repeat, distinct from
-                // standard attention's block-grouped GQA.
                 let kh = vh % n_k_heads;
                 let qh = &q_conv[kh * head_dim..(kh + 1) * head_dim];
                 let khv = &k_conv[kh * head_dim..(kh + 1) * head_dim];
@@ -640,7 +621,6 @@ impl Qwen35MoeModel {
                 for s in state.iter_mut() {
                     *s *= decay_h;
                 }
-                // sk[a] = sum_b k[b] * S[b][a]  (k^T S)
                 let mut sk = vec![0f32; head_dim];
                 for a in 0..head_dim {
                     let mut sum = 0f32;
@@ -655,7 +635,6 @@ impl Qwen35MoeModel {
                         state[i * head_dim + j] += khv[i] * d[j];
                     }
                 }
-                // o[j] = sum_i q[i] * S_new[i][j]  (q^T S_new)
                 let out = &mut attn_out[vh * head_dim..(vh + 1) * head_dim];
                 for j in 0..head_dim {
                     let mut sum = 0f32;
@@ -666,7 +645,6 @@ impl Qwen35MoeModel {
                 }
             }
 
-            // Gated RMSNorm, per head: rmsnorm(attn_out_h) * silu(z_h).
             for h in 0..n_v_heads {
                 let mut normed_h = attn_out[h * head_dim..(h + 1) * head_dim].to_vec();
                 tensor::rmsnorm_inplace(&mut normed_h, &layer.ssm_norm, 1, head_dim, eps);
@@ -697,18 +675,13 @@ impl Qwen35MoeModel {
         Ok(())
     }
 
-    /// Standard top-k softmax MoE routing (renormalized over the selected
-    /// experts) plus a separately-`sigmoid`-gated shared expert — see
-    /// `llm_graph_context::build_moe_ffn` (the `LLAMA_EXPERT_GATING_FUNC_
-    /// TYPE_SOFTMAX`, `norm_w = true` path qwen35moe uses) and `build_
-    /// layer_ffn`'s shared-expert gate.
     fn moe_ffn(&self, ffn: &MoeFfn, normed: &[f32], n_tokens: usize) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let mut out = vec![0f32; n_tokens * n_embd];
         let mut experts =
             moe_stats::LayerRecorder::for_tensors(&[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps]);
-        // Route every position before touching any expert's weights, so the
-        // batch's whole selection is known and the union can be taken.
+        // Route the whole batch first, so the union can be taken before any
+        // expert's weights are read — see `super::evaluate_routed_experts`.
         let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
             .map(|t| {
                 let x_t = &normed[t * n_embd..(t + 1) * n_embd];
@@ -738,15 +711,6 @@ impl Qwen35MoeModel {
             picks.iter().for_each(|&(e, _)| experts.select(e));
         }
 
-        // Routed experts — the CPU-scalar (per-row dequant + dot) bottleneck
-        // of MoE decode. One weight read per *distinct* expert rather than
-        // one per (token, expert): the rows are dequantized once and dotted
-        // with every token that routed to this expert. See
-        // `super::evaluate_routed_experts`, including why the contributions
-        // come back in selection order and the summation below is unchanged.
-        // The down projection's rows still fan out, so decode — where every
-        // selection is distinct and the outer fan-out is only
-        // `n_expert_used` wide — keeps filling every core.
         let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
             let inputs: Vec<&[f32]> = members
                 .iter()
@@ -840,39 +804,14 @@ impl Qwen35MoeModel {
 }
 
 #[cfg(test)]
-mod real_model_tests {
-    use super::*;
+mod tests {
+    use super::split_beta_alpha;
 
-    /// Cross-check against real llama.cpp: given the token IDs real
-    /// llama.cpp's `/tokenize` produces for "The capital of France is"
-    /// (byte-level BPE — this model's `tokenizer.ggml.model = "gpt2"`,
-    /// already correctly supported, unlike gemma4's SentencePiece gap), the
-    /// model should predict " Paris" (token 11751) as the top next token,
-    /// matching real llama.cpp's `/completion` (`n_probs`) output exactly.
-    /// Run with `ORANGU_TEST_MODEL=/path/to.gguf cargo test --release --bin
-    /// orangu-server qwen35moe::real_model_tests -- --ignored` (a 35B-param
-    /// model — expect several minutes: this engine's scalar per-row dequant
-    /// has no hand-tuned SIMD quantized-matmul kernel).
     #[test]
-    #[ignore]
-    fn qwen35moe_predicts_paris_after_capital_of_france() {
-        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
-        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
-        let model = Qwen35MoeModel::load_with_backend(
-            &loaded,
-            Arc::new(crate::engine::backend::CpuBackend),
-        )
-        .expect("build model");
-
-        let mut cache = model.new_kv_cache(64);
-        let tokens: Vec<u32> = vec![760, 6511, 314, 9338, 369];
-        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
-        let (top_id, _) = logits
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .unwrap();
-        assert_eq!(top_id, 11751, "expected ' Paris' (11751) as top prediction");
+    fn split_beta_alpha_unpacks_per_group_layout() {
+        let mixed = vec![1.0, 2.0, 11.0, 12.0, 3.0, 4.0, 13.0, 14.0];
+        let (beta, alpha) = split_beta_alpha(&mixed, 1, 2, 4);
+        assert_eq!(beta, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(alpha, vec![11.0, 12.0, 13.0, 14.0]);
     }
 }

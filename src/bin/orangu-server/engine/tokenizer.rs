@@ -16,7 +16,7 @@
 //! A from-scratch BPE tokenizer covering two real vocab shapes, dispatched
 //! on `tokenizer.ggml.model`:
 //!
-//! - **`"gpt2"`** (every Llama3/Qwen2/Qwen3/Mistral/qwen35moe GGUF): the
+//! - **`"gpt2"`** (every Llama3/Qwen2/Qwen3/Mistral/qwen35moe/qwen3next GGUF): the
 //!   classic byte-level scheme — every byte maps to a printable-unicode
 //!   alphabet (`byte_to_unicode_table`) before merges run, so a leading
 //!   space rides along inside a token like `"Ġcapital"`.
@@ -123,6 +123,19 @@ const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\
 const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
 
 /// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_CHATGLM4` — GLM-4 and GLM-5 family vocabs,
+/// including `glm-dsa` (GLM-5.2).
+///
+/// The split pattern is *character-identical* to
+/// [`SPLIT_PATTERN_LLAMA3`]'s, so this shares that constant rather than
+/// repeating it. What it does **not** share is `ignore_merges`: upstream
+/// sets that flag on its llama3 arm and not on this one, so a GLM vocab
+/// runs the ordinary BPE merge loop over every pre-token, including ones
+/// that happen to be whole vocab entries. It also clears `special_bos_id`
+/// — see [`Tokenizer::open`]'s own handling.
+const CHATGLM4_PRE_TYPES: &[&str] = &["glm4", "chatglm-bpe"];
+
+/// `tokenizer.ggml.pre` values upstream routes to
 /// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` (its own list, verbatim). Every one of
 /// them also sets `ignore_merges`.
 const LLAMA3_PRE_TYPES: &[&str] = &[
@@ -144,6 +157,10 @@ const LLAMA3_PRE_TYPES: &[&str] = &[
 fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     if LLAMA3_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_LLAMA3, true);
+    }
+    if CHATGLM4_PRE_TYPES.contains(&pre) {
+        // Same pattern, deliberately without `ignore_merges`.
+        return (SPLIT_PATTERN_LLAMA3, false);
     }
     if pre == "gpt-4o" {
         return (SPLIT_PATTERN_GPT4O, false);
@@ -242,7 +259,7 @@ pub struct Tokenizer {
 /// model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VocabKind {
-    /// `"gpt2"` (Llama3/Qwen2/Qwen3/Mistral/qwen35moe): byte-to-unicode
+    /// `"gpt2"` (Llama3/Qwen2/Qwen3/Mistral/qwen35moe/qwen3next): byte-to-unicode
     /// alphabet, GPT-2's own pre-tokenizer regex, merge-rank BPE.
     Gpt2Byte,
     /// `"gemma4"`: raw UTF-8 codepoints, `▁`-space-escaping, newline-only
@@ -398,7 +415,15 @@ impl Tokenizer {
             .map(|(b, &c)| (c, b as u8))
             .collect();
 
-        let bos_token = metadata_u32(gguf, "tokenizer.ggml.bos_token_id");
+        // GLM vocabs declare a BOS token id and then upstream throws it
+        // away (`special_bos_id = LLAMA_TOKEN_NULL` on its `glm4` arm), so
+        // nothing ever prepends it. Honoring the declared id instead would
+        // put a token in front of every prompt that the model never saw
+        // there during training.
+        let bos_token = metadata_string(gguf, "tokenizer.ggml.pre")
+            .is_none_or(|pre| !CHATGLM4_PRE_TYPES.contains(&pre.as_str()))
+            .then(|| metadata_u32(gguf, "tokenizer.ggml.bos_token_id"))
+            .flatten();
         let eos_token = metadata_u32(gguf, "tokenizer.ggml.eos_token_id");
         let eot_token = metadata_u32(gguf, "tokenizer.ggml.eot_token_id");
         let add_eos_token = metadata_u32(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(0) != 0;
@@ -1183,6 +1208,22 @@ mod tests {
         tokens.push("hi".to_string());
         let owned_tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
         build_gguf(&owned_tokens, &["h i"], 1, 2)
+    }
+
+    /// GLM vocabs share llama3's split pattern but not its
+    /// `ignore_merges`, and drop the BOS token entirely.
+    #[test]
+    fn the_glm_pre_tokenizer_shares_llama3s_pattern_without_ignore_merges() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("glm4");
+        assert_eq!(pattern, super::SPLIT_PATTERN_LLAMA3);
+        assert!(!ignore_merges);
+
+        let (llama3_pattern, llama3_ignore) = super::split_pattern_for_pre("llama3");
+        assert_eq!(llama3_pattern, pattern);
+        assert!(llama3_ignore);
+
+        // Anything unknown still falls back to the generic pattern.
+        assert_eq!(super::split_pattern_for_pre("gpt2").0, super::SPLIT_PATTERN);
     }
 
     #[test]
