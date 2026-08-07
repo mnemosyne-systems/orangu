@@ -38,7 +38,7 @@ jobs:
             echo "  $src → $out"
           done <<'PAGES'
           01-introduction.md:introduction.html:Introduction
-          03-quickstart.md:quickstart.html:Quick Start
+          03-getting_started.md:getting_started.html:Getting Started
           20-configuration.md:configuration.html:Configuration
           31-workspaces.md:workspaces.html:Workspaces
           32-skills.md:skills.html:Skills

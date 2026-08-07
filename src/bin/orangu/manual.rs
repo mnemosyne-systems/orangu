@@ -47,7 +47,7 @@ use super::render::{ANSI_FG_CODE, render_markdown_for_console};
 /// (`00-frontpage.md`) carries no readable text and is left out.
 const MANUAL_SOURCES: &[&str] = &[
     include_str!("../../../doc/manual/en/01-introduction.md"),
-    include_str!("../../../doc/manual/en/03-quickstart.md"),
+    include_str!("../../../doc/manual/en/03-getting_started.md"),
     include_str!("../../../doc/manual/en/20-configuration.md"),
     include_str!("../../../doc/manual/en/30-tools.md"),
     include_str!("../../../doc/manual/en/31-workspaces.md"),

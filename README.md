@@ -369,7 +369,7 @@ Useful first commands:
 - [Getting Started](https://github.com/mnemosyne-systems/orangu/blob/main/doc/GETTING_STARTED.md)
 - [orangu-coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/COORDINATOR.md) — auto-start/stop orangu-server for machines that only run one local model at a time
 - [orangu-server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/SERVER.md) — a native, pure-Rust GGUF inference server with an OpenAI-compatible API, plus CPU/GPU hardware detection and local GGUF model inventory
-- [Quick start](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/03-quickstart.md)
+- [Getting started](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/03-getting_started.md)
 - [Configuration](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/20-configuration.md)
 - [Tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/30-tools.md)
 - [Workspaces](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/31-workspaces.md)
