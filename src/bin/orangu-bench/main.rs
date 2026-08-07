@@ -62,28 +62,31 @@ mod web;
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
 #[derive(Parser, Debug)]
-#[command(name = "orangu-bench", version, about)]
+#[command(
+    name = "orangu-bench",
+    version = orangu::build_info::VERSION,
+    about = "Measure throughput of an OpenAI-compatible server"
+)]
 struct Args {
     /// Base URL of the server.
-    #[arg(long, default_value = "http://127.0.0.1:8100")]
+    #[arg(long, default_value = "http://127.0.0.1:8100", value_name = "URL")]
     url: String,
 
     /// Comma-separated context depths to sweep. Ranges too: `0-2048+512`.
-    #[arg(long = "depths", default_value = "0", value_delimiter = ',')]
+    #[arg(
+        long = "depths",
+        default_value = "0",
+        value_delimiter = ',',
+        value_name = "LIST"
+    )]
     depths_spec: Vec<String>,
 
     /// [`Args::depths_spec`] expanded — see [`Args::expand_lists`].
     #[arg(skip)]
     depths: Vec<u32>,
 
-    /// Prefill mode: comma-separated prompt lengths (in tokens) to sweep,
-    /// reporting **prompt-processing** throughput instead of the decode sweep
-    /// — the standard `pp` test to the default `tg`. Rates come from the
-    /// server's own `timings`, so the token count is exact rather than
-    /// inferred from the requested length, and the reported cache hit makes a
-    /// prompt that was never actually processed impossible to mistake for a
-    /// fast one.
-    #[arg(long = "pp", value_delimiter = ',')]
+    /// Prefill mode: prompt lengths to sweep, reporting prompt-processing rate.
+    #[arg(long = "pp", value_delimiter = ',', value_name = "LIST")]
     pp_spec: Vec<String>,
 
     /// [`Args::pp_spec`] expanded — see [`Args::expand_lists`].
@@ -91,18 +94,15 @@ struct Args {
     pp: Vec<u32>,
 
     /// Continuation-prefill mode: comma-separated *added* token counts to sweep.
-    #[arg(long = "pp-continue", value_delimiter = ',')]
+    #[arg(long = "pp-continue", value_delimiter = ',', value_name = "LIST")]
     pp_continue_spec: Vec<String>,
 
     /// [`Args::pp_continue_spec`] expanded — see [`Args::expand_lists`].
     #[arg(skip)]
     pp_continue: Vec<u32>,
 
-    /// Combined mode: comma-separated prompt lengths, each prefilled **and**
-    /// generated from in one request, reporting `(prompt + generated) / total`
-    /// — the whole turn, which is what a user waits for and what most
-    /// third-party comparisons quote. The generated length is `--gen`.
-    #[arg(long = "pg", value_delimiter = ',')]
+    /// Combined mode: prompt lengths prefilled and generated in one request.
+    #[arg(long = "pg", value_delimiter = ',', value_name = "LIST")]
     pg_spec: Vec<String>,
 
     /// [`Args::pg_spec`] expanded — see [`Args::expand_lists`].
@@ -114,7 +114,7 @@ struct Args {
     decode_cpu: bool,
 
     /// Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s.
-    #[arg(long = "streams", value_delimiter = ',')]
+    #[arg(long = "streams", value_delimiter = ',', value_name = "LIST")]
     streams_spec: Vec<String>,
 
     /// [`Args::streams_spec`] expanded — see [`Args::expand_lists`].
@@ -122,22 +122,11 @@ struct Args {
     streams: Vec<u32>,
 
     /// Prompt length (tokens) to prime the prefix cache with for `--pp-continue`.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 512, value_name = "N")]
     pp_continue_base: u32,
 
-    /// Embedding mode: comma-separated prompt lengths (in tokens) to sweep
-    /// against `POST /v1/embeddings`, reporting **forward-pass** throughput —
-    /// the embedding-model equivalent of `--pp`, and the only mode that works
-    /// on an embedding-only server at all.
-    ///
-    /// Such a server answers `/v1/completions` with HTTP 501, so both the
-    /// default decode sweep and `--pp` fail outright on it: `embeddinggemma-
-    /// 300M` is a supported, working model that this tool simply could not
-    /// measure. Rates come from the response's `usage.prompt_tokens` — which
-    /// every conformant server reports — so the token count is
-    /// the one the forward pass actually ran, not an estimate from the prompt
-    /// text.
-    #[arg(long = "embed", value_delimiter = ',')]
+    /// Embedding mode: prompt lengths to sweep against /v1/embeddings.
+    #[arg(long = "embed", value_delimiter = ',', value_name = "LIST")]
     embed_spec: Vec<String>,
 
     /// [`Args::embed_spec`] expanded — see [`Args::expand_lists`].
@@ -145,22 +134,19 @@ struct Args {
     embed: Vec<u32>,
 
     /// Number of tokens to generate per timed run.
-    #[arg(long = "gen", default_value_t = 128)]
+    #[arg(long = "gen", default_value_t = 128, value_name = "N")]
     n_gen: u32,
 
-    /// Curve mode: instead of the depth sweep, do ONE generation of this many
-    /// tokens and report the instantaneous decode rate bucketed by context
-    /// position. Measures decode-vs-context scaling without the slow, VRAM-heavy
-    /// deep-context prefill the depth sweep needs. `0` disables it.
-    #[arg(long, default_value_t = 0)]
+    /// Curve mode: one generation of this many tokens, bucketed by context; 0 disables.
+    #[arg(long, default_value_t = 0, value_name = "N")]
     curve: u32,
 
     /// Bucket width (in context tokens) for `--curve`.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 256, value_name = "N")]
     bucket: u32,
 
     /// Repetitions per depth; the reported rate is the best run with mean±sd.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, value_name = "N")]
     reps: u32,
 
     /// Skip the initial warmup run.
@@ -168,11 +154,11 @@ struct Args {
     no_warmup: bool,
 
     /// Per-request timeout in seconds.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 600, value_name = "SECONDS")]
     timeout: u64,
 
     /// Model id to request.
-    #[arg(long)]
+    #[arg(long, value_name = "ID")]
     model: Option<String>,
 
     /// Emit machine-readable JSON.
@@ -180,15 +166,15 @@ struct Args {
     json: bool,
 
     /// Append each measured point to this tab-separated history file.
-    #[arg(long)]
+    #[arg(long, value_name = "PATH")]
     history: Option<String>,
 
     /// Series name recorded in the history file (defaults to the server's model).
-    #[arg(long)]
+    #[arg(long, value_name = "NAME")]
     label: Option<String>,
 
     /// Render the history file to this SVG after measuring.
-    #[arg(long)]
+    #[arg(long, value_name = "PATH")]
     chart: Option<String>,
 
     /// Only render the chart from an existing history file; measure nothing.
@@ -200,31 +186,31 @@ struct Args {
     chart_png: bool,
 
     /// Pin the chart's tok/s axis to `MIN:MAX` so a pair of charts compare.
-    #[arg(long)]
+    #[arg(long, value_name = "MIN:MAX")]
     chart_scale: Option<String>,
 
     /// Label for the chart's y-axis.
-    #[arg(long, default_value = "tok/s (log)")]
+    #[arg(long, default_value = "tok/s (log)", value_name = "TEXT")]
     chart_y_label: String,
 
     /// Label for the chart's x-axis.
-    #[arg(long)]
+    #[arg(long, value_name = "TEXT")]
     chart_x_label: Option<String>,
 
     /// Record a CPU flamegraph of the server over the measured window.
-    #[arg(long)]
+    #[arg(long, value_name = "PATH")]
     flamegraph: Option<String>,
 
     /// Process to profile (default: the server's own, else the URL port's owner).
-    #[arg(long)]
+    #[arg(long, value_name = "PID")]
     flamegraph_pid: Option<u32>,
 
     /// Sampling frequency in Hz for `--flamegraph`.
-    #[arg(long, default_value_t = 999)]
+    #[arg(long, default_value_t = 999, value_name = "HZ")]
     flamegraph_freq: u32,
 
     /// Call-graph mode for `--flamegraph`: `fp` or `dwarf`.
-    #[arg(long, default_value = "fp")]
+    #[arg(long, default_value = "fp", value_name = "MODE")]
     flamegraph_call_graph: String,
 
     /// Also render a PNG beside the flamegraph SVG.
@@ -232,62 +218,55 @@ struct Args {
     flamegraph_png: bool,
 
     /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', value_name = "LIST")]
     compare_profiles: Vec<String>,
 
-    /// Write the whole run — measurements, server configuration, host — to one
-    /// JSON file to carry off this machine.
-    #[arg(long)]
+    /// Write the whole run — measurements, configuration, host — to one JSON file.
+    #[arg(long, value_name = "PATH")]
     bundle: Option<String>,
 
     /// Read bundles and report them side by side; measure nothing.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', value_name = "LIST")]
     read_bundle: Vec<String>,
 
-    /// Sweep one tuning variable: `VAR=v1,v2,...`, restarting the server per
-    /// value. Needs `--sweep-cmd`.
-    #[arg(long)]
+    /// Sweep one tuning variable: `VAR=v1,v2,...`; needs `--sweep-cmd`.
+    #[arg(long, value_name = "SPEC")]
     sweep: Option<String>,
 
     /// Shell command that starts the server, run once per `--sweep` value.
-    #[arg(long)]
+    #[arg(long, value_name = "CMD")]
     sweep_cmd: Option<String>,
 
     /// Environment held constant across every `--sweep` point (repeatable).
-    #[arg(long = "sweep-env")]
+    #[arg(long = "sweep-env", value_name = "K=V")]
     sweep_env: Vec<String>,
 
     /// Seconds to wait for a swept server to come up.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
     sweep_start_timeout: u64,
 
-    /// Re-render an already-collapsed `.folded` profile to SVG; measure
-    /// nothing. Writes beside the input unless `--flamegraph` names an output.
-    /// Combine with `--flamegraph-png` to add the PNG a run could not produce
-    /// because no rasterizer was installed at the time.
-    #[arg(long)]
+    /// Re-render an already-collapsed `.folded` profile to SVG; measure nothing.
+    #[arg(long, value_name = "PATH")]
     render_profile: Option<String>,
 
-    /// Write the run — provenance, measurements, chart and flamegraph — to
-    /// one PDF.
-    #[arg(long)]
+    /// Write the run — provenance, measurements, chart, flamegraph — to one PDF.
+    #[arg(long, value_name = "PATH")]
     report: Option<String>,
 
-    /// Serve the web console instead of measuring: define runs in a browser
-    /// and read back the summary table, the flamegraph and the chart.
+    /// Serve the web console instead of measuring.
     #[arg(long, default_value_t = false)]
     web: bool,
 
     /// Address the web console binds: "all" (or "*") for every interface.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
     host: String,
 
     /// Port the web console listens on.
-    #[arg(long, default_value_t = 8300)]
+    #[arg(long, default_value_t = 8300, value_name = "PORT")]
     port: u16,
 
     /// Seconds to wait between measured points, for a card that heats up.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     delay: u64,
 }
 

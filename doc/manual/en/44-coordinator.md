@@ -144,6 +144,8 @@ omitted once it's in place.
   silently. There is no PID file: find the process with `pgrep -f
   orangu-coordinator` and stop it with `kill -INT <pid>` for the same
   graceful shutdown `Ctrl+C` triggers in the foreground.
+- `-h`/`--help` and `-V`/`--version` are also available, as on every orangu
+  binary.
 
 Running in the foreground (not `--daemon`) sets the terminal window/tab
 title to `orangu-coordinator` for the life of the process, same as `orangu`

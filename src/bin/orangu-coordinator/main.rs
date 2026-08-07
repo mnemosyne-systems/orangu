@@ -66,7 +66,11 @@ impl Drop for TerminalTitleGuard {
 }
 
 #[derive(Parser, Debug)]
-#[command(version = VERSION)]
+#[command(
+    name = "orangu-coordinator",
+    version = VERSION,
+    about = "Start orangu-server instances on demand and route to them"
+)]
 struct Args {
     /// Path to orangu-coordinator.conf. Defaults to ./orangu-coordinator.conf,
     /// then ~/.orangu/orangu-coordinator.conf.

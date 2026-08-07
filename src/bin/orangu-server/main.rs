@@ -223,9 +223,12 @@ impl ListenFlags {
 
 #[derive(Parser, Debug)]
 #[command(
+    name = "orangu-server",
     version = VERSION,
     about = "Serve a GGUF model over a llama.cpp-compatible HTTP API",
-    long_about = "Serve a GGUF model over a llama.cpp-compatible HTTP API."
+    // Without this, `--help` promotes the `Command` enum's doc comment — an
+    // internal note about subcommand parsing — into the top-level long help.
+    long_about = None
 )]
 struct Args {
     /// A local .gguf path, an NR/MODEL label already under the configured

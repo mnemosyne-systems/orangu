@@ -128,6 +128,11 @@ use workspace_tab::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]
+#[command(
+    name = "orangu",
+    version = VERSION,
+    about = "A coding environment for OpenAI-compatible servers"
+)]
 struct Args {
     /// Path to the configuration file; defaults to ./orangu.conf, then
     /// ~/.orangu/orangu.conf.

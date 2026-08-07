@@ -168,7 +168,7 @@ chats there. **New** empties the result pane and lets go of the run it was
 showing — deliberately leaving the form alone, since the next run is almost
 always the last one with one field changed, which is exactly what an A/B arm
 is. It is remembered, so a reload after it comes back to an empty pane rather
-than reopening the newest run; a row's own **✕** does the same for one run.
+than reopening the newest run; a row's own **×** does the same for one run.
 
 **Clear all** deletes every kept run. A run that is still measuring is **not**
 one of them: it is kept, named in the reply, and the console follows it —
@@ -518,47 +518,56 @@ result carries its own provenance.
 `orangu-bench --help`:
 
 ```text
+Measure throughput of an OpenAI-compatible server
+
 Usage: orangu-bench [OPTIONS]
 
 Options:
-      --url <URL>          Base URL of the server [default: http://127.0.0.1:8100]
-      --depths <DEPTHS>    Comma-separated context depths to sweep [default: 0]
-      --pp <PP>            Prefill mode: comma-separated prompt lengths to sweep, reporting prompt-processing throughput
-      --pg <PG>            Combined mode: comma-separated prompt lengths, each prefilled and generated from in one request
-      --pp-continue <LENS> Continuation-prefill mode: comma-separated *added* token counts to sweep
-      --decode-cpu         Report the server's CPU time per generated token, with prefill excluded
-      --streams <N>        Concurrency mode: comma-separated stream counts; reports aggregate tok/s
-      --pp-continue-base <N>  Prompt length (tokens) to prime the prefix cache with for --pp-continue [default: 512]
-      --embed <EMBED>      Embedding mode: comma-separated prompt lengths to sweep against /v1/embeddings
-      --gen <N_GEN>        Number of tokens to generate per timed run [default: 128]
-      --curve <CURVE>      Curve mode: ONE generation of this many tokens, decode rate bucketed by context [default: 0]
-      --bucket <BUCKET>    Bucket width (in context tokens) for --curve [default: 256]
-      --reps <REPS>        Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
-      --no-warmup          Skip the initial warmup run
-      --timeout <TIMEOUT>  Per-request timeout in seconds [default: 600]
-      --delay <SECONDS>    Wait between measured points, for a card that heats up [default: 0]
-      --model <MODEL>      Model id to request
-      --json               Emit machine-readable JSON
-      --history <HISTORY>  Append each measured point to this tab-separated history file
-      --label <LABEL>      Series name recorded in the history file
-      --chart <CHART>      Render the history file to this SVG after measuring
-      --chart-only         Only render the chart from an existing history file; measure nothing
-      --chart-png          Also render a PNG beside the chart SVG
-      --chart-scale <MIN:MAX>  Pin the chart's tok/s axis so a pair of charts compare
-      --chart-y-label <TEXT>   Label for the chart's y-axis [default: tok/s (log)]
-      --chart-x-label <TEXT>   Label for the chart's x-axis
-      --flamegraph <FILE>  Record a CPU flamegraph of the server over the measured window
-      --flamegraph-pid <PID>          Process to profile (default: the server's own, else the URL port's owner)
-      --flamegraph-freq <HZ>          Sampling frequency in Hz for --flamegraph [default: 999]
-      --flamegraph-call-graph <MODE>  Call-graph mode for --flamegraph: fp or dwarf [default: fp]
-      --flamegraph-png                Also render a PNG beside the flamegraph SVG
-      --compare-profiles <FILES>      Compare already-collapsed .folded profiles side by side; measure nothing
-      --report <FILE.pdf>  Write the run — provenance, measurements, chart and flamegraph — to one PDF
-      --web                Serve the web console instead of measuring
-      --host <HOST>        Address the web console binds: "all" (or "*") for every interface [default: 127.0.0.1]
-      --port <PORT>        Port the web console listens on [default: 8300]
-  -h, --help               Print help
-  -V, --version            Print version
+      --url <URL>                      Base URL of the server [default: http://127.0.0.1:8100]
+      --depths <LIST>                  Comma-separated context depths to sweep. Ranges too: `0-2048+512` [default: 0]
+      --pp <LIST>                      Prefill mode: prompt lengths to sweep, reporting prompt-processing rate
+      --pp-continue <LIST>             Continuation-prefill mode: comma-separated *added* token counts to sweep
+      --pg <LIST>                      Combined mode: prompt lengths prefilled and generated in one request
+      --decode-cpu                     Report the server's CPU time per generated token, with prefill excluded
+      --streams <LIST>                 Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s
+      --pp-continue-base <N>           Prompt length (tokens) to prime the prefix cache with for `--pp-continue` [default: 512]
+      --embed <LIST>                   Embedding mode: prompt lengths to sweep against /v1/embeddings
+      --gen <N>                        Number of tokens to generate per timed run [default: 128]
+      --curve <N>                      Curve mode: one generation of this many tokens, bucketed by context; 0 disables [default: 0]
+      --bucket <N>                     Bucket width (in context tokens) for `--curve` [default: 256]
+      --reps <N>                       Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
+      --no-warmup                      Skip the initial warmup run
+      --timeout <SECONDS>              Per-request timeout in seconds [default: 600]
+      --model <ID>                     Model id to request
+      --json                           Emit machine-readable JSON
+      --history <PATH>                 Append each measured point to this tab-separated history file
+      --label <NAME>                   Series name recorded in the history file (defaults to the server's model)
+      --chart <PATH>                   Render the history file to this SVG after measuring
+      --chart-only                     Only render the chart from an existing history file; measure nothing
+      --chart-png                      Also render a PNG beside the chart SVG
+      --chart-scale <MIN:MAX>          Pin the chart's tok/s axis to `MIN:MAX` so a pair of charts compare
+      --chart-y-label <TEXT>           Label for the chart's y-axis [default: "tok/s (log)"]
+      --chart-x-label <TEXT>           Label for the chart's x-axis
+      --flamegraph <PATH>              Record a CPU flamegraph of the server over the measured window
+      --flamegraph-pid <PID>           Process to profile (default: the server's own, else the URL port's owner)
+      --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]
+      --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `fp` or `dwarf` [default: fp]
+      --flamegraph-png                 Also render a PNG beside the flamegraph SVG
+      --compare-profiles <LIST>        Compare already-collapsed `.folded` profiles side by side; measure nothing
+      --bundle <PATH>                  Write the whole run — measurements, configuration, host — to one JSON file
+      --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
+      --sweep <SPEC>                   Sweep one tuning variable: `VAR=v1,v2,...`; needs `--sweep-cmd`
+      --sweep-cmd <CMD>                Shell command that starts the server, run once per `--sweep` value
+      --sweep-env <K=V>                Environment held constant across every `--sweep` point (repeatable)
+      --sweep-start-timeout <SECONDS>  Seconds to wait for a swept server to come up [default: 300]
+      --render-profile <PATH>          Re-render an already-collapsed `.folded` profile to SVG; measure nothing
+      --report <PATH>                  Write the run — provenance, measurements, chart, flamegraph — to one PDF
+      --web                            Serve the web console instead of measuring
+      --host <HOST>                    Address the web console binds: "all" (or "*") for every interface [default: 127.0.0.1]
+      --port <PORT>                    Port the web console listens on [default: 8300]
+      --delay <SECONDS>                Seconds to wait between measured points, for a card that heats up [default: 0]
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
@@ -590,7 +599,7 @@ the printed one is the comparable one.
 
 The **headline is still the best run**, not the mean, in the table, the report
 and the history file. A best is always the flattering statistic, so the PDF
-report says so on the page and the console's table heads its column `± sd (n−1)`
+report says so on the page and the console's table heads its column `± sd (n-1)`
 for the same reason.
 
 ### Profiling what was measured (`--flamegraph`)
@@ -636,6 +645,20 @@ Three files come out of one `--flamegraph out.svg`:
 The transient `perf.data` is removed once collapsed: it is the largest artifact
 by an order of magnitude and nothing downstream reads it. The `.folded` file is
 the durable one.
+
+Because it is durable, the SVG can be rebuilt from it at any time without
+measuring again:
+
+```sh
+orangu-bench --render-profile out.folded
+orangu-bench --render-profile out.folded --flamegraph new.svg
+orangu-bench --render-profile out.folded --flamegraph-png
+```
+
+`--render-profile` measures nothing. It writes beside its input unless
+`--flamegraph` names an output, and combining it with `--flamegraph-png` adds
+the PNG a run could not produce at the time because no rasterizer was
+installed.
 
 Beside the files the tool prints what the stacks say, so the common case needs
 no SVG viewer at all:

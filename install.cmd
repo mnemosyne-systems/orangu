@@ -13,7 +13,7 @@
 ::
 :: You should have received a copy of the GNU General Public License
 :: along with this program. If not, see <https://www.gnu.org/licenses/>.
-:: Usage: curl -fsSL https://raw.githubusercontent.com/mnemosyne-systems/orangu/main/install.cmd -o install.cmd && install.cmd
+:: Usage: curl -fsSL https://mnemosyne-systems.github.io/orangu/install.cmd -o install.cmd && install.cmd
 :: Override install directory: set "INSTALL_DIR=C:\Tools" && install.cmd
 setlocal EnableDelayedExpansion
 
@@ -41,15 +41,16 @@ powershell -NoProfile -NonInteractive -Command ^
 powershell -NoProfile -NonInteractive -Command ^
     "$ErrorActionPreference='Stop'; Expand-Archive -Path '!TMP!\!ASSET!' -DestinationPath '!TMP!\out' -Force" || ^
     (echo error: could not extract archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
-:: The whole stack: the editor plus the coordinator and inference server.
-for %%b in (orangu orangu-coordinator orangu-server) do if not exist "!TMP!\out\%%b.exe" (echo error: %%b.exe not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
+:: The whole stack: the editor plus the coordinator, the inference server and
+:: the benchmarking tool — every executable the release archive carries.
+for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do if not exist "!TMP!\out\%%b.exe" (echo error: %%b.exe not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 if not exist "!INSTALL_DIR!" mkdir "!INSTALL_DIR!"
-for %%b in (orangu orangu-coordinator orangu-server) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
+for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 rd /s /q "!TMP!" >nul 2>&1
 echo Installed the orangu stack to !INSTALL_DIR!:
-echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe
+echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe  orangu-bench.exe
 echo Run "orangu --help" to get started.
 echo Run "orangu -s" and add the output to your PowerShell $PROFILE for completions.
 endlocal
