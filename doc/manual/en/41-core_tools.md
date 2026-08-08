@@ -62,7 +62,7 @@ Invoke the bundled debugging skill:
 
 ## /tools
 
-Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`, `create_file`, `modify_file`, `move_file`, `delete_file`, `create_directory`, `move_directory`, `delete_directory`), plus `list_directory`, `fetch_url`, and `run_shell_command` — that the active model may call. These are the tools described in the Tools chapter and are distinct from the local slash commands documented here.
+Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`, `create_file`, `modify_file`, `move_file`, `delete_file`, `create_directory`, `move_directory`, `delete_directory`), plus `list_directory`, `fetch_url`, and `run_shell_command` — and any connected MCP tools, named `mcp__<server>__<tool>`, that the active model may call. These are the tools described in the Tools chapter and are distinct from the local slash commands documented here.
 
 `/tools` is purely informational: it shows what the model is able to do in the current workspace, not what you can type at the prompt. In particular it is separate from the local `/list_files` convenience command.
 
@@ -71,6 +71,16 @@ Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`
 ```text
 /tools
 ```
+
+## /mcp
+
+Shows configured MCP servers for the active workspace, including whether each
+server is connected, disabled, or failed during startup and how many tools it
+exposed. Use it to diagnose a missing `mcp__<server>__<tool>` entry in `/tools`.
+
+`/mcp refresh` reconnects configured servers and re-discovers their tools.
+`/mcp add <name> <command> [args…]` writes a minimal `[mcp.<name>]` profile to
+the active config and refreshes it; `/mcp remove <name>` removes that profile.
 
 Natural-language forms:
 

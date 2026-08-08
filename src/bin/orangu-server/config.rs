@@ -18,7 +18,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use orangu::config::parse_ini_sections;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 pub const SERVER_SECTION: &str = "orangu-server";
 
@@ -161,6 +164,7 @@ pub fn bundled_configuration(
         reexec: default_reexec(),
         role_key: Some(role),
         role,
+        mcp_servers: Vec::new(),
     }
 }
 
@@ -398,6 +402,17 @@ pub struct ServerConfiguration {
     /// reasoning as `model`: no attached terminal to pass a CLI flag to),
     /// the config file's own `role` key; or, failing both, [`Role::All`].
     pub role: Role,
+    /// Read-only HTTP MCP profiles exposed by the web console. Changing this
+    /// list requires restarting `orangu-server`.
+    pub mcp_servers: Vec<McpConfiguration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct McpConfiguration {
+    pub name: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub approval_mode: String,
 }
 
 /// Expands a leading `~` or `~/` to the user's home directory — a config
@@ -572,6 +587,12 @@ pub fn load_server_configuration(
         None => default_backend(),
     };
 
+    let mut mcp_servers = sections
+        .into_iter()
+        .map(|(name, values)| parse_mcp_configuration(name, values))
+        .collect::<Result<Vec<_>>>()?;
+    mcp_servers.sort_by(|left, right| left.name.cmp(&right.name));
+
     Ok(ServerConfiguration {
         models: expand_tilde(&models),
         host,
@@ -586,6 +607,34 @@ pub fn load_server_configuration(
         backend,
         reexec,
         delete,
+        mcp_servers,
+    })
+}
+
+fn parse_mcp_configuration(
+    name: String,
+    values: HashMap<String, String>,
+) -> Result<McpConfiguration> {
+    let endpoint = values
+        .get("endpoint")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("[{name}].endpoint must be set for an MCP server"))?;
+    let enabled = values
+        .get("enabled")
+        .map(|value| parse_bool(&name, "enabled", value))
+        .transpose()?
+        .unwrap_or(true);
+    let approval_mode = values
+        .get("approval_mode")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "writes".to_string());
+    Ok(McpConfiguration {
+        name,
+        endpoint,
+        enabled,
+        approval_mode,
     })
 }
 

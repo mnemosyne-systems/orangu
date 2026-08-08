@@ -959,8 +959,16 @@ pub(crate) async fn run_review_request(
     print_screen_fn: &mut impl FnMut(ReviewScreenArgs<'_>),
 ) -> Result<ReviewRequestOutcome> {
     let checkpoint = session.checkpoint();
-    let mut future =
-        Box::pin(session.prompt(prompt, profile, tools, |_| {}, |_| {}, |_| {}, |_| {}));
+    let mut future = Box::pin(session.prompt(
+        prompt,
+        profile,
+        tools,
+        |_| {},
+        |_| {},
+        |_| {},
+        |_| {},
+        |_| false,
+    ));
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let started = std::time::Instant::now();
     let mut escape_cancel = EscapeCancelState::default();

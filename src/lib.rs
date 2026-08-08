@@ -31,6 +31,7 @@ pub mod git_index;
 pub mod graph;
 pub mod hardware;
 pub mod llm;
+pub mod mcp;
 pub mod model_download;
 pub mod model_spec;
 pub mod os;

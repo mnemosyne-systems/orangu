@@ -298,3 +298,27 @@ doc/etc/orangu.conf
 ```
 
 It ships with `orangu-server` sections and a 30-minute timeout suitable for local tool-calling workloads.
+
+## MCP servers
+
+When `[orangu-server]` or `[web]` is present, all remaining sections describe
+already-running Streamable HTTP MCP services. The endpoint normally ends in
+`/mcp`. Existing configurations can use `mcp = true` to identify an MCP section.
+
+`timeout` sets the default for initialization, discovery, and tool calls;
+`startup_timeout` and `tool_timeout` set those limits separately. `enabled = off`
+keeps a service unavailable, while `required = on` makes a failed connection
+abort workspace startup. `enabled_tools` and `disabled_tools` accept
+comma-separated tool names (the denylist wins).
+
+`approval_mode` controls MCP execution: `auto` runs tools directly, `prompt`
+asks for each call, `writes` asks unless the MCP tool declares `readOnlyHint`,
+and `deny` disables the service. In the interactive terminal,
+answer an approval with `y` or `n`; noninteractive and review runs deny calls
+that require confirmation.
+
+orangu connects to configured MCP services; it does not launch or manage MCP
+processes. A failed service is disabled with a warning while the rest of the
+session continues. MCP support is tools-only: resources, prompts, sampling,
+elicitation, and tasks are deferred. Use `/mcp refresh` to rediscover tools
+after a service changes them; an interrupted connection is retried once.
