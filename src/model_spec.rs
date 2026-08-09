@@ -1226,6 +1226,11 @@ mod tests {
             .unwrap();
     }
 
+    /// A hub-cache layout: the blob under `blobs/<oid>`, named by a symlink
+    /// under `snapshots/<rev>/`. The oid a row's local commit is read from is
+    /// the symlink's target name, so every test built on this fixture — and
+    /// the fixture itself — is unix-only.
+    #[cfg(unix)]
     fn write_cached_minimal_gguf(snapshot_path: &Path, architecture: &str, oid: &str) {
         let repo_root = snapshot_path
             .ancestors()
@@ -1827,6 +1832,7 @@ mod tests {
         assert_eq!(groups[0].local_commit, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_groups_marks_a_row_whose_local_commit_is_behind() {
         let dir = tempfile::tempdir().unwrap();
@@ -1862,6 +1868,7 @@ mod tests {
         assert!(!lines.next().unwrap().contains("(Refresh)"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_groups_does_not_mark_a_row_already_at_the_latest_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -1894,6 +1901,7 @@ mod tests {
         assert!(!output.lines().nth(1).unwrap().contains("(Refresh)"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_groups_does_not_mark_a_row_when_only_the_repo_commit_changed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1928,6 +1936,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_groups_only_marks_the_row_actually_behind_when_a_repo_has_two_local_commits() {
         // Two `:quant` rows of the same repo, cached at different commits —
@@ -1987,6 +1996,7 @@ mod tests {
 
     /// The marker is one space off the column before it, like every other
     /// column separator on the row — not the two it was first written with.
+    #[cfg(unix)]
     #[test]
     fn the_refresh_marker_is_one_space_off_the_preceding_column() {
         let dir = tempfile::tempdir().unwrap();
@@ -2023,6 +2033,7 @@ mod tests {
 
     /// `refresh`'s table: the rows worth acting on stay plain, everything
     /// already current is greyed — the inverse of what `list` greys.
+    #[cfg(unix)]
     #[test]
     fn up_to_date_dimming_greys_every_row_that_is_not_behind() {
         let dir = tempfile::tempdir().unwrap();

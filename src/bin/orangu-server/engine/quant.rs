@@ -452,12 +452,10 @@ fn dequantize_mxfp4(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     for block in bytes.chunks_exact(BLOCK_BYTES) {
         let d = e8m0_to_fp32_half(block[0]);
         let qs = &block[1..];
-        for j in 0..QK_MXFP4 / 2 {
-            let q = qs[j];
+        for &q in qs.iter().take(QK_MXFP4 / 2) {
             out.push(KVALUES_MXFP4[(q & 0x0F) as usize] as f32 * d);
         }
-        for j in 0..QK_MXFP4 / 2 {
-            let q = qs[j];
+        for &q in qs.iter().take(QK_MXFP4 / 2) {
             out.push(KVALUES_MXFP4[(q >> 4) as usize] as f32 * d);
         }
     }

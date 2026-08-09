@@ -130,7 +130,7 @@ impl Qwen3NextModel {
             "ssm.time_step_rank and ssm.group_count must be nonzero"
         );
         anyhow::ensure!(
-            ssm_dt_rank % ssm_n_group == 0,
+            ssm_dt_rank.is_multiple_of(ssm_n_group),
             "ssm.time_step_rank {ssm_dt_rank} must be a multiple of ssm.group_count {ssm_n_group}"
         );
         anyhow::ensure!(
