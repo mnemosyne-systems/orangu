@@ -32,16 +32,16 @@ path = "src/bin/orangu-bench/main.rs"
 anyhow = "1.0.104"
 arboard = { version = "3.6.1", default-features = false }
 axum = "0.8.9"
-clap = { version = "4.6.5", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
 home = "0.5.12"
 html2text = "0.17.1"
-ignore = "0.4.31"
+ignore = "0.4.33"
 markdown = "1.0.0"
 merman = { version = "0.7.0", features = ["render"] }
 printpdf = { version = "0.12.5", default-features = false, features = ["text_layout", "png"] }
 regex = "1.13"
-rmcp = { version = "3.1.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 rustc-hash = "2.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 rustyline = "18.0.1"
@@ -60,7 +60,7 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2.5.0"
 infer = "0.22.0"
 mime_guess = "2.0.5"
-base64 = "0.23.0"
+base64 = "0.23.1"
 pdf-extract = "0.12.0"
 calamine = "0.36.1"
 zip = "8.6.0"
@@ -82,7 +82,7 @@ tree-sitter-swift = "0.7"
 tree-sitter-dart = "0.2"
 tree-sitter-erlang = "0.20"
 petgraph = "0.8.3"
-tree-sitter = "0.26.11"
+tree-sitter = "0.26.12"
 tree-sitter-rust = "0.24.2"
 streaming-iterator = "0.1.9"
 tree-sitter-python = "0.25.0"
