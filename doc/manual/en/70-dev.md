@@ -35,40 +35,30 @@ cargo test
 
 ## Documentation workflow
 
+The manual and the cheat sheet are built by **orangu itself**: the same
+printpdf engine that writes the PDFs `/export` produces draws both documents,
+so they carry the reports' bands, brand colour and embedded Red Hat Text
+without a second toolchain. There is no LaTeX in the project, and no template
+to download. Pandoc is needed only for the HTML manual.
+
 1. Download dependencies
 
-    ``` sh
-    dnf install pandoc texlive-scheme-basic
-    ```
-
-2. Download Eisvogel
-
-    Use the command `pandoc --version` to locate the user data directory. On Fedora systems, this directory is typically located at `$HOME/.local/share/pandoc`.
-
-    Download the `Eisvogel` template for `pandoc`, please visit the [pandoc-latex-template](https://github.com/Wandmalfarbe/pandoc-latex-template) repository. For a standard installation, you can follow the steps outlined below.
-
 ```sh
-    wget https://github.com/Wandmalfarbe/pandoc-latex-template/releases/download/v3.4.0/Eisvogel-3.4.0.tar.gz
-    tar -xzf Eisvogel-3.4.0.tar.gz
-    mkdir -p $HOME/.local/share/pandoc/templates
-    mv Eisvogel-3.4.0/eisvogel.latex $HOME/.local/share/pandoc/templates/
+    dnf install pandoc
 ```
 
-3. Add package for LaTeX
-
-    Download the additional packages required for generating PDF and HTML files.
+2. Build
 
 ```sh
-    dnf install 'tex(footnote.sty)' 'tex(footnotebackref.sty)' 'tex(pagecolor.sty)' 'tex(hardwrap.sty)' 'tex(mdframed.sty)' 'tex(sourcesanspro.sty)' 'tex(ly1enc.def)' 'tex(sourcecodepro.sty)' 'tex(titling.sty)' 'tex(csquotes.sty)' 'tex(zref-abspage.sty)' 'tex(needspace.sty)' 'tex(selnolig.sty)' texlive-collection-latexextra
+./doc/build.sh
 ```
 
-Then
+which will produce a HTML and PDF manual, and the PDF cheat sheet. Pass
+`manual` or `cheatsheet` to build just one of them.
 
-```sh
-./doc/build_manual.sh
-```
-
-which will produce a HTML and PDF manual.
+The sources are `doc/manual/en` (one file per chapter) and
+`doc/cheatsheet/en` (one file per page); both are drawn by
+`src/bin/orangu/docs.rs`.
 
 ## Orangu files
 

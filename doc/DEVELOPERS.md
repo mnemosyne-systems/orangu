@@ -155,11 +155,20 @@ already makes them skip. The dequant fixture skips the same way when absent
 
 ## Documentation workflow
 
-The manual sources live under `doc/manual/en`.
+The manual sources live under `doc/manual/en` (one file per chapter), the cheat
+sheet under `doc/cheatsheet/en` (one file per page). One script builds both:
 
 ```sh
-./doc/build_manual.sh
+./doc/build.sh
 ```
+
+Pass `manual` or `cheatsheet` to build just one. Both PDFs are drawn by
+`src/bin/orangu/docs.rs` through the hidden `--build-manual` /
+`--build-cheatsheet` flags, on the printpdf engine in `src/bin/orangu/export.rs`
+that also writes the `/export` reports — so the documents and the reports share
+their branding by construction, and the project carries no LaTeX. Pandoc is
+still needed for the HTML manual. The cheat sheet is four pages and stays four:
+the build fails when a page's boxes no longer fit.
 
 ## Notes
 

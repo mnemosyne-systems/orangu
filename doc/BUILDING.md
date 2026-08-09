@@ -153,17 +153,32 @@ parity and is covered by the same tests.
 cargo test
 ```
 
-## Manual generation
+## Documentation generation
 
-The project includes a pandoc-based manual layout under `doc/manual/en`.
-
-To build the manual:
+One script builds both documents into `target/doc/`:
 
 ```sh
-./doc/build_manual.sh
+./doc/build.sh
 ```
 
-The script writes HTML and PDF output to `target/doc/`.
+Both PDFs are drawn by **orangu itself** — `src/bin/orangu/docs.rs`, reached
+through the hidden `--build-manual` and `--build-cheatsheet` flags — using the
+same printpdf engine that writes the reports `/export` produces. The bands, the
+brand colour, the embedded Red Hat Text faces and the page geometry all come
+from `src/bin/orangu/export.rs`, so a manual page, a cheat-sheet box and a
+review report are the same document family by construction. There is no LaTeX
+in the project.
+
+* The **manual** from `doc/manual/en`, one file per chapter, as
+  `orangu-en.pdf`: a brand cover, a linked table of contents, numbered
+  headings, real tables, and the architecture images.
+* The **cheat sheet** from `doc/cheatsheet/en`, one file per page, as
+  `orangu-cheatsheet-en.pdf`. The build fails if a page's boxes outgrow it.
+
+Pass `manual` or `cheatsheet` to build just one of them.
+
+`cargo` is the only requirement for the PDFs. Pandoc is still used for the
+HTML manual (`orangu-en.html`), which a PDF engine cannot produce.
 
 ## Example run
 

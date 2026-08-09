@@ -1,6 +1,5 @@
 [orangu]: https://github.com/mnemosyne-systems/orangu
 [Pandoc]: https://pandoc.org/
-[eisvogel]: https://github.com/Wandmalfarbe/pandoc-latex-template
 
 [git_squash]: https://www.git-tower.com/learn/git/faq/git-squash
 [progit]: https://github.com/progit/progit2/releases

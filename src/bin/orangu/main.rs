@@ -18,6 +18,7 @@ mod build;
 mod commands;
 mod completion;
 mod dispatch;
+mod docs;
 mod export;
 mod git;
 mod information;
@@ -167,6 +168,26 @@ struct Args {
     /// Print the shell completion script for the detected shell and exit.
     #[arg(short = 's', long = "shell-completions")]
     shell_completions: bool,
+    /// Build this repository's cheat sheet: the Markdown in DIR (one file per
+    /// page) into the PDF FILE. A development tool for the orangu repository,
+    /// driven by doc/build.sh, not a workspace feature — hence hidden.
+    #[arg(
+        long = "build-cheatsheet",
+        num_args = 2,
+        value_names = ["DIR", "FILE"],
+        hide = true
+    )]
+    build_cheatsheet: Option<Vec<PathBuf>>,
+    /// Build this repository's manual: the Markdown in DIR (one file per
+    /// chapter) into the PDF FILE. A development tool, like
+    /// `--build-cheatsheet`.
+    #[arg(
+        long = "build-manual",
+        num_args = 2,
+        value_names = ["DIR", "FILE"],
+        hide = true
+    )]
+    build_manual: Option<Vec<PathBuf>>,
 }
 
 /// Pick the completion script for a `$SHELL` value. Separate from printing it
@@ -207,7 +228,12 @@ fn print_shell_completions(quiet: bool) -> Result<()> {
 /// saying so beats accepting a flag that does nothing. The rule is about the
 /// flags alone, so it is decided here rather than part-way through `run()`.
 fn quiet_refusal(args: &Args) -> Option<&'static str> {
-    if !args.quiet || args.shell_completions || args.list {
+    if !args.quiet
+        || args.shell_completions
+        || args.list
+        || args.build_cheatsheet.is_some()
+        || args.build_manual.is_some()
+    {
         return None;
     }
     if args.init {
@@ -256,6 +282,30 @@ async fn run() -> Result<()> {
     }
     if args.shell_completions {
         return print_shell_completions(args.quiet);
+    }
+    if let Some(paths) = args.build_cheatsheet.take() {
+        let [source, output] = paths.as_slice() else {
+            return Err(anyhow!(
+                "--build-cheatsheet takes a source directory and an output file"
+            ));
+        };
+        let written = docs::build_cheatsheet(source, output)?;
+        if !args.quiet {
+            println!("{}", written.display());
+        }
+        return Ok(());
+    }
+    if let Some(paths) = args.build_manual.take() {
+        let [source, output] = paths.as_slice() else {
+            return Err(anyhow!(
+                "--build-manual takes a source directory and an output file"
+            ));
+        };
+        let written = docs::build_manual(source, output)?;
+        if !args.quiet {
+            println!("{}", written.display());
+        }
+        return Ok(());
     }
     if args.list {
         let listing = list_all_sessions_output()?;

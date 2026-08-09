@@ -88,8 +88,8 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      # The manual (PDF + HTML), built once by the `manual` job, to bundle into
-      # every binary archive alongside the three executables.
+      # The manual (PDF + HTML) and the cheat sheet, built once by the `manual`
+      # job, to bundle into every binary archive alongside the executables.
       - name: Download manual
         uses: actions/download-artifact@v4
         with:
@@ -102,14 +102,17 @@ jobs:
         run: |
           BINDIR=target/${{ matrix.target }}/release
           ARCHIVE=orangu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-          # Stage the manual next to the binaries so the archive stays flat
-          # (installers expect the executables at the archive root).
-          cp manual-dist/orangu-en.pdf manual-dist/orangu-en.html "$BINDIR"/
+          # Stage the manual and the cheat sheet next to the binaries so the
+          # archive stays flat (installers expect the executables at the
+          # archive root).
+          cp manual-dist/orangu-en.pdf manual-dist/orangu-en.html \
+             manual-dist/orangu-cheatsheet-en.pdf "$BINDIR"/
           # The whole stack: the editor plus the coordinator and inference
-          # server, the benchmarking tool, and the manual in both formats.
+          # server, the benchmarking tool, the manual in both formats, and the
+          # four-page cheat sheet the installers put in ~/.orangu.
           tar -czf "$ARCHIVE" -C "$BINDIR" \
             orangu orangu-coordinator orangu-server orangu-bench \
-            orangu-en.pdf orangu-en.html
+            orangu-en.pdf orangu-en.html orangu-cheatsheet-en.pdf
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -118,16 +121,18 @@ jobs:
         run: |
           $bindir = "target\${{ matrix.target }}\release"
           $archive = "orangu-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Copy-Item manual-dist\orangu-en.pdf,manual-dist\orangu-en.html $bindir
+          Copy-Item manual-dist\orangu-en.pdf,manual-dist\orangu-en.html,manual-dist\orangu-cheatsheet-en.pdf $bindir
           # The whole stack: the editor plus the coordinator and inference
-          # server, the benchmarking tool, and the manual in both formats.
+          # server, the benchmarking tool, the manual in both formats, and the
+          # four-page cheat sheet the installers put in %USERPROFILE%\.orangu.
           $items = @(
             "$bindir\orangu.exe",
             "$bindir\orangu-coordinator.exe",
             "$bindir\orangu-server.exe",
             "$bindir\orangu-bench.exe",
             "$bindir\orangu-en.pdf",
-            "$bindir\orangu-en.html"
+            "$bindir\orangu-en.html",
+            "$bindir\orangu-cheatsheet-en.pdf"
           )
           Compress-Archive -Path $items -DestinationPath $archive
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -145,35 +150,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install pandoc and TeX Live
+      # Both PDFs are drawn by orangu itself, so this job needs a toolchain;
+      # pandoc is left for the HTML manual alone.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      - name: Install pandoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            pandoc \
-            texlive-xetex \
-            texlive-fonts-recommended \
-            texlive-fonts-extra \
-            texlive-plain-generic \
-            texlive-latex-extra \
-            lmodern
+          sudo apt-get install -y pandoc
 
-      - name: Install eisvogel template
-        run: |
-          # The release tarball nests everything under Eisvogel-<version>/, so
-          # strip that component to place eisvogel.latex directly where pandoc's
-          # --template eisvogel looks (the templates data directory).
-          EISVOGEL_VERSION=3.4.0
-          mkdir -p ~/.local/share/pandoc/templates
-          curl -fsSLo /tmp/eisvogel.tar.gz \
-            "https://github.com/Wandmalfarbe/pandoc-latex-template/releases/download/v${EISVOGEL_VERSION}/Eisvogel.tar.gz"
-          tar -xzf /tmp/eisvogel.tar.gz -C ~/.local/share/pandoc/templates --strip-components=1
+      # No LaTeX, and no template to fetch: the PDFs come from orangu's own
+      # engine and the fonts in assets/fonts.
+      - name: Build the manual and the cheat sheet
+        run: bash doc/build.sh
 
-      - name: Build manual
-        run: bash doc/build_manual.sh
-
-      # Share the built manual with the per-target build jobs so each binary
-      # archive can bundle it, without re-installing pandoc/TeX Live on every
-      # matrix OS.
+      # Share the built manual and cheat sheet with the per-target build jobs so
+      # each binary archive can bundle them, without re-installing pandoc/TeX
+      # Live on every matrix OS.
       - name: Upload manual artifact
         uses: actions/upload-artifact@v4
         with:
@@ -181,6 +179,7 @@ jobs:
           path: |
             target/doc/orangu-en.pdf
             target/doc/orangu-en.html
+            target/doc/orangu-cheatsheet-en.pdf
 
       - name: Upload to release
         env:
@@ -189,6 +188,7 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             target/doc/orangu-en.pdf \
             target/doc/orangu-en.html \
+            target/doc/orangu-cheatsheet-en.pdf \
             --clobber
 
   source:

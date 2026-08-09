@@ -47,8 +47,8 @@ use markdown::{
 };
 use printpdf::{
     Actions, BorderArray, BuiltinFont, Color, Destination, Line, LinePoint, LinkAnnotation, Mm, Op,
-    PaintMode, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, Rect,
-    Rgb, TextItem,
+    PaintMode, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt,
+    RawImage, Rect, Rgb, TextItem, XObjectTransform,
 };
 use std::{
     fs::File,
@@ -100,15 +100,15 @@ const FONT_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/RedHatText-Ital
 const FONT_BOLD_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/RedHatText-BoldItalic.ttf");
 
 // --- Page geometry (A4, in millimetres) ---
-const PAGE_WIDTH_MM: f32 = 210.0;
-const PAGE_HEIGHT_MM: f32 = 297.0;
-const MARGIN_MM: f32 = 18.0;
-const USABLE_WIDTH_MM: f32 = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
+pub(crate) const PAGE_WIDTH_MM: f32 = 210.0;
+pub(crate) const PAGE_HEIGHT_MM: f32 = 297.0;
+pub(crate) const MARGIN_MM: f32 = 18.0;
+pub(crate) const USABLE_WIDTH_MM: f32 = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
 
-const PT_TO_MM: f32 = 25.4 / 72.0;
+pub(crate) const PT_TO_MM: f32 = 25.4 / 72.0;
 
-const BODY_SIZE: f32 = 10.0;
-const CODE_SIZE: f32 = 9.0;
+pub(crate) const BODY_SIZE: f32 = 10.0;
+pub(crate) const CODE_SIZE: f32 = 9.0;
 const BAND_TEXT_SIZE: f32 = 11.0;
 /// Indent (mm) added per level of list/quote nesting.
 const INDENT_MM: f32 = 6.0;
@@ -119,14 +119,14 @@ const FOOTER_BAND_MM: f32 = 11.0;
 /// Gap between a band and the page content.
 const CONTENT_GAP_MM: f32 = 5.0;
 /// First content baseline / lowest content baseline.
-const CONTENT_TOP_MM: f32 = PAGE_HEIGHT_MM - HEADER_BAND_MM - CONTENT_GAP_MM;
-const CONTENT_BOTTOM_MM: f32 = FOOTER_BAND_MM + CONTENT_GAP_MM;
+pub(crate) const CONTENT_TOP_MM: f32 = PAGE_HEIGHT_MM - HEADER_BAND_MM - CONTENT_GAP_MM;
+pub(crate) const CONTENT_BOTTOM_MM: f32 = FOOTER_BAND_MM + CONTENT_GAP_MM;
 
 /// The orangu brand colour (`ORANGU_BROWN`, rgb 139/90/43): the band fill, plus
 /// the title and headings, so the PDF matches the terminal banner.
-const BRAND_COLOR: (f32, f32, f32) = (139.0 / 255.0, 90.0 / 255.0, 43.0 / 255.0);
-const TEXT_COLOR: (f32, f32, f32) = (0.0, 0.0, 0.0);
-const WHITE: (f32, f32, f32) = (1.0, 1.0, 1.0);
+pub(crate) const BRAND_COLOR: (f32, f32, f32) = (139.0 / 255.0, 90.0 / 255.0, 43.0 / 255.0);
+pub(crate) const TEXT_COLOR: (f32, f32, f32) = (0.0, 0.0, 0.0);
+pub(crate) const WHITE: (f32, f32, f32) = (1.0, 1.0, 1.0);
 /// Overall-status banner colours (the terminal's status green/red).
 const STATUS_GREEN: (f32, f32, f32) = (80.0 / 255.0, 200.0 / 255.0, 120.0 / 255.0);
 const STATUS_RED: (f32, f32, f32) = (220.0 / 255.0, 80.0 / 255.0, 80.0 / 255.0);
@@ -136,6 +136,10 @@ const STATUS_AMBER: (f32, f32, f32) = (230.0 / 255.0, 165.0 / 255.0, 40.0 / 255.
 const GRID_COLOR: (f32, f32, f32) = (0.6, 0.6, 0.6);
 
 const ORANGU_URL: &str = "https://mnemosyne-systems.github.io/orangu/";
+
+/// The resolution an embedded image is placed at before being scaled to the
+/// width its page gives it.
+const IMAGE_DPI: f32 = 300.0;
 
 /// The overall patch verdict shown on the review export's first page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +151,7 @@ enum Verdict {
 /// One run of text with a single style. A style differs by weight and slant,
 /// which select a Red Hat Text variant (or its Helvetica fallback).
 #[derive(Clone)]
-struct Span {
+pub(crate) struct Span {
     text: String,
     bold: bool,
     italic: bool,
@@ -166,6 +170,37 @@ impl Span {
             color: None,
         }
     }
+
+    /// A run in a chosen weight and slant, for callers that lay out their own
+    /// text (the documents in [`crate::docs`]) rather than flow Markdown.
+    pub(crate) fn styled(text: impl Into<String>, bold: bool, italic: bool) -> Self {
+        Self {
+            text: text.into(),
+            bold,
+            italic,
+            color: None,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn bold(&self) -> bool {
+        self.bold
+    }
+}
+
+/// Parse Markdown into its syntax tree, GFM tables and all. An unparseable
+/// document yields an empty root rather than an error: the callers here render
+/// what they can.
+pub(crate) fn parse_markdown(markdown: &str) -> Node {
+    to_mdast(markdown, &ParseOptions::gfm()).unwrap_or_else(|_| {
+        Node::Root(markdown::mdast::Root {
+            children: Vec::new(),
+            position: None,
+        })
+    })
 }
 
 /// A logical line to be laid out: its styled spans, the font size, the leading
@@ -173,7 +208,7 @@ impl Span {
 /// after it. `word_wrap` breaks on spaces for prose; code lines wrap hard at the
 /// margin so their layout is preserved.
 #[derive(Clone)]
-struct Block {
+pub(crate) struct Block {
     spans: Vec<Span>,
     size: f32,
     indent_mm: f32,
@@ -187,6 +222,13 @@ struct Block {
 }
 
 impl Block {
+    /// Replace the block's text with a single plain run. The manual numbers
+    /// its headings (`1.2 Getting Started`) after the Markdown has been
+    /// rendered, and this is how the number gets in.
+    pub(crate) fn set_text(&mut self, text: &str) {
+        self.spans = vec![Span::plain(text)];
+    }
+
     fn paragraph(spans: Vec<Span>) -> Self {
         Self {
             spans,
@@ -1605,7 +1647,7 @@ const MONTH_NAMES: [&str; 12] = [
     "December",
 ];
 
-fn render_block_nodes(nodes: &[Node], level: usize, blocks: &mut Vec<Block>) {
+pub(crate) fn render_block_nodes(nodes: &[Node], level: usize, blocks: &mut Vec<Block>) {
     for node in nodes {
         render_block_node(node, level, blocks);
     }
@@ -1956,7 +1998,7 @@ fn syntect_rgb(color: syntect::highlighting::Color) -> (f32, f32, f32) {
     )
 }
 
-fn inline_spans_of(node: &Node) -> Vec<Span> {
+pub(crate) fn inline_spans_of(node: &Node) -> Vec<Span> {
     let mut spans = Vec::new();
     collect_inline(std::slice::from_ref(node), false, false, &mut spans);
     spans
@@ -2134,11 +2176,15 @@ fn load_embedded_fonts(doc: &mut PdfDocument) -> Option<DocFonts> {
 
 /// Incremental PDF builder: owns the document and fonts, tracks the current
 /// page and the content cursor, and draws every page's header/footer bands.
-struct Pdf {
+pub(crate) struct Pdf {
     doc: PdfDocument,
     fonts: DocFonts,
     header: String,
     footer: String,
+    /// The part of the footer that is underlined and clickable, with the URL it
+    /// opens: the reports link their leading `orangu`, the project's own
+    /// documents link the whole line.
+    footer_link: (String, String),
     /// Drawing operations accumulated for the page currently being built.
     ops: Vec<Op>,
     /// Pages already finished (flushed by `new_page`/`save`), in order.
@@ -2148,13 +2194,25 @@ struct Pdf {
 
 impl Pdf {
     fn new(header: &str, model: &str) -> Result<Self> {
+        Self::with_footer(
+            header,
+            &format!("orangu {VERSION} ({model})"),
+            ("orangu", ORANGU_URL),
+        )
+    }
+
+    /// A document whose footer band carries `footer` rather than the reports'
+    /// running `orangu {version} ({model})`. `link` is the leading part of the
+    /// footer to underline and the URL it opens.
+    pub(crate) fn with_footer(header: &str, footer: &str, link: (&str, &str)) -> Result<Self> {
         let mut doc = PdfDocument::new("orangu export");
         let fonts = load_fonts(&mut doc)?;
         let mut pdf = Pdf {
             doc,
             fonts,
             header: header.to_string(),
-            footer: format!("orangu {VERSION} ({model})"),
+            footer: footer.to_string(),
+            footer_link: (link.0.to_string(), link.1.to_string()),
             ops: Vec::new(),
             pages: Vec::new(),
             cursor_y: CONTENT_TOP_MM,
@@ -2172,7 +2230,7 @@ impl Pdf {
     }
 
     /// Start a fresh page (with its bands) and reset the content cursor.
-    fn new_page(&mut self) {
+    pub(crate) fn new_page(&mut self) {
         self.finish_page();
         self.cursor_y = CONTENT_TOP_MM;
         self.draw_furniture();
@@ -2180,11 +2238,11 @@ impl Pdf {
 
     /// The 1-based number of the page currently being drawn — what a
     /// table-of-contents entry for content drawn now should point at.
-    fn current_page(&self) -> usize {
+    pub(crate) fn current_page(&self) -> usize {
         self.pages.len() + 1
     }
 
-    fn draw_blocks(&mut self, blocks: &[Block]) {
+    pub(crate) fn draw_blocks(&mut self, blocks: &[Block]) {
         for block in blocks {
             self.draw_block(block);
         }
@@ -2247,7 +2305,7 @@ impl Pdf {
     }
 
     /// Draw a single line of text at `(x, baseline)` in the given colour.
-    fn text(
+    pub(crate) fn text(
         &mut self,
         text: &str,
         bold: bool,
@@ -2260,7 +2318,7 @@ impl Pdf {
         emit_text(&mut self.ops, text, &font, size, x, baseline, color);
     }
 
-    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32)) {
+    pub(crate) fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32)) {
         let (r, g, b) = color;
         let rect = Rect {
             x: Mm(x0).into(),
@@ -2278,7 +2336,15 @@ impl Pdf {
         });
     }
 
-    fn rule(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: (f32, f32, f32), thickness: f32) {
+    pub(crate) fn rule(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        color: (f32, f32, f32),
+        thickness: f32,
+    ) {
         let (r, g, b) = color;
         self.ops.push(Op::SetOutlineColor {
             col: Color::Rgb(Rgb::new(r, g, b, None)),
@@ -3067,7 +3133,7 @@ impl Pdf {
 
     /// Attach an internal "go to page" link spanning the content width at the
     /// given baseline (`page` is 1-based). Used by the table of contents.
-    fn link_to_page(&mut self, page: usize, y_mm: f32, height_mm: f32) {
+    pub(crate) fn link_to_page(&mut self, page: usize, y_mm: f32, height_mm: f32) {
         // The destination's `top` is the page height in points so the target
         // page is shown from its top edge.
         let top = PAGE_HEIGHT_MM / PT_TO_MM;
@@ -3139,10 +3205,11 @@ impl Pdf {
             WHITE,
         );
 
-        // Underline "orangu" (it opens the footer) and make it a link.
+        // Underline the footer's linked part and make it clickable.
+        let (link_text, link_url) = self.footer_link.clone();
         let orangu_width = self
             .fonts
-            .text_width_mm("orangu", false, false, BAND_TEXT_SIZE);
+            .text_width_mm(&link_text, false, false, BAND_TEXT_SIZE);
         let (wr, wg, wb) = WHITE;
         self.ops.push(Op::SetOutlineColor {
             col: Color::Rgb(Rgb::new(wr, wg, wb, None)),
@@ -3167,7 +3234,7 @@ impl Pdf {
                     mode: None,
                     winding_order: None,
                 },
-                Actions::uri(ORANGU_URL.to_string()),
+                Actions::uri(link_url),
                 Some(BorderArray::Solid([0.0, 0.0, 0.0])),
                 None,
                 None,
@@ -3175,7 +3242,117 @@ impl Pdf {
         });
     }
 
-    fn save(mut self, path: &Path) -> Result<()> {
+    /// Lay out `spans` in `size` from `x_mm`, wrapped to `width_mm`, with the
+    /// first baseline `y_mm` and returning the baseline just past the last
+    /// line. The reports flow one column down the page and never need this;
+    /// the documents in [`crate::docs`] place text in boxes and columns of
+    /// their own, so they measure with [`Self::spans_height_mm`] and draw here.
+    pub(crate) fn draw_spans_at(
+        &mut self,
+        spans: &[Span],
+        size: f32,
+        x_mm: f32,
+        width_mm: f32,
+        y_mm: f32,
+        color: (f32, f32, f32),
+    ) -> f32 {
+        let chars = spans_chars(spans);
+        let line_height = size * 1.35 * PT_TO_MM;
+        let mut y = y_mm;
+        for line in wrap(&chars, width_mm, width_mm, true, &self.fonts, size) {
+            y -= line_height;
+            draw_line(
+                &mut self.ops,
+                &line,
+                x_mm - MARGIN_MM,
+                size,
+                y,
+                &self.fonts,
+                color,
+            );
+        }
+        y
+    }
+
+    /// What [`Self::draw_spans_at`] would consume vertically (mm), so a caller
+    /// can size a box before drawing into it.
+    pub(crate) fn spans_height_mm(&self, spans: &[Span], size: f32, width_mm: f32) -> f32 {
+        let lines = wrap(
+            &spans_chars(spans),
+            width_mm,
+            width_mm,
+            true,
+            &self.fonts,
+            size,
+        );
+        lines.len() as f32 * size * 1.35 * PT_TO_MM
+    }
+
+    /// The width (mm) `text` occupies in the given weight and size.
+    pub(crate) fn text_width_mm(&self, text: &str, bold: bool, size: f32) -> f32 {
+        self.fonts.text_width_mm(text, bold, false, size)
+    }
+
+    /// The baseline the next content would be drawn at, and a way to move it.
+    /// The documents in [`crate::docs`] lay tables and images out themselves
+    /// between calls to [`Self::draw_blocks`], and share the cursor with it.
+    pub(crate) fn cursor(&self) -> f32 {
+        self.cursor_y
+    }
+
+    pub(crate) fn set_cursor(&mut self, y: f32) {
+        self.cursor_y = y;
+    }
+
+    /// Room left on the page below the cursor (mm).
+    pub(crate) fn room_left_mm(&self) -> f32 {
+        self.cursor_y - CONTENT_BOTTOM_MM
+    }
+
+    /// Draw a PNG centred on the text column, scaled to fit `max_width_mm` and
+    /// whatever height is left, and advance the cursor past it. The image
+    /// starts a fresh page when what remains is too short to be worth using.
+    pub(crate) fn draw_image(&mut self, bytes: &[u8], max_width_mm: f32) -> Result<()> {
+        let mut warnings = Vec::new();
+        let image = RawImage::decode_from_bytes(bytes, &mut warnings)
+            .map_err(|error| anyhow::anyhow!("could not decode the image: {error}"))?;
+        let (pixel_width, pixel_height) = (image.width as f32, image.height as f32);
+
+        // Images are placed by their natural size at `IMAGE_DPI`, then scaled
+        // to the width they are given.
+        let natural_width = pixel_width / IMAGE_DPI * 25.4;
+        let natural_height = pixel_height / IMAGE_DPI * 25.4;
+        let mut width = natural_width.min(max_width_mm);
+        let mut height = natural_height * width / natural_width;
+
+        let full_page = CONTENT_TOP_MM - CONTENT_BOTTOM_MM;
+        if height > self.room_left_mm() && height <= full_page {
+            self.new_page();
+        }
+        if height > full_page {
+            height = full_page;
+            width = natural_width * height / natural_height;
+        }
+
+        let id = self.doc.add_image(&image);
+        let x = MARGIN_MM + (USABLE_WIDTH_MM - width) / 2.0;
+        let bottom = self.cursor_y - height;
+        self.ops.push(Op::UseXobject {
+            id,
+            transform: XObjectTransform {
+                translate_x: Some(Mm(x).into()),
+                translate_y: Some(Mm(bottom).into()),
+                scale_x: Some(width / natural_width),
+                scale_y: Some(height / natural_height),
+                dpi: Some(IMAGE_DPI),
+                ..Default::default()
+            },
+        });
+        self.cursor_y = bottom - BODY_SIZE * PT_TO_MM;
+        Ok(())
+    }
+
+    pub(crate) fn save(mut self, path: &Path) -> Result<()> {
         self.finish_page();
         let pages = std::mem::take(&mut self.pages);
         self.doc.with_pages(pages);
@@ -3291,6 +3468,22 @@ fn wrap_block(block: &Block, fonts: &DocFonts) -> Vec<Vec<StyledChar>> {
         fonts,
         block.size,
     )
+}
+
+/// The styled characters of a run of spans, for callers that lay out their own
+/// lines rather than build a [`Block`].
+fn spans_chars(spans: &[Span]) -> Vec<StyledChar> {
+    spans
+        .iter()
+        .flat_map(|span| {
+            span.text.chars().map(|ch| StyledChar {
+                ch,
+                bold: span.bold,
+                italic: span.italic,
+                color: span.color,
+            })
+        })
+        .collect()
 }
 
 fn block_chars(block: &Block) -> Vec<StyledChar> {

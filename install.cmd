@@ -19,6 +19,9 @@ setlocal EnableDelayedExpansion
 
 set "REPO=mnemosyne-systems/orangu"
 if not defined INSTALL_DIR set "INSTALL_DIR=%USERPROFILE%\.local\bin"
+:: The cheat sheet goes next to the configuration, not on the PATH.
+if not defined DOC_DIR set "DOC_DIR=%USERPROFILE%\.orangu"
+set "CHEATSHEET=orangu-cheatsheet-en.pdf"
 set "TMP=%TEMP%\orangu-install-%RANDOM%%RANDOM%"
 
 where powershell >nul 2>&1 || (echo error: PowerShell is required & exit /b 1)
@@ -48,9 +51,18 @@ for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do if not exis
 if not exist "!INSTALL_DIR!" mkdir "!INSTALL_DIR!"
 for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
+:: The four-page cheat sheet — setup, coding, review, merge and push. Older
+:: archives do not carry it, so its absence is not an error.
+set "CHEATSHEET_INSTALLED="
+if exist "!TMP!\out\!CHEATSHEET!" (
+    if not exist "!DOC_DIR!" mkdir "!DOC_DIR!"
+    copy /y "!TMP!\out\!CHEATSHEET!" "!DOC_DIR!\!CHEATSHEET!" >nul && set "CHEATSHEET_INSTALLED=1"
+)
+
 rd /s /q "!TMP!" >nul 2>&1
 echo Installed the orangu stack to !INSTALL_DIR!:
 echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe  orangu-bench.exe
+if defined CHEATSHEET_INSTALLED echo Setup, coding, review, merge and push on four pages: !DOC_DIR!\!CHEATSHEET!
 echo Run "orangu --help" to get started.
 echo Run "orangu -s" and add the output to your PowerShell $PROFILE for completions.
 endlocal
