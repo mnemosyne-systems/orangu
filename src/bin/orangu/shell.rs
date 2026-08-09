@@ -176,6 +176,12 @@ mod tests {
         use clap::CommandFactory;
 
         for argument in crate::Args::command().get_arguments() {
+            // Hidden options — `--build-manual`, `--build-cheatsheet` — are
+            // repository development tools, not workspace features: they stay
+            // out of `--help` and out of the completions with it.
+            if argument.is_hide_set() {
+                continue;
+            }
             let Some(long) = argument.get_long() else {
                 continue;
             };

@@ -29,6 +29,10 @@
 //! `doc/cheatsheet/en` holds one file per page, named `??-*.md` and built in
 //! that order. Within a file:
 //!
+//! - A `> quote` is a **banner**: a band across the page, white on the brand
+//!   colour, standing between the boxes rather than inside one. The first page
+//!   opens on what orangu is and closes on what it does not do. It is set as
+//!   large as it fits on one line, and wraps if it will not.
 //! - `# Title` opens a **box** — one focus, with a brand title bar — that runs
 //!   until the next `# Title` or the end of the file.
 //! - `## Title` is a bold subheading inside the current box.
@@ -55,7 +59,7 @@ use crate::export::{
 };
 
 /// The band text: the reports put `{repository}-{branch}` here.
-const HEADER: &str = "orangu-cheatsheet";
+const HEADER: &str = "orangu cheatsheet";
 /// The footer band, and the site the whole line links to.
 const FOOTER: &str = "2026 mnemosyne-systems.ai";
 const FOOTER_URL: &str = "https://mnemosyne-systems.ai/";
@@ -82,6 +86,15 @@ const COMMAND_COLUMN_MAX: f32 = 0.46;
 const BOX_BG: (f32, f32, f32) = (0.984, 0.969, 0.949);
 const BOX_RULE: (f32, f32, f32) = (0.851, 0.776, 0.690);
 const CODE_BG: (f32, f32, f32) = (0.953, 0.918, 0.878);
+
+/// A banner band: its smallest height, the padding around its text, the size
+/// it starts at before being stepped down to fit, the size below which it
+/// wraps instead of shrinking further, and the gap left under it.
+const BANNER_MM: f32 = 11.0;
+const BANNER_PAD_MM: f32 = 2.6;
+const BANNER_SIZE: f32 = 16.0;
+const BANNER_MIN_SIZE: f32 = 11.0;
+const BANNER_GAP_MM: f32 = 3.5;
 
 /// Build `source_dir`'s Markdown into the cheat sheet at `output`, one page per
 /// source file. Returns the path written.
@@ -128,10 +141,18 @@ fn source_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
-/// One page: the file it came from, and the boxes on it.
+/// One page: the file it came from, and what runs down it.
 struct Page {
     name: String,
-    boxes: Vec<Focus>,
+    elements: Vec<Element>,
+}
+
+/// What a page is made of, in the order the source file gives them.
+enum Element {
+    /// A band across the page, white on the brand colour.
+    Banner(String),
+    /// A box.
+    Focus(Focus),
 }
 
 /// One box: a title bar and the items under it.
@@ -165,18 +186,23 @@ fn parse_page(path: &Path) -> Result<Page> {
     let root = parse_markdown(&markdown);
     let children = root.children().map(Vec::as_slice).unwrap_or(&[]);
 
-    let mut boxes: Vec<Focus> = Vec::new();
+    let mut elements: Vec<Element> = Vec::new();
     for node in children {
         match node {
-            Node::Heading(heading) if heading.depth == 1 => boxes.push(Focus {
-                title: plain_text(&inline_spans_of(node)),
-                items: Vec::new(),
-            }),
+            // A quote stands on its own between the boxes, not inside one: it
+            // closes whichever box it follows.
+            Node::Blockquote(_) => {
+                elements.push(Element::Banner(plain_text(&spans_of_node(node))));
+            }
+            Node::Heading(heading) if heading.depth == 1 => {
+                elements.push(Element::Focus(Focus {
+                    title: plain_text(&inline_spans_of(node)),
+                    items: Vec::new(),
+                }));
+            }
             other => {
-                let Some(current) = boxes.last_mut() else {
-                    bail!(
-                        "{name}: content before the first `# ` heading — every page starts a box"
-                    );
+                let Some(Element::Focus(current)) = elements.last_mut() else {
+                    bail!("{name}: content outside a box — it belongs under a `# ` heading");
                 };
                 if let Some(item) = parse_item(other) {
                     current.items.push(item);
@@ -185,10 +211,10 @@ fn parse_page(path: &Path) -> Result<Page> {
         }
     }
 
-    if boxes.is_empty() {
+    if !elements.iter().any(|e| matches!(e, Element::Focus(_))) {
         bail!("{name}: no `# ` heading, so the page has no box");
     }
-    Ok(Page { name, boxes })
+    Ok(Page { name, elements })
 }
 
 fn parse_item(node: &Node) -> Option<Item> {
@@ -197,10 +223,7 @@ fn parse_item(node: &Node) -> Option<Item> {
         Node::Paragraph(paragraph) => Some(Item::Prose(spans_of(&paragraph.children))),
         Node::Table(table) => Some(Item::Commands(command_rows(table))),
         Node::List(list) => Some(Item::Bullets(
-            list.children
-                .iter()
-                .map(|item| spans_of_node(item))
-                .collect(),
+            list.children.iter().map(spans_of_node).collect(),
         )),
         Node::Code(code) => Some(Item::Code(code.value.lines().map(str::to_string).collect())),
         _ => None,
@@ -253,12 +276,20 @@ fn plain_text(spans: &[Span]) -> String {
 
 // --- Layout ---
 
-/// Draw a page's boxes down the page, failing if they do not fit on it.
+/// Draw a page's elements down the page, failing if they do not fit on it.
 fn draw_page(pdf: &mut Pdf, page: &Page) -> Result<()> {
+    // The gap goes ahead of each element rather than after it, so the last one
+    // is measured against the bottom of the page and not a gap past it.
     let mut y = CONTENT_TOP_MM;
-    for focus in &page.boxes {
-        y = draw_focus(pdf, focus, y);
-        y -= BOX_GAP_MM;
+    for (index, element) in page.elements.iter().enumerate() {
+        y = match element {
+            Element::Banner(text) => {
+                draw_banner(pdf, text, y - if index == 0 { 0.0 } else { BANNER_GAP_MM })
+            }
+            Element::Focus(focus) => {
+                draw_focus(pdf, focus, y - if index == 0 { 0.0 } else { BOX_GAP_MM })
+            }
+        };
     }
     if y < CONTENT_BOTTOM_MM {
         bail!(
@@ -268,6 +299,67 @@ fn draw_page(pdf: &mut Pdf, page: &Page) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Draw a banner with its top edge at `top`, returning the bottom edge: white
+/// on the brand colour, centred, across the full width.
+fn draw_banner(pdf: &mut Pdf, text: &str, top: f32) -> f32 {
+    // A short line is set large, and stepped down before it is allowed to
+    // wrap: a promise reads best on one line. A longer one wraps at the size
+    // it reaches, and every line is centred either way.
+    let room = USABLE_WIDTH_MM - 2.0 * BANNER_PAD_MM;
+    let mut size = BANNER_SIZE;
+    while size > BANNER_MIN_SIZE && pdf.text_width_mm(text, true, size) > room {
+        size -= 0.25;
+    }
+
+    let lines = banner_lines(pdf, text, room, size);
+    let line_height = size * 1.35 * PT_TO_MM;
+    let text_height = lines.len() as f32 * line_height;
+    let height = (text_height + 2.0 * BANNER_PAD_MM).max(BANNER_MM);
+    let bottom = top - height;
+
+    pdf.fill_rect(
+        MARGIN_MM,
+        bottom,
+        PAGE_WIDTH_MM - MARGIN_MM,
+        top,
+        BRAND_COLOR,
+    );
+
+    let mut line_top = top - (height - text_height) / 2.0;
+    for line in &lines {
+        let line_bottom = line_top - line_height;
+        let x = MARGIN_MM + (USABLE_WIDTH_MM - pdf.text_width_mm(line, true, size)).max(0.0) / 2.0;
+        let baseline = line_bottom + (line_height - size * 0.7 * PT_TO_MM) / 2.0;
+        pdf.text(line, true, x, baseline, size, WHITE);
+        line_top = line_bottom;
+    }
+    bottom
+}
+
+/// Break `text` into the lines that fit `width` at `size`, greedily. The
+/// engine wraps for the boxes, but only from the left: a centred band has to
+/// know where its lines end.
+fn banner_lines(pdf: &Pdf, text: &str, width: f32, size: f32) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+            continue;
+        }
+        let candidate = format!("{line} {word}");
+        if pdf.text_width_mm(&candidate, true, size) > width {
+            lines.push(std::mem::replace(&mut line, word.to_string()));
+        } else {
+            line = candidate;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Draw one box with its top edge at `top`, returning the bottom edge.
@@ -917,12 +1009,72 @@ mod tests {
         page
     }
 
+    /// The boxes of a page, in order, ignoring any banners between them.
+    fn boxes_of(page: &Page) -> Vec<&Focus> {
+        page.elements
+            .iter()
+            .filter_map(|element| match element {
+                Element::Focus(focus) => Some(focus),
+                Element::Banner(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_level_one_heading_opens_a_box() {
         let page = page("boxes", "# Setup\n\nProse.\n\n# Coding\n\nMore.\n");
-        assert_eq!(page.boxes.len(), 2);
-        assert_eq!(page.boxes[0].title, "Setup");
-        assert_eq!(page.boxes[1].title, "Coding");
+        let boxes = boxes_of(&page);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].title, "Setup");
+        assert_eq!(boxes[1].title, "Coding");
+    }
+
+    /// A quote is a band, wherever it stands: opening a page, or closing one
+    /// after the last box.
+    #[test]
+    fn a_quote_is_a_banner_between_the_boxes() {
+        let page = page(
+            "banners",
+            "> The promise\n\n# Setup\n\nProse.\n\n> The closing word\n",
+        );
+        let kinds: Vec<&str> = page
+            .elements
+            .iter()
+            .map(|element| match element {
+                Element::Banner(_) => "banner",
+                Element::Focus(_) => "box",
+            })
+            .collect();
+        assert_eq!(kinds, ["banner", "box", "banner"]);
+
+        let Element::Banner(closing) = &page.elements[2] else {
+            panic!("expected the page to close on a banner");
+        };
+        assert_eq!(closing, "The closing word");
+        // The quote closed the box rather than joining it.
+        assert_eq!(boxes_of(&page)[0].items.len(), 1);
+    }
+
+    /// A banner too long for one line wraps rather than running off the card.
+    #[test]
+    fn a_long_banner_wraps_to_the_band_width() {
+        let pdf = Pdf::with_footer(HEADER, FOOTER, (FOOTER, FOOTER_URL)).unwrap();
+        let text = "Nothing leaves the machine: once the model is downloaded, orangu needs no \
+             Internet connection. Sessions resume automatically per workspace and branch.";
+        let width = USABLE_WIDTH_MM - 2.0 * BANNER_PAD_MM;
+        let lines = banner_lines(&pdf, text, width, BANNER_MIN_SIZE);
+
+        assert!(lines.len() > 1, "the text is too long for one line");
+        for line in &lines {
+            assert!(
+                pdf.text_width_mm(line, true, BANNER_MIN_SIZE) <= width,
+                "line runs past the band: {line}"
+            );
+        }
+        assert_eq!(
+            lines.join(" "),
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 
     #[test]
@@ -931,7 +1083,7 @@ mod tests {
             "commands",
             "# Setup\n\n| Command | What it does |\n| --- | --- |\n| `orangu -i` | Configure it. |\n",
         );
-        let Item::Commands(rows) = &page.boxes[0].items[0] else {
+        let Item::Commands(rows) = &boxes_of(&page)[0].items[0] else {
             panic!("expected a command list");
         };
         assert_eq!(rows.len(), 1);
@@ -945,7 +1097,7 @@ mod tests {
             "bold",
             "# Setup\n\n| A | B |\n| --- | --- |\n| `orangu` | plain |\n",
         );
-        let Item::Commands(rows) = &page.boxes[0].items[0] else {
+        let Item::Commands(rows) = &boxes_of(&page)[0].items[0] else {
             panic!("expected a command list");
         };
         assert!(rows[0].0.iter().all(Span::bold));
@@ -983,17 +1135,24 @@ mod tests {
         assert_eq!(strip_front_matter(markdown), markdown);
     }
 
+    /// Prose has to belong to a box — ahead of the first one, or adrift after
+    /// a banner has closed the last one.
     #[test]
-    fn content_before_the_first_heading_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("orangu-docs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("00-loose.md");
-        std::fs::write(&path, "Loose prose.\n\n# Setup\n").unwrap();
-        let error = match parse_page(&path) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("expected the page to be rejected"),
-        };
-        std::fs::remove_file(&path).ok();
-        assert!(error.contains("before the first"), "{error}");
+    fn content_outside_a_box_is_rejected() {
+        for (name, markdown) in [
+            ("00-loose.md", "Loose prose.\n\n# Setup\n"),
+            ("01-adrift.md", "# Setup\n\nProse.\n\n> A band\n\nAdrift.\n"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("orangu-docs-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            std::fs::write(&path, markdown).unwrap();
+            let error = match parse_page(&path) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("expected {name} to be rejected"),
+            };
+            std::fs::remove_file(&path).ok();
+            assert!(error.contains("outside a box"), "{error}");
+        }
     }
 }

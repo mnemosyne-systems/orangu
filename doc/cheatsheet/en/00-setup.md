@@ -1,3 +1,5 @@
+> orangu is a complete, self-contained AI coding stack
+
 # Setup
 
 Install the stack, serve a model, point **orangu** at it. In this order — the
@@ -50,5 +52,5 @@ keys worth knowing in `[orangu]`:
 | `auto_rebase = on` `auto_squash = on` | Let `/pull_request` fix the branch instead of stopping on it. |
 | `review_max_tokens = 2048` | Raise it if a thinking model's review answers come back truncated. |
 
-Nothing leaves the machine: once the model is downloaded, orangu needs no
-Internet connection. Sessions resume automatically per workspace and branch.
+> Nothing leaves the machine: once the model is downloaded, orangu needs no
+> Internet connection. Sessions resume automatically per workspace and branch.
