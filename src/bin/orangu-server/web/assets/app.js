@@ -180,14 +180,16 @@
   // The same markup `render.rs` emits for a diagram in a reply, so one set
   // of CSS rules covers both: an <img> per theme plus the collapsed source.
   function makeDiagram(diagram, fileName) {
+    const kind = diagram.kind || "mermaid";
+    const name = kind === "plantuml" ? "PlantUML" : "Mermaid";
     const figure = document.createElement("figure");
-    figure.className = "mermaid-diagram";
+    figure.className = `${kind}-diagram`;
 
     for (const theme of ["light", "dark"]) {
       const img = document.createElement("img");
-      img.className = `mermaid-${theme}`;
+      img.className = `${kind}-${theme}`;
       img.src = diagram[theme];
-      img.alt = fileName ? `Mermaid diagram from ${fileName}` : "Mermaid diagram";
+      img.alt = fileName ? `${name} diagram from ${fileName}` : `${name} diagram`;
       // Natural size, so a wide diagram stays legible and the figure
       // scrolls instead of scaling it down. See `web::mermaid`.
       if (diagram.width > 0) {
@@ -204,19 +206,23 @@
     const actions = document.createElement("div");
     actions.className = "diagram-actions";
     for (const theme of ["light", "dark"]) {
-      const link = document.createElement("a");
-      link.className = `diagram-dl diagram-dl-${theme}`;
-      link.href = diagram[theme];
-      link.download = fileName ? `${fileName}.svg` : "orangu-diagram.svg";
-      link.title = "Download SVG";
-      link.setAttribute("aria-label", "Download diagram as SVG");
-      link.innerHTML = SAVE_ICON;
-      actions.appendChild(link);
+      for (const format of ["svg", "png"]) {
+        const href = format === "svg" ? diagram[theme] : diagram[`${theme}_png`];
+        if (!href) continue;
+        const link = document.createElement("a");
+        link.className = `diagram-dl diagram-dl-${theme}`;
+        link.href = href;
+        link.download = fileName ? `${fileName}.${format}` : `orangu-diagram.${format}`;
+        link.title = `Download ${format.toUpperCase()}`;
+        link.setAttribute("aria-label", `Download diagram as ${format.toUpperCase()}`);
+        link.innerHTML = SAVE_ICON + (kind === "plantuml" ? `<span>${format.toUpperCase()}</span>` : "");
+        actions.appendChild(link);
+      }
     }
     figure.appendChild(actions);
 
     const details = document.createElement("details");
-    details.className = "mermaid-source";
+    details.className = "diagram-source";
     const summary = document.createElement("summary");
     summary.textContent = "Diagram source";
     const pre = document.createElement("pre");
@@ -510,7 +516,7 @@
   // also what the Save-as-Markdown button and the next turn's context see.
   function appendAttachedDiagramsToAnswer(assistantEl, attachments) {
     if (!attachments || attachments.length === 0) return;
-    if (assistantEl.querySelector(".mermaid-diagram")) return;
+    if (assistantEl.querySelector(".mermaid-diagram, .plantuml-diagram")) return;
 
     for (const att of attachments) {
       for (const diagram of att.diagrams || []) {

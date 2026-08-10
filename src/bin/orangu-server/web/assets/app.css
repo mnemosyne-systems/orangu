@@ -474,7 +474,8 @@ button:disabled {
    `render.rs` emits. Wide diagrams scroll horizontally rather than
    squashing the transcript, and `max-width: 100%` keeps narrow ones from
    overflowing on a phone. */
-.mermaid-diagram {
+.mermaid-diagram,
+.plantuml-diagram {
   /* `margin: 0.6em 0` also clears the UA stylesheet's `margin-inline: 40px`
      on <figure>, which would indent every diagram. */
   margin: 0.6em 0;
@@ -489,7 +490,8 @@ button:disabled {
    the right aspect ratio to reserve before the image decodes; `max-width`
    scales it down from there and `height: auto` keeps it in proportion.
    Full resolution is a click away on the download control below. */
-.mermaid-diagram img {
+.mermaid-diagram img,
+.plantuml-diagram img {
   max-width: 100%;
   height: auto;
   border-radius: 8px;
@@ -509,26 +511,33 @@ button:disabled {
    `:root` cascade at the top of this file: light is the baseline, the
    media query follows the OS, and an explicit `data-theme` from the
    topbar toggle outranks both. */
-.mermaid-dark {
+.mermaid-dark,
+.plantuml-dark {
   display: none;
 }
 
 @media (prefers-color-scheme: dark) {
-  .mermaid-light {
+  .mermaid-light,
+  .plantuml-light {
     display: none;
   }
-  .mermaid-dark {
+  .mermaid-dark,
+  .plantuml-dark {
     display: block;
   }
 }
 
 :root[data-theme="light"] .mermaid-light,
-:root[data-theme="dark"] .mermaid-dark {
+:root[data-theme="light"] .plantuml-light,
+:root[data-theme="dark"] .mermaid-dark,
+:root[data-theme="dark"] .plantuml-dark {
   display: block;
 }
 
 :root[data-theme="light"] .mermaid-dark,
-:root[data-theme="dark"] .mermaid-light {
+:root[data-theme="light"] .plantuml-dark,
+:root[data-theme="dark"] .mermaid-light,
+:root[data-theme="dark"] .plantuml-light {
   display: none;
 }
 
@@ -558,6 +567,12 @@ button:disabled {
   height: 14px;
 }
 
+.diagram-dl span {
+  margin-left: 3px;
+  font-size: 10px;
+  line-height: 14px;
+}
+
 /* Only the control matching the visible image, so the saved file is the
    one on screen. Mirrors the image rules above. */
 .diagram-dl-dark {
@@ -585,11 +600,13 @@ button:disabled {
 
 /* The diagram source, collapsed. Turning a code block into an image
    would otherwise remove the only way to copy the source back out. */
-.mermaid-source {
+.mermaid-source,
+.diagram-source {
   margin-top: 0.3em;
 }
 
-.mermaid-source > summary {
+.mermaid-source > summary,
+.diagram-source > summary {
   cursor: pointer;
   color: var(--text-dim);
   font-size: 0.82em;

@@ -40,13 +40,11 @@
 //! load, `render()` throws on malformed TeX, ...) rather than an empty
 //! element.
 //!
-//! ```` ```mermaid ```` blocks go the other way and are drawn here, on the
-//! server, by [`super::mermaid`] — see that module for why the result is
-//! embedded as an `<img>` rather than inlined. A block that doesn't parse as
-//! a diagram falls back to the ordinary highlighted code block, so a model's
-//! near-miss Mermaid still shows its source instead of a blank frame.
+//! Mermaid and PlantUML blocks go the other way and are drawn here on the
+//! server by [`super::mermaid`] and [`super::plantuml`]. A block that doesn't
+//! parse falls back to the ordinary highlighted code block.
 
-use super::mermaid;
+use super::{mermaid, plantuml};
 use markdown::{
     ParseOptions,
     mdast::{Code, List, ListItem, Node},
@@ -275,8 +273,7 @@ impl Renderer {
         format!("<li>{}</li>", self.render_block_nodes(&item.children))
     }
 
-    /// Routes a fenced block to either the Mermaid renderer or the syntax
-    /// highlighter.
+    /// Routes a fenced block to a diagram renderer or the syntax highlighter.
     ///
     /// A `mermaid` block is only offered to [`super::mermaid`] once its
     /// fence has closed — see [`unterminated_fence_start`] for why a
@@ -298,17 +295,30 @@ impl Renderer {
             .map(str::trim)
             .filter(|l| !l.is_empty());
 
-        let worth_trying = match language {
-            Some("mermaid" | "mmd") => true,
-            None => mermaid::looks_like_diagram(&code.value),
-            Some(_) => false,
-        };
-
-        if worth_trying
-            && self.fence_is_closed(code)
-            && let Some(diagram) = mermaid::render(&code.value)
-        {
-            return render_diagram(diagram, &code.value);
+        if self.fence_is_closed(code) {
+            match language {
+                Some("mermaid" | "mmd") => {
+                    if let Some(diagram) = mermaid::render(&code.value) {
+                        return render_diagram(diagram, &code.value);
+                    }
+                }
+                Some("plantuml" | "puml" | "pu") => {
+                    if let Some(diagram) = plantuml::render(&code.value) {
+                        return render_plantuml_diagram(diagram, &code.value);
+                    }
+                }
+                None if plantuml::looks_like_diagram(&code.value) => {
+                    if let Some(diagram) = plantuml::render(&code.value) {
+                        return render_plantuml_diagram(diagram, &code.value);
+                    }
+                }
+                None if mermaid::looks_like_diagram(&code.value) => {
+                    if let Some(diagram) = mermaid::render(&code.value) {
+                        return render_diagram(diagram, &code.value);
+                    }
+                }
+                _ => {}
+            }
         }
 
         render_code_block(language, &code.value)
@@ -388,6 +398,33 @@ fn render_diagram(diagram: &mermaid::Diagram, source: &str) -> String {
     )
 }
 
+fn render_plantuml_diagram(diagram: &plantuml::Diagram, source: &str) -> String {
+    let size = if diagram.width > 0.0 {
+        format!(
+            " width=\"{:.0}\" height=\"{:.0}\"",
+            diagram.width, diagram.height
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<figure class=\"plantuml-diagram\">\
+         <img class=\"plantuml-light\" src=\"{light}\" alt=\"PlantUML diagram\"{size}>\
+         <img class=\"plantuml-dark\" src=\"{dark}\" alt=\"PlantUML diagram\"{size}>\
+         <div class=\"diagram-actions\">{}{}{}{}</div>\
+         <details class=\"diagram-source\"><summary>Diagram source</summary>\
+         <pre><code>{}</code></pre></details>\
+         </figure>",
+        format_download_link(&diagram.light, "diagram-dl-light", "svg"),
+        format_download_link(&diagram.light_png, "diagram-dl-light", "png"),
+        format_download_link(&diagram.dark, "diagram-dl-dark", "svg"),
+        format_download_link(&diagram.dark_png, "diagram-dl-dark", "png"),
+        escape_html(source),
+        light = escape_attr(&diagram.light),
+        dark = escape_attr(&diagram.dark),
+    )
+}
+
 /// The download control on a diagram, mirroring the answer footer's
 /// Save-as-Markdown button.
 ///
@@ -404,6 +441,15 @@ fn download_link(data_uri: &str, class: &str) -> String {
     format!(
         "<a class=\"diagram-dl {class}\" href=\"{}\" download=\"orangu-diagram.svg\" \
          title=\"Download SVG\" aria-label=\"Download diagram as SVG\">{SAVE_ICON}</a>",
+        escape_attr(data_uri)
+    )
+}
+
+fn format_download_link(data_uri: &str, class: &str, format: &str) -> String {
+    let upper = format.to_ascii_uppercase();
+    format!(
+        "<a class=\"diagram-dl {class}\" href=\"{}\" download=\"orangu-plantuml.{format}\" \
+         title=\"Download {upper}\" aria-label=\"Download diagram as {upper}\">{SAVE_ICON}<span>{upper}</span></a>",
         escape_attr(data_uri)
     )
 }
@@ -567,6 +613,32 @@ mod tests {
         assert!(html.contains("<img class=\"mermaid-dark\" src=\"data:image/svg+xml;base64,"));
         // The source survives as copyable, screen-reader-legible text.
         assert!(html.contains("flowchart TD"));
+    }
+
+    #[test]
+    fn renders_plantuml_with_svg_and_png_downloads() {
+        let html =
+            render_markdown_to_html("```plantuml\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
+        assert!(
+            html.contains("<figure class=\"plantuml-diagram\">"),
+            "{html}"
+        );
+        assert!(html.contains("class=\"plantuml-light\" src=\"data:image/svg+xml;base64,"));
+        assert!(html.contains("download=\"orangu-plantuml.svg\""));
+        assert!(html.contains("download=\"orangu-plantuml.png\""));
+        assert!(html.contains("data:image/png;base64,"));
+        assert!(html.contains("Alice -&gt; Bob") || html.contains("Alice -&gt; Bob: hello"));
+    }
+
+    #[test]
+    fn plantuml_streaming_and_fallback_match_mermaid_behaviour() {
+        let open = render_markdown_to_html("```plantuml\n@startuml\nAlice -> Bob: hi\n@enduml");
+        assert!(!open.contains("plantuml-diagram"), "{open}");
+        let unsupported = render_markdown_to_html(
+            "```plantuml\n@startuml\n!include https://example.com/theme.puml\nA -> B\n@enduml\n```",
+        );
+        assert!(!unsupported.contains("plantuml-diagram"), "{unsupported}");
+        assert!(unsupported.contains("!include"));
     }
 
     #[test]
