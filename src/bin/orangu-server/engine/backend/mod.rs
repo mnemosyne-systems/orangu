@@ -44,7 +44,9 @@
 
 pub mod cpu;
 pub mod cuda;
+pub mod device;
 pub mod metal;
+pub mod multi;
 pub mod opencl;
 #[cfg(feature = "rocm")]
 pub mod rocm;
@@ -54,7 +56,9 @@ pub mod vulkan_shaders;
 
 pub use cpu::CpuBackend;
 pub use cuda::CudaBackend;
+pub use device::{DeviceCandidate, DeviceError, DeviceErrorKind, DeviceRequest};
 pub use metal::MetalBackend;
+pub use multi::MultiDeviceBackend;
 pub use opencl::OpenClBackend;
 #[cfg(feature = "rocm")]
 pub use rocm::RocmBackend;
@@ -236,6 +240,30 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// [`Backend::as_wgpu`] for work scoped to **one layer**, on the device
+    /// that layer's weights were placed on.
+    ///
+    /// `device` is always read off a weight this call is about
+    /// (`QuantMatrix::device`), never tracked separately, so it cannot
+    /// disagree with where `matmul` will send the same layer's operands —
+    /// there is one map, and it lives on the weights.
+    ///
+    /// This is what lets a *split* model keep the fused, GPU-resident
+    /// per-layer paths. `as_wgpu` has to answer `None` on a split, because
+    /// the things that reach for it without a layer in hand — the
+    /// whole-step decode submission, GPU sampling, the logits readback —
+    /// span layers and so span devices. A per-layer fused chain does not:
+    /// it takes host input, returns host output, and touches only that
+    /// layer's weights and that layer's KV. Answering `None` for those too
+    /// would put attention and every norm back on the CPU for no reason.
+    ///
+    /// Every weight of one layer is on one device (`engine::placement`
+    /// assigns whole layers), which is the invariant that makes a single
+    /// answer per layer correct.
+    fn as_wgpu_on(&self, _device: usize) -> Option<&VulkanBackend> {
+        self.as_wgpu()
+    }
+
     /// Whether this backend has a kernel for `ggml_type`.
     ///
     /// `CpuBackend` goes straight through `quant::dequantize`, so it covers
@@ -290,6 +318,32 @@ pub fn unsupported_tensor_types<'a>(
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// Splits `tensors` (name, stored bytes) into what a GPU backend uploads
+/// and what stays in host memory — `(device_bytes, host_bytes)`.
+///
+/// The same [`is_cpu_only_tensor`] rule [`unsupported_tensor_types`] uses,
+/// and for the same reason: a routed expert's weights never reach the
+/// device, so counting them against a card's VRAM would overstate the
+/// footprint of every MoE model by most of its file size.
+///
+/// This is an upper bound on the device side, not a prediction. A tensor is
+/// uploaded on first use, so a layer no request ever reaches is never
+/// uploaded at all — but every layer of a served model is reached by the
+/// first token, so the bound is tight in practice and loose only for a
+/// model that is loaded and never used.
+pub fn device_resident_split<'a>(tensors: impl Iterator<Item = (&'a str, u64)>) -> (u64, u64) {
+    let mut device = 0u64;
+    let mut host = 0u64;
+    for (name, bytes) in tensors {
+        if is_cpu_only_tensor(name) {
+            host += bytes;
+        } else {
+            device += bytes;
+        }
+    }
+    (device, host)
 }
 
 fn is_cpu_only_tensor(name: &str) -> bool {

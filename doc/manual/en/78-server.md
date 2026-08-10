@@ -69,6 +69,22 @@ dependency on any C or C++ inference library.
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
+- `engine/backend/device.rs` — *which* device a backend runs on: the
+  ranking policy, the `[orangu-server].device` override, and the startup
+  inventory. Shared by all five GPU backends, and deliberately free of any
+  one API's types so it is testable without a GPU.
+- `engine/footprint.rs` — what *this model* costs on that device: weights
+  split device/host, headroom, and how much context the headroom buys.
+  Distinct from `engine/plan.rs`, which answers the same family of question
+  about a GGUF nobody has opened yet, in terms of system RAM.
+- `engine/placement.rs` — which device runs which layer when a model is
+  spread across several: `SplitMode`, and the pure apportionment that turns
+  capacities into contiguous layer runs.
+- `engine/backend/multi.rs` — `MultiDeviceBackend`, the `Backend` that
+  routes each matmul to the device holding its weights.
+- `engine/expert_tier.rs` — which routed experts a *device* could hold, and
+  what holding them would be worth. Policy and projection only; nothing
+  executes on a device expert tier yet.
 - `engine/tokenizer.rs` — a from-scratch BPE tokenizer.
 - `engine/chat_template.rs` — renders `tokenizer.chat_template` via
   `minijinja`.
@@ -1285,11 +1301,428 @@ Apple targets the cascade starts with Metal instead — not a preference
 but a cost: macOS ships no Vulkan driver, so leading with Vulkan there is
 four retry rounds of guaranteed failure before reaching the API the
 machine actually has, and `MetalBackend` gives up nothing, being the same
-kernels. An
-explicit `backend = <name>` instead calls that one backend's `try_init`
-directly and fails to start if it returns `None`, rather than falling back
+kernels. On Windows, DX12 sits *behind* Vulkan and ahead of CUDA/OpenCL —
+also the same `wgpu` engine and the same WGSL (via `naga`'s HLSL output),
+so it reaches every fused path the matmul-only backends do not, but behind
+Vulkan because that is the API this engine was tuned on. An
+explicit `backend = <name>` instead brings up that one backend and fails
+to start if it can't, rather than falling back
 — useful when GPU inference was asked for specifically and a silent
 CPU fallback would be the wrong failure mode.
+
+### Device selection
+
+`backend` picks the API; `engine::backend::device` picks the device within
+it. Every GPU backend exposes the same two entry points — `devices() ->
+Vec<DeviceCandidate>` (enumeration only, no device creation, so it is safe
+and cheap on a machine with no driver) and `try_init_index(index)` /
+`try_init_selected(&[index])` — and
+`select_backend` drives both through the one shared policy, resolving
+`--device` first, then `ORANGU_DEVICE`, then `[orangu-server].device`
+(`requested_device`).
+
+**Selection returns a set, not a device.** `device::select_all` answers
+with every candidate the request admits, best first: under `auto` that is
+the whole ranked hardware list, and under an index or a name it is exactly
+one — which is what makes a named device *exclusive* rather than merely
+preferred. The head runs the model; the tail is carried into
+`VulkanBackend::device_selection` purely so the startup inventory and
+`/props` can report it. The distinction is load-bearing before any
+placement pass exists: "orangu chose this card out of three" and "orangu
+was told to use this card and nothing else" are different runs, and only
+the second one stays correct when a second card appears in the machine.
+
+`DeviceRole` is what the inventory reports per device — `InUse`, `Idle`
+(selected but not running the model), or `Excluded` with a reason. An idle
+device is named as idle rather than as "available": a second card sitting
+unused beside a slow first one is a question worth answering on the same
+screen as the number that prompted it.
+
+The enumeration itself goes through the same short retry as bring-up
+(`devices_with_retry`). A driver whose previous context has just been torn
+down can briefly report *no* adapters, and `request_adapter` used to hide
+that inside the retried call by both choosing and creating in one step —
+splitting the two apart would otherwise have turned a restart race into
+"no device was found" on a machine that has one.
+
+The policy ranks by class, then by size: discrete > unclassified >
+virtual > integrated, with software rasterizers never selected
+automatically (orangu's own `CpuBackend` is faster than llvmpipe, and a
+software adapter reporting itself as a GPU run is worse than useless).
+Class beats size deliberately — an iGPU reports the machine's whole system
+RAM as its memory and would otherwise win on a laptop. Unknown size ranks
+last *within* a class but never demotes a device out of it: "unknown" is
+not "zero", which is `llama.cpp`'s own rule for its `--fit` accounting.
+
+What this replaced was `request_adapter(PowerPreference::HighPerformance)`
+— a *hint*, answered by the loader, and routinely answered with the
+integrated GPU on a machine that also has a card. `llama-server` has the
+same trap and the same fix (`--device Vulkan1`).
+
+Three properties are worth keeping if this code is touched:
+
+- **The inventory is printed unconditionally**, on every start, marking
+  the device in use. It is what makes a measurement attributable, and a
+  diagnostic that has to be enabled before the run it describes is not
+  one. It also goes into `/props` next to the tuning report.
+- **A named device that isn't there is an error listing the ones that
+  are** — never a fall-back. This holds under `backend = auto` too: a
+  backend can only be chosen by satisfying the request, and a request no
+  backend in the cascade could satisfy stops the server at the end of the
+  chain instead of dropping to the CPU. An A/B between two cards is
+  worthless if one run quietly measured the other card.
+- **An ambiguous name is rejected**, not resolved by rank. Two identical
+  cards is precisely the case where picking one silently destroys the
+  comparison being attempted.
+
+`VRAM` comes from `vulkan_replay::adapter_device_local_bytes`, which
+reaches through `Adapter::as_hal` to `vkGetPhysicalDeviceMemoryProperties`
+— `wgpu` has no memory query on any backend. It reports heap *size*, not
+`VK_EXT_memory_budget`'s free figure: ranking wants a property of the card,
+and a card that happens to be driving a compositor must not be demoted
+below an iGPU for it. On non-Vulkan APIs it answers `None`, which the
+policy already handles.
+
+Each backend's `try_init()` (no index) still exists but is now `#[cfg(test)]`:
+tests want a device and don't care which, while the server proper always
+goes through enumerate → select → report → `try_init_selected`.
+
+### Device footprint
+
+`engine::footprint::DeviceFootprint` measures the loaded model against the
+chosen device, at startup, and prints it under the inventory.
+
+- **Weights** come from `LoadedModel::tensor_sizes` split by
+  `engine::backend::device_resident_split`, which reuses the same
+  `is_cpu_only_tensor` predicate the startup type check uses. That is what
+  keeps a MoE model's routed experts — which have no GPU path at all —
+  from being charged against VRAM: a 20.6 GiB Qwen3.6-35B-A3B reports
+  2.26 GiB on device and 18.35 GiB in host memory.
+- **KV** comes from `KvCache::gpu_mirror_bytes`, called on a
+  `new_kv_cache(1)` probe. The per-layer `kv_dim`/`stride` is fixed model
+  geometry, so a one-token cache — which `main` already builds for the
+  slot-persistence fingerprint — carries the whole shape, and the sizing
+  then scales it to a context far too large to allocate. Recurrent layers
+  are excluded: they have no GPU mirror.
+- `kv_cache::gpu_layer_bytes` sits directly above `GpuLayerCache::new` and
+  has to agree with it; `kv_mirror_bytes_agree_with_the_allocation` pins
+  the arithmetic to literals rather than restating the formula, so a
+  mistake in the original can't be copied into the test that guards it.
+
+**It reports, it does not refuse.** Weights reach the device lazily and are
+never evicted, the KV cache is sized per request rather than at the context
+limit, and the arenas grow to the widest prefill — so "does it fit" is not
+decidable at startup, while headroom and what that headroom buys are. A
+model whose weights exceed VRAM gets a warning naming the shortfall and
+keeps running: the driver pages, which is slow rather than broken, and
+refusing would convert working configurations into failures. Resist adding
+a verdict here.
+
+### Splitting a model across devices
+
+`engine::placement` decides which device holds which layer;
+`engine::backend::multi::MultiDeviceBackend` makes it happen. The whole
+design rests on one observation: **a `QuantMatrix` can carry its own
+device**.
+
+`LoadedModel::matrix` is the single place every architecture obtains a
+weight, and it knows the tensor's name — so it stamps each matrix with the
+device its `blk.<n>.` layer was placed on (`LoadedModel::layer_device`, set
+by `main` between loading the weights and building the model, because
+building the model is what calls `matrix`). `MultiDeviceBackend::matmul`
+then reads `w.device()` and forwards. **Not one line of any forward pass
+changes**, and there are eleven of them.
+
+The cross-device transfer falls out of the same shape rather than being
+written: `Backend::matmul` already takes host `&[f32]` and returns host
+`Vec<f32>`, so a layer on device 0 ends with its output in host memory and
+the next layer's first matmul uploads it to device 1. There is no
+peer-to-peer path and no residual to shuttle by hand.
+
+**Two hooks, and the line between them is layer scope.**
+
+`Backend::as_wgpu_on(device)` is for work scoped to one layer: fused
+attention, the fused post-attention/FFN chain, the device-side KV mirror.
+Each takes host input, returns host output, and touches only that layer's
+weights and cache, so it runs happily on whichever card the layer is on.
+`device` is always read off a weight the call is about
+(`QuantMatrix::device`) rather than tracked separately — one map, living on
+the weights, so it cannot disagree with where `matmul` sends the same
+layer's operands.
+
+`Backend::as_wgpu()` still answers `None` on a split, and now means
+something narrower: work that *spans* layers. The whole-step decode
+submission (~37 submissions down to 1), GPU sampling, the logits readback.
+Those assume one device holds the whole chain.
+`multi::tests::a_split_model_never_exposes_a_wgpu_backend` and
+`per_layer_work_asks_the_layer_s_own_device` hold both halves.
+
+The KV mirror is safe by construction: a layer's device never changes,
+`sync_gpu` is only ever called from inside a `VulkanBackend` (so the mirror
+lands on that backend's own device), and `LayerCache::copy_prefix_from`
+drops the mirror, so no buffer survives into a cache reused elsewhere.
+
+Measured on the dev machine, release build, a 0.5B model split 3:1 over two
+GPUs: **11.9 tok/s** with per-layer fusion off, **14.9** with it on,
+against **27.8** unsplit. Per-layer fusion is worth about a quarter.
+`ORANGU_NO_SPLIT_FUSION=1` is what makes that A/B possible from one binary
+— measuring it by building a second binary is how a stale copy ends up
+being the thing timed.
+
+**The whole-layer decode chain, per device run.** A split used to lose
+`record_fused_layer` for the *whole* model, not just at boundaries: the
+recorder is reached through `as_wgpu()`, which answers `None`. Every layer
+therefore fell to the step-by-step path, which round-trips through host
+memory between individual ops.
+
+`LlamaModel::record_split_decode` restores it. `record_decode_run` takes a
+**layer range**, a host input vector, and whether to append the tail; a
+single-device model is one run over every layer with the tail — the same
+code that ran before it took a range — and a split model is one run per
+device, with the hidden state crossing to host in between
+(`VulkanBackend::submit_and_read_at`). The vocab projection runs where
+`output_weight` is, which is device 0, so a model whose last layers are
+elsewhere pays one more hand-off.
+
+Two measurements decided that design, and the first killed the obvious
+alternative:
+
+- **Submission count is not a cost here.** On one device,
+  `ORANGU_DECODE_CHUNKS=24` (one submission per layer) measured *faster*
+  than the default single submission — 47.6 against 41.3 tok/s — because
+  early chunks execute while the CPU records later ones. So there is no
+  reason to keep one encoder alive across a device switch, which is the
+  hard part of that design and is now simply not needed.
+- **It was the kernel, not the second device.** Before the fix, moving a
+  *single* layer to the iGPU dropped decode from 32.2 to 13.9 tok/s while
+  moving twelve dropped it only to 16.1 — a shape no "second card is
+  slower" explanation produces.
+
+Result, one batch, 0.5B model, 3:1 split:
+
+| | decode |
+| :-- | --: |
+| unsplit | 41.8 tok/s |
+| split, all split GPU work on | **21.2 tok/s** |
+| split, all off (`ORANGU_NO_SPLIT_FUSION=1`) | 12.1 tok/s |
+
+**+75%.** And the diagnostic that exposed the bug is monotonic again: one
+iGPU layer now costs 26.4 tok/s against 41.4 unsplit, twelve cost 19.1 —
+consistent with a slower second device and a per-boundary hand-off, which
+is what is left and is inherent.
+
+**llama, phi and mistral** all have it, each verified live on a split with
+byte-identical output to the same run with the paths disabled:
+
+| family | split, on | split, off |
+| :-- | --: | --: |
+| llama/qwen2 (0.5B Q4_K_M) | 21.2 tok/s | 12.1 |
+| phi (Phi-4-mini Q4_K_M) | 14.0 tok/s | 9.5 |
+| mistral (Ministral-3B IQ3_XXS) | 5.0 tok/s | 2.9 |
+
+Consistently +47% to +75%. gemma is verified for correctness on a split
+(`gemma-4-12B` across both cards) rather than for speed — 36 of its 48
+layers land on a 4 GiB card, so that run is dominated by driver paging and
+says nothing about the chain. The one piece shared across the three is
+`arch::decode_device_runs` — the grouping of consecutive layers by device,
+and the rule that any layer without a GPU behind it declines the whole
+chain (which is how a CPU overflow tier opts out). It is shared precisely
+because its failure mode is silent: a mis-grouped run would record a
+layer's fused chain against the wrong card's weights.
+
+**gemma has it too**, with one exclusion. Its recorder takes an encoder
+from the caller — the cross-sequence batched path shares one across
+sequences — so the range and `with_tail` slot in without disturbing that,
+and `record_split_decode` brings its own encoder per run.
+
+The exclusion is **per-layer embeddings**. `record_one_sequence_decode`
+projects the token embedding once into a `[n_layer, per_layer]` `ple_buf`
+that every layer reads a slice of, and that buffer belongs to one device.
+Worse, a later run's `x` is a mid-model hidden state, not the token
+embedding, so recomputing it per run needs the original vector threaded
+through as well. A model with PLE therefore declines the chain and takes
+the step-by-step path; that is gemma-3n (`gemma-4-E2B` and relatives).
+Dense gemma-4 has `per_layer == 0` and is unaffected. `has_ple` also
+requires `layers.start == 0`, so the guard is in the code as well as in the
+caller.
+
+(Absolute numbers move between measurement batches with GPU clock state.
+Only compare within one batch.)
+
+Points worth preserving if this is extended:
+
+- **Contiguous runs, never interleaved.** Crossings per token equal the
+  number of boundaries, and interleaving would make it one per layer.
+- **Shares follow reported memory**, which on an iGPU is the whole of
+  system RAM — so `all` will over-weight the slower device on a
+  dGPU+iGPU box. Explicit ratios exist for that; inventing a correction
+  factor would be a guess.
+- **One API per split.** Every device comes from one backend's own
+  enumeration, so a model can never be spread across two vendors' kernels,
+  whose different accumulation orders would make output depend on which
+  layers landed where.
+- **Non-`wgpu` backends refuse** rather than silently running on one
+  device. `CudaBackend`/`OpenClBackend`/`RocmBackend` are matmul-only and
+  unverified against real hardware; an untested multi-device path there
+  would be worse than none.
+- **Device loss policy is unchanged**: any device's loss is `device_lost::
+  fail`'s exit 75 and a coordinator restart. A partial-device server is not
+  a state worth supporting.
+
+### The CPU as a device
+
+`SplitMode::Cpu` appends `CpuBackend` to the device set as the last entry
+and lets `placement` place layers on it. Nothing else was needed:
+`MultiDeviceBackend` holds `Arc<dyn Backend>`, and the CPU is one.
+
+Three things make it a *fill* (`placement::fill_in_order`) rather than a
+share, and they are the parts worth keeping:
+
+- **The host's budget is system RAM**, so a proportional share would hand
+  it most of the model. It gets only what the devices could not hold.
+- **The first device is charged for the non-layer tensors** — token
+  embeddings, output norm, `lm_head` — because `device_for_tensor` puts
+  them there. A live Kimi-K3 fill put 4.96 GiB of weights on a card
+  budgeted for 3.20 GiB before that subtraction existed.
+- **A plan that puts every layer on the host is still returned**, not
+  discarded as "not a split": the embeddings stay on device 0 either way,
+  and dropping the plan would hand the whole model back to the GPU, which
+  is the paging this mode exists to avoid, reached by asking for the
+  opposite. A test covers exactly that.
+
+`WEIGHTS_SHARE_OF_DEVICE` (0.8) is the only invented constant in the
+device work. It cannot be computed: the KV geometry needs a built model,
+and the model cannot be built until placement is decided, because building
+it is what stamps each tensor's device. Explicit ratios are the escape
+hatch, and the footprint report says afterwards what the choice left.
+
+`configure_cpu_threads` sizes rayon's *global* pool once, before anything
+parallel runs — `CpuBackend`'s matmul, `project_expert`, and the
+per-expert fan-out all share it, so the knob belongs there rather than on
+any one of them. Unset leaves rayon's own default, so a config that says
+nothing keeps the behaviour it had. `0` is rejected: rayon reads
+`num_threads(0)` as "the default", which would make a typo silently mean
+the opposite of what it looks like.
+
+NUMA and P-core/E-core awareness stay out of scope. That is a decision
+rather than an oversight: rayon's pool is unaware of core topology, and
+pinning workers to a socket or to P-cores only pays once there is a
+measurement saying the default placement is the bottleneck.
+
+### Device expert tiers — the seam, and why it stops there
+
+Routed experts are host-resident (`is_cpu_only_tensor`), and a hot subset
+lives in owned RAM under `engine::expert_store`'s budget, with an LRU/LFRU
+policy and a learned-heat sidecar that survives a restart. A *device* tier
+would be the same idea in VRAM. Two pieces of it exist:
+
+- `ExpertQuantMatrix::expert_matrix(e)` — one expert as an ordinary
+  `QuantMatrix`, zero-copy. This is the piece that makes a device expert
+  tier a **dispatch** problem rather than a kernel one: every GPU backend
+  already has a kernel for every quant type an expert is stored in,
+  `Backend::matmul` takes a `QuantMatrix`, and `MultiDeviceBackend` already
+  routes one by the device stamped on it. Unused outside its tests, and
+  marked `#[allow(dead_code)]` rather than deleted, because the two tests
+  over it (byte-identical against `row()`, distinct cache keys per expert)
+  are what make the first dispatch a small change.
+- `engine::expert_tier` — the placement policy: whole experts, hottest
+  first, fastest device first, all three borrowed from colibri. Its
+  `coverage()` is the number the whole decision turns on, and its
+  `projection()` is printed at startup for a MoE model on a GPU.
+
+**The dispatch now exists**, behind `ORANGU_GPU_EXPERTS=1` and off by
+default. `arch::gpu_project_expert` views one expert as a `QuantMatrix`
+(`ExpertQuantMatrix::expert_matrix`) and hands it to `Backend::matmul` —
+**no new kernel**, which is what the seam was for: every GPU backend
+already has one for every quantization an expert is stored in. It declines
+to the host path when the backend has no GPU or no kernel for that type
+(the `IQ*` types large MoE models often ship in are exactly the gap).
+
+It is a **measurement knob before it is a feature**, and it does no
+residency management at all: every expert it touches lands in the weight
+arena, which never evicts. Point it at a device that cannot hold them and
+the number it produces is driver paging.
+
+What it exists to answer is R2's own premise — whether a GPU expert matmul
+beats `engine::vecdot`'s tuned AVX2/rayon path *at all*, given that this
+dispatch is a blocking submit-and-readback per (expert, projection, layer).
+
+**Measured, and batching is what decides it.** Qwen3.6-35B-A3B with its
+dense part on the iGPU, page cache warm, same prompt throughout:
+
+| routed experts on | decode |
+| :-- | --: |
+| CPU (`engine::vecdot`, AVX2 + rayon) | 2.12–2.14 tok/s |
+| GPU, one dispatch per expert | 1.39–1.42 tok/s |
+| GPU, batched across experts | 2.67–3.71, settling ~3.3 tok/s |
+
+One dispatch per expert *loses* to the host by 1.5×; batching them —
+`arch::evaluate_routed_experts_batched`, one `matmul_batch` per (layer,
+projection) rather than one blocking submit-and-readback per expert — turns
+that into a 1.55× win. `matmul_batch` requires a uniform token count, so
+ops bucket by `n_tokens`; at decode that is one bucket.
+
+Three traps in measuring this, all hit while doing so:
+
+- **Both sides must be warm.** Cold, the same run is 0.09 tok/s prefill and
+  0.22 decode. That number is storage, not matmul.
+- **The number rises across a run** as experts land in the weight arena and
+  stop being read from the page cache. Take the settled value, not the
+  first.
+- **A different prompt routes a different expert set** and gives a
+  different number. Compare only within one prompt.
+
+**The tier is bounded.** `main::plan_expert_tier` chooses the resident set
+up front from `expert_tier::plan` — half the device's free memory after the
+dense weights — and stamps it per expert
+(`ExpertQuantMatrix::is_device_resident`). Non-resident experts stay on the
+host path through `engine::expert_store` as always, so the batch never
+pulls an expert into an arena that cannot evict it. On the model above that
+is 15978 of 30720 experts in a fixed 9.40 GiB, measuring 2.68–2.74 tok/s:
+some of the unbounded win given back, because 48% of routed experts fall
+back, in exchange for a tier that does not grow until the device is full.
+
+Five MoE architectures take the batched path — `qwen35moe`, `qwen3next`,
+`glm`, `deepseek4`, `kimi3` — each supplying its own activation closure.
+gemma's MoE does not: it projects a *fused* `gate_up` tensor by row range
+rather than separate gate/up tensors, so it needs a variant of the helper.
+
+The resident set is filled from the routing profile
+(`ORANGU_EXPERT_USAGE`, `expert_store::learned_heat`) when one exists and
+by size otherwise; the startup line says which, because that choice is most
+of what the tier is worth — colibri measured the same tier 3–5× apart
+depending on it. Every number above is the *by size* floor.
+
+The batched path bypasses `engine::expert_store`'s residency tier, which is
+correct for weights in VRAM and wrong for the host path, so non-resident
+experts keep `project_expert`.
+
+**What is still not built is the tier**, and the projection is why. On this project's dev machine a 20.6 GiB MoE model on a
+4 GiB card leaves room for 5% of the experts — a tier that cannot pay for
+itself whatever the kernels look like. Three things would have to be true
+before it should be:
+
+1. **Enough coverage to matter**, measured on the target machine, and
+   **`ORANGU_GPU_EXPERTS=1` beating the host path** on it. If the naive
+   dispatch loses badly there is still hope in step 2; if it loses by an
+   order of magnitude, there is not.
+2. **Batched dispatch.** `project_expert` is called per expert per
+   projection per layer, and the knob above issues one blocking
+   submit-and-readback for each. The shape that works is one
+   `matmul_batch` per (layer, projection) over every routed expert —
+   `MatmulOp` already carries a per-op `x`, so the operands fit, but
+   `evaluate_routed_experts` would have to be restructured into
+   gather-then-batch **without disturbing its bit-identical accumulation
+   order**, across six architectures.
+3. **A bounded residency.** `VulkanBackend::weight_buffer`'s arena never
+   evicts, so experts reaching it on demand grow without limit. Placement
+   has to choose the resident set up front, from the profile — which is
+   exactly what `expert_tier::plan` returns, and which
+   `ORANGU_GPU_EXPERTS` deliberately skips.
+
+The honest prior is not favourable: colibri's own finding is that a GPU
+expert tier "earns its VRAM only when the CPU is the weak link", and
+orangu's host expert path is tuned AVX2 over rayon.
 
 ### The Vulkan backend
 

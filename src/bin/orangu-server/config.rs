@@ -16,6 +16,8 @@
 //! Configuration for `orangu-server`: a single `[orangu-server]` section
 //! naming the models directory, and the address the HTTP server binds to.
 
+use crate::engine::backend::DeviceRequest;
+use crate::engine::placement::SplitMode;
 use anyhow::{Context, Result, anyhow};
 use orangu::config::parse_ini_sections;
 use std::{
@@ -155,6 +157,14 @@ pub fn bundled_configuration(
         // on a bundle do the one thing somebody would reach for it to do.
         web_host_explicit: false,
         backend: default_backend(),
+        // A bundle is built for a machine nobody will configure, so it takes
+        // the ranking policy rather than an index that would only be right
+        // on the box the bundle was built on.
+        device: default_device(),
+        device_split: default_device_split(),
+        // A bundle runs on a machine nobody sized, so it takes rayon's own
+        // choice rather than a count that was right where it was built.
+        threads: None,
         // The bundle's own model is not a spec resolved against `models`, so
         // it is not this key — `main::prepare` reaches for it directly. Left
         // `None` so `--daemon` doesn't try to resolve a repo name against the
@@ -268,9 +278,9 @@ pub enum BackendPreference {
     /// Tries every GPU backend compiled into this build, otherwise falls
     /// back to the CPU backend — no error either way. The order is
     /// Vulkan, CUDA, OpenCL, then — only if built with the `rocm` Cargo
-    /// feature — ROCm, except on Apple targets, where Metal is tried
-    /// first: it is the only GPU API macOS actually ships, and it reaches
-    /// the same kernels (see `main.rs::select_backend`).
+    /// feature — ROCm, plus two platform-only entries: Metal ahead of
+    /// everything on Apple targets (the only GPU API macOS ships) and DX12
+    /// behind Vulkan on Windows. See `main.rs::select_backend`.
     #[default]
     Auto,
     Cpu,
@@ -280,6 +290,11 @@ pub enum BackendPreference {
     Vulkan,
     /// Same fail-loudly contract as `Vulkan`, for an Apple Metal device.
     Metal,
+    /// Same fail-loudly contract as `Vulkan`, for a Direct3D 12 device.
+    /// The same `wgpu` engine and WGSL kernels as `Vulkan`, reached through
+    /// `naga`'s HLSL output — for a Windows machine whose GPU has a D3D12
+    /// driver but no Vulkan one.
+    Dx12,
     /// Same fail-loudly contract as `Vulkan`, for an NVIDIA CUDA device.
     Cuda,
     /// Same fail-loudly contract as `Vulkan`, for an OpenCL device.
@@ -292,6 +307,19 @@ pub enum BackendPreference {
 
 pub fn default_backend() -> BackendPreference {
     BackendPreference::Auto
+}
+
+/// The device the ranking policy picks — the highest-ranked hardware
+/// device the selected backend reports. See `engine::backend::device`.
+pub fn default_device() -> DeviceRequest {
+    DeviceRequest::Auto
+}
+
+/// One device runs the whole model — what orangu did before it could do
+/// anything else. See [`ServerConfiguration::device_split`] for why this,
+/// and not `auto`, is the default.
+pub fn default_device_split() -> SplitMode {
+    SplitMode::Off
 }
 
 /// Whether the web console may load a different model — see
@@ -359,6 +387,29 @@ pub struct ServerConfiguration {
     /// (the default) whichever GPU this platform finds first, falling back
     /// to CPU.
     pub backend: BackendPreference,
+    /// *Which device* within [`backend`](Self::backend) — an enumeration
+    /// index, a substring of the device's name, or (the default) the
+    /// ranking policy in `engine::backend::device`.
+    ///
+    /// Separate from `backend` because they answer different questions and
+    /// a machine can need both: `backend` picks the API, this picks the
+    /// card. Overridden at run time by `ORANGU_DEVICE`.
+    pub device: DeviceRequest,
+    /// Whether to spread one model's layers across the selected devices,
+    /// and how — `off` (the default), `auto`, `all`, or explicit
+    /// proportions. See `engine::placement`.
+    ///
+    /// Off by default because a split model gives up every fused
+    /// GPU-resident path in this engine (see `engine::backend::multi`), so
+    /// it buys capacity at a real cost in speed. Overridden at run time by
+    /// `ORANGU_DEVICE_SPLIT`.
+    pub device_split: SplitMode,
+    /// How many worker threads every CPU path in this process shares —
+    /// `CpuBackend`'s matmul, the MoE expert loop, the per-expert fan-out.
+    ///
+    /// `None` (the default) leaves `rayon`'s own choice of one worker per
+    /// logical core. Overridden at run time by `ORANGU_THREADS`.
+    pub threads: Option<usize>,
     /// A model spec (local path, `NR`/`MODEL` label, or `<user>/<model>
     /// [:quant]` Hugging Face repo) — the same shape as the CLI's
     /// positional `model` argument. Only consulted in `--daemon` mode,
@@ -574,17 +625,57 @@ pub fn load_server_configuration(
             "cpu" => BackendPreference::Cpu,
             "vulkan" => BackendPreference::Vulkan,
             "metal" => BackendPreference::Metal,
+            "dx12" => BackendPreference::Dx12,
             "cuda" => BackendPreference::Cuda,
             "opencl" => BackendPreference::OpenCl,
             "rocm" => BackendPreference::Rocm,
             other => {
                 return Err(anyhow!(
                     "invalid value for [{SERVER_SECTION}].backend: '{other}' \
-                     (expected auto, cpu, vulkan, metal, cuda, opencl, or rocm)"
+                     (expected auto, cpu, vulkan, metal, dx12, cuda, opencl, or rocm)"
                 ));
             }
         },
         None => default_backend(),
+    };
+
+    // No validation here, deliberately. Whether `device = 2` or
+    // `device = navi` names anything is a question only the enumerated
+    // device list can answer, and that list doesn't exist until a backend
+    // has been chosen and its driver asked — so the error belongs at
+    // startup, where it can print the devices that *do* exist alongside it,
+    // not here, where it could only say "that isn't a number".
+    let device = section
+        .get("device")
+        .map(|value| DeviceRequest::parse(value))
+        .unwrap_or_else(default_device);
+
+    // Unlike `device`, this one *is* validated here: `auto`/`all`/`off` and
+    // a ratio list are decidable without asking a driver anything, so a
+    // typo should stop the server at the config file rather than silently
+    // becoming "off" and quietly running the shape nobody asked for.
+    let threads = match section.get("threads") {
+        Some(value) => {
+            let threads = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].threads: {err}"))?;
+            if threads == 0 {
+                return Err(anyhow!(
+                    "invalid value for [{SERVER_SECTION}].threads: 0 (leave the key out for \
+                     one worker per logical core)"
+                ));
+            }
+            Some(threads)
+        }
+        None => None,
+    };
+
+    let device_split = match section.get("device_split") {
+        Some(value) => SplitMode::parse(value).map_err(|err| {
+            anyhow!("invalid value for [{SERVER_SECTION}].device_split: {err} (expected off, auto, all, or a list such as 3,1)")
+        })?,
+        None => default_device_split(),
     };
 
     let mut mcp_servers = sections
@@ -605,6 +696,9 @@ pub fn load_server_configuration(
         web_host,
         web_host_explicit,
         backend,
+        device,
+        device_split,
+        threads,
         reexec,
         delete,
         mcp_servers,
@@ -962,6 +1056,7 @@ mod tests {
             ("vulkan", BackendPreference::Vulkan),
             ("metal", BackendPreference::Metal),
             ("METAL", BackendPreference::Metal),
+            ("dx12", BackendPreference::Dx12),
             ("cuda", BackendPreference::Cuda),
             ("CUDA", BackendPreference::Cuda),
             ("opencl", BackendPreference::OpenCl),
@@ -978,6 +1073,138 @@ mod tests {
             let conf = load_server_configuration(file.path(), None, false).unwrap();
             assert_eq!(conf.backend, expected, "backend = {value}");
         }
+    }
+
+    /// `device` reads as an index, a name, or the policy — and its absence
+    /// is the policy, so every config written before the key existed keeps
+    /// choosing a device the same way.
+    #[test]
+    fn loads_the_device_key_in_each_of_its_three_forms() {
+        for (value, expected) in [
+            ("auto", DeviceRequest::Auto),
+            ("1", DeviceRequest::Index(1)),
+            ("RX 7900", DeviceRequest::Name("RX 7900".to_string())),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\ndevice = {value}\n"
+            )
+            .unwrap();
+
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.device, expected, "device = {value}");
+        }
+    }
+
+    #[test]
+    fn an_absent_device_key_is_the_ranking_policy() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.device, DeviceRequest::Auto);
+    }
+
+    /// A device that doesn't exist is *not* rejected here. It cannot be:
+    /// nothing at config-parse time has asked a driver what the machine
+    /// has, and rejecting `device = 9` without being able to print the
+    /// devices that do exist would be a worse error than the one startup
+    /// gives.
+    #[test]
+    fn a_nonexistent_device_is_not_a_config_error() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\ndevice = 9\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.device, DeviceRequest::Index(9));
+    }
+
+    #[test]
+    fn loads_every_form_of_device_split() {
+        for (value, expected) in [
+            ("off", SplitMode::Off),
+            ("auto", SplitMode::Auto),
+            ("ALL", SplitMode::All),
+            ("3,1", SplitMode::Ratios(vec![3.0, 1.0])),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\ndevice_split = {value}\n"
+            )
+            .unwrap();
+
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.device_split, expected, "device_split = {value}");
+        }
+    }
+
+    /// One device runs the model unless something says otherwise — a config
+    /// written before this key existed must keep the behaviour it had.
+    #[test]
+    fn an_absent_device_split_key_keeps_the_model_on_one_device() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.device_split, SplitMode::Off);
+    }
+
+    /// Unlike `device`, this one *is* decidable at parse time — so a typo
+    /// must stop the server rather than becoming a silent `off`, which is
+    /// precisely the outcome somebody setting the key is trying to avoid.
+    #[test]
+    fn rejects_an_invalid_device_split_value() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\ndevice_split = sideways\n"
+        )
+        .unwrap();
+
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("device_split"), "{message}");
+        assert!(message.contains("off, auto, all"), "{message}");
+    }
+
+    #[test]
+    fn loads_the_threads_key_and_rejects_zero() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\nthreads = 6\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.threads, Some(6));
+
+        // Absent means rayon's own choice, not "no threads".
+        let mut bare = tempfile::NamedTempFile::new().unwrap();
+        writeln!(bare, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        assert_eq!(
+            load_server_configuration(bare.path(), None, false)
+                .unwrap()
+                .threads,
+            None
+        );
+
+        // Zero is a mistake rather than a way to say "default": rayon reads
+        // `num_threads(0)` as the default, which would make a typo silently
+        // mean the opposite of what it looks like.
+        let mut zero = tempfile::NamedTempFile::new().unwrap();
+        writeln!(zero, "[orangu-server]\nmodels = /srv/models\nthreads = 0\n").unwrap();
+        let err = load_server_configuration(zero.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("threads"), "{err}");
+    }
+
+    #[test]
+    fn cpu_is_a_device_split_mode() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\ndevice_split = cpu\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.device_split, SplitMode::Cpu);
     }
 
     #[test]

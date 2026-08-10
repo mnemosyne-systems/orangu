@@ -708,6 +708,8 @@ impl GemmaModel {
             x,
             slot_id + 1,
             timestamps.as_ref(),
+            0..self.layers.len(),
+            true,
         );
 
         if let Some(t) = &timestamps {
@@ -742,6 +744,87 @@ impl GemmaModel {
     /// breakdown — a real per-sequence batched-decode timing breakdown
     /// would need its own, wider query set, not implemented here.
     #[allow(clippy::too_many_arguments)]
+    /// The fused per-layer decode chain on a model whose layers live on
+    /// more than one device: one encoder per run of consecutive layers
+    /// sharing a device, with the hidden state crossing to host memory in
+    /// between. See `LlamaModel::record_split_decode`, which this mirrors.
+    ///
+    /// **Declines when this model has per-layer embeddings.** PLE is
+    /// projected once from the token embedding into a `[n_layer,
+    /// per_layer]` buffer that every layer reads a slice of, and that
+    /// buffer belongs to one device. Recomputing it per run would be
+    /// correct and is the way to lift this; until then a gemma-3n split
+    /// takes the step-by-step path. gemma-4 has `per_layer == 0` and is
+    /// unaffected.
+    fn record_split_decode(
+        &self,
+        cache: &mut KvCache,
+        token: u32,
+        start_pos: usize,
+        x: &[f32],
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        if self.n_embd_per_layer > 0 {
+            return None;
+        }
+        let runs = super::decode_device_runs(
+            self.backend.as_ref(),
+            self.layers.iter().map(|layer| layer.wo.device()),
+        )?;
+        if runs.len() < 2 {
+            return None;
+        }
+        let tail_device = self.output_weight.device();
+
+        let mut hidden = x.to_vec();
+        for (index, (device, layers)) in runs.iter().enumerate() {
+            let vulkan = self.backend.as_wgpu_on(*device)?;
+            let with_tail = index + 1 == runs.len() && *device == tail_device;
+            let mut encoder = vulkan.new_encoder("orangu-server gemma decode run");
+            let (buf, offset) = self.record_one_sequence_decode(
+                vulkan,
+                &mut encoder,
+                cache,
+                token,
+                start_pos,
+                &hidden,
+                slot_id + 1,
+                // Timestamp query sets belong to one device, so a
+                // multi-run decode has nothing coherent to write into.
+                None,
+                layers.clone(),
+                with_tail,
+            );
+            if with_tail {
+                return Some(vulkan.submit_and_readback_for(
+                    encoder,
+                    &self.output_weight,
+                    slot_id + 1,
+                ));
+            }
+            hidden = vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd);
+        }
+
+        // The last layers were not on the vocab projection's device.
+        let vulkan = self.backend.as_wgpu_on(tail_device)?;
+        let mut encoder = vulkan.new_encoder("orangu-server gemma decode tail");
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Cpu(&hidden),
+            &self.output_norm,
+            self.rms_eps(),
+            self.config.n_embd,
+        );
+        vulkan.record_full_matmul(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_one_sequence_decode(
         &self,
         vulkan: &VulkanBackend,
@@ -752,6 +835,8 @@ impl GemmaModel {
         x: &[f32],
         batch_slot: usize,
         timestamps: Option<&wgpu::QuerySet>,
+        layers: std::ops::Range<usize>,
+        with_tail: bool,
     ) -> (wgpu::Buffer, u64) {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
@@ -761,7 +846,14 @@ impl GemmaModel {
         // layer's PLE sub-chain (ple_gate matmul + gelu + mul + ple_proj matmul
         // + norm), so the throughput delta vs default isolates PLE's
         // recoverable cost. Not a correctness knob.
-        let has_ple = per_layer > 0 && std::env::var_os("ORANGU_SKIP_PLE").is_none();
+        // `layers.start == 0` as well: PLE projects the *token embedding*,
+        // and a later run's `x` is a mid-model hidden state. A split model
+        // declines the whole chain when it has PLE (see
+        // `Self::record_split_decode`), so this only ever guards the case
+        // that cannot arise — cheaply, and in the one place a future
+        // per-run PLE would have to change.
+        let has_ple =
+            per_layer > 0 && layers.start == 0 && std::env::var_os("ORANGU_SKIP_PLE").is_none();
 
         let ple_buf = if has_ple {
             let gathered = self.gather_per_layer_tok_embd(&[token], 1);
@@ -807,7 +899,8 @@ impl GemmaModel {
         let layers_per_chunk = n_layers.div_ceil(chunks);
 
         let mut prev_buf: Option<(wgpu::Buffer, u64)> = None;
-        for (il, layer) in self.layers.iter().enumerate() {
+        for il in layers.clone() {
+            let layer = &self.layers[il];
             let head_dim = layer.head_dim;
             // Proportional RoPE (a learned per-frequency divisor) only
             // applies to full-attention layers, matching gemma4.cpp's
@@ -939,7 +1032,7 @@ impl GemmaModel {
             // one (`finish_timestamps`); every intermediate encoder is
             // submitted before that resolve executes, so the whole query set
             // is populated by then.
-            if chunks > 1 && il + 1 < n_layers && (il + 1) % layers_per_chunk == 0 {
+            if chunks > 1 && il + 1 < layers.end && (il + 1) % layers_per_chunk == 0 {
                 let finished =
                     std::mem::replace(encoder, vulkan.new_encoder("orangu-server decode chunk"));
                 vulkan.submit_intermediate(finished);
@@ -947,6 +1040,11 @@ impl GemmaModel {
         }
         let (last_buf, last_offset) =
             prev_buf.expect("a gemma4 model always has at least one layer");
+        if !with_tail {
+            // This run's hidden state, for the caller to read back and hand
+            // to the next device.
+            return (last_buf, last_offset);
+        }
         let normed_buf = vulkan.record_output_norm(
             encoder,
             GpuInput::Gpu(&last_buf, (last_offset / 4) as usize),
@@ -1056,7 +1154,9 @@ impl GemmaModel {
             let mut fused_attn_buf: Option<wgpu::Buffer> = None;
             let fused_attn = self
                 .backend
-                .as_wgpu()
+                // This layer's card: a fused attention chain is per-layer
+                // and needs no cross-layer state, so a split model keeps it.
+                .as_wgpu_on(layer.wo.device())
                 .filter(|vulkan| vulkan.prefill_fused_attention_enabled())
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
@@ -1237,6 +1337,8 @@ impl GemmaModel {
                     &mut cache.layers[cache_index],
                     &crate::engine::attention::Params {
                         backend: self.backend.as_ref(),
+                        // This layer's card — see `attention::Params::device`.
+                        device: layer.wo.device(),
                         n_head: self.n_head,
                         n_head_kv: layer.n_head_kv,
                         head_dim,
@@ -1268,27 +1370,29 @@ impl GemmaModel {
             // time, and it takes the step-by-step path below.
             let t0 = Instant::now();
             let fused_layer = if layer.moe.is_none() {
-                self.backend.as_wgpu().and_then(|vulkan| {
-                    vulkan.fused_post_attention_prefill(
-                        match &fused_attn_buf {
-                            Some(b) => {
-                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
-                            }
-                            None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
-                        },
-                        &x,
-                        n_tokens,
-                        &layer.wo,
-                        Some(&layer.attn_post_norm),
-                        &layer.ffn_norm,
-                        &layer.ffn_gate,
-                        &layer.ffn_up,
-                        &layer.ffn_down,
-                        Some(&layer.ffn_post_norm),
-                        eps,
-                        crate::engine::backend::vulkan::FfnActivation::Geglu,
-                    )
-                })
+                self.backend
+                    .as_wgpu_on(layer.wo.device())
+                    .and_then(|vulkan| {
+                        vulkan.fused_post_attention_prefill(
+                            match &fused_attn_buf {
+                                Some(b) => {
+                                    crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
+                                }
+                                None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                            },
+                            &x,
+                            n_tokens,
+                            &layer.wo,
+                            Some(&layer.attn_post_norm),
+                            &layer.ffn_norm,
+                            &layer.ffn_gate,
+                            &layer.ffn_up,
+                            &layer.ffn_down,
+                            Some(&layer.ffn_post_norm),
+                            eps,
+                            crate::engine::backend::vulkan::FfnActivation::Geglu,
+                        )
+                    })
             } else {
                 None
             };
@@ -1362,15 +1466,18 @@ impl GemmaModel {
                     // for `ORANGU_Q4K_MMVQ`, which needs a quantize pass the fused
                     // recorder doesn't emit.
                     let t0 = Instant::now();
-                    let fused = self.backend.as_wgpu().and_then(|vulkan| {
-                        vulkan.fused_ffn_prefill(
-                            &ffn_normed,
-                            n_tokens,
-                            &layer.ffn_gate,
-                            &layer.ffn_up,
-                            &layer.ffn_down,
-                        )
-                    });
+                    let fused = self
+                        .backend
+                        .as_wgpu_on(layer.wo.device())
+                        .and_then(|vulkan| {
+                            vulkan.fused_ffn_prefill(
+                                &ffn_normed,
+                                n_tokens,
+                                &layer.ffn_gate,
+                                &layer.ffn_up,
+                                &layer.ffn_down,
+                            )
+                        });
                     if let Some(mut ffn_out) = fused {
                         if prefill_trace {
                             eprintln!(
@@ -1448,16 +1555,19 @@ impl GemmaModel {
                 // the same strided slices one token at a time instead.
                 let t0 = Instant::now();
                 let mut gather_ms = 0.0;
-                let fused = self.backend.as_wgpu().and_then(|vulkan| {
-                    let t_gather = Instant::now();
-                    let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
-                    for t in 0..n_tokens {
-                        let base = (t * self.layers.len() + il) * per_layer;
-                        per_layer_in.extend_from_slice(&inp_per_layer[base..base + per_layer]);
-                    }
-                    gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
-                    vulkan.fused_ple_prefill(&x, n_tokens, gate_w, proj_w, &per_layer_in)
-                });
+                let fused = self
+                    .backend
+                    .as_wgpu_on(layer.wo.device())
+                    .and_then(|vulkan| {
+                        let t_gather = Instant::now();
+                        let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
+                        for t in 0..n_tokens {
+                            let base = (t * self.layers.len() + il) * per_layer;
+                            per_layer_in.extend_from_slice(&inp_per_layer[base..base + per_layer]);
+                        }
+                        gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
+                        vulkan.fused_ple_prefill(&x, n_tokens, gate_w, proj_w, &per_layer_in)
+                    });
                 let mut proj = if let Some(proj) = fused {
                     if prefill_trace {
                         eprintln!(
@@ -1580,6 +1690,8 @@ impl GemmaModel {
                     &x,
                     item.slot_id + 1,
                     None,
+                    0..self.layers.len(),
+                    true,
                 )
             })
             .collect();
@@ -1893,8 +2005,14 @@ impl ModelForward for GemmaModel {
         // load/subtract when a Vulkan backend is in use; free otherwise.
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let trace = *TRACE.get_or_init(|| std::env::var("ORANGU_GPU_TRACE").is_ok());
+        // `as_wgpu_on(0)` rather than `as_wgpu`: on a split model the latter
+        // is `None` by design, and a submission counter that goes silent on
+        // the configuration whose submission count is most in question is
+        // no counter at all. Device 0's count is the one that moves for
+        // every layer placed there, which is enough to tell a fused run
+        // from an unfused one.
         let submissions_before = (trace && n_tokens == 1)
-            .then(|| self.backend.as_wgpu())
+            .then(|| self.backend.as_wgpu_on(0))
             .flatten()
             .map(|v| v.submission_count());
 
@@ -1943,7 +2061,17 @@ impl ModelForward for GemmaModel {
         // — a separate, CPU-orchestrated submit-and-wait — the way `Self::
         // run_layers_cpu` (used by the CPU-orchestrated `else` branch below,
         // and by `Self::forward_hidden_states`) still does internally.
-        let mut logits = if n_tokens == 1
+        // A split model has no single-device backend, so the whole-step
+        // recorder below cannot see it; `record_split_decode` runs the same
+        // chain one device-run at a time instead. `None` from it falls
+        // through to the CPU-orchestrated branch, which is also what a
+        // gemma-3n split and a CPU backend get.
+        let split_logits = (n_tokens == 1 && !self.is_moe && self.backend.as_wgpu().is_none())
+            .then(|| self.record_split_decode(cache, tokens[0], start_pos, &x, slot_id))
+            .flatten();
+        let mut logits = if let Some(logits) = split_logits {
+            logits
+        } else if n_tokens == 1
             && !self.is_moe
             && let Some(vulkan) = self.backend.as_wgpu()
         {
@@ -1987,7 +2115,7 @@ impl ModelForward for GemmaModel {
             }
         }
         if let Some(before) = submissions_before
-            && let Some(vulkan) = self.backend.as_wgpu()
+            && let Some(vulkan) = self.backend.as_wgpu_on(0)
         {
             eprintln!(
                 "orangu-server: [gpu-trace] {} GPU submissions for this decode step (pos {start_pos})",
@@ -2878,8 +3006,22 @@ impl GemmaModel {
                     let n_ff = gate_up.out_dim / 2;
                     let scale = scale.as_ref().map(|s| s[expert]);
                     (
-                        super::project_expert(gate_up, expert, 0, n_ff, &inputs),
-                        super::project_expert(gate_up, expert, n_ff, n_ff, &inputs),
+                        super::project_expert(
+                            self.backend.as_ref(),
+                            gate_up,
+                            expert,
+                            0,
+                            n_ff,
+                            &inputs,
+                        ),
+                        super::project_expert(
+                            self.backend.as_ref(),
+                            gate_up,
+                            expert,
+                            n_ff,
+                            n_ff,
+                            &inputs,
+                        ),
                         scale,
                         scale,
                     )
@@ -2890,8 +3032,22 @@ impl GemmaModel {
                     gate_scale,
                     up_scale,
                 } => (
-                    super::project_expert(gate, expert, 0, gate.out_dim, &inputs),
-                    super::project_expert(up, expert, 0, up.out_dim, &inputs),
+                    super::project_expert(
+                        self.backend.as_ref(),
+                        gate,
+                        expert,
+                        0,
+                        gate.out_dim,
+                        &inputs,
+                    ),
+                    super::project_expert(
+                        self.backend.as_ref(),
+                        up,
+                        expert,
+                        0,
+                        up.out_dim,
+                        &inputs,
+                    ),
                     gate_scale.as_ref().map(|s| s[expert]),
                     up_scale.as_ref().map(|s| s[expert]),
                 ),
@@ -2920,6 +3076,7 @@ impl GemmaModel {
             // the routing weight — both scalars, folded into one.
             let down_scale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]);
             super::project_expert(
+                self.backend.as_ref(),
                 &moe.down_exps,
                 expert,
                 0,

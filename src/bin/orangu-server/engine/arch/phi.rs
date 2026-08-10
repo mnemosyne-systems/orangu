@@ -379,12 +379,45 @@ impl PhiModel {
         start_pos: usize,
         slot_id: usize,
     ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
+        if tokens.len() != 1 {
+            return None;
+        }
+        let tok = tokens[0] as usize;
+        if tok >= self.config.n_vocab {
+            return None;
+        }
+        let x0 = self.tok_embeddings.row(tok).to_vec();
+        self.record_decode_run(
+            vulkan,
+            cache,
+            0..self.layers.len(),
+            &x0,
+            start_pos,
+            slot_id,
+            true,
+        )
+    }
+
+    /// One *run* of the decode chain — see `LlamaModel::record_decode_run`,
+    /// which this mirrors: layers `layers`, starting from the host vector
+    /// `x_in`, recorded into one encoder on one device. `with_tail` appends
+    /// `output_norm` and the vocab projection.
+    #[allow(clippy::too_many_arguments)]
+    fn record_decode_run(
+        &self,
+        vulkan: &crate::engine::backend::VulkanBackend,
+        cache: &mut KvCache,
+        layers: std::ops::Range<usize>,
+        x_in: &[f32],
+        start_pos: usize,
+        slot_id: usize,
+        with_tail: bool,
+    ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         use crate::engine::backend::vulkan::{
             FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput,
         };
 
-        if tokens.len() != 1
-            || crate::engine::arch::llama::no_fused_qkv()
+        if crate::engine::arch::llama::no_fused_qkv()
             || crate::engine::arch::llama::no_fused_post_attention()
         {
             return None;
@@ -396,11 +429,6 @@ impl PhiModel {
         let n_embd = cfg.n_embd;
         let head_dim = self.head_dim();
         let kv_dim = self.kv_dim();
-        let tok = tokens[0] as usize;
-        if tok >= cfg.n_vocab {
-            return None;
-        }
-        let x0 = self.tok_embeddings.row(tok).to_vec();
         let yarn = self.rope_yarn();
 
         let mut encoder = vulkan.new_encoder("orangu-server phi decode");
@@ -419,11 +447,12 @@ impl PhiModel {
             .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
             .collect();
         let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
-        for (il, layer) in self.layers.iter().enumerate() {
+        for il in layers.clone() {
+            let layer = &self.layers[il];
             let ((wq, wk, wv), (ffn_gate, ffn_up)) = &views[il];
             let x_input = match bufs.last() {
                 Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
-                None => GpuInput::Cpu(&x0),
+                None => GpuInput::Cpu(x_in),
             };
             let out = vulkan.record_fused_layer(
                 &mut encoder,
@@ -481,6 +510,11 @@ impl PhiModel {
         }
 
         let (last_buf, last_offset) = bufs.last()?;
+        if !with_tail {
+            let (buf, offset) = (last_buf.clone(), *last_offset);
+            ts.finish(vulkan, &mut encoder, n_layer);
+            return Some((encoder, buf, offset));
+        }
         let normed = vulkan.record_output_norm(
             &mut encoder,
             GpuInput::Gpu(last_buf, (*last_offset / 4) as usize),
@@ -510,7 +544,11 @@ impl PhiModel {
         start_pos: usize,
         slot_id: usize,
     ) -> Option<Vec<f32>> {
-        let vulkan = self.backend.as_wgpu()?;
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            // No single device holds the whole model: either there is no GPU
+            // at all, or the model is split.
+            return self.record_split_decode(cache, tokens, start_pos, slot_id);
+        };
         let (encoder, _, _) =
             self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)?;
         let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
@@ -518,6 +556,76 @@ impl PhiModel {
             vulkan.report_timestamps(start_pos, self.layers.len());
         }
         Some(logits)
+    }
+
+    /// The fused per-layer decode chain on a split model — see
+    /// `LlamaModel::record_split_decode`, which this mirrors: one encoder
+    /// per run of consecutive layers sharing a device, with the hidden
+    /// state crossing to host memory in between.
+    fn record_split_decode(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        if tokens.len() != 1 {
+            return None;
+        }
+        let tok = tokens[0] as usize;
+        if tok >= self.config.n_vocab {
+            return None;
+        }
+        let runs = super::decode_device_runs(
+            self.backend.as_ref(),
+            self.layers.iter().map(|layer| layer.wo.device()),
+        )?;
+        if runs.len() < 2 {
+            return None;
+        }
+        let tail_device = self.output_weight.device();
+
+        let mut x = self.tok_embeddings.row(tok).to_vec();
+        for (index, (device, layers)) in runs.iter().enumerate() {
+            let vulkan = self.backend.as_wgpu_on(*device)?;
+            let with_tail = index + 1 == runs.len() && *device == tail_device;
+            let (encoder, buf, offset) = self.record_decode_run(
+                vulkan,
+                cache,
+                layers.clone(),
+                &x,
+                start_pos,
+                slot_id,
+                with_tail,
+            )?;
+            if with_tail {
+                return Some(vulkan.submit_and_readback_for(
+                    encoder,
+                    &self.output_weight,
+                    slot_id + 1,
+                ));
+            }
+            x = vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd);
+        }
+
+        // The last layers were not on the vocab projection's device, so the
+        // tail is a run of its own.
+        let vulkan = self.backend.as_wgpu_on(tail_device)?;
+        let mut encoder = vulkan.new_encoder("orangu-server phi decode tail");
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Cpu(&x),
+            &self.output_norm,
+            self.config.rms_eps,
+            self.config.n_embd,
+        );
+        vulkan.record_full_matmul(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
     }
 
     fn run_layers(
@@ -624,6 +732,8 @@ impl PhiModel {
                 layer_cache,
                 &crate::engine::attention::Params {
                     backend: self.backend.as_ref(),
+                    // This layer's card — see `attention::Params::device`.
+                    device: layer.wo.device(),
                     n_head,
                     n_head_kv,
                     head_dim,
@@ -646,7 +756,8 @@ impl PhiModel {
             let (w_gate, w_up_half) = layer.ffn_gate_up();
             let fused = self
                 .backend
-                .as_wgpu()
+                // This layer's card — see `Backend::as_wgpu_on`.
+                .as_wgpu_on(layer.wo.device())
                 .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(

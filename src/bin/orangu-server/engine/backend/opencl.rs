@@ -55,6 +55,7 @@ use crate::engine::quant::{
     GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
+use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, MatmulOp};
 
 /// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
@@ -542,19 +543,75 @@ pub struct OpenClBackend {
 }
 
 impl OpenClBackend {
-    /// Looks for the first GPU-type OpenCL device and builds every
+    /// Looks for the first GPU-type OpenCL device ([`Self::try_init_index`]
+    /// names another) and builds every
     /// supported quant type's kernel up front. Returns `None` (never
     /// panics) if no OpenCL platform/device is found, or compilation
     /// otherwise fails — callers fall back to `CpuBackend`, the same
     /// contract `VulkanBackend`/`CudaBackend::try_init` have.
+    ///
+    /// **Tests only** — see `VulkanBackend::try_init`. `select_backend`
+    /// goes through [`Self::devices`] and [`Self::try_init_index`] so the
+    /// operator's `[orangu-server].device` is honoured and the device list
+    /// is reported.
+    #[cfg(test)]
     pub fn try_init() -> Option<Self> {
+        Self::try_init_index(0)
+    }
+
+    /// Every GPU-type OpenCL device across every installed platform, in
+    /// `clGetDeviceIDs` order — the order an index names.
+    ///
+    /// Only `CL_DEVICE_TYPE_GPU`, matching what [`Self::try_init_index`]
+    /// will bind: a CPU-type OpenCL device is a software path this engine
+    /// has a faster answer for, and an accelerator is not something these
+    /// kernels are written against.
+    ///
+    /// Class comes from `CL_DEVICE_HOST_UNIFIED_MEMORY`, which is what
+    /// OpenCL offers in place of a device-type distinction — a device
+    /// sharing the host's memory is an iGPU/APU by any other name.
+    pub fn devices() -> Vec<DeviceCandidate> {
+        if cfg!(target_vendor = "apple") {
+            return Vec::new();
+        }
+        let Ok(ids) = get_all_devices(CL_DEVICE_TYPE_GPU) else {
+            return Vec::new();
+        };
+        ids.into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let device = Device::new(id);
+                DeviceCandidate {
+                    index,
+                    name: device
+                        .name()
+                        .unwrap_or_else(|_| format!("OpenCL device {index}")),
+                    class: match device.host_unified_memory() {
+                        Ok(false) => DeviceClass::Discrete,
+                        Ok(true) => DeviceClass::Integrated,
+                        // Not "assume discrete": an ICD that won't answer
+                        // this has told us nothing, and `Other` is the class
+                        // that says so.
+                        Err(_) => DeviceClass::Other,
+                    },
+                    vram_total_bytes: device.global_mem_size().ok().filter(|size| *size > 0),
+                    id: None,
+                    driver: device.version().ok(),
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::try_init`] against a specific device in [`Self::devices`]'s
+    /// order.
+    pub fn try_init_index(index: usize) -> Option<Self> {
         // Apple's own OpenCL ICD reports a device but segfaults inside
         // clSetKernelArg on the first real matmul call (confirmed on Apple
         // Silicon). Refuse to initialize there rather than crash.
         if cfg!(target_vendor = "apple") {
             return None;
         }
-        let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU).ok()?.first()?;
+        let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU).ok()?.get(index)?;
         let device = Device::new(device_id);
         let device_name = device.name().unwrap_or_else(|_| "OpenCL".to_string());
         let context = Context::from_device(&device).ok()?;

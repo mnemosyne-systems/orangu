@@ -56,6 +56,7 @@ use crate::engine::quant::{
     GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
+use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, MatmulOp};
 
 /// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
@@ -524,7 +525,8 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
-    /// Looks for a usable CUDA device (ordinal 0) and compiles every
+    /// Looks for a usable CUDA device (ordinal 0 — [`Self::try_init_index`]
+    /// names another) and compiles every
     /// supported quant type's kernel via NVRTC up front. Returns `None`
     /// (never panics) if no CUDA driver is present, or compilation
     /// otherwise fails — callers fall back to `CpuBackend` in that case,
@@ -545,16 +547,84 @@ impl CudaBackend {
     /// here" outcome doesn't also print a scary backtrace), turning that
     /// panic into the same graceful `None` every other missing-backend path
     /// already returns.
+    ///
+    /// **Tests only** — see `VulkanBackend::try_init`. `select_backend`
+    /// goes through [`Self::devices`] and [`Self::try_init_index`] so the
+    /// operator's `[orangu-server].device` is honoured and the device list
+    /// is reported.
+    #[cfg(test)]
     pub fn try_init() -> Option<Self> {
+        Self::try_init_index(0)
+    }
+
+    /// [`Self::try_init`] against a specific CUDA ordinal, so a machine
+    /// with several NVIDIA cards can be told which one to use rather than
+    /// always getting ordinal 0.
+    pub fn try_init_index(index: usize) -> Option<Self> {
+        Self::guarded(|| Self::try_init_inner(index))
+    }
+
+    /// Every CUDA device this driver reports.
+    ///
+    /// Enumeration only — [`CudaContext::new`] is not called, so a machine
+    /// with no NVIDIA driver answers with an empty list instead of paying
+    /// context creation to find that out.
+    ///
+    /// Every device is [`DeviceClass::Discrete`]: CUDA does report an
+    /// `INTEGRATED` attribute (Jetson, Grace-Blackwell), but reading it
+    /// needs a context per device, which is the expensive thing this
+    /// deliberately avoids. The distinction costs nothing here — an
+    /// integrated NVIDIA part is never sharing the machine with a discrete
+    /// one, so the class can't change the ranking between two devices this
+    /// function returns. Size still can, and is read.
+    pub fn devices() -> Vec<DeviceCandidate> {
+        Self::guarded(|| {
+            let count = CudaContext::device_count().ok()?.max(0) as usize;
+            Some(
+                (0..count)
+                    .map(|index| DeviceCandidate {
+                        index,
+                        name: Self::device_name_at(index)
+                            .unwrap_or_else(|| format!("CUDA device {index}")),
+                        class: DeviceClass::Discrete,
+                        vram_total_bytes: Self::device_memory_at(index),
+                        id: None,
+                        driver: None,
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
+    }
+
+    /// The device name at `index`, without holding on to the context.
+    fn device_name_at(index: usize) -> Option<String> {
+        CudaContext::new(index).ok()?.name().ok()
+    }
+
+    /// Total device memory at `index`, for the selection policy's size
+    /// tie-break. `None` when the driver declines to say.
+    fn device_memory_at(index: usize) -> Option<u64> {
+        let device = cudarc::driver::result::device::get(index as i32).ok()?;
+        // SAFETY: `device` is a valid `CUdevice` from the call above, and
+        // `total_mem` only reads a property of it.
+        let bytes = unsafe { cudarc::driver::result::device::total_mem(device) }.ok()?;
+        (bytes > 0).then_some(bytes as u64)
+    }
+
+    /// Runs `f` with the panic hook silenced and unwinding caught — see
+    /// [`Self::try_init`] for why every entry point into `cudarc` needs
+    /// this and not just the one that builds a backend.
+    fn guarded<T>(f: impl FnOnce() -> Option<T> + std::panic::UnwindSafe) -> Option<T> {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(Self::try_init_inner);
+        let result = std::panic::catch_unwind(f);
         std::panic::set_hook(previous_hook);
         result.ok().flatten()
     }
 
-    fn try_init_inner() -> Option<Self> {
-        let ctx = CudaContext::new(0).ok()?;
+    fn try_init_inner(index: usize) -> Option<Self> {
+        let ctx = CudaContext::new(index).ok()?;
         let stream = ctx.default_stream();
         let device_name = ctx.name().unwrap_or_else(|_| "CUDA".to_string());
 

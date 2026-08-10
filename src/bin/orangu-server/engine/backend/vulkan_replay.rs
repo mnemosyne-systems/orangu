@@ -214,6 +214,50 @@ fn raw_buffer_handle(_b: &wgpu::Buffer) -> Result<vk::Buffer, String> {
     Err("buffer is not a Vulkan buffer: wgpu has no Vulkan backend on Apple targets".into())
 }
 
+/// The total size of an adapter's device-local memory heaps, for
+/// [`engine::backend::device`]'s ranking — `None` when the adapter isn't a
+/// Vulkan one or reports no device-local heap at all.
+///
+/// Lives here rather than in `vulkan.rs` because `wgpu` has no memory query
+/// on *any* backend and this is the only way to one: `as_hal` down to the
+/// `VkPhysicalDevice` and ask Vulkan directly. That is the same reach this
+/// module already exists to make, and keeping it here keeps `vulkan.rs`
+/// free of the per-target `cfg` the reach requires.
+///
+/// This is the heap *size*, deliberately, not `VK_EXT_memory_budget`'s free
+/// figure. Ranking wants the property of the card, which doesn't change;
+/// free memory is a property of the moment, and a card that happens to have
+/// a compositor on it must not be demoted below an iGPU for it. On an
+/// integrated GPU the device-local heap *is* system RAM, which is the same
+/// (correct, and easily misread) answer `orangu::hardware` reports for a
+/// `MemoryKind::Shared` GPU.
+///
+/// # Safety
+/// Borrows the adapter's raw handles for the duration of the query only,
+/// and neither stores nor destroys anything.
+#[cfg(not(target_vendor = "apple"))]
+pub fn adapter_device_local_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
+    let hal = unsafe { adapter.as_hal::<Vulkan>()? };
+    let instance = hal.shared_instance().raw_instance();
+    let phys = hal.raw_physical_device();
+    let props = unsafe { instance.get_physical_device_memory_properties(phys) };
+    let total: u64 = props.memory_heaps[..props.memory_heap_count as usize]
+        .iter()
+        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|heap| heap.size)
+        .sum();
+    (total > 0).then_some(total)
+}
+
+/// Apple build of [`adapter_device_local_bytes`]. Unlike the two helpers
+/// above this one is genuinely reached — device selection runs on every
+/// platform — and answers "unknown", which the ranking policy already has
+/// to handle for every adapter whose API declines to report a size.
+#[cfg(target_vendor = "apple")]
+pub fn adapter_device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
+}
+
 /// A raw host-visible, coherent, persistently-mapped buffer we own outright —
 /// used for the per-token uniforms (`pos`/`n_pos`) so an update is a plain
 /// `memcpy` with no staging and no `wgpu` submit.

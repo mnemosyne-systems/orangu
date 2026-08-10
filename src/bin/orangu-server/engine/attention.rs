@@ -47,6 +47,16 @@ use crate::engine::tensor;
 /// wide is a wrong answer rather than a compile error.
 pub struct Params<'a> {
     pub backend: &'a dyn Backend,
+    /// Which device this layer's weights are on — read straight off one of
+    /// them (`QuantMatrix::device`), so it cannot disagree with where the
+    /// same layer's matmuls go. `0` for every layer of an unsplit model,
+    /// which is every model unless `device_split` says otherwise.
+    ///
+    /// Attention is the reason this is threaded down here at all: on a
+    /// split model it is the single largest thing that would otherwise fall
+    /// back to the CPU loop, and it needs no cross-layer state to run on
+    /// the layer's own card.
+    pub device: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
@@ -193,7 +203,7 @@ pub fn attention_decode_on_device(
         params.n_swa,
         params.start_pos,
     );
-    let vulkan = params.backend.as_wgpu()?;
+    let vulkan = params.backend.as_wgpu_on(params.device)?;
     if !vulkan.prefill_attention_enabled() {
         return None;
     }
@@ -269,7 +279,7 @@ pub fn attention(
     // shaped for it: it parallelises over *positions* rather than over queries,
     // and at `n_tokens == 1` there is exactly one query to parallelise over.
     if n_tokens == 1
-        && let Some(vulkan) = params.backend.as_wgpu()
+        && let Some(vulkan) = params.backend.as_wgpu_on(params.device)
         && vulkan.prefill_attention_enabled()
     {
         let (window_start, window_end) = window(0);
@@ -293,7 +303,7 @@ pub fn attention(
     }
 
     if n_tokens >= min_gpu_tokens()
-        && let Some(vulkan) = params.backend.as_wgpu()
+        && let Some(vulkan) = params.backend.as_wgpu_on(params.device)
         && vulkan.prefill_attention_enabled()
     {
         *out = vulkan.gpu_attention_prefill(
@@ -565,6 +575,7 @@ mod tests {
                     let n_tokens = 9;
                     let params = Params {
                         backend: &crate::engine::backend::CpuBackend,
+                        device: 0,
                         n_head: 2,
                         n_head_kv: 1,
                         head_dim: 4,
@@ -600,6 +611,7 @@ mod tests {
         }
         let params = Params {
             backend: &backend,
+            device: 0,
             n_head: 1,
             n_head_kv: 1,
             head_dim: 4,
@@ -632,6 +644,7 @@ mod tests {
         let q: Vec<f32> = (0..32).map(|_| next()).collect();
         let params = Params {
             backend: &backend,
+            device: 0,
             n_head: 1,
             n_head_kv: 1,
             head_dim: 4,

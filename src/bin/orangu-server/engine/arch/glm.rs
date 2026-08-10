@@ -766,39 +766,72 @@ impl GlmModel {
             picks.iter().for_each(|&(e, _)| experts.select(e));
         }
 
-        let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
-            let inputs: Vec<&[f32]> = members
-                .iter()
-                .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                .collect();
-            let gate =
-                super::project_expert(&moe.gate_exps, expert, 0, moe.gate_exps.out_dim, &inputs);
-            let up = super::project_expert(&moe.up_exps, expert, 0, moe.up_exps.out_dim, &inputs);
-            let hidden: Vec<Vec<f32>> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(gate, up)| {
-                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                    tensor::mul_inplace(&mut h, &up);
-                    h
-                })
-                .collect();
-            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-            super::project_expert(
+        // The GPU expert path batches the three projections across experts —
+        // see `super::evaluate_routed_experts_batched`.
+        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+            super::evaluate_routed_experts_batched(
+                self.backend.as_ref(),
+                &selection,
+                normed,
+                n_embd,
+                &moe.gate_exps,
+                &moe.up_exps,
                 &moe.down_exps,
-                expert,
-                0,
-                moe.down_exps.out_dim,
-                &hidden_refs,
+                |gate, up| {
+                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                    tensor::mul_inplace(&mut h, up);
+                    h
+                },
             )
-            .into_iter()
-            .zip(members)
-            .map(|(mut contribution, &(_, weight))| {
-                contribution.iter_mut().for_each(|v| *v *= weight);
-                contribution
+        } else {
+            super::evaluate_routed_experts(&selection, |expert, members| {
+                let inputs: Vec<&[f32]> = members
+                    .iter()
+                    .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                    .collect();
+                let gate = super::project_expert(
+                    self.backend.as_ref(),
+                    &moe.gate_exps,
+                    expert,
+                    0,
+                    moe.gate_exps.out_dim,
+                    &inputs,
+                );
+                let up = super::project_expert(
+                    self.backend.as_ref(),
+                    &moe.up_exps,
+                    expert,
+                    0,
+                    moe.up_exps.out_dim,
+                    &inputs,
+                );
+                let hidden: Vec<Vec<f32>> = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(gate, up)| {
+                        let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                        tensor::mul_inplace(&mut h, &up);
+                        h
+                    })
+                    .collect();
+                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                super::project_expert(
+                    self.backend.as_ref(),
+                    &moe.down_exps,
+                    expert,
+                    0,
+                    moe.down_exps.out_dim,
+                    &hidden_refs,
+                )
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    contribution.iter_mut().for_each(|v| *v *= weight);
+                    contribution
+                })
+                .collect()
             })
-            .collect()
-        });
+        };
         experts.loaded_once_per_distinct_expert();
 
         for t in 0..n_tokens {

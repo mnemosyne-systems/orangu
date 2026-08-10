@@ -236,6 +236,40 @@ pub struct KvCastDispatch {
     pub meta_buf: wgpu::Buffer,
 }
 
+/// The storage-buffer offset alignment [`gpu_layer_bytes`] assumes when no
+/// device has been created yet.
+///
+/// 256 bytes is what every desktop driver this runs on reports, and it is
+/// `wgpu`'s own portable default. Using it without a device can only
+/// *overstate* the padding between the `k` and `v` regions (by at most 252
+/// bytes per layer), which is the safe direction for a budget.
+const ASSUMED_STORAGE_ALIGN: u64 = 256;
+
+/// The device bytes one layer's GPU mirror occupies at `rows` stored rows.
+///
+/// Deliberately adjacent to [`GpuLayerCache::new`], which is the allocation
+/// this has to agree with: two `kv_bytes` regions packed into one buffer at
+/// an aligned offset, plus the `[rows * n_head]` f32 attention scratch. A
+/// budget computed from a stale copy of that layout is worse than no budget
+/// at all, so `kv_mirror_bytes_agree_with_the_allocation` holds the two
+/// together.
+fn gpu_layer_bytes(
+    rows: usize,
+    kv_dim: usize,
+    n_head: usize,
+    kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    align: u64,
+) -> u64 {
+    let kv_bytes: u64 = match kv_storage {
+        crate::engine::backend::vulkan_shaders::KvStorage::F32 => (rows * kv_dim * 4) as u64,
+        crate::engine::backend::vulkan_shaders::KvStorage::F16 => (rows * kv_dim * 2) as u64,
+        crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => (rows * kv_dim / 32 * 36) as u64,
+    }
+    .max(1);
+    let v_off = kv_bytes.next_multiple_of(align.max(4));
+    v_off + kv_bytes + ((rows * n_head).max(1) * 4) as u64
+}
+
 impl GpuLayerCache {
     fn new(
         device: &wgpu::Device,
@@ -719,6 +753,41 @@ impl KvCache {
         }
     }
 
+    /// Device bytes this cache's *shape* would need at `token_capacity`
+    /// tokens — the GPU mirror only, not the host buffers.
+    ///
+    /// Takes the capacity as an argument rather than reading `self`'s so a
+    /// caller can size a context it has not allocated. That is the whole
+    /// point: `ModelForward::new_kv_cache(1)` costs nothing and answers the
+    /// shape question (how many layers, each layer's `kv_dim` and stride,
+    /// which is all fixed model geometry), and this then scales it to the
+    /// context an operator is actually asking about — which may be tens of
+    /// gigabytes and must not be allocated to be counted.
+    ///
+    /// Recurrent state is excluded: it has no GPU mirror (`sync_gpu` is a
+    /// method on the positional layers alone), so counting it here would
+    /// charge a linear-attention model for device memory it never takes.
+    pub fn gpu_mirror_bytes(
+        &self,
+        token_capacity: usize,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    ) -> u64 {
+        self.layers
+            .iter()
+            .filter(|layer| layer.kv_dim > 0)
+            .map(|layer| {
+                gpu_layer_bytes(
+                    token_capacity.div_ceil(layer.stride),
+                    layer.kv_dim,
+                    n_head,
+                    kv_storage,
+                    ASSUMED_STORAGE_ALIGN,
+                )
+            })
+            .sum()
+    }
+
     /// Like [`KvCache::new_with_dims`], plus a recurrent state per entry in
     /// `recurrent_specs` (`(conv_channels, d_conv, num_heads, head_dim)`),
     /// for a mixed attention/linear-attention architecture.
@@ -1083,6 +1152,84 @@ impl RecurrentLayerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::backend::vulkan_shaders::KvStorage;
+
+    /// [`gpu_layer_bytes`] has to agree with what [`GpuLayerCache::new`]
+    /// actually allocates, and nothing but a reading of both enforces it —
+    /// the allocation needs a `wgpu::Device`, so this restates its
+    /// arithmetic rather than calling it. Restated as *literals*, not as a
+    /// second expression of the same formula: a copy of the formula would
+    /// follow a mistake in the original into the test.
+    #[test]
+    fn kv_mirror_bytes_agree_with_the_allocation() {
+        // 8 rows x 64 kv_dim in f16 = 1024 bytes per region. `v` starts at
+        // the next 256-byte boundary, which 1024 already is, so the buffer
+        // is 2048; scratch is 8 rows x 4 heads x 4 bytes = 128.
+        assert_eq!(
+            gpu_layer_bytes(8, 64, 4, KvStorage::F16, 256),
+            2048 + 128,
+            "f16"
+        );
+        // f32 doubles both regions: 2048 each, `v` at 2048, buffer 4096.
+        assert_eq!(
+            gpu_layer_bytes(8, 64, 4, KvStorage::F32, 256),
+            4096 + 128,
+            "f32"
+        );
+        // q8_0 stores 32 elements in 36 bytes: 8*64/32 = 16 blocks = 576
+        // bytes, `v` padded up to 768, so 768 + 576 = 1344.
+        assert_eq!(
+            gpu_layer_bytes(8, 64, 4, KvStorage::Q8_0, 256),
+            1344 + 128,
+            "q8_0"
+        );
+    }
+
+    /// The sizing scales a probe cache built at capacity 1 — which is how
+    /// `engine::footprint` asks about a context far too large to allocate.
+    #[test]
+    fn gpu_mirror_bytes_scale_a_capacity_one_probe_to_a_real_context() {
+        let probe = KvCache::new(4, 1, 64);
+        let real = KvCache::new(4, 1024, 64);
+        assert_eq!(
+            probe.gpu_mirror_bytes(1024, 8, KvStorage::F16),
+            real.gpu_mirror_bytes(1024, 8, KvStorage::F16)
+        );
+        // And it is four layers' worth, not one.
+        assert_eq!(
+            probe.gpu_mirror_bytes(1024, 8, KvStorage::F16),
+            4 * gpu_layer_bytes(1024, 64, 8, KvStorage::F16, ASSUMED_STORAGE_ALIGN)
+        );
+    }
+
+    /// A strided layer stores one row per `stride` tokens, so its mirror is
+    /// that much smaller — the same rule `LayerCache::new_strided` applies
+    /// to the host buffers.
+    #[test]
+    fn gpu_mirror_bytes_follow_a_layers_stride() {
+        let dense = KvCache::new_with_strided_dims(1, &[(64, 1)]);
+        let blocked = KvCache::new_with_strided_dims(1, &[(64, 4)]);
+        assert_eq!(
+            blocked.gpu_mirror_bytes(1024, 8, KvStorage::F16),
+            gpu_layer_bytes(256, 64, 8, KvStorage::F16, ASSUMED_STORAGE_ALIGN)
+        );
+        assert!(
+            blocked.gpu_mirror_bytes(1024, 8, KvStorage::F16)
+                < dense.gpu_mirror_bytes(1024, 8, KvStorage::F16)
+        );
+    }
+
+    /// A recurrent layer has no GPU mirror, so it must not be charged for
+    /// one — and a mixed model's attention layers must still be counted.
+    #[test]
+    fn gpu_mirror_bytes_ignore_recurrent_state() {
+        let mixed = KvCache::new_mixed(1, &[64, 64], &[(128, 4, 8, 16)]);
+        let attention_only = KvCache::new(2, 1, 64);
+        assert_eq!(
+            mixed.gpu_mirror_bytes(512, 8, KvStorage::F16),
+            attention_only.gpu_mirror_bytes(512, 8, KvStorage::F16)
+        );
+    }
 
     #[test]
     fn push_then_read_back_key_and_value() {

@@ -103,9 +103,11 @@ resolved file is actually stored at, the same value `list`'s `QUANT` column
 shows, appended unless the model was named with a `:tag` of its own already.
 Its second field names the backend the forward pass actually
 ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `Metal/<device name>`,
-`CUDA/<device name>`,
+`DX12/<adapter name>`, `CUDA/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
-was used (see **GPU backend** below). The workspace line is the directory
+was used (see **GPU backend** below). Above the banner, a GPU backend also
+lists every device it saw and marks the one it took — see **Choosing a
+device**. The workspace line is the directory
 tree this server operates in (see **Workspace** below).
 
 Every completed request logs a throughput line, orangu-server-style:
@@ -343,6 +345,12 @@ the CPU, so no run can draw on a discrete card's VRAM *and* system RAM (or
 on two cards) at once. Dedicated VRAM is one of the
 candidates for it, which makes the `Dedicated` table above the *fast*
 subset of this one rather than a separate machine.
+
+Each budget names the pool it came from — `3.98 GiB (Navi 14 [Radeon RX
+5500M])`, or `62.19 GiB (system RAM)`. On a machine with several GPUs a
+bare byte count is a number whose most plausible misreading (the iGPU,
+which reports the whole of system RAM as its memory) is off by an order of
+magnitude.
 
 The memory-estimation formula mirrors [Sam McLeod's GGUF VRAM
 Estimator](https://smcleod.net/vram-estimator/): model weight bytes scale
@@ -723,6 +731,7 @@ host = all
 port = 8100
 slots = 1
 backend = auto
+device = auto
 role = all
 
 [web]
@@ -777,15 +786,31 @@ reexec = yes
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
-- `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
-  `opencl`, or
+- `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
+  `cuda`, `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
   (Vulkan, CUDA, OpenCL, then ROCm if built with the `rocm` feature),
   falling back to the CPU backend silently if none is found. **On macOS the
   order starts with Metal**, which is the only GPU API Apple ships — Vulkan
-  is still tried behind it, for a Mac running MoltenVK. Naming a
+  is still tried behind it, for a Mac running MoltenVK. **On Windows DX12
+  is tried behind Vulkan**, ahead of CUDA and OpenCL. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
+- `device` — *which card*, when `backend` finds more than one: `auto` (the
+  default — every device on the machine, best first, one of which runs the
+  model), an index as printed at startup, or any part of the device's name.
+  Naming one makes it exclusive. See **Choosing a device** below.
+  `--device` on the command line overrides this, and `ORANGU_DEVICE`
+  overrides the config file, for one run.
+- `device_split` — whether one model's layers are spread across those
+  devices: `off` (the default), `auto`, `all`, `cpu`, or explicit
+  proportions like `3,1`. A split buys capacity at a real cost in speed —
+  see **Splitting a model across devices** below. `--device-split` and
+  `ORANGU_DEVICE_SPLIT` override it for one run.
+- `threads` — how many worker threads every CPU path shares: the CPU
+  matmul, the MoE expert loop, and the per-expert fan-out. Unset (the
+  default) means one per logical core. `--threads` and `ORANGU_THREADS`
+  override it for one run.
 - `role` — `all` (the default), `code`, `review`, `explorer`, or
   `embedding`. See **Roles** below. Resolved in this order: an explicit CLI
   flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`) wins
@@ -995,10 +1020,342 @@ Metal device and runs the model on the GPU. Earlier releases fell back to
 the CPU there, because Apple ships no Vulkan driver and Metal had no
 backend yet.
 
+- **DX12** (`backend = dx12`, Windows) — the Vulkan backend's engine and
+  kernels again, this time on Direct3D 12: the same WGSL, translated to
+  HLSL instead of SPIR-V. Like Metal, it is not a reimplementation, so
+  every fused GPU-resident path is live on it. It exists for the Windows
+  machine whose GPU has a working D3D12 driver but no Vulkan one, which
+  until now ran on the CPU without ever saying why. Untested against real
+  hardware during development — treat it as the CUDA/OpenCL/ROCm backends
+  are treated until verified on your own machine.
+
+On macOS, `backend = auto` needs no configuration: it finds the machine's
+Metal device and runs the model on the GPU. Earlier releases fell back to
+the CPU there, because Apple ships no Vulkan driver and Metal had no
+backend yet.
+
 Naming a `backend` explicitly fails to start rather than silently falling
 back to the CPU, for when GPU inference was asked for specifically.
 Startup prints which backend actually ran the model (see **Quick start**
 above).
+
+### Choosing a device
+
+`backend` picks the *API*. On a machine with more than one GPU — a laptop
+with a discrete card beside the CPU's integrated one, or a workstation
+with two cards — something also has to pick the *device*, and `device`
+does.
+
+Startup prints every processor in the machine — the CPU and every device
+the chosen backend reports, the devices **in the order it ranked them** —
+and says what each one is doing:
+
+```
+orangu-server: [vulkan] 1: AMD Radeon RX 5500M (RADV NAVI14) [discrete, 4.00 GiB, 0000:03:00.0] <- in use
+orangu-server: [vulkan] 0: AMD Radeon Graphics (RADV RENOIR) [integrated, 21.06 GiB, 0000:08:00.0] — selected, idle
+orangu-server: [vulkan] 2: llvmpipe (LLVM 22.1.8, 256 bits) [software, 62.19 GiB] — not selected: software rasterizer
+orangu-server: [cpu] AMD Ryzen 7 4800H [8 cores / 16 threads, AVX2, 62.19 GiB RAM, 16 worker threads (default)] — not running layers
+```
+
+The CPU line is printed even when a GPU is doing the work: the tokenizer,
+the sampler and — on a split model — attention all run there, so its core
+count, instruction set and worker-thread count are part of what a
+throughput number means. `threads` sizes that worker pool.
+
+The number at the start of each line is the device's *enumeration* index —
+the thing `device = <n>` names — which is why the lines are not in
+numerical order. Here the discrete card is device 1 and the iGPU is device
+0, and the ranking puts them the other way round.
+
+`selected, idle` is not a bug. `device = auto` selects **every** hardware
+device on the machine, best first; one of them runs the model. The others
+are reported so a second card cannot sit in a machine unnoticed while a
+throughput number is taken on the first, and so the order a future
+device-splitting placement pass would walk is visible now.
+
+Left to itself (`device = auto`, the default), orangu ranks them:
+
+1. **discrete** GPUs — a card with its own VRAM. Largest first.
+2. GPUs the driver did not classify, then **virtual** (passthrough) ones.
+3. **integrated** GPUs — an iGPU or APU, whose "VRAM" is a slice of the
+   same system RAM the CPU is using. Real, and much better than nothing,
+   but last among GPUs.
+4. **software** rasterizers (llvmpipe, lavapipe, WARP) are **never**
+   chosen automatically. They are a CPU pretending to be a GPU, and
+   orangu's own CPU backend is faster. They can still be named
+   explicitly, which is a legitimate way to exercise the GPU code path on
+   a machine without a GPU.
+
+Note that class beats size: an integrated GPU routinely reports the
+machine's whole system RAM as its memory, which would otherwise make it
+look like the biggest device on the machine.
+
+This matters more than it sounds. Before orangu ranked devices, it asked
+the driver for a "high-performance" adapter and took whatever came back —
+and on a dual-GPU machine that is routinely the integrated one. A
+throughput number from an unnamed device is not a throughput number, which
+is why the inventory above is printed on every start rather than hidden
+behind a flag.
+
+#### Pinning one device
+
+Naming a device makes it **exclusive**: that device and nothing else is
+selected, so the inventory shows every other one as `not selected`. Three
+ways to say it, in order of precedence — the command line wins over the
+environment, which wins over the config file:
+
+```sh
+orangu-server --device 1 model.gguf          # this run
+ORANGU_DEVICE=1 orangu-server model.gguf     # this run, for a sweep script
+```
+
+```ini
+[orangu-server]
+backend = vulkan
+device = 1
+```
+
+```ini
+# The same choice, spelled so it survives a driver reordering the list
+device = Radeon RX 5500M
+```
+
+A name match is case-insensitive and matches on any substring, but must
+match exactly one device: two identical cards are an error telling you to
+use an index, rather than a silent pick between them.
+
+The environment form is what a benchmark sweep uses to walk a machine's
+cards without editing anything:
+
+```sh
+ORANGU_DEVICE=0 orangu-server model.gguf
+ORANGU_DEVICE=1 orangu-server model.gguf
+```
+
+A device that does not exist is a **startup error listing the devices that
+do**, never a fall-back to a different one — an A/B between two cards is
+worthless if one of the runs quietly measured the wrong card. The same
+applies under `backend = auto`: a backend can only be chosen by satisfying
+`device`, so a request no backend could satisfy stops the server rather
+than dropping to the CPU.
+
+The full device list is also in `GET /props`, so a benchmark result
+carries the machine's other cards alongside the one that produced it.
+
+By default one device still runs the whole model. `device` chooses
+*which*; **`device_split` is what spreads one model across several** — see
+**Splitting a model across devices** below.
+
+#### What the model puts on the device
+
+Under the inventory, a GPU backend reports what this particular model costs
+on the device it chose:
+
+```
+orangu-server: [vulkan] weights 2.26 GiB on device, 18.35 GiB in host memory (routed experts)
+orangu-server: [vulkan] 2.26 GiB of 4.00 GiB used by weights, 1.74 GiB free — room for about 88064 tokens of F16 KV across 1 slot
+```
+
+Three things worth reading off it:
+
+- **Weights on device** is exact, not an estimate: it is the sum of the
+  tensor bytes a GPU backend uploads, from the model's own tensor table.
+- **In host memory** appears only for mixture-of-experts models. Routed
+  expert tensors have no GPU path at all, so they never count against
+  VRAM. That is why a 20 GiB MoE model reports 2.26 GiB on a 4 GiB card,
+  and why judging such a model by its file size is misleading in both
+  directions.
+- **Room for about N tokens** is the headroom divided by what a thousand
+  tokens of KV cache costs, across the configured `slots`, capped at the
+  context the model was trained for. It is the number to act on when
+  choosing `slots` or a context length.
+
+If the weights alone are larger than the device, a fourth line says so and
+by how much. That is a **warning, not a refusal** — the driver will page
+weights in and out of VRAM on every token, which is slow rather than
+broken, and refusing to start would turn a working (if slow)
+configuration into a failed one. The same numbers are in `GET /props`
+under `gpu.footprint`.
+
+What is deliberately *not* claimed: whether the model "fits". The KV cache
+is allocated per request at that request's own size, the transient compute
+buffers grow to whatever the widest prefill needed, and weights reach the
+device lazily — so a yes/no verdict at startup would be a guess dressed as
+a fact. Headroom and what it buys are decidable; a verdict is not.
+
+### Splitting a model across devices
+
+`device_split` spreads one model's layers over the selected devices. It is
+**off by default**, and the reason is in the next paragraph rather than
+buried at the end.
+
+```ini
+[orangu-server]
+device_split = auto
+```
+
+```sh
+orangu-server --device-split all model.gguf       # this run
+ORANGU_DEVICE_SPLIT=3,1 orangu-server model.gguf  # this run, for a sweep
+```
+
+| Value | Meaning |
+| :-- | :-- |
+| `off` | One device runs the whole model. **The default.** |
+| `auto` | Split only when the weights do not fit the first device — the case where the alternative is the driver paging VRAM on every token. |
+| `all` | Always split across every selected device, in proportion to each one's memory. |
+| `cpu` | Fill the devices with as many layers as fit, in order, and run the rest **on the CPU**. llama.cpp's partial offload (`-ngl`), decided from capacity rather than typed by hand. |
+| `3,1` | Explicit proportions, one per selected device, in the order the inventory lists them. Relative, not absolute: `3,1` is three quarters and one quarter. `0` excludes a device. |
+
+Startup says what it did, and what it cost:
+
+```
+[vulkan] split: layers 0-17 -> AMD Radeon RX 5500M, layers 18-23 -> AMD Radeon Graphics
+[vulkan] AMD Radeon RX 5500M: 313.65 MiB weights of 4.00 GiB, 18 layers
+[vulkan] AMD Radeon Graphics: 60.05 MiB weights of 21.06 GiB, 6 layers
+[vulkan] a split model keeps its per-layer GPU work — fused attention, fused FFN,
+         the device-side KV cache — but gives up the whole-step decode submission,
+         which cannot span devices, and the hidden state crosses the bus 1 time
+         per token. It buys capacity, not speed.
+```
+
+**A split model is slower**, though not as much as it once was. Work scoped
+to a single layer — fused attention, the fused FFN chain, the device-side
+KV cache — runs on the card that layer's weights are on. What a split gives
+up is the work that *spans* layers: the whole-step decode submission, which
+records every layer into one command buffer and takes a decode step from
+about 37 GPU submissions down to one. That cannot span devices.
+
+Measured on this project's dev machine, release build, a 0.5B model split
+3:1 over two GPUs: **21.2 tok/s split against 41.8 unsplit** — and 12.1
+with the split's GPU paths disabled, so they are worth about **+75%**. What
+remains is the second device's own speed and one hand-off per boundary.
+
+That applies to the llama, phi, mistral and gemma families — measured at
++47% to +75% on the first three, with identical output. The one exclusion
+is **gemma models with per-layer embeddings** (gemma-3n / `E2B`), which
+take the slower path when split; dense gemma-4 is unaffected.
+
+What a split buys is **capacity**: a model larger than any single card runs
+at all, rather than the driver paging VRAM on every token.
+
+That is why `off` is the default and why `auto` splits only when the model
+does not fit. If a model fits one card, put it on one card.
+
+Two things worth knowing before reaching for `all`:
+
+- **Shares follow reported memory**, and an integrated GPU reports the
+  machine's whole system RAM. On a laptop with a 4 GiB discrete card beside
+  an iGPU claiming 21 GiB, `all` puts most of the model on the *slower*
+  device. Measured on this project's dev machine, that costs about **10%**
+  — `all` gave 18.5 tok/s against 20.3 for `--device-split 3,1` on the same
+  model. Explicit proportions are the answer if you want that back; the
+  default is left alone because one machine's ratio is not a throughput
+  model for anyone else's.
+- **Layers are handed out in contiguous runs**, never interleaved, so the
+  hidden state crosses the bus once per boundary — twice for three devices,
+  not once per layer.
+
+#### Overflowing onto the CPU
+
+`device_split = cpu` is the one mode that is a *fill* rather than a share,
+and it has to be: the host's budget is system RAM, so giving it a
+proportional share would hand it most of the model. Instead each device
+takes as many layers as fit and the CPU takes what is left:
+
+```
+[cpu] AMD Ryzen 7 4800H [8 cores / 16 threads, AVX2, 62.19 GiB RAM, 16 worker threads (default)] — overflow tier
+[vulkan] split: layers 0-1 -> AMD Radeon RX 5500M, layers 2-47 -> AMD Radeon Graphics, layers 48-92 -> AMD Ryzen 7 4800H
+[vulkan] AMD Radeon RX 5500M: 3.10 GiB weights of 4.00 GiB, 2 layers
+[vulkan] AMD Radeon Graphics: 16.68 GiB weights of 21.06 GiB, 46 layers
+[vulkan] AMD Ryzen 7 4800H: 16.28 GiB weights, 45 layers
+```
+
+That is a 36 GiB model placed on a machine whose largest card is 4 GiB —
+which without this would have run entirely on the GPU with the driver
+paging VRAM on every token.
+
+Each device is filled to **80% of its memory**, leaving the rest for the KV
+cache and the compute buffers, and the first device is charged for the
+token embeddings and `lm_head` as well as its layers (they always live
+there). The 80% is a heuristic and the only one here: the KV cache cannot be
+sized until the model is built, and the model cannot be built until
+placement is decided. Explicit proportions set the boundary exactly if you
+would rather do it by hand.
+
+Only the `wgpu` backends (`vulkan`, `metal`, `dx12`) can be split. Asking
+for a split on `cpu`/`cuda`/`opencl`/`rocm` is a startup error naming the
+limitation rather than a silent single-device run. Because every device in
+a split comes from one API's own enumeration, a model can never be spread
+across two vendors' kernels — which would make its output depend on which
+layers landed where.
+
+`GET /props` reports the split under `gpu`: the per-device layer counts,
+weights and capacities, and how many boundary crossings a token costs.
+
+`ORANGU_NO_SPLIT_FUSION=1` puts a split model's per-layer work back on the
+CPU — the behaviour splits had before per-layer fusion existed. It is there
+so the change can be measured from one binary, and as an escape hatch if a
+driver turns out to dislike two devices recording fused chains at once.
+
+### Expert tiers
+
+A mixture-of-experts model is mostly experts, and orangu keeps them in host
+memory: routed expert tensors have no GPU path at all, which is why the
+footprint above reports a 20 GiB MoE model as 2.26 GiB on a 4 GiB card. A
+hot subset is kept in owned RAM under a byte budget by orangu's own
+residency tier, which learns a routing profile that survives a restart.
+
+The obvious next step is a *device* expert tier — hot experts in spare
+VRAM. Whether that is worth anything depends entirely on how much of the
+routing it would actually serve, so on a MoE model a GPU backend prints
+what such a tier would hold:
+
+```
+[vulkan] a device expert tier in the free VRAM would hold 1531 of 30720 experts (5.0%, 893.19 MiB)
+[vulkan] no routing profile, so that is also its expected hit rate — a tier filled
+         by heat serves far more traffic than one filled by size
+[vulkan] projection only: experts run on the CPU, and no tier is active.
+```
+
+`ORANGU_GPU_EXPERTS=1` routes routed-expert matmuls to the GPU, batching
+them across experts. On this project's dev machine that measured **~1.55×
+faster** than the CPU path on a 35B-A3B model — but only *with* the
+batching; one dispatch per expert is 1.5× *slower*.
+
+The tier is **bounded**: half the device's free memory after the dense
+weights, chosen up front, with everything else staying on the host path.
+Startup says what it holds — `expert tier: 15978 of 30720 experts on device
+(9.40 GiB)`.
+
+The set is filled from a routing profile when `ORANGU_EXPERT_USAGE` names
+one, and by size otherwise — the startup line says which.
+
+Still off by default: every measurement so far is on an integrated GPU
+whose memory is system RAM, gemma's MoE is not converted, and the profile
+path has not been exercised end to end.
+
+**The tier itself is a projection, not a feature.** No device expert tier
+runs today.
+The lines exist because the alternative is that "would a VRAM expert tier
+help on this machine?" can only be answered by building one first — and the
+answer above (5% of a 4 GiB card, on a 20 GiB model) is one an operator can
+act on without waiting for that.
+
+Read it as a floor. It assumes no routing profile, so every expert is
+equally likely and coverage equals the share of experts held. With a real
+profile a small tier serves disproportionately more traffic: colibri, whose
+design this follows, measured the same 150 GB tier at 0.94–1.64 tok/s
+filled hottest-first against 0.29 tok/s filled without routing heat.
+
+Two things a large coverage number would *not* settle, and which is why
+orangu is not building this on the strength of the projection alone:
+
+- an expert matmul dispatched per expert per layer is a GPU round trip per
+  expert per layer, which has to be batched to be worth anything;
+- orangu's host expert path is a tuned AVX2/rayon matmul, and colibri's own
+  conclusion is that a GPU expert tier "earns its VRAM only when the CPU is
+  the weak link".
 
 ### When the GPU device is lost
 
@@ -1506,7 +1863,7 @@ pin — there is no later turn to keep a cache warm for.
 | `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
 | `GET /health` | |
-| `GET /props` | model + server metadata: the `backend` and device the model is running on, and `version`/`commit` — which build is answering |
+| `GET /props` | model + server metadata: the `backend` and device the model is running on (plus every other device that backend saw, and under `gpu.footprint` what this model costs on it), and `version`/`commit` — which build is answering |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `GET /metrics` | Prometheus text |
 | `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |

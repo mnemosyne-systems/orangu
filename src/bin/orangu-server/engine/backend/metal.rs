@@ -108,6 +108,12 @@ impl MetalBackend {
     /// found", which is true and actionable on every platform, rather than
     /// having `metal` be a config value that parses on Linux and then
     /// names a variant that does not exist.
+    ///
+    /// **Tests only** — see [`VulkanBackend::try_init`]. `select_backend`
+    /// goes through [`Self::devices`] and [`Self::try_init_selected`] so the
+    /// operator's `[orangu-server].device` is honoured and the device list
+    /// is reported.
+    #[cfg(test)]
     pub fn try_init() -> Option<Self> {
         let inner = VulkanBackend::try_init_backends(wgpu::Backends::METAL)?;
         // `wgpu` only ever hands back an adapter from the requested set, so
@@ -118,6 +124,25 @@ impl MetalBackend {
         // module's doc comment is written against.
         debug_assert_eq!(inner.wgpu_backend(), wgpu::Backend::Metal);
         Some(Self { inner })
+    }
+
+    /// Brings the engine up on one specific Metal device — see
+    /// [`VulkanBackend::try_init_selected`], which this forwards to
+    /// unchanged.
+    ///
+    /// Apple has shipped Macs with more than one GPU (the discrete/
+    /// integrated pairs of the Intel era, and external GPUs over
+    /// Thunderbolt), so `Backends::METAL` is not automatically a
+    /// single-device list and the same selection policy applies here.
+    pub fn try_init_selected(selected: &[usize]) -> Option<Self> {
+        let inner = VulkanBackend::try_init_selected(wgpu::Backends::METAL, selected)?;
+        debug_assert_eq!(inner.wgpu_backend(), wgpu::Backend::Metal);
+        Some(Self { inner })
+    }
+
+    /// Every Metal device `wgpu` reports, in enumeration order.
+    pub fn devices() -> Vec<super::device::DeviceCandidate> {
+        VulkanBackend::devices(wgpu::Backends::METAL)
     }
 
     /// The adapter's own description (the Metal device name) — for the

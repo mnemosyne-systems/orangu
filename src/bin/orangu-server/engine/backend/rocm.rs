@@ -53,8 +53,8 @@ use std::ptr;
 use std::sync::Mutex;
 
 use cubecl_hip_sys::{
-    HIP_SUCCESS, hipDeviceGetName, hipDeviceSynchronize, hipFree, hipFunction_t, hipGetDeviceCount,
-    hipInit, hipMalloc, hipMemcpy, hipMemcpyKind_hipMemcpyDeviceToHost,
+    HIP_SUCCESS, hipDeviceGetName, hipDeviceSynchronize, hipDeviceTotalMem, hipFree, hipFunction_t,
+    hipGetDeviceCount, hipInit, hipMalloc, hipMemcpy, hipMemcpyKind_hipMemcpyDeviceToHost,
     hipMemcpyKind_hipMemcpyHostToDevice, hipModule_t, hipModuleGetFunction, hipModuleLaunchKernel,
     hipModuleLoadData, hipSetDevice, hipStream_t, hipStreamCreate, hiprtcCompileProgram,
     hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
@@ -67,6 +67,7 @@ use crate::engine::quant::{
     GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
+use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, MatmulOp};
 
 /// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
@@ -605,12 +606,84 @@ pub struct RocmBackend {
 }
 
 impl RocmBackend {
-    /// Looks for a usable HIP device (ordinal 0) and compiles every
+    /// Looks for a usable HIP device (ordinal 0 — [`Self::try_init_index`]
+    /// names another) and compiles every
     /// supported quant type's kernel via HIPRTC up front. Returns `None`
     /// (never panics) if no HIP runtime/device is present, or compilation
     /// otherwise fails — callers fall back to `CpuBackend`, the same
     /// contract every other backend's `try_init` has.
+    ///
+    /// **Tests only** — see `VulkanBackend::try_init`. `select_backend`
+    /// goes through [`Self::devices`] and [`Self::try_init_index`] so the
+    /// operator's `[orangu-server].device` is honoured and the device list
+    /// is reported.
+    #[cfg(test)]
     pub fn try_init() -> Option<Self> {
+        Self::try_init_index(0)
+    }
+
+    /// Every HIP device this runtime reports.
+    ///
+    /// Every device is [`DeviceClass::Discrete`]. HIP does expose an
+    /// `integrated` flag, but only through `hipGetDevicePropertiesR0600`,
+    /// whose struct layout differs across the `cubecl-hip-sys` binding sets
+    /// this can be built against — an FFI shape this project has no ROCm
+    /// machine to verify. Since a discrete-vs-integrated distinction can
+    /// only re-rank devices *within* this list, and ROCm on an APU beside a
+    /// discrete Radeon is not a configuration anyone has reported, the flag
+    /// is not read rather than read unverifiably. Size is, and is what
+    /// actually orders a multi-card box.
+    ///
+    /// The name query needs no context, so an empty list here really does
+    /// mean "no HIP device", not "not asked yet".
+    pub fn devices() -> Vec<DeviceCandidate> {
+        unsafe {
+            if hipInit(0) != HIP_SUCCESS {
+                return Vec::new();
+            }
+            let mut count: std::os::raw::c_int = 0;
+            if hipGetDeviceCount(&mut count) != HIP_SUCCESS || count <= 0 {
+                return Vec::new();
+            }
+            (0..count)
+                .map(|ordinal| DeviceCandidate {
+                    index: ordinal as usize,
+                    name: Self::device_name_at(ordinal)
+                        .unwrap_or_else(|| format!("HIP device {ordinal}")),
+                    class: DeviceClass::Discrete,
+                    vram_total_bytes: Self::device_memory_at(ordinal),
+                    id: None,
+                    driver: None,
+                })
+                .collect()
+        }
+    }
+
+    /// # Safety
+    /// `hipInit` must already have succeeded.
+    unsafe fn device_name_at(ordinal: std::os::raw::c_int) -> Option<String> {
+        let mut name_buf = [0i8; 256];
+        unsafe {
+            (hipDeviceGetName(name_buf.as_mut_ptr(), 256, ordinal) == HIP_SUCCESS).then(|| {
+                CStr::from_ptr(name_buf.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        }
+    }
+
+    /// # Safety
+    /// `hipInit` must already have succeeded.
+    unsafe fn device_memory_at(ordinal: std::os::raw::c_int) -> Option<u64> {
+        let mut bytes: usize = 0;
+        unsafe {
+            (hipDeviceTotalMem(&mut bytes, ordinal) == HIP_SUCCESS && bytes > 0)
+                .then_some(bytes as u64)
+        }
+    }
+
+    /// [`Self::try_init`] against a specific HIP ordinal.
+    pub fn try_init_index(index: usize) -> Option<Self> {
         unsafe {
             if hipInit(0) != HIP_SUCCESS {
                 return None;
@@ -619,18 +692,19 @@ impl RocmBackend {
             if hipGetDeviceCount(&mut count) != HIP_SUCCESS || count == 0 {
                 return None;
             }
-            if hipSetDevice(0) != HIP_SUCCESS {
+            let ordinal = std::os::raw::c_int::try_from(index).ok()?;
+            if ordinal >= count {
+                return None;
+            }
+            // Every HIP call below is thread-local to the selected device,
+            // which is what makes an ordinal other than 0 reachable at all:
+            // the kernels, the stream and the weight buffers all land on
+            // whichever device this call named.
+            if hipSetDevice(ordinal) != HIP_SUCCESS {
                 return None;
             }
 
-            let mut name_buf = [0i8; 256];
-            let device_name = if hipDeviceGetName(name_buf.as_mut_ptr(), 256, 0) == HIP_SUCCESS {
-                CStr::from_ptr(name_buf.as_ptr())
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                "ROCm".to_string()
-            };
+            let device_name = Self::device_name_at(ordinal).unwrap_or_else(|| "ROCm".to_string());
 
             let mut stream: hipStream_t = ptr::null_mut();
             if hipStreamCreate(&mut stream) != HIP_SUCCESS {

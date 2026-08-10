@@ -459,6 +459,8 @@ impl Qwen35Model {
             layer_cache,
             &crate::engine::attention::Params {
                 backend: self.backend.as_ref(),
+                // This layer's card — see `attention::Params::device`.
+                device: layer.wo.device(),
                 n_head,
                 n_head_kv,
                 head_dim,

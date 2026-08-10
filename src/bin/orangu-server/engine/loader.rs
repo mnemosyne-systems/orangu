@@ -392,6 +392,20 @@ pub struct LoadedModel {
     /// (per-layer arrays, architecture-specific keys) directly from this.
     pub metadata: Vec<(String, GgufValue)>,
     tensors: HashMap<String, TensorLocation>,
+    /// Which device holds each transformer layer, when the model is spread
+    /// across more than one (`engine::placement`). Empty for the ordinary
+    /// single-device case, which is also what every tensor outside a
+    /// numbered `blk.<n>.` block gets.
+    ///
+    /// Set once, by `main` between loading the weights and building the
+    /// model, because [`Self::matrix`] is what stamps it onto each tensor
+    /// and every architecture calls that during construction.
+    layer_device: Vec<usize>,
+    /// Which experts of each `*_exps.weight` tensor a device tier holds —
+    /// see `ExpertQuantMatrix::residency`. Empty when no tier is active,
+    /// and set at the same moment (and for the same reason) as
+    /// `layer_device`.
+    expert_residency: HashMap<String, Arc<[bool]>>,
 }
 
 /// A lazy view onto a 2D GGUF tensor (an `[in_dim, out_dim]` matmul weight,
@@ -411,6 +425,18 @@ pub struct QuantMatrix {
     row_bytes: usize,
     pub in_dim: usize,
     pub out_dim: usize,
+    /// Which device in the selected set holds this tensor — a position in
+    /// `engine::placement`'s plan, `0` for every tensor of an unsplit
+    /// model.
+    ///
+    /// Stamped by [`LoadedModel::matrix`] from the layer number in the
+    /// tensor's name, and read by `engine::backend::multi::
+    /// MultiDeviceBackend` to route the matmul. It rides on the matrix
+    /// rather than being looked up per call because the matrix is the only
+    /// thing `Backend::matmul` is given that can identify the layer at all
+    /// — which is what lets a split model need no change to any
+    /// architecture's forward pass.
+    device: usize,
 }
 
 impl QuantMatrix {
@@ -472,6 +498,10 @@ impl QuantMatrix {
             row_bytes: self.row_bytes,
             in_dim: self.in_dim,
             out_dim: count,
+            // A slice of a tensor is on the same device as the tensor. Not
+            // inheriting this would send half a layer's rows to device 0
+            // and produce a result that is wrong only on a split model.
+            device: self.device,
         }
     }
 
@@ -488,6 +518,19 @@ impl QuantMatrix {
     /// view every cache entry belonging to the whole tensor — the same buffer,
     /// the same bind groups, the wrong output width. Including the length makes
     /// the key a complete description of the range it names.
+    /// Which device in the selected set holds this tensor — see the field's
+    /// own doc. `0` unless a split plan said otherwise.
+    pub fn device(&self) -> usize {
+        self.device
+    }
+
+    /// Overrides the device tag, for tests that need a matrix on a
+    /// particular device without a `LoadedModel` behind it.
+    #[cfg(test)]
+    pub fn set_device(&mut self, device: usize) {
+        self.device = device;
+    }
+
     pub fn cache_key(&self) -> (usize, usize) {
         (
             self.bytes.as_ptr() as usize + self.start,
@@ -560,6 +603,7 @@ pub(crate) fn test_quant_matrix(
         row_bytes: bytes.len() / out_dim,
         in_dim,
         out_dim,
+        device: 0,
     }
 }
 
@@ -587,6 +631,16 @@ pub struct ExpertQuantMatrix {
     pub in_dim: usize,
     pub out_dim: usize,
     pub n_expert: usize,
+    /// Which of this tensor's experts a device holds, when a device expert
+    /// tier is active — one flag per expert, `None` when there is no tier.
+    ///
+    /// Per expert rather than per tensor because that is the unit a tier
+    /// works in: `engine::expert_tier` places whole experts, and one
+    /// tensor's experts routinely straddle the budget. Shared behind an
+    /// `Arc` because every `ExpertQuantMatrix` for a tensor is a fresh
+    /// value built by `LoadedModel::expert_matrix`, and the flags are the
+    /// same for all of them.
+    residency: Option<Arc<[bool]>>,
 }
 
 /// An `F32` [`ExpertQuantMatrix`] over deterministic generated values, for
@@ -632,6 +686,7 @@ pub(crate) fn test_expert_matrix_named(
     );
     ExpertQuantMatrix {
         name: Arc::from(name),
+        residency: None,
         bytes: matrix.bytes,
         ggml_type: matrix.ggml_type,
         start: 0,
@@ -656,6 +711,25 @@ impl ExpertQuantMatrix {
         (self.row_bytes * self.out_dim) as u64
     }
 
+    /// The quantization these experts are stored in — what a GPU backend
+    /// needs a kernel for before it can be handed one.
+    pub fn ggml_type(&self) -> u32 {
+        self.ggml_type
+    }
+
+    /// Whether a device expert tier holds `expert`.
+    ///
+    /// `false` when there is no tier at all, which is the default and which
+    /// keeps every expert on the host path. A tier that answered `true`
+    /// everywhere would be the unbounded arena this exists to bound.
+    pub fn is_device_resident(&self, expert: usize) -> bool {
+        self.residency
+            .as_ref()
+            .and_then(|flags| flags.get(expert))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// The tensor's GGUF name — stable across runs, unlike
     /// [`Self::tensor_id`].
     pub fn name(&self) -> &Arc<str> {
@@ -668,6 +742,49 @@ impl ExpertQuantMatrix {
     /// not collide, since the mappings are held for the model's whole life.
     pub fn tensor_id(&self) -> usize {
         self.bytes.as_ptr() as usize + self.start
+    }
+
+    /// One expert as an ordinary [`QuantMatrix`] — the same bytes, viewed as
+    /// the `[in_dim, out_dim]` matrix they already are.
+    ///
+    /// Zero-copy: an expert's rows are contiguous in the stacked tensor, so
+    /// this is the same `start`/`row_bytes`/`in_dim`/`out_dim` arithmetic
+    /// [`Self::row`] does, hoisted out of the per-row loop.
+    ///
+    /// # Why this exists
+    ///
+    /// It is the seam a device-resident expert tier needs, and the reason
+    /// such a tier needs no new kernels. `Backend::matmul` takes a
+    /// `QuantMatrix`; every GPU backend already has a kernel for every quant
+    /// type an expert is stored in; and `engine::backend::multi` already
+    /// routes a `QuantMatrix` by the device stamped on it. So an expert that
+    /// a placement policy put on a device is a `matmul` call, not a porting
+    /// exercise.
+    ///
+    /// Nothing calls this on a hot path yet — see `engine::expert_tier` for
+    /// what would have to be true first — but it is what makes the rest of
+    /// that work a dispatch question rather than a kernel one.
+    ///
+    pub fn expert_matrix(&self, expert: usize) -> QuantMatrix {
+        assert!(
+            expert < self.n_expert,
+            "expert {expert} >= {}",
+            self.n_expert
+        );
+        QuantMatrix {
+            bytes: self.bytes.clone(),
+            ggml_type: self.ggml_type,
+            start: self.start + expert * self.expert_stride,
+            row_bytes: self.row_bytes,
+            in_dim: self.in_dim,
+            out_dim: self.out_dim,
+            // Expert tensors are host-resident today (`engine::backend::
+            // is_cpu_only_tensor`), so a view of one is device 0's until a
+            // tier says otherwise. A tier would stamp this from its own
+            // placement, exactly as `LoadedModel::matrix` does from the
+            // layer plan.
+            device: 0,
+        }
     }
 
     /// One expert's still-quantized bytes, as they lie in the mapping.
@@ -810,6 +927,81 @@ impl LoadedModel {
         self.tensors
             .iter()
             .map(|(name, loc)| (name.as_str(), loc.ggml_type))
+    }
+
+    /// Records which device each transformer layer will run on, so that
+    /// every `QuantMatrix` built afterwards carries its device with it.
+    ///
+    /// Must be called *before* the model is constructed — an architecture's
+    /// `load_with_backend` is where `matrix` is called, and a tensor
+    /// fetched before this is stamped for device 0. `main` does it
+    /// immediately after `select_backend`, which is the only place both the
+    /// plan and the loaded weights exist at once.
+    pub fn set_layer_devices(&mut self, layer_device: Vec<usize>) {
+        self.layer_device = layer_device;
+    }
+
+    /// Records which experts a device tier holds, per `*_exps.weight`
+    /// tensor. Must be called before the model is built, for the same
+    /// reason [`Self::set_layer_devices`] must.
+    pub fn set_expert_residency(&mut self, residency: HashMap<String, Arc<[bool]>>) {
+        self.expert_residency = residency;
+    }
+
+    /// Every stacked per-expert tensor's name and expert count — what a
+    /// residency plan has to be built over.
+    pub fn expert_tensors(&self) -> Vec<(String, usize, u64)> {
+        self.tensors
+            .iter()
+            .filter(|(name, _)| name.ends_with("_exps.weight"))
+            .filter_map(|(name, loc)| {
+                // `[in_dim, out_dim, n_expert]`; anything else is not a
+                // stacked expert tensor whatever it is called.
+                let n_expert = *loc.dims.get(2)? as usize;
+                (n_expert > 0).then(|| (name.clone(), n_expert, (loc.len / n_expert) as u64))
+            })
+            .collect()
+    }
+
+    /// The device holding `name`'s layer.
+    ///
+    /// Everything outside a numbered `blk.<n>.` block — token embeddings,
+    /// the output norm, `lm_head` — goes to device 0. Those are touched
+    /// once per token at the very start and the very end of a forward pass,
+    /// so placing them anywhere else would add two bus crossings per token
+    /// to save nothing: they are a small fraction of a model's bytes, and
+    /// the first device is the largest by construction (the set is ranked).
+    pub fn device_for_tensor(&self, name: &str) -> usize {
+        if self.layer_device.is_empty() {
+            return 0;
+        }
+        let Some(layer) = name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            return 0;
+        };
+        // A layer number past the plan is a model whose `n_layer` and
+        // tensor names disagree — not something to guess at, and device 0
+        // is the answer that behaves exactly like an unsplit model.
+        self.layer_device.get(layer).copied().unwrap_or(0)
+    }
+
+    /// Every tensor's name and stored byte length.
+    ///
+    /// The bytes as the file holds them, which is also the bytes a GPU
+    /// backend uploads: nothing is dequantized on the way to the device
+    /// (`VulkanBackend::weight_buffer` writes `QuantMatrix::raw_bytes`
+    /// straight into its arena), so this is the model's device footprint
+    /// and not an approximation of it.
+    ///
+    /// Reads the tensor *directory* only — the mapping is already open, so
+    /// this touches no weight bytes and pages nothing in.
+    pub fn tensor_sizes(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.tensors
+            .iter()
+            .map(|(name, loc)| (name.as_str(), loc.len as u64))
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -978,6 +1170,10 @@ impl LoadedModel {
             config,
             metadata: gguf.metadata,
             tensors,
+            // A model is single-device until `main` says otherwise; see
+            // `Self::set_layer_devices`.
+            layer_device: Vec::new(),
+            expert_residency: HashMap::new(),
         })
     }
 
@@ -1134,6 +1330,7 @@ impl LoadedModel {
             row_bytes,
             in_dim,
             out_dim,
+            device: self.device_for_tensor(name),
         })
     }
 
@@ -1162,6 +1359,7 @@ impl LoadedModel {
             loc.len
         );
         Ok(ExpertQuantMatrix {
+            residency: self.expert_residency.get(name).cloned(),
             name: Arc::from(name),
             bytes: loc.bytes.clone(),
             ggml_type: loc.ggml_type,
@@ -1273,6 +1471,43 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device seam: an expert viewed as a `QuantMatrix` must dequantize
+    /// to exactly what reading it row by row gives, for *every* expert.
+    ///
+    /// The failure this guards is the one that would matter: an
+    /// `expert_stride` mistake reads a neighbouring expert's weights, which
+    /// is not a crash and not obviously wrong output — it is a model that
+    /// quietly answers with the wrong expert. Checking every expert rather
+    /// than one is what catches an off-by-one stride, which agrees on
+    /// expert 0 by construction.
+    #[test]
+    fn an_expert_view_reads_the_same_weights_as_the_row_reader() {
+        let stacked = test_expert_matrix(4, 6, 32);
+        for expert in 0..stacked.n_expert {
+            let view = stacked.expert_matrix(expert);
+            assert_eq!(view.in_dim, stacked.in_dim);
+            assert_eq!(view.out_dim, stacked.out_dim);
+            for row in 0..stacked.out_dim {
+                assert_eq!(
+                    view.row(row),
+                    stacked.row(expert, row),
+                    "expert {expert} row {row}"
+                );
+            }
+        }
+    }
+
+    /// Two experts' views must not share a cache key, or a GPU weight arena
+    /// would upload one of them and serve it for both.
+    #[test]
+    fn expert_views_have_distinct_cache_keys() {
+        let stacked = test_expert_matrix(4, 6, 32);
+        let keys: std::collections::HashSet<_> = (0..stacked.n_expert)
+            .map(|expert| stacked.expert_matrix(expert).cache_key())
+            .collect();
+        assert_eq!(keys.len(), stacked.n_expert);
+    }
 
     /// A `[in_dim, out_dim]` Q8_0 matrix whose row `r` is filled with the
     /// byte `r + 1`, so a view can be checked to start where it claims.
@@ -1599,6 +1834,8 @@ mod tests {
                 ("kimi-k3.positive".to_string(), GgufValue::U32(7)),
             ],
             tensors: HashMap::new(),
+            layer_device: Vec::new(),
+            expert_residency: HashMap::new(),
         };
         assert_eq!(model.metadata_f32("kda.gate_lower_bound"), Some(-5.0));
         assert_eq!(model.metadata_f32("situ_beta"), Some(4.0));

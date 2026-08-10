@@ -198,11 +198,30 @@ fn is_total_budget_eligible(gpu: &GpuInfo) -> bool {
 /// VRAM when `suggest` runs (a compositor, a browser, an already-running
 /// `llama-server`) shouldn't shrink a hardware-based estimate.
 fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
-    gpus.iter()
-        .filter(|g| is_dedicated_for_budget(g))
-        .filter_map(|g| g.vram_total_bytes)
-        .max()
+    largest_dedicated_gpu(gpus)
+        .and_then(|gpu| gpu.vram_total_bytes)
         .unwrap_or(0)
+}
+
+/// The GPU [`dedicated_vram_budget_bytes`] took its number from — so the
+/// report can name it rather than leaving the reader to work out which of
+/// the machine's cards a bare byte count refers to.
+fn largest_dedicated_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    gpus.iter()
+        .filter(|g| is_dedicated_for_budget(g) && g.vram_total_bytes.is_some())
+        .max_by_key(|g| g.vram_total_bytes.unwrap_or(0))
+}
+
+/// The GPU [`total_budget_bytes`] took its number from, or `None` when the
+/// winner was system RAM.
+fn largest_total_pool<'a>(cpu: &CpuInfo, gpus: &'a [GpuInfo]) -> Option<&'a GpuInfo> {
+    gpus.iter()
+        .filter(|g| is_total_budget_eligible(g))
+        .filter(|g| {
+            g.vram_total_bytes
+                .is_some_and(|v| v > cpu.total_memory_bytes)
+        })
+        .max_by_key(|g| g.vram_total_bytes.unwrap_or(0))
 }
 
 /// The largest single memory pool a model can actually be run in on this
@@ -251,9 +270,21 @@ fn format_param_count(params_billion: f64) -> String {
 /// quantization in [`QUANT_LADDER`] — larger contexts and heavier
 /// quantizations both leave less budget for model weights, so suggested
 /// sizes shrink as either grows.
-fn push_suggestion_block(out: &mut String, label: &str, budget: u64) {
+fn push_suggestion_block(out: &mut String, label: &str, budget: u64, source: Option<&str>) {
     out.push_str(&format!("\n{label}\n"));
-    out.push_str(&format!("  Estimated budget : {}\n", format_bytes(budget)));
+    // Which pool the number came from, not just its size. On a machine with
+    // three GPUs — the ordinary laptop with a discrete card, an iGPU, and a
+    // software rasterizer all reporting memory — "3.98 GiB" alone is a
+    // number the reader has to guess the provenance of, and the plausible
+    // wrong guess (the iGPU, which reports the whole system RAM) is off by
+    // an order of magnitude.
+    match source {
+        Some(source) => out.push_str(&format!(
+            "  Estimated budget : {} ({source})\n",
+            format_bytes(budget)
+        )),
+        None => out.push_str(&format!("  Estimated budget : {}\n", format_bytes(budget))),
+    }
 
     let headers: Vec<String> = QUANT_LADDER
         .iter()
@@ -299,17 +330,24 @@ pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String
     // all) would just print an estimated budget of 0 B and a table of
     // nothing but "-" — noise, not a suggestion — so the whole block is
     // skipped rather than shown empty.
-    if gpus.iter().any(is_dedicated_for_budget) {
+    if let Some(gpu) = largest_dedicated_gpu(gpus) {
         push_suggestion_block(
             &mut out,
             "Suggested model size (Dedicated)",
             dedicated_vram_budget_bytes(gpus),
+            Some(&gpu.name),
         );
     }
+    let total = total_budget_bytes(cpu, gpus);
     push_suggestion_block(
         &mut out,
         "Suggested model size (Total)",
-        total_budget_bytes(cpu, gpus),
+        total,
+        Some(
+            &largest_total_pool(cpu, gpus)
+                .map(|gpu| gpu.name.clone())
+                .unwrap_or_else(|| "system RAM".to_string()),
+        ),
     );
 
     out
@@ -320,9 +358,13 @@ mod tests {
     use super::*;
 
     fn gpu(memory_kind: MemoryKind, vram_total_bytes: Option<u64>) -> GpuInfo {
+        named_gpu("Test GPU", memory_kind, vram_total_bytes)
+    }
+
+    fn named_gpu(name: &str, memory_kind: MemoryKind, vram_total_bytes: Option<u64>) -> GpuInfo {
         GpuInfo {
             vendor: "Test".to_string(),
-            name: "Test GPU".to_string(),
+            name: name.to_string(),
             vram_total_bytes,
             vram_used_bytes: None,
             driver: None,
@@ -406,6 +448,34 @@ mod tests {
         let q2 = suggest_param_count(budget, 8192, 3.00).unwrap();
         let q8 = suggest_param_count(budget, 8192, 8.5).unwrap();
         assert!(q8 <= q2);
+    }
+
+    /// The budget names the card it came from. On a machine with a
+    /// discrete card *and* an iGPU reporting the whole system RAM, a bare
+    /// byte count is a number whose most plausible misreading is off by an
+    /// order of magnitude.
+    #[test]
+    fn the_dedicated_budget_names_the_card_it_came_from() {
+        let gpus = vec![
+            named_gpu("Small Card", MemoryKind::Dedicated, Some(4 * GIB)),
+            named_gpu("Big Card", MemoryKind::Dedicated, Some(24 * GIB)),
+            named_gpu("iGPU", MemoryKind::Shared, Some(64 * GIB)),
+        ];
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
+        assert!(report.contains("24.00 GiB (Big Card)"), "{report}");
+        // The `Total` block's winner here is system RAM, tied with the
+        // iGPU's shared pool — and a tie must not be reported as the GPU,
+        // since the pool really is the same RAM.
+        assert!(report.contains("64.00 GiB (system RAM)"), "{report}");
+    }
+
+    /// A card genuinely bigger than system RAM is what the `Total` budget
+    /// is drawn from, and saying so is the point of the label.
+    #[test]
+    fn the_total_budget_names_a_gpu_when_the_gpu_is_the_largest_pool() {
+        let gpus = vec![named_gpu("Big Card", MemoryKind::Dedicated, Some(80 * GIB))];
+        let report = format_suggestion(&orangu::os::detect(), &cpu(32 * GIB), &gpus);
+        assert!(report.contains("80.00 GiB (Big Card)"), "{report}");
     }
 
     #[test]

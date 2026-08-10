@@ -226,6 +226,358 @@ impl ExpertRouting {
         (selected, weights)
     }
 }
+/// Consecutive layers grouped by the device holding them, in layer order —
+/// `[(0, 0..24)]` for an unsplit model, one entry per device for a split
+/// one.
+///
+/// The one piece of the split decode path that is shared across
+/// architectures, because it is the piece whose failure is silent: a
+/// mis-grouped run records a layer's fused chain against the wrong card's
+/// weights, which is wrong output rather than a crash.
+///
+/// `None` when any layer has no `wgpu` backend behind it. That is how a CPU
+/// overflow tier declines the fused chain — it is a GPU chain, and a run of
+/// layers on the host has to take the step-by-step route — and it is also
+/// the answer on a machine with no GPU at all.
+pub(crate) fn decode_device_runs(
+    backend: &dyn crate::engine::backend::Backend,
+    layer_devices: impl Iterator<Item = usize>,
+) -> Option<Vec<(usize, std::ops::Range<usize>)>> {
+    let mut runs: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    for (il, device) in layer_devices.enumerate() {
+        backend.as_wgpu_on(device)?;
+        match runs.last_mut() {
+            Some((prev, range)) if *prev == device => range.end = il + 1,
+            _ => runs.push((device, il..il + 1)),
+        }
+    }
+    (!runs.is_empty()).then_some(runs)
+}
+
+/// Issues `ops` as few `Backend::matmul_batch` calls as the trait allows —
+/// one per distinct `n_tokens`, since a batch requires a uniform token
+/// count — returning results in the caller's order.
+///
+/// At decode every routed expert has exactly one token, so this is one
+/// call. At prefill the groups differ in size and it is one call per
+/// distinct size, which is still far fewer than one per expert.
+fn matmul_batch_mixed(
+    backend: &dyn crate::engine::backend::Backend,
+    ops: &[crate::engine::backend::MatmulOp<'_>],
+) -> Vec<Vec<f32>> {
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        buckets.entry(op.n_tokens).or_default().push(index);
+    }
+    let mut out: Vec<Option<Vec<f32>>> = (0..ops.len()).map(|_| None).collect();
+    for indices in buckets.into_values() {
+        let group: Vec<crate::engine::backend::MatmulOp<'_>> = indices
+            .iter()
+            .map(|&i| crate::engine::backend::MatmulOp {
+                x: ops[i].x,
+                n_tokens: ops[i].n_tokens,
+                w: ops[i].w,
+            })
+            .collect();
+        for (slot, result) in indices.iter().zip(backend.matmul_batch(&group)) {
+            out[*slot] = Some(result);
+        }
+    }
+    out.into_iter()
+        .map(|o| o.expect("every op is in exactly one bucket"))
+        .collect()
+}
+
+/// [`evaluate_routed_experts`] with the three expert projections **batched
+/// across experts** instead of issued one expert at a time.
+///
+/// Same contract as the per-expert form — contributions come back
+/// `[token][selection rank]`, in the order the router picked them, so the
+/// caller's summation is untouched — and the same grouping, so each expert's
+/// weights are still read once for every token that selected it.
+///
+/// What changes is the dispatch: a decode step's routed experts become
+/// three `matmul_batch` calls per layer rather than three per expert. That
+/// is the ~8x reduction a GPU expert path needs to be worth measuring at
+/// all; the blocking submit-and-readback per expert is what made the naive
+/// dispatch lose to the host.
+///
+/// **Only for the GPU path.** It goes through `Backend::matmul`, which
+/// reads the weights straight from the mapping — bypassing
+/// `engine::expert_store`'s residency tier and its accounting. That is
+/// correct for weights living in VRAM and wrong for the host path, which
+/// keeps [`project_expert`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_routed_experts_batched(
+    backend: &dyn crate::engine::backend::Backend,
+    selection: &[Vec<(usize, f32)>],
+    hidden: &[f32],
+    n_embd: usize,
+    gate_exps: &crate::engine::loader::ExpertQuantMatrix,
+    up_exps: &crate::engine::loader::ExpertQuantMatrix,
+    down_exps: &crate::engine::loader::ExpertQuantMatrix,
+    activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
+) -> Vec<Vec<Vec<f32>>> {
+    use crate::engine::backend::MatmulOp;
+
+    // Same first-seen grouping as `evaluate_routed_experts`, and for the
+    // same reason: it keeps the evaluation order reproducible from the
+    // routing alone.
+    let mut experts: Vec<usize> = Vec::new();
+    let mut members: Vec<Vec<(usize, f32)>> = Vec::new();
+    let mut ranks: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<usize, usize> = HashMap::new();
+    for (token, picks) in selection.iter().enumerate() {
+        for (rank, &(expert, weight)) in picks.iter().enumerate() {
+            let group = *group_of.entry(expert).or_insert_with(|| {
+                experts.push(expert);
+                members.push(Vec::new());
+                ranks.push(Vec::new());
+                experts.len() - 1
+            });
+            members[group].push((token, weight));
+            ranks[group].push(rank);
+        }
+    }
+    if experts.is_empty() {
+        return selection
+            .iter()
+            .map(|picks| vec![Vec::new(); picks.len()])
+            .collect();
+    }
+
+    // Each group's inputs, contiguous: the tokens that routed to one expert
+    // are scattered through `hidden`, and a `MatmulOp` wants one
+    // `[n_tokens, n_embd]` run.
+    // Only the experts a device actually holds take the batched GPU path;
+    // the rest go through `project_expert`, which reads them through
+    // `engine::expert_store`'s residency tier as it always has. Without
+    // this split the batch would pull every routed expert into an arena
+    // that never evicts — the tier would be unbounded, which is the one
+    // thing it exists not to be.
+    let on_device: Vec<bool> = experts
+        .iter()
+        .map(|&e| {
+            gate_exps.is_device_resident(e)
+                && up_exps.is_device_resident(e)
+                && down_exps.is_device_resident(e)
+        })
+        .collect();
+
+    let xs: Vec<Vec<f32>> = members
+        .iter()
+        .map(|members| {
+            let mut x = Vec::with_capacity(members.len() * n_embd);
+            for &(token, _) in members {
+                x.extend_from_slice(&hidden[token * n_embd..(token + 1) * n_embd]);
+            }
+            x
+        })
+        .collect();
+
+    // Views first, then ops: a `MatmulOp` borrows its weight.
+    let gate_views: Vec<_> = experts
+        .iter()
+        .map(|&e| gate_exps.expert_matrix(e))
+        .collect();
+    let up_views: Vec<_> = experts.iter().map(|&e| up_exps.expert_matrix(e)).collect();
+    let mut ops: Vec<MatmulOp<'_>> = Vec::new();
+    let mut op_group: Vec<usize> = Vec::new();
+    for group in 0..experts.len() {
+        if !on_device[group] {
+            continue;
+        }
+        ops.push(MatmulOp {
+            x: &xs[group],
+            n_tokens: members[group].len(),
+            w: &gate_views[group],
+        });
+        ops.push(MatmulOp {
+            x: &xs[group],
+            n_tokens: members[group].len(),
+            w: &up_views[group],
+        });
+        op_group.push(group);
+    }
+    let batched = matmul_batch_mixed(backend, &ops);
+    // Back into per-group slots, so the activation loop reads the same way
+    // whichever path produced a group's projections.
+    let mut slots: Vec<Option<(Vec<f32>, Vec<f32>)>> = (0..experts.len()).map(|_| None).collect();
+    for (slot, group) in op_group.iter().enumerate() {
+        slots[*group] = Some((batched[slot * 2].clone(), batched[slot * 2 + 1].clone()));
+    }
+    for group in 0..experts.len() {
+        if on_device[group] {
+            continue;
+        }
+        let inputs: Vec<&[f32]> = (0..members[group].len())
+            .map(|m| &xs[group][m * n_embd..(m + 1) * n_embd])
+            .collect();
+        let gate = project_expert(
+            backend,
+            gate_exps,
+            experts[group],
+            0,
+            gate_exps.out_dim,
+            &inputs,
+        );
+        let up = project_expert(
+            backend,
+            up_exps,
+            experts[group],
+            0,
+            up_exps.out_dim,
+            &inputs,
+        );
+        slots[group] = Some((gate.concat(), up.concat()));
+    }
+    let projected: Vec<(Vec<f32>, Vec<f32>)> = slots
+        .into_iter()
+        .map(|p| p.expect("every group took one path or the other"))
+        .collect();
+
+    // Activation, per member, into one contiguous run per group — the down
+    // projection's operand.
+    let ffn_dim = gate_exps.out_dim;
+    let hs: Vec<Vec<f32>> = (0..experts.len())
+        .map(|group| {
+            let (gate, up) = &projected[group];
+            let mut h = Vec::with_capacity(members[group].len() * ffn_dim);
+            for m in 0..members[group].len() {
+                let range = m * ffn_dim..(m + 1) * ffn_dim;
+                h.extend_from_slice(&activate(&gate[range.clone()], &up[range]));
+            }
+            h
+        })
+        .collect();
+
+    let down_views: Vec<_> = experts
+        .iter()
+        .map(|&e| down_exps.expert_matrix(e))
+        .collect();
+    let mut down_ops: Vec<MatmulOp<'_>> = Vec::new();
+    let mut down_group: Vec<usize> = Vec::new();
+    for group in 0..experts.len() {
+        if !on_device[group] {
+            continue;
+        }
+        down_ops.push(MatmulOp {
+            x: &hs[group],
+            n_tokens: members[group].len(),
+            w: &down_views[group],
+        });
+        down_group.push(group);
+    }
+    let down_batched = matmul_batch_mixed(backend, &down_ops);
+    let mut down: Vec<Option<Vec<f32>>> = (0..experts.len()).map(|_| None).collect();
+    for (slot, group) in down_group.iter().enumerate() {
+        down[*group] = Some(down_batched[slot].clone());
+    }
+    let ffn_dim_in = down_exps.in_dim;
+    for group in 0..experts.len() {
+        if on_device[group] {
+            continue;
+        }
+        let inputs: Vec<&[f32]> = (0..members[group].len())
+            .map(|m| &hs[group][m * ffn_dim_in..(m + 1) * ffn_dim_in])
+            .collect();
+        down[group] = Some(
+            project_expert(
+                backend,
+                down_exps,
+                experts[group],
+                0,
+                down_exps.out_dim,
+                &inputs,
+            )
+            .concat(),
+        );
+    }
+    let down: Vec<Vec<f32>> = down
+        .into_iter()
+        .map(|d| d.expect("every group took one path or the other"))
+        .collect();
+
+    let out_dim = down_exps.out_dim;
+    let mut out: Vec<Vec<Vec<f32>>> = selection
+        .iter()
+        .map(|picks| vec![Vec::new(); picks.len()])
+        .collect();
+    for group in 0..experts.len() {
+        for (m, &(token, weight)) in members[group].iter().enumerate() {
+            let mut contribution = down[group][m * out_dim..(m + 1) * out_dim].to_vec();
+            contribution.iter_mut().for_each(|v| *v *= weight);
+            out[token][ranks[group][m]] = contribution;
+        }
+    }
+    out
+}
+
+/// Whether `ORANGU_GPU_EXPERTS=1` asked for routed-expert matmuls to go to
+/// the GPU instead of the host AVX2/rayon path.
+///
+/// **Off by default, and a measurement knob before it is a feature.** The
+/// open question a device expert tier rests on is whether a GPU expert
+/// matmul beats `engine::vecdot`'s tuned host path *at all* — colibri, the
+/// only engine either reference tree has that ships such a tier, concludes
+/// it "earns its VRAM only when the CPU is the weak link". This routes
+/// every routed expert to the device so that question can be answered
+/// before a residency policy, a heat profile and a batched dispatch are
+/// built on top of the assumption that it can.
+///
+/// It deliberately does **no** residency management: every expert it
+/// touches lands in the backend's weight arena, which never evicts. On a
+/// model whose experts exceed VRAM that is driver paging, and the number it
+/// produces is meaningless. Point it at a device that can hold them.
+pub(crate) fn gpu_experts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ORANGU_GPU_EXPERTS").is_some())
+}
+
+/// One expert's projection on the GPU, or `None` to take the host path.
+///
+/// The whole of the dispatch: an expert's rows are contiguous in the
+/// stacked tensor, so `ExpertQuantMatrix::expert_matrix` views them as an
+/// ordinary `QuantMatrix` and `Backend::matmul` already knows what to do
+/// with one. No new kernel — every GPU backend already has one for every
+/// quantization an expert is stored in, which is what
+/// `engine::expert_tier` is written against.
+///
+/// Returns `None` — the host path — when the knob is off, the backend has
+/// no GPU, or the backend has no kernel for this quantization. That last
+/// one matters: the `IQ*` types the Vulkan backend lacks are exactly the
+/// ones large MoE models are shipped in.
+fn gpu_project_expert(
+    backend: &dyn crate::engine::backend::Backend,
+    weights: &crate::engine::loader::ExpertQuantMatrix,
+    expert: usize,
+    first_row: usize,
+    n_rows: usize,
+    inputs: &[&[f32]],
+) -> Option<Vec<Vec<f32>>> {
+    if !gpu_experts() || backend.as_wgpu().is_none() || !backend.supports_type(weights.ggml_type())
+    {
+        return None;
+    }
+    let in_dim = weights.in_dim;
+    let mut x = Vec::with_capacity(inputs.len() * in_dim);
+    for input in inputs {
+        debug_assert_eq!(input.len(), in_dim);
+        x.extend_from_slice(input);
+    }
+    let view = weights.expert_matrix(expert).rows(first_row, n_rows);
+    // `matmul`, not `matmul_decode`: this is the same shape a prefill
+    // matmul has — several independent input rows against one weight — and
+    // the decode entry point exists for a *batch of sequences*, which these
+    // rows are not.
+    let y = backend.matmul(&x, inputs.len(), &view);
+    Some(
+        (0..inputs.len())
+            .map(|t| y[t * n_rows..(t + 1) * n_rows].to_vec())
+            .collect(),
+    )
+}
 
 /// One expert matrix applied to every token routed to that expert,
 /// dequantizing each row **exactly once** and never holding more than a few
@@ -253,6 +605,7 @@ impl ExpertRouting {
 /// (`gemma-4-26B-A4B`'s `ffn_gate_up_exps`, whose first half is the gate and
 /// second half the up).
 pub(crate) fn project_expert(
+    backend: &dyn crate::engine::backend::Backend,
     weights: &crate::engine::loader::ExpertQuantMatrix,
     expert: usize,
     first_row: usize,
@@ -262,6 +615,9 @@ pub(crate) fn project_expert(
     let n_inputs = inputs.len();
     if n_inputs == 0 {
         return Vec::new();
+    }
+    if let Some(out) = gpu_project_expert(backend, weights, expert, first_row, n_rows, inputs) {
+        return out;
     }
     // Row-major in the *row* index: one contiguous run of `n_inputs` outputs
     // per row, so a task owns a disjoint slice and writes it without
@@ -923,7 +1279,14 @@ mod tests {
         let refs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
 
         for expert in 0..n_expert {
-            let together = project_expert(&weights, expert, 0, out_dim, &refs);
+            let together = project_expert(
+                &crate::engine::backend::CpuBackend,
+                &weights,
+                expert,
+                0,
+                out_dim,
+                &refs,
+            );
             for (i, input) in refs.iter().enumerate() {
                 let alone: Vec<f32> = (0..out_dim)
                     .map(|o| tensor::dot(input, &weights.row(expert, o)))
@@ -943,7 +1306,14 @@ mod tests {
         let input: Vec<f32> = vec![1.0, -2.0, 0.5, 3.0];
         let refs: [&[f32]; 1] = [&input];
 
-        let second_half = project_expert(&weights, 1, 3, 3, &refs);
+        let second_half = project_expert(
+            &crate::engine::backend::CpuBackend,
+            &weights,
+            1,
+            3,
+            3,
+            &refs,
+        );
         let expected: Vec<f32> = (3..6)
             .map(|o| tensor::dot(&input, &weights.row(1, o)))
             .collect();
@@ -956,7 +1326,9 @@ mod tests {
     fn projecting_no_inputs_reads_nothing() {
         use crate::engine::loader::test_expert_matrix;
         let weights = test_expert_matrix(2, 4, 4);
-        assert!(project_expert(&weights, 0, 0, 4, &[]).is_empty());
+        assert!(
+            project_expert(&crate::engine::backend::CpuBackend, &weights, 0, 0, 4, &[]).is_empty()
+        );
     }
 
     mod budget {

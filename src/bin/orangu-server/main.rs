@@ -61,10 +61,15 @@ use engine::arch::phi::PhiModel;
 use engine::arch::qwen3next::Qwen3NextModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
-use engine::backend::{Backend, CpuBackend, CudaBackend, MetalBackend, VulkanBackend};
+use engine::backend::device;
+use engine::backend::{
+    Backend, CpuBackend, CudaBackend, DeviceCandidate, DeviceError, DeviceErrorKind, DeviceRequest,
+    MetalBackend, MultiDeviceBackend, VulkanBackend,
+};
 use engine::generate::Engine;
 use engine::loader::ArchFamily;
 use engine::loader::LoadedModel;
+use engine::placement::{self, SplitMode, SplitPlan};
 use engine::scheduler::SlotPool;
 use engine::tokenizer::Tokenizer;
 use orangu::gguf::{GgufFile, GgufValue, ggml_type_name};
@@ -252,6 +257,15 @@ struct Args {
     /// current working directory.
     #[arg(short, long)]
     workspace: Option<PathBuf>,
+    /// GPU device to use exclusively: an index, part of its name, or `auto`.
+    #[arg(long, value_name = "DEVICE")]
+    device: Option<String>,
+    /// Spread the model's layers across the selected devices: off, auto, all, cpu, or shares like 3,1.
+    #[arg(long = "device-split", value_name = "MODE")]
+    device_split: Option<String>,
+    /// Worker threads for every CPU path. Defaults to one per logical core.
+    #[arg(long, value_name = "N")]
+    threads: Option<String>,
     /// Interactively create ~/.orangu/orangu-server.conf.
     #[arg(short, long)]
     init: bool,
@@ -765,6 +779,11 @@ fn auto_pair_dflash_target(
 fn prepare(args: Args) -> Result<Prepared> {
     let cli_role = args.role();
     let config_path = args.config.clone();
+    // Read before `args` is consumed below; applied at `select_backend`,
+    // where the device list it names actually exists.
+    let device_flag = args.device.clone();
+    let split_flag = args.device_split.clone();
+    let threads_flag = args.threads.clone();
     let conf = load_config(args.config, cli_role, args.daemon)?;
     let mut role = conf.role;
     let workspace = resolve_workspace(args.workspace.clone())?;
@@ -861,15 +880,52 @@ fn prepare(args: Args) -> Result<Prepared> {
     let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
     let chat_template_source = metadata_string(&gguf, "tokenizer.chat_template");
 
-    let loaded = source.load().context("loading model weights")?;
-    let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(conf.backend)?;
+    // Before anything parallel runs — the loader itself reaches for rayon,
+    // and `build_global` can only be called once.
+    let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
+    let mut loaded = source.load().context("loading model weights")?;
+    let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(
+        conf.backend,
+        &requested_device(device_flag.as_deref(), &conf.device),
+    )?;
+    // The split decision needs only the *weight* side of the footprint,
+    // which is readable straight from the loaded tensor table — the KV side
+    // needs a built model, and the model cannot be built until placement is
+    // decided, since building it is what stamps each tensor's device.
+    let (weights_device_bytes, _) = engine::backend::device_resident_split(loaded.tensor_sizes());
+    let per_layer_bytes =
+        engine::footprint::DeviceFootprint::weights_per_layer(&loaded, loaded.config.n_layer);
+    let (backend, backend_label, split) = apply_device_split(
+        backend,
+        backend_label,
+        &requested_split(split_flag.as_deref(), &conf.device_split)?,
+        &per_layer_bytes,
+        weights_device_bytes,
+    )?;
+    eprintln!(
+        "{}",
+        cpu_inventory(
+            match &split {
+                Some(split) if split.plan.runs_on_host() => "— overflow tier",
+                _ if backend.as_wgpu().is_none() && split.is_none() => "<- in use",
+                _ => "— not running layers",
+            },
+            threads
+        )
+    );
+    // Before the model is built: `LoadedModel::matrix` is what stamps each
+    // tensor's device, and every architecture calls it during construction.
+    if let Some(split) = &split {
+        loaded.set_layer_devices(split.plan.layer_device.clone());
+    }
+    plan_expert_tier(&mut loaded, backend.as_ref(), weights_device_bytes);
     // Captured here, while the concrete backend is still in hand, because the
     // `wgpu` engine is the only thing that knows which of its kernels feature
     // negotiation and the `ORANGU_*` flags actually left live — and that
     // answer travels with every benchmark result through `/props`. `None` for
     // the CPU/CUDA/OpenCL/ROCm backends, which have no such selection to
     // report. See `VulkanBackend::tuning_report`.
-    let gpu_tuning = backend
+    let mut gpu_tuning = backend
         .as_wgpu()
         .map(engine::backend::VulkanBackend::tuning_report);
     let gpu_tuning_summary = backend
@@ -935,6 +991,61 @@ fn prepare(args: Args) -> Result<Prepared> {
             MistralModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
     };
+
+    // What this model puts on the chosen device, against what that device
+    // has — reported here, where both are finally known, and before the
+    // first request rather than after somebody notices the throughput.
+    //
+    // The KV geometry comes from a one-token probe cache, the same trick
+    // the slot-persistence fingerprint below uses: the per-layer shape is
+    // fixed model geometry, so it can be read from a cache that allocates
+    // nothing and then scaled to a context far too large to build.
+    // A split model has no single device to measure, so it reports what
+    // each device holds instead — the same question, answered per device.
+    if let Some(split) = &split {
+        let per_device = engine::footprint::DeviceFootprint::weights_per_device(
+            &loaded,
+            split.device_names.len(),
+        );
+        for line in split.lines(&per_device) {
+            eprintln!("{line}");
+        }
+        // `as_wgpu` is `None` on a split, so the ordinary tuning report was
+        // never built. Standing this in its place keeps `/props` describing
+        // the run rather than going silent on the configuration that most
+        // needs describing.
+        gpu_tuning = Some(split.to_json(&per_device));
+    }
+    let footprint = backend.as_wgpu().map(|wgpu| {
+        engine::footprint::DeviceFootprint::measure(
+            &loaded,
+            &model.new_kv_cache(1),
+            Some(wgpu.kv_storage()),
+            conf.slots,
+        )
+    });
+    if let (Some(footprint), Some(wgpu)) = (&footprint, backend.as_wgpu()) {
+        for line in footprint.report(wgpu.api_tag(), wgpu.device_in_use()) {
+            eprintln!("{line}");
+        }
+        // Beside the tuning report rather than in it: `tuning_report` is a
+        // property of the device and its kernels, this is a property of the
+        // device *and this model*, and a reader of `/props` wants both in
+        // one place regardless.
+        if let Some(object) = gpu_tuning.as_mut().and_then(|value| value.as_object_mut()) {
+            object.insert(
+                "footprint".to_string(),
+                footprint.to_json(wgpu.device_in_use()),
+            );
+        }
+        // On a MoE model, what a device expert tier in that headroom would
+        // be worth. A projection, printed because the question otherwise
+        // can only be answered by building the tier first — see
+        // `engine::expert_tier`.
+        for line in expert_tier_projection(&loaded, footprint, wgpu) {
+            eprintln!("{line}");
+        }
+    }
 
     let slots = SlotPool::new(conf.slots);
     // Cross-sequence GEMM batching, off by default: a real, reproducible
@@ -2010,7 +2121,7 @@ async fn wait_for_sigint() {
 /// Generic over the constructor rather than hardcoding `VulkanBackend` because
 /// `MetalBackend` comes up through the same `wgpu` machinery and so has the
 /// same transient-failure window.
-fn init_gpu_with_retry<B>(init: fn() -> Option<B>) -> Option<B> {
+fn init_gpu_with_retry<B>(init: impl Fn() -> Option<B>) -> Option<B> {
     const ATTEMPTS: usize = 4;
     for attempt in 1..=ATTEMPTS {
         if let Some(backend) = init() {
@@ -2023,9 +2134,585 @@ fn init_gpu_with_retry<B>(init: fn() -> Option<B>) -> Option<B> {
     None
 }
 
+/// The CPU's own name, for a device list that has to name it beside the
+/// GPUs — the brand string when `sysinfo` has one, `"CPU"` otherwise.
+fn cpu_label() -> String {
+    let brand = orangu::hardware::detect_cpu().brand;
+    if brand.trim().is_empty() {
+        "CPU".to_string()
+    } else {
+        brand
+    }
+}
+
+/// The CPU's line in the startup device inventory, so one block covers
+/// every processor in the machine rather than only the GPUs.
+///
+/// `role` says what it is doing in this run — running the model, holding
+/// the layers that did not fit a device, or nothing. The last is worth a
+/// line too: on a machine whose GPU is doing the work, the CPU's core count
+/// and instruction set are still what the tokenizer, the sampler and (on a
+/// split model) attention run on.
+fn cpu_inventory(role: &str, threads: Option<usize>) -> String {
+    let cpu = orangu::hardware::detect_cpu();
+    let mut detail = Vec::new();
+    match cpu.physical_cores {
+        Some(cores) => detail.push(format!("{cores} cores / {} threads", cpu.logical_cores)),
+        None => detail.push(format!("{} threads", cpu.logical_cores)),
+    }
+    // The widest instruction set `engine::vecdot` will actually dispatch to,
+    // which is what decides the CPU matmul's speed — not the full feature
+    // list, which belongs in the `system` report.
+    detail.push(
+        if cpu.features.avx512f {
+            "AVX-512"
+        } else if cpu.features.avx2 {
+            "AVX2"
+        } else if cpu.features.sse4_2 {
+            "SSE4.2"
+        } else {
+            "scalar"
+        }
+        .to_string(),
+    );
+    detail.push(format!(
+        "{} RAM",
+        orangu::format::format_bytes(cpu.total_memory_bytes)
+    ));
+    detail.push(match threads {
+        Some(threads) => format!("{threads} worker threads"),
+        None => format!("{} worker threads (default)", cpu.logical_cores),
+    });
+    format!(
+        "orangu-server: [cpu] {} [{}] {role}",
+        cpu_label(),
+        detail.join(", ")
+    )
+}
+
+/// Sizes the worker pool every CPU path in this process shares.
+///
+/// One pool, set once, before anything parallel runs: `CpuBackend`'s
+/// matmul, the MoE expert loop (`engine::arch::project_expert`) and the
+/// per-expert fan-out all go through `rayon`'s global pool, so the knob
+/// belongs there rather than on any one of them.
+///
+/// `None` — the default — leaves rayon's own choice (one worker per logical
+/// core) untouched, so a config that says nothing about threads keeps
+/// exactly the behaviour it had. Returns what was applied, for the
+/// inventory line.
+fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Result<Option<usize>> {
+    let requested = match flag {
+        Some(raw) => Some(
+            raw.trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("--threads {raw:?} is not a number"))?,
+        ),
+        None => match std::env::var("ORANGU_THREADS") {
+            Ok(raw) => Some(
+                raw.trim()
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("ORANGU_THREADS={raw:?} is not a number"))?,
+            ),
+            Err(_) => configured,
+        },
+    };
+    let Some(threads) = requested else {
+        return Ok(None);
+    };
+    if threads == 0 {
+        bail!("threads must be at least 1 (leave it unset for one worker per logical core)");
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .map_err(|err| anyhow!("could not size the worker pool to {threads} threads: {err}"))?;
+    Ok(Some(threads))
+}
+
+/// Chooses which routed experts a device holds, and records it on the model
+/// so `LoadedModel::expert_matrix` can stamp each tensor.
+///
+/// Only when `ORANGU_GPU_EXPERTS=1` asked for the tier at all — without it
+/// every expert stays on the host path and this does nothing.
+///
+/// **This is what bounds the tier.** `VulkanBackend::weight_buffer`'s arena
+/// never evicts, so an expert that reaches the device stays there; choosing
+/// the resident set up front is the only thing standing between a tier and
+/// unbounded VRAM growth. `engine::expert_tier::plan` does the choosing —
+/// whole experts, hottest first, fastest device first — and heat is uniform
+/// here because a routing profile belongs to a session and this runs before
+/// the first token. That makes this the floor a tier achieves, which is
+/// what the startup projection has always reported.
+fn plan_expert_tier(
+    loaded: &mut engine::loader::LoadedModel,
+    backend: &dyn Backend,
+    weights_device_bytes: u64,
+) {
+    if !engine::arch::gpu_experts() {
+        return;
+    }
+    let Some(wgpu) = backend.as_wgpu() else {
+        return;
+    };
+    let Some(total) = wgpu.device_in_use().vram_total_bytes else {
+        // A device that will not say how big it is cannot be given a
+        // budget, and guessing one is how an arena silently overruns.
+        return;
+    };
+    let tensors = loaded.expert_tensors();
+    if tensors.is_empty() {
+        return;
+    }
+    // Half the headroom after the dense weights, leaving the rest for the
+    // KV cache and the transient arenas — the same reservation the startup
+    // projection reports against, and for the same reason it cannot be
+    // computed exactly here.
+    let budget = total.saturating_sub(weights_device_bytes) / 2;
+
+    // Real routing heat when a previous session left one
+    // (`ORANGU_EXPERT_USAGE`), by size otherwise. The difference is not
+    // marginal: colibri measured the same tier 3-5x apart depending on
+    // which of the two filled it, and this tier holds only about half the
+    // experts, so the choice of *which* half is most of its value.
+    let learned = engine::expert_store::learned_heat();
+    let mut heat = Vec::new();
+    for (name, n_expert, bytes) in &tensors {
+        let key: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+        for expert in 0..*n_expert {
+            heat.push(engine::expert_tier::ExpertHeat {
+                bytes: *bytes,
+                // Zero for an expert no history mentions. `expert_tier::
+                // plan` still admits those once the hot ones are placed —
+                // unused VRAM serves nobody — they simply cannot displace
+                // one routing actually asked for.
+                heat: learned.get(&(key.clone(), expert)).copied().unwrap_or(0) as u64,
+            });
+        }
+    }
+    let profiled = heat.iter().any(|e| e.heat > 0);
+    let plan = engine::expert_tier::plan(&heat, &[budget]);
+
+    let mut residency = std::collections::HashMap::new();
+    let mut at = 0usize;
+    for (name, n_expert, _) in &tensors {
+        let flags: std::sync::Arc<[bool]> = plan.device_of[at..at + n_expert]
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        residency.insert(name.clone(), flags);
+        at += n_expert;
+    }
+    eprintln!(
+        "orangu-server: [{}] expert tier: {} of {} experts on device ({}), filled by {}",
+        wgpu.api_tag(),
+        plan.resident_count(),
+        heat.len(),
+        orangu::format::format_bytes(plan.resident_bytes()),
+        // Which of the two filled it is the thing that decides what the
+        // tier is worth, so it is on the line rather than inferable.
+        match (profiled, plan.coverage()) {
+            (true, Some(coverage)) => format!(
+                "measured routing heat ({:.1}% of recorded selections)",
+                coverage * 100.0
+            ),
+            _ => "size (no routing profile — set ORANGU_EXPERT_USAGE)".to_string(),
+        },
+    );
+    loaded.set_expert_residency(residency);
+}
+
+/// What a device-resident expert tier in this device's free VRAM would
+/// hold — empty for a dense model, which has no routed experts at all.
+///
+/// Sizes every expert from the model's own `*_exps.weight` tensors and the
+/// architecture's `expert_count`, so the figure is this model's rather than
+/// a class of model's. Heat is uniform: orangu's routing profile lives in
+/// `engine::expert_store`'s sidecar and belongs to a *session*, while this
+/// runs before the first token — so the projection reports the floor a tier
+/// would achieve, and says that a real profile does better.
+fn expert_tier_projection(
+    loaded: &engine::loader::LoadedModel,
+    footprint: &engine::footprint::DeviceFootprint,
+    wgpu: &VulkanBackend,
+) -> Vec<String> {
+    let expert_bytes = footprint.weights_host_bytes;
+    if expert_bytes == 0 {
+        return Vec::new();
+    }
+    let n_expert = loaded.metadata_u64("expert_count").unwrap_or(0) as usize;
+    // The unit is `(tensor, expert)`, matching `engine::expert_store`'s own
+    // granularity: GGUF keeps one layer's gate/up/down experts in three
+    // separate stacked tensors, so a "seat" in a tier is one expert of one
+    // of them. Sized from each tensor's real `expert_bytes` rather than by
+    // dividing a total, since the three stacks of a layer are not the same
+    // size as each other.
+    let stacks: Vec<String> = loaded
+        .tensor_sizes()
+        .filter(|(name, _)| name.ends_with("_exps.weight"))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if n_expert == 0 || stacks.is_empty() {
+        return Vec::new();
+    }
+    let mut heat = Vec::with_capacity(n_expert * stacks.len());
+    for name in &stacks {
+        let Ok(stacked) = loaded.expert_matrix(name) else {
+            return Vec::new();
+        };
+        heat.extend(std::iter::repeat_n(
+            engine::expert_tier::ExpertHeat {
+                bytes: stacked.expert_bytes(),
+                heat: 1,
+            },
+            stacked.n_expert,
+        ));
+    }
+    let headroom = footprint
+        .headroom_on(wgpu.device_in_use())
+        .unwrap_or(0)
+        // The same headroom the KV cache and the transient arenas draw on,
+        // so a tier cannot be projected into memory the model is already
+        // going to need. Half is a deliberately conservative split, and it
+        // is a projection either way.
+        / 2;
+    let slots = heat.len();
+    let plan = engine::expert_tier::plan(&heat, &[headroom]);
+    engine::expert_tier::projection(wgpu.api_tag(), &plan, slots, true)
+}
+
+/// Spreads the model across the selected devices when asked to, wrapping
+/// the already-built head backend rather than replacing it.
+///
+/// Runs *after* `select_backend`, not inside it, and the split is decided
+/// from what that returned: the chosen backend still holds the device set
+/// it selected from, so nothing has to be enumerated twice or threaded
+/// through. The head device's backend is reused as-is — element 0 of the
+/// wrapper — so a split costs one extra bring-up per additional device and
+/// no rework of the first.
+///
+/// Only the `wgpu` backends can be split. `CudaBackend`/`OpenClBackend`/
+/// `RocmBackend` are matmul-only implementations that no NVIDIA/OpenCL/ROCm
+/// hardware has verified during development; giving them an untested
+/// multi-device path would be a worse answer than not offering one, so a
+/// split asked for on those is refused with that said out loud.
+fn apply_device_split(
+    backend: Arc<dyn Backend>,
+    label: String,
+    mode: &SplitMode,
+    per_layer_bytes: &[u64],
+    weights_bytes: u64,
+) -> Result<(Arc<dyn Backend>, String, Option<SplitReport>)> {
+    /// The share of a device's memory a fill-in-order placement will put
+    /// weights into, leaving the rest for the KV cache and the transient
+    /// compute buffers.
+    ///
+    /// A heuristic, and the only one here. It cannot be computed: the KV
+    /// geometry needs a built model, and the model cannot be built until
+    /// placement is decided, since building it is what stamps each tensor's
+    /// device. Explicit ratios exist for anyone who wants to set the
+    /// boundary exactly, and the footprint report says afterwards how much
+    /// headroom the choice actually left.
+    const WEIGHTS_SHARE_OF_DEVICE: f64 = 0.8;
+
+    if mode.is_off() {
+        return Ok((backend, label, None));
+    }
+    let Some(wgpu) = backend.as_wgpu() else {
+        bail!(
+            "device_split = {mode}, but {label} cannot be split — only the wgpu backends \
+             (vulkan, metal, dx12) place layers across devices. Use device_split = off, or \
+             a backend that can."
+        );
+    };
+    let set = wgpu.device_set();
+    // What each device actually has, for the report — as distinct from the
+    // reduced budget the fill plans against below. Showing the budget would
+    // make a device look over-subscribed when it is merely holding back
+    // room for the KV cache.
+    let reported_capacities: Vec<Option<u64>> = set.iter().map(|c| c.vram_total_bytes).collect();
+    let mut capacities: Vec<Option<u64>> = set
+        .iter()
+        .map(|c| {
+            c.vram_total_bytes
+                .map(|total| (total as f64 * WEIGHTS_SHARE_OF_DEVICE) as u64)
+        })
+        .collect();
+    // The first device pays for every tensor outside a numbered layer —
+    // token embeddings, the output norm, `lm_head` — because that is where
+    // `LoadedModel::device_for_tensor` puts them. Charging it only for the
+    // layers it was given would overfill it by their size, which on a
+    // large-vocabulary model is gigabytes: a live Kimi-K3 fill put 4.96 GiB
+    // of weights on a card budgeted for 3.20 GiB before this line existed.
+    let non_layer_bytes = weights_bytes.saturating_sub(per_layer_bytes.iter().sum::<u64>());
+    if let Some(head) = capacities.first_mut().and_then(Option::as_mut) {
+        *head = head.saturating_sub(non_layer_bytes);
+    }
+    let backends_bit = wgpu.backends_bit();
+    let api = wgpu.api_tag().to_string();
+    // Indices and names first, then drop the borrow: the head backend is
+    // about to be moved into the wrapper, and `set` borrows from it.
+    let indices: Vec<usize> = set.iter().map(|c| c.index).collect();
+    let mut names: Vec<String> = set.iter().map(|c| c.name.clone()).collect();
+    drop(set);
+
+    // The host as the last device: unbounded, because its memory is system
+    // RAM and the weights are mapped there already. It therefore takes
+    // exactly what the devices could not hold, which is the whole point of
+    // `SplitMode::Cpu` and is why it is a fill rather than a share.
+    let overflow_to_cpu = matches!(mode, SplitMode::Cpu);
+    let mut reported_capacities = reported_capacities;
+    if overflow_to_cpu {
+        capacities.push(None);
+        reported_capacities.push(None);
+        names.push(cpu_label());
+    }
+
+    let Some(plan) = placement::plan(mode, per_layer_bytes, &capacities, weights_bytes) else {
+        return Ok((backend, label, None));
+    };
+
+    let mut devices: Vec<Arc<dyn Backend>> = Vec::with_capacity(capacities.len());
+    devices.push(backend);
+    for (position, &index) in indices.iter().enumerate().skip(1) {
+        // `indices` holds only the wgpu devices; the host entry appended to
+        // `capacities`/`names` above has no adapter to bring up.
+
+        // A device the plan gave no layers to is still brought up: the
+        // wrapper indexes by position, and skipping one would shift every
+        // later device's weights onto the wrong card.
+        let extra =
+            init_gpu_with_retry(|| VulkanBackend::try_init_selected(backends_bit, &[index]))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "device_split = {mode}, but device {index} ({}) could not be brought up \
+                     (device or pipeline creation failed)",
+                        names[position]
+                    )
+                })?;
+        devices.push(Arc::new(extra));
+    }
+
+    if overflow_to_cpu {
+        devices.push(Arc::new(CpuBackend));
+    }
+    let label = format!(
+        "{label} + {} more ({} devices, split)",
+        devices.len() - 1,
+        devices.len()
+    );
+    Ok((
+        Arc::new(MultiDeviceBackend::new(devices)),
+        label,
+        Some(SplitReport {
+            api,
+            plan,
+            device_names: names,
+            device_capacities: reported_capacities,
+        }),
+    ))
+}
+
+/// Everything a split run has to be able to say about itself afterwards.
+///
+/// Carried out of `apply_device_split` because nothing else can reconstruct
+/// it: once the per-device backends are behind a `MultiDeviceBackend`,
+/// `Backend::as_wgpu` answers `None` by design and the device metadata is no
+/// longer reachable. Without this, splitting a model would *lose* the
+/// device reporting that P0 exists to provide.
+struct SplitReport {
+    api: String,
+    plan: SplitPlan,
+    device_names: Vec<String>,
+    device_capacities: Vec<Option<u64>>,
+}
+
+impl SplitReport {
+    /// The startup lines: the layer ranges, what each device holds against
+    /// what it has, and what the split costs.
+    ///
+    /// The cost is stated on the same screen as the split itself, because
+    /// it is large and counter-intuitive: spreading a model across two
+    /// cards makes it *slower* per token, not faster, and the reason to do
+    /// it is that a model too big for one card runs at all.
+    fn lines(&self, weights_per_device: &[u64]) -> Vec<String> {
+        let api = &self.api;
+        let mut lines = vec![format!(
+            "orangu-server: [{api}] split: {}",
+            self.plan.describe(&self.device_names)
+        )];
+        for (device, &bytes) in weights_per_device.iter().enumerate() {
+            let capacity = match self.device_capacities.get(device).copied().flatten() {
+                Some(total) => format!(" of {}", orangu::format::format_bytes(total)),
+                None => String::new(),
+            };
+            lines.push(format!(
+                "orangu-server: [{api}] {}: {} weights{capacity}, {} layer{}",
+                self.device_names
+                    .get(device)
+                    .cloned()
+                    .unwrap_or_else(|| format!("device {device}")),
+                orangu::format::format_bytes(bytes),
+                self.plan
+                    .per_device_layers
+                    .get(device)
+                    .copied()
+                    .unwrap_or(0),
+                if self.plan.per_device_layers.get(device) == Some(&1) {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        }
+        lines.push(format!(
+            "orangu-server: [{api}] a split model keeps its per-layer GPU work — fused \
+             attention, fused FFN, the device-side KV cache — but gives up the whole-step \
+             decode submission, which cannot span devices, and the hidden state crosses \
+             the bus {} time{} per token. It buys capacity, not speed.",
+            self.plan.boundaries(),
+            if self.plan.boundaries() == 1 { "" } else { "s" }
+        ));
+        lines
+    }
+
+    /// The same thing for `/props`, standing in for the tuning report a
+    /// split run has no single device to produce.
+    fn to_json(&self, weights_per_device: &[u64]) -> serde_json::Value {
+        serde_json::json!({
+            "api": self.api,
+            "split": true,
+            "boundaries_per_token": self.plan.boundaries(),
+            "devices": self
+                .device_names
+                .iter()
+                .enumerate()
+                .map(|(device, name)| serde_json::json!({
+                    "name": name,
+                    "total_bytes": self.device_capacities.get(device).copied().flatten(),
+                    "weights_bytes": weights_per_device.get(device).copied().unwrap_or(0),
+                    "layers": self.plan.per_device_layers.get(device).copied().unwrap_or(0),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// How the model should be spread: `--device-split` if given, then
+/// `ORANGU_DEVICE_SPLIT`, then `[orangu-server].device_split`.
+///
+/// Same precedence as `requested_device`, and validated the same way — a
+/// value that isn't a mode or a ratio list is an error rather than a silent
+/// `off`, since silently not splitting is exactly the outcome somebody
+/// setting this is trying to avoid.
+fn requested_split(flag: Option<&str>, configured: &SplitMode) -> Result<SplitMode> {
+    let raw = match flag {
+        Some(raw) => Some(raw.to_string()),
+        None => std::env::var("ORANGU_DEVICE_SPLIT").ok(),
+    };
+    match raw {
+        Some(raw) => {
+            SplitMode::parse(&raw).map_err(|err| anyhow!("device split {raw:?} is invalid: {err}"))
+        }
+        None => Ok(configured.clone()),
+    }
+}
+
+/// The device the operator asked for: `ORANGU_DEVICE` if set, otherwise
+/// `[orangu-server].device`, otherwise the ranking policy.
+///
+/// The environment wins so a benchmark sweep can walk a machine's cards
+/// without rewriting the config file between runs — the same precedence
+/// every other `ORANGU_*` tuning knob has. A malformed value can't be
+/// rejected here (see `config`'s own note on the key): "device 2" is only
+/// wrong once a driver has been asked what it has.
+fn requested_device(flag: Option<&str>, configured: &DeviceRequest) -> DeviceRequest {
+    if let Some(raw) = flag {
+        return DeviceRequest::parse(raw);
+    }
+    match std::env::var("ORANGU_DEVICE") {
+        Ok(raw) => DeviceRequest::parse(&raw),
+        Err(_) => configured.clone(),
+    }
+}
+
+/// Enumeration under the same short retry [`init_gpu_with_retry`] applies
+/// to bring-up.
+///
+/// A `wgpu` driver that has just had a context torn down by an exiting
+/// process can briefly report *no* adapters, not merely fail to create a
+/// device on one — and enumeration used to sit inside the retried call
+/// (`request_adapter` both chose and created). Splitting selection out
+/// ahead of bring-up would have quietly dropped that protection, turning a
+/// restart race into "no device was found" on a machine that has one.
+///
+/// Costs nothing where there is genuinely no driver beyond the wait the
+/// previous code already paid there: four fast failures and 2.1s of
+/// backoff.
+fn devices_with_retry(enumerate: impl Fn() -> Vec<DeviceCandidate>) -> Vec<DeviceCandidate> {
+    init_gpu_with_retry(|| {
+        let devices = enumerate();
+        (!devices.is_empty()).then_some(devices)
+    })
+    .unwrap_or_default()
+}
+
+/// Applies `request` to one backend's enumerated devices and prints the
+/// inventory — returning the selected *enumeration indices*, best first.
+///
+/// Under `auto` that is every hardware device the backend reported, ranked;
+/// under an explicit index or name it is exactly one. One device runs the
+/// model either way (the head), which is why the inventory says which of
+/// the selected ones is idle rather than implying all of them are working.
+///
+/// Printing happens here, unconditionally, rather than at the call sites:
+/// these lines are what make a later measurement attributable to a device,
+/// and they are worth nothing if they have to be switched on before the run
+/// they describe. They are also the only place a second, idle card on the
+/// machine becomes visible.
+///
+/// Shared by all five backends — the policy is the same whether the device
+/// list came from `wgpu`, CUDA, OpenCL or HIP, and each of those knowing
+/// only how to *enumerate* is what keeps it that way.
+fn choose_device(
+    api: &str,
+    candidates: &[DeviceCandidate],
+    request: &DeviceRequest,
+) -> std::result::Result<Vec<usize>, DeviceError> {
+    match device::select_all(candidates, request) {
+        Ok(selected) => {
+            for line in device::inventory(api, candidates, &selected) {
+                eprintln!("{line}");
+            }
+            let head = selected[0];
+            if candidates[head].class.is_software() {
+                eprintln!(
+                    "orangu-server: [{api}] {} is a software rasterizer — this runs the GPU \
+                     code path on the CPU, and orangu's own CPU backend is faster. It was \
+                     asked for explicitly, so it is being used.",
+                    candidates[head].name
+                );
+            }
+            Ok(selected.iter().map(|&p| candidates[p].index).collect())
+        }
+        // A machine with no driver for this API is the ordinary case under
+        // `auto` and says nothing. A machine that has devices and still
+        // can't offer one — the software-rasterizer-only case — is
+        // surprising, and stays silent forever unless it is said here.
+        Err(err) => {
+            if !candidates.is_empty() && err.kind == DeviceErrorKind::Absent {
+                eprintln!("orangu-server: [{api}] {err}");
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Picks the `Backend` the forward pass runs on, per `[orangu-server].
 /// backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`, see
-/// `config::BackendPreference`), and a label for the startup banner (e.g.
+/// `config::BackendPreference`) and `device` (`[orangu-server].device` or
+/// `ORANGU_DEVICE`, see `engine::backend::device`), and a label for the
+/// startup banner (e.g.
 /// `"CPU/AVX2"`, `"Vulkan/AMD Radeon RX 5500M (RADV NAVI14)"` or
 /// `"Metal/Apple M1 Pro (Metal)"`). `auto`
 /// tries every GPU backend compiled into this build, preferring the most
@@ -2046,7 +2733,25 @@ fn init_gpu_with_retry<B>(init: fn() -> Option<B>) -> Option<B> {
 /// same engine and the same kernels as `VulkanBackend`, so nothing is
 /// given up by preferring it. Vulkan stays in the chain behind it for a
 /// Mac running MoltenVK.
-fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, String)> {
+///
+/// On Windows `auto` additionally tries **DX12 behind Vulkan**. It is the
+/// same `wgpu` engine and the same WGSL kernels again (`naga` emits HLSL
+/// instead of SPIR-V), so it reaches every fused path `engine::arch` asks
+/// for through `Backend::as_wgpu` — which is why it goes ahead of the
+/// matmul-only CUDA and OpenCL backends rather than after them. Behind
+/// Vulkan because that is the API this engine was tuned on. Its value is
+/// the machine with a working D3D12 driver and no Vulkan ICD, which until
+/// now ran on the CPU without ever saying why.
+///
+/// `device` is applied to *whichever* backend answers, and a backend can
+/// only answer by satisfying it — so a named device is never silently
+/// swapped for another one. Under `auto`, a request no backend in the
+/// chain could satisfy is an error at the end of the chain rather than a
+/// fall-back to the CPU.
+fn select_backend(
+    preference: BackendPreference,
+    device: &DeviceRequest,
+) -> Result<(Arc<dyn Backend>, String)> {
     // Metal is an Apple API and `wgpu` compiles its Metal backend only for
     // Apple targets, so `Backends::METAL` matches nothing anywhere else.
     // Elsewhere, `auto` therefore skips it rather than paying an adapter
@@ -2054,6 +2759,11 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
     // *that* rather than "no device found" after 2.1s of retry backoff for
     // a device that was never going to appear.
     const HAS_METAL: bool = cfg!(target_vendor = "apple");
+    // The same argument for Direct3D 12, which `wgpu` compiles only for
+    // Windows.
+    const HAS_DX12: bool = cfg!(windows);
+    const VULKAN: wgpu::Backends = wgpu::Backends::VULKAN;
+    const DX12: wgpu::Backends = wgpu::Backends::DX12;
 
     let cpu = || -> (Arc<dyn Backend>, String) {
         let label = if is_x86_feature_detected() {
@@ -2063,15 +2773,39 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
         };
         (Arc::new(CpuBackend), label.to_string())
     };
+    // Turns a device-selection failure into the message an explicitly-named
+    // backend fails with. The `DeviceError` already carries the whole device
+    // list, which is the part that makes the message actionable.
+    let named = |api: &str, err: DeviceError| {
+        anyhow!(
+            "[{}].backend = {api}, but {err}",
+            config::SERVER_SECTION,
+            err = err
+        )
+    };
+    // Bring-up failed *after* a device was successfully chosen: the driver
+    // or pipeline creation refused, which is a different problem from not
+    // finding a device and must not be reported as one.
+    let unusable = |api: &str, index: usize| {
+        anyhow!(
+            "[{}].backend = {api}, but device {index} could not be brought up \
+             (device or pipeline creation failed)",
+            config::SERVER_SECTION
+        )
+    };
+
     match preference {
         BackendPreference::Cpu => Ok(cpu()),
         BackendPreference::Vulkan => {
-            let backend = init_gpu_with_retry(VulkanBackend::try_init).ok_or_else(|| {
-                anyhow!(
-                    "[{}].backend = vulkan, but no usable Vulkan adapter was found",
-                    config::SERVER_SECTION
-                )
-            })?;
+            let selected = choose_device(
+                "vulkan",
+                &devices_with_retry(|| VulkanBackend::devices(VULKAN)),
+                device,
+            )
+            .map_err(|err| named("vulkan", err))?;
+            let backend =
+                init_gpu_with_retry(|| VulkanBackend::try_init_selected(VULKAN, &selected))
+                    .ok_or_else(|| unusable("vulkan", selected[0]))?;
             let label = format!("Vulkan/{}", backend.adapter_name);
             Ok((Arc::new(backend), label))
         }
@@ -2081,44 +2815,56 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
             config::SERVER_SECTION
         )),
         BackendPreference::Metal => {
-            let backend = init_gpu_with_retry(MetalBackend::try_init).ok_or_else(|| {
-                anyhow!(
-                    "[{}].backend = metal, but no usable Metal device was found",
-                    config::SERVER_SECTION
-                )
-            })?;
+            let selected =
+                choose_device("metal", &devices_with_retry(MetalBackend::devices), device)
+                    .map_err(|err| named("metal", err))?;
+            let backend = init_gpu_with_retry(|| MetalBackend::try_init_selected(&selected))
+                .ok_or_else(|| unusable("metal", selected[0]))?;
             let label = format!("Metal/{}", backend.device_name());
             Ok((Arc::new(backend), label))
         }
+        BackendPreference::Dx12 if !HAS_DX12 => Err(anyhow!(
+            "[{}].backend = dx12, but Direct3D 12 is a Windows API and this build is \
+             not running on Windows",
+            config::SERVER_SECTION
+        )),
+        BackendPreference::Dx12 => {
+            let selected = choose_device(
+                "dx12",
+                &devices_with_retry(|| VulkanBackend::devices(DX12)),
+                device,
+            )
+            .map_err(|err| named("dx12", err))?;
+            let backend = init_gpu_with_retry(|| VulkanBackend::try_init_selected(DX12, &selected))
+                .ok_or_else(|| unusable("dx12", selected[0]))?;
+            let label = format!("DX12/{}", backend.adapter_name);
+            Ok((Arc::new(backend), label))
+        }
         BackendPreference::Cuda => {
-            let backend = CudaBackend::try_init().ok_or_else(|| {
-                anyhow!(
-                    "[{}].backend = cuda, but no usable CUDA device was found",
-                    config::SERVER_SECTION
-                )
-            })?;
+            let index = choose_device("cuda", &CudaBackend::devices(), device)
+                .map_err(|err| named("cuda", err))?[0];
+            let backend =
+                CudaBackend::try_init_index(index).ok_or_else(|| unusable("cuda", index))?;
             let label = format!("CUDA/{}", backend.device_name);
             Ok((Arc::new(backend), label))
         }
         BackendPreference::OpenCl => {
-            let backend = engine::backend::OpenClBackend::try_init().ok_or_else(|| {
-                anyhow!(
-                    "[{}].backend = opencl, but no usable OpenCL device was found",
-                    config::SERVER_SECTION
-                )
-            })?;
+            use engine::backend::OpenClBackend;
+            let index = choose_device("opencl", &OpenClBackend::devices(), device)
+                .map_err(|err| named("opencl", err))?[0];
+            let backend =
+                OpenClBackend::try_init_index(index).ok_or_else(|| unusable("opencl", index))?;
             let label = format!("OpenCL/{}", backend.device_name);
             Ok((Arc::new(backend), label))
         }
         BackendPreference::Rocm => {
             #[cfg(feature = "rocm")]
             {
-                let backend = engine::backend::RocmBackend::try_init().ok_or_else(|| {
-                    anyhow!(
-                        "[{}].backend = rocm, but no usable ROCm/HIP device was found",
-                        config::SERVER_SECTION
-                    )
-                })?;
+                use engine::backend::RocmBackend;
+                let index = choose_device("rocm", &RocmBackend::devices(), device)
+                    .map_err(|err| named("rocm", err))?[0];
+                let backend =
+                    RocmBackend::try_init_index(index).ok_or_else(|| unusable("rocm", index))?;
                 let label = format!("ROCm/{}", backend.device_name);
                 Ok((Arc::new(backend), label))
             }
@@ -2132,28 +2878,122 @@ fn select_backend(preference: BackendPreference) -> Result<(Arc<dyn Backend>, St
             }
         }
         BackendPreference::Auto => {
+            // An explicitly requested device that an API in this chain
+            // *has* devices for but doesn't offer. Remembered rather than
+            // raised on the spot: the next API along may be the one that
+            // has it, and only the end of the chain knows that none did.
+            //
+            // What this must never become is a silent fall-through. A
+            // backend can only succeed below by satisfying `device`, so
+            // reaching the CPU fallback with a request outstanding means
+            // the named device was nowhere — which is an error, not a
+            // reason to quietly measure something else.
+            let mut rejected: Option<DeviceError> = None;
+            let mut remember = |err: DeviceError| {
+                if err.kind == DeviceErrorKind::Rejected && rejected.is_none() {
+                    rejected = Some(err);
+                }
+            };
+
             // Ahead of Vulkan, and only where it can succeed at all — see
             // this function's doc comment for both halves of that.
-            if HAS_METAL && let Some(backend) = init_gpu_with_retry(MetalBackend::try_init) {
-                let label = format!("Metal/{}", backend.device_name());
-                return Ok((Arc::new(backend), label));
+            if HAS_METAL {
+                match choose_device("metal", &devices_with_retry(MetalBackend::devices), device) {
+                    Ok(selected) => {
+                        if let Some(backend) =
+                            init_gpu_with_retry(|| MetalBackend::try_init_selected(&selected))
+                        {
+                            let label = format!("Metal/{}", backend.device_name());
+                            return Ok((Arc::new(backend), label));
+                        }
+                    }
+                    Err(err) => remember(err),
+                }
             }
-            if let Some(backend) = init_gpu_with_retry(VulkanBackend::try_init) {
-                let label = format!("Vulkan/{}", backend.adapter_name);
-                return Ok((Arc::new(backend), label));
+            match choose_device(
+                "vulkan",
+                &devices_with_retry(|| VulkanBackend::devices(VULKAN)),
+                device,
+            ) {
+                Ok(selected) => {
+                    if let Some(backend) =
+                        init_gpu_with_retry(|| VulkanBackend::try_init_selected(VULKAN, &selected))
+                    {
+                        let label = format!("Vulkan/{}", backend.adapter_name);
+                        return Ok((Arc::new(backend), label));
+                    }
+                }
+                Err(err) => remember(err),
             }
-            if let Some(backend) = CudaBackend::try_init() {
-                let label = format!("CUDA/{}", backend.device_name);
-                return Ok((Arc::new(backend), label));
+            // Behind Vulkan, and only on Windows — see this function's doc
+            // comment. Before CUDA/OpenCL because it reaches the same fused
+            // `wgpu` engine those two don't have.
+            if HAS_DX12 {
+                match choose_device(
+                    "dx12",
+                    &devices_with_retry(|| VulkanBackend::devices(DX12)),
+                    device,
+                ) {
+                    Ok(selected) => {
+                        if let Some(backend) = init_gpu_with_retry(|| {
+                            VulkanBackend::try_init_selected(DX12, &selected)
+                        }) {
+                            let label = format!("DX12/{}", backend.adapter_name);
+                            return Ok((Arc::new(backend), label));
+                        }
+                    }
+                    Err(err) => remember(err),
+                }
             }
-            if let Some(backend) = engine::backend::OpenClBackend::try_init() {
-                let label = format!("OpenCL/{}", backend.device_name);
-                return Ok((Arc::new(backend), label));
+            match choose_device("cuda", &CudaBackend::devices(), device) {
+                Ok(selected) => {
+                    if let Some(backend) = CudaBackend::try_init_index(selected[0]) {
+                        let label = format!("CUDA/{}", backend.device_name);
+                        return Ok((Arc::new(backend), label));
+                    }
+                }
+                Err(err) => remember(err),
+            }
+            {
+                use engine::backend::OpenClBackend;
+                match choose_device("opencl", &OpenClBackend::devices(), device) {
+                    Ok(selected) => {
+                        if let Some(backend) = OpenClBackend::try_init_index(selected[0]) {
+                            let label = format!("OpenCL/{}", backend.device_name);
+                            return Ok((Arc::new(backend), label));
+                        }
+                    }
+                    Err(err) => remember(err),
+                }
             }
             #[cfg(feature = "rocm")]
-            if let Some(backend) = engine::backend::RocmBackend::try_init() {
-                let label = format!("ROCm/{}", backend.device_name);
-                return Ok((Arc::new(backend), label));
+            {
+                use engine::backend::RocmBackend;
+                match choose_device("rocm", &RocmBackend::devices(), device) {
+                    Ok(selected) => {
+                        if let Some(backend) = RocmBackend::try_init_index(selected[0]) {
+                            let label = format!("ROCm/{}", backend.device_name);
+                            return Ok((Arc::new(backend), label));
+                        }
+                    }
+                    Err(err) => remember(err),
+                }
+            }
+            if let Some(err) = rejected {
+                // The qualifier goes in front: `DeviceError`'s message ends
+                // with the multi-line device listing, and anything appended
+                // after it reads as part of the last device's line.
+                return Err(anyhow!(
+                    "no backend on this machine could satisfy device = {device}: {err}",
+                    device = device,
+                    err = err
+                ));
+            }
+            if !device.is_auto() {
+                return Err(anyhow!(
+                    "device = {device}, but no GPU backend on this machine reported any \
+                     device to match it against",
+                ));
             }
             Ok(cpu())
         }

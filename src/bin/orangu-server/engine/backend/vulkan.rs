@@ -61,6 +61,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::device::{self, DeviceCandidate, DeviceClass};
 use super::vulkan_replay;
 use super::vulkan_shaders;
 use super::{Backend, MatmulOp};
@@ -1141,6 +1142,20 @@ pub struct VulkanBackend {
     /// The adapter's own description (the driver's GPU name string) — for
     /// the startup banner.
     pub adapter_name: String,
+    /// Every device this instance chose *from*, in enumeration order.
+    ///
+    /// Kept for the startup inventory and `/props`. A measurement is only
+    /// attributable if the machine's other cards are recorded beside it:
+    /// "12 tok/s on an RX 5500M" and "12 tok/s on an RX 5500M *while a
+    /// 7900 XTX sat idle in the same box*" are different results, and only
+    /// the second one is a bug report.
+    devices: Vec<DeviceCandidate>,
+    /// Which of `devices` the selection admitted, best first, as *positions
+    /// in `devices`* (not enumeration indices — see `DeviceCandidate::index`
+    /// for the difference). The head is the device this instance is running
+    /// on; a tail exists only under `device = auto`, which selects the whole
+    /// ranked set.
+    device_selection: Vec<usize>,
     /// Which `wgpu` API this instance actually came up on — `Vulkan` for
     /// [`VulkanBackend::try_init`], `Metal` for `engine::backend::metal::
     /// MetalBackend`. Only the handful of paths that genuinely cannot be
@@ -2637,8 +2652,109 @@ impl VulkanBackend {
     /// compute pipeline up front. Returns `None` (never panics) if no
     /// Vulkan driver is present, or device/pipeline creation otherwise
     /// fails — callers fall back to `CpuBackend` in that case.
+    ///
+    /// Which adapter, when the machine has several, is
+    /// `engine::backend::device`'s ranking policy — not the driver's own
+    /// answer to `request_adapter`, which this used to take and which is
+    /// routinely the integrated GPU on a machine that also has a card.
+    ///
+    /// **Tests only.** The server proper goes through
+    /// `main::select_backend`, which enumerates, applies
+    /// `[orangu-server].device`, and prints the device inventory before
+    /// bringing anything up. Nothing there wants a device chosen silently;
+    /// a test wants a device and does not care which.
+    #[cfg(test)]
     pub fn try_init() -> Option<Self> {
         Self::try_init_backends(wgpu::Backends::VULKAN)
+    }
+
+    /// The `wgpu` instance every entry point here enumerates through, so
+    /// the instance flags can't drift between enumeration and bring-up.
+    fn instance(backends: wgpu::Backends) -> wgpu::Instance {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        })
+    }
+
+    /// Describes one enumerated adapter for the selection policy.
+    ///
+    /// `index` is the adapter's position in `wgpu`'s enumeration, which is
+    /// what `[orangu-server].device = <n>` names. That order is a property
+    /// of the driver and the machine, not of this process, so it is stable
+    /// across runs of the same binary on the same box — but it is not a
+    /// durable identifier, which is what `DeviceCandidate::id` (the PCI bus
+    /// id, where the API has one) is for.
+    fn describe_adapter(index: usize, adapter: &wgpu::Adapter) -> DeviceCandidate {
+        let info = adapter.get_info();
+        let class = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => DeviceClass::Discrete,
+            wgpu::DeviceType::IntegratedGpu => DeviceClass::Integrated,
+            wgpu::DeviceType::VirtualGpu => DeviceClass::Virtual,
+            wgpu::DeviceType::Cpu => DeviceClass::Software,
+            wgpu::DeviceType::Other => DeviceClass::Other,
+        };
+        DeviceCandidate {
+            index,
+            name: info.name,
+            class,
+            vram_total_bytes: vulkan_replay::adapter_device_local_bytes(adapter),
+            id: (!info.device_pci_bus_id.is_empty()).then_some(info.device_pci_bus_id),
+            driver: (!info.driver.is_empty()).then(|| {
+                if info.driver_info.is_empty() {
+                    info.driver.clone()
+                } else {
+                    format!("{} ({})", info.driver, info.driver_info)
+                }
+            }),
+        }
+    }
+
+    /// Every device `wgpu` reports for `backends`, in enumeration order.
+    ///
+    /// Enumeration only — no device is created, so this is cheap enough to
+    /// call before deciding anything and safe to call on a machine with no
+    /// driver at all (the answer is an empty list, not a failure).
+    pub fn devices(backends: wgpu::Backends) -> Vec<DeviceCandidate> {
+        let instance = Self::instance(backends);
+        pollster::block_on(instance.enumerate_adapters(backends))
+            .iter()
+            .enumerate()
+            .map(|(index, adapter)| Self::describe_adapter(index, adapter))
+            .collect()
+    }
+
+    /// Brings the engine up on the head of `selected` — enumeration indices
+    /// as reported by [`Self::devices`], best first, not positions in the
+    /// ranked order.
+    ///
+    /// The tail is carried purely so this instance can report it: a second
+    /// selected card sitting idle is a fact about the run, and one that has
+    /// to survive into `/props` for a measurement taken here to be readable
+    /// later.
+    ///
+    /// `None` when no adapter has any of those indices, or when device/
+    /// pipeline creation fails; the caller has the device list and so is the
+    /// one that can say which of those happened.
+    pub fn try_init_selected(backends: wgpu::Backends, selected: &[usize]) -> Option<Self> {
+        let instance = Self::instance(backends);
+        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        let candidates: Vec<DeviceCandidate> = adapters
+            .iter()
+            .enumerate()
+            .map(|(i, adapter)| Self::describe_adapter(i, adapter))
+            .collect();
+        // Enumeration indices → positions in `candidates`. The two are the
+        // same today (`describe_adapter` numbers by position), and are
+        // converted anyway so that stops being load-bearing the moment an
+        // unusable adapter is skipped during enumeration.
+        let positions: Vec<usize> = selected
+            .iter()
+            .filter_map(|index| candidates.iter().position(|c| c.index == *index))
+            .collect();
+        let &head = positions.first()?;
+        let adapter = adapters.into_iter().nth(head)?;
+        Self::init_on_adapter(adapter, candidates, positions)
     }
 
     /// Which `wgpu` API this instance actually came up on. `Vulkan` for
@@ -2647,6 +2763,55 @@ impl VulkanBackend {
     /// not depend on the answer.
     pub fn wgpu_backend(&self) -> wgpu::Backend {
         self.wgpu_backend
+    }
+
+    /// The lower-case API name the startup inventory tags its lines with —
+    /// `vulkan`, `metal`, `dx12`. Derived from the adapter rather than
+    /// passed in, so a report can never be labelled with an API this
+    /// instance did not come up on.
+    pub fn api_tag(&self) -> &'static str {
+        match self.wgpu_backend {
+            wgpu::Backend::Vulkan => "vulkan",
+            wgpu::Backend::Metal => "metal",
+            wgpu::Backend::Dx12 => "dx12",
+            _ => "gpu",
+        }
+    }
+
+    /// The device this instance is running on.
+    pub fn device_in_use(&self) -> &DeviceCandidate {
+        &self.devices[self.device_selection[0]]
+    }
+
+    /// Every device this instance's selection admitted, best first — the
+    /// head being [`Self::device_in_use`].
+    ///
+    /// What a layer-split plan is built from: it needs each candidate's
+    /// capacity *and* its enumeration index, and this instance is the only
+    /// thing that still holds both after `select_backend` has returned.
+    pub fn device_set(&self) -> Vec<&DeviceCandidate> {
+        self.device_selection
+            .iter()
+            .map(|&position| &self.devices[position])
+            .collect()
+    }
+
+    /// The single-API `wgpu::Backends` bit this instance came up on, so a
+    /// caller can bring up a *second* device through the same API without
+    /// having to remember which one was chosen.
+    pub fn backends_bit(&self) -> wgpu::Backends {
+        match self.wgpu_backend {
+            wgpu::Backend::Metal => wgpu::Backends::METAL,
+            wgpu::Backend::Dx12 => wgpu::Backends::DX12,
+            _ => wgpu::Backends::VULKAN,
+        }
+    }
+
+    /// How the GPU-resident KV mirror is stored — the factor of two (or
+    /// four) between `f32`, `f16` and `q8_0` on every KV byte this device
+    /// holds, which is why a capacity figure is meaningless without it.
+    pub fn kv_storage(&self) -> vulkan_shaders::KvStorage {
+        self.kv_storage
     }
 
     /// Open the timestamp slots for one decode step, writing the step-start
@@ -2749,6 +2914,10 @@ impl VulkanBackend {
         serde_json::json!({
             "api": format!("{:?}", self.wgpu_backend),
             "adapter": self.adapter_name,
+            // The whole device set, not just the winner: see `Self::
+            // devices` for why the alternatives belong next to the
+            // measurement.
+            "devices": device::inventory_json(&self.devices, &self.device_selection),
             "features": {
                 "shader_f16": has(wgpu::Features::SHADER_F16),
                 "subgroup": has(wgpu::Features::SUBGROUP),
@@ -2873,18 +3042,36 @@ impl VulkanBackend {
     /// `backends` is a *set* rather than a single API only because that is
     /// `wgpu`'s own shape; callers pass exactly one bit, so
     /// `Self::wgpu_backend` is unambiguous.
+    ///
+    /// Picks the device by [`device::DeviceRequest::Auto`] — the highest-
+    /// ranked hardware adapter, never a software rasterizer. A caller that
+    /// has an operator's own choice to honour goes through
+    /// [`Self::devices`] + [`device::select_all`] + [`Self::try_init_selected`]
+    /// instead, so that a device that isn't there is an error naming the
+    /// ones that are rather than a silent fall-back to a different one.
+    ///
+    /// **Tests only**, for the same reason [`Self::try_init`] is.
+    #[cfg(test)]
     pub fn try_init_backends(backends: wgpu::Backends) -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            ..Default::default()
-        }))
-        .ok()?;
+        let candidates = Self::devices(backends);
+        let selected = device::select_all(&candidates, &device::DeviceRequest::Auto).ok()?;
+        let indices: Vec<usize> = selected.iter().map(|&p| candidates[p].index).collect();
+        Self::try_init_selected(backends, &indices)
+    }
+
+    /// The shared bring-up, once a device has been chosen: negotiate
+    /// features against `adapter`, resolve every tuning knob, and build
+    /// every pipeline.
+    ///
+    /// `candidates`/`position` are carried in rather than re-derived so the
+    /// instance can report the whole device set it chose from — a
+    /// throughput number is only attributable if the alternatives it beat
+    /// are on the record next to it.
+    fn init_on_adapter(
+        adapter: wgpu::Adapter,
+        candidates: Vec<DeviceCandidate>,
+        selected: Vec<usize>,
+    ) -> Option<Self> {
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let wgpu_backend = info.backend;
@@ -3831,6 +4018,8 @@ impl VulkanBackend {
             argmax_sample_cache: Mutex::new(HashMap::new()),
             uniform_arena: Mutex::new(ScratchArena::new()),
             adapter_name,
+            devices: candidates,
+            device_selection: selected,
             wgpu_backend,
             elem4_bind_group_layout,
             elem3_bind_group_layout,
@@ -9932,6 +10121,25 @@ impl VulkanBackend {
     pub fn read_buffer_f32(&self, buf: &wgpu::Buffer, len: usize) -> Vec<f32> {
         let encoder = self.new_encoder("orangu-server buffer readback encoder");
         let (out, _) = self.submit_and_readback_split(encoder, buf, 0, len);
+        out
+    }
+
+    /// Submits `encoder` and brings `len` `f32`s back from `buf` starting at
+    /// `byte_offset`.
+    ///
+    /// The hand-off between two devices' halves of a split model's forward
+    /// pass: one device's last layer leaves the hidden state in a buffer at
+    /// an arena offset, and the next device's first layer needs it as a host
+    /// slice to upload. [`Self::read_buffer_f32`] cannot serve that — it
+    /// reads from offset 0, and a layer's output is rarely there.
+    pub fn submit_and_read_at(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        buf: &wgpu::Buffer,
+        byte_offset: u64,
+        len: usize,
+    ) -> Vec<f32> {
+        let (out, _) = self.submit_and_readback_split(encoder, buf, byte_offset, len);
         out
     }
 

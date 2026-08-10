@@ -664,6 +664,17 @@ impl TieredExpertStore {
     }
 }
 
+/// The routing history `ORANGU_EXPERT_USAGE` names, keyed by `(tensor
+/// name, expert)` — empty when there is no history to read.
+///
+/// Public because a *device* expert tier has to choose its resident set
+/// before the first token, from whatever previous sessions learned
+/// (`main::plan_expert_tier`). The alternative is filling by size, which
+/// colibri measured at 3-5x worse than filling by heat.
+pub fn learned_heat() -> std::collections::HashMap<(Arc<str>, usize), u32> {
+    load_usage()
+}
+
 /// Reads a routing history, or an empty one when there is nothing to read.
 ///
 /// A malformed line is skipped rather than fatal. This is an optimisation

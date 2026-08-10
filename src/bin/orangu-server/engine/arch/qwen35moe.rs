@@ -511,6 +511,8 @@ impl Qwen35MoeModel {
             layer_cache,
             &crate::engine::attention::Params {
                 backend: self.backend.as_ref(),
+                // This layer's card — see `attention::Params::device`.
+                device: layer.wo.device(),
                 n_head,
                 n_head_kv,
                 head_dim,
@@ -747,39 +749,74 @@ impl Qwen35MoeModel {
         // The down projection's rows still fan out, so decode — where every
         // selection is distinct and the outer fan-out is only
         // `n_expert_used` wide — keeps filling every core.
-        let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
-            let inputs: Vec<&[f32]> = members
-                .iter()
-                .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                .collect();
-            let gate =
-                super::project_expert(&ffn.gate_exps, expert, 0, ffn.gate_exps.out_dim, &inputs);
-            let up = super::project_expert(&ffn.up_exps, expert, 0, ffn.up_exps.out_dim, &inputs);
-            let hidden: Vec<Vec<f32>> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(gate, up)| {
-                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                    tensor::mul_inplace(&mut h, &up);
-                    h
-                })
-                .collect();
-            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-            super::project_expert(
+        // The GPU expert path batches the three projections across experts
+        // instead of issuing them one expert at a time — see
+        // `super::evaluate_routed_experts_batched` for why that is the
+        // whole question, and why it is only for the GPU.
+        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+            super::evaluate_routed_experts_batched(
+                self.backend.as_ref(),
+                &selection,
+                normed,
+                n_embd,
+                &ffn.gate_exps,
+                &ffn.up_exps,
                 &ffn.down_exps,
-                expert,
-                0,
-                ffn.down_exps.out_dim,
-                &hidden_refs,
+                |gate, up| {
+                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                    tensor::mul_inplace(&mut h, up);
+                    h
+                },
             )
-            .into_iter()
-            .zip(members)
-            .map(|(mut contribution, &(_, weight))| {
-                contribution.iter_mut().for_each(|v| *v *= weight);
-                contribution
+        } else {
+            super::evaluate_routed_experts(&selection, |expert, members| {
+                let inputs: Vec<&[f32]> = members
+                    .iter()
+                    .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                    .collect();
+                let gate = super::project_expert(
+                    self.backend.as_ref(),
+                    &ffn.gate_exps,
+                    expert,
+                    0,
+                    ffn.gate_exps.out_dim,
+                    &inputs,
+                );
+                let up = super::project_expert(
+                    self.backend.as_ref(),
+                    &ffn.up_exps,
+                    expert,
+                    0,
+                    ffn.up_exps.out_dim,
+                    &inputs,
+                );
+                let hidden: Vec<Vec<f32>> = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(gate, up)| {
+                        let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                        tensor::mul_inplace(&mut h, &up);
+                        h
+                    })
+                    .collect();
+                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                super::project_expert(
+                    self.backend.as_ref(),
+                    &ffn.down_exps,
+                    expert,
+                    0,
+                    ffn.down_exps.out_dim,
+                    &hidden_refs,
+                )
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    contribution.iter_mut().for_each(|v| *v *= weight);
+                    contribution
+                })
+                .collect()
             })
-            .collect()
-        });
+        };
         experts.loaded_once_per_distinct_expert();
 
         for t in 0..n_tokens {
