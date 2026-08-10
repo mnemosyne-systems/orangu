@@ -21,12 +21,14 @@
 //! assistant message is rendered from markdown to syntax-highlighted HTML
 //! server-side (`web::render`), reusing `markdown`/`syntect` — the same
 //! crates `orangu`'s own TUI uses for its terminal rendering — with
-//! ```` ```mermaid ```` blocks drawn to SVG by `web::mermaid`.
+//! ```` ```mermaid ```` and ```` ```plantuml ```` blocks drawn locally by
+//! `web::mermaid` and `web::plantuml`.
 
 pub mod attachments;
 pub mod mcp;
 pub mod mermaid;
 pub mod models;
+pub mod plantuml;
 pub mod render;
 pub mod sessions;
 
@@ -508,8 +510,13 @@ struct AttachmentView {
 /// [`mermaid`] for why there are two) and the source it came from.
 #[derive(Serialize)]
 struct DiagramView {
+    kind: &'static str,
     light: String,
     dark: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    light_png: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dark_png: Option<String>,
     source: String,
     /// Natural size for the `<img>` — see [`mermaid::Diagram`] for why an
     /// unsized diagram reflows the transcript when it decodes.
@@ -523,27 +530,42 @@ struct DiagramView {
 /// Called on session load and once per send, never per token — attachment
 /// text doesn't change while a reply streams.
 fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
-    let found = attachment
-        .text
-        .as_deref()
-        .map(mermaid::find_in_text)
-        .unwrap_or_default();
+    let mut diagrams = Vec::new();
+    let mut diagrams_found = 0;
+    if let Some(text) = attachment.text.as_deref() {
+        let found = mermaid::find_in_text(text);
+        diagrams_found += found.len();
+        diagrams.extend(found.into_iter().map(|found| DiagramView {
+            kind: "mermaid",
+            light: found.diagram.light.clone(),
+            dark: found.diagram.dark.clone(),
+            light_png: None,
+            dark_png: None,
+            width: found.diagram.width,
+            height: found.diagram.height,
+            source: found.source,
+        }));
+        let found = plantuml::find_in_text(text);
+        diagrams_found += found.len();
+        diagrams.extend(found.into_iter().map(|found| DiagramView {
+            kind: "plantuml",
+            light: found.diagram.light.clone(),
+            dark: found.diagram.dark.clone(),
+            light_png: Some(found.diagram.light_png.clone()),
+            dark_png: Some(found.diagram.dark_png.clone()),
+            width: found.diagram.width,
+            height: found.diagram.height,
+            source: found.source,
+        }));
+    }
+    diagrams.truncate(mermaid::MAX_PER_ATTACHMENT);
     AttachmentView {
         name: attachment.name,
         mime: attachment.mime,
         size: attachment.size,
         text: attachment.text,
-        diagrams_capped: found.len() >= mermaid::MAX_PER_ATTACHMENT,
-        diagrams: found
-            .into_iter()
-            .map(|found| DiagramView {
-                light: found.diagram.light.clone(),
-                dark: found.diagram.dark.clone(),
-                width: found.diagram.width,
-                height: found.diagram.height,
-                source: found.source,
-            })
-            .collect(),
+        diagrams_capped: diagrams_found > mermaid::MAX_PER_ATTACHMENT,
+        diagrams,
     }
 }
 
@@ -827,6 +849,25 @@ mod tests {
         );
         assert_eq!(view.diagrams.len(), 1);
         assert!(view.diagrams[0].source.contains("sequenceDiagram"));
+    }
+
+    #[test]
+    fn a_plantuml_upload_includes_svg_png_and_kind() {
+        let view = upload(
+            "login.puml",
+            "",
+            "@startuml\nAlice -> Bob: Login\nBob --> Alice: OK\n@enduml\n",
+        );
+        assert_eq!(view.diagrams.len(), 1);
+        let diagram = &view.diagrams[0];
+        assert_eq!(diagram.kind, "plantuml");
+        assert!(diagram.light.starts_with("data:image/svg+xml;base64,"));
+        assert!(
+            diagram
+                .light_png
+                .as_deref()
+                .is_some_and(|png| png.starts_with("data:image/png;base64,"))
+        );
     }
 
     #[test]

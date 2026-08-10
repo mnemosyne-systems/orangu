@@ -1475,17 +1475,48 @@ is a Mermaid header — models don't always add the tag — is drawn too. A
 fence tagged as something else is left alone: if the model said `bash`,
 you get `bash`, even when the contents would parse as a diagram.
 
+PlantUML source is supported with `plantuml`, `puml`, or `pu` fences:
+
+````
+```plantuml
+@startuml
+actor User
+participant API
+database Store
+User -> API: Save document
+API -> Store: INSERT
+Store --> API: OK
+API --> User: Saved
+@enduml
+```
+````
+
+This is a clean-room Rust implementation: it does not download PlantUML,
+start Java, invoke Graphviz, or contact a rendering server. The current
+compatibility surface covers sequence diagrams (participants, messages,
+notes and groups), class/object/interface diagrams (members, aliases and UML
+relationships), component/deployment/use-case/state graphs, and modern
+activity syntax. Cosmetic `skinparam` and direction hints are accepted where
+they do not change topology. Unsupported structural syntax stays an ordinary
+code block, so the console never substitutes an incomplete picture.
+
+PlantUML diagrams provide both SVG and PNG downloads. Both formats are made
+locally from the same layout and have light and dark variants. Untagged
+PlantUML is recognised only by a leading `@startuml` and closing `@enduml`;
+the explicit guards keep prose containing `A -> B` from becoming a diagram.
+
 ### Diagrams in attached files
 
 Diagrams are also detected in files you attach, and drawn under that
 message's file chips. Two shapes are recognised:
 
-* **A file that is one diagram** — a `.mmd`/`.mermaid` export, or a plain
-  text file holding nothing but diagram source. There is no fence to go
-  on, so this is recognised from the diagram header itself.
+* **A file that is one diagram** — a `.mmd`/`.mermaid` or `.puml` export, or
+  a plain text file holding nothing but diagram source. There is no fence to
+  go on, so this is recognised from the diagram guards/header itself.
 * **A document containing diagrams** — a Markdown design doc with
-  ```` ```mermaid ```` blocks in it. Untagged blocks are checked the same
-  way replies are; blocks tagged as another language are left alone.
+  ```` ```mermaid ```` or ```` ```plantuml ```` blocks in it. Untagged
+  blocks are checked the same way replies are; blocks tagged as another
+  language are left alone.
 
 Each attached file the server could read becomes an expandable chip: click
 it to see what was actually sent to the model — any diagrams as pictures,
@@ -1510,8 +1541,8 @@ Diagrams are left-aligned and scaled to fit the message. Real diagrams run
 large — an ER diagram with a dozen entities is around 2700 pixels wide,
 several times a message's width — so each one carries a **download**
 button, the same save icon an answer has, giving you the SVG at full
-resolution. The button saves the variant matching your current theme, and
-the file is the exact diagram on screen.
+resolution (and PNG for PlantUML). The button saves the variant matching your
+current theme, and the file is the exact diagram on screen.
 
 ### Diagrams in the answer
 
@@ -1522,7 +1553,7 @@ no diagram of its own, the diagrams from that turn's attachments are shown
 beneath it, at full size, each captioned with the file it came from. You
 get the explanation and then the picture.
 
-If the model *does* write a Mermaid block, that is what you see and
+If the model *does* write a Mermaid or PlantUML block, that is what you see and
 nothing is added — the answer is never second-guessed or duplicated. The
 caption exists so a picture drawn from your file never reads as one the
 model produced, and the reply's saved text stays exactly what the model
