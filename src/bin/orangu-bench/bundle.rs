@@ -19,7 +19,7 @@
 //! # The problem this exists for
 //!
 //! `--history` already carries measurements between machines, but a history row
-//! is eight columns: date, label, mode, n, best, mean, sd, sd_sample. It says a number was
+//! is nine columns: date, label, mode, n, best, mean, sd, sd_sample, device. It says a number was
 //! 163.3 and nothing whatsoever about what produced it. That is fine while
 //! every row comes off the same desk. It stops being fine the moment the
 //! interesting comparison is against a GPU nobody local can boot — a different
@@ -161,6 +161,11 @@ pub fn write(
             // a `±` from another benchmark can be put beside. `null` where one
             // repetition leaves it undefined.
             "sd_sample": r.sd_sample,
+            // Which device produced the row. Redundant with `props.backend`
+            // for a bundle written by one run — and not redundant at all once
+            // a reader has several bundles open, which is the case this file
+            // exists for.
+            "device": r.device,
         })).collect::<Vec<_>>(),
     });
     // Pretty-printed on purpose: a bundle's whole job is to be read months
@@ -231,6 +236,9 @@ fn record_from(v: &serde_json::Value) -> Option<Record> {
         // Absent from a bundle written before this field existed, which is
         // read back as "not recorded" rather than as zero.
         sd_sample: f("sd_sample"),
+        // Same: absent from an older bundle, and from one written against a
+        // server that named no backend.
+        device: s("device"),
     })
 }
 
@@ -316,6 +324,7 @@ mod tests {
             mean,
             sd: 0.5,
             sd_sample: Some(0.61),
+            device: None,
         }
     }
 

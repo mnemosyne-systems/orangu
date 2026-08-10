@@ -123,6 +123,7 @@ pub fn records(stats: &serde_json::Value, label: &str, n: u32, reps: u32) -> Vec
             // already writes into that column.
             sd: 0.0,
             sd_sample: None,
+            device: None,
         });
     };
 

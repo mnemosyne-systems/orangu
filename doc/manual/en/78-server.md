@@ -1457,6 +1457,35 @@ Those assume one device holds the whole chain.
 `multi::tests::a_split_model_never_exposes_a_wgpu_backend` and
 `per_layer_work_asks_the_layer_s_own_device` hold both halves.
 
+**What that `None` costs the reporting, and what is done about it.** Three
+things hang off `as_wgpu()` that have nothing to do with running the model:
+the kernel/tuning report, the device footprint, and `/gpu-timings`. A split
+therefore used to lose all three at once, silently — `/props` carried a
+placement plan in the `gpu` slot with no tuning fields, the footprint was
+never measured, and the timings endpoint answered `enabled: false` in the same
+words it uses for "you did not switch timestamps on".
+
+Two of the three are now answered per device instead of not at all:
+
+- **Footprint.** `SplitReport` carries each device's capacity *and* its
+  `KvStorage` out of `apply_device_split`, captured while the concrete
+  backends are still in hand, and `DeviceFootprint::for_split_device` builds
+  one footprint per device: the weights the plan placed there
+  (`weights_per_device`, which asks `LoadedModel::device_for_tensor` rather
+  than re-deriving the placement) and the KV mirror for *that device's own
+  layers* (`KvCache::gpu_mirror_bytes_where`). Per layer, not per layer
+  *count*: `kv_dim` and stride vary down a model's depth, so a device holding
+  a quarter of the layers can hold half the cache. Host-resident weights
+  (routed experts) are charged to no device and stated once at the top of the
+  plan JSON — charging them per card would count them once per card.
+- **Timings** stay single-device (a query set belongs to one device), but the
+  endpoint now names the reason: `unavailable: "split"` against
+  `"no_wgpu_backend"`, read off the `split` flag in the tuning report so there
+  is one source of truth for "was this run split".
+
+`orangu-bench` renders both, and the last of the three — the kernel report —
+is printed as explicitly absent rather than omitted.
+
 The KV mirror is safe by construction: a layer's device never changes,
 `sync_gpu` is only ever called from inside a `VulkanBackend` (so the mirror
 lands on that backend's own device), and `LayerCache::copy_prefix_from`
@@ -1801,7 +1830,7 @@ only (set to `1`), except where noted.
 | `ORANGU_SPECULATIVE` | unset (off) | Enables prompt-lookup speculative decoding: each step drafts the next few tokens by matching recent output against an earlier point in the context and verifies the whole draft in one forward, so the weights stream once for several tokens. Greedy-only (the output is identical to non-speculative greedy decoding); ignored for non-greedy sampling and for multi-slot batched decode. **Currently slower on this GPU** — see `SERVER_ROADMAP.md` Step 12 — because the multi-token verify runs the CPU-orchestrated forward; kept for hardware/paths where a resident multi-position forward makes it a win. Off by default. |
 | `ORANGU_SPEC_NGRAM` | `2` | With `ORANGU_SPECULATIVE`, how many trailing tokens must match an earlier point in the context to trigger a draft. Lower drafts more often (more speculative work, more misses); higher drafts only on a longer exact echo. |
 | `ORANGU_SPEC_DRAFT` | `4` | With `ORANGU_SPECULATIVE`, how many tokens to draft (and verify in one forward) once a match is found. The ceiling on tokens a single accepted step can produce. |
-| `ORANGU_GPU_TIMESTAMPS` | unset (off) | Logs a per-decode-step GPU timing breakdown to stderr — the per-layer-embedding (PLE) projection, the sum/average/slowest across all model layers, and the output-norm-plus-`lm_head` tail, in milliseconds. Also logs a `[gpu-op-breakdown]` line splitting each token into **qkv-side** (Q/K/V matmuls + norm/RoPE + KV write), **attention** (split-k), and **ffn-side** (wo/gate/up/down matmuls + their norms + GELU/mul + PLE + copies) — so matmul vs attention vs overhead is measured, not estimated. Requires an adapter with `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_ENCODERS`; a diagnostic, no effect on the computation. |
+| `ORANGU_GPU_TIMESTAMPS` | unset (off) | Logs a per-decode-step GPU timing breakdown to stderr — the per-layer-embedding (PLE) projection, the sum/average/slowest across all model layers, and the output-norm-plus-`lm_head` tail, in milliseconds. Also logs a `[gpu-op-breakdown]` line splitting each token into **qkv-side** (Q/K/V matmuls + norm/RoPE + KV write), **attention** (split-k), and **ffn-side** (wo/gate/up/down matmuls + their norms + GELU/mul + PLE + copies) — so matmul vs attention vs overhead is measured, not estimated. Requires an adapter with `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_ENCODERS`; a diagnostic, no effect on the computation. **Unavailable on a split model**: a query set belongs to one device and a split resolves none, so `GET /gpu-timings` answers `{"enabled": false, "timings": null, "unavailable": "split"}` — the reason is named rather than left as an empty result, since a client that reports nothing when it receives nothing makes a split run look like one whose GPU stages cost nothing. `--flamegraph` still profiles the CPU side. |
 
 Shader compilation is cached to disk across restarts
 (`~/.orangu/server/<adapter-key>/cache.bin`, keyed by a vendor/device-

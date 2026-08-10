@@ -773,10 +773,33 @@ impl KvCache {
         n_head: usize,
         kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> u64 {
+        self.gpu_mirror_bytes_where(token_capacity, n_head, kv_storage, |_| true)
+    }
+
+    /// The same, over the layers `keep` accepts by index — what one device of
+    /// a split model holds.
+    ///
+    /// A predicate over layer indices rather than a count, because a device's
+    /// share of the KV cache is **not** its share of the layers: `kv_dim` and
+    /// `stride` vary along a model's own depth (a per-layer `head_count_kv`,
+    /// a block-compressed layer, a linear-attention layer with no positional
+    /// state at all), so scaling the total by `layers_on_device / n_layer`
+    /// would be wrong by whatever that variation is — and wrong in the
+    /// direction of the architectures where the answer matters most. The
+    /// indices line up with the placement plan's `layer_device`: both are
+    /// indexed by transformer block.
+    pub fn gpu_mirror_bytes_where(
+        &self,
+        token_capacity: usize,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+        keep: impl Fn(usize) -> bool,
+    ) -> u64 {
         self.layers
             .iter()
-            .filter(|layer| layer.kv_dim > 0)
-            .map(|layer| {
+            .enumerate()
+            .filter(|(index, layer)| layer.kv_dim > 0 && keep(*index))
+            .map(|(_, layer)| {
                 gpu_layer_bytes(
                     token_capacity.div_ceil(layer.stride),
                     layer.kv_dim,
@@ -1200,6 +1223,36 @@ mod tests {
             probe.gpu_mirror_bytes(1024, 8, KvStorage::F16),
             4 * gpu_layer_bytes(1024, 64, 8, KvStorage::F16, ASSUMED_STORAGE_ALIGN)
         );
+    }
+
+    /// One device of a split holds the KV of the layers it holds — and its
+    /// share is not a fraction of the total unless every layer is the same
+    /// size, which is exactly what a per-layer `head_count_kv` or a
+    /// block-compressed layer breaks.
+    ///
+    /// Two 64-wide layers and two 256-wide ones: the device holding the two
+    /// narrow ones holds a fifth of the cache, not half of it. A footprint
+    /// that scaled by layer count would report four times too much headroom
+    /// used on one card and far too little on the other.
+    #[test]
+    fn a_devices_share_of_the_cache_is_its_layers_not_its_layer_count() {
+        let mixed = KvCache::new_with_dims(1, &[64, 64, 256, 256]);
+        let bytes =
+            |keep: fn(usize) -> bool| mixed.gpu_mirror_bytes_where(1024, 8, KvStorage::F16, keep);
+        let narrow = bytes(|layer| layer < 2);
+        let wide = bytes(|layer| layer >= 2);
+        assert_eq!(
+            narrow + wide,
+            mixed.gpu_mirror_bytes(1024, 8, KvStorage::F16)
+        );
+        // Not half and half: the wide pair is four times the narrow pair, so
+        // splitting two layers each puts 20% on one card and 80% on the other.
+        assert!(
+            wide > narrow * 3,
+            "expected the wide layers to dominate: {narrow} vs {wide}"
+        );
+        // And an empty selection is zero rather than the whole thing.
+        assert_eq!(bytes(|_| false), 0);
     }
 
     /// A strided layer stores one row per `stride` tokens, so its mirror is

@@ -1210,14 +1210,40 @@ ORANGU_DEVICE_SPLIT=3,1 orangu-server model.gguf  # this run, for a sweep
 Startup says what it did, and what it cost:
 
 ```
-[vulkan] split: layers 0-17 -> AMD Radeon RX 5500M, layers 18-23 -> AMD Radeon Graphics
-[vulkan] AMD Radeon RX 5500M: 313.65 MiB weights of 4.00 GiB, 18 layers
-[vulkan] AMD Radeon Graphics: 60.05 MiB weights of 21.06 GiB, 6 layers
+[vulkan] split: layers 0-1 -> AMD Radeon RX 5500M, layers 2-15 -> AMD Radeon Graphics
+[vulkan] AMD Radeon RX 5500M: 279.54 MiB weights of 4.00 GiB, 2 layers
+[vulkan] AMD Radeon RX 5500M: 3.73 GiB free after weights — room for the full
+         131072-token context in F16 KV for its 2 layers
+[vulkan] AMD Radeon Graphics: 483.27 MiB weights of 21.06 GiB, 14 layers
+[vulkan] AMD Radeon Graphics: 20.59 GiB free after weights — room for the full
+         131072-token context in F16 KV for its 14 layers
 [vulkan] a split model keeps its per-layer GPU work — fused attention, fused FFN,
          the device-side KV cache — but gives up the whole-step decode submission,
          which cannot span devices, and the hidden state crosses the bus 1 time
          per token. It buys capacity, not speed.
 ```
+
+The **free after weights** line is per device and is the one to read before a
+long-context run. A device's share of the KV cache is not its share of the
+layers — `kv_dim` varies down a model's depth, and a device holding a quarter
+of the layers can be holding half the cache — so the layer counts above cannot
+be turned into this number by hand.
+
+When the plan gives a device more than it has, that is said outright rather
+than left to be inferred from two figures that happen not to fit:
+
+```
+[vulkan] AMD Radeon RX 5500M: 5.49 GiB weights of 4.00 GiB, 36 layers
+[vulkan] AMD Radeon RX 5500M: 0 B free after weights — about 0 tokens of F16 KV
+         for its 36 layers
+[vulkan] AMD Radeon RX 5500M: the weights placed here are 1.49 GiB larger than
+         the device — the driver will page them on every token. Give this device
+         a smaller share (device_split = <ratios>) or add a device.
+```
+
+That is gemma-4-12B at `--device-split 3,1` on a 4 GiB card, and it is worth
+recognising, because the throughput it produces looks like a slow engine rather
+than a placement to change.
 
 **A split model is slower**, though not as much as it once was. Work scoped
 to a single layer — fused attention, the fused FFN chain, the device-side
@@ -1247,11 +1273,13 @@ Two things worth knowing before reaching for `all`:
 - **Shares follow reported memory**, and an integrated GPU reports the
   machine's whole system RAM. On a laptop with a 4 GiB discrete card beside
   an iGPU claiming 21 GiB, `all` puts most of the model on the *slower*
-  device. Measured on this project's dev machine, that costs about **10%**
-  — `all` gave 18.5 tok/s against 20.3 for `--device-split 3,1` on the same
-  model. Explicit proportions are the answer if you want that back; the
-  default is left alone because one machine's ratio is not a throughput
-  model for anyone else's.
+  device. What that costs depends on the model, and the range is wide: on a
+  0.5B, `all` gave 18.5 tok/s against 20.3 for `--device-split 3,1` — about
+  **10%**. On Llama-3.2-1B the same comparison was 24.2 against 35.2 — **45%**,
+  because `all` had put 14 of 16 layers on the integrated card. Explicit
+  proportions are the answer if you want that back; the default is left alone
+  because one machine's ratio is not a throughput model for anyone else's.
+  Read the per-device lines above to see where the layers actually went.
 - **Layers are handed out in contiguous runs**, never interleaved, so the
   hidden state crosses the bus once per boundary — twice for three devices,
   not once per layer.

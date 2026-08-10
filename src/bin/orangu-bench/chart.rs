@@ -129,11 +129,26 @@ pub fn render_labelled(
         .map(|r| r.date.as_str())
         .max()
         .unwrap_or("");
-    let records: Vec<Record> = all_records
+    let mut records: Vec<Record> = all_records
         .iter()
         .filter(|r| r.date == newest_date)
         .cloned()
         .collect();
+    // A series is a label — until the file holds rows from more than one
+    // device, at which point a label is no longer an identity: the same model
+    // measured on two cards writes rows that differ in nothing else, and
+    // drawing them as one series turns a comparison into a trend. Folded into
+    // the label here, once, so everything downstream keeps treating "the
+    // label" as the series and nothing else has to know.
+    //
+    // Only when they actually differ (`devices_differ` ignores rows that name
+    // no device), so a one-card machine's chart is unchanged and a file of
+    // older rows does not get relabelled by the arrival of a newer one.
+    if crate::history::devices_differ(&records) {
+        for r in &mut records {
+            r.label = r.series(true);
+        }
+    }
     let records = &records[..];
     let mut labels: Vec<String> = Vec::new();
     for r in records {
@@ -255,7 +270,38 @@ pub fn render_labelled(
     }
 
     let head_h = 56.0;
-    let legend_h = 30.0;
+    // Where each legend entry sits, worked out *before* the document is sized
+    // because the legend's height depends on how many rows it takes.
+    //
+    // It used to be one row, laid out by accumulating x and never looking at
+    // the canvas — which was fine while a series was called `orangu`. A device
+    // column and a `--label` prefix make a matrix's series
+    // `model-a · ORANGU_DEVICE=0 · api/some graphics card`, and four of those
+    // reached x=1501 on a 900-wide canvas: one entry visible, three off the
+    // edge, on a chart whose whole purpose was comparing the four.
+    const LEGEND_ROW_H: f64 = 16.0;
+    let entry_w = |label: &String| 22.0 + 6.6 * label.chars().count() as f64;
+    let legend_at: Vec<(f64, usize)> = {
+        let mut out = Vec::with_capacity(labels.len());
+        let (mut x, mut row) = (16.0, 0usize);
+        for label in &labels {
+            let w = entry_w(label);
+            // Never wrap a row that has nothing on it yet: an entry wider than
+            // the whole canvas overflows its own row, which is still readable
+            // from the left, where starting off-screen is not readable at all.
+            if x > 16.0 && x + w > WIDTH - 16.0 {
+                row += 1;
+                x = 16.0;
+            }
+            out.push((x, row));
+            x += w;
+        }
+        out
+    };
+    let legend_rows = legend_at.last().map_or(1, |(_, row)| row + 1);
+    // One row is 30.0 — exactly what this was before it could wrap, so a
+    // one-row chart is unchanged down to the pixel.
+    let legend_h = 14.0 + legend_rows as f64 * LEGEND_ROW_H;
     let height = head_h + legend_h + PANEL_H * charts.len() as f64 + 10.0;
 
     let mut s = String::new();
@@ -323,19 +369,18 @@ pub fn render_labelled(
 
     // Identity is never colour alone: every series is named here and each
     // line's right-hand end is direct-labelled in the chart below.
-    let mut lx = 16.0;
-    for (i, label) in labels.iter().enumerate() {
+    for ((i, label), &(lx, row)) in labels.iter().enumerate().zip(&legend_at) {
+        let ly = head_h + row as f64 * LEGEND_ROW_H;
         let _ = write!(
             s,
             r#"<circle class="f{i}" cx="{:.1}" cy="{:.1}" r="4"/><text class="ink" x="{:.1}" y="{:.1}" font-size="11">{}</text>"#,
             lx + 4.0,
-            head_h + 6.0,
+            ly + 6.0,
             lx + 14.0,
-            head_h + 10.0,
+            ly + 10.0,
             esc(label)
         );
         s.push('\n');
-        lx += 22.0 + 6.6 * label.chars().count() as f64;
     }
 
     for (idx, chart) in charts.iter().enumerate() {
@@ -629,6 +674,15 @@ mod tests {
             mean: best,
             sd: 0.0,
             sd_sample: None,
+            device: None,
+        }
+    }
+
+    /// A record that names the device it was measured on.
+    fn rec_on(date: &str, label: &str, device: &str, mode: &str, n: u32, best: f64) -> Record {
+        Record {
+            device: Some(device.into()),
+            ..rec(date, label, mode, n, best)
         }
     }
 
@@ -735,6 +789,106 @@ mod tests {
             assert!(!tag.contains(".f"), "a line must not wear a fill class");
         }
         assert!(svg.contains(">orangu<") && svg.contains(">reference<"));
+    }
+
+    /// Two cards, one model, one label — the shape `--device` made possible
+    /// and the shape this chart used to draw as a single series with two
+    /// points at every x. Two lines, and each device named in the legend.
+    #[test]
+    fn one_label_on_two_devices_draws_two_lines() {
+        let svg = render_labelled(
+            &[
+                rec_on("2026-08-10", "model-a", "api/first card", "tg", 0, 43.0),
+                rec_on("2026-08-10", "model-a", "api/first card", "tg", 512, 41.0),
+                rec_on("2026-08-10", "model-a", "api/second card", "tg", 0, 21.0),
+                rec_on("2026-08-10", "model-a", "api/second card", "tg", 512, 20.0),
+            ],
+            "t",
+            None,
+            Labels::default(),
+        );
+        assert_eq!(svg.matches("<polyline").count(), 2, "{svg}");
+        assert!(
+            svg.contains("first card") && svg.contains("second card"),
+            "{svg}"
+        );
+        // Both rates survive: the two series are not reduced against each
+        // other the way two rows of one series at the same x would be. (The
+        // direct label at a line's end is its last point, so 41 and 20.)
+        assert!(svg.contains(">41<") && svg.contains(">20<"), "{svg}");
+        assert!(
+            svg.contains("n=0 · 43.00") && svg.contains("n=0 · 21.00"),
+            "{svg}"
+        );
+    }
+
+    /// The same records with one device between them must draw exactly what
+    /// they drew before the column existed — one line, and a legend that says
+    /// `model-a`, not `model-a · api/first card`.
+    #[test]
+    fn one_device_changes_nothing_about_the_chart() {
+        let points = |device: Option<&str>| {
+            [(0, 43.0), (512, 41.0)].map(|(n, best)| Record {
+                device: device.map(str::to_string),
+                ..rec("2026-08-10", "model-a", "tg", n, best)
+            })
+        };
+        let bare = render_labelled(&points(None), "t", None, Labels::default());
+        let named = render_labelled(
+            &points(Some("api/first card")),
+            "t",
+            None,
+            Labels::default(),
+        );
+        assert_eq!(bare, named);
+        assert!(bare.contains(">model-a<") && !bare.contains("first card"));
+    }
+
+    /// Series names got long the moment a row could carry a device and a
+    /// `--label` prefix, and the legend laid them out on one row by
+    /// accumulating x — so a four-series comparison put three of its four
+    /// names past the right edge of the canvas, on the chart drawn to compare
+    /// them. Every entry has to start inside the canvas.
+    #[test]
+    fn a_legend_too_wide_for_one_row_wraps_instead_of_running_off_the_edge() {
+        let long = |n: u32| {
+            format!("a-fairly-long-model-name-Q4_K_M · VAR=value{n} · api/some graphics card")
+        };
+        let records: Vec<Record> = (0..4)
+            .flat_map(|series| {
+                [(0, 40.0), (512, 38.0)]
+                    .map(|(n, best)| rec("2026-08-10", &long(series), "tg", n, best))
+            })
+            .collect();
+        let svg = render_labelled(&records, "t", None, Labels::default());
+        assert_eq!(svg.matches("<polyline").count(), 4, "four series expected");
+        // Every legend entry starts on the canvas. (The `viewBox` is fixed at
+        // WIDTH; an entry placed past it is drawn nowhere a reader can see.)
+        let mut entries = 0;
+        for caps in svg.split("<text class=\"ink\" x=\"").skip(1) {
+            let Some((x, rest)) = caps.split_once('"') else {
+                continue;
+            };
+            // This element's own text, not the rest of the document — the
+            // first version of this loop asked whether *anything after* the
+            // x attribute mentioned the series, which every element does.
+            let Some((body, _)) = rest.split_once("</text>") else {
+                continue;
+            };
+            if !body.contains("VAR=value") {
+                continue;
+            }
+            entries += 1;
+            let x: f64 = x.parse().expect("a numeric x");
+            assert!(
+                x < WIDTH,
+                "legend entry at x={x} is off a {WIDTH}-wide canvas"
+            );
+        }
+        assert_eq!(entries, 4, "every series must be named in the legend");
+        // And the extra rows are paid for in height rather than drawn over the
+        // first chart panel.
+        assert!(svg.contains("height=\"474\""), "{}", &svg[..200]);
     }
 
     /// The file accumulates every run; the chart is only ever the newest date

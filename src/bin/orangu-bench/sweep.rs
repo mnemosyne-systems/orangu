@@ -76,6 +76,31 @@ impl Spec {
     /// An empty value is kept deliberately: `VAR=,1` sweeps "unset" against
     /// "set to 1", which is the shape of every opt-in flag in the engine and
     /// would otherwise need a second mechanism.
+    ///
+    /// # Values that contain commas
+    ///
+    /// `ORANGU_DEVICE_SPLIT` takes a ratio — `3,1` puts three quarters of the
+    /// layers on the first device — so the separator this list has always used
+    /// is also a character inside a legal value. Comma-splitting
+    /// `ORANGU_DEVICE_SPLIT=off,all,3,1` yields **four** points, and because
+    /// `3` and `1` are themselves legal one-entry ratios, nothing errors: the
+    /// sweep runs, the table has four columns, and two of them are
+    /// configurations nobody asked for. That is the failure this module's
+    /// documentation is otherwise entirely about — a sweep that answers
+    /// confidently and wrongly.
+    ///
+    /// So: **a spec containing `;` is split on `;` and never on `,`**, which
+    /// makes `ORANGU_DEVICE_SPLIT=off;all;3,1` say what it looks like it says.
+    /// A spec with no `;` splits on `,` exactly as before, so every existing
+    /// invocation means what it meant. `;` rather than `/` because a swept
+    /// value here is as often a *path* as a list — `MODEL=a.gguf;b.gguf`
+    /// through `--sweep-cmd` is how models get swept — and a separator that
+    /// cannot appear in a path is the only one that can carry them.
+    ///
+    /// The remaining ambiguity is a comma list that *wanted* to be a ratio,
+    /// which no parser can see. For `ORANGU_DEVICE_SPLIT` specifically it can:
+    /// a bare integer is never a useful split point on its own, so it is
+    /// refused with the fix rather than measured.
     pub fn parse(spec: &str) -> anyhow::Result<Self> {
         let (var, values) = spec
             .split_once('=')
@@ -84,9 +109,27 @@ impl Spec {
         if var.is_empty() {
             anyhow::bail!("--sweep {spec:?} has no variable name");
         }
-        let values: Vec<String> = values.split(',').map(|v| v.trim().to_string()).collect();
+        let separator = if values.contains(';') { ';' } else { ',' };
+        let values: Vec<String> = values
+            .split(separator)
+            .map(|v| v.trim().to_string())
+            .collect();
         if values.is_empty() {
             anyhow::bail!("--sweep {spec:?} has no values");
+        }
+        // A ratio that lost its comma. `3` alone means "one device, all of
+        // it", which is `off` with extra steps — nobody sweeps it, so its
+        // presence is evidence of the split rather than of intent.
+        if var == "ORANGU_DEVICE_SPLIT"
+            && separator == ','
+            && let Some(bare) = values.iter().find(|v| v.parse::<u32>().is_ok())
+        {
+            anyhow::bail!(
+                "--sweep {spec:?}: {bare:?} on its own is not a split to sweep — a ratio \
+                 like `3,1` contains the comma this list is separated by, so it was read \
+                 as two points. Separate the points with `;` instead: \
+                 --sweep '{var}=off;all;3,1'"
+            );
         }
         Ok(Spec {
             var: var.to_string(),
@@ -344,6 +387,45 @@ mod tests {
         assert_eq!(s.values, ["", "1"]);
         assert_eq!(s.label(""), "ORANGU_SUBGROUP=<unset>");
         assert_eq!(s.label("1"), "ORANGU_SUBGROUP=1");
+    }
+
+    /// A split ratio contains the separator the value list uses. Semicolons
+    /// take precedence so the ratio survives as one point, and the comma form
+    /// keeps meaning exactly what it meant for every sweep written before this
+    /// existed.
+    #[test]
+    fn a_semicolon_list_keeps_commas_inside_a_value() {
+        let s = Spec::parse("ORANGU_DEVICE_SPLIT=off;all;3,1").unwrap();
+        assert_eq!(s.values, ["off", "all", "3,1"]);
+        assert_eq!(s.label("3,1"), "ORANGU_DEVICE_SPLIT=3,1");
+        // A path list is the other value that cannot use `/`, and is why the
+        // separator is `;`.
+        let m = Spec::parse("MODEL=/models/a.gguf;/models/b.gguf").unwrap();
+        assert_eq!(m.values, ["/models/a.gguf", "/models/b.gguf"]);
+        // Unchanged: no semicolon, no new behaviour.
+        assert_eq!(
+            Spec::parse("ORANGU_COOP_MIN_TOKENS=8,16").unwrap().values,
+            ["8", "16"]
+        );
+    }
+
+    /// The trap this replaced: `off,all,3,1` parsed into four points, two of
+    /// them halves of a ratio, and ran a whole sweep without a complaint. It
+    /// has to be refused, and the refusal has to say how to spell it.
+    #[test]
+    fn a_split_ratio_flattened_by_commas_is_refused_with_the_fix() {
+        let text = match Spec::parse("ORANGU_DEVICE_SPLIT=off,all,3,1") {
+            Ok(spec) => panic!("a flattened ratio must not be measured: {:?}", spec.values),
+            Err(err) => err.to_string(),
+        };
+        assert!(text.contains(';'), "{text}");
+        assert!(text.contains("3,1"), "{text}");
+        // Modes on their own are still a legal comma sweep — the refusal is
+        // for the numbers, not for the variable.
+        assert_eq!(
+            Spec::parse("ORANGU_DEVICE_SPLIT=off,all").unwrap().values,
+            ["off", "all"]
+        );
     }
 
     #[test]

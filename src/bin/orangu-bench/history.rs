@@ -33,7 +33,7 @@ use std::io::Write as _;
 
 /// The column header written when a history file is created, so a file found
 /// on its own is self-describing. Read back as a comment and skipped.
-const HEADER: &str = "#date\tlabel\tmode\tn\tbest\tmean\tsd\tsd_sample";
+const HEADER: &str = "#date\tlabel\tmode\tn\tbest\tmean\tsd\tsd_sample\tdevice";
 
 /// One measurement: what was measured, of what, when, and how fast it went.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +65,23 @@ pub struct Record {
     /// eighth column, empty where a run of one repetition leaves it undefined
     /// and absent from every row written before it existed.
     pub sd_sample: Option<f64>,
+    /// Which device produced the row — the server's own backend label, short
+    /// enough to sit in a legend (see `orangu-bench`'s `device_tag`).
+    ///
+    /// A ninth column rather than something folded into [`Record::label`],
+    /// because a row's device is a fact about the run and a label is a name
+    /// somebody chose: with `--device` on the server, the same model measured
+    /// on two cards produced two sets of rows that were identical in every
+    /// recorded field, and the only thing standing between them and a chart
+    /// drawn as one series was the operator having remembered `--label`.
+    /// A recorded fact belongs in a column of its own, not folded into a
+    /// name somebody has to remember to set.
+    ///
+    /// `None` on every row written before this column existed, and on a server
+    /// that reports no backend at all. Not defaulted to anything: "unknown
+    /// device" and "some particular device" are different claims, and only one
+    /// of them can be compared against a later run.
+    pub device: Option<String>,
 }
 
 impl Record {
@@ -72,7 +89,7 @@ impl Record {
         let mut s = String::new();
         let _ = write!(
             s,
-            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{}",
+            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}",
             self.date,
             self.label,
             self.mode,
@@ -83,7 +100,8 @@ impl Record {
             // Empty rather than `0.00`: one repetition has no sample spread,
             // and a zero would claim it was measured.
             self.sd_sample
-                .map_or_else(String::new, |sd| format!("{sd:.2}"))
+                .map_or_else(String::new, |sd| format!("{sd:.2}")),
+            self.device.as_deref().unwrap_or(""),
         );
         s
     }
@@ -102,9 +120,52 @@ impl Record {
             // empty on a single-repetition row. Neither is a malformed row:
             // the file is append-only, so old rows stay exactly as they were.
             sd_sample: f.next().and_then(|v| v.trim().parse().ok()),
+            // Same contract, one column further along: absent on an older row,
+            // empty when the server named no backend.
+            device: f
+                .next()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
         };
         Some(rec)
     }
+
+    /// The series this row belongs to in a chart: the label alone, or the
+    /// label and the device when `show_device` says the set it came from holds
+    /// more than one.
+    ///
+    /// `?` for a row that records no device, which is what an unqualified
+    /// label has always meant — it is only worth spelling out once a
+    /// neighbouring row *does* name one.
+    pub fn series(&self, show_device: bool) -> String {
+        if show_device {
+            format!("{} · {}", self.label, self.device.as_deref().unwrap_or("?"))
+        } else {
+            self.label.clone()
+        }
+    }
+}
+
+/// Whether `records` hold measurements from more than one named device — the
+/// condition under which a label alone no longer identifies a series.
+///
+/// Rows that name **no** device are ignored rather than counted as a device of
+/// their own. Every row written before the column existed is one of those, so
+/// counting them would rename every historical series the moment one new run
+/// appended a row beside them — a file whose old rows did not change would
+/// draw a chart whose old lines did. The rule is the one a table follows when
+/// it grows a column only for a parameter that varies.
+pub fn devices_differ(records: &[Record]) -> bool {
+    let mut seen: Option<&str> = None;
+    for device in records.iter().filter_map(|r| r.device.as_deref()) {
+        match seen {
+            None => seen = Some(device),
+            Some(first) if first != device => return true,
+            Some(_) => {}
+        }
+    }
+    false
 }
 
 /// Append `records` to `path`, creating it with a header if it does not exist.
@@ -225,8 +286,85 @@ mod tests {
             mean: 81.40,
             sd_sample: Some(0.31),
             sd: 0.26,
+            device: Some("api/first card".into()),
         };
         assert_eq!(Record::from_row(&r.to_row()), Some(r));
+    }
+
+    /// The device column arrived the same way `sd_sample` did — appended to a
+    /// file that already had years of rows in it — and has to behave the same
+    /// way: an eight-column row is a measurement whose device nobody recorded,
+    /// not a broken line.
+    ///
+    /// `perf-history.tsv` currently holds seven-, eight- and nine-column rows
+    /// at once. All three have to read.
+    #[test]
+    fn a_row_written_before_the_device_column_still_reads() {
+        let eight = "2026-07-25\torangu\tpp\t1120\t81.75\t81.40\t0.26\t0.31";
+        let parsed = Record::from_row(eight).expect("an eight-column row still parses");
+        assert_eq!(parsed.sd_sample, Some(0.31));
+        assert_eq!(parsed.device, None, "a device was invented from nothing");
+
+        // A nine-column row whose device is empty means the same thing: the
+        // server named no backend. Empty is not a device called "".
+        let empty = "2026-07-25\torangu\tpp\t1120\t81.75\t81.40\t0.26\t0.31\t";
+        assert_eq!(Record::from_row(empty).unwrap().device, None);
+    }
+
+    /// The reason this column exists. Two runs of one model on two cards
+    /// differ in *no other recorded field* — same date, same label, same mode,
+    /// same n — so without the device they are one series with two points at
+    /// every x, and a chart of them is a comparison silently drawn as a trend.
+    #[test]
+    fn one_model_on_two_cards_is_two_series() {
+        let on = |device: &str, best: f64| Record {
+            date: "2026-08-10".into(),
+            label: "gemma-4-E2B".into(),
+            mode: "tg".into(),
+            n: 0,
+            best,
+            mean: best,
+            sd: 0.0,
+            sd_sample: None,
+            device: Some(device.into()),
+        };
+        let rows = [on("api/first card", 43.0), on("api/second card", 21.5)];
+        assert!(devices_differ(&rows));
+        assert_ne!(rows[0].series(true), rows[1].series(true));
+        // And the whole point of the flag: with the device dropped they are
+        // indistinguishable, which is what every row in this file looked like
+        // before the column existed.
+        assert_eq!(rows[0].series(false), rows[1].series(false));
+    }
+
+    /// One card is the ordinary case, and it must not rename anything: a
+    /// legend that reads `orangu · api/first card` on a machine with one GPU
+    /// is noise, and worse, it breaks the series identity of a file whose
+    /// earlier rows say `orangu`.
+    #[test]
+    fn one_device_and_unrecorded_devices_leave_the_series_alone() {
+        let plain = Record {
+            date: "2026-08-10".into(),
+            label: "orangu".into(),
+            mode: "tg".into(),
+            n: 0,
+            best: 43.0,
+            mean: 43.0,
+            sd: 0.0,
+            sd_sample: None,
+            device: None,
+        };
+        let named = Record {
+            device: Some("api/first card".into()),
+            ..plain.clone()
+        };
+        // Two rows on the same card.
+        assert!(!devices_differ(&[named.clone(), named.clone()]));
+        // Historical rows that name no device are not a second device: a file
+        // of old rows plus one new run on one card is still one card.
+        assert!(!devices_differ(&[plain.clone(), named.clone()]));
+        assert!(!devices_differ(&[plain.clone(), plain.clone()]));
+        assert_eq!(named.series(false), "orangu");
     }
 
     /// Every row written before `sd_sample` existed has seven columns, and
@@ -289,6 +427,7 @@ mod tests {
             mean: 42.75,
             sd: 0.26,
             sd_sample: Some(0.31),
+            device: None,
         };
         append(p, std::slice::from_ref(&r)).unwrap();
         append(p, std::slice::from_ref(&r)).unwrap();

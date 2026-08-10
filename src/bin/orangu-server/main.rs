@@ -62,11 +62,14 @@ use engine::arch::qwen3next::Qwen3NextModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::device;
+use engine::backend::vulkan_shaders::KvStorage;
 use engine::backend::{
     Backend, CpuBackend, CudaBackend, DeviceCandidate, DeviceError, DeviceErrorKind, DeviceRequest,
     MetalBackend, MultiDeviceBackend, VulkanBackend,
 };
+use engine::footprint::DeviceFootprint;
 use engine::generate::Engine;
+use engine::kv_cache::KvCache;
 use engine::loader::ArchFamily;
 use engine::loader::LoadedModel;
 use engine::placement::{self, SplitMode, SplitPlan};
@@ -1003,18 +1006,19 @@ fn prepare(args: Args) -> Result<Prepared> {
     // A split model has no single device to measure, so it reports what
     // each device holds instead — the same question, answered per device.
     if let Some(split) = &split {
-        let per_device = engine::footprint::DeviceFootprint::weights_per_device(
-            &loaded,
-            split.device_names.len(),
-        );
-        for line in split.lines(&per_device) {
+        // One probe cache for every device: the shape is the model's, and
+        // each device's share of it is selected by layer inside
+        // `for_split_device`.
+        let footprints = split.footprints(&loaded, &model.new_kv_cache(1), conf.slots);
+        for line in split.lines(&footprints) {
             eprintln!("{line}");
         }
         // `as_wgpu` is `None` on a split, so the ordinary tuning report was
         // never built. Standing this in its place keeps `/props` describing
         // the run rather than going silent on the configuration that most
         // needs describing.
-        gpu_tuning = Some(split.to_json(&per_device));
+        let (_, weights_host_bytes) = engine::backend::device_resident_split(loaded.tensor_sizes());
+        gpu_tuning = Some(split.to_json(&footprints, weights_host_bytes));
     }
     let footprint = backend.as_wgpu().map(|wgpu| {
         engine::footprint::DeviceFootprint::measure(
@@ -2473,6 +2477,11 @@ fn apply_device_split(
     };
 
     let mut devices: Vec<Arc<dyn Backend>> = Vec::with_capacity(capacities.len());
+    // Captured per device as each one is brought up. After the loop the
+    // backends are behind the wrapper and `as_wgpu` answers `None`, so this is
+    // the only point at which each device can still be asked how it stores a
+    // KV cache — which is what turns a layer count into a byte figure.
+    let mut kv_storage: Vec<Option<KvStorage>> = vec![Some(wgpu.kv_storage())];
     devices.push(backend);
     for (position, &index) in indices.iter().enumerate().skip(1) {
         // `indices` holds only the wgpu devices; the host entry appended to
@@ -2490,10 +2499,14 @@ fn apply_device_split(
                         names[position]
                     )
                 })?;
+        kv_storage.push(Some(extra.kv_storage()));
         devices.push(Arc::new(extra));
     }
 
     if overflow_to_cpu {
+        // The host tier has no GPU KV mirror, which is a different answer
+        // from "not measured" and is what `None` says here.
+        kv_storage.push(None);
         devices.push(Arc::new(CpuBackend));
     }
     let label = format!(
@@ -2509,6 +2522,7 @@ fn apply_device_split(
             plan,
             device_names: names,
             device_capacities: reported_capacities,
+            device_kv_storage: kv_storage,
         }),
     ))
 }
@@ -2525,6 +2539,15 @@ struct SplitReport {
     plan: SplitPlan,
     device_names: Vec<String>,
     device_capacities: Vec<Option<u64>>,
+    /// How each device stores its KV mirror, captured while the concrete
+    /// backends were still in hand. `None` for the host overflow tier, which
+    /// has no GPU mirror at all.
+    ///
+    /// Read per device rather than once from the head, because it is a
+    /// property of each device's own negotiated features — and taken here for
+    /// the same reason the capacities are: after the wrapper is built there is
+    /// nothing left to ask.
+    device_kv_storage: Vec<Option<KvStorage>>,
 }
 
 impl SplitReport {
@@ -2535,14 +2558,15 @@ impl SplitReport {
     /// it is large and counter-intuitive: spreading a model across two
     /// cards makes it *slower* per token, not faster, and the reason to do
     /// it is that a model too big for one card runs at all.
-    fn lines(&self, weights_per_device: &[u64]) -> Vec<String> {
+    fn lines(&self, footprints: &[DeviceFootprint]) -> Vec<String> {
         let api = &self.api;
         let mut lines = vec![format!(
             "orangu-server: [{api}] split: {}",
             self.plan.describe(&self.device_names)
         )];
-        for (device, &bytes) in weights_per_device.iter().enumerate() {
-            let capacity = match self.device_capacities.get(device).copied().flatten() {
+        for (device, footprint) in footprints.iter().enumerate() {
+            let total = self.device_capacities.get(device).copied().flatten();
+            let capacity = match total {
                 Some(total) => format!(" of {}", orangu::format::format_bytes(total)),
                 None => String::new(),
             };
@@ -2552,7 +2576,7 @@ impl SplitReport {
                     .get(device)
                     .cloned()
                     .unwrap_or_else(|| format!("device {device}")),
-                orangu::format::format_bytes(bytes),
+                orangu::format::format_bytes(footprint.weights_device_bytes),
                 self.plan
                     .per_device_layers
                     .get(device)
@@ -2564,6 +2588,63 @@ impl SplitReport {
                     "s"
                 },
             ));
+            // What is left on that card, and what it buys — the question a
+            // split is chosen to answer, and the one a layer count alone
+            // cannot: two cards holding the same number of layers can have
+            // wildly different KV shares, and a card can be full of weights
+            // with no room left for the context the operator wants.
+            if let Some(headroom) = footprint.headroom_in(total) {
+                let mut line = format!(
+                    "orangu-server: [{api}] {}: {} free after weights",
+                    self.device_names
+                        .get(device)
+                        .cloned()
+                        .unwrap_or_else(|| format!("device {device}")),
+                    orangu::format::format_bytes(headroom)
+                );
+                if let (Some(tokens), Some(storage)) =
+                    (footprint.kv_tokens_in(headroom), footprint.kv_storage)
+                {
+                    let ceiling = footprint.n_ctx_train.saturating_mul(footprint.slots);
+                    let layers = self
+                        .plan
+                        .per_device_layers
+                        .get(device)
+                        .copied()
+                        .unwrap_or(0);
+                    let plural = if layers == 1 { "" } else { "s" };
+                    // Two devices whose headroom both exceeds the ceiling
+                    // would otherwise print the *same* capped number and look
+                    // alike, when what they have is 918k tokens of room
+                    // against 724k. Saying the ceiling binds is both shorter
+                    // and the thing an operator can act on: a device that
+                    // holds the whole context needs no further arithmetic.
+                    if tokens >= ceiling {
+                        line.push_str(&format!(
+                            " — room for the full {ceiling}-token context in {storage:?} KV \
+                             for its {layers} layer{plural}"
+                        ));
+                    } else {
+                        line.push_str(&format!(
+                            " — about {tokens} tokens of {storage:?} KV for its \
+                             {layers} layer{plural}"
+                        ));
+                    }
+                }
+                lines.push(line);
+            }
+            if let Some(shortfall) = footprint.shortfall_in(total) {
+                lines.push(format!(
+                    "orangu-server: [{api}] {}: the weights placed here are {} larger than \
+                     the device — the driver will page them on every token. Give this device \
+                     a smaller share (device_split = <ratios>) or add a device.",
+                    self.device_names
+                        .get(device)
+                        .cloned()
+                        .unwrap_or_else(|| format!("device {device}")),
+                    orangu::format::format_bytes(shortfall)
+                ));
+            }
         }
         lines.push(format!(
             "orangu-server: [{api}] a split model keeps its per-layer GPU work — fused \
@@ -2578,11 +2659,23 @@ impl SplitReport {
 
     /// The same thing for `/props`, standing in for the tuning report a
     /// split run has no single device to produce.
-    fn to_json(&self, weights_per_device: &[u64]) -> serde_json::Value {
+    ///
+    /// Each device carries a `footprint` under the same field names the
+    /// single-device report uses (`DeviceFootprint::to_json_in`), so a reader
+    /// parses one shape whether the run used one card or four.
+    fn to_json(
+        &self,
+        footprints: &[DeviceFootprint],
+        weights_host_bytes: u64,
+    ) -> serde_json::Value {
         serde_json::json!({
             "api": self.api,
             "split": true,
             "boundaries_per_token": self.plan.boundaries(),
+            // Once, at the top: routed experts are in system RAM and on no
+            // device, so per-device footprints report zero for them and this
+            // is where the total belongs.
+            "weights_host_bytes": weights_host_bytes,
             "devices": self
                 .device_names
                 .iter()
@@ -2590,11 +2683,40 @@ impl SplitReport {
                 .map(|(device, name)| serde_json::json!({
                     "name": name,
                     "total_bytes": self.device_capacities.get(device).copied().flatten(),
-                    "weights_bytes": weights_per_device.get(device).copied().unwrap_or(0),
+                    "weights_bytes": footprints
+                        .get(device)
+                        .map_or(0, |f| f.weights_device_bytes),
                     "layers": self.plan.per_device_layers.get(device).copied().unwrap_or(0),
+                    "footprint": footprints.get(device).map(|f| {
+                        f.to_json_in(self.device_capacities.get(device).copied().flatten())
+                    }),
                 }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// One [`DeviceFootprint`] per device: what the plan placed there, and
+    /// what that device's own layers cost in KV.
+    fn footprints(
+        &self,
+        model: &LoadedModel,
+        probe: &KvCache,
+        slots: usize,
+    ) -> Vec<DeviceFootprint> {
+        let weights = DeviceFootprint::weights_per_device(model, self.device_names.len());
+        (0..self.device_names.len())
+            .map(|device| {
+                DeviceFootprint::for_split_device(
+                    &model.config,
+                    probe,
+                    self.device_kv_storage.get(device).copied().flatten(),
+                    slots,
+                    weights.get(device).copied().unwrap_or(0),
+                    &self.plan.layer_device,
+                    device,
+                )
+            })
+            .collect()
     }
 }
 

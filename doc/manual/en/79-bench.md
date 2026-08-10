@@ -485,6 +485,214 @@ What to do about it:
   drift (thermals, clocks, a cold first run), interleave the arms rather than
   running all of one and then all of the other.
 
+### Measuring across cards, and across models
+
+`orangu-bench` is an HTTP client, so it never chooses a device: the server
+does, with `--device` / `[orangu-server].device` (an index, part of a name, or
+`auto`) and `--device-split` for spreading one model's layers across several.
+What the benchmark side owns is making the answers *comparable* afterwards —
+recording which card produced each row, and restarting the server between
+points so one invocation can cover several.
+
+`ORANGU_DEVICE` is read ahead of the config file precisely so a sweep can walk
+a machine's cards without editing anything between runs:
+
+```sh
+# the same model, every card in the machine, one invocation
+orangu-bench --sweep ORANGU_DEVICE=0,1 \
+             --sweep-cmd "orangu-server --model gemma-4-E2B-it-Q4_K_M.gguf" \
+             --depths 0,512,1024 --history perf-history.tsv --chart cards.svg
+```
+
+Each point starts its own server, waits for it to answer, proves through
+`/props` that the process answering is the one it started, measures it, and
+stops it — see the warnings in *A sweep can contaminate its own later rows*
+for why the restart matters, and `--sweep`'s own refusal to measure a server it
+did not launch for why the identity check does. The summary table is followed
+by a line naming the device behind each point, because `0` and `1` are the
+indices asked for and not the cards that answered:
+
+```text
+  ORANGU_DEVICE=0          Vulkan/Radeon Graphics
+  ORANGU_DEVICE=1          Vulkan/Radeon RX 5500M
+```
+
+That line appears only when the points really did run on different devices, so
+an ordinary tuning sweep's output is unchanged.
+
+**Models sweep the same way.** `--sweep-cmd` runs through a shell with the
+swept variable exported, so the variable does not have to be one the engine
+reads — it can be one the command line reads:
+
+```sh
+orangu-bench --sweep 'MODEL=/models/a.gguf;/models/b.gguf' \
+             --sweep-cmd 'orangu-server --model "$MODEL"' --pp 512
+```
+
+**Values that contain commas need `;`.** A split ratio is written `3,1`, which
+is also how the value list is separated: `--sweep ORANGU_DEVICE_SPLIT=off,all,3,1`
+would be four points, two of them halves of a ratio, and because `3` and `1`
+are themselves legal one-entry ratios nothing would complain. A spec containing
+a semicolon is therefore split on semicolons and never on commas:
+
+```sh
+orangu-bench --sweep 'ORANGU_DEVICE_SPLIT=off;all;3,1' --sweep-cmd "orangu-server ..." --depths 0
+```
+
+A spec with no semicolon splits on commas exactly as before. The one case a
+parser can still catch is caught: a comma-separated sweep of
+`ORANGU_DEVICE_SPLIT` containing a bare number is refused, with the semicolon
+form in the message, rather than measured.
+
+#### Every card against every model
+
+`--sweep` is deliberately **one axis**. A cartesian product costs the product of
+two model loads, and its result is not a table anyone can read — so the matrix
+is a shell loop around the sweep, writing into **one** history file:
+
+```sh
+for model in /models/llama-1b.gguf /models/gemma-12b.gguf; do
+  orangu-bench --url http://127.0.0.1:8100 \
+    --sweep ORANGU_DEVICE=0,1 \
+    --sweep-cmd "orangu-server $model --port 8100 --web 0" \
+    --depths 0,512,2048 --gen 128 --reps 3 \
+    --label "$(basename "$model" .gguf)" \
+    --history matrix.tsv
+done
+orangu-bench --chart-only --history matrix.tsv --chart matrix.svg
+```
+
+The three things that vary land in three different fields, which is what makes
+the file readable rather than a pile of colliding rows:
+
+- **the model** in `--label`, which inside a sweep *prefixes* each point rather
+  than replacing it — so the series above come out as
+  `llama-1b · ORANGU_DEVICE=0`. The loop is what varies the model, and a label
+  is the only field it can reach.
+- **the swept variable** in the point name, which the sweep writes itself.
+- **the device** in the `device` column, which the run fills in from the server
+  it measured.
+
+That asymmetry is why the loop goes over *models* and the sweep over *devices*
+rather than the other way round: the device needs no naming and the model does.
+
+The chart is drawn at the end, once, from the accumulated file — every run's
+rows are already in it, so nothing has to be re-measured to redraw. Each series
+comes out as `llama-1b · Vulkan/Radeon RX 5500M`, and the four combinations sit
+on one pair of axes.
+
+Two practical notes for a matrix that takes hours. Give each model its own
+`--sweep-cmd` port only if you are running loops concurrently — otherwise let
+them share one, since each sweep frees the port before it returns. And check
+the `build` line in each block: a matrix is long enough that a rebuild can land
+in the middle of it, which is exactly how two points end up measuring two
+different binaries (see *Confirm you are measuring the build you think you
+are*).
+
+A split model reports its **placement plan** in the header where a single
+device reports its kernel selection, since there is no one device to describe:
+
+```text
+  api      vulkan · split across 2 devices · 1 hand-off/token
+  device 0  Radeon RX 5500M · 2 layers · 0.27 GiB of 4.00 GiB · 3.73 GiB free · KV room ~918k tok
+  device 1  Radeon Graphics · 14 layers · 0.47 GiB of 21.06 GiB · 20.59 GiB free · KV room ~724k tok
+  kernels  not reported on a split — the tuning report describes one device, and this run has none
+  timings  no GPU stage breakdown on a split — query sets belong to one device; --flamegraph still profiles the CPU side
+```
+
+**KV room is per device and is not proportional to the layer count.** In the
+run above, device 1 holds seven times the layers and five times the free memory
+of device 0 and has *less* room for KV, because its fourteen layers cost seven
+times as much per token. That figure comes from the server measuring each
+device's own layers (`kv_dim` and stride vary down a model's depth), not from
+scaling a total — which is why it cannot be worked out from the layer counts by
+hand.
+
+A device the plan overfilled says so, on its own line:
+
+```text
+  device 0  Radeon RX 5500M · 36 layers · 5.49 GiB of 4.00 GiB · 0.00 GiB free · KV room ~0k tok
+  device 0  OVER by 1.49 GiB — the driver will page this device's weights on every token; give it a smaller share of the split
+```
+
+This is the single most useful thing the header can tell you before trusting a
+split's throughput, because paging weights on every token produces a rate that
+looks like a slow engine rather than a placement to change.
+
+Two things that block is honest about, because they change what a split run's
+numbers can be used for. The **kernel and flag report is unavailable**, so a
+split cannot be A/B'd against a single card for kernel selection — only for
+placement. And **`--flamegraph` is the only profiler that still works**: a GPU
+timestamp query set belongs to one device, so `ORANGU_GPU_TIMESTAMPS` resolves
+none of them on a split. The server says so rather than answering an empty
+result — `GET /gpu-timings` returns `{"enabled": false, "timings": null,
+"unavailable": "split"}` — and the header line above repeats it, because a
+diagnostic that silently does nothing invites the reading that what it measures
+cost nothing.
+
+#### What a split costs, and how to measure it
+
+A split's loss has two terms, and they behave completely differently: a **fixed**
+cost paid the moment the model is split at all, and a **marginal** cost for each
+layer that ends up on the slower device. Separating them is one sweep — move the
+boundary and watch the slope:
+
+```sh
+orangu-bench --sweep 'ORANGU_DEVICE_SPLIT=off;15,1;14,2;12,4;8,8' \
+             --sweep-cmd "orangu-server model.gguf --port 8100 --web 0" \
+             --depths 0 --gen 32 --reps 4
+```
+
+`off` is the baseline, and every other point has **exactly one boundary** — the
+plan hands out layers in contiguous runs — so anything the points share is
+fixed and anything that grows with the layer count is marginal. Convert the
+rates to milliseconds per token before reading it; a slope in tok/s is not a
+slope in cost. On this project's dev machine (RX 5500M + Renoir iGPU,
+Llama-3.2-1B-Q4_K_M, 16 layers):
+
+| placement | decode | ms/token |
+| :-- | --: | --: |
+| `off` — 16 layers on the discrete card | 60.0 tok/s | 16.7 |
+| `15,1` | 39.4 | 25.4 |
+| `14,2` | 36.0 | 27.8 |
+| `12,4` | 36.3 | 27.5 |
+| `8,8` | 27.4 | 36.5 |
+
+The slope is about **1.7–2.4 ms per layer moved**, and extrapolating back to
+zero layers moved leaves about **6–7 ms** that the split costs before any layer
+has changed device — roughly 40% of an entire unsplit token. So **moving one
+single layer costs 34%**, and moving seven more costs only about as much again.
+If you take one thing from this: a split's price is mostly paid at the moment
+you split, so a model that fits on one card belongs on one card.
+
+That fixed term is not the hand-off across the bus. The hidden state for this
+model is 2048 floats — 8 KiB — which is microseconds on any link; what the
+fixed term actually is has not been established. Note also that it cannot be
+attributed *per boundary* on a two-device machine, because every split there has
+exactly one: separating "the cost of a boundary" from "the cost of splitting"
+needs a third device, and this rig has two.
+
+Two more things worth knowing before trusting such a sweep:
+
+- **Use `--reps 4` or more.** At two repetitions this same sweep put `14,2`
+  ahead of `15,1`, which is impossible — the ordering came back at four. The
+  unsplit point is the noisiest of all (±4.8 tok/s here) because it is the
+  fastest, so scheduling jitter is a larger share of its per-token time.
+- **`ORANGU_NO_SPLIT_FUSION=1` is the A/B for the split's GPU paths**, from one
+  binary and two runs — the way to check they are live rather than assume it:
+
+  ```sh
+  orangu-bench --sweep 'ORANGU_NO_SPLIT_FUSION=;1' \
+               --sweep-env 'ORANGU_DEVICE_SPLIT=12,4' \
+               --sweep-cmd "orangu-server model.gguf --port 8100 --web 0" \
+               --depths 0 --gen 32 --reps 2
+  ```
+
+  The empty first value means *unset*, so the two points are "fusion on" against
+  "fusion off". Here that was 34.8 against 20.8 tok/s — per-layer fusion is
+  worth **+68%** on a split, which is most of what makes one usable at all.
+  `--sweep-env` is what holds the placement identical across both.
+
 ### What was measured
 
 Every run opens with the server's model, backend and **build** (from
@@ -542,7 +750,7 @@ Options:
       --model <ID>                     Model id to request
       --json                           Emit machine-readable JSON
       --history <PATH>                 Append each measured point to this tab-separated history file
-      --label <NAME>                   Series name recorded in the history file (defaults to the server's model)
+      --label <NAME>                   Series name recorded in the history file (defaults to the server's model); prefixes each `--sweep` point
       --chart <PATH>                   Render the history file to this SVG after measuring
       --chart-only                     Only render the chart from an existing history file; measure nothing
       --chart-png                      Also render a PNG beside the chart SVG
@@ -557,7 +765,7 @@ Options:
       --compare-profiles <LIST>        Compare already-collapsed `.folded` profiles side by side; measure nothing
       --bundle <PATH>                  Write the whole run — measurements, configuration, host — to one JSON file
       --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
-      --sweep <SPEC>                   Sweep one tuning variable: `VAR=v1,v2,...`; needs `--sweep-cmd`
+      --sweep <SPEC>                   Sweep one tuning variable: `VAR=v1,v2,...` (`;` if a value has a comma); needs `--sweep-cmd`
       --sweep-cmd <CMD>                Shell command that starts the server, run once per `--sweep` value
       --sweep-env <K=V>                Environment held constant across every `--sweep` point (repeatable)
       --sweep-start-timeout <SECONDS>  Seconds to wait for a swept server to come up [default: 300]
@@ -951,22 +1159,40 @@ hand-editable; blank lines, comments and unparseable rows are skipped rather
 than fatal. Each row is `date`, `label`, `mode` (`pp`, `tg`, `curve`, `cpu` or
 `pg`, `embed` — each drawn as its own chart panel, since an embedding pass and a
 generative model's prefill are not the same measurement, and two of the five
-are not even in tokens/second), `n`, and the best / mean / both standard
-deviations of the run's repetitions (see *Which standard deviation* above):
+are not even in tokens/second), `n`, the best / mean / both standard
+deviations of the run's repetitions (see *Which standard deviation* above), and
+the `device` that produced the row:
 
 ```text
-#date	label	mode	n	best	mean	sd	sd_sample
-2026-07-25	orangu af7c767	pp	1120	81.75	81.40	0.26	0.32
-2026-07-25	reference b10104	pp	1120	1061.66	1049.40	8.84	10.83
+#date	label	mode	n	best	mean	sd	sd_sample	device
+2026-07-25	orangu af7c767	pp	1120	81.75	81.40	0.26	0.32	Vulkan/Radeon RX 5500M
+2026-07-25	reference b10104	pp	1120	1061.66	1049.40	8.84	10.83	Vulkan/Radeon RX 5500M
 ```
 
 Nothing is ever rewritten — a row is a measurement that was taken, and a later
-run that disagrees is another row, not a correction.
+run that disagrees is another row, not a correction. Columns are only ever
+appended, and a shorter row is read as "that column was not recorded" rather
+than as a broken line, so a file written by an older build keeps working: rows
+with seven, eight and nine columns can sit in one file and all three parse.
+
+`device` is filled in from the server's own backend label, shortened to fit a
+legend — `Vulkan/Radeon RX 5500M`, `CPU/AVX2`, or
+`Vulkan/Radeon RX 5500M (split 2)` for a model spread across cards. It is
+recorded because with `--device` on the server the same model measured on two
+cards produces rows that are identical in every other field: same date, same
+label, same mode, same `n`. Without it the file cannot tell the two cards
+apart, and the chart draws one series with two points at every x — a comparison
+silently rendered as a trend. The bundle (`--bundle`) keeps the unshortened
+name, the driver string and, on a split, the whole placement plan.
 
 `--label` is the series identity, so it must stay stable across runs for a line
 to be drawn; it defaults to the server's model id, which distinguishes two
 models but *not* two builds of orangu, so pass it explicitly when A/B-ing
-builds. Prompt-processing rows are keyed by the token count the server actually
+builds. Two devices need no such care: when a file holds rows from more than
+one named device, the chart appends the device to each series name by itself —
+`gemma-4-E2B · Vulkan/Radeon RX 5500M`. When every row names the same device,
+or none names one at all, nothing is appended and the chart is exactly what it
+was before the column existed. Prompt-processing rows are keyed by the token count the server actually
 reported rather than the requested length, and a row without server timings is
 printed but not recorded — a time-to-first-token is a different measurement and
 does not belong on the same line as a prefill rate.

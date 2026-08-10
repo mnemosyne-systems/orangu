@@ -174,7 +174,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     history: Option<String>,
 
-    /// Series name recorded in the history file (defaults to the server's model).
+    /// Series name recorded in the history file (defaults to the server's model); prefixes each `--sweep` point.
     #[arg(long, value_name = "NAME")]
     label: Option<String>,
 
@@ -234,7 +234,7 @@ struct Args {
     #[arg(long, value_delimiter = ',', value_name = "LIST")]
     read_bundle: Vec<String>,
 
-    /// Sweep one tuning variable: `VAR=v1,v2,...`; needs `--sweep-cmd`.
+    /// Sweep one tuning variable: `VAR=v1,v2,...` (`;` if a value has a comma); needs `--sweep-cmd`.
     #[arg(long, value_name = "SPEC")]
     sweep: Option<String>,
 
@@ -1045,10 +1045,97 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
     }
 
-    let measured = measured?;
+    let mut measured = measured?;
+    stamp_device(&mut measured, device_tag(&env.props).as_deref());
     write_bundle(args, args.bundle.as_deref(), &env, &measured)?;
     record_and_chart(args, &measured)?;
     write_report(args, &env, &measured, profile.as_ref())
+}
+
+/// Record which device produced these measurements.
+///
+/// Stamped here, once, rather than threaded through every `run_*` path: the
+/// device is a property of the server, and a server cannot change device
+/// inside one invocation. A sweep restarts one per point and stamps each
+/// point's own — which is the case that needs it, since `ORANGU_DEVICE=0,1`
+/// is one invocation measuring two cards.
+fn stamp_device(records: &mut [history::Record], device: Option<&str>) {
+    for r in records {
+        r.device = device.map(str::to_string);
+    }
+}
+
+/// The short device identity recorded beside every measurement — e.g.
+/// `Vulkan/Some Card`, `Vulkan/Some Card (split 2)`, `CPU/AVX2`.
+///
+/// Short because it has to fit a chart legend and a table column; `props` in
+/// the bundle keeps the full name, the driver string, and the whole placement
+/// plan. This is an identity, not provenance: the question it answers is "are
+/// these two rows the same device or different ones", and the answer has to be
+/// readable at a glance beside a number.
+///
+/// **A split is tagged as one.** `props.backend` on a split model reads
+/// `"… + 1 more (2 devices, split)"`, and shortening that as ordinary text
+/// would trim it back to the head device's name — which would tag a split run
+/// identically to a single-card run on its head card, the exact confusion the
+/// column exists to prevent. So the split flag is read from `props.gpu` and
+/// spelled out.
+///
+/// The tag names the *devices*, not the placement: `--device-split 3,1` and
+/// `--device-split all` over the same two cards produce the same tag. A sweep
+/// over ratios is told apart by its own `VAR=value` label, and the plan itself
+/// is in the bundle.
+fn device_tag(props: &serde_json::Value) -> Option<String> {
+    let backend = props
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|b| !b.is_empty())?;
+    let gpu = props.get("gpu").filter(|g| !g.is_null());
+    let split = gpu
+        .and_then(|g| g.get("split"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if split {
+        // Everything before the `" + N more"` the server appends is the head
+        // device's own label, which is what the shortener understands.
+        let head = short_device(backend.split(" + ").next().unwrap_or(backend));
+        let devices = gpu
+            .and_then(|g| g.get("devices"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        return Some(format!("{head} (split {devices})"));
+    }
+    Some(short_device(backend))
+}
+
+/// `Vulkan/AMD Some Card (DRIVER TAG)` → `Vulkan/Some Card`.
+///
+/// Two things come off: the driver parenthetical, and a leading vendor word.
+/// Neither distinguishes two cards in one machine — which is what this string
+/// is for — and both cost the legend width that does. The API prefix stays:
+/// the same card under Vulkan and under DX12 is a real A/B, and it is the one
+/// pair this would otherwise collapse.
+fn short_device(label: &str) -> String {
+    let (api, name) = match label.split_once('/') {
+        Some((api, name)) => (Some(api), name),
+        None => (None, label),
+    };
+    // Only when something is left: `"(DRIVER TAG)"` as an entire name is
+    // unhelpful, but it is better than an empty tag.
+    let name = match name.split_once(" (") {
+        Some((before, _)) if !before.trim().is_empty() => before.trim(),
+        _ => name.trim(),
+    };
+    let name = ["AMD", "NVIDIA", "Intel(R)", "Intel", "Apple"]
+        .iter()
+        .find_map(|vendor| name.strip_prefix(vendor).map(str::trim_start))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(name);
+    match api {
+        Some(api) => format!("{api}/{name}"),
+        None => name.to_string(),
+    }
 }
 
 /// Write `--bundle`, if asked for.
@@ -1521,7 +1608,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     let mut all = Vec::new();
     let mut bundles = Vec::new();
     for value in &spec.values {
-        let label = spec.label(value);
+        let label = sweep_point_label(args, &spec, value);
         println!("\n=== {label}");
         // Named after the point, not the run: a sweep that fails at value 3
         // of 5 must leave the log that explains *that* start, not the last
@@ -1542,7 +1629,11 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         report_clocks(&clocks.stop(), args);
         env_report.gpu_timings = take_gpu_timings(&client, &args.url);
         report_gpu_timings(&env_report.gpu_timings, args);
-        let measured = measured?;
+        let mut measured = measured?;
+        // Per point, from that point's own server: a sweep of `ORANGU_DEVICE`
+        // is one invocation whose points ran on different cards, which is the
+        // case the column exists for.
+        stamp_device(&mut measured, device_tag(&env_report.props).as_deref());
 
         if let Some(stem) = &args.bundle {
             let path = bundle_point_path(stem, &label);
@@ -1561,9 +1652,10 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     println!(
         "\nswept {} — mean tok/s, against {}",
         spec.var,
-        spec.label(&spec.values[0])
+        sweep_point_label(args, &spec, &spec.values[0])
     );
-    print_sweep_table(&spec, &all);
+    print_sweep_table(args, &spec, &all);
+    print_sweep_devices(args, &spec, &all);
     if !bundles.is_empty() {
         println!("\nbundles: {}", bundles.join(" "));
     }
@@ -1615,6 +1707,27 @@ fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow:
     Ok(())
 }
 
+/// The series name for one swept point: `VAR=value`, or `<label> · VAR=value`
+/// when the run carries a `--label`.
+///
+/// A sweep names its own points, which is right when the sweep *is* the
+/// experiment — but it made `--label` do nothing at all, and that turned the
+/// one shape a matrix needs into rows that collide. Two models swept over
+/// `ORANGU_DEVICE=0,1` wrote four series names between eight measurements: the
+/// device column told the cards apart and **nothing told the models apart**,
+/// because the label — the only field that could have — was being discarded.
+/// The same discard also aimed both models' `--bundle` points at one filename.
+///
+/// Prefix rather than replace: inside one sweep the `VAR=value` half is still
+/// what distinguishes a point, and a `--label` that overwrote it would trade
+/// one collision for another.
+fn sweep_point_label(args: &Args, spec: &sweep::Spec, value: &str) -> String {
+    match &args.label {
+        Some(prefix) => format!("{prefix} · {}", spec.label(value)),
+        None => spec.label(value),
+    }
+}
+
 /// `ORANGU_COOP_MIN_TOKENS=16` → `orangu_coop_min_tokens-16`, for a filename.
 fn slug(label: &str) -> String {
     label
@@ -1642,12 +1755,12 @@ fn bundle_point_path(stem: &str, label: &str) -> String {
 }
 
 /// The sweep's answer, as one row per measured point and one column per value.
-fn print_sweep_table(spec: &sweep::Spec, records: &[history::Record]) {
+fn print_sweep_table(args: &Args, spec: &sweep::Spec, records: &[history::Record]) {
     let mut points: Vec<(String, u32)> = records.iter().map(|r| (r.mode.clone(), r.n)).collect();
     points.sort_unstable();
     points.dedup();
     let at = |value: &str, mode: &str, n: u32| -> Option<f64> {
-        let label = spec.label(value);
+        let label = sweep_point_label(args, spec, value);
         records
             .iter()
             .find(|r| r.label == label && r.mode == mode && r.n == n)
@@ -1671,6 +1784,31 @@ fn print_sweep_table(spec: &sweep::Spec, records: &[history::Record]) {
             }
         }
         println!();
+    }
+}
+
+/// Which device each swept point actually ran on — printed only when they
+/// differ.
+///
+/// `--sweep ORANGU_DEVICE=0,1` heads its columns `0` and `1`, which are the
+/// indices asked for and not the cards that answered: whether index 1 is the
+/// discrete card or the integrated one is the whole content of the comparison,
+/// and it is knowable only from the server that came up. Silent when every
+/// point ran on the same device, which is every sweep of an ordinary tuning
+/// knob — a column earns its width only when it varies, which is also why an
+/// existing sweep's output is unchanged.
+fn print_sweep_devices(args: &Args, spec: &sweep::Spec, records: &[history::Record]) {
+    if !history::devices_differ(records) {
+        return;
+    }
+    for value in &spec.values {
+        let label = sweep_point_label(args, spec, value);
+        let device = records
+            .iter()
+            .find(|r| r.label == label)
+            .and_then(|r| r.device.as_deref())
+            .unwrap_or("?");
+        println!("  {label:<24} {device}");
     }
 }
 
@@ -2237,6 +2375,7 @@ fn run_pg(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
         });
     }
 
@@ -2409,6 +2548,7 @@ fn run_tg(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
         });
         records.extend(moe::records(&moe_stats, label, depth, args.reps.max(1)));
         if !args.json
@@ -2896,6 +3036,7 @@ fn run_pp(
                 mean: stats.mean,
                 sd: stats.sd,
                 sd_sample: stats.sd_sample,
+                device: None,
             });
             // Keyed on the token count the server reported, exactly as the
             // rate row is, so a mechanism figure and the rate it explains sit
@@ -3022,6 +3163,7 @@ fn run_streams(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
         });
     }
     Ok(records)
@@ -3133,6 +3275,7 @@ fn run_decode_cpu(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
         });
     }
     Ok(records)
@@ -3275,6 +3418,7 @@ fn run_pp_continue(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
         });
     }
     Ok(records)
@@ -3367,6 +3511,7 @@ fn run_embed(
                 mean: stats.mean,
                 sd: stats.sd,
                 sd_sample: stats.sd_sample,
+                device: None,
             });
         }
     }
@@ -3566,6 +3711,16 @@ fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
     let Some(gpu) = gpu.filter(|g| !g.is_null()) else {
         return Vec::new();
     };
+    // A split model reports its placement plan here instead of a tuning
+    // report — a different document under the same key, and one this used to
+    // read as a tuning report with every field missing.
+    if gpu
+        .get("split")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return format_device_split(gpu);
+    }
     let get = |path: [&str; 2]| -> Option<&serde_json::Value> {
         gpu.get(path[0]).and_then(|v| v.get(path[1]))
     };
@@ -3638,6 +3793,122 @@ fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
         show(get(["tuning", "coop_geom"])),
         show(get(["limits", "max_compute_workgroup_storage_size"])),
     ));
+    out
+}
+
+/// The placement plan of a split model, as header lines: which devices, how
+/// many layers each, how much of each card that filled, and how many times a
+/// token crosses the bus.
+///
+/// This stands where the tuning report stands on a single device, because on a
+/// split there is no single device to report one for (`as_wgpu` is `None` on
+/// the multi-device backend, so the server never builds one). What it replaces
+/// is worse than nothing: the single-device formatter reading this document
+/// printed four lines of `?` — an adapter, kernels, flags and geometry all
+/// "unknown" — while the plan sat unread in the same object. A reader could
+/// not tell that from a server whose feature negotiation had gone wrong, and
+/// nothing on screen said the model had been split at all.
+///
+/// The last line says the kernel selection is *unreported* rather than leaving
+/// it out. An absent flag list reads as a default flag list, and this tool's
+/// standing rule is that "not measured" must never be printable as a value —
+/// the same reason `report_gpu_timings` prints its step count.
+fn format_device_split(gpu: &serde_json::Value) -> Vec<String> {
+    let devices = gpu
+        .get("devices")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let api = gpu
+        .get("api")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let boundaries = gpu
+        .get("boundaries_per_token")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let gib = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_u64)
+            .map(|b| format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+    };
+    let mut out = vec![format!(
+        "api      {api} · split across {} device{} · {boundaries} hand-off{}/token",
+        devices.len(),
+        if devices.len() == 1 { "" } else { "s" },
+        if boundaries == 1 { "" } else { "s" },
+    )];
+    for (i, device) in devices.iter().enumerate() {
+        let name = device
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let layers = device
+            .get("layers")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        // "of ?" rather than a bare weight figure when the device did not
+        // report a capacity: how full a card is is the number that says
+        // whether a split is about to page, and a weight with nothing to
+        // compare it against cannot answer that.
+        let weights = gib(device.get("weights_bytes")).unwrap_or_else(|| "?".to_string());
+        let total = gib(device.get("total_bytes")).unwrap_or_else(|| "?".to_string());
+        let mut line = format!(
+            "device {i}  {} · {layers} layer{} · {weights} of {total}",
+            short_device(name),
+            if layers == 1 { "" } else { "s" },
+        );
+        // The footprint, when the server reports one. Weights against capacity
+        // says how full a card is; the headroom says whether what is left can
+        // hold any context — which is the question a split is chosen to
+        // answer, and the one a layer count cannot reach, since two devices
+        // holding the same number of layers can hold very different shares of
+        // the KV cache.
+        let footprint = device.get("footprint").filter(|f| !f.is_null());
+        if let Some(footprint) = footprint {
+            match gib(footprint.get("headroom_bytes")) {
+                Some(free) => line.push_str(&format!(" · {free} free")),
+                // A device that declined to report a size. Said rather than
+                // left blank: no headroom figure and a headroom of zero are
+                // opposite answers.
+                None => line.push_str(" · size unreported, so no headroom figure"),
+            }
+            if let Some(tokens) = footprint
+                .get("kv_tokens_in_headroom")
+                .and_then(serde_json::Value::as_u64)
+            {
+                // "room for", not "usable context": this is what the *card*
+                // has space for across its own layers, which a model's trained
+                // context may well be smaller than.
+                line.push_str(&format!(" · KV room ~{}k tok", tokens / 1000));
+            }
+        }
+        out.push(line);
+        // The one thing knowable in advance, and the reason the footprint is
+        // worth carrying at all: past this point the driver pages weights on
+        // every token, which reads as "orangu is slow on this card" rather
+        // than as a placement that needs changing.
+        if let Some(short) = footprint.and_then(|f| gib(f.get("shortfall_bytes"))) {
+            out.push(format!(
+                "device {i}  OVER by {short} — the driver will page this device's weights on \
+                 every token; give it a smaller share of the split"
+            ));
+        }
+    }
+    out.push(
+        "kernels  not reported on a split — the tuning report describes one device, and this \
+         run has none"
+            .to_string(),
+    );
+    // Said here, unconditionally, rather than left to the absence of a timings
+    // line after the table. `/gpu-timings` resolves a timestamp query set that
+    // belongs to one device, so a split resolves none and reports nothing —
+    // and a diagnostic that silently does nothing invites the reading that
+    // what it measures cost nothing. `--flamegraph` still works, so the line
+    // says what to reach for instead.
+    out.push(
+        "timings  no GPU stage breakdown on a split — query sets belong to one device; \
+         --flamegraph still profiles the CPU side"
+            .to_string(),
+    );
     out
 }
 
@@ -4011,6 +4282,7 @@ fn run_curve(
             // One sample: a sample standard deviation is undefined, and the
             // sentence above is the reason this mode is kept apart from `tg`.
             sd_sample: None,
+            device: None,
         });
         lo = hi;
     }
@@ -4020,6 +4292,224 @@ fn run_curve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The placement plan a split server reports under `props.gpu`, as
+    /// `apply_device_split`'s `to_json` writes it.
+    fn split_props() -> serde_json::Value {
+        serde_json::json!({
+            "model": "gemma-4-E2B",
+            "backend": "Vulkan/AMD Some Card (DRIVER TAG) + 1 more (2 devices, split)",
+            "gpu": {
+                "api": "vulkan",
+                "split": true,
+                "boundaries_per_token": 1,
+                "devices": [
+                    {
+                        "name": "AMD Some Card (DRIVER TAG)",
+                        "total_bytes": 4_294_967_296_u64,
+                        "weights_bytes": 3_221_225_472_u64,
+                        "layers": 18,
+                        "footprint": {
+                            "weights_device_bytes": 3_221_225_472_u64,
+                            "device_total_bytes": 4_294_967_296_u64,
+                            "headroom_bytes": 1_073_741_824_u64,
+                            "shortfall_bytes": serde_json::Value::Null,
+                            "kv_tokens_in_headroom": 24_000,
+                        },
+                    },
+                    {
+                        "name": "AMD Other Card (DRIVER TAG)",
+                        "total_bytes": 12_884_901_888_u64,
+                        "weights_bytes": 1_073_741_824_u64,
+                        "layers": 6,
+                        "footprint": {
+                            "weights_device_bytes": 1_073_741_824_u64,
+                            "device_total_bytes": 12_884_901_888_u64,
+                            "headroom_bytes": 11_811_160_064_u64,
+                            "shortfall_bytes": serde_json::Value::Null,
+                            "kv_tokens_in_headroom": 512_000,
+                        },
+                    },
+                ],
+            },
+        })
+    }
+
+    /// The header used to read a split's placement plan as a tuning report
+    /// with every field missing, and print four lines of `?`. A `?` in that
+    /// block means "this server declined to say", which is how a broken
+    /// feature negotiation looks — so a split was indistinguishable from a
+    /// card that had quietly lost half its kernels, and nothing said the model
+    /// had been split at all.
+    #[test]
+    fn a_split_reports_its_plan_instead_of_a_wall_of_question_marks() {
+        let props = split_props();
+        let lines = format_gpu_tuning(props.get("gpu"));
+        let text = lines.join("\n");
+        assert!(!text.contains('?'), "{text}");
+        assert!(text.contains("split across 2 devices"), "{text}");
+        assert!(text.contains("1 hand-off/token"), "{text}");
+        // Each device, with what it is holding and what it had to hold it in.
+        assert!(text.contains("Some Card"), "{text}");
+        assert!(text.contains("18 layers"), "{text}");
+        assert!(text.contains("3.00 GiB of 4.00 GiB"), "{text}");
+        assert!(text.contains("6 layers"), "{text}");
+        // And the absence of a kernel report is stated, not left to be read
+        // as a default kernel report.
+        assert!(text.contains("not reported on a split"), "{text}");
+        // Same for the GPU stage breakdown: a split resolves no timestamp
+        // query set, and a run that printed nothing about it would look like a
+        // run whose GPU stages cost nothing.
+        assert!(text.contains("no GPU stage breakdown on a split"), "{text}");
+        assert!(text.contains("--flamegraph"), "{text}");
+        // The footprint: what is left on each card, and what it buys. A layer
+        // count cannot answer this — these two devices hold 18 and 6 layers
+        // and have 1.00 and 11.00 GiB free.
+        assert!(text.contains("1.00 GiB free"), "{text}");
+        assert!(text.contains("11.00 GiB free"), "{text}");
+        assert!(text.contains("KV room ~24k tok"), "{text}");
+        // `provenance_fields` splits these on the first double space, so every
+        // line has to carry one — otherwise the PDF gets a row with no label.
+        for line in &lines {
+            assert!(line.split_once("  ").is_some(), "{line:?}");
+        }
+    }
+
+    /// The single-device path is the one every existing run takes, and this
+    /// change must not touch it.
+    #[test]
+    fn a_single_device_still_gets_the_tuning_report() {
+        let gpu = serde_json::json!({
+            "api": "vulkan",
+            "adapter": "AMD Some Card (DRIVER TAG)",
+            "kernels": {"decode": {"Q4_K": "coop", "Q6_K": "scalar"}, "prefill": {"Q4_K": "tile"}},
+            "flags": {"kv_storage": "F16", "attn_coop": true, "flash_attn": false},
+            "features": {"shader_f16": true, "subgroup": true},
+            "tuning": {"coop_min_n_tokens": 8, "reduce_n_rows": 4},
+        });
+        let text = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(text.contains("api      vulkan · AMD Some Card"), "{text}");
+        assert!(text.contains("decode q4_k coop"), "{text}");
+        // `split_k` is a tuning constant on this path; the placement plan's
+        // wording is what must not appear.
+        assert!(!text.contains("split across"), "{text}");
+    }
+
+    /// A matrix is a loop over models wrapping a sweep over devices, into one
+    /// history file. That only works if the two axes land in *different*
+    /// fields: the sweep names its points, the device column fills itself in,
+    /// and the model has nothing left but `--label` — which a sweep used to
+    /// throw away, so two models wrote four series names between eight
+    /// measurements and the file could not say which model a row came from.
+    #[test]
+    fn a_labelled_sweep_keeps_the_label_so_two_models_do_not_collide() {
+        let spec = sweep::Spec::parse("ORANGU_DEVICE=0,1").expect("a valid spec");
+        let mut args = Args::parse_from(["orangu-bench"]);
+        // Unlabelled: the sweep names its own points, exactly as before.
+        assert_eq!(sweep_point_label(&args, &spec, "0"), "ORANGU_DEVICE=0");
+
+        // Labelled: the label scopes them, and two models' points differ.
+        args.label = Some("llama-1b".to_string());
+        let llama = sweep_point_label(&args, &spec, "0");
+        args.label = Some("smollm-360m".to_string());
+        let smol = sweep_point_label(&args, &spec, "0");
+        assert_ne!(llama, smol, "two models must not share a series name");
+        assert!(llama.contains("llama-1b") && llama.contains("ORANGU_DEVICE=0"));
+        // And the point is still distinguished within one model's sweep —
+        // a label that replaced the point name would trade one collision for
+        // another.
+        args.label = Some("llama-1b".to_string());
+        assert_ne!(
+            sweep_point_label(&args, &spec, "0"),
+            sweep_point_label(&args, &spec, "1")
+        );
+    }
+
+    /// The case the footprint exists for: a device the plan overfilled. The
+    /// rate collapses because the driver pages weights on every token, and
+    /// nothing else in the header would say so — a layer count and a weight
+    /// figure both look ordinary.
+    #[test]
+    fn an_over_subscribed_device_of_a_split_says_so() {
+        let gpu = serde_json::json!({
+            "api": "vulkan",
+            "split": true,
+            "boundaries_per_token": 1,
+            "devices": [{
+                "name": "AMD Some Card (DRIVER TAG)",
+                "total_bytes": 4_294_967_296_u64,
+                "weights_bytes": 6_442_450_944_u64,
+                "layers": 40,
+                "footprint": {
+                    "headroom_bytes": 0,
+                    "shortfall_bytes": 2_147_483_648_u64,
+                    "kv_tokens_in_headroom": 0,
+                },
+            }],
+        });
+        let text = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(text.contains("OVER by 2.00 GiB"), "{text}");
+        assert!(text.contains("page this device's weights"), "{text}");
+    }
+
+    /// A server from before the footprint existed still reports the plan, and
+    /// reading a run against an older build is the ordinary case during a
+    /// bisect. The device lines have to survive it without inventing a
+    /// headroom figure.
+    #[test]
+    fn a_split_without_a_footprint_still_reports_its_plan() {
+        let gpu = serde_json::json!({
+            "api": "vulkan",
+            "split": true,
+            "boundaries_per_token": 1,
+            "devices": [{
+                "name": "AMD Some Card (DRIVER TAG)",
+                "total_bytes": 4_294_967_296_u64,
+                "weights_bytes": 3_221_225_472_u64,
+                "layers": 18,
+            }],
+        });
+        let text = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(text.contains("18 layers · 3.00 GiB of 4.00 GiB"), "{text}");
+        assert!(!text.contains("free"), "{text}");
+        assert!(!text.contains("OVER"), "{text}");
+    }
+
+    /// A split must not be tagged as the card at the head of it. The server's
+    /// backend label starts with that card's name, so any shortener that
+    /// treated it as ordinary text would file a two-card run under the same
+    /// device as a one-card run — silently making the two comparable in the
+    /// history file.
+    #[test]
+    fn a_split_is_not_tagged_as_its_head_device() {
+        let split = device_tag(&split_props()).expect("a backend was reported");
+        let single = device_tag(&serde_json::json!({
+            "backend": "Vulkan/AMD Some Card (DRIVER TAG)",
+            "gpu": {"api": "vulkan", "adapter": "AMD Some Card (DRIVER TAG)"},
+        }))
+        .expect("a backend was reported");
+        assert_eq!(single, "Vulkan/Some Card");
+        assert_eq!(split, "Vulkan/Some Card (split 2)");
+        assert_ne!(split, single);
+    }
+
+    /// The tag has to survive the servers that report no `gpu` block at all —
+    /// the CPU backend, and every other engine this harness is pointed at.
+    #[test]
+    fn a_device_tag_without_a_gpu_block_is_the_backend_itself() {
+        let tag = |backend: &str| device_tag(&serde_json::json!({"backend": backend}));
+        assert_eq!(tag("CPU/AVX2").as_deref(), Some("CPU/AVX2"));
+        assert_eq!(
+            tag("Metal/Apple M1 Pro (Metal)").as_deref(),
+            Some("Metal/M1 Pro")
+        );
+        // Nothing to record is recorded as nothing, not as an empty device.
+        assert_eq!(tag(""), None);
+        assert_eq!(device_tag(&serde_json::json!({})), None);
+        // A name that is *only* a parenthetical keeps it rather than becoming
+        // an empty tag.
+        assert_eq!(tag("(DRIVER TAG)").as_deref(), Some("(DRIVER TAG)"));
+    }
 
     /// Two standard deviations, and the difference between them is not
     /// cosmetic: at three repetitions the sample estimator is 22% larger than

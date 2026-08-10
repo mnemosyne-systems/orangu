@@ -83,15 +83,41 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// happened in the window: either `ORANGU_GPU_TIMESTAMPS=1` is not set, or
 /// this adapter has no timestamp query. Reported as zero steps rather than
 /// zero milliseconds so "not measured" cannot be read as "took no time".
+///
+/// `unavailable` extends that rule one step further out. A **split** model has
+/// no `wgpu` backend to ask at all — `Backend::as_wgpu` answers `None` on the
+/// multi-device wrapper by design, because a timestamp query set belongs to one
+/// device and a split resolves none of them — so this endpoint used to answer
+/// `enabled: false` and nothing else. That is indistinguishable from "you
+/// forgot to set `ORANGU_GPU_TIMESTAMPS`", and a client that reports nothing
+/// when it gets nothing (as `orangu-bench` did) leaves a split run looking like
+/// a run whose GPU stages cost zero. Naming the reason is what stops that: the
+/// caller can say *why* there is no breakdown, and point at the profiler that
+/// does still work.
 pub async fn gpu_timings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let timings = state
         .wgpu_backend
         .as_deref()
         .and_then(orangu_backend_as_wgpu)
         .map(|v| v.take_timings().to_json());
+    // Read off the tuning report rather than carried as a second flag: that
+    // object *is* the placement plan on a split (see `SplitReport::to_json`),
+    // so there is one source for "was this run split" and it cannot drift.
+    let split = state
+        .gpu_tuning
+        .as_ref()
+        .and_then(|gpu| gpu.get("split"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let unavailable = match (timings.is_some(), split) {
+        (true, _) => None,
+        (false, true) => Some("split"),
+        (false, false) => Some("no_wgpu_backend"),
+    };
     Json(serde_json::json!({
         "enabled": timings.is_some(),
         "timings": timings,
+        "unavailable": unavailable,
     }))
 }
 

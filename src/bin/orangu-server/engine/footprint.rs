@@ -51,7 +51,7 @@ use crate::engine::backend::device::DeviceCandidate;
 use crate::engine::backend::device_resident_split;
 use crate::engine::backend::vulkan_shaders::KvStorage;
 use crate::engine::kv_cache::KvCache;
-use crate::engine::loader::LoadedModel;
+use crate::engine::loader::{LoadedModel, ModelConfig};
 use orangu::format::format_bytes;
 
 /// Context granularity every per-token quantity is reported at. Bytes per
@@ -107,6 +107,52 @@ impl DeviceFootprint {
             kv_bytes_per_step,
             slots,
             n_ctx_train: model.config.n_ctx_train,
+            kv_storage,
+        }
+    }
+
+    /// What **one device of a split** holds: the weights placed on it and the
+    /// KV mirror for the layers placed on it.
+    ///
+    /// `weights_device_bytes` is passed in rather than recomputed because the
+    /// caller already has it from [`DeviceFootprint::weights_per_device`], and
+    /// that function asks the model where each tensor actually went — a second
+    /// derivation here could disagree with the first.
+    ///
+    /// `weights_host_bytes` is **zero** on every device of a split, not the
+    /// model's host total. Routed experts live in system RAM and are on no
+    /// device at all; charging them to each card in turn would count them
+    /// twice on a two-card split and make every headroom figure wrong in the
+    /// same direction. The split report states the host total once, where it
+    /// belongs.
+    pub fn for_split_device(
+        config: &ModelConfig,
+        probe: &KvCache,
+        kv_storage: Option<KvStorage>,
+        slots: usize,
+        weights_device_bytes: u64,
+        layer_device: &[usize],
+        device: usize,
+    ) -> Self {
+        let kv_bytes_per_step = kv_storage
+            .map(|storage| {
+                probe.gpu_mirror_bytes_where(
+                    CONTEXT_STEP,
+                    config.n_head,
+                    storage,
+                    // A layer the plan does not mention is on the head device,
+                    // which is where `LoadedModel::device_for_tensor` puts
+                    // anything it has no placement for.
+                    |layer| layer_device.get(layer).copied().unwrap_or(0) == device,
+                )
+            })
+            .unwrap_or(0);
+        Self {
+            weights_device_bytes,
+            weights_host_bytes: 0,
+            kv_bytes_per_step,
+            slots,
+            n_ctx_train: config.n_ctx_train,
             kv_storage,
         }
     }
@@ -182,11 +228,15 @@ impl DeviceFootprint {
     /// is unknown — which is not zero, and must not be reported as a
     /// shortfall (see `engine::backend::device`'s own note on unknown VRAM).
     pub fn headroom_on(&self, device: &DeviceCandidate) -> Option<u64> {
-        Some(
-            device
-                .vram_total_bytes?
-                .saturating_sub(self.weights_device_bytes),
-        )
+        self.headroom_in(device.vram_total_bytes)
+    }
+
+    /// The same against a bare capacity, for a device of a split — where
+    /// there is no `DeviceCandidate` left to ask (`Backend::as_wgpu` is
+    /// `None` on the multi-device wrapper by design, so the split report
+    /// carries the capacities out instead).
+    pub fn headroom_in(&self, total_bytes: Option<u64>) -> Option<u64> {
+        Some(total_bytes?.saturating_sub(self.weights_device_bytes))
     }
 
     /// `Some(shortfall)` when the weights alone exceed the device, `None`
@@ -198,7 +248,13 @@ impl DeviceFootprint {
     /// like "orangu is slow on this card" rather than like a capacity
     /// problem.
     pub fn shortfall_on(&self, device: &DeviceCandidate) -> Option<u64> {
-        let total = device.vram_total_bytes?;
+        self.shortfall_in(device.vram_total_bytes)
+    }
+
+    /// [`DeviceFootprint::shortfall_on`] against a bare capacity, for a
+    /// device of a split.
+    pub fn shortfall_in(&self, total_bytes: Option<u64>) -> Option<u64> {
+        let total = total_bytes?;
         (self.weights_device_bytes > total).then(|| self.weights_device_bytes - total)
     }
 
@@ -272,16 +328,23 @@ impl DeviceFootprint {
     /// The same numbers for `/props`, beside the tuning report a benchmark
     /// result already carries.
     pub fn to_json(&self, device: &DeviceCandidate) -> serde_json::Value {
+        self.to_json_in(device.vram_total_bytes)
+    }
+
+    /// [`DeviceFootprint::to_json`] against a bare capacity, for one device of
+    /// a split — the same field names, so a reader (and `orangu-bench`) parses
+    /// one shape whether the run used one card or four.
+    pub fn to_json_in(&self, total_bytes: Option<u64>) -> serde_json::Value {
         serde_json::json!({
             "weights_device_bytes": self.weights_device_bytes,
             "weights_host_bytes": self.weights_host_bytes,
             "kv_bytes_per_1k_tokens_per_slot": self.kv_bytes_per_step,
             "slots": self.slots,
-            "device_total_bytes": device.vram_total_bytes,
-            "headroom_bytes": self.headroom_on(device),
-            "shortfall_bytes": self.shortfall_on(device),
+            "device_total_bytes": total_bytes,
+            "headroom_bytes": self.headroom_in(total_bytes),
+            "shortfall_bytes": self.shortfall_in(total_bytes),
             "kv_tokens_in_headroom": self
-                .headroom_on(device)
+                .headroom_in(total_bytes)
                 .and_then(|headroom| self.kv_tokens_in(headroom)),
         })
     }
@@ -341,6 +404,110 @@ mod tests {
         let f = footprint(6 * GIB, MIB, 1);
         assert_eq!(f.headroom_on(&card(None)), None);
         assert_eq!(f.shortfall_on(&card(None)), None);
+    }
+
+    /// A ModelConfig is all [`DeviceFootprint::for_split_device`] needs of a
+    /// model — the head count for the KV geometry and the trained context —
+    /// which is why it takes one rather than a `LoadedModel`: the weights and
+    /// the placement are passed in by the caller that already has them.
+    fn config(n_head: usize, n_ctx_train: usize) -> ModelConfig {
+        ModelConfig {
+            architecture: "llama".to_string(),
+            n_vocab: 0,
+            n_embd: 0,
+            n_layer: 4,
+            n_head,
+            n_head_kv: n_head,
+            head_dim: 1,
+            n_ctx_train,
+            rope_dim: 0,
+            rope_freq_base: 0.0,
+            rms_eps: 0.0,
+            pooling_type: crate::engine::loader::PoolingType::Mean,
+        }
+    }
+
+    /// Each device of a split is charged for its own layers' KV and nothing
+    /// else, and the parts add up to the whole. A footprint that gave every
+    /// device the model's full KV figure would report the *same* headroom
+    /// pressure on a card holding two layers as on one holding fourteen —
+    /// which is exactly the case an operator splits a model to get out of.
+    #[test]
+    fn a_split_device_is_charged_for_its_own_layers_only() {
+        let probe = KvCache::new_with_dims(1, &[64, 64, 256, 256]);
+        let config = config(8, 4096);
+        // Layers 0 and 1 on device 0, layers 2 and 3 on device 1.
+        let layer_device = [0, 0, 1, 1];
+        let on = |device: usize| {
+            DeviceFootprint::for_split_device(
+                &config,
+                &probe,
+                Some(KvStorage::F16),
+                1,
+                0,
+                &layer_device,
+                device,
+            )
+        };
+        let whole = DeviceFootprint {
+            kv_bytes_per_step: probe.gpu_mirror_bytes(CONTEXT_STEP, 8, KvStorage::F16),
+            ..footprint(0, 0, 1)
+        };
+        assert_eq!(
+            on(0).kv_bytes_per_step + on(1).kv_bytes_per_step,
+            whole.kv_bytes_per_step,
+            "the devices' shares must add up to the model's"
+        );
+        // And they are not equal shares: these layers are not equal sizes.
+        assert!(on(1).kv_bytes_per_step > on(0).kv_bytes_per_step * 3);
+        // A device the plan gave nothing to is charged nothing — not the
+        // whole model.
+        assert_eq!(on(2).kv_bytes_per_step, 0);
+    }
+
+    /// Routed experts are in system RAM and on no device. Charging them to
+    /// each device in turn would count them once per card and pull every
+    /// headroom figure down by the same wrong amount.
+    #[test]
+    fn host_weights_are_not_charged_to_any_device_of_a_split() {
+        let probe = KvCache::new_with_dims(1, &[64]);
+        let f = DeviceFootprint::for_split_device(
+            &config(8, 4096),
+            &probe,
+            Some(KvStorage::F16),
+            1,
+            3 * GIB,
+            &[0],
+            0,
+        );
+        assert_eq!(f.weights_host_bytes, 0);
+        assert_eq!(f.weights_device_bytes, 3 * GIB);
+        // The capacity-taking core answers exactly as the DeviceCandidate one
+        // does — a split has no candidate left to ask, and the two must not
+        // drift into different arithmetic.
+        assert_eq!(
+            f.headroom_in(Some(4 * GIB)),
+            f.headroom_on(&card(Some(4 * GIB)))
+        );
+        assert_eq!(f.shortfall_in(Some(2 * GIB)), Some(GIB));
+        assert_eq!(f.headroom_in(None), None);
+        assert_eq!(
+            f.to_json_in(Some(4 * GIB))["headroom_bytes"],
+            serde_json::json!(GIB)
+        );
+    }
+
+    /// A device with no GPU KV mirror — the host overflow tier of
+    /// `device_split = cpu` — is charged no KV, and says so as `None` rather
+    /// than as zero bytes of a mirror it does not have.
+    #[test]
+    fn the_host_tier_of_a_split_has_no_kv_mirror() {
+        let probe = KvCache::new_with_dims(1, &[64, 64]);
+        let f =
+            DeviceFootprint::for_split_device(&config(8, 4096), &probe, None, 1, GIB, &[0, 1], 1);
+        assert_eq!(f.kv_bytes_per_step, 0);
+        assert_eq!(f.kv_storage, None);
+        assert_eq!(f.kv_tokens_in(GIB), None);
     }
 
     #[test]
