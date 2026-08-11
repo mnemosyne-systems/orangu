@@ -1146,6 +1146,16 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   prefill half of this (the `enable_thinking` kwarg still applies, for
   whatever templates check it).
 
+  A model whose format makes reasoning a *separate message* rather than a
+  tagged span — `muse-glimmer`, which addresses one message `to=self` and
+  the next `to=user`, and `inkling`, which opens one with
+  `<|content_thinking|>` and the next with `<|content_text|>` — is handled
+  exactly rather than approximated: the reasoning message is dropped from
+  the reply, and no `<think>` block is prefilled (that prefill would land
+  inside the message header the first format leaves open, or ahead of the
+  marker that types the body in the second, and the reply came back empty
+  when it did).
+
 `code` behaves identically to `all` today — no `orangu-server` feature is
 `code`-specific yet beyond what `all` already provides.
 
@@ -1547,7 +1557,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for ten
+Text-in/text-out GGUF chat, completion, and embedding models, for twelve
 architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -1573,7 +1583,18 @@ the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
 frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
 e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
 width read from `attention.key_length` rather than derived from
-`n_embd / n_head`, and an attention temperature scale) — using
+`n_embd / n_head`, and an attention temperature scale), and Muse-Glimmer
+(`muse-glimmer`, e.g. `unsloth/Muse-Glimmer-30B-GGUF` — a dense GQA block
+with a norm on both sides of each sub-layer, per-head query/key norms, a
+sigmoid gate on the attention output, three rotated sliding-window layers
+to every unrotated full-attention one, and both a logit scale and final
+logit softcapping on the output), and Inkling (`inkling`, e.g.
+`unsloth/Inkling-Small-GGUF` — a mixture-of-experts decoder that rotates
+nothing at all: position arrives through a learned per-head
+relative-position bias and a causal short convolution on the key/value
+projections and on each sub-layer's output, layers alternate
+sliding-window and full attention, and the routed experts share their
+weight normalization with two always-on shared ones) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than
@@ -1655,6 +1676,102 @@ persistence cover all of it. That cache is wide: on top of the shared
 which for `DeepSeek-V4-Flash-0731` works out to roughly half a megabyte per
 token of context across all 43 layers, allocated up front for the
 prompt-plus-`max_tokens` budget of each request.
+
+Muse-Glimmer (`muse-glimmer`) runs on the CPU path only. It is a dense
+grouped-query decoder, and most of what it adds to the ordinary block it
+borrows from families already here: a norm on both sides of each
+sub-layer (`attn_norm`/`post_attention_norm`, `ffn_norm`/`post_ffw_norm`)
+as Gemma has; per-head query and key norms; a sliding window of 2048 on
+three layers in every four, the fourth attending the whole prefix
+(`attention.sliding_window_pattern`); and a sigmoid gate on the attention
+output as Kimi-K3 and Qwen3.5 carry — here its own `attn_gate` tensor,
+projected from the same normed layer input as query/key/value and
+multiplied into the attention output before the output projection. What
+has no counterpart elsewhere here is that **the rotation runs on the
+sliding-window layers only**: the full-attention quarter rotates nothing,
+and nothing in the file says so. Its output logits are scaled
+(`logit_scale`) and then soft-capped (`final_logit_softcapping`), and its
+token embeddings are normalized on the way in. The multimodal projector
+shipped beside the text weights (`mmproj-*.gguf`) is not used, as for
+every architecture here.
+
+This model's prompt format is worth knowing about, because an assistant
+turn is several *messages* rather than one. The chat template ends the
+generation prompt at `<|start|>assistant` and leaves the model to write its
+own recipient — `to=self` for a reasoning message, `to=user` for the
+answer, `to=<tool>` for a tool call — before the `<|message|>` that starts
+the text. The markers are control tokens and are filtered out like any
+others; the recipient is ordinary text, and it is dropped too, so a reply
+never begins ` to=user`.
+
+Which messages you see is the server's **role**, the same switch that
+governs reasoning everywhere else. A reasoning-suppressing role
+(`--review`) shows the message addressed to you and nothing else; every
+other role shows the reasoning first, then a blank line, then the answer —
+the same treatment a `<think>`-style model's reasoning already gets here.
+Note that this model reasons on every turn: its template writes
+`Reasoning strength: high` into the system block itself and does not read
+the `enable_thinking` flag, so `--review` is what turns the reasoning off
+in the reply, not in the generation.
+
+Not implemented: reporting reasoning separately as `reasoning_content`
+rather than inline, and parsing this model's XML-shaped tool calls (a
+`to=<tool>` message reaches you as its literal markup).
+
+Inkling (`inkling`, e.g. `unsloth/Inkling-Small-GGUF`) runs on the CPU path
+only, and is the first architecture here that **rotates nothing** — no
+layer applies a rotary embedding. Position reaches attention two other
+ways. The first is a learned relative-position bias: each layer projects
+its input to a small per-head vector and mixes it against a per-layer bank
+into one additive term per query/key *distance*, so a key further back than
+the bank is wide contributes no bias at all and a short bank still serves a
+long prefix. The second is a causal depthwise short convolution — four of
+them per layer, of the width `inkling.shortconv_kernel` gives: on the raw
+key and value projections, and on the output of each sub-layer before its
+residual add. Each carries the previous few inputs forward, which is state
+that outlives a decode step, so it lives in the same per-sequence recurrent
+slot Qwen3.5's linear-attention layers use. That state has no per-position
+history to roll back, so the opt-in prompt-lookup speculative decoding is
+not available for this model, exactly as for the other recurrent families
+here.
+
+The rest is assembled from parts already present: an alternating
+sliding-window/full-attention pattern read per layer, per-head query and
+key norms, `dense_block_count` leading dense layers, and sigmoid-routed
+experts with a selection bias. Two things differ from every other
+mixture-of-experts model here. The router emits one logit per routed expert
+**plus** one per shared expert, and the selected routed weights are
+normalized together with the shared ones rather than among themselves.
+And the full-attention layers multiply every score by a factor that grows
+with the context (`inkling.log_scaling_n_floor`,
+`inkling.log_scaling_alpha`), so a long conversation attends differently
+from a short one; below the floor that factor is exactly 1, which is why a
+short prompt cannot tell whether it is implemented at all.
+
+Its vocabulary is padded — `inkling.unpadded_vocab_size` names how many of
+its rows are real tokens — and the padding rows are masked out of the
+logits, since one of them can otherwise win an argmax and decode to
+nothing. The audio and image inputs the model was trained for are out of
+scope, as multimodal input is for every architecture here: the
+`mmproj-*.gguf` shipped beside the text weights is a separate model this
+server does not load, and the audio embedding table is not part of the text
+GGUF at all.
+
+This model's prompt format types each message *body* with a control token:
+`<|content_thinking|>` opens the model's reasoning, `<|content_text|>` the
+answer, and `<|end_message|>` closes either. The markers are filtered out
+of the reply like any other control token, and which bodies you see is the
+server's **role**, the same switch that governs reasoning everywhere else.
+A reasoning-suppressing role (`--review`) shows the answer alone; every
+other role shows the reasoning, a blank line, then the answer. The model
+reasons on every turn regardless — its template writes a thinking-effort
+line into the system block and never reads the `enable_thinking` flag — so
+`--review` turns the reasoning off in the reply, not in the generation.
+
+Not implemented for this model: reporting reasoning separately as
+`reasoning_content` rather than inline, and parsing its JSON tool
+invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
+reaches you as its literal JSON).
 
 `orangu-server list` also recognizes `dflash` draft GGUFs such as the
 DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no

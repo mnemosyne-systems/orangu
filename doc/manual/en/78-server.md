@@ -65,7 +65,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -87,11 +87,40 @@ dependency on any C or C++ inference library.
   executes on a device expert tier yet.
 - `engine/tokenizer.rs` — a from-scratch BPE tokenizer.
 - `engine/chat_template.rs` — renders `tokenizer.chat_template` via
-  `minijinja`.
+  `minijinja`, plus the three compatibility shims real templates need:
+  `minijinja_contrib::pycompat` for Python dict/str methods (`.get()`,
+  `.strip()`), and a source rewrite that parenthesizes a keyword
+  argument whose value is a bare inline conditional
+  (`f(k=a if b else c)` → `f(k=(a if b else c))`). The latter is a
+  minijinja parser gap that Jinja2 and llama.cpp's `minja` both lack, and
+  it bites at *compile* time — one such argument in a branch that never
+  runs still fails every request. `muse-glimmer`'s template has one. The
+  third is the `tojson` filter itself: this build's `minijinja` has
+  none (its JSON filters sit behind a feature this project does not
+  enable), so the filter is registered here with `transformers`'
+  semantics — `json.dumps` with `ensure_ascii` defaulting to false,
+  compact separators, and none of Jinja2's HTML escaping — including the
+  `ensure_ascii`/`indent`/`separators` keyword arguments templates pass
+  it. `Inkling-Small`'s writes every tool declaration through one, and
+  without the filter its tool-carrying chat requests fail at render time
+  with a 500.
 - `engine/sampling.rs` — repetition penalty, temperature/top-k/top-p/min-p.
 - `engine/kv_cache.rs` — per-sequence KV cache buffers.
 - `engine/scheduler.rs`, `engine/generate.rs`, `engine/batch.rs` — the
   multi-slot request scheduler and continuous-batching machinery.
+  `generate.rs` also owns `MessageHeader`, which decides what a
+  reply in one of the two *multi-message* assistant formats actually
+  shows. For the `<|start|>…<|message|>` framing: the header text
+  between the two markers is framing (`muse-glimmer` has the model write
+  its own ` to=self` / ` to=user` recipient there) and is dropped like the
+  markers around it, and a message addressed to `to=self` is reasoning, so
+  a reasoning-suppressing role drops its whole body while every other role
+  shows it followed by a blank line. The second format asks the same
+  question with tokens: `inkling` writes no header and instead opens each
+  body with a marker naming its *kind*
+  (`<|content_thinking|>`/`<|content_text|>`, read off
+  `Tokenizer::content_kinds`), and the same rule applies to it. Inert for
+  a vocabulary with neither, which is every other model here.
 - `http/{mod,openai,native}.rs` — the HTTP surface.
 - `web/{mod,render,sessions,models,attachments}.rs` — the built-in chat UI.
   `sessions.rs` also owns the `session.json` activity marker
@@ -1165,6 +1194,122 @@ mod`), so adding a family is additive rather than a rewrite:
   Llama-4-style attention temperature scale — the last of which is exactly
   `1.0` below the trained context, so a short prompt cannot tell whether it
   is implemented at all.
+
+- `muse.rs` — `muse-glimmer` (Muse-Glimmer), e.g.
+  `unsloth/Muse-Glimmer-30B-GGUF`, confirmed against upstream
+  `src/models/muse-glimmer.cpp`. A dense GQA decoder: `llama.rs`'s block
+  plus four things this engine already had, each from a different family,
+  and one it did not. Borrowed: gemma's **sandwich norms**
+  (`attn_norm`/`post_attention_norm` and `ffn_norm`/`post_ffw_norm`, all
+  four on every layer — the presence of `ffn_norm` is what distinguishes
+  this from `qwen35.rs`'s two-norm block), gemma/qwen3's **per-head
+  QK-norm**, the alternating **sliding-window pattern** (a *scalar*
+  `attention.sliding_window_pattern` of 4 fed to upstream's
+  `set_swa_pattern`, so `il % 4 < 3` is windowed at 2048 and every fourth
+  layer attends the whole prefix), and kimi3/qwen35's **sigmoid output
+  gate on attention** — here its own `attn_gate` tensor rather than folded
+  into the query projection, projected from the same normed input as
+  Q/K/V and multiplied into attention's output before `attn_output`. New:
+  **RoPE runs on the sliding-window layers only** (`use_rope =
+  hparams.is_swa(il)`), so the full-attention quarter is NoPE and caches
+  its keys unrotated. Nothing in the file says so.
+
+  Four further details are each invisible from the tensor directory and
+  each produce a model that loads and runs while answering "The capital of
+  France is" with a newline: the token embeddings take a **weightless**
+  RMSNorm on the way in (gemma scales by `sqrt(n_embd)` instead, and the
+  llama family does nothing); the two *post*-norms use a hardcoded
+  `1e-8` epsilon rather than the file's `attention.layer_norm_rms_epsilon`
+  (`1e-5`); the FFN is SwiGLU, not the GEGLU the gemma-shaped block would
+  suggest; and the rotation is `NORM`-paired — `muse-glimmer` sits in
+  upstream's `LLAMA_ROPE_TYPE_NORM` arm with `llama`/`mistral`, not with
+  the gemma and Qwen families it otherwise resembles. Nothing extra is
+  folded in at run time for the query-key scale factor: upstream notes it
+  was baked into `attn_q_norm`'s weights at conversion, and `attn_k_norm`
+  is a vector of ones.
+
+  This module is CPU-orchestrated, like `qwen35.rs`/`glm.rs`/`kimi3.rs` —
+  matmuls still dispatch to the `Backend` and attention still goes
+  wherever `engine::attention` decides, but neither whole-half fused
+  Vulkan prefill chain is taken, because neither can express this layer:
+  `fused_attention_prefill` rotates unconditionally, and
+  `fused_post_attention_prefill` takes one epsilon for all three of its
+  norms where this needs two. Teaching those two chains a per-layer NoPE
+  flag and a second epsilon is the obvious way to put this family back on
+  the fused path. Its `mmproj-*.gguf` is a separate `clip` model and is
+  not loaded, as for every other family here.
+
+  The vocabulary is worth its own note: `tokenizer.ggml.pre = "llama4"`
+  reads like the llama3 pre-tokenizer family and is not one — upstream
+  routes it to `LLAMA_VOCAB_PRE_TYPE_GPT4O`, which splits letter runs on
+  case boundaries and leaves `ignore_merges` clear. See
+  `engine/tokenizer.rs`'s `GPT4O_PRE_TYPES`.
+
+- `inkling.rs` — `inkling` (Inkling), e.g. `unsloth/Inkling-Small-GGUF`.
+  The one family here with **no rotation anywhere**, which is also the
+  thing most likely to be got wrong by analogy: there is no
+  `rope.dimension_count`, no `rope.freq_base`, and nothing in the tensor
+  directory that would look wrong if a rotation were applied anyway.
+  Position enters twice instead.
+
+  **A learned relative-position bias.** `attn_r` (`[n_embd, n_head *
+  d_rel]`) gives each token a `d_rel`-wide coefficient vector per head;
+  `attn_rel_proj` (`[d_rel, rel_extent]`) is the per-layer bank they mix,
+  producing one additive logit per query/key *distance*. Distances past
+  the bank's width take no bias, which is how a 1024-wide bank serves a
+  million-token context. The bank is **narrower on the sliding-window
+  layers** (`inkling.rel_extent_swa`) than on the full-attention ones
+  (`inkling.rel_extent`), and that is used as the load-time cross-check on
+  `attention.sliding_window_pattern`: each layer's own `attn_rel_proj`
+  shape has to agree with the kind of layer the pattern says it is, so a
+  pattern read the wrong way round is a load error instead of a model that
+  answers badly.
+
+  **Four causal depthwise short convolutions per layer**
+  (`shortconv_k`/`_v`/`_attn`/`_mlp`, width `inkling.shortconv_kernel`),
+  each `conv(x) + x` — the residual is inside the operator, and a layer's
+  own residual add is a *second*, separate add. The key/value ones run on
+  the **raw projections**, before the per-head norm and before anything is
+  cached, so the cache holds already-convolved keys. Their rolling windows
+  outlive a decode step, so they live in `KvCache::recurrent` and reuse
+  `RecurrentLayerState::conv_step` — the primitive `qwen35moe.rs`'s
+  linear-attention layers already had. Four slots per layer in a fixed
+  order; they are all the same shape and the same type, so swapping two is
+  neither a compile error nor a crash.
+
+  Three more details each produce a model that loads, runs, and answers
+  fluently while being wrong. The attention scale is `1 / head_dim`, not
+  `1 / sqrt(head_dim)` — the per-head query/key RMSNorm accounts for the
+  other factor. The routed experts' weights are normalized **together
+  with** the shared experts' (the router emits `n_expert +
+  n_expert_shared` logits, and the trailing ones gate the shared branch),
+  where every other MoE family here normalizes the routed weights among
+  themselves. And the full-attention layers multiply every score by
+  `1 + log_scaling_alpha * ln((pos + 1) / log_scaling_n_floor)` once the
+  position passes the floor — exactly `1.0` below it, so a short prompt
+  cannot tell whether it is implemented.
+
+  The tail divides the final hidden state by `inkling.logit_scale_denom`
+  before the output projection, and masks the vocabulary's padding rows
+  (`inkling.unpadded_vocab_size` real rows out of `vocab_size`) to `-inf`
+  rather than truncating the vector, so a caller indexing logits by token
+  id still can. Left unmasked, a padding row wins the argmax and decodes
+  to nothing.
+
+  CPU-orchestrated like `glm.rs`/`kimi3.rs`: the matmuls (including every
+  expert projection, through `arch::mod`'s shared `project_expert` /
+  `evaluate_routed_experts` / expert-budget machinery) still dispatch to
+  the `Backend`, but the attention loop itself is the host's — the
+  relative bias is a per-`(token, head)` additive term and the length
+  scaling a per-query multiply, and no attention kernel here takes either.
+  `forward_all_logits` is deliberately not implemented, so the opt-in
+  prompt-lookup speculative decoder refuses this family rather than
+  silently mismatching a convolution window it cannot roll back.
+
+  Its vocabulary is the o200k one: `tokenizer.ggml.pre = "inkling"` is
+  routed to the same `GPT4O_PRE_TYPES` arm `muse-glimmer` uses, and the
+  `mmproj-*.gguf` shipped beside it is a separate `clip` model that is not
+  loaded.
 
 - `phi.rs` — `phi3`, covering both Phi-3 and Phi-4-mini (e.g.
   `unsloth/Phi-4-mini-instruct-GGUF`), confirmed against upstream

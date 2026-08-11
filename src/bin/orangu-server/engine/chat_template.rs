@@ -147,6 +147,7 @@ impl ChatTemplate {
             ))
         });
         env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
+        env.add_filter("tojson", tojson);
         // Real chat templates (this project's own gemma-4-E2B-it test
         // model's included) are written for Python's Jinja2 and lean on
         // dict/list/str methods minijinja doesn't implement natively —
@@ -155,7 +156,8 @@ impl ChatTemplate {
         // template using `.get()` (a common pattern for optional
         // tool-calling/reasoning fields) fails to render at all.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template("chat", &self.source)
+        let source = parenthesize_call_kwarg_conditionals(&self.source);
+        env.add_template("chat", &source)
             .map_err(|err| anyhow!("invalid chat template: {err}"))?;
         let tmpl = env.get_template("chat").expect("just added");
         // Built additively rather than as one `context!` per combination:
@@ -177,6 +179,363 @@ impl ChatTemplate {
         }
         tmpl.render(minijinja::Value::from_serialize(&ctx))
             .map_err(|err| anyhow!("failed to render chat template: {err}"))
+    }
+}
+
+/// `tojson`, as `transformers` defines it for chat templates: a thin
+/// wrapper over Python's `json.dumps` that takes `ensure_ascii`, `indent`,
+/// `separators` and `sort_keys` as keyword arguments and — unlike Jinja2's
+/// own HTML-safe `tojson` — escapes nothing beyond what JSON requires.
+///
+/// This build's `minijinja` has no `tojson` at all (its JSON filters are
+/// behind a feature this project does not enable), so a template that calls
+/// one fails to render: `Inkling-Small`'s does, in the recursive
+/// `canonical_json` macro that writes its tool declarations, and that
+/// failure is a 500 on every tool-carrying chat request rather than
+/// anything visible at load. Registering it here is purely additive —
+/// there is no existing behavior to change.
+///
+/// The defaults are `transformers`', not Python's: `ensure_ascii` defaults
+/// to **false** and the separators to the compact `(',', ':')`, which is
+/// what every chat template written against `transformers` assumes.
+/// Object keys keep the order the template produced them in (Python's
+/// behavior); `sort_keys` is accepted and rejected rather than ignored,
+/// since silently leaving keys unsorted would be a difference nothing
+/// downstream could see.
+fn tojson(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<minijinja::Value, minijinja::Error> {
+    use minijinja::{Error, ErrorKind};
+    use serde::Serialize;
+
+    let ensure_ascii: bool = kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
+    let indent: Option<usize> = kwargs.get::<Option<usize>>("indent")?;
+    // A Python 2-tuple, which reaches minijinja as a two-element sequence.
+    let separators = match kwargs.get::<Option<minijinja::Value>>("separators")? {
+        Some(pair) if !pair.is_none() => {
+            let parts: Vec<String> = pair
+                .try_iter()
+                .map_err(|err| Error::new(ErrorKind::InvalidOperation, format!("tojson: {err}")))?
+                .map(|v| v.to_string())
+                .collect();
+            let [item, key] = <[String; 2]>::try_from(parts).map_err(|parts| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("tojson: separators wants 2 values, got {}", parts.len()),
+                )
+            })?;
+            Some((item, key))
+        }
+        _ => None,
+    };
+    if kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "tojson(sort_keys=true) is not implemented",
+        ));
+    }
+    kwargs.assert_all_used()?;
+
+    let mut buf = Vec::new();
+    match indent {
+        // Python's `indent` overrides the separators with newline-and-pad,
+        // which is exactly what serde_json's pretty formatter writes.
+        Some(indent) => {
+            let pad = " ".repeat(indent);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+            value.serialize(&mut ser)
+        }
+        None => {
+            let (item, key) = separators.unwrap_or_else(|| (",".to_string(), ":".to_string()));
+            let mut ser =
+                serde_json::Serializer::with_formatter(&mut buf, PythonSeparators { item, key });
+            value.serialize(&mut ser)
+        }
+    }
+    .map_err(|err| Error::new(ErrorKind::InvalidOperation, format!("tojson: {err}")))?;
+
+    let json = String::from_utf8(buf)
+        .map_err(|err| Error::new(ErrorKind::InvalidOperation, format!("tojson: {err}")))?;
+    Ok(minijinja::Value::from(if ensure_ascii {
+        escape_non_ascii(&json)
+    } else {
+        json
+    }))
+}
+
+/// A `serde_json` formatter that writes Python's `separators=(item, key)`
+/// pair instead of serde's fixed `,`/`:`.
+///
+/// Only the three hooks that emit a separator are overridden; everything
+/// else — number and string formatting, escaping — stays serde_json's, which
+/// already matches `json.dumps` for every value a chat template can hold.
+struct PythonSeparators {
+    item: String,
+    key: String,
+}
+
+impl serde_json::ser::Formatter for PythonSeparators {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(self.item.as_bytes())
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(self.item.as_bytes())
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(self.key.as_bytes())
+    }
+}
+
+/// `json.dumps(..., ensure_ascii=True)`'s escaping: every non-ASCII
+/// character as `\uXXXX`, with astral ones as a surrogate pair.
+///
+/// Safe to run over the finished document rather than per string, because
+/// every character JSON gives structural meaning is ASCII — a non-ASCII
+/// character can only ever be inside a string literal.
+fn escape_non_ascii(json: &str) -> String {
+    if json.is_ascii() {
+        return json.to_string();
+    }
+    let mut out = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+/// Rewrites `f(k=a if b else c)` to `f(k=(a if b else c))` throughout a
+/// template's tags, leaving everything else byte-for-byte alone.
+///
+/// A **parser** gap, not a template bug: minijinja parses a call's keyword
+/// argument with an expression grammar that stops short of the inline
+/// conditional, so it reads `k=a`, meets `if`, and reports "unexpected
+/// identifier, expected `,`" — at *compile* time, which fails the whole
+/// template for every request rather than only the branch containing it.
+/// Python's Jinja2 and llama.cpp's own `minja` both accept the bare form,
+/// so a template written against either can carry it. `Muse-Glimmer-30B`'s
+/// does (`namespace(name=tcid if tcid else '')`, in its tool-message
+/// branch), and without this its chat endpoints are unusable — the model
+/// loads and generates fine, but no chat request can be rendered.
+///
+/// The parenthesized form is accepted (inside brackets minijinja runs its
+/// full expression parser) and means exactly the same thing, so this is a
+/// pure widening: every source that parsed before still parses, unchanged.
+/// It only ever fires on a keyword argument whose value contains a
+/// *top-level* `if`, which is precisely the shape that could not have
+/// parsed before. Borrowed and untouched when nothing matches, which is
+/// every template this project had before Muse-Glimmer.
+///
+/// Deliberately a source rewrite rather than a Jinja dialect of our own:
+/// the alternative is forking the parser, and this is one production with
+/// one shape.
+fn parenthesize_call_kwarg_conditionals(source: &str) -> std::borrow::Cow<'_, str> {
+    let mut current = std::borrow::Cow::Borrowed(source);
+    // One pass wraps a set of non-overlapping spans. A keyword argument
+    // nested inside another one's value overlaps it, so only the outer is
+    // taken this time round and the inner on the next — hence the loop.
+    // It terminates because each pass either wraps at least one span
+    // (strictly reducing how many are left unwrapped) or finds none.
+    loop {
+        let mut spans = call_kwarg_conditional_spans(current.as_bytes());
+        spans.sort_unstable();
+        let mut copied = 0;
+        let mut out = String::with_capacity(current.len() + 2 * spans.len());
+        let mut wrapped = 0;
+        for (start, end) in spans {
+            if start < copied {
+                continue;
+            }
+            out.push_str(&current[copied..start]);
+            out.push('(');
+            out.push_str(&current[start..end]);
+            out.push(')');
+            copied = end;
+            wrapped += 1;
+        }
+        if wrapped == 0 {
+            return current;
+        }
+        out.push_str(&current[copied..]);
+        current = std::borrow::Cow::Owned(out);
+    }
+}
+
+/// One keyword argument being scanned by [`call_kwarg_conditional_spans`]:
+/// where its value started, how deeply nested the call was at that point,
+/// and whether a bare `if` has been seen at that same nesting depth (an
+/// `if` inside a nested call or literal belongs to that inner expression,
+/// which parses fine on its own).
+struct PendingKwarg {
+    depth: usize,
+    start: usize,
+    has_if: bool,
+}
+
+/// Every keyword-argument value in `bytes` that is a bare inline
+/// conditional, as a byte span.
+///
+/// Innermost-first, and a nested one is *contained* in its enclosing
+/// argument's span rather than disjoint from it — which is why the caller
+/// sorts, wraps a non-overlapping subset, and comes round again.
+///
+/// A single left-to-right pass over the source. Only the inside of a Jinja
+/// `{% %}`/`{{ }}` tag is examined; template *text* and `{# #}` comments
+/// are passed over, which is what keeps a document that merely mentions
+/// `f(a=b if c else d)` in prose or in a comment from being rewritten.
+/// String literals are skipped wholesale, so a `,`, a bracket or the word
+/// `if` inside one cannot move the scan.
+fn call_kwarg_conditional_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'{' || !matches!(bytes[i + 1], b'%' | b'{' | b'#') {
+            i += 1;
+            continue;
+        }
+        // A comment holds no expressions at all — not even a string
+        // literal that could hide a `#}` — so it is skipped whole.
+        if bytes[i + 1] == b'#' {
+            i = bytes[i + 2..]
+                .windows(2)
+                .position(|w| w == b"#}")
+                .map_or(bytes.len(), |p| i + 2 + p + 2);
+            continue;
+        }
+        // Inside a tag. `depth` counts every kind of bracket together:
+        // what matters to an argument's extent is only whether it is
+        // nested, not in what.
+        let kind = bytes[i + 1];
+        let mut depth = 0usize;
+        let mut pending: Vec<PendingKwarg> = Vec::new();
+        let mut j = i + 2;
+        while j < bytes.len() {
+            let c = bytes[j];
+            match c {
+                b'\'' | b'"' => {
+                    j += 1;
+                    while j < bytes.len() && bytes[j] != c {
+                        // A backslash escapes the next byte, quote included.
+                        j += if bytes[j] == b'\\' { 2 } else { 1 };
+                    }
+                    j += 1;
+                    continue;
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    // `%}` / `}}` at the outermost level closes the tag;
+                    // `}}` inside a dict literal does not.
+                    let closes_tag = match kind {
+                        b'%' => false,
+                        _ => c == b'}' && depth == 0 && bytes.get(j + 1) == Some(&b'}'),
+                    };
+                    if closes_tag {
+                        j += 2;
+                        break;
+                    }
+                    depth = depth.saturating_sub(1);
+                    while pending.last().is_some_and(|k| k.depth > depth) {
+                        finish_kwarg(&mut pending, bytes, j, &mut spans);
+                    }
+                }
+                b'%' if kind == b'%' && bytes.get(j + 1) == Some(&b'}') => {
+                    j += 2;
+                    break;
+                }
+                b',' => {
+                    while pending.last().is_some_and(|k| k.depth == depth) {
+                        finish_kwarg(&mut pending, bytes, j, &mut spans);
+                    }
+                }
+                b'i' if bytes.get(j + 1) == Some(&b'f')
+                    && !bytes[..j].last().is_some_and(|&p| is_ident(p))
+                    && !bytes.get(j + 2).copied().is_some_and(is_ident) =>
+                {
+                    if let Some(k) = pending.last_mut()
+                        && k.depth == depth
+                    {
+                        k.has_if = true;
+                    }
+                }
+                // A keyword argument's `=`: inside a call (`depth > 0`),
+                // preceded by an identifier, and not half of `==`/`!=`/
+                // `<=`/`>=`. Assignment in `{% set x = ... %}` is at depth
+                // 0 and is left alone — minijinja parses *that* position
+                // with the full grammar already.
+                b'=' if depth > 0
+                    && bytes.get(j + 1) != Some(&b'=')
+                    && !matches!(bytes[j - 1], b'=' | b'!' | b'<' | b'>')
+                    && bytes[..j]
+                        .iter()
+                        .rposition(|&p| p != b' ')
+                        .is_some_and(|p| is_ident(bytes[p])) =>
+                {
+                    let mut start = j + 1;
+                    while bytes.get(start) == Some(&b' ') {
+                        start += 1;
+                    }
+                    pending.push(PendingKwarg {
+                        depth,
+                        start,
+                        has_if: false,
+                    });
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        i = j.max(i + 2);
+    }
+    spans
+}
+
+/// Closes the innermost pending keyword argument at `end`, recording its
+/// value's span when that value turned out to be a bare inline
+/// conditional. Trailing spaces are left outside the parentheses so the
+/// rewrite stays as close to the original text as it can.
+fn finish_kwarg(
+    pending: &mut Vec<PendingKwarg>,
+    bytes: &[u8],
+    end: usize,
+    spans: &mut Vec<(usize, usize)>,
+) {
+    let kwarg = pending.pop().expect("caller checked `last`");
+    let mut end = end;
+    while end > kwarg.start && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+    if kwarg.has_if && end > kwarg.start {
+        spans.push((kwarg.start, end));
     }
 }
 
@@ -257,6 +616,66 @@ mod tests {
         let messages = vec![ChatMessage::text("user", "hi")];
         let out = tmpl.render(&messages, true, "<s>", "</s>", None).unwrap();
         assert_eq!(out, "user: hi\nassistant:");
+    }
+
+    /// The whole point of [`parenthesize_call_kwarg_conditionals`]: a
+    /// keyword argument whose value is a bare inline conditional. This is
+    /// `Muse-Glimmer-30B`'s own construct, reduced — without the rewrite
+    /// minijinja rejects it at *compile* time, so the template fails for
+    /// every request, not only for the tool-message branch it sits in.
+    #[test]
+    fn renders_a_conditional_keyword_argument() {
+        let tmpl = ChatTemplate::new(
+            "{%- set ns = namespace(name=messages[0].content if messages else 'none') -%}\
+             {{- ns.name -}}"
+                .to_string(),
+        );
+        let messages = vec![ChatMessage::text("user", "hi")];
+        assert_eq!(tmpl.render(&messages, false, "", "", None).unwrap(), "hi");
+        assert_eq!(tmpl.render(&[], false, "", "", None).unwrap(), "none");
+    }
+
+    /// The rewrite is a widening, so a template that never needed it must
+    /// come through byte-for-byte — including the shapes that look like
+    /// its trigger and are not: an assignment outside a call, a comparison
+    /// (`==`, `!=`), an `if` belonging to a nested expression rather than
+    /// to the argument, and template *text* that merely reads like code.
+    #[test]
+    fn leaves_everything_that_already_parsed_untouched() {
+        for source in [
+            "{% set x = a if b else c %}",
+            "{% if a == b %}{{ f(k=1) }}{% endif %}",
+            "{% if a != b %}{{ f(k=[1, 2], j='x') }}{% endif %}",
+            "{{ f(k=g(a if b else c)) }}",
+            "call f(k=a if b else c) in prose",
+            "{# f(k=a if b else c) #}",
+            "{{ f(k='a if b else c') }}",
+        ] {
+            assert!(
+                matches!(
+                    parenthesize_call_kwarg_conditionals(source),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "rewrote {source:?}"
+            );
+        }
+    }
+
+    /// Two arguments, only one of them conditional, and a conditional
+    /// nested one call deep — the cases the single-pass span collection
+    /// cannot get right on its own.
+    #[test]
+    fn wraps_each_conditional_argument_and_nothing_else() {
+        assert_eq!(
+            parenthesize_call_kwarg_conditionals("{% set n = f(a=1, b=x if y else z) %}"),
+            "{% set n = f(a=1, b=(x if y else z)) %}"
+        );
+        assert_eq!(
+            parenthesize_call_kwarg_conditionals(
+                "{% set n = f(a=g(b=x if y else z) if q else w) %}"
+            ),
+            "{% set n = f(a=(g(b=(x if y else z)) if q else w)) %}"
+        );
     }
 
     #[test]
@@ -436,5 +855,163 @@ mod tests {
     fn strftime_now_leaves_an_escaped_percent_alone() {
         assert_eq!(strftime_now("100%%"), "100%");
         assert_eq!(strftime_now("%%b"), "%b");
+    }
+
+    /// Renders `{{ value | tojson(<args>) }}` and returns what came out.
+    fn render_tojson(args: &str, value: serde_json::Value) -> Result<String> {
+        let tmpl = ChatTemplate::new(format!("{{{{ value | tojson({args}) }}}}"));
+        // The value rides in as a message field, since `render` builds its
+        // own context — `content` is passed through untouched.
+        let source = tmpl.source.replace("value", "messages[0].tool_calls");
+        let mut env = Environment::new();
+        env.add_filter("tojson", tojson);
+        env.add_template("t", &source)
+            .map_err(|err| anyhow!("{err}"))?;
+        env.get_template("t")
+            .unwrap()
+            .render(
+                minijinja::context! { messages => vec![serde_json::json!({"tool_calls": value})] },
+            )
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    /// The default has to be `transformers`' default, not Python's or
+    /// Jinja2's: compact separators, no HTML escaping, and non-ASCII left
+    /// as itself. A template that passes no keyword arguments at all still
+    /// expects that.
+    #[test]
+    fn tojson_defaults_to_compact_unescaped_json() {
+        let out = render_tojson("", serde_json::json!({"a": 1, "b": ["x", "<y>"]})).unwrap();
+        assert_eq!(out, r#"{"a":1,"b":["x","<y>"]}"#);
+        assert_eq!(
+            render_tojson("", serde_json::json!("héllo")).unwrap(),
+            r#""héllo""#
+        );
+    }
+
+    /// The keyword arguments real templates pass. `Inkling-Small`'s writes
+    /// every one of its tool declarations through
+    /// `tojson(ensure_ascii=false, separators=(',', ':'))`.
+    #[test]
+    fn tojson_honors_pythons_keyword_arguments() {
+        let value = serde_json::json!({"a": 1, "b": 2});
+        assert_eq!(
+            render_tojson("ensure_ascii=false, separators=(',', ':')", value.clone()).unwrap(),
+            r#"{"a":1,"b":2}"#
+        );
+        assert_eq!(
+            render_tojson("separators=(', ', ': ')", value.clone()).unwrap(),
+            r#"{"a": 1, "b": 2}"#
+        );
+        assert_eq!(
+            render_tojson("indent=2", value).unwrap(),
+            "{\n  \"a\": 1,\n  \"b\": 2\n}"
+        );
+        // `ensure_ascii=true` is Python's own default and the one no chat
+        // template asks for; it escapes past ASCII, astral planes as a
+        // surrogate pair.
+        assert_eq!(
+            render_tojson("ensure_ascii=true", serde_json::json!("héllo ☃ 😀")).unwrap(),
+            r#""h\u00e9llo \u2603 \ud83d\ude00""#
+        );
+    }
+
+    /// A keyword argument that would change the output and is not
+    /// implemented must fail loudly. Accepting and ignoring `sort_keys`
+    /// would produce a differently-ordered document that nothing
+    /// downstream could notice.
+    #[test]
+    fn tojson_rejects_the_keyword_arguments_it_does_not_implement() {
+        let err = render_tojson("sort_keys=true", serde_json::json!({"b": 1, "a": 2}))
+            .expect_err("sort_keys is not implemented");
+        assert!(err.to_string().contains("sort_keys"), "{err}");
+        let err = render_tojson("wat=1", serde_json::json!(1)).expect_err("unknown kwarg");
+        assert!(err.to_string().contains("wat"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod real_model_tests {
+    use super::*;
+
+    /// A model's *own* `tokenizer.chat_template`, rendered.
+    ///
+    /// The compatibility shims here (`pycompat`, the keyword-argument
+    /// rewrite, [`tojson`]) each exist because one real template needed
+    /// one, and a template that fails to render fails at *request* time —
+    /// the model loads, generates, and every chat call returns a 500. A
+    /// unit test over a reduced construct proves the shim works; only the
+    /// real file proves the shim was enough.
+    fn render_real_template(env_var: &str, tools: Option<&serde_json::Value>) -> String {
+        let path = std::env::var(env_var).unwrap_or_else(|_| panic!("set {env_var}"));
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let source = gguf
+            .metadata
+            .iter()
+            .find_map(|(k, v)| match (k.as_str(), v) {
+                ("tokenizer.chat_template", orangu::gguf::GgufValue::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the file has no tokenizer.chat_template");
+        let messages = vec![
+            ChatMessage::text("system", "You are terse."),
+            ChatMessage::text("user", "Name three primes over 20."),
+            ChatMessage::text("assistant", "23, 29, 31."),
+            ChatMessage::text("user", "And one more?"),
+        ];
+        ChatTemplate::new(source)
+            .render_with_tools(&messages, true, "", "", None, tools)
+            .expect("render")
+    }
+
+    /// `unsloth/Inkling-Small-GGUF`'s template, which leans harder on
+    /// Jinja than any other model here: recursive macros, `{% set %}`
+    /// blocks, string slicing, and `tojson` called with Python's keyword
+    /// arguments.
+    ///
+    /// Run with `ORANGU_TEST_INKLING_MODEL=/path/to/Inkling-Small-...-00001-of-00005.gguf
+    /// cargo test --bin orangu-server chat_template::real_model_tests --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn the_inkling_template_renders_a_conversation() {
+        let out = render_real_template("ORANGU_TEST_INKLING_MODEL", None);
+        assert!(out.contains("<|message_user|><|content_text|>And one more?<|end_message|>"));
+        assert!(out.contains("<|message_model|><|content_text|>23, 29, 31."));
+        // The generation prompt: an open model turn with no content marker,
+        // so the model picks the kind of body it writes next.
+        assert!(
+            out.ends_with("<|message_model|>"),
+            "tail: {:?}",
+            &out[out.len().saturating_sub(64)..]
+        );
+    }
+
+    /// The same template with tools, which is the branch that reaches the
+    /// recursive `canonical_json` macro and its `tojson(ensure_ascii=false,
+    /// separators=(',', ':'))` calls.
+    #[test]
+    #[ignore]
+    fn the_inkling_template_renders_tool_declarations() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Current weather for a place",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"place": {"type": "string"}},
+                    "required": ["place"],
+                },
+            },
+        }]);
+        let out = render_real_template("ORANGU_TEST_INKLING_MODEL", Some(&tools));
+        assert!(out.contains("<|message_system|>tool_declare<|content_xml|>["));
+        // Compact separators and no HTML escaping — Python's `json.dumps`
+        // as transformers configures it, which is what `tojson` reproduces.
+        assert!(
+            out.contains(r#""name":"get_weather""#),
+            "tool declaration was: {out}"
+        );
     }
 }

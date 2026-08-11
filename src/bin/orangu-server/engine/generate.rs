@@ -281,6 +281,11 @@ impl Engine {
         let batch_coordinator = self.batch_coordinator.clone();
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
+        // Whether a reasoning message reaches the client is this server's
+        // role's call, not the request's — the same place every other
+        // reasoning decision is made (`Role::enable_thinking`, which the
+        // HTTP layers pass to the chat template).
+        let role = self.role;
 
         let id_slot = req.id_slot;
         tokio::spawn(async move {
@@ -309,6 +314,7 @@ impl Engine {
                         slot_store.as_deref(),
                         &guard,
                         req,
+                        role,
                         task_tx.clone(),
                     )
                 }));
@@ -347,6 +353,7 @@ fn run(
     slot_store: Option<&super::slot_store::SlotStore>,
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
+    role: crate::config::Role,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<()> {
     let config = model.config();
@@ -461,6 +468,7 @@ fn run(
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
+    let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
     loop {
         if generated >= req.max_tokens {
             finish_reason = FinishReason::Length;
@@ -479,20 +487,29 @@ fn run(
         // user — otherwise a gemma-4 reply spills literal `<turn|>`/
         // `<channel|>` tokens into the stream (`skip_special_tokens`).
         let emitted = if tokenizer.is_special(next) {
-            // Almost every special token is structural and stays hidden. The
-            // exception is a tool-call marker: the model writes its call
-            // *between* special tokens, so suppressing them would leave the
-            // arguments as loose prose with nothing to say they were a call.
-            // Rendered back to literal text here and read by
-            // `engine::tool_calls`; the HTTP layer removes the whole span
-            // from what the user sees, so this never reaches a chat client
-            // as content.
-            tokenizer
-                .token_text(next)
-                .and_then(tool_calls::marker_text)
-                .map(str::to_string)
+            // A message marker opens or closes a header; it is hidden
+            // either way, like every other structural token, but ending one
+            // can call for a separator between two visible messages.
+            match header.observe_marker(next) {
+                Some(separator) => Some(separator.to_string()),
+                // Almost every special token is structural and stays hidden.
+                // The exception is a tool-call marker: the model writes its
+                // call *between* special tokens, so suppressing them would
+                // leave the arguments as loose prose with nothing to say
+                // they were a call. Rendered back to literal text here and
+                // read by `engine::tool_calls`; the HTTP layer removes the
+                // whole span from what the user sees, so this never reaches
+                // a chat client as content.
+                None => tokenizer
+                    .token_text(next)
+                    .and_then(tool_calls::marker_text)
+                    .map(str::to_string),
+            }
         } else {
-            Some(tokenizer.decode(&[next]))
+            // Suppressed while this is a message *header* (the recipient the
+            // model wrote for the format's benefit, not the reader's), and
+            // while it is a message body the role hides.
+            header.observe_text(tokenizer.decode(&[next]))
         };
         if let Some(text) = emitted
             && tx.send(StreamEvent::Token(text)).is_err()
@@ -706,6 +723,171 @@ fn run(
         finish_reason,
     });
     Ok(())
+}
+
+/// The recipient text that marks a message as the model's own reasoning
+/// rather than something addressed to the caller.
+///
+/// `muse-glimmer` writes `<|start|>assistant to=self<|message|>` for a
+/// chain-of-thought message and ` to=user` for the answer; the gpt-oss
+/// family spells the same distinction with a channel name. Matching on the
+/// text the model writes, the way `Tokenizer::message_framing` matches on
+/// the vocabulary's own token names — a format that doesn't use it simply
+/// never produces a header containing it.
+const REASONING_RECIPIENT: &str = "to=self";
+
+/// How much text may be withheld as a message header before
+/// [`MessageHeader`] concludes it is not looking at one. A recipient is a
+/// role plus a name (` to=self`, ` to=weather.get_current`); this is far
+/// above any of them and far below a reply worth losing.
+const MAX_HEADER_LEN: usize = 128;
+
+/// Splits a `<|start|>…<|message|>`-framed reply into its parts as it
+/// streams: the message *headers*, which are framing and never shown, and
+/// the message *bodies*, which are shown or not depending on who the model
+/// addressed them to.
+///
+/// The markers themselves are CONTROL tokens and were always hidden. Two
+/// things are new:
+///
+/// - **The header text is hidden.** `muse-glimmer` stops its generation
+///   prompt at `<|start|>assistant` so the model can pick its own
+///   recipient, and the ` to=self` / ` to=user` it writes there is framing,
+///   not prose. Left visible, every reply from that model began
+///   `" to=self"`.
+/// - **A reasoning message is hidden when the role says so.** An assistant
+///   turn in this format is *several* messages — reasoning addressed
+///   `to=self`, then the answer addressed `to=user` — and which of them the
+///   caller sees is the same question `Role::enable_thinking` already
+///   answers for models that mark reasoning with `<think>`. A role that
+///   suppresses reasoning gets the answer alone; every other role gets
+///   both, separated by a blank line (they are different messages, and
+///   running them together produced `…Final.Three primes larger than…`).
+///
+/// A second format asks the same question with tokens instead of text, and
+/// is answered here too: `inkling` opens each body with a marker naming its
+/// *kind* (`<|content_thinking|>` for reasoning, `<|content_text|>` for the
+/// answer) and writes no header at all. Same rule — a reasoning body is
+/// hidden when the role says so, and two visible bodies are separated by a
+/// blank line — read off `Tokenizer::content_kinds` rather than off a
+/// recipient string.
+///
+/// Inert (`framing` and `kinds` both `None`) for every vocabulary with
+/// neither, which is every other model this server serves — those keep
+/// byte-for-byte the behavior they had.
+struct MessageHeader {
+    /// `(<|start|>, <|message|>)`, or `None` when this vocabulary has no
+    /// such framing and nothing here applies.
+    framing: Option<(u32, u32)>,
+    /// The body-kind markers, for a vocabulary that types its bodies
+    /// instead of naming a recipient. `None` for every other.
+    kinds: Option<crate::engine::tokenizer::ContentKinds>,
+    /// Whether the stream is currently inside a header.
+    inside: bool,
+    /// The current header's text so far, accumulated to be read once at
+    /// `<|message|>` and then discarded. Bounded by the header's own length
+    /// (a recipient name), not by the reply's.
+    recipient: String,
+    /// Whether the message body now streaming is suppressed.
+    hidden_body: bool,
+    /// Whether any *visible* body has already been emitted this turn —
+    /// what decides if the next one needs a separator in front of it.
+    emitted_body: bool,
+    suppress_reasoning: bool,
+}
+
+impl MessageHeader {
+    fn for_prompt(tokenizer: &Tokenizer, prompt_tokens: &[u32], role: crate::config::Role) -> Self {
+        Self {
+            framing: tokenizer.message_framing(),
+            kinds: tokenizer.content_kinds(),
+            inside: Self::prompt_ends_in_header(tokenizer, prompt_tokens),
+            recipient: String::new(),
+            hidden_body: false,
+            emitted_body: false,
+            suppress_reasoning: role.suppresses_reasoning(),
+        }
+    }
+
+    /// Whether generation resumes *inside* a header.
+    ///
+    /// Read off the prompt rather than taken as a flag from the caller: the
+    /// prompt is the ground truth, every caller renders one, and a flag is
+    /// one more thing three HTTP paths would have to keep consistent.
+    ///
+    /// A prompt whose last marker is `<|start|>` (the ordinary generation
+    /// prompt, `…<|eot|><|start|>assistant`) resumes inside a header. One
+    /// whose last marker is `<|message|>` — a prefilled partial reply —
+    /// resumes inside a body. One with neither, which includes every
+    /// raw-completion prompt, likewise resumes in a body.
+    fn prompt_ends_in_header(tokenizer: &Tokenizer, prompt_tokens: &[u32]) -> bool {
+        tokenizer.message_framing().is_some_and(|(start, message)| {
+            prompt_tokens
+                .iter()
+                .rev()
+                .find_map(|&t| (t == start || t == message).then_some(t == start))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Feed every *special* token the model generates through this.
+    /// Returns text to emit in the marker's place — a separator between two
+    /// visible messages, and otherwise nothing.
+    fn observe_marker(&mut self, id: u32) -> Option<&'static str> {
+        // A body-kind marker settles the same question a header's recipient
+        // does, and settles it on its own — a format that has these writes
+        // no header, so this is checked first and returns rather than
+        // falling through to the header machinery.
+        if let Some(kinds) = &self.kinds
+            && (id == kinds.reasoning || kinds.other.contains(&id))
+        {
+            self.hidden_body = self.suppress_reasoning && id == kinds.reasoning;
+            let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
+            self.emitted_body |= !self.hidden_body;
+            return separator;
+        }
+        let (start, message) = self.framing?;
+        if id == start {
+            self.inside = true;
+            self.recipient.clear();
+            return None;
+        }
+        if id != message {
+            return None;
+        }
+        // The header just ended: its text says who this message is for.
+        self.inside = false;
+        self.hidden_body = self.suppress_reasoning
+            && self
+                .recipient
+                .replace(' ', "")
+                .contains(REASONING_RECIPIENT);
+        let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
+        self.emitted_body |= !self.hidden_body;
+        separator
+    }
+
+    /// Feed every *ordinary* (non-special) token's text through this.
+    /// Returns what to emit: nothing while inside a header, and nothing
+    /// inside a body the role suppresses.
+    fn observe_text(&mut self, text: String) -> Option<String> {
+        if !self.inside {
+            return (!self.hidden_body).then_some(text);
+        }
+        self.recipient.push_str(&text);
+        if self.recipient.len() <= MAX_HEADER_LEN {
+            return None;
+        }
+        // Long past any recipient's length and still no `<|message|>`: this
+        // is not a header, so whatever was withheld is content and is
+        // released now. Withholding is the one failure worth bounding —
+        // a stray recipient in the reply is cosmetic, a reply swallowed
+        // whole is not, and only the second can happen without a bound.
+        self.inside = false;
+        self.hidden_body = false;
+        self.emitted_body = true;
+        Some(std::mem::take(&mut self.recipient))
+    }
 }
 
 /// Prompt-lookup speculative-decode settings, read once at the start of a
@@ -1015,6 +1197,246 @@ fn speculative_next(
 }
 
 #[cfg(test)]
+mod message_header_tests {
+    use super::{MessageHeader, REASONING_RECIPIENT};
+
+    const START: u32 = 1;
+    const MESSAGE: u32 = 2;
+    const EOM: u32 = 3;
+    /// The body-kind markers of the second format (`inkling`'s
+    /// `<|content_thinking|>` and `<|content_text|>`).
+    const THINKING: u32 = 4;
+    const TEXT: u32 = 5;
+
+    /// One thing the model produced: a structural marker, or a run of
+    /// ordinary text.
+    enum Out {
+        Marker(u32),
+        Text(&'static str),
+    }
+    use Out::{Marker, Text};
+
+    /// Everything a client would see for `stream`, given a reply that
+    /// resumes inside a header (the ordinary generation prompt) and a role
+    /// that either shows reasoning or suppresses it.
+    fn shown(suppress_reasoning: bool, resumes_in_header: bool, stream: &[Out]) -> String {
+        let mut header = MessageHeader {
+            framing: Some((START, MESSAGE)),
+            kinds: None,
+            inside: resumes_in_header,
+            recipient: String::new(),
+            hidden_body: false,
+            emitted_body: false,
+            suppress_reasoning,
+        };
+        let mut out = String::new();
+        for item in stream {
+            match item {
+                Marker(id) => {
+                    if let Some(separator) = header.observe_marker(*id) {
+                        out.push_str(separator);
+                    }
+                }
+                Text(text) => {
+                    if let Some(text) = header.observe_text((*text).to_string()) {
+                        out.push_str(&text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A whole `muse-glimmer` assistant turn: a reasoning message, then the
+    /// answer. Every header is dropped — this is the bug that made replies
+    /// begin `" to=self"` — and the two bodies are separated rather than
+    /// run together (`…Final.Three primes larger than…`).
+    #[test]
+    fn a_showing_role_gets_both_messages_with_their_headers_dropped() {
+        let turn = [
+            Text(" to=self"),
+            Marker(MESSAGE),
+            Text("Let me think."),
+            Marker(EOM),
+            Marker(START),
+            Text(" to=user"),
+            Marker(MESSAGE),
+            Text("23, 29, 31."),
+        ];
+        assert_eq!(shown(false, true, &turn), "Let me think.\n\n23, 29, 31.");
+    }
+
+    /// The same turn under a reasoning-suppressing role: the answer alone,
+    /// with no separator in front of it (there is nothing to separate).
+    #[test]
+    fn a_suppressing_role_gets_only_the_message_addressed_to_the_caller() {
+        let turn = [
+            Text(" to=self"),
+            Marker(MESSAGE),
+            Text("Let me think."),
+            Marker(EOM),
+            Marker(START),
+            Text(" to=user"),
+            Marker(MESSAGE),
+            Text("23, 29, 31."),
+        ];
+        assert_eq!(shown(true, true, &turn), "23, 29, 31.");
+    }
+
+    /// The recipient arrives one token at a time and need not land as a
+    /// single piece, so the test that reads it must not assume it did.
+    #[test]
+    fn a_recipient_split_across_tokens_is_still_recognized() {
+        let turn = [
+            Text(" to"),
+            Text("="),
+            Text("se"),
+            Text("lf"),
+            Marker(MESSAGE),
+            Text("thinking"),
+        ];
+        assert_eq!(shown(true, true, &turn), "");
+        assert_eq!(shown(false, true, &turn), "thinking");
+    }
+
+    /// A prompt that does *not* end in a header — a prefilled partial reply,
+    /// or any raw-completion prompt — resumes inside a body, and hiding its
+    /// first tokens would swallow the start of the reply.
+    #[test]
+    fn a_reply_resuming_inside_a_body_hides_nothing() {
+        assert_eq!(
+            shown(false, false, &[Text("already answering")]),
+            "already answering"
+        );
+        assert_eq!(
+            shown(true, false, &[Text("already answering")]),
+            "already answering"
+        );
+    }
+
+    /// Every vocabulary without both markers keeps exactly its previous
+    /// behavior: nothing is hidden and nothing is inserted, whatever the
+    /// model emits and whatever the role is.
+    #[test]
+    fn a_vocabulary_without_the_markers_is_unaffected() {
+        let mut header = MessageHeader {
+            framing: None,
+            kinds: None,
+            inside: false,
+            recipient: String::new(),
+            hidden_body: false,
+            emitted_body: false,
+            suppress_reasoning: true,
+        };
+        assert_eq!(header.observe_marker(START), None);
+        assert_eq!(header.observe_marker(MESSAGE), None);
+        assert_eq!(
+            header.observe_text("plain".to_string()),
+            Some("plain".to_string())
+        );
+    }
+
+    /// Everything a client would see from an `inkling`-style reply, where
+    /// each body is opened by a marker naming its kind and there is no
+    /// header at all.
+    fn shown_by_kind(suppress_reasoning: bool, stream: &[Out]) -> String {
+        let mut header = MessageHeader {
+            framing: None,
+            kinds: Some(crate::engine::tokenizer::ContentKinds {
+                reasoning: THINKING,
+                other: vec![TEXT],
+            }),
+            inside: false,
+            recipient: String::new(),
+            hidden_body: false,
+            emitted_body: false,
+            suppress_reasoning,
+        };
+        let mut out = String::new();
+        for item in stream {
+            match item {
+                Marker(id) => {
+                    if let Some(separator) = header.observe_marker(*id) {
+                        out.push_str(separator);
+                    }
+                }
+                Text(text) => {
+                    if let Some(text) = header.observe_text((*text).to_string()) {
+                        out.push_str(&text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A whole `inkling` assistant turn: a thinking body, then the answer.
+    /// The showing role gets both, separated; the suppressing role gets the
+    /// answer alone, with no leading separator.
+    #[test]
+    fn a_typed_body_is_shown_or_hidden_by_its_own_marker() {
+        let turn = [
+            Marker(THINKING),
+            Text("Let me think."),
+            Marker(EOM),
+            Marker(TEXT),
+            Text("23, 29, 31."),
+        ];
+        assert_eq!(shown_by_kind(false, &turn), "Let me think.\n\n23, 29, 31.");
+        assert_eq!(shown_by_kind(true, &turn), "23, 29, 31.");
+    }
+
+    /// The markers that are *not* body kinds — a turn marker, an end
+    /// marker — must not be read as the start of a visible body. Taking
+    /// `<|end_message|>` for one would un-hide the reasoning that follows
+    /// it under a suppressing role.
+    #[test]
+    fn a_marker_that_is_not_a_body_kind_does_not_reopen_a_body() {
+        let turn = [
+            Marker(THINKING),
+            Text("first thought."),
+            Marker(EOM),
+            Marker(START),
+            Text("second thought."),
+        ];
+        assert_eq!(shown_by_kind(true, &turn), "");
+        assert_eq!(shown_by_kind(false, &turn), "first thought.second thought.");
+    }
+
+    /// A reply that never writes `<|message|>` must not be swallowed. The
+    /// prompt still ends in a header, so the filter starts by withholding —
+    /// but only up to `MAX_HEADER_LEN`, after which it concludes this is
+    /// not a header and releases what it held.
+    ///
+    /// The failure this guards is not hypothetical: appending an empty
+    /// `<think>` block to a `<|start|>assistant` prompt (the old blanket
+    /// reasoning-suppression prefill) produced exactly such a reply, and
+    /// with no bound the whole answer came back empty.
+    #[test]
+    fn a_reply_that_never_leaves_the_header_is_released_rather_than_swallowed() {
+        let long = "x".repeat(super::MAX_HEADER_LEN + 1);
+        let stream = [Text(Box::leak(long.into_boxed_str()) as &'static str)];
+        let out = shown(false, true, &stream);
+        assert!(
+            out.len() > super::MAX_HEADER_LEN,
+            "withheld text must be released, got {} chars",
+            out.len()
+        );
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    /// The recipient this module keys on is the one the format writes; a
+    /// header naming anyone else is an ordinary message, shown under every
+    /// role.
+    #[test]
+    fn only_the_reasoning_recipient_is_suppressed() {
+        assert_eq!(REASONING_RECIPIENT, "to=self");
+        let turn = [Text(" to=user"), Marker(MESSAGE), Text("the answer")];
+        assert_eq!(shown(true, true, &turn), "the answer");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::kv_cache::KvCache;
@@ -1195,7 +1617,18 @@ mod tests {
             id_slot: None,
             timings_per_token: false,
         };
-        run(model, tokenizer, None, prefix_cache, None, &guard, req, tx).unwrap();
+        run(
+            model,
+            tokenizer,
+            None,
+            prefix_cache,
+            None,
+            &guard,
+            req,
+            crate::config::Role::default(),
+            tx,
+        )
+        .unwrap();
         drain(rx)
     }
 

@@ -24,16 +24,25 @@
 //! hash-routed experts), `glm` (GLM with DeepSeek sparse attention:
 //! absorbed multi-head latent attention plus a lightning indexer), `kimi3`
 //! (Kimi-K3: hybrid delta-net/latent attention with cross-layer residuals
-//! and a latent MoE), and `dflash` (DeepSeek draft sidecars, served through
-//! the target model they draft for).
+//! and a latent MoE), `muse` (Muse-Glimmer: `llama`'s dense GQA block plus
+//! gemma-style sandwich norms, a sigmoid output gate on attention, and an
+//! alternating pattern of rotated sliding-window and unrotated
+//! full-attention layers), `inkling` (Inkling: no rotation at all — a
+//! learned relative-position bias plus causal short convolutions — over
+//! sigmoid-routed experts that share their normalization with the shared
+//! ones), and `dflash`
+//! (DeepSeek draft sidecars, served through the target model they draft
+//! for).
 
 pub mod deepseek4;
 pub mod dflash;
 pub mod gemma;
 pub mod glm;
+pub mod inkling;
 pub mod kimi3;
 pub mod llama;
 pub mod mistral;
+pub mod muse;
 pub mod phi;
 pub mod qwen35;
 pub mod qwen35moe;

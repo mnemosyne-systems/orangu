@@ -799,9 +799,11 @@ fn render_prompt(
         eos,
         state.engine.role.enable_thinking(),
     )?;
-    if state.engine.role.suppresses_reasoning() {
-        prompt.push_str(crate::http::openai::EMPTY_THINK_BLOCK);
-    }
+    crate::http::openai::append_reasoning_suppression(
+        &mut prompt,
+        state.engine.role,
+        &state.engine.tokenizer,
+    );
     Ok(prompt)
 }
 

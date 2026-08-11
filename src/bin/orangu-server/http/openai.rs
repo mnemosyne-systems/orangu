@@ -155,6 +155,42 @@ pub(crate) fn default_cache_prompt() -> bool {
 /// template that checks for it).
 pub(crate) const EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
 
+/// Appends [`EMPTY_THINK_BLOCK`] to a rendered prompt when — and only
+/// when — that approximation is the right tool for this model.
+///
+/// It is not always. A `<|start|>…<|message|>`-framed model
+/// (`Tokenizer::message_framing`, `muse-glimmer`) ends its generation
+/// prompt *mid-header*, at `<|start|>assistant`, waiting for the model to
+/// write its own recipient. Appending anything there lands inside the
+/// header rather than after it, and the model then continues from a
+/// malformed turn: the observed result was a reply that never wrote
+/// `<|message|>` at all, which `engine::generate`'s own header filter then
+/// withheld in full — an empty answer.
+///
+/// The same holds for a model that types each message body with a control
+/// token (`Tokenizer::content_kinds`, `inkling`): its generation prompt
+/// ends at `<|message_model|>`, and a `<think>` block appended there is
+/// body text arriving before the marker that says what kind of body this
+/// is.
+///
+/// Those models need no approximation anyway. Their reasoning is a whole
+/// separate message — addressed `to=self`, or opened with
+/// `<|content_thinking|>` — and a suppressing role drops it exactly (see
+/// `MessageHeader`) rather than trying to talk the model out of producing
+/// one.
+pub(crate) fn append_reasoning_suppression(
+    prompt: &mut String,
+    role: crate::config::Role,
+    tokenizer: &crate::engine::tokenizer::Tokenizer,
+) {
+    if role.suppresses_reasoning()
+        && tokenizer.message_framing().is_none()
+        && tokenizer.content_kinds().is_none()
+    {
+        prompt.push_str(EMPTY_THINK_BLOCK);
+    }
+}
+
 /// Reject an `id_slot` this server has no slot for, rather than silently
 /// ignoring it and quietly reprefilling every turn — the exact failure the
 /// field was added to end. Same shape `POST /slots/{id}` already answers with.
@@ -263,9 +299,7 @@ pub async fn chat_completions(
         Ok(p) => p,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
-    if state.engine.role.suppresses_reasoning() {
-        prompt.push_str(EMPTY_THINK_BLOCK);
-    }
+    append_reasoning_suppression(&mut prompt, state.engine.role, &state.engine.tokenizer);
     let tokens = state.engine.tokenizer.encode(&prompt, false);
 
     let mut sampling = SamplingParams::default_for_role(state.engine.role);

@@ -105,6 +105,10 @@ const SPLIT_PATTERN_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[
 /// Phi-4-mini), from upstream's `LLAMA_VOCAB_PRE_TYPE_GPT4O` arm. Shares
 /// `\p{N}{1,3}` with [`SPLIT_PATTERN_LLAMA3`] and additionally splits
 /// letter runs on an upper/lower-case boundary.
+///
+/// See [`GPT4O_PRE_TYPES`] for the other `pre` values that land here —
+/// `llama4` in particular *looks* like it belongs with the llama3 family
+/// and does not.
 const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
 
 /// Mistral's "tekken" pre-tokenizer (`tokenizer.ggml.pre = "tekken"`, e.g.
@@ -150,6 +154,26 @@ const LLAMA3_PRE_TYPES: &[&str] = &[
     "jina-v5-nano",
 ];
 
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O` (its own list, verbatim). None of them sets
+/// `ignore_merges`.
+///
+/// `llama4` is the trap here: every other `llama*` `pre` value sits in
+/// [`LLAMA3_PRE_TYPES`], but upstream puts Llama 4's vocab — and
+/// `muse-glimmer`, which reuses it (`unsloth/Muse-Glimmer-30B-GGUF`) — on
+/// the GPT-4o arm instead, which both splits letter runs on case
+/// boundaries and leaves `ignore_merges` clear. Reading the name rather
+/// than the table would mis-tokenize every prompt in a way that still
+/// produces fluent-looking output.
+///
+/// `inkling` (`unsloth/Inkling-Small-GGUF`) is here because its vocabulary
+/// *is* this one: a 200k byte-level BPE whose pre-tokenizer split is the
+/// o200k regex character for character — the case-boundary alternation, the
+/// `\p{N}{1,3}` digit runs, and the `[\r\n/]*` tail that no other family
+/// here has. Confirmed against colibrì's `inkling` engine, which carries
+/// the same pattern spelled out as an explicit scanner.
+const GPT4O_PRE_TYPES: &[&str] = &["gpt-4o", "llama4", "kanana2", "talkie", "inkling"];
+
 /// Picks the pre-tokenizer split pattern and upstream's `ignore_merges`
 /// flag for a `tokenizer.ggml.pre` value, falling back to the generic
 /// GPT-2-ish pattern for anything not specifically handled (the behavior
@@ -162,13 +186,42 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
         // Same pattern, deliberately without `ignore_merges`.
         return (SPLIT_PATTERN_LLAMA3, false);
     }
-    if pre == "gpt-4o" {
+    if GPT4O_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_GPT4O, false);
     }
     if pre == "tekken" {
         return (SPLIT_PATTERN_TEKKEN, true);
     }
     (SPLIT_PATTERN, false)
+}
+
+/// The control token that opens a *reasoning* message body, for a
+/// vocabulary that types its bodies (see [`Tokenizer::content_kinds`]).
+const REASONING_CONTENT_TOKEN: &str = "<|content_thinking|>";
+
+/// The control tokens that open every other kind of message body — an
+/// answer, markup, a tool invocation, a tool error. A vocabulary need not
+/// have all of them; the ones it does have mark a body the caller sees.
+///
+/// Listed rather than derived as "anything that isn't the reasoning
+/// marker", because the alternative would treat every unknown control
+/// token in a reply — a turn marker, an end marker — as the start of a
+/// visible body and reset the suppression mid-reasoning.
+const OTHER_CONTENT_TOKENS: &[&str] = &[
+    "<|content_text|>",
+    "<|content_xml|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_invoke_tool_text|>",
+    "<|content_tool_error|>",
+];
+
+/// A vocabulary's message-body kind markers — see
+/// [`Tokenizer::content_kinds`].
+pub struct ContentKinds {
+    /// The marker that opens a reasoning body.
+    pub reasoning: u32,
+    /// The markers that open a body the caller is meant to see.
+    pub other: Vec<u32>,
 }
 
 /// SentencePiece's word-boundary marker (U+2581, "▁") — gemma4-family
@@ -719,6 +772,65 @@ impl Tokenizer {
         self.special_ids.contains(&id)
     }
 
+    /// `(<|start|>, <|message|>)` for a vocabulary that frames each message
+    /// as `<|start|><role> <header><|message|><content>`, and `None` for
+    /// every vocabulary that doesn't.
+    ///
+    /// Both markers are CONTROL tokens and so are already hidden by
+    /// [`Self::is_special`]. What this exists for is the text *between*
+    /// them, which is not: in `muse-glimmer`'s format the model writes its
+    /// own ` to=self` / ` to=user` / ` to=<tool>` recipient there, and the
+    /// generation prompt deliberately stops right before it
+    /// (`…<|eot|><|start|>assistant`) so the model can choose. Rendered as
+    /// content, that reaches a chat client as a reply literally beginning
+    /// `" to=self"`. `engine::generate` uses this pair to skip a message's
+    /// header the way it already skips the markers around it.
+    ///
+    /// Matching on the vocabulary's own names for the tokens, as
+    /// [`Self::NAMED_END_TOKENS`] does, rather than on an architecture: the
+    /// framing is a property of the chat format, several models share it
+    /// (`muse-glimmer`, the gpt-oss family), and a vocabulary without both
+    /// tokens is unaffected.
+    pub fn message_framing(&self) -> Option<(u32, u32)> {
+        let start = *self.token_to_id.get("<|start|>")?;
+        let message = *self.token_to_id.get("<|message|>")?;
+        (self.is_special(start) && self.is_special(message)).then_some((start, message))
+    }
+
+    /// The marker a reasoning body opens with, and the markers every other
+    /// kind of body opens with — for a vocabulary that types each message
+    /// *body* with a control token instead of naming a recipient in text.
+    /// `None` for every vocabulary without the reasoning one, which is
+    /// every model here but `inkling`.
+    ///
+    /// The same question [`Self::message_framing`] answers, asked of a
+    /// format that answers it differently. `inkling` writes
+    /// `<|content_thinking|>`, its chain of thought, `<|end_message|>`,
+    /// then a fresh `<|message_model|><|content_text|>` and the answer — so
+    /// which of an assistant turn's several messages the caller sees is
+    /// decided by a *token*, not by text between two markers. Both markers
+    /// are already hidden by [`Self::is_special`]; what this exists for is
+    /// the body that follows one.
+    ///
+    /// Matched on the vocabulary's own token names, as
+    /// [`Self::NAMED_END_TOKENS`] and [`Self::message_framing`] are: the
+    /// framing is a property of the chat format rather than of an
+    /// architecture.
+    pub fn content_kinds(&self) -> Option<ContentKinds> {
+        let reasoning = *self.token_to_id.get(REASONING_CONTENT_TOKEN)?;
+        if !self.is_special(reasoning) {
+            return None;
+        }
+        Some(ContentKinds {
+            reasoning,
+            other: OTHER_CONTENT_TOKENS
+                .iter()
+                .filter_map(|name| self.token_to_id.get(*name).copied())
+                .filter(|&id| self.is_special(id))
+                .collect(),
+        })
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
@@ -1224,6 +1336,36 @@ mod tests {
 
         // Anything unknown still falls back to the generic pattern.
         assert_eq!(super::split_pattern_for_pre("gpt2").0, super::SPLIT_PATTERN);
+    }
+
+    /// `llama4` is named like the llama3 family and belongs to the GPT-4o
+    /// one — upstream's own table, and the routing `muse-glimmer`'s vocab
+    /// (`unsloth/Muse-Glimmer-30B-GGUF`) depends on. The two patterns
+    /// disagree about case boundaries inside a word and about
+    /// `ignore_merges`, so reading the *name* rather than the table
+    /// mis-tokenizes every prompt while still producing fluent-looking
+    /// output.
+    #[test]
+    fn llama4_uses_the_gpt4o_pre_tokenizer_and_not_llama3s() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("llama4");
+        assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::split_pattern_for_pre("llama3").0);
+        assert_eq!(pattern, super::split_pattern_for_pre("gpt-4o").0);
+    }
+
+    /// `inkling`'s vocabulary is the o200k one, so its `pre` value has to
+    /// land on the GPT-4o arm rather than on the generic GPT-2 fallback an
+    /// unrecognized name gets. The two disagree about case boundaries
+    /// inside a word and about digit runs, and the fallback would produce
+    /// fluent-looking output from a mis-tokenized prompt rather than an
+    /// error.
+    #[test]
+    fn inkling_uses_the_gpt4o_pre_tokenizer_and_not_the_generic_fallback() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("inkling");
+        assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::SPLIT_PATTERN);
     }
 
     #[test]

@@ -135,6 +135,21 @@ pub enum ArchFamily {
     /// `attention.key_length` rather than derived, and an attention
     /// temperature scale. See `engine::arch::mistral`.
     Mistral3,
+    /// Muse-Glimmer (`muse-glimmer`) — a dense GQA decoder with gemma-style
+    /// sandwich norms around both sub-layers, per-head QK-norm, a sigmoid
+    /// output gate on attention (`attn_gate`), an alternating pattern of
+    /// sliding-window and full-attention layers where **only the
+    /// sliding-window ones rotate**, and both a logit scale and final logit
+    /// softcapping on the tail. See `engine::arch::muse`.
+    Muse,
+    /// Inkling (`inkling`) — a rotation-free MoE decoder: position enters
+    /// through a learned per-head relative-position bias and a causal
+    /// depthwise short convolution on the key/value projections and on
+    /// each sub-layer's output, layers alternate sliding-window and
+    /// full-attention (the latter with a context-length attention
+    /// temperature), and sigmoid-routed experts share their normalization
+    /// with the always-on shared experts. See `engine::arch::inkling`.
+    Inkling,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -199,6 +214,14 @@ const KIMI_K3_ARCHITECTURES: &[&str] = &["kimi-k3"];
 /// either — same attention block, but routed experts this module has no
 /// path for.
 const PHI3_ARCHITECTURES: &[&str] = &["phi3"];
+/// `muse-glimmer` (e.g. `unsloth/Muse-Glimmer-30B-GGUF`) — see
+/// [`ArchFamily::Muse`] and `engine::arch::muse`.
+const MUSE_ARCHITECTURES: &[&str] = &["muse-glimmer"];
+/// `inkling` (e.g. `unsloth/Inkling-Small-GGUF`) — see
+/// [`ArchFamily::Inkling`] and `engine::arch::inkling`. The `mmproj-*.gguf`
+/// shipped alongside is a separate `clip`-architecture model and is not
+/// this.
+const INKLING_ARCHITECTURES: &[&str] = &["inkling"];
 
 pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LLAMA_STYLE_ARCHITECTURES.contains(&architecture) {
@@ -234,6 +257,12 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if MISTRAL_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Mistral3);
     }
+    if MUSE_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Muse);
+    }
+    if INKLING_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Inkling);
+    }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
@@ -249,6 +278,8 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(KIMI_K3_ARCHITECTURES)
             .chain(PHI3_ARCHITECTURES)
             .chain(MISTRAL_ARCHITECTURES)
+            .chain(MUSE_ARCHITECTURES)
+            .chain(INKLING_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
@@ -1965,6 +1996,15 @@ mod tests {
         // cross-layer residuals, latent MoE or situ activation, so it is
         // deliberately not routed here.
         assert!(resolve_arch_family("kimi-linear").is_err());
+    }
+
+    /// `inkling` is the text decoder. The multimodal projector shipped in
+    /// the same repository is a `clip` model, and routing it here would
+    /// promise a load that fails on the first missing tensor.
+    #[test]
+    fn resolve_arch_family_accepts_inkling_but_not_its_projector() {
+        assert_eq!(resolve_arch_family("inkling").unwrap(), ArchFamily::Inkling);
+        assert!(resolve_arch_family("clip").is_err());
     }
 
     #[test]

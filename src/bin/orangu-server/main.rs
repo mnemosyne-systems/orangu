@@ -54,9 +54,11 @@ use engine::arch::deepseek4::Deepseek4Model;
 use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
 use engine::arch::glm::GlmModel;
+use engine::arch::inkling::InklingModel;
 use engine::arch::kimi3::Kimi3Model;
 use engine::arch::llama::LlamaModel;
 use engine::arch::mistral::MistralModel;
+use engine::arch::muse::MuseModel;
 use engine::arch::phi::PhiModel;
 use engine::arch::qwen3next::Qwen3NextModel;
 use engine::arch::qwen35::Qwen35Model;
@@ -992,6 +994,12 @@ fn prepare(args: Args) -> Result<Prepared> {
         ),
         ArchFamily::Mistral3 => Arc::new(
             MistralModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Muse => Arc::new(
+            MuseModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Inkling => Arc::new(
+            InklingModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
         ),
     };
 

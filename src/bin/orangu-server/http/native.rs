@@ -585,9 +585,11 @@ pub async fn apply_template(
             // prefill, so this endpoint's whole point — showing exactly
             // what will be sent to the model — stays accurate for `Role::
             // Review`.
-            if state.engine.role.suppresses_reasoning() {
-                prompt.push_str(super::openai::EMPTY_THINK_BLOCK);
-            }
+            super::openai::append_reasoning_suppression(
+                &mut prompt,
+                state.engine.role,
+                &state.engine.tokenizer,
+            );
             Json(ApplyTemplateResponse { prompt }).into_response()
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
