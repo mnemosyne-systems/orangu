@@ -1,0 +1,9 @@
+@startuml
+package outer {
+  package inner {
+    component API <<service>> as api
+    database Store as store
+    api -[#4c8bf5]-> store : writes
+  }
+}
+@enduml

@@ -248,6 +248,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/static/katex/katex.min.css", get(katex_css))
         .route("/static/katex/katex.min.js", get(katex_js))
         .route("/static/katex/fonts/{name}", get(katex_font))
+        .route("/api/diagrams/{key}/{name}", get(diagram_asset))
         .route("/api/asset-version", get(asset_version_handler))
         .route("/api/system-report", get(system_report))
         // `delete` on both: one row's cross, and History's **Clear all**
@@ -276,6 +277,24 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         // of documents (base64 inflates bytes by ~4/3).
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+/// Delivers a PlantUML render from the in-memory renderer cache.  Keeping
+/// diagram bytes off the streamed message payload is particularly important
+/// for PNGs, whose base64 representation grows every JSON event by about a
+/// third.
+async fn diagram_asset(Path((key, name)): Path<(String, String)>) -> impl IntoResponse {
+    match plantuml::asset(&key, &name) {
+        Some((content_type, bytes)) => (
+            [
+                ("content-type", content_type),
+                ("cache-control", "private, max-age=3600"),
+            ],
+            bytes.to_vec(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn index(State(state): State<Arc<WebState>>) -> impl IntoResponse {
@@ -535,29 +554,42 @@ fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
     if let Some(text) = attachment.text.as_deref() {
         let found = mermaid::find_in_text(text);
         diagrams_found += found.len();
-        diagrams.extend(found.into_iter().map(|found| DiagramView {
-            kind: "mermaid",
-            light: found.diagram.light.clone(),
-            dark: found.diagram.dark.clone(),
-            light_png: None,
-            dark_png: None,
-            width: found.diagram.width,
-            height: found.diagram.height,
-            source: found.source,
+        diagrams.extend(found.into_iter().map(|found| {
+            (
+                found.offset,
+                DiagramView {
+                    kind: "mermaid",
+                    light: found.diagram.light.clone(),
+                    dark: found.diagram.dark.clone(),
+                    light_png: None,
+                    dark_png: None,
+                    width: found.diagram.width,
+                    height: found.diagram.height,
+                    source: found.source,
+                },
+            )
         }));
         let found = plantuml::find_in_text(text);
         diagrams_found += found.len();
-        diagrams.extend(found.into_iter().map(|found| DiagramView {
-            kind: "plantuml",
-            light: found.diagram.light.clone(),
-            dark: found.diagram.dark.clone(),
-            light_png: Some(found.diagram.light_png.clone()),
-            dark_png: Some(found.diagram.dark_png.clone()),
-            width: found.diagram.width,
-            height: found.diagram.height,
-            source: found.source,
+        diagrams.extend(found.into_iter().map(|found| {
+            (
+                found.offset,
+                DiagramView {
+                    kind: "plantuml",
+                    light: found.diagram.light.clone(),
+                    dark: found.diagram.dark.clone(),
+                    light_png: Some(found.diagram.light_png.clone()),
+                    dark_png: Some(found.diagram.dark_png.clone()),
+                    width: found.diagram.width,
+                    height: found.diagram.height,
+                    source: found.source,
+                },
+            )
         }));
     }
+    // Each parser walks only its own family, so sort the combined result by
+    // fence position before applying the shared attachment cap.
+    diagrams.sort_by_key(|(offset, _)| *offset);
     diagrams.truncate(mermaid::MAX_PER_ATTACHMENT);
     AttachmentView {
         name: attachment.name,
@@ -565,7 +597,7 @@ fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
         size: attachment.size,
         text: attachment.text,
         diagrams_capped: diagrams_found > mermaid::MAX_PER_ATTACHMENT,
-        diagrams,
+        diagrams: diagrams.into_iter().map(|(_, diagram)| diagram).collect(),
     }
 }
 
@@ -863,13 +895,26 @@ mod tests {
         assert_eq!(view.diagrams.len(), 1);
         let diagram = &view.diagrams[0];
         assert_eq!(diagram.kind, "plantuml");
-        assert!(diagram.light.starts_with("data:image/svg+xml;base64,"));
+        assert!(diagram.light.starts_with("/api/diagrams/"));
         assert!(
             diagram
                 .light_png
                 .as_deref()
-                .is_some_and(|png| png.starts_with("data:image/png;base64,"))
+                .is_some_and(|png| png.ends_with("/light.png"))
         );
+    }
+
+    #[test]
+    fn attachment_diagrams_keep_their_source_order_across_families() {
+        let view = upload(
+            "mixed.md",
+            "text/markdown",
+            "```plantuml\n@startuml\nA -> B: first\n@enduml\n```\n\n```mermaid\nflowchart LR\n  C --> D\n```\n\n```puml\n@startuml\nE -> F: third\n@enduml\n```\n",
+        );
+        assert_eq!(view.diagrams.len(), 3);
+        assert_eq!(view.diagrams[0].kind, "plantuml");
+        assert_eq!(view.diagrams[1].kind, "mermaid");
+        assert_eq!(view.diagrams[2].kind, "plantuml");
     }
 
     #[test]

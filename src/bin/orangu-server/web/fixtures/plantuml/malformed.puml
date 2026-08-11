@@ -1,0 +1,4 @@
+@startuml
+!include https://example.invalid/theme.puml
+A -> B
+@enduml

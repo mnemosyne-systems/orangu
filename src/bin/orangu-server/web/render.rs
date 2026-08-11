@@ -623,10 +623,10 @@ mod tests {
             html.contains("<figure class=\"plantuml-diagram\">"),
             "{html}"
         );
-        assert!(html.contains("class=\"plantuml-light\" src=\"data:image/svg+xml;base64,"));
+        assert!(html.contains("class=\"plantuml-light\" src=\"/api/diagrams/"));
         assert!(html.contains("download=\"orangu-plantuml.svg\""));
         assert!(html.contains("download=\"orangu-plantuml.png\""));
-        assert!(html.contains("data:image/png;base64,"));
+        assert!(html.contains("/light.png"));
         assert!(html.contains("Alice -&gt; Bob") || html.contains("Alice -&gt; Bob: hello"));
     }
 

@@ -84,6 +84,9 @@ impl Diagram {
 pub struct Found {
     pub diagram: &'static Diagram,
     pub source: String,
+    /// Byte offset of the fence in the attachment, used when combining
+    /// diagram families without changing the author's source order.
+    pub offset: usize,
 }
 
 /// Pulls `width`/`height` out of `viewBox="minX minY width height"`.
@@ -381,6 +384,7 @@ pub fn find_in_text(text: &str) -> Vec<Found> {
         return vec![Found {
             diagram,
             source: text.trim().to_string(),
+            offset: 0,
         }];
     }
 
@@ -405,6 +409,10 @@ fn collect_from_nodes(node: &markdown::mdast::Node, found: &mut Vec<Found>) {
             found.push(Found {
                 diagram,
                 source: code.value.clone(),
+                offset: code
+                    .position
+                    .as_ref()
+                    .map_or(usize::MAX, |p| p.start.offset),
             });
         }
         return;

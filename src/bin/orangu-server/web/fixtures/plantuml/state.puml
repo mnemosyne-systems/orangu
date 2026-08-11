@@ -1,0 +1,4 @@
+@startuml
+[*] --> Idle
+Idle --> [*]
+@enduml

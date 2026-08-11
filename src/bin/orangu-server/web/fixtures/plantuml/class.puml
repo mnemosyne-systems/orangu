@@ -1,0 +1,8 @@
+@startuml
+class Animal {
+  +name: String
+  +move()
+}
+class Dog
+Animal <|-- Dog : extends
+@enduml

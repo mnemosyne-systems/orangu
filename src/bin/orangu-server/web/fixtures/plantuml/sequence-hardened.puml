@@ -1,0 +1,16 @@
+@startuml
+title
+  Request lifecycle
+  with retries
+end title
+participant "Web client" as client
+participant API <<service>> as api
+client -[#4c8bf5]> api: submit
+activate api
+note right of api
+  validates input
+  and records an audit trail
+end note
+api ->x client: rejected
+deactivate api
+@enduml

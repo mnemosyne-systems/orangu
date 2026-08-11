@@ -1,0 +1,6 @@
+@startuml
+Alice -> Bob: start
+loop every 5 minutes
+  Bob --> Alice: status
+end
+@enduml
