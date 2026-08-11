@@ -1,0 +1,10 @@
+@startuml
+start
+:Read configuration;
+if (valid?) then (yes)
+:Run server;
+else (no)
+:Report error;
+endif
+stop
+@enduml

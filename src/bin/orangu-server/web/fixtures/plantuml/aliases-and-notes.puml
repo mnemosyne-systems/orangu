@@ -1,0 +1,6 @@
+@startuml
+participant "Web client" as client
+participant API as api
+note right of api: validates the request
+client -> api: submit
+@enduml

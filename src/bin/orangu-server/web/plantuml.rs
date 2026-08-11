@@ -16,7 +16,6 @@
 //! `None`, allowing the Markdown renderer to preserve the original code block
 //! instead of displaying a plausible but incomplete diagram.
 
-use base64::Engine as _;
 use rustc_hash::FxHasher;
 use std::{
     collections::{HashMap, VecDeque},
@@ -25,7 +24,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-const CACHE_LIMIT: usize = 256;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_ITEMS: usize = 512;
 const MAX_DIMENSION: f64 = 4096.0;
@@ -36,10 +34,17 @@ type Cache = HashMap<u64, Option<&'static Diagram>>;
 /// A rendered PlantUML diagram in both console themes and both requested
 /// output formats.
 pub struct Diagram {
+    /// Stable, same-process URLs for the rendered assets.  Keeping the
+    /// bytes in the renderer cache avoids inflating streamed chat HTML and
+    /// attachment JSON with base64-encoded PNGs.
     pub light: String,
     pub dark: String,
     pub light_png: String,
     pub dark_png: String,
+    light_svg: Vec<u8>,
+    dark_svg: Vec<u8>,
+    light_png_bytes: Vec<u8>,
+    dark_png_bytes: Vec<u8>,
     pub width: f64,
     pub height: f64,
 }
@@ -47,6 +52,7 @@ pub struct Diagram {
 pub struct Found {
     pub diagram: &'static Diagram,
     pub source: String,
+    pub offset: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -126,9 +132,10 @@ pub fn render(source: &str) -> Option<&'static Diagram> {
 
     let rendered = render_uncached(source);
     if let Ok(mut cache) = cache().lock() {
-        if cache.len() >= CACHE_LIMIT {
-            cache.clear();
-        }
+        // `Diagram` is intentionally leaked so callers can cheaply retain
+        // shared renders.  Clearing this map therefore did not release its
+        // bytes, but did make previously streamed asset URLs return 404.
+        // Retain the lookup for the lifetime of the process instead.
         cache.insert(key, rendered);
     }
     rendered
@@ -142,11 +149,18 @@ fn render_uncached(source: &str) -> Option<&'static Diagram> {
     let (width, height) = parsed.size();
     let light_png = rasterize(&light_svg)?;
     let dark_png = rasterize(&dark_svg)?;
+    let mut hasher = FxHasher::default();
+    source.hash(&mut hasher);
+    let key = hasher.finish();
     Some(Box::leak(Box::new(Diagram {
-        light: svg_uri(&light_svg),
-        dark: svg_uri(&dark_svg),
-        light_png: png_uri(&light_png),
-        dark_png: png_uri(&dark_png),
+        light: asset_url(key, "light.svg"),
+        dark: asset_url(key, "dark.svg"),
+        light_png: asset_url(key, "light.png"),
+        dark_png: asset_url(key, "dark.png"),
+        light_svg: light_svg.into_bytes(),
+        dark_svg: dark_svg.into_bytes(),
+        light_png_bytes: light_png,
+        dark_png_bytes: dark_png,
         width,
         height,
     })))
@@ -228,6 +242,8 @@ impl Parsed {
 }
 
 fn parse(lines: &[String]) -> Option<Parsed> {
+    let lines = normalise_title_blocks(lines)?;
+    let lines = &lines;
     if looks_like_activity(lines) {
         return parse_activity(lines).map(Parsed::Graph);
     }
@@ -238,6 +254,32 @@ fn parse(lines: &[String]) -> Option<Parsed> {
         return parse_sequence(lines).map(Parsed::Sequence);
     }
     parse_graph(lines).map(Parsed::Graph)
+}
+
+/// Turns PlantUML's block-title form into the inline form understood by the
+/// individual parsers, while rejecting an unterminated block.  Doing this at
+/// the grammar boundary keeps title text from being mistaken for a message,
+/// member, or activity action.
+fn normalise_title_blocks(lines: &[String]) -> Option<Vec<String>> {
+    let mut result = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim().eq_ignore_ascii_case("title") {
+            index += 1;
+            let start = index;
+            while index < lines.len() && !lines[index].trim().eq_ignore_ascii_case("end title") {
+                index += 1;
+            }
+            if index == lines.len() || start == index {
+                return None;
+            }
+            result.push(format!("title {}", lines[start..index].join(" ")));
+        } else {
+            result.push(lines[index].clone());
+        }
+        index += 1;
+    }
+    Some(result)
 }
 
 fn looks_like_graph(lines: &[String]) -> bool {
@@ -298,12 +340,25 @@ fn is_cosmetic(line: &str) -> bool {
 }
 
 fn title(lines: &[String]) -> Option<String> {
-    lines.iter().find_map(|line| {
-        significant(line)?
+    for (index, line) in lines.iter().enumerate() {
+        let Some(line) = significant(line) else {
+            continue;
+        };
+        if let Some(value) = line
             .strip_prefix("title ")
-            .or_else(|| significant(line)?.strip_prefix("Title "))
-            .map(clean_label)
-    })
+            .or_else(|| line.strip_prefix("Title "))
+        {
+            return Some(clean_label(value));
+        }
+        if line.eq_ignore_ascii_case("title") {
+            let end = lines[index + 1..]
+                .iter()
+                .position(|line| line.trim().eq_ignore_ascii_case("end title"))?;
+            let value = lines[index + 1..index + 1 + end].join(" ");
+            return (!value.trim().is_empty()).then(|| clean_label(&value));
+        }
+    }
+    None
 }
 
 fn looks_like_sequence(lines: &[String]) -> bool {
@@ -350,6 +405,8 @@ enum SeqEvent {
     GroupElse(String),
     GroupEnd,
     Divider(String),
+    Activate(String),
+    Deactivate(String),
 }
 
 struct Sequence {
@@ -378,6 +435,7 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
     let mut indexes = HashMap::new();
     let mut events = Vec::new();
     let mut index = 0;
+    let mut group_depth = 0usize;
     while index < lines.len() {
         let Some(line) = significant(&lines[index]) else {
             index += 1;
@@ -388,7 +446,9 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
             let (kind, rest) = line.split_once(char::is_whitespace)?;
             let (id, label) = parse_decl_name(rest)?;
             add_participant(&mut participants, &mut indexes, &id, &label, kind);
-        } else if let Some((mut from, mut to, label, arrow)) = split_message(line) {
+        } else if let Some((mut from, mut to, label, arrow)) =
+            split_message(&strip_arrow_style(line))
+        {
             if arrow.starts_with('<') {
                 std::mem::swap(&mut from, &mut to);
             }
@@ -429,6 +489,7 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
             .iter()
             .any(|word| lower == *word || lower.starts_with(&format!("{word} ")))
         {
+            group_depth += 1;
             events.push(SeqEvent::GroupStart(clean_label(
                 line.split_once(' ').map_or(line, |(_, value)| value),
             )));
@@ -437,13 +498,33 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
                 line.split_once(' ').map_or("else", |(_, value)| value),
             )));
         } else if lower == "end" {
+            group_depth = group_depth.checked_sub(1)?;
             events.push(SeqEvent::GroupEnd);
         } else if line.starts_with("==") && line.ends_with("==") {
             events.push(SeqEvent::Divider(clean_label(line.trim_matches('='))));
+        } else if lower.starts_with("activate ") {
+            let target = clean_id(&line["activate ".len()..]);
+            if !valid_id(&target) {
+                return None;
+            }
+            add_participant(
+                &mut participants,
+                &mut indexes,
+                &target,
+                &target,
+                "participant",
+            );
+            events.push(SeqEvent::Activate(target));
+        } else if lower.starts_with("deactivate ") {
+            let target = clean_id(&line["deactivate ".len()..]);
+            if !valid_id(&target) {
+                return None;
+            }
+            events.push(SeqEvent::Deactivate(target));
         } else if lower.starts_with("title ")
+            || lower == "title"
+            || lower == "end title"
             || is_cosmetic(line)
-            || lower.starts_with("activate ")
-            || lower.starts_with("deactivate ")
             || lower.starts_with("destroy ")
             || lower.starts_with("create ")
             || lower == "autonumber"
@@ -461,11 +542,23 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
         }
         index += 1;
     }
-    (!participants.is_empty() && !events.is_empty()).then(|| Sequence {
+    (!participants.is_empty() && !events.is_empty() && group_depth == 0).then(|| Sequence {
         participants,
         events,
         title: title(lines),
     })
+}
+
+fn strip_arrow_style(line: &str) -> String {
+    let mut value = line.to_string();
+    while let Some(start) = value.find("-[") {
+        let Some(end) = value[start + 2..].find(']') else {
+            break;
+        };
+        let end = start + 2 + end;
+        value.replace_range(start + 1..=end, "");
+    }
+    value
 }
 
 fn add_participant(
@@ -522,8 +615,8 @@ fn split_ascii_case<'a>(value: &'a str, needle: &str) -> Option<(&'a str, &'a st
 
 fn split_message(line: &str) -> Option<(String, String, String, String)> {
     const ARROWS: &[&str] = &[
-        "-->>", "<<--", "->>", "<<-", "-->", "<--", "-\\", "\\-", "-/", "/-", "->o", "o<-", "-x",
-        "x-", "->", "<-",
+        "-->>", "<<--", "->>", "<<-", "->x", "<x-", "o->", "<-o", "-->", "<--", "-\\", "\\-", "-/",
+        "/-", "->o", "o<-", "-x", "x-", "->", "<-",
     ];
     for arrow in ARROWS {
         if let Some(at) = line.find(arrow) {
@@ -617,6 +710,7 @@ impl Sequence {
         let mut event_svg = String::new();
         let mut group_svg = String::new();
         let mut groups: Vec<(f64, String)> = Vec::new();
+        let mut activations: HashMap<String, Vec<f64>> = HashMap::new();
         for event in &self.events {
             match event {
                 SeqEvent::Message {
@@ -731,6 +825,37 @@ impl Sequence {
                         p.text,
                     );
                 }
+                SeqEvent::Activate(target) => {
+                    if let Some(&x) = xs.get(target.as_str()) {
+                        activations
+                            .entry(target.clone())
+                            .or_default()
+                            .push(y - 20.0);
+                        let _ = write!(
+                            event_svg,
+                            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"10\" height=\"40\" fill=\"{}\" stroke=\"{}\"/>",
+                            x - 5.0,
+                            y - 20.0,
+                            p.surface_alt,
+                            p.accent
+                        );
+                    }
+                }
+                SeqEvent::Deactivate(target) => {
+                    if let (Some(&x), Some(starts)) =
+                        (xs.get(target.as_str()), activations.get_mut(target))
+                        && let Some(start) = starts.pop()
+                    {
+                        let _ = write!(
+                            event_svg,
+                            "<rect x=\"{:.1}\" y=\"{start:.1}\" width=\"10\" height=\"{:.1}\" fill=\"{}\" stroke=\"{}\"/>",
+                            x - 5.0,
+                            (y - start + 20.0).max(40.0),
+                            p.surface_alt,
+                            p.accent
+                        );
+                    }
+                }
             }
             y += 58.0;
         }
@@ -773,6 +898,7 @@ fn parse_graph(lines: &[String]) -> Option<Graph> {
     let mut indexes = HashMap::new();
     let mut raw_edges = Vec::new();
     let mut index = 0;
+    let mut containers = 0usize;
     while index < lines.len() {
         let Some(line) = significant(&lines[index]) else {
             index += 1;
@@ -781,7 +907,8 @@ fn parse_graph(lines: &[String]) -> Option<Graph> {
         let lower = line.to_ascii_lowercase();
         if is_graph_container(line) {
             // Containers are layout hints. Their children are still parsed;
-            // the closing brace is accepted below.
+            // their balanced braces are still checked below.
+            containers += 1;
         } else if let Some((kind, rest)) = declaration(line) {
             let (id, label) = parse_graph_name(rest)?;
             let mut members = Vec::new();
@@ -798,7 +925,7 @@ fn parse_graph(lines: &[String]) -> Option<Graph> {
                 }
             }
             upsert_node(&mut nodes, &mut indexes, id, label, kind, members);
-        } else if let Some(edge) = split_relation(line) {
+        } else if let Some(edge) = split_relation(&strip_arrow_style(line)) {
             raw_edges.push(edge);
         } else if lower.starts_with("title ") || is_cosmetic(line) {
         } else if lower.starts_with("package ")
@@ -806,10 +933,14 @@ fn parse_graph(lines: &[String]) -> Option<Graph> {
             || lower.starts_with("folder ")
             || lower.starts_with("frame ")
             || line == "{"
-            || line == "}"
         {
             // Containers are layout hints. Their child declarations and
             // relationships remain faithfully represented.
+            if line == "{" {
+                containers += 1;
+            }
+        } else if line == "}" {
+            containers = containers.checked_sub(1)?;
         } else if lower.starts_with("note ") || lower == "end note" {
             // Notes do not alter graph topology; multiline note bodies are
             // accepted as presentation-only until their terminator.
@@ -844,7 +975,7 @@ fn parse_graph(lines: &[String]) -> Option<Graph> {
             tail_diamond: raw.arrow.contains("*--") || raw.arrow.contains("o--"),
         });
     }
-    if nodes.is_empty() || (nodes.len() == 1 && edges.is_empty()) {
+    if containers != 0 || nodes.is_empty() || (nodes.len() == 1 && edges.is_empty()) {
         return None;
     }
     Graph::layout(
@@ -1550,18 +1681,25 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn svg_uri(svg: &str) -> String {
-    format!(
-        "data:image/svg+xml;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(svg.as_bytes())
-    )
+fn asset_url(key: u64, asset: &str) -> String {
+    format!("/api/diagrams/{key:016x}/{asset}")
 }
 
-fn png_uri(png: &[u8]) -> String {
-    format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(png)
-    )
+/// Looks up a rendered asset by the opaque cache key used in its URL.
+///
+/// Assets are intentionally process-local: they are a delivery mechanism
+/// for the diagram cache, not durable uploads or a public file store.
+pub fn asset(key: &str, name: &str) -> Option<(&'static str, &'static [u8])> {
+    let key = u64::from_str_radix(key, 16).ok()?;
+    let cache = cache().lock().ok()?;
+    let diagram = (*cache.get(&key)?)?;
+    match name {
+        "light.svg" => Some(("image/svg+xml; charset=utf-8", &diagram.light_svg)),
+        "dark.svg" => Some(("image/svg+xml; charset=utf-8", &diagram.dark_svg)),
+        "light.png" => Some(("image/png", &diagram.light_png_bytes)),
+        "dark.png" => Some(("image/png", &diagram.dark_png_bytes)),
+        _ => None,
+    }
 }
 
 fn rasterize(svg: &str) -> Option<Vec<u8>> {
@@ -1592,6 +1730,7 @@ pub fn find_in_text(text: &str) -> Vec<Found> {
         return vec![Found {
             diagram,
             source: text.trim().to_string(),
+            offset: 0,
         }];
     }
     let Ok(tree) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else {
@@ -1616,6 +1755,10 @@ fn collect_from_nodes(node: &markdown::mdast::Node, found: &mut Vec<Found>) {
             found.push(Found {
                 diagram,
                 source: code.value.clone(),
+                offset: code
+                    .position
+                    .as_ref()
+                    .map_or(usize::MAX, |p| p.start.offset),
             });
         }
         return;
@@ -1631,24 +1774,78 @@ fn collect_from_nodes(node: &markdown::mdast::Node, found: &mut Vec<Found>) {
 mod tests {
     use super::*;
 
-    const SEQUENCE: &str = "@startuml\nAlice -> Bob: Authentication Request\nBob --> Alice: Authentication Response\n@enduml";
-
     #[test]
     fn renders_sequence_to_svg_and_png_for_both_themes() {
-        let diagram = render(SEQUENCE).expect("sequence renders");
-        assert!(diagram.light.starts_with("data:image/svg+xml;base64,"));
-        assert!(diagram.dark.starts_with("data:image/svg+xml;base64,"));
-        assert!(diagram.light_png.starts_with("data:image/png;base64,"));
-        assert!(diagram.dark_png.starts_with("data:image/png;base64,"));
+        let diagram =
+            render(include_str!("fixtures/plantuml/sequence.puml")).expect("sequence renders");
+        assert!(diagram.light.starts_with("/api/diagrams/"));
+        assert!(diagram.dark.ends_with("/dark.svg"));
+        assert!(diagram.light_png.ends_with("/light.png"));
         assert_ne!(diagram.light, diagram.dark);
-        let png = base64::engine::general_purpose::STANDARD
-            .decode(
-                diagram
-                    .light_png
-                    .strip_prefix("data:image/png;base64,")
-                    .unwrap(),
-            )
-            .unwrap();
+        let (_, png) = asset_from_url(&diagram.light_png).expect("cached PNG");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn golden_fixtures_render_to_structured_svg_and_valid_png() {
+        // These sources cover the supported families at their public syntax
+        // boundary.  Assert stable SVG structure rather than byte-for-byte
+        // output: layout metrics can legitimately change while the rendered
+        // diagram remains correct.
+        for (source, label) in [
+            (include_str!("fixtures/plantuml/sequence.puml"), "Alice"),
+            (include_str!("fixtures/plantuml/class.puml"), "Animal"),
+            (
+                include_str!("fixtures/plantuml/component.puml"),
+                "Web console",
+            ),
+            (include_str!("fixtures/plantuml/state.puml"), "Idle"),
+            (
+                include_str!("fixtures/plantuml/activity.puml"),
+                "Read configuration",
+            ),
+            (
+                include_str!("fixtures/plantuml/aliases-and-notes.puml"),
+                "Web client",
+            ),
+            (
+                include_str!("fixtures/plantuml/loops.puml"),
+                "every 5 minutes",
+            ),
+            (
+                include_str!("fixtures/plantuml/sequence-hardened.puml"),
+                "Request lifecycle",
+            ),
+            (
+                include_str!("fixtures/plantuml/nested-components.puml"),
+                "API &lt;&lt;service&gt;&gt;",
+            ),
+        ] {
+            let diagram = render(source).unwrap_or_else(|| panic!("fixture failed: {label}"));
+            let svg = asset_svg(&diagram.light);
+            assert!(svg.starts_with("<svg "), "{label}: {svg}");
+            assert!(
+                svg.contains("<text ") && svg.contains(label),
+                "{label}: {svg}"
+            );
+            let (_, png) = asset_from_url(&diagram.light_png).expect("cached PNG");
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{label}");
+        }
+        assert!(render(include_str!("fixtures/plantuml/malformed.puml")).is_none());
+        assert!(render("@startuml\npackage open {\ncomponent A\n@enduml").is_none());
+        assert!(render("@startuml\nAlice -> Bob\nalt ok\nAlice -> Bob: hi\n@enduml").is_none());
+    }
+
+    #[test]
+    fn cached_assets_survive_subsequent_renders() {
+        let first = render("@startuml\nA -> B: first\n@enduml").unwrap();
+        let url = first.light_png.clone();
+        // Asset routes must remain valid for a message that is already on
+        // screen while later messages add distinct diagrams.
+        for index in 0..3 {
+            assert!(render(&format!("@startuml\nA -> B: {index}\n@enduml")).is_some());
+        }
+        let (_, png) = asset_from_url(&url).expect("original asset retained");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
@@ -1656,7 +1853,7 @@ mod tests {
     fn renders_class_relationships_and_members() {
         let source = "@startuml\nclass Animal {\n  +name: String\n  +move()\n}\nclass Dog\nAnimal <|-- Dog : extends\n@enduml";
         let diagram = render(source).expect("class diagram renders");
-        let svg = decode_svg(&diagram.light);
+        let svg = asset_svg(&diagram.light);
         assert!(svg.contains("Animal"));
         assert!(svg.contains("Dog"));
         assert!(svg.contains("+move()"));
@@ -1667,23 +1864,23 @@ mod tests {
     fn graph_declarations_disambiguate_component_arrows_from_messages() {
         let source = "@startuml\ncomponent [Web console] as web\ndatabase Storage as db\nweb --> db : writes\n@enduml";
         let diagram = render(source).expect("component diagram renders");
-        let svg = decode_svg(&diagram.light);
+        let svg = asset_svg(&diagram.light);
         assert!(svg.contains("Web console"));
         assert!(svg.contains("Storage"));
         assert!(svg.contains("writes"));
 
         let implicit = "@startuml\n[Web] --> [API]\n@enduml";
-        let svg = decode_svg(&render(implicit).expect("implicit components render").light);
+        let svg = asset_svg(&render(implicit).expect("implicit components render").light);
         assert!(svg.contains("Web"));
         assert!(svg.contains("API"));
 
         let state = "@startuml\nskinparam state {\n  BackgroundColor white\n}\n[*] --> Idle\nIdle --> [*]\n@enduml";
-        let svg = decode_svg(&render(state).expect("state graph renders").light);
+        let svg = asset_svg(&render(state).expect("state graph renders").light);
         assert!(svg.contains("Idle"));
         assert_eq!(svg.matches("<circle").count(), 1, "{svg}");
 
         let usecase = "@startuml\nactor User\nrectangle System {\n  usecase (Log in) as Login\n}\nUser --> Login\n@enduml";
-        let svg = decode_svg(&render(usecase).expect("use-case container renders").light);
+        let svg = asset_svg(&render(usecase).expect("use-case container renders").light);
         assert!(svg.contains("User"));
         assert!(svg.contains("Log in"));
     }
@@ -1692,7 +1889,7 @@ mod tests {
     fn renders_activity_syntax() {
         let source = "@startuml\nstart\n:Read configuration;\nif (valid?) then (yes)\n:Run server;\nelse (no)\n:Report error;\nendif\nstop\n@enduml";
         let diagram = render(source).expect("activity renders");
-        let svg = decode_svg(&diagram.dark);
+        let svg = asset_svg(&diagram.dark);
         assert!(svg.contains("Read configuration"));
         assert!(svg.contains("Report error"));
         assert!(
@@ -1701,7 +1898,7 @@ mod tests {
         );
 
         let loops = "@startuml\nstart\nwhile (more?)\n:Process item;\nendwhile\nrepeat\n:Wait;\nrepeat while (retry?)\nstop\n@enduml";
-        let svg = decode_svg(&render(loops).expect("activity loops render").light);
+        let svg = asset_svg(&render(loops).expect("activity loops render").light);
         assert!(svg.contains("more?"));
         assert!(svg.contains("retry?"));
         assert!(svg.contains("Process item"));
@@ -1721,7 +1918,7 @@ mod tests {
     fn escapes_untrusted_labels() {
         let diagram = render("@startuml\nA -> B: </text><script>alert(1)</script>\n@enduml")
             .expect("renders safely");
-        let svg = decode_svg(&diagram.light);
+        let svg = asset_svg(&diagram.light);
         assert!(!svg.contains("<script>"));
         assert!(svg.contains("&lt;/text&gt;"));
     }
@@ -1729,21 +1926,29 @@ mod tests {
     #[test]
     fn caches_and_finds_attached_diagrams() {
         assert!(std::ptr::eq(
-            render(SEQUENCE).unwrap(),
-            render(SEQUENCE).unwrap()
+            render(include_str!("fixtures/plantuml/sequence.puml")).unwrap(),
+            render(include_str!("fixtures/plantuml/sequence.puml")).unwrap()
         ));
         let doc = format!(
-            "# Design\n\n```plantuml\n{SEQUENCE}\n```\n\n```rust\n@startuml\nA -> B\n@enduml\n```\n"
+            "# Design\n\n```plantuml\n{}\n```\n\n```rust\n@startuml\nA -> B\n@enduml\n```\n",
+            include_str!("fixtures/plantuml/sequence.puml")
         );
         let found = find_in_text(&doc);
         assert_eq!(found.len(), 1);
         assert!(found[0].source.contains("Alice -> Bob"));
     }
 
-    fn decode_svg(uri: &str) -> String {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(uri.strip_prefix("data:image/svg+xml;base64,").unwrap())
-            .unwrap();
-        String::from_utf8(bytes).unwrap()
+    fn asset_from_url(url: &str) -> Option<(&'static str, &'static [u8])> {
+        let mut segments = url.trim_start_matches('/').split('/');
+        if segments.next()? != "api" || segments.next()? != "diagrams" {
+            return None;
+        }
+        asset(segments.next()?, segments.next()?)
+    }
+
+    fn asset_svg(url: &str) -> String {
+        let (mime, bytes) = asset_from_url(url).expect("cached SVG");
+        assert_eq!(mime, "image/svg+xml; charset=utf-8");
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 }

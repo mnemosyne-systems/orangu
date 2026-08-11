@@ -1528,8 +1528,20 @@ activity syntax. Cosmetic `skinparam` and direction hints are accepted where
 they do not change topology. Unsupported structural syntax stays an ordinary
 code block, so the console never substitutes an incomplete picture.
 
+| Syntax family | Status |
+| --- | --- |
+| Sequence: participants, aliases, messages, notes, `alt`/`opt`/`loop` groups | Supported |
+| Class, object and interface declarations; members and common UML relationships | Supported |
+| Component, deployment, use-case and state graphs | Supported |
+| Activity: `start`/`stop`, actions, branches, `while` and `repeat` loops | Supported |
+| Simple cosmetic `skinparam` blocks and layout direction hints | Accepted when they do not alter diagram topology |
+| Nested packages/components, multiline titles, stereotypes, activation bars, rich notes and common arrow modifiers | Supported |
+| Gantt, mindmap/WBS, timing, JSON/YAML, Salt and preprocessing/includes | Not supported (planned as separate follow-up work) |
+
 PlantUML diagrams provide both SVG and PNG downloads. Both formats are made
-locally from the same layout and have light and dark variants. Untagged
+locally from the same layout and have light and dark variants. They are
+served from the console's in-memory diagram cache rather than embedded in
+streamed HTML or attachment JSON. Untagged
 PlantUML is recognised only by a leading `@startuml` and closing `@enduml`;
 the explicit guards keep prose containing `A -> B` from becoming a diagram.
 

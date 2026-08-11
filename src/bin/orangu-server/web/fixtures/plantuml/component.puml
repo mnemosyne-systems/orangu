@@ -1,0 +1,5 @@
+@startuml
+component [Web console] as web
+database Storage as db
+web --> db : writes
+@enduml
