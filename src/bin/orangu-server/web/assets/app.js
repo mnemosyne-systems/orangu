@@ -34,9 +34,18 @@
   // "X" while a reply is streaming so the same button can cancel it.
   const SEND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
   const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
-  // Shown in each assistant message's footer, next to the generation time
-  // — triggers a raw-Markdown download of that answer.
+  // Shown in each assistant message's footer, next to the generation time.
+  // The primary action saves the raw Markdown; its adjacent menu offers
+  // plain text and the browser's PDF print flow.
   const SAVE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+  const SAVE_MENU_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>`;
+  let openSaveMenu = null;
+
+  document.addEventListener("click", (event) => {
+    if (openSaveMenu && !openSaveMenu.control.contains(event.target)) {
+      openSaveMenu.close();
+    }
+  });
 
   const THEME_KEY = "orangu-theme";
 
@@ -347,6 +356,123 @@
     URL.revokeObjectURL(url);
   }
 
+  // Plain text is taken from the rendered answer rather than naively
+  // stripping Markdown: that preserves readable tables, code, and links
+  // while omitting the generation footer and its controls.
+  function renderedAnswerText(assistantEl) {
+    const answer = assistantEl.cloneNode(true);
+    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source").forEach((el) => el.remove());
+    return (answer.innerText ?? answer.textContent ?? "").trim();
+  }
+
+  // Browser PDF generation is intentionally native: it is available offline,
+  // preserves the rendered Markdown, and lets the user pick their normal
+  // printer or "Save to PDF" destination. It happens in a new window, so
+  // the console stays exactly where it was after saving.
+  function printAnswerAsPdf(assistantEl) {
+    // Open synchronously from the menu click, before any document work, so
+    // browsers recognize this as a user-initiated popup rather than blocking
+    // it. The new window is entirely local and has no opener relationship.
+    const pdfWindow = window.open("", "_blank");
+    if (!pdfWindow) return;
+    pdfWindow.opener = null;
+
+    const answer = assistantEl.cloneNode(true);
+    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source").forEach((el) => el.remove());
+    answer.classList.add("pdf-answer");
+
+    pdfWindow.document.open();
+    pdfWindow.document.write(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orangu answer</title>
+<link rel="stylesheet" href="/static/katex/katex.min.css">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  body { padding: 24px; background: #fff; color: #000; }
+  .pdf-answer { max-width: none; width: auto; padding: 0; border: none; background: none; color: #000; }
+  .pdf-answer .diagram-actions, .pdf-answer .diagram-source { display: none; }
+  @media print { body { padding: 0; } }
+</style>
+</head>
+<body>${answer.outerHTML}</body>
+</html>`);
+    pdfWindow.document.close();
+    pdfWindow.addEventListener("load", () => {
+      pdfWindow.focus();
+      pdfWindow.print();
+    }, { once: true });
+  }
+
+  function addSaveMenuItem(menu, label, onClick) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "save-format-item";
+    item.setAttribute("role", "menuitem");
+    item.textContent = label;
+    item.addEventListener("click", onClick);
+    menu.appendChild(item);
+  }
+
+  // A split button keeps Markdown as the one-click default while making the
+  // other answer formats discoverable without a dialog.
+  function createAnswerSaveControl(assistantEl, rawContent) {
+    const control = document.createElement("div");
+    control.className = "save-control";
+
+    const markdown = document.createElement("button");
+    markdown.type = "button";
+    markdown.className = "save-md-btn";
+    markdown.innerHTML = SAVE_ICON;
+    markdown.setAttribute("aria-label", "Save answer as Markdown");
+    markdown.setAttribute("title", "Save answer as Markdown");
+    markdown.addEventListener("click", () => downloadMarkdown(rawContent ?? ""));
+    control.appendChild(markdown);
+
+    const menu = document.createElement("div");
+    menu.className = "save-format-menu";
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    addSaveMenuItem(menu, "Markdown", () => downloadMarkdown(rawContent ?? ""));
+    addSaveMenuItem(menu, "Text", () => downloadTextFile(renderedAnswerText(assistantEl), "orangu-answer"));
+    addSaveMenuItem(menu, "PDF", () => printAnswerAsPdf(assistantEl));
+
+    const menuButton = document.createElement("button");
+    menuButton.type = "button";
+    menuButton.className = "save-menu-btn";
+    menuButton.innerHTML = SAVE_MENU_ICON;
+    menuButton.setAttribute("aria-label", "Choose answer save format");
+    menuButton.setAttribute("title", "Choose answer save format");
+    const close = () => {
+      menu.hidden = true;
+      menuButton.setAttribute("aria-expanded", "false");
+      if (openSaveMenu?.control === control) openSaveMenu = null;
+    };
+    menu.addEventListener("click", close);
+    menuButton.setAttribute("aria-haspopup", "menu");
+    menuButton.setAttribute("aria-expanded", "false");
+    menuButton.addEventListener("click", () => {
+      if (menu.hidden) {
+        if (openSaveMenu) openSaveMenu.close();
+        menu.hidden = false;
+        menuButton.setAttribute("aria-expanded", "true");
+        openSaveMenu = { control, close };
+      } else {
+        close();
+      }
+    });
+    control.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        close();
+        menuButton.focus();
+      }
+    });
+    control.append(menuButton, menu);
+    return control;
+  }
+
   // The whole visible transcript, read back out of the DOM rather than
   // kept in a parallel JS structure — `state` deliberately holds nothing
   // but `sessionId`/`busy`/`abortController` (see its own declaration), and
@@ -454,17 +580,11 @@
     }
 
     const time = document.createElement("span");
+    time.className = "gen-duration";
     time.textContent = formatDuration(ms);
     footer.appendChild(time);
 
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "save-md-btn";
-    saveBtn.innerHTML = SAVE_ICON;
-    saveBtn.setAttribute("aria-label", "Save answer as Markdown");
-    saveBtn.setAttribute("title", "Save answer as Markdown");
-    saveBtn.addEventListener("click", () => downloadMarkdown(rawContent ?? ""));
-    footer.appendChild(saveBtn);
+    footer.appendChild(createAnswerSaveControl(assistantEl, rawContent));
 
     assistantEl.appendChild(footer);
   }

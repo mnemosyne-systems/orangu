@@ -406,33 +406,92 @@ button:disabled {
   gap: 6px;
   color: var(--text-dim);
   font-size: 0.72em;
-  opacity: 0.65;
 }
 
 /* Tokens-per-second sits at the left of the footer (the time and Save
    button stay right); the auto margin absorbs the free space between
-   them. Tabular figures keep its width steady as the rate ticks. */
+   them. The individual controls are dimmed, rather than the whole footer,
+   so the format popup stays fully opaque. */
+.gen-tps,
+.gen-duration,
+.save-md-btn,
+.save-menu-btn {
+  opacity: 0.65;
+}
+
 .gen-tps {
   margin-right: auto;
   font-variant-numeric: tabular-nums;
 }
 
-.save-md-btn {
+.save-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.save-md-btn,
+.save-menu-btn {
   display: inline-flex;
   padding: 0;
   border: none;
   background: none;
   color: inherit;
   line-height: 0;
+  cursor: pointer;
 }
 
-.save-md-btn:hover {
+.save-menu-btn {
+  margin-left: 2px;
+}
+
+.save-md-btn:hover,
+.save-menu-btn:hover {
   color: var(--text);
+  opacity: 1;
 }
 
-.save-md-btn svg {
+.save-md-btn svg,
+.save-menu-btn svg {
   width: 12px;
   height: 12px;
+}
+
+.save-menu-btn svg {
+  width: 10px;
+}
+
+.save-format-menu {
+  position: absolute;
+  z-index: 1;
+  right: 0;
+  bottom: calc(100% + 5px);
+  min-width: 142px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  box-shadow: 0 3px 10px rgb(0 0 0 / 15%);
+}
+
+.save-format-item {
+  display: block;
+  width: 100%;
+  padding: 5px 7px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 1em;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.save-format-item:hover,
+.save-format-item:focus-visible {
+  background: var(--bg-input);
 }
 
 .message pre {
