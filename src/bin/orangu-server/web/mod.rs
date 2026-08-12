@@ -290,7 +290,7 @@ async fn diagram_asset(Path((key, name)): Path<(String, String)>) -> impl IntoRe
                 ("content-type", content_type),
                 ("cache-control", "private, max-age=3600"),
             ],
-            bytes.to_vec(),
+            bytes,
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
