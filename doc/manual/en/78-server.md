@@ -2411,6 +2411,33 @@ addition, not a rewrite of model output. It runs on the `done` event
 and again on session load, so a reloaded answer carries the same picture a
 live one did.
 
+### PlantUML diagrams (`web::plantuml`)
+
+`web::plantuml` is a clean-room, offline implementation of the commonly
+generated PlantUML UML families. It parses guarded `@startuml` documents,
+lays them out directly, emits theme-specific SVG, and rasterizes the same SVG
+to PNG with `resvg`. It never starts Java or Graphviz, downloads a jar, expands
+an include, or contacts a PlantUML server.
+
+The parser deliberately accepts a smaller language than PlantUML itself:
+sequence, class/object/interface, component/deployment/use-case/state, and
+modern activity diagrams. Unsupported structural input returns `None`, so
+`web::render` leaves the original fenced block visible instead of presenting
+an incomplete diagram as if it were authoritative. Presentation-only syntax
+such as common `skinparam` blocks may be accepted when ignoring it cannot
+change topology. Source size, item count, output dimensions, and raster pixel
+count are capped before expensive work.
+
+Each successful render produces four assets: light and dark SVG plus light and
+dark PNG. The streamed HTML contains short `/api/diagrams/<sha256>/<asset>`
+URLs rather than repeating base64 PNG data on every token. A 256-entry,
+128-MiB LRU holds owned diagrams and cached failures; eviction drops the `Arc`
+and its SVG and PNG buffers instead of leaking them for the rest of the server
+process.
+Attachment discovery shares the same renderer, recognises `plantuml`, `puml`,
+and `pu` fences case-insensitively, preserves mixed Mermaid/PlantUML source
+order, and applies the common per-attachment cap.
+
 ### Bundling a model into the binary (`bundle.rs`)
 
 `orangu-server bundle` writes a new executable: this binary's program image,

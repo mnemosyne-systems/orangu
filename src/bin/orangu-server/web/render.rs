@@ -294,9 +294,10 @@ impl Renderer {
             .as_deref()
             .map(str::trim)
             .filter(|l| !l.is_empty());
+        let diagram_language = language.map(str::to_ascii_lowercase);
 
         if self.fence_is_closed(code) {
-            match language {
+            match diagram_language.as_deref() {
                 Some("mermaid" | "mmd") => {
                     if let Some(diagram) = mermaid::render(&code.value) {
                         return render_diagram(diagram, &code.value);
@@ -304,12 +305,12 @@ impl Renderer {
                 }
                 Some("plantuml" | "puml" | "pu") => {
                     if let Some(diagram) = plantuml::render(&code.value) {
-                        return render_plantuml_diagram(diagram, &code.value);
+                        return render_plantuml_diagram(&diagram, &code.value);
                     }
                 }
                 None if plantuml::looks_like_diagram(&code.value) => {
                     if let Some(diagram) = plantuml::render(&code.value) {
-                        return render_plantuml_diagram(diagram, &code.value);
+                        return render_plantuml_diagram(&diagram, &code.value);
                     }
                 }
                 None if mermaid::looks_like_diagram(&code.value) => {
@@ -628,6 +629,16 @@ mod tests {
         assert!(html.contains("download=\"orangu-plantuml.png\""));
         assert!(html.contains("/light.png"));
         assert!(html.contains("Alice -&gt; Bob") || html.contains("Alice -&gt; Bob: hello"));
+    }
+
+    #[test]
+    fn plantuml_fence_tags_are_case_insensitive() {
+        let html =
+            render_markdown_to_html("```PlantUML\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
+        assert!(
+            html.contains("<figure class=\"plantuml-diagram\">"),
+            "{html}"
+        );
     }
 
     #[test]

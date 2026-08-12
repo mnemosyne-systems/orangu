@@ -16,20 +16,67 @@
 //! `None`, allowing the Markdown renderer to preserve the original code block
 //! instead of displaying a plausible but incomplete diagram.
 
-use rustc_hash::FxHasher;
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Write as _,
-    hash::{Hash as _, Hasher as _},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
+const CACHE_LIMIT: usize = 256;
+const CACHE_BYTES_LIMIT: usize = 128 * 1024 * 1024;
+const MAX_DIAGRAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_ITEMS: usize = 512;
 const MAX_DIMENSION: f64 = 4096.0;
 pub const MAX_PER_ATTACHMENT: usize = 32;
 
-type Cache = HashMap<u64, Option<&'static Diagram>>;
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, Option<Arc<Diagram>>>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl Cache {
+    fn get(&mut self, key: &str) -> Option<Option<Arc<Diagram>>> {
+        let value = self.entries.get(key).cloned()?;
+        if let Some(index) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.to_string());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: Option<Arc<Diagram>>) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry_bytes(&previous));
+            self.order.retain(|candidate| candidate != &key);
+        }
+        let value_bytes = entry_bytes(&value);
+        while self.entries.len() >= CACHE_LIMIT
+            || self.bytes.saturating_add(value_bytes) > CACHE_BYTES_LIMIT
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some(previous) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(entry_bytes(&previous));
+                }
+            } else {
+                break;
+            }
+        }
+        if value_bytes > CACHE_BYTES_LIMIT {
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.bytes += value_bytes;
+        self.entries.insert(key, value);
+    }
+}
+
+fn entry_bytes(value: &Option<Arc<Diagram>>) -> usize {
+    value.as_ref().map_or(0, |diagram| diagram.asset_bytes())
+}
 
 /// A rendered PlantUML diagram in both console themes and both requested
 /// output formats.
@@ -49,8 +96,17 @@ pub struct Diagram {
     pub height: f64,
 }
 
+impl Diagram {
+    fn asset_bytes(&self) -> usize {
+        self.light_svg.len()
+            + self.dark_svg.len()
+            + self.light_png_bytes.len()
+            + self.dark_png_bytes.len()
+    }
+}
+
 pub struct Found {
-    pub diagram: &'static Diagram,
+    pub diagram: Arc<Diagram>,
     pub source: String,
     pub offset: usize,
 }
@@ -95,53 +151,51 @@ fn palette(dark: bool) -> Palette {
 
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
 }
 
 /// PlantUML source is unambiguous only when it has one of its `@start...`
 /// guards. Requiring the guard prevents prose containing arrows from being
 /// converted into a picture when it appears in an untagged fence or file.
 pub fn looks_like_diagram(text: &str) -> bool {
-    first_meaningful_line(text).is_some_and(|line| {
-        let line = line.to_ascii_lowercase();
-        line == "@startuml"
-            || line.starts_with("@startuml ")
-            || line == "@startmindmap"
-            || line == "@startwbs"
-    })
+    if text.len() > MAX_SOURCE_BYTES {
+        return false;
+    }
+    strip_comments(text)
+        .and_then(|lines| lines.into_iter().find(|line| !line.is_empty()))
+        .is_some_and(|line| {
+            let line = line.to_ascii_lowercase();
+            line == "@startuml"
+                || line.starts_with("@startuml ")
+                || line == "@startmindmap"
+                || line == "@startwbs"
+        })
 }
 
-fn first_meaningful_line(text: &str) -> Option<&str> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('\''))
-}
-
-pub fn render(source: &str) -> Option<&'static Diagram> {
+pub fn render(source: &str) -> Option<Arc<Diagram>> {
     if source.len() > MAX_SOURCE_BYTES {
         return None;
     }
-    let mut hasher = FxHasher::default();
-    source.hash(&mut hasher);
-    let key = hasher.finish();
-    if let Ok(cache) = cache().lock()
+    let key = cache_key(source);
+    if let Ok(mut cache) = cache().lock()
         && let Some(hit) = cache.get(&key)
     {
-        return *hit;
+        return hit;
     }
 
-    let rendered = render_uncached(source);
+    let rendered = render_uncached(source, &key);
     if let Ok(mut cache) = cache().lock() {
-        // `Diagram` is intentionally leaked so callers can cheaply retain
-        // shared renders.  Clearing this map therefore did not release its
-        // bytes, but did make previously streamed asset URLs return 404.
-        // Retain the lookup for the lifetime of the process instead.
-        cache.insert(key, rendered);
+        cache.insert(key, rendered.clone());
     }
     rendered
 }
 
-fn render_uncached(source: &str) -> Option<&'static Diagram> {
+fn cache_key(source: &str) -> String {
+    let digest = Sha256::digest(source.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn render_uncached(source: &str, key: &str) -> Option<Arc<Diagram>> {
     let body = diagram_body(source)?;
     let parsed = parse(&body)?;
     let light_svg = parsed.svg(palette(false))?;
@@ -149,10 +203,7 @@ fn render_uncached(source: &str) -> Option<&'static Diagram> {
     let (width, height) = parsed.size();
     let light_png = rasterize(&light_svg)?;
     let dark_png = rasterize(&dark_svg)?;
-    let mut hasher = FxHasher::default();
-    source.hash(&mut hasher);
-    let key = hasher.finish();
-    Some(Box::leak(Box::new(Diagram {
+    let diagram = Arc::new(Diagram {
         light: asset_url(key, "light.svg"),
         dark: asset_url(key, "dark.svg"),
         light_png: asset_url(key, "light.png"),
@@ -163,11 +214,12 @@ fn render_uncached(source: &str) -> Option<&'static Diagram> {
         dark_png_bytes: dark_png,
         width,
         height,
-    })))
+    });
+    (diagram.asset_bytes() <= MAX_DIAGRAM_BYTES).then_some(diagram)
 }
 
 fn diagram_body(source: &str) -> Option<Vec<String>> {
-    let lines: Vec<_> = source.lines().map(str::trim).collect();
+    let lines = strip_comments(source)?;
     let start = lines
         .iter()
         .position(|line| !line.is_empty() && !line.starts_with('\''))?;
@@ -199,7 +251,7 @@ fn diagram_body(source: &str) -> Option<Vec<String>> {
     let mut body = Vec::new();
     let mut index = start + 1;
     while index < end {
-        let line = lines[index];
+        let line = &lines[index];
         if line.to_ascii_lowercase().starts_with("skinparam ") && line.ends_with('{') {
             index += 1;
             while index < end && lines[index] != "}" {
@@ -209,11 +261,56 @@ fn diagram_body(source: &str) -> Option<Vec<String>> {
                 return None;
             }
         } else {
-            body.push(line.to_string());
+            body.push(line.clone());
         }
         index += 1;
     }
     Some(body)
+}
+
+/// Removes PlantUML apostrophe and `/' ... '/` comments without treating
+/// comment markers inside quoted labels as syntax.
+fn strip_comments(source: &str) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    for raw in source.lines() {
+        let mut line = String::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut index = 0;
+        while index < raw.len() {
+            let rest = &raw[index..];
+            if in_block {
+                if rest.starts_with("'/") {
+                    in_block = false;
+                    index += 2;
+                } else {
+                    index += rest.chars().next()?.len_utf8();
+                }
+                continue;
+            }
+            if !quoted && rest.starts_with("/'") {
+                in_block = true;
+                index += 2;
+                continue;
+            }
+            let ch = rest.chars().next()?;
+            if !quoted && ch == '\'' {
+                break;
+            }
+            line.push(ch);
+            index += ch.len_utf8();
+            if ch == '"' && !escaped {
+                quoted = !quoted;
+            }
+            escaped = ch == '\\' && !escaped;
+            if ch != '\\' {
+                escaped = false;
+            }
+        }
+        lines.push(line.trim().to_string());
+    }
+    (!in_block).then_some(lines)
 }
 
 enum Parsed {
@@ -434,6 +531,7 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
     let mut participants = Vec::new();
     let mut indexes = HashMap::new();
     let mut events = Vec::new();
+    let mut calls = Vec::new();
     let mut index = 0;
     let mut group_depth = 0usize;
     while index < lines.len() {
@@ -454,6 +552,7 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
             }
             add_participant(&mut participants, &mut indexes, &from, &from, "participant");
             add_participant(&mut participants, &mut indexes, &to, &to, "participant");
+            calls.push((from.clone(), to.clone()));
             events.push(SeqEvent::Message {
                 from,
                 to,
@@ -494,6 +593,9 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
                 line.split_once(' ').map_or(line, |(_, value)| value),
             )));
         } else if lower == "else" || lower.starts_with("else ") {
+            if group_depth == 0 {
+                return None;
+            }
             events.push(SeqEvent::GroupElse(clean_label(
                 line.split_once(' ').map_or("else", |(_, value)| value),
             )));
@@ -521,19 +623,24 @@ fn parse_sequence(lines: &[String]) -> Option<Sequence> {
                 return None;
             }
             events.push(SeqEvent::Deactivate(target));
+        } else if lower == "return" || lower.starts_with("return ") {
+            let (from, to) = calls.pop()?;
+            events.push(SeqEvent::Message {
+                from: to,
+                to: from,
+                label: clean_label(line.get("return".len()..).unwrap_or_default()),
+                dashed: true,
+                open: true,
+            });
         } else if lower.starts_with("title ")
             || lower == "title"
             || lower == "end title"
             || is_cosmetic(line)
-            || lower.starts_with("destroy ")
-            || lower.starts_with("create ")
             || lower == "autonumber"
             || lower.starts_with("autonumber ")
-            || lower == "return"
-            || lower.starts_with("return ")
         {
-            // Presentation/lifecycle directives do not change the message
-            // topology drawn by this compact renderer.
+            // Presentation directives do not change the message topology
+            // drawn by this compact renderer.
         } else {
             return None;
         }
@@ -1681,23 +1788,25 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn asset_url(key: u64, asset: &str) -> String {
-    format!("/api/diagrams/{key:016x}/{asset}")
+fn asset_url(key: &str, asset: &str) -> String {
+    format!("/api/diagrams/{key}/{asset}")
 }
 
 /// Looks up a rendered asset by the opaque cache key used in its URL.
 ///
 /// Assets are intentionally process-local: they are a delivery mechanism
 /// for the diagram cache, not durable uploads or a public file store.
-pub fn asset(key: &str, name: &str) -> Option<(&'static str, &'static [u8])> {
-    let key = u64::from_str_radix(key, 16).ok()?;
-    let cache = cache().lock().ok()?;
-    let diagram = (*cache.get(&key)?)?;
+pub fn asset(key: &str, name: &str) -> Option<(&'static str, Vec<u8>)> {
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut cache = cache().lock().ok()?;
+    let diagram = cache.get(key)??;
     match name {
-        "light.svg" => Some(("image/svg+xml; charset=utf-8", &diagram.light_svg)),
-        "dark.svg" => Some(("image/svg+xml; charset=utf-8", &diagram.dark_svg)),
-        "light.png" => Some(("image/png", &diagram.light_png_bytes)),
-        "dark.png" => Some(("image/png", &diagram.dark_png_bytes)),
+        "light.svg" => Some(("image/svg+xml; charset=utf-8", diagram.light_svg.clone())),
+        "dark.svg" => Some(("image/svg+xml; charset=utf-8", diagram.dark_svg.clone())),
+        "light.png" => Some(("image/png", diagram.light_png_bytes.clone())),
+        "dark.png" => Some(("image/png", diagram.dark_png_bytes.clone())),
         _ => None,
     }
 }
@@ -1747,7 +1856,11 @@ fn collect_from_nodes(node: &markdown::mdast::Node, found: &mut Vec<Found>) {
     }
     if let markdown::mdast::Node::Code(code) = node {
         let language = code.lang.as_deref().map(str::trim);
-        let tagged = matches!(language, Some("plantuml" | "puml" | "pu"));
+        let diagram_language = language.map(str::to_ascii_lowercase);
+        let tagged = matches!(
+            diagram_language.as_deref(),
+            Some("plantuml" | "puml" | "pu")
+        );
         let untagged = language.unwrap_or("").is_empty();
         if (tagged || (untagged && looks_like_diagram(&code.value)))
             && let Some(diagram) = render(&code.value)
@@ -1850,6 +1963,39 @@ mod tests {
     }
 
     #[test]
+    fn cache_is_lru_bounded_without_leaking_diagrams() {
+        let mut cache = Cache::default();
+        for index in 0..=CACHE_LIMIT {
+            cache.insert(format!("{index:064x}"), None);
+        }
+        assert_eq!(cache.entries.len(), CACHE_LIMIT);
+        assert!(cache.bytes <= CACHE_BYTES_LIMIT);
+        assert!(!cache.entries.contains_key(&format!("{:064x}", 0)));
+        assert!(cache.entries.contains_key(&format!("{:064x}", CACHE_LIMIT)));
+    }
+
+    #[test]
+    fn supports_comments_and_return_shorthand() {
+        let source = "@startuml\n/' ignored block\nA -> Missing\n'/\nparticipant \"O'Reilly\" as user\nparticipant API\nuser -> API: request ' trailing comment\nreturn response\n@enduml";
+        let diagram = render(source).expect("comments and return render");
+        let svg = asset_svg(&diagram.light);
+        assert!(svg.contains("O&apos;Reilly"));
+        assert!(svg.contains("request"));
+        assert!(svg.contains("response"));
+        assert!(!svg.contains("Missing"));
+        assert_eq!(svg.matches("marker-end=\"url(#open-arrow)\"").count(), 1);
+        assert!(looks_like_diagram(source));
+    }
+
+    #[test]
+    fn rejects_unbalanced_or_semantically_unsupported_sequence_syntax() {
+        assert!(render("@startuml\nA -> B\nelse orphan\n@enduml").is_none());
+        assert!(render("@startuml\nreturn orphan\n@enduml").is_none());
+        assert!(render("@startuml\ncreate B\nA -> B\n@enduml").is_none());
+        assert!(render("@startuml\n/' never closed\nA -> B\n@enduml").is_none());
+    }
+
+    #[test]
     fn renders_class_relationships_and_members() {
         let source = "@startuml\nclass Animal {\n  +name: String\n  +move()\n}\nclass Dog\nAnimal <|-- Dog : extends\n@enduml";
         let diagram = render(source).expect("class diagram renders");
@@ -1925,9 +2071,9 @@ mod tests {
 
     #[test]
     fn caches_and_finds_attached_diagrams() {
-        assert!(std::ptr::eq(
-            render(include_str!("fixtures/plantuml/sequence.puml")).unwrap(),
-            render(include_str!("fixtures/plantuml/sequence.puml")).unwrap()
+        assert!(Arc::ptr_eq(
+            &render(include_str!("fixtures/plantuml/sequence.puml")).unwrap(),
+            &render(include_str!("fixtures/plantuml/sequence.puml")).unwrap()
         ));
         let doc = format!(
             "# Design\n\n```plantuml\n{}\n```\n\n```rust\n@startuml\nA -> B\n@enduml\n```\n",
@@ -1938,7 +2084,7 @@ mod tests {
         assert!(found[0].source.contains("Alice -> Bob"));
     }
 
-    fn asset_from_url(url: &str) -> Option<(&'static str, &'static [u8])> {
+    fn asset_from_url(url: &str) -> Option<(&'static str, Vec<u8>)> {
         let mut segments = url.trim_start_matches('/').split('/');
         if segments.next()? != "api" || segments.next()? != "diagrams" {
             return None;
