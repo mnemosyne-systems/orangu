@@ -3268,7 +3268,9 @@ pub(crate) fn run_auto_review_browse(
             (KeyCode::Tab, _, _) => {
                 crate::input::apply_completion(&mut input_state, workspace, &[], &[], skills);
             }
-            (KeyCode::BackTab, _, _) => crate::input::cycle_ghost_suggestion(&mut input_state),
+            (KeyCode::BackTab, _, _) => {
+                crate::input::cycle_ghost_suggestion(&mut input_state, workspace)
+            }
             // Once the run is done Up/Down move between report items (not
             // headings); `-` removes the highlighted one only while the input
             // window is empty, so a `-` in a typed path is still editable.

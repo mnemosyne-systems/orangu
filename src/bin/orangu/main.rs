@@ -25,6 +25,7 @@ mod information;
 mod init;
 mod input;
 mod manual;
+mod mode;
 mod models;
 mod oneshot;
 mod quotes;

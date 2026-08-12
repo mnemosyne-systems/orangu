@@ -535,6 +535,10 @@ pub enum LocalCommand<'a> {
     PendingList,
     PendingDelete(Option<usize>),
     Skills,
+    /// `/developer` and `/committer`: what the prompt is for — writing code, or
+    /// landing a reviewed pull request. Only the prompt's own suggestions
+    /// change; every command stays available in both (see [`crate::mode`]).
+    Mode(crate::mode::PromptMode),
     Graph,
 }
 

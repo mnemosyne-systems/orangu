@@ -72,6 +72,70 @@ Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`
 /tools
 ```
 
+\newpage
+
+## /developer
+
+Puts the prompt in **developer mode**, the default: writing code. The prompt keeps out of the way — an untouched line opens with the greeting `Welcome, I'm orangu`, and from there only what you type is hinted (slash commands, natural-language bindings, and argument completion, exactly as described in the Terminal chapter).
+
+The greeting is a label, not a suggestion: it is drawn in grey like any other hint, but it is deliberately kept out of the `Tab` and `Shift+Tab` candidates, so it can never be completed into the line.
+
+Switching mode changes only what the prompt suggests. Every command stays available in both modes, and nothing about the session, the model, or the workspace changes.
+
+**Examples**
+
+```text
+/developer
+```
+
+Natural-language forms:
+
+```text
+developer
+developer mode
+```
+
+\newpage
+
+## /committer
+
+Puts the prompt in **committer mode**: landing a reviewed pull request. The prompt walks the merge flow, hinting one step at a time, starting from the empty line:
+
+```text
+pull <PR_NUMBER>
+build | review | auto review    (optional, on the pulled branch)
+switch to main|master
+merge <BRANCH_NAME>
+push
+delete <BRANCH_NAME>
+comment on <PR_NUMBER> merged.md
+```
+
+`pull` remembers the request number and the branch it checked out, so the following steps are hinted with the real names — `merge pr-231`, not a placeholder. Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
+
+`build`, `review`, and `auto review` are offered as optional steps while the pulled branch is still checked out — what you would reasonably do to a request before taking it to the base branch. They are never the first suggestion, and running one advances nothing: the flow is remembered across them, so the next auto-suggestion is still the step the request is waiting on. They stop being offered once the flow has left the branch.
+
+Within the mode the flow comes first everywhere the prompt suggests something: as the inline ghost, in the `Shift+Tab` cycle, and in the `Tab` candidate list, where the rest of the flow follows the current step so a step can be skipped by cycling past it. The remembered branch and request number also lead the argument completions for `merge `, `delete `, `switch to `, and `comment on `. Nothing is hidden — workspace files, branches, and the natural-language bindings still follow. See **The merge flow** in the Terminal chapter for the full behaviour.
+
+The flow belongs to the workspace it was started in, so other workspace tabs are unaffected. Checking out a branch that is neither the request's nor the base ends it, as does commenting on the request. Steps taken in developer mode are still tracked, so `/committer` picks up where the branch actually is.
+
+The comment body comes from `~/.orangu/comments/merged.md`, like any other `/comment` template.
+
+**Examples**
+
+```text
+/committer
+```
+
+Natural-language forms:
+
+```text
+committer
+committer mode
+```
+
+\newpage
+
 ## /mcp
 
 Shows configured MCP servers for the active workspace, including whether each

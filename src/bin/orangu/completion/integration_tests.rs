@@ -1218,3 +1218,104 @@ fn auto_review_completes_files_by_name_per_branch() {
     .expect("auto_review completion");
     assert!(candidates.is_empty(), "{candidates:?}");
 }
+
+#[test]
+fn merge_flow_steps_come_before_workspace_files() {
+    let _guard = crate::test_support::exclusive_committer_prompt();
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("main.rs"), "").expect("main.rs");
+    flow::test_support::begin(231, "pr-231", flow::MergeFlowStep::Merge, workspace.path());
+
+    // Typing the first word offers the flow's next step ahead of the file that
+    // shares its prefix; both replace the same typed text.
+    let (start, _, candidates) = completion_candidates(
+        "m",
+        1,
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("completion");
+    assert_eq!(start, 0);
+    assert_eq!(candidates.first().map(String::as_str), Some("merge pr-231"));
+    assert!(candidates.iter().any(|c| c == "main.rs"), "{candidates:?}");
+
+    // The empty prompt offers the whole remaining flow first.
+    let (_, _, candidates) = completion_candidates(
+        "",
+        0,
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("completion");
+    assert_eq!(
+        candidates[..4],
+        [
+            "merge pr-231".to_string(),
+            "push".to_string(),
+            "delete pr-231".to_string(),
+            "comment on 231 merged.md".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn merge_flow_puts_its_own_branch_first_among_the_offered_branches() {
+    let _guard = crate::test_support::exclusive_committer_prompt();
+    let workspace = tempdir().expect("workspace");
+    init_test_git_repo(workspace.path());
+    std::process::Command::new("git")
+        .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+        .current_dir(workspace.path())
+        .status()
+        .expect("set initial branch to main");
+    fs::write(workspace.path().join("README.md"), "").expect("readme");
+    for args in [
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+        vec!["branch", "another-branch"],
+        vec!["branch", "pr-231"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git")
+                .success()
+        );
+    }
+    flow::test_support::begin(231, "pr-231", flow::MergeFlowStep::Merge, workspace.path());
+
+    // Every branch is still offered — the one being merged just leads.
+    let (_, _, candidates) = completion_candidates(
+        "merge ",
+        "merge ".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+    )
+    .expect("merge completion");
+    assert_eq!(candidates.first().map(String::as_str), Some("pr-231"));
+    assert!(
+        candidates.iter().any(|c| c == "another-branch"),
+        "{candidates:?}"
+    );
+
+    // The ghost previews that same first candidate.
+    assert_eq!(
+        completion_ghost_suffix(
+            "merge p",
+            "merge p".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+        ),
+        Some("r-231".to_string())
+    );
+}

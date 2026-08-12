@@ -22,6 +22,39 @@ fn leaves_regular_prompts_unhandled() {
 }
 
 #[test]
+fn parses_the_prompt_modes() {
+    use crate::mode::PromptMode;
+
+    for input in ["/developer", "developer", "developer mode", "DEVELOPER"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Mode(PromptMode::Developer))
+            ),
+            "{input:?} is not the developer mode"
+        );
+    }
+    for input in ["/committer", "committer", "committer mode", "Committer"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Mode(PromptMode::Committer))
+            ),
+            "{input:?} is not the committer mode"
+        );
+    }
+    // The git commands they read like are untouched.
+    assert!(matches!(
+        parse_local_command("commit"),
+        Some(LocalCommand::Commit(None))
+    ));
+    assert!(matches!(
+        parse_local_command("delete feature/x"),
+        Some(LocalCommand::Branch(BranchSubcommand::Delete(_)))
+    ));
+}
+
+#[test]
 fn parses_schedule_commands() {
     assert!(matches!(
         parse_local_command("/schedule"),

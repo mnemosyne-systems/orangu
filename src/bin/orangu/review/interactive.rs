@@ -910,7 +910,9 @@ pub(crate) fn run_review_mode(
             (KeyCode::Tab, _, _) => {
                 crate::input::apply_completion(input_state, workspace, &[], &[], chrome.skills);
             }
-            (KeyCode::BackTab, _, _) => crate::input::cycle_ghost_suggestion(input_state),
+            (KeyCode::BackTab, _, _) => {
+                crate::input::cycle_ghost_suggestion(input_state, workspace)
+            }
             // Input window editing.
             (KeyCode::Backspace, true, _) => input_state.delete_backward_readline_word(),
             (KeyCode::Backspace, _, _) => input_state.backspace(),

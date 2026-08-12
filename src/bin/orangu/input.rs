@@ -33,8 +33,7 @@ use std::{
 use crate::VERSION;
 
 use super::completion::{
-    completion_candidates, first_ghost_word, natural_language_ghost_candidates,
-    natural_language_ghost_suffix_at,
+    completion_candidates, first_ghost_word, ghost_candidates, ghost_suffix_at,
 };
 
 pub const ESC_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1299,7 +1298,7 @@ pub fn handle_input_event_with_status(
                 }
                 (KeyCode::BackTab, _) => {
                     interrupt_state.reset();
-                    cycle_ghost_suggestion(input_state);
+                    cycle_ghost_suggestion(input_state, input_context.workspace);
                     redraw = true;
                 }
                 (KeyCode::PageUp, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1688,16 +1687,17 @@ pub fn handle_reverse_search_key(
     ReverseSearchKey::Handled
 }
 
-/// Advance the inline natural-language ghost preview to the next candidate
-/// (Shift+Tab). For input like `c`, this cycles `current model` -> `code review` ->
-/// `checkout ` -> ... -> back to `current model`. Tab then accepts whatever is shown.
+/// Advance the inline ghost preview to the next candidate (Shift+Tab). For
+/// input like `c`, this cycles `current model` -> `code review` -> `checkout `
+/// -> ... -> back to `current model`; while a pull request is being merged the
+/// flow's remaining steps come first. Tab then accepts whatever is shown.
 /// No-op when the cursor is not at the end of the line, or when there is nothing
 /// (or only one thing) to cycle through.
-pub fn cycle_ghost_suggestion(input_state: &mut InputState) {
+pub fn cycle_ghost_suggestion(input_state: &mut InputState, workspace: &Path) {
     if input_state.cursor() != input_state.buffer.len() {
         return;
     }
-    let count = natural_language_ghost_candidates(input_state.as_str()).len();
+    let count = ghost_candidates(input_state.as_str(), workspace).len();
     if count > 1 {
         input_state.ghost_index = (input_state.ghost_index + 1) % count;
     }
@@ -1722,8 +1722,9 @@ pub fn apply_completion(
         return;
     }
 
-    // Accept the inline natural-language ghost the user is seeing (e.g. "c" ->
-    // "current model") before falling back to generic file completion, so Tab fills in
+    // Accept the inline ghost the user is seeing (e.g. "c" -> "current model",
+    // or the merge flow's next step) before falling back to generic file
+    // completion, so Tab fills in
     // the hint that is actually rendered rather than a same-prefixed filename.
     // The cycle position chosen with Shift+Tab decides which candidate is taken.
     // Only when the cursor is at the end of the line, matching where the ghost
@@ -1734,9 +1735,9 @@ pub fn apply_completion(
     // `push ` -> `push force`. The remaining words stay rendered as the ghost.
     if input_state.cursor() == input_state.buffer.len()
         && let Some(suffix) =
-            natural_language_ghost_suffix_at(input_state.as_str(), input_state.ghost_index)
+            ghost_suffix_at(input_state.as_str(), input_state.ghost_index, workspace)
     {
-        let word = first_ghost_word(suffix);
+        let word = first_ghost_word(&suffix);
         let end = input_state.buffer.len();
         let original = input_state.buffer.clone();
         apply_completion_candidate(input_state, end, end, &original, word);

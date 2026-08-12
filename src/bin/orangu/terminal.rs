@@ -133,6 +133,10 @@ impl TerminalUiGuard {
         // A running Ctrl+R search owns the hint: the grey text after the line is
         // the history command it found, filled in with Tab, and the status line
         // carries the bash-style search prompt.
+        // With nothing typed and nothing to complete, the developer prompt draws
+        // its greeting instead. That one is a label rather than a suggestion —
+        // it is not in the Tab candidates, so it can never be filled in — which
+        // is why it is added here and not in `input_ghost_suffix`.
         let structured_ghost = screen
             .reverse_search
             .is_none()
@@ -146,6 +150,7 @@ impl TerminalUiGuard {
                     render.available_models,
                     render.skills,
                 )
+                .or_else(|| crate::mode::opening_ghost(screen.input).map(str::to_string))
             })
             .flatten();
         let ghost = match screen.reverse_search {

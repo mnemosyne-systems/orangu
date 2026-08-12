@@ -81,6 +81,8 @@ pub enum SlashCommand {
     Build,
     Shell,
     Skills,
+    Developer,
+    Committer,
     Graph,
     Clear,
     Theme,
@@ -157,6 +159,8 @@ impl SlashCommand {
             SlashCommand::Build => "Builds the workspace project",
             SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",
+            SlashCommand::Developer => "Puts the prompt in developer mode (the default)",
+            SlashCommand::Committer => "Puts the prompt in committer mode: the merge flow",
             SlashCommand::Graph => {
                 "Generates an HTML visualization of the codebase Knowledge Graph"
             }

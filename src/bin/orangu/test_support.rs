@@ -18,6 +18,41 @@ use orangu::tui::{Banner, HeaderStatus};
 
 pub(crate) use crate::git::init_git_for_test as init_test_git_repo;
 
+/// One merge flow and one prompt mode exist per process, so the tests that
+/// write either take this lock (see [`exclusive_prompt_state`]).
+static PROMPT_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) struct PromptStateGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for PromptStateGuard {
+    fn drop(&mut self) {
+        crate::completion::flow::test_support::reset();
+        crate::completion::set_active_pull_requests(&[]);
+        crate::mode::set(crate::mode::PromptMode::default());
+    }
+}
+
+/// Take sole ownership of the prompt state — the merge flow, the cached open
+/// pull requests, and the prompt mode — for the rest of the test, starting and
+/// finishing at the defaults.
+pub(crate) fn exclusive_prompt_state() -> PromptStateGuard {
+    let guard = PROMPT_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::completion::flow::test_support::reset();
+    crate::completion::set_active_pull_requests(&[]);
+    crate::mode::set(crate::mode::PromptMode::default());
+    PromptStateGuard(guard)
+}
+
+/// [`exclusive_prompt_state`] on the committer prompt — the mode the merge flow
+/// is suggested in, and so the one its tests need.
+pub(crate) fn exclusive_committer_prompt() -> PromptStateGuard {
+    let guard = exclusive_prompt_state();
+    crate::mode::set(crate::mode::PromptMode::Committer);
+    guard
+}
+
 pub(crate) fn test_profile(endpoint: &str, model: &str) -> LlmConfiguration {
     LlmConfiguration {
         endpoint: endpoint.to_string(),

@@ -21,6 +21,7 @@ use crate::git::{
 
 mod bisect;
 mod files;
+pub mod flow;
 mod ghost;
 mod git_refs;
 mod issue;
@@ -76,7 +77,16 @@ pub fn completion_candidates(
         .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(0);
     let token = &prefix[start..];
-    Some((start, cursor, file_completion_candidates(token, workspace)))
+    // While the first word is being typed — the empty prompt included — the
+    // merge flow's next steps come before the workspace files, so Tab reaches
+    // for `switch to main` / `merge <branch>` / ... ahead of a same-prefixed
+    // filename. Both replace from the same offset, so they share one list.
+    let mut candidates = Vec::new();
+    if start == 0 {
+        candidates.extend(flow::flow_candidates(prefix, workspace));
+    }
+    candidates.extend(file_completion_candidates(token, workspace));
+    Some((start, cursor, candidates))
 }
 
 fn skills_for_prefix<'a>(
@@ -221,6 +231,30 @@ fn build_completion_candidates(prefix: &str, workspace: &Path) -> Option<(usize,
 /// hint can reuse exactly these structured candidates without the prose-noisy
 /// fallback.
 fn structured_completion_candidates(
+    prefix: &str,
+    cursor: usize,
+    workspace: &Path,
+    server_names: &[String],
+    available_models: &[String],
+) -> Option<(usize, usize, Vec<String>)> {
+    let (start, end, mut candidates) = structured_completion_candidates_unordered(
+        prefix,
+        cursor,
+        workspace,
+        server_names,
+        available_models,
+    )?;
+    // A merge flow in progress decides which of the offered branches, request
+    // numbers, and comment templates is the one Tab fills in first; the list
+    // itself is unchanged.
+    flow::hoist_preferred_arguments(&mut candidates, workspace);
+    Some((start, end, candidates))
+}
+
+/// The structured candidates in their own natural order, before the merge flow
+/// gets a say. Split from [`structured_completion_candidates`] so every form
+/// below can return early and still be reordered in one place.
+fn structured_completion_candidates_unordered(
     prefix: &str,
     cursor: usize,
     workspace: &Path,

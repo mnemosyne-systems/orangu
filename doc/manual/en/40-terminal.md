@@ -258,6 +258,31 @@ As you type, a grey inline hint previews the command your input is growing into,
 
 The natural-language hint takes priority over generic filename completion, so `c` + `Tab` completes to `current model` rather than a same-prefixed file such as `contrib/`. Slash-command and argument completion (branches, files, commit hashes, and so on) continue to use the cycling `Tab` behavior described next.
 
+### The merge flow
+
+The prompt has two modes, selected with `/developer` and `/committer` (see the Core tools chapter). In **developer mode** — the default — an untouched line opens with the greeting `Welcome, I'm orangu` and nothing else is suggested until you type. Everything in this section is what **committer mode** adds.
+
+Merging a reviewed pull request is the same six commands every time, so in committer mode the prompt hints them for you, in order, starting from the empty line:
+
+```text
+pull <PR_NUMBER>
+build | review | auto review    (optional, on the pulled branch)
+switch to main|master
+merge <BRANCH_NAME>
+push
+delete <BRANCH_NAME>
+comment on <PR_NUMBER> merged.md
+```
+
+- Before a request is checked out, the empty prompt hints `pull <PR_NUMBER>` for the open pull/merge requests fetched at startup; `Shift+Tab` cycles through them.
+- While the pulled branch is still checked out, `build`, `review`, and `auto review` are offered too — the things worth doing to a request before taking it to the base branch. They are never the first suggestion and they never advance anything: the flow is remembered across them, so after a build or a review the prompt still opens with `switch to main`. They drop off the list once the flow has left the branch.
+- `pull` remembers the request number and the branch it checked out. From then on the empty prompt hints the next step — `switch to main`, then `merge <BRANCH_NAME>`, `push`, `delete <BRANCH_NAME>`, and finally `comment on <PR_NUMBER> merged.md` (the body is read from `~/.orangu/comments/merged.md`, like any other comment template).
+- Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
+- The steps come first everywhere the prompt suggests something: as the inline ghost, in the `Shift+Tab` cycle, and in the `Tab` candidate list — where the rest of the flow follows the current step, so a step can be skipped by cycling past it. Nothing is hidden: workspace files and the natural-language bindings still follow.
+- While a request is being merged, its branch also leads the argument completions — `merge `, `delete `, and `switch to ` offer the remembered branch and the base branch first, and `comment on ` offers the request number and `merged.md` first. Every other candidate is still listed, just after them.
+- The flow belongs to the workspace it was started in, so other workspace tabs are not hinted at its branches. Checking out a branch that is neither the request's nor the base ends it, as does commenting on the request.
+- Steps run in developer mode are still tracked, so `/committer` picks up where the branch actually is instead of starting over.
+
 ### Tab completion
 
 `Tab` uses context-sensitive completion. The first `Tab` inserts the first match. Repeated `Tab` presses cycle through the remaining matches for the same completion range.
@@ -285,7 +310,7 @@ The completion modes are checked in order:
     skill such as `/debugging`. When the `drop_down` option is enabled in
     `orangu.conf` (the default), this completion is also visualized as an interactive
     dropdown menu that intercepts the Up/Down arrow keys.
-15. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor.
+15. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor. In committer mode, while the first word is being typed — the empty line included — the merge flow's remaining steps are offered before those entries.
 
 Path-completion details:
 

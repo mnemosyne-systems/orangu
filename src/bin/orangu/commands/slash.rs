@@ -121,6 +121,8 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
         "/skills" => Some(LocalCommand::Skills),
+        "/developer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Developer)),
+        "/committer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Committer)),
         "/graph" => Some(LocalCommand::Graph),
         _ => {
             if let Some(args) = input.strip_prefix("/mcp ") {

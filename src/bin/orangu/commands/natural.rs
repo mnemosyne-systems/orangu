@@ -322,6 +322,11 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "git branch -D ",
     "delete branch ",
     "delete ",
+    // --- prompt mode ---
+    "developer",
+    "developer mode",
+    "committer",
+    "committer mode",
     // --- session ---
     "session",
     "switch session",
@@ -991,6 +996,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 )));
             }
         }
+    }
+    // The prompt modes. Checked after the git commands they read like
+    // ("commit", "delete") so neither steals a prefix from the other.
+    if matches_ci(input, &["developer", "developer mode"]) {
+        return Some(LocalCommand::Mode(crate::mode::PromptMode::Developer));
+    }
+    if matches_ci(input, &["committer", "committer mode"]) {
+        return Some(LocalCommand::Mode(crate::mode::PromptMode::Committer));
     }
     if matches_ci(
         input,

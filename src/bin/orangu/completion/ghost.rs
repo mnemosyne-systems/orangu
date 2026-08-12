@@ -20,12 +20,13 @@ use super::*;
 use crate::commands::NATURAL_LANGUAGE_BINDINGS;
 
 /// The grey inline ghost suffix to draw after the cursor for `input`, or `None`
-/// when there is nothing to hint. Slash commands take priority over
-/// natural-language bindings (with `ghost_index` picking which cycled candidate
-/// to preview), and structured argument completions — branches, tags, files,
-/// models, servers — fall last. Only hinted while the cursor sits at the end of
-/// the typed text. Shared by the main prompt and the `/review` / `/auto_review`
-/// input windows so all three preview completions the same way.
+/// when there is nothing to hint. Slash commands take priority over the merge
+/// flow's next step and the natural-language bindings (with `ghost_index`
+/// picking which cycled candidate to preview), and structured argument
+/// completions — branches, tags, files, models, servers — fall last. Only
+/// hinted while the cursor sits at the end of the typed text. Shared by the
+/// main prompt and the `/review` / `/auto_review` input windows so all three
+/// preview completions the same way.
 pub fn input_ghost_suffix(
     input: &str,
     cursor: usize,
@@ -39,7 +40,7 @@ pub fn input_ghost_suffix(
         return None;
     }
     command_ghost_suffix(input, skills)
-        .or_else(|| natural_language_ghost_suffix_at(input, ghost_index).map(str::to_string))
+        .or_else(|| ghost_suffix_at(input, ghost_index, workspace))
         .or_else(|| {
             completion_ghost_suffix(
                 input,
@@ -130,16 +131,40 @@ pub fn natural_language_ghost_candidates(input: &str) -> Vec<&'static str> {
     candidates
 }
 
-/// The natural-language ghost suffix to preview at cycle position `index`,
-/// wrapping around the candidate list (see [`natural_language_ghost_candidates`]).
-/// `index` 0 is the first match (e.g. `c` -> `urrent model`, completing `current model`);
-/// Shift+Tab advances it. This is the grey hint shown inline after the cursor.
-pub fn natural_language_ghost_suffix_at(input: &str, index: usize) -> Option<&'static str> {
-    let candidates = natural_language_ghost_candidates(input);
+/// Everything the part-typed `input` could still grow into, as the trailing
+/// characters that complete each candidate — the merge flow's remaining steps
+/// first (see [`flow::flow_candidates`]), then the natural-language bindings.
+/// This is the list the grey ghost previews and Shift+Tab cycles through, so
+/// the next step of the flow is always what the prompt offers first: on an
+/// empty line it hints `switch to main` / `merge <branch>` / ... outright,
+/// where a binding alone would have nothing to say.
+///
+/// A flow step that spells out a binding already offered (e.g. `push`) is kept
+/// once, in the flow's position.
+pub fn ghost_candidates(input: &str, workspace: &Path) -> Vec<String> {
+    let mut candidates: Vec<String> = flow::flow_candidates(input, workspace)
+        .iter()
+        .filter_map(|command| command.get(input.len()..))
+        .filter(|suffix| !suffix.is_empty())
+        .map(str::to_string)
+        .collect();
+    for suffix in natural_language_ghost_candidates(input) {
+        if !candidates.iter().any(|seen| seen == suffix) {
+            candidates.push(suffix.to_string());
+        }
+    }
+    candidates
+}
+
+/// The ghost suffix to preview at cycle position `index`, wrapping around
+/// [`ghost_candidates`]. Index 0 is what the prompt draws; Shift+Tab advances
+/// it and Tab accepts whatever is shown.
+pub fn ghost_suffix_at(input: &str, index: usize, workspace: &Path) -> Option<String> {
+    let candidates = ghost_candidates(input, workspace);
     if candidates.is_empty() {
         return None;
     }
-    Some(candidates[index % candidates.len()])
+    Some(candidates[index % candidates.len()].clone())
 }
 
 /// The leading single word of a natural-language ghost `suffix`, including the
@@ -167,8 +192,81 @@ pub fn first_ghost_word(suffix: &str) -> &str {
 mod tests {
     use super::*;
     use crate::commands::parse_local_command;
+    use crate::completion::flow::MergeFlowStep;
+    use crate::completion::flow::test_support::begin;
     use crate::input::{InputState, apply_completion, cycle_ghost_suggestion};
+    use crate::test_support::exclusive_committer_prompt as exclusive;
     use tempfile::tempdir;
+
+    /// The whole prompt hint for `input`, the way the screen draws it.
+    fn ghost_for(input: &str, workspace: &Path) -> Option<String> {
+        input_ghost_suffix(
+            input,
+            input.len(),
+            0,
+            workspace,
+            &[],
+            &[],
+            &orangu::skills::SkillRegistry::discover(Path::new("/")),
+        )
+    }
+
+    #[test]
+    fn merge_flow_leads_the_ghost_from_the_empty_prompt_on() {
+        let _guard = exclusive();
+        let workspace = tempdir().expect("workspace");
+        begin(231, "pr-231", MergeFlowStep::Switch, workspace.path());
+
+        // The empty prompt hints the step to take next — a binding alone has
+        // nothing to say there.
+        assert_eq!(
+            ghost_for("", workspace.path()).as_deref(),
+            Some("switch to main")
+        );
+        // Shift+Tab walks the optional steps and then the rest of the flow,
+        // all before the bindings.
+        assert_eq!(
+            ghost_candidates("", workspace.path())[..5],
+            [
+                "switch to main",
+                "build",
+                "review",
+                "auto review",
+                "merge pr-231"
+            ]
+        );
+        // A part-typed line keeps the flow's step ahead of the binding that
+        // shares its prefix, and completes the remembered branch...
+        assert_eq!(
+            ghost_for("m", workspace.path()).as_deref(),
+            Some("erge pr-231")
+        );
+        // ...including after the binding itself is complete, where the plain
+        // binding ghost stops.
+        assert_eq!(
+            ghost_for("merge", workspace.path()).as_deref(),
+            Some(" pr-231")
+        );
+        // Slash commands still own the hint.
+        assert_eq!(ghost_for("/q", workspace.path()).as_deref(), Some("uit"));
+    }
+
+    #[test]
+    fn tab_accepts_the_flow_step_one_word_at_a_time() {
+        let _guard = exclusive();
+        let workspace = tempdir().expect("workspace");
+        begin(231, "pr-231", MergeFlowStep::Comment, workspace.path());
+
+        let mut input_state = InputState::default();
+        let skills = orangu::skills::SkillRegistry::discover(Path::new("/"));
+        for expected in ["comment ", "comment on ", "comment on 231 "] {
+            apply_completion(&mut input_state, workspace.path(), &[], &[], &skills);
+            assert_eq!(input_state.as_str(), expected);
+        }
+        apply_completion(&mut input_state, workspace.path(), &[], &[], &skills);
+        assert_eq!(input_state.as_str(), "comment on 231 merged.md");
+        assert!(parse_local_command(input_state.as_str()).is_some());
+    }
 
     #[test]
     fn get_comments_ghost_offers_issue_and_pull_request() {
@@ -247,7 +345,7 @@ mod tests {
     #[test]
     fn suggests_ghost_suffix_for_partial_natural_language_bindings() {
         // The rendered hint is cycle position 0.
-        let ghost = |input| natural_language_ghost_suffix_at(input, 0);
+        let ghost = |input| natural_language_ghost_candidates(input).first().copied();
 
         // A partial verb completes to the rest of the binding.
         assert_eq!(ghost("discon"), Some("nect"));
@@ -294,24 +392,18 @@ mod tests {
         // "c" matches several bindings; cycling walks them in priority order and
         // wraps back to the first. Bindings differing only by trailing whitespace
         // (e.g. "checkout " vs "checkout") collapse to one entry.
+        let workspace = tempdir().expect("workspace");
         let candidates = natural_language_ghost_candidates("c");
         assert!(
             candidates.len() > 1,
             "expected multiple candidates for \"c\", got {candidates:?}"
         );
-        assert_eq!(
-            natural_language_ghost_suffix_at("c", 0),
-            Some(candidates[0])
-        );
-        assert_eq!(
-            natural_language_ghost_suffix_at("c", 1),
-            Some(candidates[1])
-        );
+        // With no merge flow in progress the cycled list is the bindings' own.
+        let cycled = |index| ghost_suffix_at("c", index, workspace.path());
+        assert_eq!(cycled(0).as_deref(), Some(candidates[0]));
+        assert_eq!(cycled(1).as_deref(), Some(candidates[1]));
         // Index wraps around the candidate list.
-        assert_eq!(
-            natural_language_ghost_suffix_at("c", candidates.len()),
-            Some(candidates[0])
-        );
+        assert_eq!(cycled(candidates.len()).as_deref(), Some(candidates[0]));
 
         // The whole list completes "c" to distinct, real commands.
         for suffix in candidates {
@@ -344,7 +436,10 @@ mod tests {
         );
         assert_eq!(input_state.as_str(), "push ");
         assert_eq!(input_state.cursor(), "push ".len());
-        assert_eq!(natural_language_ghost_suffix_at("push ", 0), Some("force"));
+        assert_eq!(
+            natural_language_ghost_candidates("push ").first().copied(),
+            Some("force")
+        );
         apply_completion(
             &mut input_state,
             workspace.path(),
@@ -390,7 +485,7 @@ mod tests {
             "c{}",
             first_ghost_word(natural_language_ghost_candidates("c")[1])
         );
-        cycle_ghost_suggestion(&mut input_state);
+        cycle_ghost_suggestion(&mut input_state, workspace.path());
         assert_eq!(input_state.ghost_index, 1);
         apply_completion(
             &mut input_state,
@@ -404,7 +499,7 @@ mod tests {
         // Editing the line resets the cycle back to the first candidate.
         let mut input_state = InputState::default();
         input_state.set_buffer("c".to_string());
-        cycle_ghost_suggestion(&mut input_state);
+        cycle_ghost_suggestion(&mut input_state, workspace.path());
         input_state.insert_char('o');
         assert_eq!(input_state.ghost_index, 0);
     }

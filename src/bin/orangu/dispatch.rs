@@ -464,6 +464,12 @@ pub(crate) fn handle_command(
             }
             Ok(CommandOutcome::Output(out))
         }
+        // Switching mode says nothing: the prompt itself is the answer — the
+        // greeting, or the merge flow's next step, on the very next line.
+        LocalCommand::Mode(mode) => {
+            crate::mode::set(mode);
+            Ok(CommandOutcome::Quiet)
+        }
         LocalCommand::Disconnect => Ok({
             *current_endpoint = None;
             CommandOutcome::Quiet
@@ -983,8 +989,16 @@ pub(crate) fn handle_command(
         )),
         LocalCommand::Pull(Some(pr_number)) => {
             match pull_request_output(workspace, pr_number, forge) {
-                Ok(Some(advice)) => Ok(CommandOutcome::Output(advice)),
-                Ok(None) => Ok(CommandOutcome::Quiet),
+                // The checkout starts the merge flow: from here the prompt
+                // hints the request through switch, merge, push, delete and
+                // the closing comment.
+                Ok(advice) => {
+                    completion::flow::start(pr_number, workspace);
+                    match advice {
+                        Some(advice) => Ok(CommandOutcome::Output(advice)),
+                        None => Ok(CommandOutcome::Quiet),
+                    }
+                }
                 Err(err) => Ok(local_command_error(err)),
             }
         }
@@ -993,7 +1007,10 @@ pub(crate) fn handle_command(
         )),
         LocalCommand::Comment(Some((issue_number, body))) => {
             match comment_output(workspace, issue_number, &body, review_reports, forge) {
-                Ok(_) => Ok(CommandOutcome::Quiet),
+                Ok(_) => {
+                    completion::flow::note_comment(issue_number);
+                    Ok(CommandOutcome::Quiet)
+                }
                 Err(err) => Ok(local_command_error(err)),
             }
         }
@@ -1034,7 +1051,10 @@ pub(crate) fn handle_command(
             merge_usage_message().to_string(),
         )),
         LocalCommand::Merge(Some(branch)) => match merge_output(workspace, &branch, forge) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
+            Ok(_) => {
+                completion::flow::note_merge(&branch);
+                Ok(CommandOutcome::Quiet)
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Branch(sub) => match sub {
@@ -1056,7 +1076,10 @@ pub(crate) fn handle_command(
                     }
                 };
                 match git_checkout(&root, &name) {
-                    Ok(_) => Ok(CommandOutcome::Quiet),
+                    Ok(_) => {
+                        completion::flow::note_checkout(&name);
+                        Ok(CommandOutcome::Quiet)
+                    }
                     Err(err) => Ok(local_command_error(err)),
                 }
             }
@@ -1069,7 +1092,10 @@ pub(crate) fn handle_command(
                 Err(err) => Ok(local_command_error(err)),
             },
             BranchSubcommand::Delete(name) => match branch_delete_output(workspace, &name) {
-                Ok(_) => Ok(CommandOutcome::Quiet),
+                Ok(_) => {
+                    completion::flow::note_delete(&name);
+                    Ok(CommandOutcome::Quiet)
+                }
                 Err(err) => Ok(local_command_error(err)),
             },
         },
@@ -1182,8 +1208,13 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Push(force) => match push_output(workspace, force) {
-            Ok(Some(advice)) => Ok(CommandOutcome::Output(advice)),
-            Ok(None) => Ok(CommandOutcome::Quiet),
+            Ok(advice) => {
+                completion::flow::note_push();
+                match advice {
+                    Some(advice) => Ok(CommandOutcome::Output(advice)),
+                    None => Ok(CommandOutcome::Quiet),
+                }
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::InitRepo => match init_repo_output(workspace) {
@@ -1439,8 +1470,6 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// The typed commands run the same `orangu::files` operations the tools
-    /// and the server's endpoints do, and report what reached the index.
     #[test]
     fn file_commands_run_the_shared_operations_and_report_staging() {
         let workspace = tempdir().expect("workspace");
@@ -1650,6 +1679,71 @@ mod tests {
                 assert!(readme.patch.contains("+two"), "{:?}", readme.patch);
             }
             _ => panic!("expected an AutoReview outcome for `all`"),
+        }
+    }
+
+    #[test]
+    fn the_mode_commands_switch_the_prompt_without_printing() {
+        let _guard = exclusive_prompt_state();
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("http://localhost:8100/v1", "gemma"),
+        )]);
+        let workspace = tempdir().expect("workspace");
+        let tools = ToolExecutor::new(workspace.path());
+
+        // Both spellings of both modes: the command switches the prompt and
+        // says nothing — the prompt's own hint is the acknowledgement.
+        for (input, mode) in [
+            ("/committer", crate::mode::PromptMode::Committer),
+            ("developer", crate::mode::PromptMode::Developer),
+            ("committer mode", crate::mode::PromptMode::Committer),
+            ("/developer", crate::mode::PromptMode::Developer),
+        ] {
+            let mut active_model = "llama".to_string();
+            let mut active_model_id = "gemma".to_string();
+            let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+            let mut session = ChatSession::new("system");
+            let outcome = handle_command(
+                input,
+                CommandState {
+                    active_model: &mut active_model,
+                    active_model_id: &mut active_model_id,
+                    current_endpoint: &mut current_endpoint,
+                    session: &mut session,
+                    detect_model: &mut false,
+                },
+                CommandContext {
+                    skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                    startup_model: "llama",
+                    startup_endpoint: "http://localhost:8100/v1",
+                    llms: &llms,
+                    tools: &tools,
+                    workspace: workspace.path(),
+                    session_dir: workspace.path(),
+                    embeddings_server: "",
+                    is_coordinator: false,
+                    usage_stats: &super::UsageStats::new(),
+                    available_models: &[],
+                    virtual_width: 512,
+                    auto_rebase: false,
+                    auto_squash: false,
+                    compile_workers: 1,
+                    compression: false,
+                    terminal: "",
+                    forge: crate::git::Forge::GitHub,
+                    semantic_budget_tokens: 16384,
+                    config_path: workspace.path(),
+                    review_reports: crate::git::ReviewReports::default(),
+                },
+            )
+            .expect("handle command");
+
+            assert!(
+                matches!(&outcome, CommandOutcome::Quiet),
+                "{input:?} should print nothing"
+            );
+            assert_eq!(crate::mode::current(), mode, "{input:?} did not switch");
         }
     }
 

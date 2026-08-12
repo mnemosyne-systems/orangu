@@ -255,6 +255,9 @@ mod tests {
 
     #[test]
     fn pull_number_candidates_filter_and_sort() {
+        // The cache is process-wide; the guard keeps the tests that write it
+        // (and the merge flow, which reads it) from tripping over each other.
+        let _guard = crate::test_support::exclusive_prompt_state();
         set_active_pull_requests(&[
             PullRequest {
                 number: 90,
@@ -280,6 +283,7 @@ mod tests {
 
     #[test]
     fn close_and_get_comments_complete_flags_and_pr_numbers() {
+        let _guard = crate::test_support::exclusive_prompt_state();
         set_active_pull_requests(&[
             PullRequest {
                 number: 12,
