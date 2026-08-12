@@ -65,7 +65,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,nemotron,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -1175,6 +1175,87 @@ mod`), so adding a family is additive rather than a rewrite:
   full-width input), and the **situ** activation. The delta-net state is
   the memory cost of this architecture: `kda.head_dim` squared per head per
   recurrent layer, fixed and independent of context.
+- `nemotron.rs` — Nemotron-H (`general.architecture = "nemotron_h_moe"`),
+  e.g. `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`. The one
+  family here whose **block is a single sub-layer**, not an
+  attention/FFN pair — which is the thing most likely to be got wrong by
+  analogy, because a loader written to the usual shape finds every tensor
+  it looks for on *some* layer and simply builds the wrong graph. Each
+  block is one mixer under one `attn_norm` and one residual add, and the
+  per-layer metadata arrays pick which: `feed_forward_length[i] != 0` is a
+  MoE block, else `attention.head_count_kv[i] != 0` is attention, else a
+  state-space block. Both arrays must be read — a zero
+  `feed_forward_length` alone covers the recurrent *and* the attention
+  blocks. On the 30B-A3B model that is 23/6/23 across 52 trunk layers, so
+  `new_kv_cache` allocates six positional slots and 23 recurrent ones.
+
+  **The state-space block.** One `ssm_in` projection fans out to
+  `[z | x | B | C | dt]` — the gate, the convolved streams, and the
+  per-head timestep, in that order. `x`/`B`/`C` go through the causal
+  depthwise convolution (`RecurrentLayerState::conv_step`, the primitive
+  `qwen35moe.rs` already had, plus a bias this architecture has and the
+  delta-net families do not) and a SiLU; then per head, `dt` is biased and
+  softplussed once and used twice — to scale this token's contribution and,
+  through `ssm_a`, to decay the state. `ssm_a` is stored already negated,
+  so the decay is `exp(step * a)` with no sign flip of its own. `ssm_d` is
+  a per-head skip on the block's own *convolved* input, added to the
+  recurrence output before the gate. Then the gate is applied **and only
+  then** the grouped norm — `ssm_norm` is `n_group` consecutive
+  `ssm.inner_size / n_group`-wide weight vectors, each normalizing its own
+  slice. Reversing those two (norm, then gate — which is what
+  `qwen3next.rs` does) loads, runs, and answers fluently while being wrong.
+
+  The state is **rectangular**: `[ssm.inner_size / ssm.time_step_rank,
+  ssm.state_size]` per head, `[64, 128]` on this model. That is what
+  `kv_cache::RecurrentSpec::ssm` exists for — the delta-net families all
+  take `::delta_net`, whose per-head state is square because it accumulates
+  an outer product of two same-width vectors. `RecurrentLayerState` carries
+  the two axes separately for exactly this reason.
+
+  **The attention block** is plain causal GQA with nothing on it: no
+  rotation (this architecture rotates nothing anywhere — the
+  `rope.dimension_count` and `rope.freq_base` in the file are vestigial and
+  applying them is silently wrong), no QK-norm, no biases, no sliding
+  window. `head_count_kv` is read per layer even though every attention
+  block on this model agrees, since it is the same array that classified
+  the block.
+
+  **The MoE block** has **no gate projection** on either branch: routed
+  experts and the one shared expert are both `down(relu(up(x))^2)`, two
+  matrices rather than SwiGLU's three, and there is no `ffn_gate_exps` /
+  `ffn_gate_shexp` tensor to read. The shared branch is added unweighted.
+  Routing is `arch::mod`'s `ExpertRouting` unchanged — sigmoid
+  probabilities, `exp_probs_b` steering the selection only, top-k,
+  normalize, scale — and evaluation is the shared
+  `evaluate_routed_experts` / `project_expert` host path.
+
+  The router and the shared expert's up projection read the same normalized
+  input and neither depends on the other, so `router_and_shared_up` issues
+  them as one `matmul_batch` — one input upload and one backend round trip
+  per MoE block rather than two. It splits them only when the shared expert
+  is a quantization the selected backend has no kernel for, which is allowed:
+  `engine::backend::is_cpu_only_tensor` exempts the shared-expert matrices
+  from the startup device-capability check so that a low-bit file still gets
+  a GPU for the rest of the model. Every shared-expert matmul therefore goes
+  through `arch::mod`'s `matmul_host_fallback`; handing such a tensor
+  straight to the backend is not a slow path but a panic.
+
+  The trailing multi-token-prediction block (`nextn_predict_layers`, one
+  extra `block_count` entry with its own `nextn.*` tensors, attention and
+  MoE) is not loaded, as in `glm.rs` and `deepseek4.rs`. `engine::plan`
+  knows about it too — `trunk_block_count` bounds which blocks it charges to
+  the resident and streamable totals, so a draft block's experts are not
+  counted as weight anything reads. That applied to all three of these
+  architectures, not just this one.
+
+  The recurrence is sequential by construction, but the projections around
+  it are not, and that distinction is most of the throughput: `ssm_in`, the
+  MoE router, the shared expert and `ssm_out` each run once for the whole
+  batch, with only the per-token mixing between them walking the prompt.
+  Writing the recurrence output into one buffer and projecting it once,
+  rather than projecting each token as it is produced, is worth two orders
+  of magnitude on prefill: the per-token form issues a backend round trip
+  per token per block, and the round trip, not the arithmetic, is the cost.
 - `dflash.rs` — DeepSeek draft sidecars (`general.architecture =
   "dflash"`), e.g. the `dspark-` file in
   `unsloth/DeepSeek-V4-Flash-0731-GGUF`. There is no standalone model in
@@ -1769,6 +1850,23 @@ device work. It cannot be computed: the KV geometry needs a built model,
 and the model cannot be built until placement is decided, because building
 it is what stamps each tensor's device. Explicit ratios are the escape
 hatch, and the footprint report says afterwards what the choice left.
+
+`project_expert` reads the quantized bytes **directly**, through the same
+`engine::vecdot` integer-dot kernels `CpuBackend` uses for every dense
+matmul: `dot_row`/`dot_k_row` when one token is routed to an expert, and
+`unpack_row` once plus `dot_unpacked_multi` when several are. Only the types
+`vecdot` has no unpacking for fall back to dequantizing a row to `f32` and
+dotting it there.
+
+That was worth finding. A routed expert's rows are read once and thrown
+away, so the `f32` row was pure overhead — materialized, dotted, discarded —
+and on a `nemotron_h_moe` decode profile `quant::dequantize_into` under this
+one function was **60% of all CPU time in the process**. It is the same
+shape for every mixture-of-experts family here, since they all share this
+path. Note what it also does to the arithmetic: an expert now quantizes its
+activations exactly as the dense path always has, so an expert's numerics
+are *consistent with* the rest of its layer rather than more precise than
+it.
 
 `configure_cpu_threads` sizes rayon's *global* pool once, before anything
 parallel runs — `CpuBackend`'s matmul, `project_expert`, and the

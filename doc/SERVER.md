@@ -1594,7 +1594,12 @@ nothing at all: position arrives through a learned per-head
 relative-position bias and a causal short convolution on the key/value
 projections and on each sub-layer's output, layers alternate
 sliding-window and full attention, and the routed experts share their
-weight normalization with two always-on shared ones) — using
+weight normalization with two always-on shared ones), and Nemotron-H
+(`nemotron_h_moe`, e.g.
+`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
+blocks are a *single* sub-layer each rather than the usual
+attention-plus-FFN pair: a selective state-space mixer, an unrotated
+attention, or a squared-ReLU mixture-of-experts FFN) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than
@@ -1772,6 +1777,57 @@ Not implemented for this model: reporting reasoning separately as
 `reasoning_content` rather than inline, and parsing its JSON tool
 invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
+
+Nemotron-H (`nemotron_h_moe`, e.g.
+`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`) runs on the CPU
+path only, and breaks the assumption every other architecture here shares:
+a block is **not** an attention sub-layer plus an FFN sub-layer. It is one
+or the other — or neither. Each block holds exactly one mixer under one
+norm and one residual, and the file's own per-layer metadata says which:
+where `feed_forward_length` is nonzero the block is a mixture-of-experts
+FFN, where it is zero and `attention.head_count_kv` is nonzero the block is
+self-attention, and where both are zero the block is a selective
+state-space mixer. On the 30B-A3B model that is 23 state-space blocks, 23
+expert blocks and just **6 attention blocks** across 52 layers, so the
+great majority of the sequence mixing is recurrent and the key/value cache
+covers a sixth of the depth. A long conversation therefore costs far less
+cache here than its context length suggests.
+
+Position enters this model **only** through the recurrence. There is no
+rotary embedding on any layer — the attention blocks are unrotated, and the
+`rope.dimension_count` and `rope.freq_base` the file still carries are
+vestigial. What carries order instead is the state-space block: a causal
+convolution `ssm.conv_kernel` taps wide over the projected input, then a
+per-head recurrence whose state decays by a learned, input-dependent
+timestep. That state is `ssm.inner_size / ssm.time_step_rank` by
+`ssm.state_size` per head — rectangular, unlike the square accumulator the
+gated-DeltaNet families here carry — and it is fixed, independent of how
+long the conversation gets. Like every recurrent family here it has no
+per-position history to roll back, so the opt-in prompt-lookup speculative
+decoding is not available for this model.
+
+Its expert layers differ from every other mixture-of-experts model here in
+one respect worth naming: the FFN has **no gate projection**. Both the
+routed experts and the single shared expert are squared ReLU —
+`down(relu(up(x))^2)` — a two-matrix FFN rather than the three-matrix
+SwiGLU everything else uses, and the shared branch is added at full
+strength rather than being folded into the routing weights. The routing
+itself is the familiar one: sigmoid probabilities, a correction bias that
+steers the selection only, top-k, then normalization and a scale.
+
+The file also carries a trailing multi-token-prediction block — an extra
+`block_count` entry holding a self-contained draft head that predicts two
+tokens ahead. Nothing in the trunk reads it, and this server has no
+second-model speculative path to use it with, so it is left on disk. `plan`
+reports it on its own `Draft head` line rather than folding it into either
+of the two figures that decide whether a model is usable: it is neither
+weight that must be resident nor weight that can stream, because it is never
+read at all.
+
+Not implemented for this model: embeddings requests, and reporting its
+reasoning separately as `reasoning_content`. It reasons inline before
+answering, with no marker tokens around the reasoning, so a
+reasoning-suppressing role cannot separate the two.
 
 `orangu-server list` also recognizes `dflash` draft GGUFs such as the
 DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no

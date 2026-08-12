@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use super::ModelForward;
 use crate::engine::backend::{Backend, MatmulOp};
-use crate::engine::kv_cache::KvCache;
+use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
 
@@ -303,7 +303,7 @@ impl ModelForward for Qwen35Model {
         let (n_full_attn, n_recurrent) = self.cache_layout();
         let kv_dims = vec![self.n_head_kv * self.head_dim; n_full_attn];
         let recurrent_specs = vec![
-            (
+            RecurrentSpec::delta_net(
                 self.conv_channels(),
                 self.ssm_d_conv,
                 self.ssm_dt_rank,

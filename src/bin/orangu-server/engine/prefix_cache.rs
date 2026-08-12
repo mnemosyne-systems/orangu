@@ -30,6 +30,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use super::kv_cache::KvCache;
+#[cfg(test)]
+use super::kv_cache::RecurrentSpec;
 
 /// One pool entry: a finished request's full token sequence (prompt plus
 /// whatever it generated) alongside the KV cache that resulted from
@@ -511,7 +513,7 @@ mod tests {
     #[test]
     fn a_mixed_recurrent_cache_only_matches_on_its_full_length() {
         let pool = PrefixCache::new(4);
-        let mut mixed = KvCache::new_mixed(8, &[4], &[(2, 3, 1, 2)]);
+        let mut mixed = KvCache::new_mixed(8, &[4], &[RecurrentSpec::delta_net(2, 3, 1, 2)]);
         for layer in &mut mixed.layers {
             for _ in 0..3 {
                 layer.push(&[0.0; 4], &[0.0; 4]);
@@ -528,7 +530,7 @@ mod tests {
     #[test]
     fn a_mixed_recurrent_cache_is_skipped_on_a_partial_match() {
         let pool = PrefixCache::new(4);
-        let mut mixed = KvCache::new_mixed(8, &[4], &[(2, 3, 1, 2)]);
+        let mut mixed = KvCache::new_mixed(8, &[4], &[RecurrentSpec::delta_net(2, 3, 1, 2)]);
         for layer in &mut mixed.layers {
             for _ in 0..3 {
                 layer.push(&[0.0; 4], &[0.0; 4]);

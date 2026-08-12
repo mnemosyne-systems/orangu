@@ -150,6 +150,13 @@ pub enum ArchFamily {
     /// temperature), and sigmoid-routed experts share their normalization
     /// with the always-on shared experts. See `engine::arch::inkling`.
     Inkling,
+    /// Nemotron-H (`nemotron_h_moe`) — a hybrid whose blocks are a *single*
+    /// sub-layer each rather than the usual attention-plus-FFN pair: a
+    /// selective state-space mixer, an unrotated (position-free) attention,
+    /// or a squared-ReLU mixture-of-experts FFN, chosen per block by the
+    /// file's own per-layer `feed_forward_length` and
+    /// `attention.head_count_kv`. See `engine::arch::nemotron`.
+    NemotronHMoe,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -222,6 +229,12 @@ const MUSE_ARCHITECTURES: &[&str] = &["muse-glimmer"];
 /// shipped alongside is a separate `clip`-architecture model and is not
 /// this.
 const INKLING_ARCHITECTURES: &[&str] = &["inkling"];
+/// `nemotron_h_moe` (e.g. `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-
+/// GGUF`) — see [`ArchFamily::NemotronHMoe`] and `engine::arch::nemotron`.
+/// The dense `nemotron_h` and the unrelated, ordinary-transformer `nemotron`
+/// are *not* here: only the mixture-of-experts variant has been confirmed
+/// against a real file.
+const NEMOTRON_ARCHITECTURES: &[&str] = &["nemotron_h_moe"];
 
 pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LLAMA_STYLE_ARCHITECTURES.contains(&architecture) {
@@ -263,6 +276,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if INKLING_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Inkling);
     }
+    if NEMOTRON_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::NemotronHMoe);
+    }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
@@ -280,6 +296,7 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(MISTRAL_ARCHITECTURES)
             .chain(MUSE_ARCHITECTURES)
             .chain(INKLING_ARCHITECTURES)
+            .chain(NEMOTRON_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")
@@ -748,6 +765,14 @@ impl ExpertQuantMatrix {
         self.ggml_type
     }
 
+    /// Bytes per row, still quantized — how [`Self::expert_span`] (or a
+    /// residency tier's copy of it) is sliced by a kernel that reads the
+    /// quantized bytes directly instead of dequantizing a row first. Same
+    /// stride [`Self::row_from`] uses.
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
     /// Whether a device expert tier holds `expert`.
     ///
     /// `false` when there is no tier at all, which is the default and which
@@ -837,18 +862,6 @@ impl ExpertQuantMatrix {
     pub fn row_from(&self, span: &[u8], index: usize, out: &mut Vec<f32>) {
         let offset = index * self.row_bytes;
         let bytes = &span[offset..offset + self.row_bytes];
-        quant::dequantize_into(self.ggml_type, bytes, self.in_dim, out)
-            .expect("row byte range was validated when this ExpertQuantMatrix was constructed");
-    }
-
-    /// [`Self::row`] into a caller-owned buffer, reusing its capacity.
-    ///
-    /// The allocating form is fine for a one-off, and wrong for the MoE
-    /// expert loop, which reads every row of an expert's three matrices and
-    /// would otherwise allocate `in_dim` floats thousands of times per layer.
-    pub fn row_into(&self, expert: usize, index: usize, out: &mut Vec<f32>) {
-        let offset = self.start + expert * self.expert_stride + index * self.row_bytes;
-        let bytes = &self.bytes[offset..offset + self.row_bytes];
         quant::dequantize_into(self.ggml_type, bytes, self.in_dim, out)
             .expect("row byte range was validated when this ExpertQuantMatrix was constructed");
     }
@@ -1679,6 +1692,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_arch_family_accepts_nemotron() {
+        for arch in NEMOTRON_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::NemotronHMoe);
+        }
+    }
+
+    /// The dense sibling and the unrelated older `nemotron` share a name
+    /// prefix but not this module's block structure, so a prefix match would
+    /// promise a load that then fails on the first missing tensor.
+    #[test]
+    fn resolve_arch_family_rejects_the_other_nemotron_architectures() {
+        assert!(resolve_arch_family("nemotron_h").is_err());
+        assert!(resolve_arch_family("nemotron").is_err());
+    }
+
+    #[test]
     fn resolve_arch_family_accepts_qwen3next() {
         for arch in QWEN3NEXT_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen3Next);
@@ -1921,6 +1950,14 @@ mod tests {
         let (arch, bad_quant) =
             model_load_support(&header_only("qwen35moe", &["blk.0.ffn_gate_inp.weight"]));
         assert_eq!(arch.as_deref(), Some("qwen35moe"));
+        assert_eq!(bad_quant, None);
+    }
+
+    #[test]
+    fn model_load_support_accepts_a_nemotron_model() {
+        let (arch, bad_quant) =
+            model_load_support(&header_only("nemotron_h_moe", &["blk.0.ssm_in.weight"]));
+        assert_eq!(arch.as_deref(), Some("nemotron_h_moe"));
         assert_eq!(bad_quant, None);
     }
 

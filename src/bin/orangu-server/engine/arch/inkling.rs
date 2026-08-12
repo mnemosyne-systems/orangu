@@ -90,7 +90,7 @@ use std::sync::Arc;
 
 use super::{ExpertGating, ModelForward};
 use crate::engine::backend::{Backend, MatmulOp};
-use crate::engine::kv_cache::{KvCache, RecurrentLayerState};
+use crate::engine::kv_cache::{KvCache, RecurrentLayerState, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
 use crate::engine::tensor;
@@ -1000,12 +1000,12 @@ impl ModelForward for InklingModel {
         // Four convolution states per layer, in `CONV_*` order, each with
         // no delta-net state at all — this architecture's recurrence is the
         // convolution window and nothing else.
-        let recurrent: Vec<(usize, usize, usize, usize)> = self
+        let recurrent: Vec<RecurrentSpec> = self
             .layers
             .iter()
             .flat_map(|l| {
                 self.conv_channels(l)
-                    .map(|channels| (channels, self.conv_kernel, 0, 0))
+                    .map(|channels| RecurrentSpec::delta_net(channels, self.conv_kernel, 0, 0))
             })
             .collect();
         KvCache::new_mixed(capacity, &kv_dims, &recurrent)
@@ -1053,7 +1053,7 @@ mod tests {
     fn a_short_convolution_carries_its_window_across_calls() {
         // One channel, three taps, so a token's output is
         // `w0*x[t-2] + w1*x[t-1] + w2*x[t] + x[t]`.
-        let mut cache = KvCache::new_mixed(4, &[0], &[(1, 3, 0, 0)]);
+        let mut cache = KvCache::new_mixed(4, &[0], &[RecurrentSpec::delta_net(1, 3, 0, 0)]);
         let kernel = [0.5f32, 0.25, 2.0];
         let mut prefill = vec![1.0f32, 2.0, 3.0];
         shortconv(&mut cache.recurrent[0], &mut prefill, 3, 1, &kernel);

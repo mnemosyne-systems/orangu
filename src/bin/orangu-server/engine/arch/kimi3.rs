@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use super::{ExpertGating, ExpertRouting, ModelForward, attend, rms_norm_scale, row_mean_sq};
 use crate::engine::backend::Backend;
-use crate::engine::kv_cache::KvCache;
+use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
 use crate::engine::tensor;
@@ -185,7 +185,7 @@ pub struct Kimi3Model {
     kv_row: usize,
     kq_scale: f32,
     kv_dims: Vec<usize>,
-    recurrent_specs: Vec<(usize, usize, usize, usize)>,
+    recurrent_specs: Vec<RecurrentSpec>,
     layers: Vec<Kimi3Layer>,
 }
 
@@ -354,7 +354,12 @@ impl Kimi3Model {
                     );
                     conv_kernel.extend_from_slice(&kernel);
                 }
-                recurrent_specs.push((3 * d_inner, d_conv, n_head, kda_head_dim));
+                recurrent_specs.push(RecurrentSpec::delta_net(
+                    3 * d_inner,
+                    d_conv,
+                    n_head,
+                    kda_head_dim,
+                ));
                 Attn::Kda(Box::new(KdaLayer {
                     wq: get_matrix("attn_q.weight")?,
                     wk: get_matrix("attn_k.weight")?,

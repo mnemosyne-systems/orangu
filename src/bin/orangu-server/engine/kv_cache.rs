@@ -812,19 +812,18 @@ impl KvCache {
     }
 
     /// Like [`KvCache::new_with_dims`], plus a recurrent state per entry in
-    /// `recurrent_specs` (`(conv_channels, d_conv, num_heads, head_dim)`),
-    /// for a mixed attention/linear-attention architecture.
+    /// `recurrent_specs`, for a mixed attention/linear-attention
+    /// architecture.
     pub fn new_mixed(
         capacity: usize,
         kv_dims: &[usize],
-        recurrent_specs: &[(usize, usize, usize, usize)],
+        recurrent_specs: &[RecurrentSpec],
     ) -> Self {
         let mut cache = Self::new_with_dims(capacity, kv_dims);
         cache.recurrent = recurrent_specs
             .iter()
-            .map(|&(conv_channels, d_conv, num_heads, head_dim)| {
-                RecurrentLayerState::new(conv_channels, d_conv, num_heads, head_dim)
-            })
+            .copied()
+            .map(RecurrentLayerState::new)
             .collect();
         cache
     }
@@ -897,8 +896,8 @@ impl KvCache {
     }
 
     /// A structural signature — layer count and each layer's `kv_dim`, plus
-    /// every recurrent layer's `(conv_channels, d_conv, num_heads, head_dim)`
-    /// — with no per-position data or capacity in it. Two caches from the
+    /// every recurrent layer's [`RecurrentSpec`] — with no per-position data
+    /// or capacity in it. Two caches from the
     /// same model architecture always agree here; two from different models
     /// (or different KV shapes) never do. Feeds the on-disk slot fingerprint
     /// so a snapshot can only ever be restored into a structurally identical
@@ -916,6 +915,7 @@ impl KvCache {
             push_u32(&mut out, r.d_conv as u32);
             push_u32(&mut out, r.num_heads() as u32);
             push_u32(&mut out, r.head_dim as u32);
+            push_u32(&mut out, r.state_dim as u32);
         }
         out
     }
@@ -943,6 +943,7 @@ impl KvCache {
             push_u32(&mut out, r.d_conv as u32);
             push_u32(&mut out, r.num_heads() as u32);
             push_u32(&mut out, r.head_dim as u32);
+            push_u32(&mut out, r.state_dim as u32);
             push_f32s(&mut out, &r.conv_history);
             push_f32s(&mut out, &r.delta_state);
         }
@@ -978,12 +979,14 @@ impl KvCache {
             let d_conv = cur.u32()? as usize;
             let num_heads = cur.u32()? as usize;
             let head_dim = cur.u32()? as usize;
+            let state_dim = cur.u32()? as usize;
             let conv_history = cur.f32s(conv_channels * d_conv.saturating_sub(1))?;
-            let delta_state = cur.f32s(num_heads * head_dim * head_dim)?;
+            let delta_state = cur.f32s(num_heads * head_dim * state_dim)?;
             recurrent.push(RecurrentLayerState::from_parts(
                 conv_channels,
                 d_conv,
                 head_dim,
+                state_dim,
                 conv_history,
                 delta_state,
             ));
@@ -1052,30 +1055,95 @@ impl<'a> ByteReader<'a> {
     }
 }
 
+/// The shape of one recurrent layer's state — what [`KvCache::new_mixed`]
+/// needs to allocate it.
+///
+/// The two constructors name the two shapes that occur, which differ only in
+/// whether each head's state matrix is square. Nothing else about the two
+/// paths differs here: both carry a causal-conv1d history alongside it, and
+/// both evolve a single state forward rather than keeping per-position
+/// history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecurrentSpec {
+    pub conv_channels: usize,
+    pub d_conv: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub state_dim: usize,
+}
+
+impl RecurrentSpec {
+    /// A gated-delta-net layer: keys and values are the same width, so each
+    /// head's state is the square `[head_dim, head_dim]` outer-product
+    /// accumulator (`engine::arch::qwen35moe`, `qwen35`, `qwen3next`,
+    /// `kimi3`). Also the shape a conv-only layer asks for with
+    /// `num_heads == 0` (`engine::arch::inkling`'s short convolutions),
+    /// which allocates no state matrix at all.
+    pub fn delta_net(
+        conv_channels: usize,
+        d_conv: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            conv_channels,
+            d_conv,
+            num_heads,
+            head_dim,
+            state_dim: head_dim,
+        }
+    }
+
+    /// A selective state-space layer: the state axis is the model's own
+    /// `ssm.state_size`, which is independent of the head width, so each
+    /// head's state is the rectangular `[head_dim, state_dim]`
+    /// (`engine::arch::nemotron`).
+    pub fn ssm(
+        conv_channels: usize,
+        d_conv: usize,
+        num_heads: usize,
+        head_dim: usize,
+        state_dim: usize,
+    ) -> Self {
+        Self {
+            conv_channels,
+            d_conv,
+            num_heads,
+            head_dim,
+            state_dim,
+        }
+    }
+}
+
 /// One recurrent (SSM / gated-delta-net) layer's persistent state: a
-/// causal-conv1d rolling history and a per-head delta-net state matrix.
-/// Unlike [`LayerCache`], there's no per-position history to index —
-/// linear attention/SSM layers carry a single evolving state forward.
+/// causal-conv1d rolling history and a per-head state matrix. Unlike
+/// [`LayerCache`], there's no per-position history to index — linear
+/// attention/SSM layers carry a single evolving state forward.
 pub struct RecurrentLayerState {
     /// `[conv_channels, d_conv - 1]`, channel-major, oldest-first per
     /// channel — the causal conv1d's rolling window of prior inputs.
     conv_history: Vec<f32>,
     conv_channels: usize,
     d_conv: usize,
-    /// Per-head delta-net state matrices, flattened
-    /// `[num_heads, head_dim, head_dim]` (`state[head][i][j]`).
+    /// Per-head state matrices, flattened `[num_heads, head_dim, state_dim]`
+    /// (`state[head][i][j]`), with `state_dim` fastest-varying.
     delta_state: Vec<f32>,
     head_dim: usize,
+    /// The second axis of each head's state matrix — equal to `head_dim` for
+    /// a delta-net layer, `ssm.state_size` for a selective-SSM one. See
+    /// [`RecurrentSpec`].
+    state_dim: usize,
 }
 
 impl RecurrentLayerState {
-    fn new(conv_channels: usize, d_conv: usize, num_heads: usize, head_dim: usize) -> Self {
+    fn new(spec: RecurrentSpec) -> Self {
         Self {
-            conv_history: vec![0.0; conv_channels * d_conv.saturating_sub(1)],
-            conv_channels,
-            d_conv,
-            delta_state: vec![0.0; num_heads * head_dim * head_dim],
-            head_dim,
+            conv_history: vec![0.0; spec.conv_channels * spec.d_conv.saturating_sub(1)],
+            conv_channels: spec.conv_channels,
+            d_conv: spec.d_conv,
+            delta_state: vec![0.0; spec.num_heads * spec.head_dim * spec.state_dim],
+            head_dim: spec.head_dim,
+            state_dim: spec.state_dim,
         }
     }
 
@@ -1085,6 +1153,7 @@ impl RecurrentLayerState {
         conv_channels: usize,
         d_conv: usize,
         head_dim: usize,
+        state_dim: usize,
         conv_history: Vec<f32>,
         delta_state: Vec<f32>,
     ) -> Self {
@@ -1094,16 +1163,18 @@ impl RecurrentLayerState {
             d_conv,
             delta_state,
             head_dim,
+            state_dim,
         }
     }
 
-    /// How many delta-net heads this state carries — `delta_state` is a dense
-    /// `[num_heads, head_dim, head_dim]`, so the head count is implied by its
-    /// length. `0` for the degenerate `head_dim == 0` case (never real).
+    /// How many heads this state carries — `delta_state` is a dense
+    /// `[num_heads, head_dim, state_dim]`, so the head count is implied by
+    /// its length. `0` for the degenerate `head_dim == 0` case (a conv-only
+    /// layer, which carries no state matrix).
     fn num_heads(&self) -> usize {
         self.delta_state
             .len()
-            .checked_div(self.head_dim * self.head_dim)
+            .checked_div(self.head_dim * self.state_dim)
             .unwrap_or(0)
     }
 
@@ -1116,6 +1187,7 @@ impl RecurrentLayerState {
             d_conv: self.d_conv,
             delta_state: self.delta_state.clone(),
             head_dim: self.head_dim,
+            state_dim: self.state_dim,
         }
     }
 
@@ -1127,6 +1199,7 @@ impl RecurrentLayerState {
         debug_assert_eq!(self.conv_channels, src.conv_channels);
         debug_assert_eq!(self.d_conv, src.d_conv);
         debug_assert_eq!(self.head_dim, src.head_dim);
+        debug_assert_eq!(self.state_dim, src.state_dim);
         self.conv_history.copy_from_slice(&src.conv_history);
         self.delta_state.copy_from_slice(&src.delta_state);
     }
@@ -1164,11 +1237,13 @@ impl RecurrentLayerState {
         out
     }
 
-    /// The delta-net state matrix for `head` (`[head_dim, head_dim]`,
-    /// mutable — the recurrence updates it in place every token).
+    /// The state matrix for `head` (`[head_dim, state_dim]`, `state_dim`
+    /// fastest-varying, mutable — the recurrence updates it in place every
+    /// token).
     pub fn delta_state_mut(&mut self, head: usize) -> &mut [f32] {
-        let start = head * self.head_dim * self.head_dim;
-        &mut self.delta_state[start..start + self.head_dim * self.head_dim]
+        let size = self.head_dim * self.state_dim;
+        let start = head * size;
+        &mut self.delta_state[start..start + size]
     }
 }
 
@@ -1276,7 +1351,7 @@ mod tests {
     /// one — and a mixed model's attention layers must still be counted.
     #[test]
     fn gpu_mirror_bytes_ignore_recurrent_state() {
-        let mixed = KvCache::new_mixed(1, &[64, 64], &[(128, 4, 8, 16)]);
+        let mixed = KvCache::new_mixed(1, &[64, 64], &[RecurrentSpec::delta_net(128, 4, 8, 16)]);
         let attention_only = KvCache::new(2, 1, 64);
         assert_eq!(
             mixed.gpu_mirror_bytes(512, 8, KvStorage::F16),
@@ -1414,7 +1489,7 @@ mod tests {
     fn conv_step_uses_zeroed_history_for_the_first_tokens() {
         // 1 channel, d_conv=3 (2 taps of history + the current token).
         // kernel = [tap0, tap1, tap2] for this channel.
-        let mut state = RecurrentLayerState::new(1, 3, 1, 1);
+        let mut state = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 3, 1, 1));
         let kernel = [1.0, 10.0, 100.0];
         // History starts at [0, 0]; first token contributes only via the
         // last tap: 0*1 + 0*10 + 5*100 = 500.
@@ -1424,7 +1499,7 @@ mod tests {
 
     #[test]
     fn conv_step_slides_the_window_across_tokens() {
-        let mut state = RecurrentLayerState::new(1, 3, 1, 1);
+        let mut state = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 3, 1, 1));
         let kernel = [1.0, 10.0, 100.0];
         let _ = state.conv_step(&[5.0], &kernel); // history becomes [0, 5]
         // Second token=7: taps see history [0, 5] then current 7:
@@ -1439,7 +1514,7 @@ mod tests {
 
     #[test]
     fn delta_state_mut_is_independent_per_head() {
-        let mut state = RecurrentLayerState::new(1, 2, 2, 2);
+        let mut state = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 2, 2, 2));
         state
             .delta_state_mut(0)
             .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);

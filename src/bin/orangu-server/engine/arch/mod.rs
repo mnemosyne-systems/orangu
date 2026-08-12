@@ -30,7 +30,10 @@
 //! full-attention layers), `inkling` (Inkling: no rotation at all — a
 //! learned relative-position bias plus causal short convolutions — over
 //! sigmoid-routed experts that share their normalization with the shared
-//! ones), and `dflash`
+//! ones), `nemotron` (Nemotron-H: blocks that are a *single* sub-layer each
+//! — a selective state-space mixer, an unrotated attention, or a squared-
+//! ReLU mixture-of-experts FFN — rather than the usual attention-plus-FFN
+//! pair), and `dflash`
 //! (DeepSeek draft sidecars, served through the target model they draft
 //! for).
 
@@ -43,6 +46,7 @@ pub mod kimi3;
 pub mod llama;
 pub mod mistral;
 pub mod muse;
+pub mod nemotron;
 pub mod phi;
 pub mod qwen35;
 pub mod qwen35moe;
@@ -51,6 +55,7 @@ pub mod qwen3next;
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::ModelConfig;
 use crate::engine::tensor;
+use crate::engine::vecdot;
 use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -523,6 +528,38 @@ pub(crate) fn evaluate_routed_experts_batched(
     out
 }
 
+/// `Backend::matmul`, falling back to the host when the selected backend has
+/// no kernel for this tensor's quantization.
+///
+/// Needed for exactly one class of tensor. `engine::backend::
+/// unsupported_tensor_types` rejects a GPU backend outright if the model
+/// carries a type it lacks — so every ordinary weight is guaranteed, by the
+/// time a forward pass runs, to be one the device can take, and a plain
+/// `backend.matmul` on one cannot meet a gap. The exception is the set
+/// `engine::backend::is_cpu_only_tensor` names: the expert stacks and the
+/// **shared-expert** matrices are exempt from that check on purpose, so that
+/// a low-bit mixture-of-experts file still gets a GPU for the rest of the
+/// model rather than being pushed onto the host wholesale.
+///
+/// That exemption is what makes this function necessary: a shared expert can
+/// be a type the device has no shader for, and `VulkanBackend` *panics* on
+/// that rather than returning zeros. So every shared-expert matmul has to go
+/// through here. `qwen35moe` and `qwen3next` each carry their own copy of
+/// this check for the same reason.
+pub(crate) fn matmul_host_fallback(
+    backend: &dyn crate::engine::backend::Backend,
+    x: &[f32],
+    n_tokens: usize,
+    w: &crate::engine::loader::QuantMatrix,
+) -> Vec<f32> {
+    use crate::engine::backend::Backend as _;
+    if backend.supports_type(w.ggml_type()) {
+        backend.matmul(x, n_tokens, w)
+    } else {
+        crate::engine::backend::CpuBackend.matmul(x, n_tokens, w)
+    }
+}
+
 /// Whether `ORANGU_GPU_EXPERTS=1` asked for routed-expert matmuls to go to
 /// the GPU instead of the host AVX2/rayon path.
 ///
@@ -639,26 +676,87 @@ pub(crate) fn project_expert(
     // The tier's copy when it has one, the mapping otherwise. Identical bytes
     // either way — the tier holds a copy of exactly these — so which side
     // serves a row cannot change a single output value.
-    let span = lease.bytes();
+    let raw = lease.bytes().unwrap_or_else(|| weights.expert_span(expert));
+
+    let ggml_type = weights.ggml_type();
+    let in_dim = weights.in_dim;
+    let row_bytes = weights.row_bytes();
+    let row = |index: usize| {
+        let offset = (first_row + index) * row_bytes;
+        &raw[offset..offset + row_bytes]
+    };
 
     let mut by_row = vec![0f32; n_rows * n_inputs];
-    by_row
-        .par_chunks_mut(n_inputs)
-        .enumerate()
-        // One dequantization buffer per rayon job rather than per row: the
-        // rows are all `in_dim` wide, so the buffer is filled and refilled
-        // without ever reallocating. `for_each_init` runs the initializer
-        // once per work split, not once per item, which is exactly the reuse
-        // scope wanted here.
-        .for_each_init(Vec::new, |weights_row, (row, out)| {
-            match span {
-                Some(span) => weights.row_from(span, first_row + row, weights_row),
-                None => weights.row_into(expert, first_row + row, weights_row),
+    if vecdot::supports(ggml_type, in_dim) {
+        // The integer-dot kernels `engine::backend::cpu` already uses for
+        // every dense matmul, applied to the one matmul that was still
+        // dequantizing to `f32` first.
+        //
+        // That mattered more here than anywhere else: a routed expert's rows
+        // are read once and thrown away, so the `f32` row was pure overhead —
+        // materialized, dotted once per token, discarded. On a
+        // `nemotron_h_moe` decode profile `quant::dequantize_into` under this
+        // function was **60% of all CPU time**, and it is the same shape for
+        // every mixture-of-experts family here.
+        //
+        // The activation quantization this introduces is the same one the
+        // dense path has always used, so an expert's arithmetic is now
+        // consistent with the rest of the layer rather than more precise than
+        // it.
+        if n_inputs == 1 {
+            // GEMV: the fused per-row kernels, which never spill an unpacked
+            // row to memory. `engine::backend::cpu` documents why that beats
+            // the unpack-once form when there is only one activation to
+            // amortize it over.
+            if vecdot::supports_k_row(ggml_type, in_dim) {
+                let act = vecdot::quantize_act_k_row(inputs[0]);
+                by_row
+                    .par_chunks_mut(1)
+                    .enumerate()
+                    .for_each(|(index, out)| {
+                        out[0] = vecdot::dot_k_row(ggml_type, row(index), &act);
+                    });
+            } else {
+                let act = vecdot::quantize_act(inputs[0]);
+                by_row
+                    .par_chunks_mut(1)
+                    .enumerate()
+                    .for_each(|(index, out)| {
+                        out[0] = vecdot::dot_row(ggml_type, row(index), &act);
+                    });
             }
-            for (slot, input) in out.iter_mut().zip(inputs) {
-                *slot = tensor::dot(input, weights_row);
-            }
-        });
+        } else {
+            // GEMM: unpack each row once, then dot it against every token
+            // routed to this expert — the same amortization the dequantizing
+            // path had, minus the `f32` materialization.
+            let acts: Vec<vecdot::ActQ8> = inputs.iter().map(|x| vecdot::quantize_act(x)).collect();
+            by_row.par_chunks_mut(n_inputs).enumerate().for_each_init(
+                vecdot::UnpackedRow::new,
+                |unpacked, (index, out)| {
+                    vecdot::unpack_row(ggml_type, row(index), in_dim, unpacked);
+                    vecdot::dot_unpacked_multi(unpacked, &acts, out);
+                },
+            );
+        }
+    } else {
+        // Types the integer-dot kernels have no unpacking for — the `IQ`
+        // family, which is exactly what the largest mixture-of-experts models
+        // ship in. Dequantize a row and dot it in `f32`, as this always did.
+        by_row
+            .par_chunks_mut(n_inputs)
+            .enumerate()
+            // One dequantization buffer per rayon job rather than per row: the
+            // rows are all `in_dim` wide, so the buffer is filled and refilled
+            // without ever reallocating. `for_each_init` runs the initializer
+            // once per work split, not once per item, which is exactly the reuse
+            // scope wanted here.
+            .for_each_init(Vec::new, |weights_row, (index, out)| {
+                weights.row_from(raw, first_row + index, weights_row);
+                for (slot, input) in out.iter_mut().zip(inputs) {
+                    *slot = tensor::dot(input, weights_row);
+                }
+            });
+    }
     (0..n_inputs)
         .map(|i| (0..n_rows).map(|row| by_row[row * n_inputs + i]).collect())
         .collect()
@@ -1123,10 +1221,63 @@ pub trait ModelForward: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertGating, ExpertRouting, attend, evaluate_routed_experts, project_expert, top_k_indices,
+        ExpertGating, ExpertRouting, attend, evaluate_routed_experts, matmul_host_fallback,
+        project_expert, top_k_indices,
     };
+    use crate::engine::backend::Backend;
+    use crate::engine::loader::{QuantMatrix, test_quant_matrix};
+    use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_Q8_0};
     use crate::engine::tensor;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend that panics on any type it does not list, the way
+    /// `engine::backend::vulkan` panics when asked for a shader it has no
+    /// pipeline for. The panic is the point: a fallback that silently sent
+    /// the call through anyway would be indistinguishable from a working one
+    /// until a real low-bit file hit it.
+    struct Picky(&'static [u32]);
+
+    impl Backend for Picky {
+        fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+            assert!(
+                self.0.contains(&w.ggml_type()),
+                "backend has no kernel for ggml_type {}",
+                w.ggml_type()
+            );
+            let _ = (x, n_tokens);
+            vec![-1.0; n_tokens * w.out_dim]
+        }
+        fn supports_type(&self, ggml_type: u32) -> bool {
+            self.0.contains(&ggml_type)
+        }
+    }
+
+    /// A shared-expert matrix is exempt from the startup device-capability
+    /// check (`engine::backend::is_cpu_only_tensor`), so it is the one weight
+    /// that can reach a forward pass in a type the device cannot run. The
+    /// fallback has to notice and route it to the host instead of handing the
+    /// backend a call it will panic on.
+    #[test]
+    fn matmul_host_fallback_routes_a_type_the_backend_lacks_to_the_host() {
+        // One row of eight `f32` weights, all 1.0, as `F32` — so the host
+        // result is just the sum of the input.
+        let weights: Vec<u8> = (0..8).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let w = test_quant_matrix(&weights, GGML_TYPE_F32, 8, 1);
+        let x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        // A backend that has this type runs it, and we see the backend's own
+        // sentinel rather than the host's answer.
+        assert_eq!(
+            matmul_host_fallback(&Picky(&[GGML_TYPE_F32]), &x, 1, &w),
+            vec![-1.0]
+        );
+        // A backend that lacks it must not be called at all — the host
+        // computes the real dot instead of the sentinel.
+        assert_eq!(
+            matmul_host_fallback(&Picky(&[GGML_TYPE_Q8_0]), &x, 1, &w),
+            vec![36.0]
+        );
+    }
 
     /// A stand-in for one expert's arithmetic, deliberately order-sensitive
     /// in floating point.
