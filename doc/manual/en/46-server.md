@@ -2054,7 +2054,7 @@ blocks are a *single* sub-layer each rather than the usual
 attention-plus-FFN pair: a selective state-space mixer, an unrotated
 attention, or a squared-ReLU mixture-of-experts FFN) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
-`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
+`IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
 across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
@@ -2299,7 +2299,7 @@ loads and runs; what the label predicts is the size, not a single tensor type.
 
 Type coverage differs by backend. Only `cpu` reads every type listed above.
 `vulkan` and `metal` — the same kernels — cover all of them except `IQ1_S`,
-`IQ1_M`, and `IQ2_XXS`; `cuda`,
+`IQ1_M`, the three `IQ1_*` types below them, and `IQ2_XXS`; `cuda`,
 `opencl`, and `rocm` cover the float types, the legacy quants,
 `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and `IQ4_NL`. What's missing in each case
 is the `IQ*` types that index a lattice codebook the backend has no uploaded
@@ -2320,6 +2320,23 @@ GPU backend needs a kernel for any of them. One consequence worth knowing:
 those tensors are held in memory rather than read from the mapped file,
 because interleaving rows leaves no row with a contiguous range to be lazy
 about.
+
+Three further types are narrower still, and come from *outside* the
+upstream type numbering: `IQ1_XS`, `IQ1_XXS` and `IQ1_XXXS`, at 1.4375,
+1.3125 and 1.1875 bits per weight. They are how a "dynamic" 1-bit release of a
+very large mixture-of-experts model gets under its size target — the expert
+stacks of `unsloth/Qwen3.8-2.4T-A95B-GGUF:Q1_0` are stored as `IQ1_XXXS`,
+38 bytes per 256 weights. Each narrows exactly one field of `IQ1_S`, its
+codebook index, from 11 bits to 10, 9 and 8, selecting from a 1024-, 512-
+or 256-point subset of the same 2048-point lattice `IQ1_S` itself indexes.
+Every other field keeps its `IQ1_S` meaning — the `f16` super-block scale,
+the 3-bit sub-block scale, the `±0.125` delta — so orangu reads all three
+through the same code path, bit-for-bit against the reference
+implementation on both random blocks and real model tensors. Their ids are
+64, 65 and 66, deliberately above the 42..63 range left free for upstream to
+grow into, so a build without them rejects such a file rather than
+misreading it; `list` prints anything in that gap as `reserved(N)` for the
+same reason.
 
 Not yet built, and out of scope for now: multimodal input, `/infill`,
 `/rerank`, LoRA hot-swap, and slot save/restore.

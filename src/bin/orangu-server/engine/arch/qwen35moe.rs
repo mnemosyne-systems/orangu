@@ -46,9 +46,13 @@
 //!   (`sigmoid`) shared expert whose output adds in.
 //!
 //! **Not implemented**: NextN/MTP (speculative-decoding-only extra decoder
-//! blocks beyond `block_count`) — this module only ever reads `config.
-//! n_layer` (`block_count`) layers; any MTP blocks in the file are simply
-//! never touched. Multi-section RoPE ("IMRoPE") is implemented as plain
+//! blocks) — this module reads the `block_count` layers a file declares
+//! *less* its `nextn_predict_layers`, so an MTP block is never touched
+//! whether it sits past `block_count` or is counted inside it. The
+//! trillion-parameter releases do the latter: their last block is an MTP
+//! head carrying only `ffn_*`, `post_attention_norm` and `nextn.*`
+//! tensors, and running it as a trunk layer would fail on the attention
+//! tensors it does not have. Multi-section RoPE ("IMRoPE") is implemented as plain
 //! NEOX rope: for text-only input every rope "position channel" (t/h/w/e)
 //! carries the same linear position, at which point the sections mechanism
 //! (confirmed by reading `ggml_mrope_cache_init`) is a no-op — it only
@@ -158,7 +162,15 @@ pub struct Qwen35MoeModel {
 impl Qwen35MoeModel {
     pub fn load_with_backend(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
         let config = loaded.config.clone();
-        let n_layer = config.n_layer;
+        // `block_count` counts the multi-token-prediction blocks too when a
+        // release ships one, so the trunk is everything before them. A file
+        // that does not is unaffected — the key is absent and this is a
+        // subtraction of zero.
+        let n_layer = config
+            .n_layer
+            .checked_sub(loaded.metadata_u64("nextn_predict_layers").unwrap_or(0) as usize)
+            .filter(|&n| n > 0)
+            .context("nextn_predict_layers is not smaller than block_count")?;
 
         loaded
             .metadata_u64("expert_count")

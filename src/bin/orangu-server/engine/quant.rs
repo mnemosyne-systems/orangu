@@ -23,7 +23,8 @@
 //! round-number quants (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole
 //! K-quant family
 //! (`Q2_K` through `Q6_K`), and the `IQ*` codebook quants a mixed
-//! "dynamic" release reaches for at the low end (`IQ2_XS`, `IQ2_S`,
+//! "dynamic" release reaches for at the low end (`IQ1_S`, `IQ1_M`,
+//! `IQ1_XS`, `IQ1_XXS`, `IQ1_XXXS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 //! `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`), plus `MXFP4`. Anything else fails with a
 //! clear "not yet supported" error naming the type, rather than silently
 //! misreading the bytes.
@@ -39,8 +40,8 @@ use half::f16;
 use orangu::gguf::{ggml_type_name, is_removed_ggml_type};
 
 use crate::engine::iq_grids::{
-    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
-    KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    IQ1S_GRID, IQ1XS_GRID, IQ1XXS_GRID, IQ1XXXS_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID,
+    IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 
 // ggml_type ids, from ggml.h. `pub(crate)` so `engine::backend::vulkan`'s
@@ -101,6 +102,14 @@ pub(crate) const GGML_TYPE_IQ4_NL_4_4: u32 = 36;
 pub(crate) const GGML_TYPE_IQ4_NL_4_8: u32 = 37;
 pub(crate) const GGML_TYPE_IQ4_NL_8_8: u32 = 38;
 pub(crate) const GGML_TYPE_MXFP4: u32 = 39;
+// `IQ1_S` with a narrower codebook index, and the only ids here that ggml
+// itself does not define: 42..63 are left free for ggml to grow into, so a
+// quantizer shipping types of its own starts at 64. A stock build rejects a
+// file carrying one instead of misreading it, which is exactly what the
+// reservation is for — and what makes these ids safe to read here.
+pub(crate) const GGML_TYPE_IQ1_XS: u32 = 64;
+pub(crate) const GGML_TYPE_IQ1_XXS: u32 = 65;
+pub(crate) const GGML_TYPE_IQ1_XXXS: u32 = 66;
 
 const QK4_0: usize = 32;
 const QK4_1: usize = 32;
@@ -136,6 +145,9 @@ fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_IQ2_XS => Some((2 + (QK_K / 8) * 2 + QK_K / 32, QK_K)),
         GGML_TYPE_IQ1_S => Some((2 + QK_K / 8 + QK_K / 16, QK_K)),
         GGML_TYPE_IQ1_M => Some((QK_K / 8 + QK_K / 16 + QK_K / 32, QK_K)),
+        GGML_TYPE_IQ1_XS => Some((2 + QK_K / 8 + QK_K / 32 + QK_K / 64, QK_K)),
+        GGML_TYPE_IQ1_XXS => Some((2 + QK_K / 8 + QK_K / 32, QK_K)),
+        GGML_TYPE_IQ1_XXXS => Some((2 + QK_K / 8 + QK_K / 64, QK_K)),
         GGML_TYPE_IQ2_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 32, QK_K)),
         GGML_TYPE_IQ3_XXS => Some((2 + 3 * (QK_K / 8), QK_K)),
         GGML_TYPE_IQ3_S => Some((2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64, QK_K)),
@@ -406,6 +418,9 @@ pub fn dequantize_into(
         GGML_TYPE_IQ2_XS => dequantize_iq2_xs(bytes, element_count, out),
         GGML_TYPE_IQ1_S => dequantize_iq1_s(bytes, element_count, out),
         GGML_TYPE_IQ1_M => dequantize_iq1_m(bytes, element_count, out),
+        GGML_TYPE_IQ1_XS => dequantize_iq1_xs(bytes, element_count, out),
+        GGML_TYPE_IQ1_XXS => dequantize_iq1_xxs(bytes, element_count, out),
+        GGML_TYPE_IQ1_XXXS => dequantize_iq1_xxxs(bytes, element_count, out),
         GGML_TYPE_IQ2_S => dequantize_iq2_s(bytes, element_count, out),
         GGML_TYPE_IQ3_XXS => dequantize_iq3_xxs(bytes, element_count, out),
         GGML_TYPE_IQ3_S => dequantize_iq3_s(bytes, element_count, out),
@@ -1024,6 +1039,116 @@ fn dequantize_iq1_m(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     out.truncate(element_count);
 }
 
+// The three quantizations *below* `IQ1_S`, which reach 1.4375, 1.3125 and
+// 1.1875 bpw by narrowing one field of it and nothing else.
+//
+// `IQ1_S` spends 11 of its 1.5625 bits per weight on an index into a
+// 2048-point codebook — 88% of the whole budget — so the index is the only
+// field with room to give. Each of these types keeps the 8 low bits in
+// `qs` and stores fewer high bits (2, 1, then none at all), indexing a
+// 1024-, 512- or 256-point selection from the very same lattice
+// (`IQ1XS_GRID`, `IQ1XXS_GRID`, `IQ1XXXS_GRID`).
+//
+// Everything else keeps its `IQ1_S` meaning exactly: `d` is the `f16`
+// super-block scale, a 3-bit sub-block code gives `d * (2*ls + 1)`, and a
+// sign bit picks `±IQ1_DELTA`. Only the reassembly of the index differs,
+// which is why all three end in the same `push_iq1_grid` call
+// `dequantize_iq1_s` does.
+//
+// Where those two fields *live* is what the byte counts force. A 32-weight
+// sub-block must carry four index-high fields plus a scale and a sign, and
+// at 10 / 9 / 8 index bits that is 12 / 8 / 4 bits — so `IQ1_XXS` alone
+// fits scale and sign into the same byte as its index-highs, while
+// `IQ1_XS` and `IQ1_XXXS` put them in a separate nibble-per-sub-block
+// array (`iq1_narrow_sub_scale`).
+
+/// The `(scale multiplier, delta)` that `IQ1_XS`/`IQ1_XXXS` pack into one
+/// nibble: bits 0..2 the 3-bit sub-block scale, bit 3 the sign of the
+/// delta.
+fn iq1_narrow_sub_scale(nibble: u8) -> (f32, f32) {
+    let scale = (2 * (nibble & 7) + 1) as f32;
+    let delta = if nibble & 8 != 0 {
+        -IQ1_DELTA
+    } else {
+        IQ1_DELTA
+    };
+    (scale, delta)
+}
+
+/// `block_iq1_xs`: `{ d: f16, qs: [u8; 32], qh: [u8; 8], sc: [u8; 4] }`,
+/// 1.4375 bpw. Each `qh` byte holds the four 2-bit index-highs of its
+/// 32-weight group; the scale and sign live in `sc`.
+fn dequantize_iq1_xs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 32 + QK_K / 64;
+    out.clear();
+    out.reserve(element_count);
+    for block in bytes.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let qs = &block[2..2 + QK_K / 8];
+        let qh = &block[2 + QK_K / 8..2 + QK_K / 8 + QK_K / 32];
+        let sc = &block[2 + QK_K / 8 + QK_K / 32..];
+        for ib in 0..QK_K / 32 {
+            let (scale, delta) = iq1_narrow_sub_scale((sc[ib / 2] >> (4 * (ib % 2))) & 0xf);
+            for l in 0..4 {
+                let idx = qs[4 * ib + l] as usize | ((((qh[ib] >> (2 * l)) & 3) as usize) << 8);
+                push_iq1_grid(out, IQ1XS_GRID[idx], d * scale, delta);
+            }
+        }
+    }
+    out.truncate(element_count);
+}
+
+/// `block_iq1_xxs`: `{ d: f16, qs: [u8; 32], qh: [u8; 8] }`, 1.3125 bpw —
+/// the one that packs perfectly. A single index-high bit per group of 8
+/// leaves exactly four bits over in the same byte, which is where the
+/// 3-bit scale (bits 4..6) and the delta's sign (bit 7) go, so there is no
+/// separate scale array.
+fn dequantize_iq1_xxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 32;
+    out.clear();
+    out.reserve(element_count);
+    for block in bytes.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let qs = &block[2..2 + QK_K / 8];
+        let qh = &block[2 + QK_K / 8..];
+        for ib in 0..QK_K / 32 {
+            let dl = d * (2 * ((qh[ib] >> 4) & 7) + 1) as f32;
+            let delta = if qh[ib] & 0x80 != 0 {
+                -IQ1_DELTA
+            } else {
+                IQ1_DELTA
+            };
+            for l in 0..4 {
+                let idx = qs[4 * ib + l] as usize | ((((qh[ib] >> l) & 1) as usize) << 8);
+                push_iq1_grid(out, IQ1XXS_GRID[idx], dl, delta);
+            }
+        }
+    }
+    out.truncate(element_count);
+}
+
+/// `block_iq1_xxxs`: `{ d: f16, qs: [u8; 32], sc: [u8; 4] }`, 1.1875 bpw —
+/// 38 bytes per 256 weights, the narrowest this family goes. The index fits
+/// a byte, so the block carries no index-high field at all and `qs` alone
+/// selects the codebook entry.
+fn dequantize_iq1_xxxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 64;
+    out.clear();
+    out.reserve(element_count);
+    for block in bytes.chunks_exact(BLOCK_BYTES) {
+        let d = read_f16(block, 0);
+        let qs = &block[2..2 + QK_K / 8];
+        let sc = &block[2 + QK_K / 8..];
+        for ib in 0..QK_K / 32 {
+            let (scale, delta) = iq1_narrow_sub_scale((sc[ib / 2] >> (4 * (ib % 2))) & 0xf);
+            for l in 0..4 {
+                push_iq1_grid(out, IQ1XXXS_GRID[qs[4 * ib + l] as usize], d * scale, delta);
+            }
+        }
+    }
+    out.truncate(element_count);
+}
+
 /// `block_iq2_xs`: `{ d: f16, qs: [u16; 32], scales: [u8; 8] }`, 256
 /// elements as 8 groups of 32 — mirrors ggml's `dequantize_row_iq2_xs`.
 ///
@@ -1269,6 +1394,14 @@ mod tests {
         (GGML_TYPE_IQ2_S, "iq2_s", 512, 0xc86c_2e15_90b4_3a35),
         (GGML_TYPE_IQ1_S, "iq1_s", 512, 0xdc0c_1a7b_8609_7ba5),
         (GGML_TYPE_IQ1_M, "iq1_m", 512, 0xf7ca_fbf0_92bc_33a5),
+        // The three sub-`IQ1_S` types have no "before" implementation to be
+        // captured from, so these were taken once the fixture in
+        // `dequantize_matches_ggml_for_every_quantized_type` had already
+        // agreed with ggml bit-for-bit. That test is what says the values
+        // are *right*; this one is what says they never quietly change.
+        (GGML_TYPE_IQ1_XS, "iq1_xs", 512, 0xae4c_e46b_ecf2_83e5),
+        (GGML_TYPE_IQ1_XXS, "iq1_xxs", 512, 0x6c8e_911c_a956_b465),
+        (GGML_TYPE_IQ1_XXXS, "iq1_xxxs", 512, 0xa7f0_c934_d9fc_8825),
         (GGML_TYPE_IQ3_XXS, "iq3_xxs", 512, 0xb565_b973_da18_d32d),
         (GGML_TYPE_IQ3_S, "iq3_s", 512, 0xa05c_c44c_4ab8_a2f5),
         (GGML_TYPE_IQ4_NL, "iq4_nl", 256, 0x7956_c82f_eba1_2125),
@@ -1299,7 +1432,7 @@ mod tests {
         })
     }
 
-    /// The guard on `dequantize_into`: 24 formats, each still producing the
+    /// The guard on `dequantize_into`: 27 formats, each still producing the
     /// bits it produced before the buffer-reusing rewrite.
     #[test]
     fn dequantizing_every_type_is_unchanged() {
@@ -1445,7 +1578,7 @@ mod tests {
         let Some(cases) = ggml_reference_cases() else {
             return;
         };
-        assert_eq!(cases.len(), 16, "fixture should cover 16 types");
+        assert_eq!(cases.len(), 20, "fixture should cover 20 types");
 
         for (ggml_type, block_elems, raw, want) in cases {
             let name = ggml_type_name(ggml_type);

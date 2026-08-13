@@ -148,6 +148,15 @@ and new files to confirm before trusting a regeneration. Two tests read the
 fixture, and `dequantize_matches_ggml_for_every_quantized_type` asserts the
 type count, so bump that number in the same change.
 
+The list ends with `IQ1_S` and the three types below it
+(`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`, ids 64-66), which a stock `libggml-base`
+does not define — those ids sit above the range ggml reserves for itself, so
+only a build carrying them can produce the fixture. Point `-I`/`-L` at such
+a build to regenerate, or drop the last four entries and the count to 16 to
+regenerate against a stock one. Either way the checked-in guard on those
+three dequantizers is `dequantizing_every_type_is_unchanged`'s checksums,
+which need no fixture at all.
+
 CI never generates these: the tests that use them need embedding models that
 are not cached there, so they skip, exactly as an unset `ORANGU_TEST_*_MODEL`
 already makes them skip. The dequant fixture skips the same way when absent

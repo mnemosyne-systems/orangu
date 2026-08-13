@@ -410,6 +410,15 @@ impl<R: Read> Reader<R> {
 /// download instead. A retired id is never reused, so the name stays
 /// unambiguous. Ids beyond the table are types added after this was
 /// written.
+///
+/// The table runs past the end of ggml's own enum because ids 64 and up are
+/// where a quantizer that ships types of its own puts them, by the
+/// convention that leaves 42..63 free for ggml to grow into. Those ids
+/// therefore have to be *named* here for a file carrying one to say
+/// anything useful, and the gap below them is the reservation itself —
+/// `None`, printed as `reserved(N)`, so a file that somehow carries one is
+/// reported as a range ggml has not filled yet rather than as a type this
+/// build is merely behind on.
 const GGML_TYPE_NAMES: &[Option<&str>] = &[
     Some("F32"),        // 0
     Some("F16"),        // 1
@@ -453,6 +462,31 @@ const GGML_TYPE_NAMES: &[Option<&str>] = &[
     Some("MXFP4"),      // 39
     Some("NVFP4"),      // 40
     Some("Q1_0"),       // 41
+    Some("Q2_0"),       // 42
+    None,               // 43 \
+    None,               // 44 |
+    None,               // 45 |
+    None,               // 46 |
+    None,               // 47 |
+    None,               // 48 |
+    None,               // 49 |
+    None,               // 50 |
+    None,               // 51 |
+    None,               // 52 > reserved for ggml itself
+    None,               // 53 |
+    None,               // 54 |
+    None,               // 55 |
+    None,               // 56 |
+    None,               // 57 |
+    None,               // 58 |
+    None,               // 59 |
+    None,               // 60 |
+    None,               // 61 |
+    None,               // 62 |
+    None,               // 63 /
+    Some("IQ1_XS"),     // 64
+    Some("IQ1_XXS"),    // 65
+    Some("IQ1_XXXS"),   // 66
 ];
 
 /// `ggml_type` ids ggml itself has **deleted** *and* that this build cannot
@@ -576,6 +610,25 @@ mod tests {
         assert!(!is_removed_ggml_type(2));
         assert!(!is_removed_ggml_type(20));
         assert_eq!(ggml_type_name(255), "unknown(255)");
+    }
+
+    /// The three sub-`IQ1_S` types live at 64+, above a gap ggml has not
+    /// filled. All three must name themselves, the gap must read as
+    /// reserved rather than as a real type, and the last id ggml has
+    /// actually used must still be the one it says it is — an off-by-one in
+    /// the run of `None`s would shift every name after it.
+    #[test]
+    fn narrow_iq1_types_are_named_above_ggmls_reserved_range() {
+        assert_eq!(ggml_type_name(42), "Q2_0");
+        assert_eq!(ggml_type_name(43), "reserved(43)");
+        assert_eq!(ggml_type_name(63), "reserved(63)");
+        assert_eq!(ggml_type_name(64), "IQ1_XS");
+        assert_eq!(ggml_type_name(65), "IQ1_XXS");
+        assert_eq!(ggml_type_name(66), "IQ1_XXXS");
+        assert_eq!(ggml_type_name(67), "unknown(67)");
+        for reserved in 43..64 {
+            assert!(!is_removed_ggml_type(reserved), "type {reserved}");
+        }
     }
 
     #[test]

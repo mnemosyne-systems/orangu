@@ -945,10 +945,10 @@ directly from ggml's own `ggml-common.h`/`ggml-quants.c`
 path is bit-for-bit compatible with what other GGUF loaders read. Supported
 types: the floats (`F32`, `F16`, `BF16`), the legacy quants (`Q4_0`,
 `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole K-quant family (`Q2_K` through
-`Q6_K`), and the `IQ*` codebook quants (`IQ1_S`, `IQ1_M`, `IQ2_XXS`,
-`IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`) — any other
-`ggml_type` fails to load with a clear "not yet supported" error rather
-than misreading it.
+`Q6_K`), and the `IQ*` codebook quants (`IQ1_S`, `IQ1_M`, `IQ1_XS`,
+`IQ1_XXS`, `IQ1_XXXS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,
+`IQ4_NL`, `IQ4_XS`) — any other `ggml_type` fails to load with a clear
+"not yet supported" error rather than misreading it.
 
 `IQ4_NL` is worth calling out because it turns up in files whose *name*
 promises a pure K-quant. It is the one `IQ*` type that blocks at 32
@@ -972,6 +972,36 @@ functions interleave 4 or 8 *rows* into shared records — so
 every such tensor to its plain base type before anything reads one. Past
 the loader these ids do not exist, so the CPU fused kernel and all four GPU
 backends serve them with no new code.
+
+`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS` (ids 64-66) are the other three that sit
+outside ggml's own enum, and the reason `gguf::GGML_TYPE_NAMES` now runs
+past its end. They are `IQ1_S` with a narrower codebook index — 10, 9 and 8
+bits instead of 11, into 1024-, 512- and 256-point subsets of the very same
+2048-point lattice — reaching 1.4375, 1.3125 and 1.1875 bits per weight, and
+a "dynamic" 1-bit release of a trillion-parameter mixture-of-experts model
+stores its expert stacks as the last of them. Because only the index
+changes, `dequantize_iq1_xs`/`_xxs`/`_xxxs` are the `IQ1_S` dequantizer with
+a different index reassembly, ending in the same `push_iq1_grid` call, and
+`iq1_narrow_sub_scale` is shared by the two whose scale and sign live in a
+nibble array rather than in the index byte itself. Nothing downstream needed
+a change: the expert stacks these appear in are read on the CPU whatever the
+backend, so `SUPPORTED_TYPES` for the GPU backends stays as it was.
+
+The ids matter as much as the layouts. 42-63 are left free for ggml to grow
+into, which is what makes 64+ safe for a quantizer to claim: a build that
+does not know these types rejects the file instead of reading it at the
+wrong stride. `GGML_TYPE_NAMES` therefore spells the gap out as `None`,
+printed as `reserved(N)`, so `list` distinguishes "an id ggml has not used
+yet" from `unknown(N)`, "a type newer than this build".
+
+`testdata/ggml-dequant-reference.bin` covers 20 types rather than 16 for
+this: the three new ones plus `IQ1_S`, whose presence is what says the
+harness covers this family rather than agreeing vacuously. Regenerating it
+leaves the 16 that were already there byte-identical, but needs a ggml
+build that implements the narrow types — that fixture is local rather than
+checked in, so on a checkout without it the cross-check skips and
+`dequantizing_every_type_is_unchanged`'s checksums are what hold the three
+dequantizers still.
 
 `quant::repack_layout` is the whole specification, as
 `(base type, rows, run, xor)`. Two entries in it do not follow from the
@@ -1094,7 +1124,12 @@ mod`), so adding a family is additive rather than a rewrite:
   per-layer embeddings (PLE), and GEGLU.
 - `qwen35moe.rs` — Qwen3.5/3.6-MoE (confirmed against upstream
   `src/models/qwen35moe.cpp`/`delta-net-base.cpp`): a genuinely different
-  shape, with mixture-of-experts FFN routing.
+  shape, with mixture-of-experts FFN routing. Its trunk is `block_count`
+  *less* `nextn_predict_layers`, as in `glm.rs` and `nemotron.rs`: the
+  trillion-parameter releases count their multi-token-prediction head as
+  the last `block_count` entry rather than putting it past the end, and it
+  carries no attention tensors, so reading it as a trunk layer fails on
+  `blk.N.attn_qkv.weight` rather than running the wrong thing.
 - `qwen35.rs` — Qwen3.5 dense (confirmed against upstream `src/models/
   qwen35.cpp`), e.g. `unsloth/Ornith-1.0-9B-GGUF`: identical hybrid
   full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
@@ -2190,7 +2225,8 @@ rows aren't 256-divisible (see the Scope section of the server chapter) is
 runnable here at all.
 
 `VulkanBackend`'s own coverage is a subset too — it has no shader for
-`IQ1_S`, `IQ1_M`, or `IQ2_XXS`. Every GPU backend therefore overrides
+`IQ1_S`, `IQ1_M`, the three narrow `IQ1_*` types, or `IQ2_XXS`. Every GPU
+backend therefore overrides
 `Backend::supports_type`, and `engine::backend::unsupported_tensor_types`
 walks every shard's tensor directory once at startup so a gap is reported as
 an error naming each missing type. Before that check existed, the gap

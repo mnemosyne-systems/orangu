@@ -60,7 +60,8 @@ use super::{Backend, MatmulOp};
 
 /// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
 /// `engine::quant` reads on the CPU path: the remaining `IQ*` types
-/// (`IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS`)
+/// (`IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/
+/// `IQ3_XXS`/`IQ3_S`/`IQ4_XS`)
 /// index lattice codebooks that would each need their own uploaded buffer,
 /// which `VulkanBackend` has (`IQ_GRID_PRELUDE`) and this backend does not.
 /// `IQ4_NL` is here because it is the exception — a 16-entry level table
