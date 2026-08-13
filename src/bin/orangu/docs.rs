@@ -46,6 +46,7 @@
 //! A page holds what it holds: if a file's boxes do not fit on one page the
 //! build fails, naming the file, rather than spilling onto a fifth page.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -54,8 +55,9 @@ use markdown::mdast::{Node, Table};
 
 use crate::export::{
     BRAND_COLOR, Block, CODE_SIZE, CONTENT_BOTTOM_MM, CONTENT_TOP_MM, MARGIN_MM, PAGE_HEIGHT_MM,
-    PAGE_WIDTH_MM, PT_TO_MM, Pdf, Span, TEXT_COLOR, USABLE_WIDTH_MM, WHITE, inline_spans_of,
-    parse_markdown, render_block_nodes,
+    PAGE_WIDTH_MM, PT_TO_MM, Pdf, Span, TEXT_COLOR, USABLE_WIDTH_MM, WHITE,
+    collect_link_definitions, inline_spans_of, parse_markdown, render_block_nodes,
+    resolve_reference_links,
 };
 
 /// The band text: the reports put `{repository}-{branch}` here.
@@ -560,7 +562,7 @@ fn draw_item(pdf: &mut Pdf, item: &Item, y: f32, width: f32) -> f32 {
 // --- The manual ---
 
 /// The manual's band text, and how deep its table of contents goes.
-const MANUAL_HEADER: &str = "orangu-manual";
+const MANUAL_HEADER: &str = "orangu";
 const TOC_DEPTH: u8 = 2;
 /// The cover's wordmark and tagline sizes.
 const COVER_TITLE_SIZE: f32 = 64.0;
@@ -580,14 +582,24 @@ pub fn build_manual(source_dir: &Path, output: &Path) -> Result<PathBuf> {
     // knowing only that every chapter starts a fresh page, so the numbers hold
     // once the cover and the contents are pushed in front of them.
     let mut probe = Pdf::with_footer(MANUAL_HEADER, FOOTER, (FOOTER, FOOTER_URL))?;
-    let entries = draw_chapters(&mut probe, &chapters)?;
-    let toc_pages = toc_page_count(entries.len());
+    let outline = draw_chapters(&mut probe, &chapters)?;
+    let toc_pages = toc_page_count(outline.entries.len());
     let offset = 1 + toc_pages;
 
     let mut pdf = Pdf::with_footer(MANUAL_HEADER, FOOTER, (FOOTER, FOOTER_URL))?;
+    // The pages the probe saw, shifted past the cover and the contents: with
+    // these, a `](#anchor)` link jumps to its heading instead of opening a
+    // URL no viewer can follow.
+    pdf.set_anchors(
+        outline
+            .anchors
+            .iter()
+            .map(|(slug, page)| (slug.clone(), page + offset))
+            .collect(),
+    );
     draw_cover(&mut pdf, &title, &subtitle);
     pdf.new_page();
-    draw_contents(&mut pdf, &entries, offset);
+    draw_contents(&mut pdf, &outline.entries, offset);
     while pdf.current_page() < offset {
         pdf.new_page();
     }
@@ -613,41 +625,97 @@ struct Chapter {
 /// monospaced approximation.
 enum Piece {
     Blocks(Vec<Block>),
-    /// A heading: its depth, its numbered text, and the blocks that draw it.
-    Heading(u8, String, Vec<Block>),
+    /// A heading: its depth, its numbered text, the anchor a `[label](#slug)`
+    /// link elsewhere in the manual points at, and the blocks that draw it.
+    Heading {
+        depth: u8,
+        title: String,
+        slug: String,
+        blocks: Vec<Block>,
+    },
     Table(Vec<Vec<Vec<Span>>>),
     Image(PathBuf),
     PageBreak,
 }
 
 fn read_chapters(dir: &Path) -> Result<Vec<Chapter>> {
+    let sources = source_files(dir)?;
+    let mut texts = Vec::with_capacity(sources.len());
+    for path in &sources {
+        texts.push(
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        );
+    }
+    let definitions = link_definitions(&texts);
+
     let mut numbers = [0usize; 6];
-    source_files(dir)?
+    let chapters = sources
         .iter()
-        .map(|path| read_chapter(path, &mut numbers))
+        .zip(&texts)
+        .map(|(path, markdown)| read_chapter(path, markdown, &definitions, &mut numbers))
+        .collect::<Result<Vec<_>>>()?;
+    // A file that holds nothing but link definitions — the references — draws
+    // nothing, and an empty chapter would still take a page of its own.
+    Ok(chapters
+        .into_iter()
+        .filter(|chapter| !chapter.pieces.is_empty())
+        .collect())
+}
+
+/// Every `[id]: url` definition in the manual, as a Markdown block to put in
+/// front of each chapter. The sources keep them in one file of their own, but
+/// a chapter is parsed on its own, so without this a `[label][id]` reference
+/// in another file has nothing to resolve against and stays literal text.
+fn link_definitions(texts: &[String]) -> String {
+    let mut definitions = BTreeMap::new();
+    for markdown in texts {
+        collect_link_definitions(
+            &parse_markdown(strip_front_matter(markdown)),
+            &mut definitions,
+        );
+    }
+    definitions
+        .iter()
+        .map(|(identifier, url)| format!("[{identifier}]: <{url}>\n"))
         .collect()
 }
 
-fn read_chapter(path: &Path, numbers: &mut [usize; 6]) -> Result<Chapter> {
-    let markdown =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let root = parse_markdown(strip_front_matter(&markdown));
+fn read_chapter(
+    path: &Path,
+    markdown: &str,
+    definitions: &str,
+    numbers: &mut [usize; 6],
+) -> Result<Chapter> {
+    let body = format!("{definitions}\n{}", strip_front_matter(markdown));
+    let mut root = parse_markdown(&body);
+    resolve_reference_links(&mut root);
     let dir = path.parent().unwrap_or(Path::new("."));
 
     let mut pieces = Vec::new();
     for node in root.children().map(Vec::as_slice).unwrap_or(&[]) {
         match node {
             Node::Heading(heading) => {
-                let text =
-                    number_heading(heading.depth, &plain_text(&inline_spans_of(node)), numbers);
+                let plain = plain_text(&inline_spans_of(node));
+                let title = number_heading(heading.depth, &plain, numbers);
                 let mut blocks = Vec::new();
                 render_block_nodes(std::slice::from_ref(node), 0, &mut blocks);
                 if let Some(block) = blocks.first_mut() {
-                    block.set_text(&text);
+                    block.set_text(&title);
                 }
-                pieces.push(Piece::Heading(heading.depth, text, blocks));
+                pieces.push(Piece::Heading {
+                    depth: heading.depth,
+                    title,
+                    // The anchor is the heading as written, before it was
+                    // numbered: that is what the Markdown links point at.
+                    slug: slug_of(&plain),
+                    blocks,
+                });
             }
             Node::Table(table) => pieces.push(Piece::Table(table_cells(table))),
+            // A link definition draws nothing: it has already done its work,
+            // resolving the references that point at it.
+            Node::Definition(_) => {}
             // A paragraph holding nothing but an image is a figure; a lone
             // `\newpage` is the page break the sources use between chapters.
             Node::Paragraph(paragraph) => match paragraph.children.as_slice() {
@@ -791,6 +859,29 @@ struct Entry {
     page: usize,
 }
 
+/// What a drawing pass learned about where the headings landed: the contents
+/// entries, and the page behind each `#anchor` the manual links to.
+#[derive(Default)]
+struct Outline {
+    entries: Vec<Entry>,
+    anchors: BTreeMap<String, usize>,
+}
+
+/// The anchor a heading answers to, the way the HTML manual names it: folded
+/// to lower case, spaces to hyphens, and everything else dropped — so
+/// `## Optional external tools` is reached by `](#optional-external-tools)`.
+fn slug_of(title: &str) -> String {
+    title
+        .chars()
+        .filter_map(|ch| match ch {
+            _ if ch.is_whitespace() => Some('-'),
+            '-' | '_' => Some(ch),
+            _ if ch.is_alphanumeric() => Some(ch.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
 const TOC_SIZE: f32 = 10.0;
 const TOC_ROW_MM: f32 = TOC_SIZE * 1.7 * PT_TO_MM;
 
@@ -840,11 +931,11 @@ fn draw_contents(pdf: &mut Pdf, entries: &[Entry], offset: usize) {
     }
 }
 
-/// Draw every chapter, returning the contents entries with the page each one
-/// started on. Each chapter opens a fresh page, so these numbers stay true
-/// when the cover and contents are added in front of them.
-fn draw_chapters(pdf: &mut Pdf, chapters: &[Chapter]) -> Result<Vec<Entry>> {
-    let mut entries = Vec::new();
+/// Draw every chapter, returning where its headings landed. Each chapter
+/// opens a fresh page, so these numbers stay true when the cover and contents
+/// are added in front of them.
+fn draw_chapters(pdf: &mut Pdf, chapters: &[Chapter]) -> Result<Outline> {
+    let mut outline = Outline::default();
     let mut first = true;
     for chapter in chapters {
         if !first {
@@ -853,14 +944,20 @@ fn draw_chapters(pdf: &mut Pdf, chapters: &[Chapter]) -> Result<Vec<Entry>> {
         first = false;
         for piece in &chapter.pieces {
             match piece {
-                Piece::Heading(depth, title, blocks) => {
+                Piece::Heading {
+                    depth,
+                    title,
+                    slug,
+                    blocks,
+                } => {
                     if *depth <= TOC_DEPTH {
-                        entries.push(Entry {
+                        outline.entries.push(Entry {
                             depth: *depth,
                             title: title.clone(),
                             page: pdf.current_page(),
                         });
                     }
+                    outline.anchors.insert(slug.clone(), pdf.current_page());
                     pdf.draw_blocks(blocks);
                 }
                 Piece::Blocks(blocks) => pdf.draw_blocks(blocks),
@@ -875,7 +972,7 @@ fn draw_chapters(pdf: &mut Pdf, chapters: &[Chapter]) -> Result<Vec<Entry>> {
             }
         }
     }
-    Ok(entries)
+    Ok(outline)
 }
 
 /// Start a new page, unless nothing has been drawn on this one yet. Every
@@ -956,14 +1053,16 @@ fn draw_table(pdf: &mut Pdf, rows: &[Vec<Vec<Span>>]) {
 /// prose gives way.
 fn column_widths(pdf: &Pdf, rows: &[Vec<Vec<Span>>]) -> Vec<f32> {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // What each column would like — its widest cell on one line — and the
+    // least it can take before wrapping starts cutting words in half.
     let mut wanted = vec![0.0_f32; columns];
-    for row in rows {
+    let mut needed = vec![0.0_f32; columns];
+    for (row_index, row) in rows.iter().enumerate() {
+        // The header row is drawn bold, so it is measured bold.
+        let bold = row_index == 0;
         for (index, cell) in row.iter().enumerate() {
-            let width: f32 = cell
-                .iter()
-                .map(|span| pdf.text_width_mm(span.text(), span.bold(), CODE_SIZE))
-                .sum();
-            wanted[index] = wanted[index].max(width + 2.0 * CELL_PAD_MM);
+            wanted[index] = wanted[index].max(cell_width(pdf, cell, bold) + 2.0 * CELL_PAD_MM);
+            needed[index] = needed[index].max(widest_word(pdf, cell, bold) + 2.0 * CELL_PAD_MM);
         }
     }
     let total: f32 = wanted.iter().sum();
@@ -972,24 +1071,49 @@ fn column_widths(pdf: &Pdf, rows: &[Vec<Vec<Span>>]) -> Vec<f32> {
         let extra = (USABLE_WIDTH_MM - total) / columns as f32;
         return wanted.iter().map(|width| width + extra).collect();
     }
-    // Too wide: shrink proportionally, but never below a readable minimum.
-    let minimum = (USABLE_WIDTH_MM / columns as f32 / 3.0).max(14.0);
-    let scale = USABLE_WIDTH_MM / total;
-    let mut widths: Vec<f32> = wanted
-        .iter()
-        .map(|width| (width * scale).max(minimum))
-        .collect();
-    let over: f32 = widths.iter().sum::<f32>() - USABLE_WIDTH_MM;
-    if over > 0.0 {
-        // Take the overshoot from the widest column, which is the prose one.
-        if let Some(widest) = widths
-            .iter_mut()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            *widest -= over;
-        }
+
+    // Too wide for the page. Every column first takes the width of its
+    // longest word: a key column is a column of names, and breaking
+    // `review_max_tokens` across three lines to widen prose that did not need
+    // it serves nobody. What is left over is then shared out in proportion to
+    // how much more each column asked for, which is nearly all prose.
+    let floor: f32 = needed.iter().sum();
+    if floor >= USABLE_WIDTH_MM {
+        // Not even the words fit side by side: scale them down and let them
+        // break, which is the best a page this wide can do.
+        let scale = USABLE_WIDTH_MM / floor;
+        return needed.iter().map(|width| width * scale).collect();
     }
-    widths
+    let slack = USABLE_WIDTH_MM - floor;
+    let hunger: f32 = wanted
+        .iter()
+        .zip(&needed)
+        .map(|(wanted, needed)| (wanted - needed).max(0.0))
+        .sum();
+    needed
+        .iter()
+        .zip(&wanted)
+        .map(|(needed, wanted)| needed + slack * (wanted - needed).max(0.0) / hunger)
+        .collect()
+}
+
+/// A cell's width set on one line.
+fn cell_width(pdf: &Pdf, cell: &[Span], bold: bool) -> f32 {
+    cell.iter()
+        .map(|span| pdf.text_width_mm(span.text(), bold || span.bold(), CODE_SIZE))
+        .sum()
+}
+
+/// The width of the longest word in a cell — the narrowest its column can be
+/// before wrapping breaks a word rather than a line.
+fn widest_word(pdf: &Pdf, cell: &[Span], bold: bool) -> f32 {
+    cell.iter()
+        .flat_map(|span| {
+            span.text()
+                .split_whitespace()
+                .map(move |word| pdf.text_width_mm(word, bold || span.bold(), CODE_SIZE))
+        })
+        .fold(0.0_f32, f32::max)
 }
 
 #[cfg(test)]
@@ -1018,6 +1142,149 @@ mod tests {
                 Element::Banner(_) => None,
             })
             .collect()
+    }
+
+    /// A manual whose references live in a file of their own, as the real one
+    /// does: a chapter that points at `[label][id]`, and the `[id]: url` it
+    /// resolves against.
+    fn manual_with_references() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("manual");
+        std::fs::write(
+            dir.path().join("01-introduction.md"),
+            "# Introduction\n\nBuilt with [**orangu**][orangu].\n",
+        )
+        .expect("write chapter");
+        std::fs::write(
+            dir.path().join("99-references.md"),
+            "[orangu]: https://example.invalid/orangu\n",
+        )
+        .expect("write references");
+        dir
+    }
+
+    /// Build a manual and return its bytes and the text drawn on its pages.
+    /// A URL that reaches the file without reaching the text is one that was
+    /// attached as an annotation.
+    fn built(sources: &Path) -> (Vec<u8>, String) {
+        let output = sources.join("manual.pdf");
+        build_manual(sources, &output).expect("build");
+        let bytes = std::fs::read(&output).expect("read pdf");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract text");
+        (bytes, text)
+    }
+
+    /// Each chapter is parsed on its own, so a reference to a definition in
+    /// the references file has nothing to resolve against unless the
+    /// definitions are gathered across the whole manual first — and an
+    /// unresolved reference is drawn as the literal `[label][id]`.
+    #[test]
+    fn a_reference_resolves_against_a_definition_in_another_file() {
+        let sources = manual_with_references();
+        let (bytes, text) = built(sources.path());
+
+        assert!(text.contains("orangu"), "extracted: {text:?}");
+        assert!(!text.contains("[orangu]"), "extracted: {text:?}");
+        // The band across every page carries the product's name, not the
+        // document's.
+        assert!(!text.contains("orangu-manual"), "extracted: {text:?}");
+        // Resolved: the destination is in the file, as a link over the label.
+        assert!(contains(&bytes, "https://example.invalid/orangu"));
+    }
+
+    /// A link is drawn as its label alone. The URL belongs to the annotation
+    /// over it, not to the text — a reader should see `orangu`, not
+    /// `orangu (https://…)`.
+    #[test]
+    fn a_link_is_annotated_rather_than_printed() {
+        let sources = manual_with_references();
+        let (_, text) = built(sources.path());
+        assert!(
+            !text.contains("https://example.invalid/orangu"),
+            "extracted: {text:?}"
+        );
+    }
+
+    /// A link into the manual itself names a heading, not a URL: it becomes a
+    /// jump to the page that heading landed on. Left as a URI it would be a
+    /// link no viewer could follow.
+    #[test]
+    fn a_link_to_an_anchor_jumps_to_its_heading() {
+        let sources = tempfile::tempdir().expect("manual");
+        std::fs::write(
+            sources.path().join("01-introduction.md"),
+            "# Introduction
+
+See [the tools](#optional-external-tools).
+",
+        )
+        .expect("write chapter");
+        std::fs::write(
+            sources.path().join("02-tools.md"),
+            "# Optional external tools
+
+Prose.
+",
+        )
+        .expect("write chapter");
+
+        let (bytes, text) = built(sources.path());
+        assert!(text.contains("the tools"), "extracted: {text:?}");
+        assert!(!contains(&bytes, "#optional-external-tools"));
+        // One jump per contents entry, and one more for the link itself.
+        assert_eq!(count(&bytes, "/GoTo"), 3);
+    }
+
+    /// Whether `needle` appears in the PDF's bytes: an annotation's URL is
+    /// written as a plain string, unlike the compressed page content.
+    fn contains(bytes: &[u8], needle: &str) -> bool {
+        count(bytes, needle) > 0
+    }
+
+    fn count(bytes: &[u8], needle: &str) -> usize {
+        bytes
+            .windows(needle.len())
+            .filter(|window| *window == needle.as_bytes())
+            .count()
+    }
+
+    /// A key column is a column of names, and a name that breaks across three
+    /// lines is unreadable. It keeps the width its longest key needs; the
+    /// prose beside it takes what is left and uses more lines instead.
+    #[test]
+    fn a_key_column_keeps_its_longest_key_on_one_line() {
+        let pdf = Pdf::with_footer(MANUAL_HEADER, FOOTER, (FOOTER, FOOTER_URL)).expect("pdf");
+        let key = "review_confidence_threshold";
+        let markdown = format!(
+            "| Key | Description |\n| :-- | :-- |\n| `{key}` | {} |\n",
+            "Minimum confidence score for findings, below which they are \
+             silently dropped, which is a description long enough to want \
+             every millimetre the page can spare."
+        );
+        let root = parse_markdown(&markdown);
+        let table = root
+            .children()
+            .and_then(|children| {
+                children.iter().find_map(|node| match node {
+                    Node::Table(table) => Some(table),
+                    _ => None,
+                })
+            })
+            .expect("table");
+
+        let widths = column_widths(&pdf, &table_cells(table));
+        let needed = pdf.text_width_mm(key, false, CODE_SIZE) + 2.0 * CELL_PAD_MM;
+        assert!(widths[0] >= needed, "{widths:?} for a key needing {needed}");
+        // And the room it did not take went to the prose.
+        assert!(widths[1] > widths[0], "{widths:?}");
+    }
+
+    /// The references draw nothing, so they are not a chapter: one that drew
+    /// nothing would still take a blank page of its own.
+    #[test]
+    fn a_file_of_only_link_definitions_is_not_a_chapter() {
+        let sources = manual_with_references();
+        let chapters = read_chapters(sources.path()).expect("chapters");
+        assert_eq!(chapters.len(), 1);
     }
 
     #[test]

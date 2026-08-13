@@ -42,7 +42,7 @@
 use anyhow::{Context, Result};
 use markdown::{
     ParseOptions,
-    mdast::{Code, Heading, List, ListItem, Node, Paragraph},
+    mdast::{Code, Heading, Image, Link, List, ListItem, Node, Paragraph},
     to_mdast,
 };
 use printpdf::{
@@ -51,6 +51,7 @@ use printpdf::{
     RawImage, Rect, Rgb, TextItem, XObjectTransform,
 };
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -159,6 +160,11 @@ pub(crate) struct Span {
     /// (brand for headings, black for body); set only for syntax-highlighted
     /// appendix code so its runs carry their own colours.
     color: Option<(f32, f32, f32)>,
+    /// The URL this run links to. A Markdown link becomes a run carrying its
+    /// destination, which the page turns into a clickable annotation over
+    /// exactly the text it drew — so the manual reads `orangu`, not
+    /// `orangu (https://…)`.
+    link: Option<String>,
 }
 
 impl Span {
@@ -168,6 +174,7 @@ impl Span {
             bold: false,
             italic: false,
             color: None,
+            link: None,
         }
     }
 
@@ -179,6 +186,7 @@ impl Span {
             bold,
             italic,
             color: None,
+            link: None,
         }
     }
 
@@ -201,6 +209,60 @@ pub(crate) fn parse_markdown(markdown: &str) -> Node {
             position: None,
         })
     })
+}
+
+/// Replace reference-style links and images (`[label][id]`, with a matching
+/// `[id]: url` definition elsewhere in the document) by their inline
+/// equivalents, so they render with their URLs instead of as bare labels.
+pub(crate) fn resolve_reference_links(tree: &mut Node) {
+    let mut definitions = BTreeMap::new();
+    collect_link_definitions(tree, &mut definitions);
+    if !definitions.is_empty() {
+        replace_reference_nodes(tree, &definitions);
+    }
+}
+
+/// Every `[id]: url` definition in `node`, by identifier.
+pub(crate) fn collect_link_definitions(node: &Node, definitions: &mut BTreeMap<String, String>) {
+    if let Node::Definition(definition) = node {
+        definitions.insert(definition.identifier.clone(), definition.url.clone());
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_link_definitions(child, definitions);
+        }
+    }
+}
+
+fn replace_reference_nodes(node: &mut Node, definitions: &BTreeMap<String, String>) {
+    let Some(children) = node.children_mut() else {
+        return;
+    };
+    for child in children {
+        let replacement = match child {
+            Node::LinkReference(reference) => definitions.get(&reference.identifier).map(|url| {
+                Node::Link(Link {
+                    children: std::mem::take(&mut reference.children),
+                    position: None,
+                    url: url.clone(),
+                    title: None,
+                })
+            }),
+            Node::ImageReference(reference) => definitions.get(&reference.identifier).map(|url| {
+                Node::Image(Image {
+                    position: None,
+                    alt: std::mem::take(&mut reference.alt),
+                    url: url.clone(),
+                    title: None,
+                })
+            }),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *child = replacement;
+        }
+        replace_reference_nodes(child, definitions);
+    }
 }
 
 /// A logical line to be laid out: its styled spans, the font size, the leading
@@ -242,12 +304,16 @@ impl Block {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct StyledChar {
     ch: char,
     bold: bool,
     italic: bool,
     color: Option<(f32, f32, f32)>,
+    /// The index, among the spans this line was laid out from, of the linked
+    /// run this character belongs to. Wrapping moves characters between
+    /// lines, so the annotation can only be placed once the line is known.
+    link: Option<usize>,
 }
 
 /// Export the console output window to a PDF in the workspace root.
@@ -271,6 +337,7 @@ pub fn export_console(
                 bold,
                 italic: false,
                 color: None,
+                link: None,
             }],
             size: BODY_SIZE,
             indent_mm: 0.0,
@@ -545,6 +612,7 @@ fn pr_title_block(pr: &PullRequestDetail) -> Block {
             bold: true,
             italic: false,
             color: None,
+            link: None,
         }],
         size: title_size,
         indent_mm: 0.0,
@@ -793,6 +861,7 @@ fn build_changed_file_blocks(pr: &PullRequestDetail) -> Vec<Block> {
                     bold: false,
                     italic: false,
                     color: Some(STATUS_GREEN),
+                    link: None,
                 },
                 Span::plain("  "),
                 Span {
@@ -800,6 +869,7 @@ fn build_changed_file_blocks(pr: &PullRequestDetail) -> Vec<Block> {
                     bold: false,
                     italic: false,
                     color: Some(STATUS_RED),
+                    link: None,
                 },
             ],
             size: BODY_SIZE,
@@ -843,6 +913,7 @@ fn checks_heading_block() -> Block {
             bold: true,
             italic: false,
             color: None,
+            link: None,
         }],
         size: BODY_SIZE,
         indent_mm: 0.0,
@@ -950,6 +1021,7 @@ fn last_comment_table_layout(
             bold: false,
             italic: false,
             color: None,
+            link: None,
         })
         .collect();
     let lines = wrap(&chars, comment_width, comment_width, true, fonts, BODY_SIZE)
@@ -1377,6 +1449,7 @@ fn location_block(location: &FunctionLocation, linker: &SourceLinker) -> Block {
             bold: false,
             italic: false,
             color: url.as_ref().map(|_| BRAND_COLOR),
+            link: None,
         }],
         size: BODY_SIZE,
         indent_mm: 0.0,
@@ -1950,6 +2023,7 @@ fn highlight_code_blocks(
             bold: false,
             italic: false,
             color: Some(GRID_COLOR),
+            link: None,
         }];
         let ranges = highlighter
             .as_mut()
@@ -1961,6 +2035,7 @@ fn highlight_code_blocks(
                 bold: true,
                 italic: false,
                 color: Some(syntect_rgb(style.foreground)),
+                link: None,
             })),
             // Recorded line without a theme: bold black so it still stands out.
             (true, None) => spans.push(Span {
@@ -1968,6 +2043,7 @@ fn highlight_code_blocks(
                 bold: true,
                 italic: false,
                 color: None,
+                link: None,
             }),
             // Context line: plain.
             (false, _) => spans.push(Span::plain(line.clone())),
@@ -2013,11 +2089,23 @@ fn collect_inline(nodes: &[Node], bold: bool, italic: bool, out: &mut Vec<Span>)
             Node::Strong(strong) => collect_inline(&strong.children, true, italic, out),
             Node::Emphasis(emphasis) => collect_inline(&emphasis.children, bold, true, out),
             Node::Delete(delete) => collect_inline(&delete.children, bold, italic, out),
+            // A link is drawn as its label alone, in the brand colour, with
+            // the destination carried on the runs so the page can make them
+            // clickable. A link with no label falls back to its URL: there
+            // would be nothing to click otherwise.
             Node::Link(link) => {
-                collect_inline(&link.children, bold, italic, out);
-                if !link.url.is_empty() {
-                    push_span(out, &format!(" ({})", link.url), bold, italic);
+                let mut label = Vec::new();
+                collect_inline(&link.children, bold, italic, &mut label);
+                if label.is_empty() {
+                    push_span(&mut label, &link.url, bold, italic);
                 }
+                if !link.url.is_empty() {
+                    for span in &mut label {
+                        span.color = Some(BRAND_COLOR);
+                        span.link = Some(link.url.clone());
+                    }
+                }
+                out.append(&mut label);
             }
             Node::Image(image) => {
                 push_span(
@@ -2055,12 +2143,17 @@ fn push_span(out: &mut Vec<Span>, text: &str, bold: bool, italic: bool) {
         return;
     }
     match out.last_mut() {
-        Some(last) if last.bold == bold && last.italic == italic => last.text.push_str(&normalized),
+        // A linked run is never extended: the text after a link is not part
+        // of it, and merging would put it under the same annotation.
+        Some(last) if last.bold == bold && last.italic == italic && last.link.is_none() => {
+            last.text.push_str(&normalized)
+        }
         _ => out.push(Span {
             text: normalized,
             bold,
             italic,
             color: None,
+            link: None,
         }),
     }
 }
@@ -2190,6 +2283,10 @@ pub(crate) struct Pdf {
     /// Pages already finished (flushed by `new_page`/`save`), in order.
     pages: Vec<PdfPage>,
     cursor_y: f32,
+    /// The page each `#anchor` names, for documents whose Markdown links
+    /// within itself. Empty until a caller that knows its own layout — the
+    /// manual, which learns the pages on a first pass — sets it.
+    anchors: BTreeMap<String, usize>,
 }
 
 impl Pdf {
@@ -2216,6 +2313,7 @@ impl Pdf {
             ops: Vec::new(),
             pages: Vec::new(),
             cursor_y: CONTENT_TOP_MM,
+            anchors: BTreeMap::new(),
         };
         pdf.draw_furniture();
         Ok(pdf)
@@ -2282,24 +2380,21 @@ impl Pdf {
             if let Some(url) = &block.link {
                 let text: String = line.iter().map(|styled| styled.ch).collect();
                 let width = self.fonts.text_width_mm(&text, false, false, block.size);
-                let baseline = self.cursor_y;
-                self.ops.push(Op::LinkAnnotation {
-                    link: LinkAnnotation::new(
-                        Rect {
-                            x: Mm(MARGIN_MM + indent).into(),
-                            y: Mm(baseline - 1.5).into(),
-                            width: Mm(width).into(),
-                            height: Mm(block.size * PT_TO_MM + 2.5).into(),
-                            mode: None,
-                            winding_order: None,
-                        },
-                        Actions::uri(url.clone()),
-                        Some(BorderArray::Solid([0.0, 0.0, 0.0])),
-                        None,
-                        None,
-                    ),
-                });
+                self.ops.push(uri_annotation(
+                    MARGIN_MM + indent,
+                    width,
+                    self.cursor_y,
+                    block.size,
+                    url,
+                ));
             }
+            self.annotate_links(
+                &line,
+                &block.spans,
+                MARGIN_MM + indent,
+                self.cursor_y,
+                block.size,
+            );
         }
         self.cursor_y -= block.space_after_mm;
     }
@@ -3131,33 +3226,72 @@ impl Pdf {
         }
     }
 
+    /// Lay a clickable link over each linked run of a line that has just been
+    /// drawn. Wrapping decides where a run ends up — a link can be split
+    /// across two lines, and a line can carry several — so the annotation is
+    /// measured from the characters actually drawn rather than from the span.
+    fn annotate_links(
+        &mut self,
+        line: &[StyledChar],
+        spans: &[Span],
+        x_mm: f32,
+        baseline: f32,
+        size: f32,
+    ) {
+        let mut x = x_mm;
+        let mut start = x_mm;
+        let mut run: Option<usize> = None;
+        for sc in line {
+            if sc.link != run {
+                self.annotate_run(spans, run, start, x - start, baseline, size);
+                run = sc.link;
+                start = x;
+            }
+            x += self.fonts.char_width_mm(sc.ch, sc.bold, sc.italic, size);
+        }
+        self.annotate_run(spans, run, start, x - start, baseline, size);
+    }
+
+    /// One such run: nothing at all unless it came from a linked span.
+    fn annotate_run(
+        &mut self,
+        spans: &[Span],
+        run: Option<usize>,
+        x_mm: f32,
+        width_mm: f32,
+        baseline: f32,
+        size: f32,
+    ) {
+        let Some(url) = run
+            .and_then(|index| spans.get(index))
+            .and_then(|span| span.link.as_deref())
+        else {
+            return;
+        };
+        let annotation = link_annotation(x_mm, width_mm, baseline, size, url, &self.anchors);
+        self.ops.extend(annotation);
+    }
+
+    /// Where each `#anchor` in this document leads (1-based page numbers), so
+    /// a Markdown link into the document itself becomes a jump rather than a
+    /// URL nothing can open.
+    pub(crate) fn set_anchors(&mut self, anchors: BTreeMap<String, usize>) {
+        self.anchors = anchors;
+    }
+
     /// Attach an internal "go to page" link spanning the content width at the
     /// given baseline (`page` is 1-based). Used by the table of contents.
     pub(crate) fn link_to_page(&mut self, page: usize, y_mm: f32, height_mm: f32) {
-        // The destination's `top` is the page height in points so the target
-        // page is shown from its top edge.
-        let top = PAGE_HEIGHT_MM / PT_TO_MM;
-        self.ops.push(Op::LinkAnnotation {
-            link: LinkAnnotation::new(
-                Rect {
-                    x: Mm(MARGIN_MM).into(),
-                    y: Mm(y_mm).into(),
-                    width: Mm(USABLE_WIDTH_MM).into(),
-                    height: Mm(height_mm).into(),
-                    mode: None,
-                    winding_order: None,
-                },
-                Actions::go_to(Destination::Xyz {
-                    page,
-                    left: Some(0.0),
-                    top: Some(top),
-                    zoom: None,
-                }),
-                Some(BorderArray::Solid([0.0, 0.0, 0.0])),
-                None,
-                None,
-            ),
-        });
+        let rect = Rect {
+            x: Mm(MARGIN_MM).into(),
+            y: Mm(y_mm).into(),
+            width: Mm(USABLE_WIDTH_MM).into(),
+            height: Mm(height_mm).into(),
+            mode: None,
+            winding_order: None,
+        };
+        self.ops
+            .push(annotation(rect, Actions::go_to(top_of_page(page))));
     }
 
     /// Draw the header and footer bands (brand fill, centered white text) on the
@@ -3270,6 +3404,7 @@ impl Pdf {
                 &self.fonts,
                 color,
             );
+            self.annotate_links(&line, spans, x_mm, y, size);
         }
         y
     }
@@ -3384,6 +3519,7 @@ fn heading(text: &str, size: f32) -> Block {
             bold: true,
             italic: false,
             color: None,
+            link: None,
         }],
         size,
         indent_mm: 0.0,
@@ -3461,7 +3597,7 @@ fn wrap_block(block: &Block, fonts: &DocFonts) -> Vec<Vec<StyledChar>> {
     let first_width = (USABLE_WIDTH_MM - block.indent_mm).max(1.0);
     let cont_width = (USABLE_WIDTH_MM - block.hanging_mm).max(1.0);
     wrap(
-        &block_chars(block),
+        &spans_chars(&block.spans),
         first_width,
         cont_width,
         block.word_wrap,
@@ -3470,35 +3606,23 @@ fn wrap_block(block: &Block, fonts: &DocFonts) -> Vec<Vec<StyledChar>> {
     )
 }
 
-/// The styled characters of a run of spans, for callers that lay out their own
-/// lines rather than build a [`Block`].
+/// The styled characters of a run of spans. Each character remembers which
+/// span it came from when that span is linked, so the annotation can be laid
+/// over it once wrapping has settled which line it fell on.
 fn spans_chars(spans: &[Span]) -> Vec<StyledChar> {
     spans
         .iter()
-        .flat_map(|span| {
-            span.text.chars().map(|ch| StyledChar {
+        .enumerate()
+        .flat_map(|(index, span)| {
+            span.text.chars().map(move |ch| StyledChar {
                 ch,
                 bold: span.bold,
                 italic: span.italic,
                 color: span.color,
+                link: span.link.as_ref().map(|_| index),
             })
         })
         .collect()
-}
-
-fn block_chars(block: &Block) -> Vec<StyledChar> {
-    let mut chars = Vec::new();
-    for span in &block.spans {
-        for ch in span.text.chars() {
-            chars.push(StyledChar {
-                ch,
-                bold: span.bold,
-                italic: span.italic,
-                color: span.color,
-            });
-        }
-    }
-    chars
 }
 
 /// Break a styled line into visual lines that fit the page width (mm). The first
@@ -3583,6 +3707,78 @@ fn draw_line(
         run.push(sc.ch);
     }
     flush_run(ops, &mut run, x, y, size, run_style, fonts);
+}
+
+/// The annotation for one drawn link run: a jump to the page an in-document
+/// `#anchor` names, or a URI for anything else. An anchor this document does
+/// not define gets nothing — a link to a destination that is not here would
+/// be a link that does nothing when clicked.
+fn link_annotation(
+    x_mm: f32,
+    width_mm: f32,
+    baseline: f32,
+    size: f32,
+    url: &str,
+    anchors: &BTreeMap<String, usize>,
+) -> Option<Op> {
+    let Some(anchor) = url.strip_prefix('#') else {
+        return Some(uri_annotation(x_mm, width_mm, baseline, size, url));
+    };
+    let page = *anchors.get(anchor)?;
+    Some(page_annotation(x_mm, width_mm, baseline, size, page))
+}
+
+/// A clickable URI over the text drawn from `x_mm` at `baseline`, tall enough
+/// to cover the line it sits on.
+fn uri_annotation(x_mm: f32, width_mm: f32, baseline: f32, size: f32, url: &str) -> Op {
+    annotation(
+        line_rect(x_mm, width_mm, baseline, size),
+        Actions::uri(url.to_string()),
+    )
+}
+
+/// A jump to the top of `page` (1-based) over the text drawn from `x_mm` at
+/// `baseline`.
+fn page_annotation(x_mm: f32, width_mm: f32, baseline: f32, size: f32, page: usize) -> Op {
+    annotation(
+        line_rect(x_mm, width_mm, baseline, size),
+        Actions::go_to(top_of_page(page)),
+    )
+}
+
+/// The box a one-line annotation covers: the drawn run, with a little air
+/// above and below so the whole glyph height is clickable.
+fn line_rect(x_mm: f32, width_mm: f32, baseline: f32, size: f32) -> Rect {
+    Rect {
+        x: Mm(x_mm).into(),
+        y: Mm(baseline - 1.5).into(),
+        width: Mm(width_mm).into(),
+        height: Mm(size * PT_TO_MM + 2.5).into(),
+        mode: None,
+        winding_order: None,
+    }
+}
+
+/// A destination showing `page` (1-based) from its top edge.
+fn top_of_page(page: usize) -> Destination {
+    Destination::Xyz {
+        page,
+        left: Some(0.0),
+        top: Some(PAGE_HEIGHT_MM / PT_TO_MM),
+        zoom: None,
+    }
+}
+
+fn annotation(rect: Rect, actions: Actions) -> Op {
+    Op::LinkAnnotation {
+        link: LinkAnnotation::new(
+            rect,
+            actions,
+            Some(BorderArray::Solid([0.0, 0.0, 0.0])),
+            None,
+            None,
+        ),
+    }
 }
 
 /// Draw `run` at `(x, y)` (mm) in its style's colour and return the x just past
