@@ -144,12 +144,25 @@ pub fn plan(heat: &[ExpertHeat], budgets: &[u64]) -> ExpertTierPlan {
 }
 
 /// What a tier of `budgets` would be worth against `heat`, in one line
-/// each — a projection, and labelled as one.
+/// each — a projection, and labelled as one *when it is one*.
 ///
 /// Printed at startup for a MoE model on a GPU, because the alternative is
 /// that the question "would a VRAM expert tier help on this machine?" can
 /// only be answered by building one first.
-pub fn projection(api: &str, plan: &ExpertTierPlan, n_expert: usize, uniform: bool) -> Vec<String> {
+///
+/// `active` is whether a tier is really running (`ORANGU_GPU_EXPERTS`).
+/// Without it the closing line claimed "no tier is active" unconditionally,
+/// which on a run that had just printed `expert tier: N of M experts on
+/// device` is not a stale caveat but a direct contradiction of the line
+/// above it — and the reader who believes the wrong one of the two goes
+/// looking for a bug in the wrong half of the engine.
+pub fn projection(
+    api: &str,
+    plan: &ExpertTierPlan,
+    n_expert: usize,
+    uniform: bool,
+    active: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let share = if n_expert > 0 {
         100.0 * plan.resident_count() as f64 / n_expert as f64
@@ -177,10 +190,17 @@ pub fn projection(api: &str, plan: &ExpertTierPlan, n_expert: usize, uniform: bo
              rate — a tier filled by heat serves far more traffic than one filled by size"
         )),
     }
-    lines.push(format!(
-        "orangu-server: [{api}] projection only: experts run on the CPU, and no tier is \
-         active. See the manual's \"Expert tiers\" section."
-    ));
+    lines.push(if active {
+        format!(
+            "orangu-server: [{api}] the tier above is active: a resident expert runs on the \
+             device, the rest on the CPU. See the manual's \"Expert tiers\" section."
+        )
+    } else {
+        format!(
+            "orangu-server: [{api}] projection only: experts run on the CPU, and no tier is \
+             active. See the manual's \"Expert tiers\" section."
+        )
+    });
     lines
 }
 
@@ -322,8 +342,26 @@ mod tests {
     fn the_projection_states_that_it_is_a_projection() {
         let heat = experts(&[3, 2, 1], MIB);
         let plan = plan(&heat, &[MIB]);
-        let text = projection("vulkan", &plan, 3, false).join("\n");
+        let text = projection("vulkan", &plan, 3, false, false).join("\n");
         assert!(text.contains("1 of 3 experts"), "{text}");
         assert!(text.contains("projection only"), "{text}");
+    }
+
+    /// An active tier must not be described as one that does not exist.
+    ///
+    /// The two lines are emitted together, so a closing caveat that ignores
+    /// `active` contradicts the capacity line directly above it rather than
+    /// merely being out of date.
+    #[test]
+    fn an_active_tier_is_not_reported_as_projection_only() {
+        let heat = experts(&[3, 2, 1], MIB);
+        let plan = plan(&heat, &[MIB]);
+        let text = projection("vulkan", &plan, 3, false, true).join("\n");
+        assert!(text.contains("1 of 3 experts"), "{text}");
+        assert!(
+            !text.contains("projection only"),
+            "an active tier was reported as a projection: {text}"
+        );
+        assert!(text.contains("active"), "{text}");
     }
 }

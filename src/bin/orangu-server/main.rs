@@ -2268,6 +2268,18 @@ fn plan_expert_tier(
     if !engine::arch::gpu_experts() {
         return;
     }
+    // Streaming makes a resident tier redundant *and* harmful: it holds
+    // whatever this call needs in a bounded region that rewinds, so a fixed
+    // subset admitted up front only takes VRAM the streaming region and the
+    // KV cache then cannot have. Measured with both on, the card sat at
+    // capacity.
+    if engine::arch::expert_streaming() {
+        eprintln!(
+            "orangu-server: [{}] expert weights stream per batch; no resident tier is planned",
+            backend.as_wgpu().map_or("cpu", |w| w.api_tag()),
+        );
+        return;
+    }
     let Some(wgpu) = backend.as_wgpu() else {
         return;
     };
@@ -2394,7 +2406,10 @@ fn expert_tier_projection(
         / 2;
     let slots = heat.len();
     let plan = engine::expert_tier::plan(&heat, &[headroom]);
-    engine::expert_tier::projection(wgpu.api_tag(), &plan, slots, true)
+    // Whether the tier this projects is the one actually running: the same
+    // knob `plan_expert_tier` gates on, so the two lines cannot disagree.
+    let active = engine::arch::gpu_experts();
+    engine::expert_tier::projection(wgpu.api_tag(), &plan, slots, true, active)
 }
 
 /// Spreads the model across the selected devices when asked to, wrapping

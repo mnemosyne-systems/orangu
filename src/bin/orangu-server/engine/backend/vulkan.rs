@@ -815,6 +815,125 @@ struct WeightArena {
 /// so this is far smaller than `WEIGHT_ARENA_CHUNK_BYTES`.
 const OP_ARENA_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Capacity of [`StreamArena`], from `ORANGU_EXPERT_STREAM_BYTES`.
+///
+/// It has to hold **one call's** weights, not a model's: the routed experts a
+/// single layer's batch touches. On a 30-layer, 128-expert model a prefill
+/// batch routes to 50–90 of them, and one projection's share is ~2.2 MiB
+/// each, so ~200 MiB covers a layer with room to spare. Bounded and recycled
+/// rather than grown, which is the whole point — `weight_cache` never evicts,
+/// and that is why expert residency has to be decided up front today.
+fn expert_stream_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_EXPERT_STREAM_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(256 * 1024 * 1024)
+    })
+}
+
+/// [`VulkanBackend::stream_groups`]'s decision, with the region budget and
+/// the placement alignment passed in rather than read from the environment
+/// and the device — so the grouping can be tested at region sizes a test can
+/// state, on shapes it can build, without a GPU.
+fn stream_groups<'o, 'a>(
+    ops: &'o [MatmulOp<'a>],
+    budget: u64,
+    align: u64,
+) -> Vec<(&'o [MatmulOp<'a>], u64)> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut seen: HashSet<WeightCacheKey> = HashSet::new();
+    let mut bytes = 0u64;
+    for (i, op) in ops.iter().enumerate() {
+        let (waddr, wlen) = op.w.cache_key();
+        let raw = op.w.raw_bytes().len();
+        let key = (waddr, wlen, op.w.ggml_type(), raw);
+        if seen.contains(&key) {
+            continue;
+        }
+        let size = (raw as u64).next_multiple_of(16).next_multiple_of(align);
+        if bytes + size > budget && i > start {
+            groups.push((&ops[start..i], bytes));
+            start = i;
+            seen.clear();
+            bytes = 0;
+        }
+        seen.insert(key);
+        bytes += size;
+    }
+    groups.push((&ops[start..], bytes));
+    groups
+}
+
+/// A **recyclable** weight region: one fixed buffer, bump-allocated and
+/// rewound when the next group of weights will not fit what is left.
+///
+/// `WeightArena` is the right shape for weights that live as long as the
+/// model — upload once, keep the offset forever. Routed experts are not that:
+/// a 12 GiB expert set cannot sit in a 4 GiB card, so today only a bounded
+/// *subset* is ever admitted (`main::plan_expert_tier`) and the rest stay on
+/// the host. This is the other answer — hold only what the calls in flight
+/// need, and reuse the same bytes once they no longer do.
+///
+/// **On demand rather than per call**, because prefill issues a layer's
+/// experts once per token sub-batch and consecutive sub-batches route to
+/// substantially the same experts — see
+/// [`VulkanBackend::reserve_stream_space`] for what rewinding per call cost.
+///
+/// **Rewinding is safe because the dispatch that reads these bytes has
+/// already finished.** `matmul_batch_dispatch` submits and blocks on its own
+/// readback before returning, so by the time a rewind can happen, nothing on
+/// the device still references the previous epoch's contents. That is a
+/// property of the current synchronous path and would have to be revisited
+/// alongside any asynchronous submit.
+struct StreamArena {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    next_offset: u64,
+    /// Where each weight landed *in this epoch*. Cleared on rewind, unlike
+    /// `WeightArena::slots` — a weight that survives to the next call is
+    /// still here and is not uploaded again; one that does not is.
+    slots: HashMap<WeightCacheKey, (u64, u64)>,
+    /// Bytes uploaded, and the wall time spent in the upload call itself,
+    /// since process start. Reported by [`VulkanBackend::stream_upload_rate`]
+    /// as a rate.
+    ///
+    /// The rate is the whole question for streaming: a batch's experts have
+    /// to cross the bus *every call*, where a resident weight crosses once
+    /// ever. Whether that is affordable is a number, not an argument — and
+    /// one worth measuring rather than inferring from a throughput delta,
+    /// which folds in every other cost too.
+    uploaded: u64,
+    upload_ns: u128,
+    /// How many weights were uploaded, and how many times the region was
+    /// rewound.
+    ///
+    /// Bytes alone cannot tell "this batch needs a lot of experts" from "the
+    /// same expert is being re-uploaded every epoch". `uploads / epochs`
+    /// against the number of experts a layer actually routes to is what
+    /// separates them, and the second is a bug where the first is a cost.
+    uploads: u64,
+    epochs: u64,
+    /// Placements that found the weight already in the region this epoch.
+    ///
+    /// `hits` against `uploads` is the difference between "this workload
+    /// needs that many distinct experts" and "the region is being asked for
+    /// the same expert again and again and cannot answer" — and only the
+    /// second is something a bigger region or a different eviction order
+    /// could fix.
+    hits: u64,
+    /// `matmul_batch_streamed` calls, and the ops across them.
+    ///
+    /// `uploaded` divided by the model's whole expert set is how many
+    /// *passes* a prompt makes over those weights; `calls` is what that
+    /// number is made of. The reference engine makes one pass per prompt, so
+    /// the count — not the rate — is the thing to compare against it.
+    calls: u64,
+    ops: u64,
+}
+
 /// One `uniform_arena` chunk. Per-op meta uniforms are tiny (a handful of
 /// `u32`s each) but there are hundreds of them across a model's layers — the
 /// whole set fits, offset-packed, in a single chunk this size, collapsing
@@ -1053,6 +1172,10 @@ pub struct VulkanBackend {
     /// bytes completely differently — exactly the pair that first caught
     /// this needing `ggml_type` too, not just a length check.
     weight_cache: Mutex<WeightArena>,
+    /// The recyclable expert-weight region — see [`StreamArena`]. `None`
+    /// until a streamed call first needs it, so a run that never streams
+    /// pays no VRAM for it.
+    stream_arena: Mutex<Option<StreamArena>>,
     /// Backing store for every `CachedOpResources::x_buffer` — see
     /// `ScratchArena`'s own doc comment for why this is a separate arena
     /// from `output_arena` rather than one shared pool.
@@ -1449,6 +1572,18 @@ pub struct VulkanBackend {
     /// mechanism and ship default as the same strict, bit-for-bit-verified
     /// improvement.
     wide_unroll_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+
+    /// The **block-hoisted** decode pipelines, one per quantization that has
+    /// a `block_dot` (see `vulkan_shaders::block_hoisted_middle`).
+    ///
+    /// This is the fast decode path for every type the K-quant-only
+    /// `wide_unroll_pipelines` cannot serve. Those two never overlap: a type
+    /// with a block-unroll kernel is not in here, and the selection ladder
+    /// checks the block-unroll first, so this changes nothing for `Q4_K`,
+    /// `Q5_K` or `Q6_K`. Opt out with `ORANGU_NO_BLOCK_HOISTED=1`, which
+    /// restores the element-wise `reduce` for these types — the control for
+    /// its measurement.
+    block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// `Q4_K` block-unroll combined with the packed-`f16` dot
     /// (`vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16`).
     /// `Some` only when `wide_unroll` **and**
@@ -1913,17 +2048,29 @@ type FusedLayerCacheKey = (usize, usize, usize, u32, usize, usize);
 /// `row_bytes` are all fixed by it.
 struct CachedOpResources {
     bind_group: wgpu::BindGroup,
+    /// The weight region `bind_group` was built against — `(chunk, offset,
+    /// size)`.
+    ///
+    /// Fixed for a permanently-arena'd weight, which is why nothing used to
+    /// record it. A **streamed** weight moves: its region rewinds between
+    /// calls, so the same entry can be reused for the same *shape* while the
+    /// bytes it reads live somewhere else than last time. Keeping the triple
+    /// lets [`VulkanBackend::rebind_weight`] rebuild only the bind group and
+    /// leave the entry's regions, uniform, readback buffer and grid alone —
+    /// see [`VulkanBackend::op_entry_streamed`].
+    weight_binding: (wgpu::Buffer, u64, u64),
     /// A `VulkanBackend::x_arena` chunk — `x_offset` is this entry's own
-    /// fixed, non-overlapping region's start within it (`build_op_
-    /// resources` already folded the region's size into `bind_group`
-    /// directly; nothing else needs it — every write call site passes its
-    /// own correct length independently). Only the *contents* at that
-    /// region change between reuses (a fresh `write_buffer`/
+    /// fixed, non-overlapping region's start within it, and `x_len` its size
+    /// (every write call site passes its own correct length independently;
+    /// `x_len` is kept because rebuilding the bind group needs the same
+    /// binding range the original was built with). Only the *contents* at
+    /// that region change between reuses (a fresh `write_buffer`/
     /// `copy_buffer_to_buffer` per call — the activations themselves
     /// differ every time); the region itself, like every other field here,
     /// is fixed for the key's whole lifetime.
     x_buffer: wgpu::Buffer,
     x_offset: u64,
+    x_len: u64,
     /// A `VulkanBackend::output_arena` chunk — `output_len` is this entry's
     /// own fixed, non-overlapping region's size within it, `output_offset`
     /// its start.
@@ -1963,13 +2110,10 @@ struct CachedOpResources {
     /// The `Meta` uniform (dims, `row_bytes`) bound at binding 3 — a
     /// `uniform_arena` sub-range, write-once. Kept as named fields (the bind
     /// group already holds it alive) so the raw-Vulkan replay capture can
-    /// enumerate the exact uniform this matmul binds. Only read by the replay
-    /// path.
-    #[allow(dead_code)]
+    /// enumerate the exact uniform this matmul binds, and so
+    /// [`VulkanBackend::rebind_weight`] can bind the same range again.
     meta_chunk: wgpu::Buffer,
-    #[allow(dead_code)]
     meta_offset: u64,
-    #[allow(dead_code)]
     meta_size: u64,
     /// MMVQ (integer-dot) resources for this op, built when
     /// `VulkanBackend::q4_k_mmvq` is on and the op is a `Q4_K` matmul with
@@ -1985,8 +2129,12 @@ struct CachedOpResources {
 struct MmvqOp {
     /// q8-quantized activation (`10 * in_dim/32` `u32`), written by the
     /// quantize pass, read as binding 1 of the MMVQ matmul.
-    #[allow(dead_code)]
     q8_buffer: wgpu::Buffer,
+    /// `q8_buffer`'s byte length — kept for the same reason as
+    /// `CachedOpResources::x_len`: rebinding a moved weight rebuilds this
+    /// op's matmul bind group, which binds `q8_buffer` over exactly this
+    /// range.
+    q8_len: u64,
     /// `elem3` bind group: this op's f32 activation (binding 0) → `q8_buffer`
     /// (binding 1), `quantize_meta` (binding 2).
     quantize_bind_group: wgpu::BindGroup,
@@ -2028,7 +2176,7 @@ const COOP_MIN_N_TOKENS: usize = 24;
 /// crossover. Other backends can split at any positive width; the `wgpu`
 /// prefill paths need at least [`COOP_MIN_N_TOKENS`] so a tuned run cannot
 /// accidentally push a wide stripe onto the "small batch" shape everywhere.
-fn max_matmul_tokens_per_submission() -> usize {
+pub(crate) fn max_matmul_tokens_per_submission() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         crate::engine::backend::max_multi_token_phase_tokens().max(COOP_MIN_N_TOKENS)
@@ -3767,6 +3915,28 @@ impl VulkanBackend {
             HashMap::new()
         };
 
+        // Every type with a `block_dot`, unless opted out. Built
+        // unconditionally otherwise: it is strictly better than the
+        // element-wise path it replaces for these types (same arithmetic in
+        // the same order, one block header decode instead of `BLOCK_ELEMS`),
+        // so there is no threshold to tune and nothing to gate on.
+        let block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline> =
+            if std::env::var_os("ORANGU_NO_BLOCK_HOISTED").is_none() {
+                SUPPORTED_TYPES
+                    .iter()
+                    .filter_map(|&ggml_type| {
+                        let source = vulkan_shaders::shader_source_reduce_block_hoisted(
+                            ggml_type,
+                            reduce_n_rows(),
+                            subgroup_reduce,
+                        )?;
+                        Some((ggml_type, build_pipeline(source)))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+
         // See `Self::q4_k_unroll_packed_pipeline`'s own doc comment. Built
         // only when both the block-unroll (default) and the packed-`f16` dot
         // (`ORANGU_PACKED_DOT=1`, which already encodes the `supports_f16`
@@ -3990,6 +4160,7 @@ impl VulkanBackend {
             pipelines,
             pipelines_coop,
             pipelines_coop_tiled,
+            stream_arena: Mutex::new(None),
             weight_cache: Mutex::new(WeightArena {
                 chunks: Vec::new(),
                 current_chunk_capacity: 0,
@@ -4067,6 +4238,7 @@ impl VulkanBackend {
             wide_packed_pipeline,
             wide_unroll,
             wide_unroll_pipelines,
+            block_hoisted_pipelines,
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
             q4_k_light_pipeline,
@@ -4117,6 +4289,193 @@ impl VulkanBackend {
     /// `matmul` call to ever use this tensor. See `WeightArena`'s own doc
     /// comment for why this packs many tensors into few chunk buffers
     /// instead of allocating one `wgpu::Buffer` per tensor.
+    /// One batch of matmuls whose **weights are streamed** into a bounded,
+    /// recyclable region rather than the permanent arena.
+    ///
+    /// For routed experts, and only them. A model's expert set is far larger
+    /// than the card (12.0 GiB against 4.00 on this machine), so the
+    /// permanent arena can hold only a fixed fraction chosen before the first
+    /// token — which caps how much expert work can ever run on the device. A
+    /// batch's *own* experts are a few hundred MiB, and that fits, so
+    /// streaming replaces "which experts live here" with "which experts does
+    /// this call need".
+    ///
+    /// **Split into groups that fit the region**, each dispatched on its own
+    /// and so preceded by its own rewind. A batch is not otherwise bounded by
+    /// anything: a prefill-width batch of this model routes to all 128 of a
+    /// layer's experts, 408 MiB against a 256 MiB region. Without the split
+    /// the region fills partway through and every expert after that takes the
+    /// per-weight fallback below — into the permanent arena, which never
+    /// evicts, which is the exact residency cap streaming exists to remove.
+    /// It is not a small effect: it put 40% of *every* layer's experts into
+    /// the arena permanently and drove VRAM to the top of the card.
+    ///
+    /// Falls back to the permanent arena for a single weight larger than the
+    /// whole region, which no routed expert on any model measured here comes
+    /// near — with the split above, that guard is now only ever a guard.
+    pub fn matmul_batch_streamed(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        let widest = ops.iter().map(|op| op.n_tokens).max().unwrap_or(0);
+        if widest > max_matmul_tokens_per_submission() {
+            // Striping re-enters the dispatch per token range, and each entry
+            // would rewind the region out from under the previous range's
+            // weights. Not worth special-casing for a shape the expert path
+            // does not produce; take the unstreamed path.
+            return self.matmul_batch(ops);
+        }
+        if let Some(arena) = self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_mut()
+        {
+            arena.calls += 1;
+            arena.ops += ops.len() as u64;
+        }
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(ops.len());
+        for (group, bytes) in self.stream_groups(ops) {
+            self.reserve_stream_space(bytes);
+            out.extend(self.matmul_batch_dispatch_streamed(group, true));
+        }
+        out
+    }
+
+    /// Makes room for a group's `bytes` of distinct weights, rewinding the
+    /// region only if they will not fit what is left of it.
+    ///
+    /// **This is why the region is not rewound per call.** Prefill runs in
+    /// sub-batches of at most [`max_matmul_tokens_per_submission`] tokens,
+    /// and consecutive sub-batches of one layer route to substantially the
+    /// same experts — so a rewind per dispatch re-uploads a layer's whole
+    /// expert set once per sub-batch. Measured on a 1374-token prompt: 2639
+    /// epochs and **132 GiB** across the bus, against the ~37 GiB the expert
+    /// set itself accounts for. Rewinding on demand keeps a layer's working
+    /// set in place across its sub-batches.
+    ///
+    /// Rewinding here rather than mid-placement is what keeps it safe: a
+    /// group's own weights are guaranteed to fit an empty region
+    /// ([`stream_groups`]), so no rewind can ever strand a weight this same
+    /// group already placed. A rewind between groups is fine for the same
+    /// reason the per-call one was — the previous dispatch blocked on its own
+    /// readback, and a cached op rebinds to wherever its weight now lives
+    /// ([`Self::rebind_weight`]).
+    fn reserve_stream_space(&self, bytes: u64) {
+        if let Some(arena) = self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_mut()
+            && arena.next_offset + bytes > arena.capacity
+        {
+            arena.next_offset = 0;
+            arena.slots.clear();
+            arena.epochs += 1;
+        }
+    }
+
+    /// Splits `ops` into the longest consecutive runs whose **distinct**
+    /// weights fit [`expert_stream_bytes`].
+    ///
+    /// Distinct because two ops routinely name the same tensor — a fused
+    /// gate/up pair is two row ranges of one expert — and the region uploads
+    /// it once per epoch, so counting it twice would split groups that fit.
+    /// Sized the way [`Self::weight_buffer_streamed`] places them (16-byte
+    /// size padding, then the device's storage-offset alignment), because a
+    /// group that fits by an accounting the placer does not share still
+    /// overflows.
+    ///
+    /// A single weight over budget gets a group to itself and takes the
+    /// permanent-arena fallback there, rather than dragging its neighbours
+    /// into an overflowing group.
+    fn stream_groups<'o, 'a>(&self, ops: &'o [MatmulOp<'a>]) -> Vec<(&'o [MatmulOp<'a>], u64)> {
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
+        stream_groups(ops, expert_stream_bytes(), align)
+    }
+
+    /// `(bytes uploaded, seconds spent uploading)` for the streaming region
+    /// since process start, or `None` if nothing has ever been streamed.
+    ///
+    /// Note what this does **not** measure: `queue.write_buffer` stages the
+    /// bytes and the copy lands at the next submit, so the time here is the
+    /// CPU-side cost of getting them into the staging path, not the bus
+    /// transfer. A rate that looks impossible is that — the real transfer is
+    /// then inside the submit, and the way to see it is the submit's own
+    /// wait, which `matmul_batch_dispatch`'s trace already reports.
+    #[allow(clippy::type_complexity)]
+    pub fn stream_upload_rate(&self) -> Option<(u64, f64, u64, u64, u64, u64, u64)> {
+        self.stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_ref()
+            .map(|a| {
+                (
+                    a.uploaded,
+                    a.upload_ns as f64 / 1e9,
+                    a.uploads,
+                    a.epochs,
+                    a.hits,
+                    a.calls,
+                    a.ops,
+                )
+            })
+    }
+
+    /// Places `w` in the recyclable [`StreamArena`], uploading it, or `None`
+    /// if it will not fit even in an empty one.
+    ///
+    /// `None` is a routing decision rather than an error: a weight larger
+    /// than the whole streaming region has to take the permanent arena (and
+    /// so be bounded by the residency plan) or stay on the host. Every
+    /// routed expert on every model measured here is a few MiB against a
+    /// region of hundreds, so this is the guard rather than the common case.
+    fn weight_buffer_streamed(&self, w: &QuantMatrix) -> Option<(wgpu::Buffer, u64, u64)> {
+        let (waddr, wlen) = w.cache_key();
+        let bytes = w.raw_bytes();
+        let key = (waddr, wlen, w.ggml_type(), bytes.len());
+        let size = (bytes.len() as u64).next_multiple_of(16);
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
+        let mut slot = self.stream_arena.lock().expect("stream arena poisoned");
+        let arena = slot.get_or_insert_with(|| {
+            let capacity = expert_stream_bytes().max(size);
+            StreamArena {
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("orangu-server expert stream arena"),
+                    size: capacity,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                capacity,
+                next_offset: 0,
+                slots: HashMap::new(),
+                uploaded: 0,
+                upload_ns: 0,
+                uploads: 0,
+                epochs: 0,
+                hits: 0,
+                calls: 0,
+                ops: 0,
+            }
+        });
+        // Uploaded once per epoch, not once per call: a batch's gate and up
+        // projections are two row ranges of the *same* expert tensor, so
+        // without this the same bytes would cross the bus twice.
+        if let Some(&(offset, size)) = arena.slots.get(&key) {
+            arena.hits += 1;
+            return Some((arena.buffer.clone(), offset, size));
+        }
+        let offset = arena.next_offset.next_multiple_of(align);
+        if offset + size > arena.capacity {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        self.queue.write_buffer(&arena.buffer, offset, bytes);
+        arena.upload_ns += t.elapsed().as_nanos();
+        arena.next_offset = offset + size;
+        arena.uploaded += size;
+        arena.uploads += 1;
+        arena.slots.insert(key, (offset, size));
+        Some((arena.buffer.clone(), offset, size))
+    }
+
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
         let (waddr, wlen) = w.cache_key();
         let bytes = w.raw_bytes();
@@ -4222,16 +4581,34 @@ impl Backend for VulkanBackend {
         if ops.is_empty() {
             return Vec::new();
         }
+        // **Mixed token counts are fine below the stripe threshold**, and
+        // that is the case this exists for. Every op is resourced
+        // independently — its own pipeline, its own `Meta`, its own workgroup
+        // count (`build_op_resources`) — so nothing in one dispatch depends
+        // on its neighbours' width. Only *striping* does: splitting a wide op
+        // into token ranges is a whole-batch decision, and it is the reason
+        // this used to demand one shared `n_tokens` for every call.
+        //
+        // Requiring it everywhere had a cost paid by exactly one caller.
+        // `arch::matmul_batch_mixed` routes a layer's routed experts through
+        // here, and at prefill every expert has a different number of tokens
+        // routed to it — so it had to bucket by width and issue **one
+        // blocking submission per distinct member count**, dozens per layer,
+        // each with its own readback. That, not arithmetic, is what made the
+        // device expert path lose to the host.
+        let widest = ops.iter().map(|op| op.n_tokens).max().unwrap_or(0);
+        if widest <= max_matmul_tokens_per_submission() {
+            return self.matmul_batch_dispatch(ops);
+        }
+        // Striping still wants one width, and a caller wide enough to need it
+        // is a single-shape prefill rather than a mixture.
         let n_tokens = ops[0].n_tokens;
         assert!(
             ops.iter().all(|op| op.n_tokens == n_tokens),
-            "matmul_batch's token-range chunking assumes every op in one \
-             call shares the same n_tokens"
+            "matmul_batch can mix token counts only below the stripe \
+             threshold ({}); this batch's widest op is {widest}",
+            max_matmul_tokens_per_submission()
         );
-        if n_tokens <= max_matmul_tokens_per_submission() {
-            return self.matmul_batch_dispatch(ops);
-        }
-
         self.matmul_batch_striped(ops, n_tokens)
     }
 
@@ -4640,6 +5017,22 @@ impl VulkanBackend {
     }
 
     fn matmul_batch_dispatch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        self.matmul_batch_dispatch_streamed(ops, false)
+    }
+
+    /// [`Self::matmul_batch_dispatch`], optionally taking its weights from
+    /// the recyclable streaming region — see [`StreamArena`].
+    ///
+    /// The region is rewound here, once per call, which is what makes this
+    /// bounded: a call holds only the weights *it* needs, and the next call
+    /// reuses the same bytes. That is the difference between a residency
+    /// plan decided up front against total VRAM and one decided per batch
+    /// against the batch's own working set.
+    fn matmul_batch_dispatch_streamed(
+        &self,
+        ops: &[MatmulOp<'_>],
+        streamed: bool,
+    ) -> Vec<Vec<f32>> {
         if ops.is_empty() {
             return Vec::new();
         }
@@ -4649,28 +5042,31 @@ impl VulkanBackend {
             .map(|op| self.pipeline_for(op.w.ggml_type(), op.w.in_dim, op.n_tokens))
             .collect();
 
-        // Two ops in the same batch can never legitimately share a cache
-        // key: every real call site batches *independent* projections of
-        // one input (e.g. a layer's Q/K/V), which are always different
-        // weight tensors. If that ever changed, locking the same entry's
-        // `Mutex` twice on this thread below would deadlock silently
-        // instead of failing loudly — so check for it explicitly instead.
-        let mut seen_keys = HashSet::with_capacity(ops.len());
-        for op in ops {
-            let (waddr, wlen) = op.w.cache_key();
-            assert!(
-                seen_keys.insert((waddr, wlen, op.n_tokens)),
-                "matmul_batch called with the same (weight, n_tokens) op twice in one batch \
-                 — would deadlock locking its cached resources twice"
-            );
-        }
-
         let _region_guard = self.prefill_region_guard();
         let entries: Vec<Arc<Mutex<CachedOpResources>>> = ops
             .iter()
             .enumerate()
-            .map(|(i, op)| self.op_entry_at(op, 0, ROLE_BATCH + i))
+            .map(|(i, op)| self.op_entry_streamed(op, 0, ROLE_BATCH + i, streamed))
             .collect();
+
+        // Two ops in the same batch can never legitimately share an entry:
+        // every real call site batches *independent* projections of one input
+        // (e.g. a layer's Q/K/V), and each op is given its own `region_slot`
+        // above, so each gets its own. If that ever stopped holding, locking
+        // the same `Mutex` twice on this thread below would hang — silently,
+        // and nowhere near the cause. Checked on the entries themselves
+        // rather than on the ops' weights: a **streamed** op's entry is keyed
+        // by shape, so distinct weights no longer imply distinct entries and
+        // a weight-identity check would miss exactly the case that hangs.
+        let mut seen = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            assert!(
+                seen.insert(Arc::as_ptr(entry)),
+                "matmul_batch built one batch with two ops sharing cached resources \
+                 — would deadlock locking the same entry twice"
+            );
+        }
+
         let mut guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
             .iter()
             .map(|entry| entry.lock().expect("op cache entry poisoned"))
@@ -4767,10 +5163,13 @@ impl VulkanBackend {
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, wait.callback());
         }
+        let t_wait = std::time::Instant::now();
         self.poll_blocking(CONTEXT);
         wait.check(CONTEXT);
+        let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
 
-        guards
+        let t_copy = std::time::Instant::now();
+        let out: Vec<Vec<f32>> = guards
             .iter()
             .map(|guard| {
                 let data = self.mapped_bytes(
@@ -4786,7 +5185,53 @@ impl VulkanBackend {
                     .unmap();
                 result
             })
-            .collect()
+            .collect();
+        // Under `ORANGU_PREFILL_TRACE`, split this batch's tail the way
+        // `ReadbackSplit` splits the fused-attention path's. `wait_ms` is the
+        // GPU actually finishing; `copy_ms` is the host walking mapped device
+        // memory into owned `Vec`s, and on a card whose mappable heap has no
+        // `HOST_CACHED` that read is *slow* — which is the difference between
+        // "the device computed this too slowly" and "getting the answer back
+        // cost more than computing it". A batch of routed experts returns
+        // every expert's intermediates, so it is the one place that
+        // distinction decides a design.
+        if crate::engine::arch::gemma::submission_trace() {
+            let bytes: usize = out.iter().map(|o| o.len() * 4).sum();
+            let copy_ms = t_copy.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "orangu-server: [prefill-trace]   batch-readback ops={} bytes={} \
+                 wait={wait_ms:.2}ms copy={copy_ms:.2}ms ({:.0} MB/s)",
+                out.len(),
+                bytes,
+                if copy_ms > 0.0 {
+                    (bytes as f64 / 1e6) / (copy_ms / 1000.0)
+                } else {
+                    0.0
+                }
+            );
+            // Streamed weights go *up* the same bus these results come down,
+            // every call rather than once — so the running total belongs
+            // beside the readback it has to be weighed against.
+            if streamed
+                && let Some((up_bytes, up_s, uploads, epochs, hits, calls, ops)) =
+                    self.stream_upload_rate()
+            {
+                eprintln!(
+                    "orangu-server: [prefill-trace]   stream-upload total={:.1} MiB \
+                     in {up_s:.2}s ({:.0} MB/s, staging only) uploads={uploads} \
+                     epochs={epochs} hits={hits} calls={calls} ops={ops} \
+                     op-cache={} entries",
+                    up_bytes as f64 / (1024.0 * 1024.0),
+                    if up_s > 0.0 {
+                        (up_bytes as f64 / 1e6) / up_s
+                    } else {
+                        0.0
+                    },
+                    self.op_cache.lock().expect("op cache poisoned").len(),
+                );
+            }
+        }
+        out
     }
 
     /// Whether `n_tokens` both takes the cooperative-path (prefill) shape
@@ -4938,6 +5383,19 @@ impl VulkanBackend {
             && let Some(pipeline) = self.wide_unroll_pipelines.get(&ggml_type)
         {
             return (pipeline, "block-unroll");
+        }
+        // Every rung above this one is `Q4_K`, `Q5_K` or `Q6_K`. This is the
+        // one that is not: the block-hoisted kernel covers whatever type it
+        // has a `block_dot` for, and exists because everything else was
+        // falling all the way through to the element-wise `reduce` and
+        // decoding each block's header once per element. Checked *after* the
+        // block-unroll so the K-quants keep their tuned path — the two sets
+        // are disjoint anyway, and the order makes that explicit rather than
+        // incidental.
+        if n_tokens < self.coop_min_n_tokens
+            && let Some(pipeline) = self.block_hoisted_pipelines.get(&ggml_type)
+        {
+            return (pipeline, "block-hoisted");
         }
         // Checked *first*, so
         // `ORANGU_WIDE_LOAD=1 ORANGU_PACKED_DOT=1` together select the
@@ -5126,7 +5584,49 @@ impl VulkanBackend {
         batch_slot: usize,
         region_slot: usize,
     ) -> Arc<Mutex<CachedOpResources>> {
-        let (waddr, wlen) = op.w.cache_key();
+        self.op_entry_streamed(op, batch_slot, region_slot, false)
+    }
+
+    /// [`Self::op_entry_at`], with `streamed` selecting the recyclable weight
+    /// region.
+    ///
+    /// **A streamed op is cached by shape, not by weight.** `CachedOpResources`
+    /// holds a bind group, and a bind group pins the weight buffer and offset
+    /// it was built against — which a rewinding region invalidates. Everything
+    /// *else* in the entry (the `x`/output regions, the `Meta` uniform, the
+    /// readback buffer, the dispatch grid) depends only on the op's shape and
+    /// survives the move, so the entry is kept and only its bind group is
+    /// rebuilt ([`Self::rebind_weight`]). Building fresh instead — which is
+    /// what this did first — allocates scratch per op per call, thousands of
+    /// regions a prefill, none of them reused.
+    ///
+    /// Zeroing the weight identity is what makes one entry serve every expert
+    /// of a given shape. Two ops that are live at the same instant must not
+    /// land on the same entry, and do not: the one caller that streams
+    /// ([`Self::matmul_batch_dispatch_streamed`]) gives every op in its batch
+    /// a distinct `region_slot`, which is part of the key. Concurrent
+    /// *calls* are serialised by the same region guard the rewinding arena
+    /// already requires.
+    fn op_entry_streamed(
+        &self,
+        op: &MatmulOp<'_>,
+        batch_slot: usize,
+        region_slot: usize,
+        streamed: bool,
+    ) -> Arc<Mutex<CachedOpResources>> {
+        // Resolved before the lookup: whether the weight *fits* the streaming
+        // region decides which cache namespace this op belongs in. One that
+        // does not fit fell back to the permanent arena, where its binding is
+        // fixed, so it is an ordinary weight-keyed entry like any other.
+        let streamed_weight = streamed
+            .then(|| self.weight_buffer_streamed(op.w))
+            .flatten();
+        let (waddr, wlen) = match streamed_weight {
+            // No real tensor is at address 0, so the shape namespace cannot
+            // collide with the weight-keyed one.
+            Some(_) => (0, 0),
+            None => op.w.cache_key(),
+        };
         let key: OpCacheKey = (
             waddr,
             wlen,
@@ -5138,11 +5638,18 @@ impl VulkanBackend {
             batch_slot,
             region_slot,
         );
-        {
+        let hit = {
             let cache = self.op_cache.lock().expect("op cache poisoned");
-            if let Some(entry) = cache.get(&key) {
-                return entry.clone();
+            cache.get(&key).cloned()
+        };
+        if let Some(entry) = hit {
+            if let Some(weight) = streamed_weight {
+                // The entry outlives the region its weights sat in last call.
+                // Follow the move; the borrow ends before the caller takes its
+                // own guard.
+                self.rebind_weight(&mut entry.lock().expect("op cache entry poisoned"), weight);
             }
+            return entry;
         }
         // Built outside the lock — buffer/bind-group creation doesn't need
         // exclusive access to the cache, only the final insert does. If
@@ -5150,10 +5657,21 @@ impl VulkanBackend {
         // (functionally identical) copy and whichever inserts second just
         // has its own copy dropped; no correctness issue, only a rare,
         // one-time bit of redundant setup work.
-        let resources = self.build_op_resources(op, region_slot);
+        let resources = self.build_op_resources(op, region_slot, streamed_weight.clone());
         let entry = Arc::new(Mutex::new(resources));
-        let mut cache = self.op_cache.lock().expect("op cache poisoned");
-        cache.entry(key).or_insert(entry).clone()
+        let stored = {
+            let mut cache = self.op_cache.lock().expect("op cache poisoned");
+            cache.entry(key).or_insert(entry).clone()
+        };
+        if let Some(weight) = streamed_weight {
+            // Losing that race hands back *another* thread's entry, built
+            // against whatever weight that thread was streaming — which for a
+            // shape-keyed entry is a different tensor, not an equivalent copy.
+            // Rebinding here is what makes the race benign; it costs nothing
+            // when this thread's own entry is the one that landed.
+            self.rebind_weight(&mut stored.lock().expect("op cache entry poisoned"), weight);
+        }
+        stored
     }
 
     /// Held for as long as a call's pooled regions are in use — `None` when
@@ -5229,13 +5747,107 @@ impl VulkanBackend {
         entry
     }
 
+    /// The five-binding matmul bind group: weights (0), activations (1),
+    /// output (2), `Meta` (3), and the shared IQ lookup grid (4).
+    ///
+    /// One function rather than an open-coded descriptor per site so that a
+    /// rebuilt bind group ([`Self::rebind_weight`]) cannot drift from the one
+    /// [`Self::build_op_resources`] first created — they must bind the same
+    /// ranges over the same layout, differing only in where the weights are.
+    fn matmul_bind_group(
+        &self,
+        label: &str,
+        weight: (&wgpu::Buffer, u64, u64),
+        x: BindSrc<'_>,
+        output: BindSrc<'_>,
+        meta: BindSrc<'_>,
+    ) -> wgpu::BindGroup {
+        let (weight_chunk, weight_offset, weight_size) = weight;
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: weight_chunk,
+                        offset: weight_offset,
+                        size: Some(
+                            std::num::NonZeroU64::new(weight_size)
+                                .expect("weight size is always > 0"),
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: meta.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.iq_grid_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Points an existing entry at a weight region that has **moved**,
+    /// rebuilding its bind group(s) and nothing else.
+    ///
+    /// This is what lets a streamed op keep a cache entry at all. Everything
+    /// in `CachedOpResources` except the bind group is a function of the op's
+    /// *shape* — the `x`/output regions, the `Meta` uniform, the readback
+    /// buffer, the dispatch grid — and a streamed op has the same shape every
+    /// call; only the weight's address changes, because the region it lives in
+    /// rewinds. Discarding the whole entry to follow that address is what made
+    /// the streamed path allocate fresh scratch for every op of every call.
+    ///
+    /// A no-op when the region has not actually moved, which is the common
+    /// case within one epoch (a fused gate/up pair binds the same tensor
+    /// twice).
+    fn rebind_weight(&self, res: &mut CachedOpResources, weight: (wgpu::Buffer, u64, u64)) {
+        if res.weight_binding == weight {
+            return;
+        }
+        let (chunk, offset, size) = &weight;
+        res.bind_group = self.matmul_bind_group(
+            "orangu-server matmul bind group (rebound)",
+            (chunk, *offset, *size),
+            BindSrc::Slice(&res.x_buffer, res.x_offset, res.x_len),
+            BindSrc::Slice(&res.output_buffer, res.output_offset, res.output_len),
+            BindSrc::Slice(&res.meta_chunk, res.meta_offset, res.meta_size),
+        );
+        if let Some(mmvq) = res.mmvq.as_mut() {
+            mmvq.mmvq_bind_group = self.matmul_bind_group(
+                "orangu-server mmvq bind group (rebound)",
+                (chunk, *offset, *size),
+                BindSrc::Slice(&mmvq.q8_buffer, 0, mmvq.q8_len),
+                BindSrc::Slice(&res.output_buffer, res.output_offset, res.output_len),
+                BindSrc::Slice(&res.meta_chunk, res.meta_offset, res.meta_size),
+            );
+        }
+        res.weight_binding = weight;
+    }
+
     /// Builds one op's activation/output/readback/uniform buffers and the
     /// bind group tying them (plus the tensor's cached weight buffer)
     /// together — everything needed to dispatch against this `(weight,
     /// n_tokens)` shape, minus the activation data itself (written fresh
     /// by the caller on every reuse, since that's the one thing that
     /// actually changes call to call).
-    fn build_op_resources(&self, op: &MatmulOp<'_>, region_slot: usize) -> CachedOpResources {
+    fn build_op_resources(
+        &self,
+        op: &MatmulOp<'_>,
+        region_slot: usize,
+        streamed_weight: Option<(wgpu::Buffer, u64, u64)>,
+    ) -> CachedOpResources {
         let &MatmulOp { x, n_tokens, w } = op;
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
@@ -5250,7 +5862,12 @@ impl VulkanBackend {
             "matmul op x must be either empty (GPU-produced) or exactly n_tokens * in_dim"
         );
 
-        let (weight_chunk, weight_offset, weight_size) = self.weight_buffer(w);
+        // A streamed weight is already placed by the caller (`op_entry_
+        // streamed`, which needs the region to decide whether an existing
+        // entry can be rebound rather than rebuilt); everything else takes
+        // the permanent arena.
+        let (weight_chunk, weight_offset, weight_size) =
+            streamed_weight.unwrap_or_else(|| self.weight_buffer(w));
 
         // `x_buffer`/`output_buffer` are placed in `Self::x_arena`/
         // `Self::output_arena` — see `ScratchArena`'s own doc comment for
@@ -5301,39 +5918,13 @@ impl VulkanBackend {
         // op's meta instead of one per op.
         let (meta_chunk, meta_offset, meta_size) = self.uniform_alloc(bytemuck::bytes_of(&meta));
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("orangu-server matmul bind group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &weight_chunk,
-                        offset: weight_offset,
-                        size: Some(
-                            std::num::NonZeroU64::new(weight_size)
-                                .expect("weight size is always > 0"),
-                        ),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: BindSrc::Slice(&x_buffer, x_offset, x_len).resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: BindSrc::Slice(&output_buffer, output_offset, output_len).resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: BindSrc::Slice(&meta_chunk, meta_offset, meta_size).resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.iq_grid_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = self.matmul_bind_group(
+            "orangu-server matmul bind group",
+            (&weight_chunk, weight_offset, weight_size),
+            BindSrc::Slice(&x_buffer, x_offset, x_len),
+            BindSrc::Slice(&output_buffer, output_offset, output_len),
+            BindSrc::Slice(&meta_chunk, meta_offset, meta_size),
+        );
 
         // The plain (now non-default — opt back in with
         // `ORANGU_NO_TILED_PREFILL=1`) cooperative shader dispatches one
@@ -5421,44 +6012,17 @@ impl VulkanBackend {
                     &quantize_meta,
                 );
                 let quantize_workgroups = Self::workgroup_dims((n_blocks as u32).div_ceil(64));
-                let mmvq_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("orangu-server mmvq bind group"),
-                    layout: &self.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &weight_chunk,
-                                offset: weight_offset,
-                                size: Some(
-                                    std::num::NonZeroU64::new(weight_size)
-                                        .expect("weight size is > 0"),
-                                ),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: BindSrc::Slice(&q8_buffer, 0, q8_len).resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: BindSrc::Slice(&output_buffer, output_offset, output_len)
-                                .resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: BindSrc::Slice(&meta_chunk, meta_offset, meta_size)
-                                .resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: self.iq_grid_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
+                let mmvq_bind_group = self.matmul_bind_group(
+                    "orangu-server mmvq bind group",
+                    (&weight_chunk, weight_offset, weight_size),
+                    BindSrc::Slice(&q8_buffer, 0, q8_len),
+                    BindSrc::Slice(&output_buffer, output_offset, output_len),
+                    BindSrc::Slice(&meta_chunk, meta_offset, meta_size),
+                );
                 let mmvq_workgroups = Self::workgroup_dims((out_dim * n_tokens) as u32);
                 MmvqOp {
                     q8_buffer,
+                    q8_len,
                     quantize_bind_group,
                     quantize_meta,
                     quantize_workgroups,
@@ -5469,8 +6033,10 @@ impl VulkanBackend {
 
         CachedOpResources {
             bind_group,
+            weight_binding: (weight_chunk, weight_offset, weight_size),
             x_buffer,
             x_offset,
+            x_len,
             output_buffer,
             output_offset,
             readback_buffer: None,
@@ -15835,9 +16401,275 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cross_check(GGML_TYPE_Q8_0, 64, 17);
     }
 
+    /// The legacy quants at a **model-shaped** `in_dim`, which is what
+    /// actually exercises the block-hoisted decode kernel.
+    ///
+    /// `cross_check`'s usual `in_dim = 64` is two 32-element blocks. The
+    /// block-hoisted path assigns one block per lane and strides by the
+    /// workgroup, so at two blocks exactly two of sixty-four lanes do any
+    /// work and the loop never goes round twice — every indexing mistake
+    /// that depends on the stride, the second iteration, or a lane whose
+    /// first block is already past the end is invisible. 2816 is this
+    /// hardware's `gemma-4-26B-A4B` `n_embd` and 88 blocks: lanes 0..23 run
+    /// twice, 24..63 once, and the tail condition is live.
+    ///
+    /// `out_dim = 7` is deliberately not a multiple of `REDUCE_N_ROWS`, so
+    /// the `o{i} < params.out_dim` guards are exercised too.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_0_model_shaped() {
+        cross_check(GGML_TYPE_Q4_0, 2816, 7);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_1_model_shaped() {
+        cross_check(GGML_TYPE_Q4_1, 2816, 7);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_q8_0_model_shaped() {
+        cross_check(GGML_TYPE_Q8_0, 2816, 7);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_for_q4_k() {
         cross_check(GGML_TYPE_Q4_K, 512, 5);
+    }
+
+    /// A prefill-width batch routes to *every* expert in a layer, which on
+    /// this model is 408 MiB against a 256 MiB region. Grouping is what keeps
+    /// that inside the region: each group is dispatched separately and so
+    /// preceded by its own rewind.
+    ///
+    /// Getting it wrong is not a crash — `weight_buffer_streamed` returns
+    /// `None` for whatever no longer fits and those weights go to the
+    /// permanent arena instead, which never evicts. So an overflowing group
+    /// still computes the right answer while quietly reinstating the
+    /// residency cap streaming exists to remove.
+    #[test]
+    fn a_streamed_batch_is_split_into_groups_that_fit_the_region() {
+        // 34 raw bytes each (one `Q8_0` block), placed on 256-byte
+        // boundaries, so the budget below is exactly three weights wide.
+        const ALIGN: u64 = 256;
+        let bytes: Vec<Vec<u8>> = (0..5)
+            .map(|_| {
+                let mut seed = 0xA11CE_u64;
+                build_block(GGML_TYPE_Q8_0, &mut seed)
+            })
+            .collect();
+        let mats: Vec<QuantMatrix> = bytes
+            .iter()
+            .map(|b| test_quant_matrix(b, GGML_TYPE_Q8_0, 32, 1))
+            .collect();
+        let x = vec![0.5f32; 32];
+        fn op<'a>(x: &'a [f32], w: &'a QuantMatrix) -> MatmulOp<'a> {
+            MatmulOp { x, n_tokens: 1, w }
+        }
+
+        let five: Vec<MatmulOp<'_>> = mats.iter().map(|w| op(&x, w)).collect();
+        let groups = stream_groups(&five, 3 * ALIGN, ALIGN);
+        assert_eq!(
+            groups.iter().map(|(g, _)| g.len()).collect::<Vec<_>>(),
+            vec![3, 2],
+            "five weights into a three-wide region is 3 + 2"
+        );
+        // The reported size is what `reserve_stream_space` rewinds against,
+        // so a group that under-reports its own bytes would overflow the
+        // region it was just told it fits in.
+        assert_eq!(
+            groups.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
+            vec![3 * ALIGN, 2 * ALIGN]
+        );
+        // Whatever the split, every op has to be dispatched exactly once and
+        // in order — the caller concatenates the groups' results positionally.
+        let flattened: Vec<*const QuantMatrix> = groups
+            .iter()
+            .flat_map(|(g, _)| g.iter().map(|op| std::ptr::from_ref(op.w)))
+            .collect();
+        let want: Vec<*const QuantMatrix> =
+            five.iter().map(|op| std::ptr::from_ref(op.w)).collect();
+        assert_eq!(flattened, want);
+
+        // One tensor named twice is uploaded once per epoch (a fused gate/up
+        // pair is two row ranges of one expert), so counting it twice would
+        // split a batch that fits.
+        let repeated = vec![
+            op(&x, &mats[0]),
+            op(&x, &mats[0]),
+            op(&x, &mats[1]),
+            op(&x, &mats[2]),
+        ];
+        let groups = stream_groups(&repeated, 3 * ALIGN, ALIGN);
+        assert_eq!(
+            groups.len(),
+            1,
+            "three distinct weights fit a three-wide region however often they are named"
+        );
+
+        // A budget below a single weight: each gets its own group rather than
+        // one overflowing group, and the batch still runs (that weight takes
+        // the permanent-arena fallback).
+        let groups = stream_groups(&five, 1, ALIGN);
+        assert_eq!(groups.len(), 5);
+        assert!(groups.iter().all(|(g, _)| g.len() == 1));
+    }
+
+    /// `n` distinct `Q4_0` weights of one shape, plus activations — the
+    /// shape a batch of routed experts has.
+    fn streamed_expert_fixture(
+        n: usize,
+        in_dim: usize,
+        out_dim: usize,
+        n_tokens: usize,
+    ) -> (Vec<Vec<u8>>, Vec<f32>) {
+        let mut seed = 0x5EED_D0DE_u64;
+        let blocks = out_dim * (in_dim / block_elems(GGML_TYPE_Q4_0));
+        let weights = (0..n)
+            .map(|_| {
+                (0..blocks)
+                    .flat_map(|_| build_block(GGML_TYPE_Q4_0, &mut seed))
+                    .collect()
+            })
+            .collect();
+        let x = (0..n_tokens * in_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+            .collect();
+        (weights, x)
+    }
+
+    /// Two different weights of the **same shape**, streamed one call after
+    /// the other.
+    ///
+    /// Streamed ops share one cache entry per shape — that is what stops the
+    /// path allocating fresh scratch for every expert of every call — and the
+    /// entry's bind group pins the region its weights sat in, which the next
+    /// call rewinds. So the second call has to follow its weight
+    /// (`rebind_weight`) or it computes the *first* expert's answer against
+    /// the second's activations: a plausible matmul of the wrong tensor, with
+    /// nothing about it to notice.
+    #[test]
+    fn a_second_streamed_weight_of_one_shape_reuses_the_entry_and_still_computes_its_own() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        // A shape of this test's own: the whole point is that streamed
+        // entries are keyed by shape, so a shape shared with another test
+        // would have that test's entries counted here — and the tests in this
+        // binary share one backend and run concurrently.
+        const IN_DIM: usize = 512;
+        const OUT_DIM: usize = 4;
+        const N_TOKENS: usize = 3;
+
+        let (bytes, x) = streamed_expert_fixture(2, IN_DIM, OUT_DIM, N_TOKENS);
+        let mats: Vec<QuantMatrix> = bytes
+            .iter()
+            .map(|b| test_quant_matrix(b, GGML_TYPE_Q4_0, IN_DIM, OUT_DIM))
+            .collect();
+        let want: Vec<Vec<f32>> = mats
+            .iter()
+            .map(|w| CpuBackend.matmul_dequant(&x, N_TOKENS, w))
+            .collect();
+        // Without this the test would pass on a backend that ignored the
+        // second weight entirely — the exact bug it exists to catch.
+        assert!(
+            want[0]
+                .iter()
+                .zip(&want[1])
+                .any(|(a, b)| (a - b).abs() > 1e-2),
+            "the two fixtures must give different results for this test to mean anything"
+        );
+
+        fn op<'a>(x: &'a [f32], n_tokens: usize, w: &'a QuantMatrix) -> MatmulOp<'a> {
+            MatmulOp { x, n_tokens, w }
+        }
+        // Streamed entries only (`waddr == 0`), and only this shape's.
+        let entries = || {
+            vulkan
+                .op_cache
+                .lock()
+                .expect("op cache poisoned")
+                .keys()
+                .filter(|k| k.0 == 0 && k.3 == IN_DIM && k.4 == OUT_DIM)
+                .count()
+        };
+
+        let first = vulkan.matmul_batch_streamed(&[op(&x, N_TOKENS, &mats[0])]);
+        let after_first = entries();
+        let second = vulkan.matmul_batch_streamed(&[op(&x, N_TOKENS, &mats[1])]);
+        let after_second = entries();
+
+        for (got, want) in [(&first[0], &want[0]), (&second[0], &want[1])] {
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-2 * w.abs().max(1.0),
+                    "element {i}: gpu={g} cpu={w} on {}",
+                    vulkan.adapter_name
+                );
+            }
+        }
+        assert_eq!(
+            after_first, after_second,
+            "a second streamed weight of the same shape must rebind the first's \
+             entry, not allocate its own"
+        );
+    }
+
+    /// Two streamed experts of the same shape **in one batch**, which are
+    /// live at the same instant and so cannot share an entry.
+    ///
+    /// The shape key is what makes that a live hazard: they differ only in
+    /// the `region_slot` the batch assigns by position. Get that wrong and
+    /// both dispatches write the same output region, so one expert's result
+    /// silently becomes the other's.
+    #[test]
+    fn two_streamed_experts_of_one_shape_in_a_batch_keep_their_own_outputs() {
+        let Some(vulkan) = shared_vulkan() else {
+            eprintln!("{NO_GPU_SKIP}");
+            return;
+        };
+        // Not the shape the entry-reuse test above uses — it counts entries
+        // by shape, and these tests share one backend.
+        const IN_DIM: usize = 640;
+        const OUT_DIM: usize = 5;
+        const N_TOKENS: usize = 3;
+
+        let (bytes, x) = streamed_expert_fixture(2, IN_DIM, OUT_DIM, N_TOKENS);
+        let mats: Vec<QuantMatrix> = bytes
+            .iter()
+            .map(|b| test_quant_matrix(b, GGML_TYPE_Q4_0, IN_DIM, OUT_DIM))
+            .collect();
+        let want: Vec<Vec<f32>> = mats
+            .iter()
+            .map(|w| CpuBackend.matmul_dequant(&x, N_TOKENS, w))
+            .collect();
+        assert!(
+            want[0]
+                .iter()
+                .zip(&want[1])
+                .any(|(a, b)| (a - b).abs() > 1e-2),
+            "the two fixtures must give different results for this test to mean anything"
+        );
+
+        let ops: Vec<MatmulOp<'_>> = mats
+            .iter()
+            .map(|w| MatmulOp {
+                x: &x,
+                n_tokens: N_TOKENS,
+                w,
+            })
+            .collect();
+        let got = vulkan.matmul_batch_streamed(&ops);
+
+        for (e, (got, want)) in got.iter().zip(&want).enumerate() {
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-2 * w.abs().max(1.0),
+                    "expert {e} element {i}: gpu={g} cpu={w} on {}",
+                    vulkan.adapter_name
+                );
+            }
+        }
     }
 
     /// A larger `Q4_K` reduce-path shape than the 512×5 above: `in_dim =

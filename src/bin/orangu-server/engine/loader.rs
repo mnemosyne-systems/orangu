@@ -708,6 +708,27 @@ pub(crate) fn test_expert_matrix(
     test_expert_matrix_named("test.exps.weight", n_expert, out_dim, in_dim)
 }
 
+/// [`test_expert_matrix`] with every expert marked device-resident, so a
+/// test can reach the batched-dispatch branch that a residency check
+/// otherwise gates off.
+///
+/// The point is not to pretend there is a GPU: paired with `CpuBackend` the
+/// "device" branch runs `Backend::matmul_batch` on the host, which is what
+/// makes the branch's *bookkeeping* — the row-range views it builds, the
+/// order it puts results back in — testable on a machine with no GPU at all.
+/// Without this the branch is dead code in every test, and the row ranges a
+/// fused gate/up tensor depends on are only exercised on the fallback side.
+#[cfg(test)]
+pub(crate) fn test_expert_matrix_resident(
+    n_expert: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> ExpertQuantMatrix {
+    let mut matrix = test_expert_matrix(n_expert, out_dim, in_dim);
+    matrix.residency = Some(std::iter::repeat_n(true, n_expert).collect());
+    matrix
+}
+
 /// [`test_expert_matrix`] with a chosen tensor name, for tests about anything
 /// that keys on the name rather than on the runtime address.
 #[cfg(test)]
@@ -993,9 +1014,32 @@ impl LoadedModel {
     }
 
     /// Every stacked per-expert tensor's name and expert count — what a
-    /// residency plan has to be built over.
+    /// residency plan has to be built over — **in name order**.
+    ///
+    /// The sort is load-bearing twice over, and `self.tensors` is a
+    /// `HashMap`, so without it this returns hash order.
+    ///
+    /// *Reproducibility.* `engine::expert_tier::plan` breaks equal heat by
+    /// index, and its own test pins that so "the same profile always
+    /// produces the same tier". Indexes into a hash-ordered list defeat
+    /// that: with no routing profile every expert has heat zero, the
+    /// tie-break becomes the entire policy, and the tier changes shape from
+    /// run to run. It changes *size* too, because a model's expert tensors
+    /// are not all the same size — a fused `ffn_gate_up_exps` is twice a
+    /// `ffn_down_exps` — so an order that happens to front-load the smaller
+    /// one fits more experts into the same byte budget. Two identical starts
+    /// reported 972 and 1100 of 7680 before this.
+    ///
+    /// *Granularity.* Name order groups one layer's expert tensors together,
+    /// so a budget that holds a fraction of the model holds whole layers'
+    /// experts rather than a scatter across every layer. That is the
+    /// difference between some layers running their expert branch entirely
+    /// on the device and every layer running most of it on the host — and
+    /// with it, whether a device expert path is ever measured in the
+    /// configuration that could win.
     pub fn expert_tensors(&self) -> Vec<(String, usize, u64)> {
-        self.tensors
+        let mut tensors: Vec<(String, usize, u64)> = self
+            .tensors
             .iter()
             .filter(|(name, _)| name.ends_with("_exps.weight"))
             .filter_map(|(name, loc)| {
@@ -1004,7 +1048,9 @@ impl LoadedModel {
                 let n_expert = *loc.dims.get(2)? as usize;
                 (n_expert > 0).then(|| (name.clone(), n_expert, (loc.len / n_expert) as u64))
             })
-            .collect()
+            .collect();
+        tensors.sort_by(|a, b| a.0.cmp(&b.0));
+        tensors
     }
 
     /// The device holding `name`'s layer.
@@ -1901,6 +1947,109 @@ mod tests {
         assert_eq!(model.metadata_f32("situ_beta"), Some(4.0));
         assert_eq!(model.metadata_f32("positive"), Some(7.0));
         assert_eq!(model.metadata_f32("absent"), None);
+    }
+
+    /// A residency plan has to be reproducible and layer-granular, and
+    /// `self.tensors` is a `HashMap`, so `expert_tensors` has to impose an
+    /// order rather than inherit one.
+    ///
+    /// Both properties are checked because they fail differently and only
+    /// one of them is loud. Non-reproducibility shows up as a tier that
+    /// changes *size* between identical starts — `expert_tier::plan` fills a
+    /// byte budget, and the two expert tensors here differ 2:1 per expert
+    /// exactly as a fused `ffn_gate_up_exps` differs from a `ffn_down_exps`,
+    /// so which one comes first changes how many experts fit. Scattering
+    /// shows up as nothing at all: the tier is the right size and simply
+    /// never gives any layer its whole expert set.
+    #[test]
+    fn expert_tensors_come_back_layer_grouped_and_in_a_stable_order() {
+        let mut tensors = HashMap::new();
+        // Inserted in an order that is neither sorted nor layer-grouped, and
+        // interleaved with tensors that must not be selected at all.
+        for name in [
+            "blk.2.ffn_gate_up_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+            "output_norm.weight",
+            "blk.1.ffn_gate_up_exps.weight",
+            "blk.2.ffn_down_exps.weight",
+            "blk.0.ffn_gate_up_exps.weight",
+            "blk.1.attn_q.weight",
+            "blk.1.ffn_down_exps.weight",
+        ] {
+            // `ffn_down_exps` half the per-expert bytes of `ffn_gate_up_exps`,
+            // the shape that made hash order change the tier's size.
+            let out_dim = if name.contains("gate_up") { 8 } else { 4 };
+            let n_expert = if name.ends_with("_exps.weight") { 4 } else { 0 };
+            let dims = if n_expert > 0 {
+                vec![2, out_dim, n_expert as u64]
+            } else {
+                vec![2, out_dim]
+            };
+            tensors.insert(
+                name.to_string(),
+                TensorLocation {
+                    ggml_type: crate::engine::quant::GGML_TYPE_F32,
+                    dims,
+                    start: 0,
+                    len: 2 * out_dim as usize * n_expert.max(1) * 4,
+                    bytes: Arc::new(Vec::<u8>::new()) as TensorBytes,
+                },
+            );
+        }
+        let model = LoadedModel {
+            config: ModelConfig {
+                architecture: "gemma4".to_string(),
+                n_vocab: 0,
+                n_embd: 0,
+                n_layer: 3,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: 1,
+                n_ctx_train: 0,
+                rope_dim: 0,
+                rope_freq_base: 0.0,
+                rms_eps: 0.0,
+                pooling_type: PoolingType::Mean,
+            },
+            metadata: Vec::new(),
+            tensors,
+            layer_device: Vec::new(),
+            expert_residency: HashMap::new(),
+        };
+
+        let names: Vec<String> = model.expert_tensors().into_iter().map(|t| t.0).collect();
+        assert_eq!(
+            names,
+            vec![
+                "blk.0.ffn_down_exps.weight",
+                "blk.0.ffn_gate_up_exps.weight",
+                "blk.1.ffn_down_exps.weight",
+                "blk.1.ffn_gate_up_exps.weight",
+                "blk.2.ffn_down_exps.weight",
+                "blk.2.ffn_gate_up_exps.weight",
+            ],
+            "expert tensors must come back sorted, so a tier is reproducible \
+             and one layer's tensors are adjacent"
+        );
+        // Layer-grouped is the property a budget consumes, so state it
+        // directly rather than leaving it implicit in the list above: a
+        // prefix of any length splits at most one layer.
+        for prefix in 0..=names.len() {
+            let straddling = (0..3)
+                .filter(|layer| {
+                    let tag = format!("blk.{layer}.");
+                    let held = names[..prefix]
+                        .iter()
+                        .filter(|n| n.starts_with(&tag))
+                        .count();
+                    held == 1
+                })
+                .count();
+            assert!(
+                straddling <= 1,
+                "a budget holding {prefix} tensors split {straddling} layers"
+            );
+        }
     }
 
     /// A header-only `GgufFile` (no tensor data) carrying one architecture

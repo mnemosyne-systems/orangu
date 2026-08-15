@@ -105,6 +105,21 @@ pub struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// The rest of the sampler, under the same names `/completion` uses.
+    ///
+    /// These are not OpenAI's fields, and that is the point: the sampler
+    /// has knobs OpenAI's schema has no word for, and a request that names
+    /// one it cannot reach is **silently ignored** rather than rejected —
+    /// `serde` drops unknown keys. That failure mode is worse than the gap
+    /// it comes from: a caller sending `repeat_penalty` and seeing no change
+    /// concludes the penalty does nothing, when in fact the value never
+    /// arrived. It cost a real debugging session exactly that way.
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
@@ -302,16 +317,17 @@ pub async fn chat_completions(
     append_reasoning_suppression(&mut prompt, state.engine.role, &state.engine.tokenizer);
     let tokens = state.engine.tokenizer.encode(&prompt, false);
 
-    let mut sampling = SamplingParams::default_for_role(state.engine.role);
-    if let Some(v) = req.temperature {
-        sampling.temperature = v;
-    }
-    if let Some(v) = req.top_p {
-        sampling.top_p = v;
-    }
-    if let Some(v) = req.seed {
-        sampling.seed = v;
-    }
+    let sampling = sampling_for(
+        state.engine.role,
+        RequestSampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            repeat_penalty: req.repeat_penalty,
+            seed: req.seed,
+        },
+    );
     let max_tokens = req.max_tokens.unwrap_or(512);
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let created = unix_now();
@@ -501,6 +517,52 @@ pub async fn chat_completions(
     axum::response::sse::Sse::new(stream).into_response()
 }
 
+/// The sampler fields an HTTP request may override, gathered so the two
+/// OpenAI-compatible endpoints apply them through one place.
+///
+/// Every field is `Option`: `None` keeps the role's default rather than
+/// meaning "zero". A `temperature` of `0.0` is greedy and a `repeat_penalty`
+/// of `1.0` is off, so the difference between "unset" and "set to the
+/// neutral value" is real and cannot be collapsed.
+struct RequestSampling {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    min_p: Option<f32>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+}
+
+/// The role's defaults with a request's overrides applied.
+///
+/// One function rather than a copy per endpoint: the two of them had drifted
+/// — chat honoured `temperature`/`top_p`/`seed` and completions honoured
+/// `temperature` alone — and nothing about either endpoint made that
+/// deliberate. A field added to one and forgotten in the other is not a
+/// visible bug, because the ignored value simply has no effect.
+fn sampling_for(role: crate::config::Role, req: RequestSampling) -> SamplingParams {
+    let mut sampling = SamplingParams::default_for_role(role);
+    if let Some(v) = req.temperature {
+        sampling.temperature = v;
+    }
+    if let Some(v) = req.top_p {
+        sampling.top_p = v;
+    }
+    if let Some(v) = req.top_k {
+        sampling.top_k = v;
+    }
+    if let Some(v) = req.min_p {
+        sampling.min_p = v;
+    }
+    if let Some(v) = req.repeat_penalty {
+        sampling.repeat_penalty = v;
+    }
+    if let Some(v) = req.seed {
+        sampling.seed = v;
+    }
+    sampling
+}
+
 #[derive(Deserialize)]
 pub struct CompletionsRequest {
     prompt: String,
@@ -508,6 +570,20 @@ pub struct CompletionsRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
+    /// The rest of the sampler — see [`ChatCompletionRequest::top_k`] for why
+    /// these are here and why their absence was worse than a gap. This
+    /// endpoint had *only* `temperature`, so a request setting `top_k` or
+    /// `repeat_penalty` here was accepted and discarded.
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
     #[serde(default)]
     stream: bool,
     /// Keep generating to `max_tokens` even if the model emits EOS (llama.cpp's
@@ -543,10 +619,17 @@ pub async fn completions(
         return rejection;
     }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
-    let mut sampling = SamplingParams::default_for_role(state.engine.role);
-    if let Some(v) = req.temperature {
-        sampling.temperature = v;
-    }
+    let sampling = sampling_for(
+        state.engine.role,
+        RequestSampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            repeat_penalty: req.repeat_penalty,
+            seed: req.seed,
+        },
+    );
     let max_tokens = req.max_tokens.unwrap_or(256);
     // `ignore_eos` drops the EOS stop token so generation runs the full
     // `max_tokens` — the "measure decode, not content" contract benchmarks need.
@@ -792,6 +875,111 @@ mod tests {
             generated_tokens: 30,
             generate_time: Duration::from_millis(1000),
         }
+    }
+
+    /// Every sampler field a request can name must actually reach the
+    /// sampler, on **both** OpenAI-compatible endpoints.
+    ///
+    /// This is the test whose absence cost a debugging session. `serde`
+    /// drops unknown keys, so an endpoint that lacks a field accepts a
+    /// request naming it and silently ignores the value — indistinguishable,
+    /// from the client's side, from a knob that genuinely does nothing.
+    /// `/v1/completions` honoured `temperature` alone; a `repeat_penalty` or
+    /// `top_k` sent to it went nowhere, and the conclusion drawn was that the
+    /// repetition penalty was not the cause of a garbling it was in fact
+    /// causing.
+    ///
+    /// Deserializing real JSON rather than constructing the structs is the
+    /// point: a field that exists on the struct but is spelled differently on
+    /// the wire fails here and nowhere else.
+    #[test]
+    fn every_sampler_field_a_request_names_reaches_the_sampler() {
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "messages": [],
+            "temperature": 0.25,
+            "top_p": 0.6,
+            "top_k": 7,
+            "min_p": 0.125,
+            "repeat_penalty": 1.5,
+            "seed": 99,
+        });
+        let role = crate::config::Role::All;
+
+        let chat: ChatCompletionRequest =
+            serde_json::from_value(body.clone()).expect("chat request parses");
+        let completions: CompletionsRequest =
+            serde_json::from_value(body).expect("completions request parses");
+
+        for (label, got) in [
+            (
+                "chat",
+                sampling_for(
+                    role,
+                    RequestSampling {
+                        temperature: chat.temperature,
+                        top_p: chat.top_p,
+                        top_k: chat.top_k,
+                        min_p: chat.min_p,
+                        repeat_penalty: chat.repeat_penalty,
+                        seed: chat.seed,
+                    },
+                ),
+            ),
+            (
+                "completions",
+                sampling_for(
+                    role,
+                    RequestSampling {
+                        temperature: completions.temperature,
+                        top_p: completions.top_p,
+                        top_k: completions.top_k,
+                        min_p: completions.min_p,
+                        repeat_penalty: completions.repeat_penalty,
+                        seed: completions.seed,
+                    },
+                ),
+            ),
+        ] {
+            assert_eq!(got.temperature, 0.25, "{label}: temperature");
+            assert_eq!(got.top_p, 0.6, "{label}: top_p");
+            assert_eq!(got.top_k, 7, "{label}: top_k");
+            assert_eq!(got.min_p, 0.125, "{label}: min_p");
+            assert_eq!(got.repeat_penalty, 1.5, "{label}: repeat_penalty");
+            assert_eq!(got.seed, 99, "{label}: seed");
+        }
+    }
+
+    /// An unset field keeps the role's default rather than collapsing to
+    /// zero — and the default penalty is **off**.
+    ///
+    /// `1.0` is the neutral value, not the absent one, so "unset" and "set to
+    /// neutral" must both leave the penalty off while remaining distinct for
+    /// every other field. The default itself is pinned here because it is a
+    /// behavioural promise: a penalty applied per token id falls hardest on
+    /// the newline, and turning it on by default corrupts generated code.
+    #[test]
+    fn an_unset_field_keeps_the_role_default_and_the_penalty_is_off() {
+        let empty: CompletionsRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "hi"})).expect("parses");
+        let got = sampling_for(
+            crate::config::Role::All,
+            RequestSampling {
+                temperature: empty.temperature,
+                top_p: empty.top_p,
+                top_k: empty.top_k,
+                min_p: empty.min_p,
+                repeat_penalty: empty.repeat_penalty,
+                seed: empty.seed,
+            },
+        );
+        let default = SamplingParams::default_for_role(crate::config::Role::All);
+        assert_eq!(got.temperature, default.temperature);
+        assert_eq!(got.top_k, default.top_k);
+        assert_eq!(
+            got.repeat_penalty, 1.0,
+            "the repetition penalty must default to off"
+        );
     }
 
     #[test]

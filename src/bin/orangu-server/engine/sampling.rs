@@ -26,6 +26,9 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub top_p: f32,
     pub min_p: f32,
+    /// Divisor applied to the logit of any token seen in the last
+    /// [`Self::repeat_last_n`]. **`1.0` — off — by default**, matching the
+    /// reference implementation; see [`Default`].
     pub repeat_penalty: f32,
     /// How many of the most recent generated tokens the repeat penalty
     /// looks at.
@@ -34,13 +37,37 @@ pub struct SamplingParams {
 }
 
 impl Default for SamplingParams {
+    /// **`repeat_penalty` is `1.0`, which means the penalty is off.**
+    ///
+    /// It was `1.1`, and that is a bad default for anything structured. The
+    /// penalty is applied per *token id*, so it falls hardest on whichever
+    /// token repeats most — and in source code that is the **newline**. What
+    /// the model reaches for once the newline has been pushed down is
+    /// whatever else is plausible there, which for a block comment is a rule
+    /// of dashes or a `|`; both are already in its top eight at those
+    /// positions. The reported symptom was exactly that: generated C coming
+    /// back with `-------------------------` runs and `|` characters where
+    /// the line breaks belonged.
+    ///
+    /// Measured on `gemma-4-26B-A4B`, same server and prompt, penalty the
+    /// only difference: `1.1` continues a block comment with
+    /// `'---------------------'`, `1.0` continues it with `'\n * @param'` —
+    /// which is what real `llama.cpp` produces for the same tokens. Over 90
+    /// tokens of C, `1.0` emits twice the newlines.
+    ///
+    /// `1.0` is also what `llama.cpp` itself defaults to, so a prompt now
+    /// behaves the same way through either engine unless a caller asks for
+    /// otherwise. Repetition is a real failure mode on some workloads, but it
+    /// is the caller's to opt into rather than something to impose on every
+    /// request — and imposing it silently corrupts the one output format
+    /// whose whitespace is load-bearing.
     fn default() -> Self {
         Self {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
             min_p: 0.05,
-            repeat_penalty: 1.1,
+            repeat_penalty: 1.0,
             repeat_last_n: 64,
             seed: 0,
         }

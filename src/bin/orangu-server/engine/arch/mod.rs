@@ -268,6 +268,81 @@ pub(crate) fn decode_device_runs(
     (!runs.is_empty()).then_some(runs)
 }
 
+/// [`matmul_batch_mixed`] when routed-expert weights are streamed: the ops
+/// that *can* stream do, and the rest run on the CPU.
+///
+/// An op wider than the stripe threshold cannot stream, because striping
+/// re-enters the dispatch once per token range and each entry rewinds the
+/// region out from under the last range's weights. What it must **not** do
+/// instead is fall through to the ordinary device path, whose arena never
+/// evicts: one such expert per layer is enough to rebuild, permanently, the
+/// residency streaming exists to avoid. Measured, on a 3.98 GiB card: 7.0
+/// GiB of weights in the arena after a single 512-token prefill, and prefill
+/// 3.0x slower than the host path — because *every* layer had one hot expert
+/// over the threshold, which sent that layer's whole batch down the
+/// non-streamed path.
+///
+/// The CPU is the right home for those few: it is where all of them run when
+/// `gpu_experts` is off at all, and there are only ever a handful per layer
+/// (an expert needs more than [`max_matmul_tokens_per_submission`] tokens
+/// routed to it to qualify).
+fn streamed_batch_mixed(
+    vulkan: &crate::engine::backend::vulkan::VulkanBackend,
+    ops: &[crate::engine::backend::MatmulOp<'_>],
+    limit: usize,
+) -> Vec<Vec<f32>> {
+    use crate::engine::backend::{Backend as _, CpuBackend, MatmulOp};
+    use rayon::prelude::*;
+
+    let (narrow, wide): (Vec<usize>, Vec<usize>) =
+        (0..ops.len()).partition(|&i| ops[i].n_tokens <= limit);
+    let narrow_ops: Vec<MatmulOp<'_>> = narrow
+        .iter()
+        .map(|&i| MatmulOp {
+            x: ops[i].x,
+            n_tokens: ops[i].n_tokens,
+            w: ops[i].w,
+        })
+        .collect();
+
+    // The device batch blocks on its own readback, so the host ops fill that
+    // wait instead of following it — the same overlap the routed and shared
+    // branches already use.
+    let (streamed, hosted) = rayon::join(
+        || vulkan.matmul_batch_streamed(&narrow_ops),
+        || {
+            wide.par_iter()
+                .map(|&i| CpuBackend.matmul(ops[i].x, ops[i].n_tokens, ops[i].w))
+                .collect::<Vec<_>>()
+        },
+    );
+
+    restore_order(ops.len(), vec![(narrow, streamed), (wide, hosted)])
+}
+
+/// Puts results computed in two separate groups back in the caller's order.
+///
+/// Separated out because this is the step that fails **silently**: every
+/// expert still gets a plausible vector, just the wrong one, and the model
+/// goes on producing fluent text from it. A panic or a wrong length would
+/// have announced itself; a permutation does not.
+fn restore_order(len: usize, groups: Vec<(Vec<usize>, Vec<Vec<f32>>)>) -> Vec<Vec<f32>> {
+    let mut out: Vec<Option<Vec<f32>>> = (0..len).map(|_| None).collect();
+    for (slots, results) in groups {
+        assert_eq!(
+            slots.len(),
+            results.len(),
+            "a group came back with a different number of results than it was given"
+        );
+        for (slot, result) in slots.into_iter().zip(results) {
+            out[slot] = Some(result);
+        }
+    }
+    out.into_iter()
+        .map(|o| o.expect("every slot belongs to exactly one group"))
+        .collect()
+}
+
 /// Issues `ops` as few `Backend::matmul_batch` calls as the trait allows —
 /// one per distinct `n_tokens`, since a batch requires a uniform token
 /// count — returning results in the caller's order.
@@ -279,13 +354,46 @@ fn matmul_batch_mixed(
     backend: &dyn crate::engine::backend::Backend,
     ops: &[crate::engine::backend::MatmulOp<'_>],
 ) -> Vec<Vec<f32>> {
-    use std::collections::BTreeMap;
-    let mut buckets: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    // **One submission for the whole layer**, whatever mixture of token
+    // counts its experts were routed.
+    //
+    // This used to bucket the ops by `n_tokens` and call `matmul_batch` once
+    // per bucket, because that call demanded a single shared width. At
+    // decode that is one bucket and costs nothing; at prefill every expert
+    // has a different number of tokens routed to it, so a layer became
+    // dozens of blocking submissions with a readback each — and the device
+    // expert path lost to the host by 2x for that reason rather than any
+    // arithmetic one. `Backend::matmul_batch` now takes a mixture directly
+    // (every op was already resourced independently), so the bucketing is
+    // gone and with it the per-bucket round trips.
+    //
+    // Above that threshold the old shape is still required: striping a wide
+    // op into token ranges is a whole-batch decision and needs one width, so
+    // a batch containing one is bucketed as before. That is not a rare edge
+    // — a long enough prompt routes more than `max_matmul_tokens_per_
+    // submission` tokens to a single expert — and without this it would be
+    // an assertion failure rather than a slower path.
+    let limit = crate::engine::backend::vulkan::max_matmul_tokens_per_submission();
+    if expert_streaming()
+        && let Some(vulkan) = backend.as_wgpu()
+    {
+        return streamed_batch_mixed(vulkan, ops, limit);
+    }
+    if ops.iter().all(|op| op.n_tokens <= limit) {
+        return backend.matmul_batch(ops);
+    }
+    let mut buckets: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, op) in ops.iter().enumerate() {
         buckets.entry(op.n_tokens).or_default().push(index);
     }
+    let mut widths: Vec<usize> = buckets.keys().copied().collect();
+    widths.sort_unstable();
     let mut out: Vec<Option<Vec<f32>>> = (0..ops.len()).map(|_| None).collect();
-    for indices in buckets.into_values() {
+    for width in widths {
+        let indices = &buckets[&width];
         let group: Vec<crate::engine::backend::MatmulOp<'_>> = indices
             .iter()
             .map(|&i| crate::engine::backend::MatmulOp {
@@ -301,6 +409,44 @@ fn matmul_batch_mixed(
     out.into_iter()
         .map(|o| o.expect("every op is in exactly one bucket"))
         .collect()
+}
+
+/// One of the three matmuls a routed expert performs, named as a **row
+/// range** of a stacked expert tensor plus an optional per-expert output
+/// scalar.
+///
+/// The row range is what lets one tensor serve two projections. Several
+/// architectures ship the gate and up weights fused into a single
+/// `ffn_gate_up_exps` whose first half is the gate and second half the up;
+/// naming them as two ranges of one tensor is the difference between the
+/// batched path covering those models and not.
+///
+/// `scale` multiplies this projection's **output**, never its rows.
+/// `(x · row) * s` and `x · (row * s)` are different `f32`s — the first
+/// rounds one product, the second rounds every term of the accumulation —
+/// and the first is what the reference computes, so it is what this has to
+/// compute. Folding the scalar into the weights would be cheaper and wrong.
+pub(crate) struct ExpertProjection<'a> {
+    pub exps: &'a crate::engine::loader::ExpertQuantMatrix,
+    /// First row of this projection within one expert's rows.
+    pub first_row: usize,
+    /// Row count — this projection's output width.
+    pub n_rows: usize,
+    /// Per-expert scalar applied to the output, indexed by expert.
+    pub scale: Option<&'a [f32]>,
+}
+
+impl<'a> ExpertProjection<'a> {
+    /// A projection that is a whole expert tensor, unscaled — the shape
+    /// every architecture had before fused gate/up tensors needed naming.
+    pub fn whole(exps: &'a crate::engine::loader::ExpertQuantMatrix) -> Self {
+        Self {
+            exps,
+            first_row: 0,
+            n_rows: exps.out_dim,
+            scale: None,
+        }
+    }
 }
 
 /// [`evaluate_routed_experts`] with the three expert projections **batched
@@ -321,7 +467,11 @@ fn matmul_batch_mixed(
 /// reads the weights straight from the mapping — bypassing
 /// `engine::expert_store`'s residency tier and its accounting. That is
 /// correct for weights living in VRAM and wrong for the host path, which
-/// keeps [`project_expert`].
+/// keeps [`project_expert`]. It is also *sequential* over the groups it has
+/// to fall back on, where [`evaluate_routed_experts`] runs them under a
+/// `par_iter` — so a caller that takes this path with nothing resident does
+/// strictly more work than one that never called it. Gate on
+/// [`gpu_experts`], as every caller does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_routed_experts_batched(
     backend: &dyn crate::engine::backend::Backend,
@@ -331,6 +481,41 @@ pub(crate) fn evaluate_routed_experts_batched(
     gate_exps: &crate::engine::loader::ExpertQuantMatrix,
     up_exps: &crate::engine::loader::ExpertQuantMatrix,
     down_exps: &crate::engine::loader::ExpertQuantMatrix,
+    activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
+) -> Vec<Vec<Vec<f32>>> {
+    evaluate_routed_experts_batched_views(
+        backend,
+        selection,
+        hidden,
+        n_embd,
+        &ExpertProjection::whole(gate_exps),
+        &ExpertProjection::whole(up_exps),
+        &ExpertProjection::whole(down_exps),
+        activate,
+    )
+}
+
+/// One host-evaluated group's gate and up projections, tagged with the group
+/// it belongs to — what the parallel fallback in
+/// [`evaluate_routed_experts_batched_views`] hands back, since a `par_iter`
+/// cannot write into the slot vector directly.
+type HostProjections = (usize, (Vec<f32>, Vec<f32>));
+
+/// [`evaluate_routed_experts_batched`] over row ranges rather than whole
+/// tensors, so a fused gate/up tensor and per-expert output scalars are
+/// expressible.
+///
+/// Everything the wrapper's documentation says applies here; this is the
+/// implementation and that is the common case of it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_routed_experts_batched_views(
+    backend: &dyn crate::engine::backend::Backend,
+    selection: &[Vec<(usize, f32)>],
+    hidden: &[f32],
+    n_embd: usize,
+    gate: &ExpertProjection<'_>,
+    up: &ExpertProjection<'_>,
+    down: &ExpertProjection<'_>,
     activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
     use crate::engine::backend::MatmulOp;
@@ -370,18 +555,55 @@ pub(crate) fn evaluate_routed_experts_batched(
     // this split the batch would pull every routed expert into an arena
     // that never evicts — the tier would be unbounded, which is the one
     // thing it exists not to be.
+    // `ORANGU_MOE_FORCE_HOST_GROUPS=1` sends every group down the host path
+    // while keeping this batched helper's own structure — the control that
+    // separates "the device is slow" from "getting here cost something".
+    // Entering this function at all means gathering each group's activations
+    // into a fresh contiguous buffer (`xs` below), which the per-expert path
+    // never does: it hands `project_expert` slices of `hidden` directly. That
+    // gather is charged to every group, not only the resident ones, so it is
+    // not visible in any comparison that toggles residency.
+    let force_host = std::env::var_os("ORANGU_MOE_FORCE_HOST_GROUPS").is_some();
+    // **With streaming on, residency stops deciding this.** The permanent
+    // weight arena never evicts, so `is_device_resident` is a plan made
+    // before the first token against total VRAM — on a card holding 4.00 GiB
+    // against 12.0 GiB of experts that caps the device at ~12% of them
+    // however fast it is. Streaming holds only *this call's* experts in a
+    // bounded region that rewinds, so the question becomes whether the batch
+    // fits rather than whether the model does, and every group can go.
+    let streamed = expert_streaming();
     let on_device: Vec<bool> = experts
         .iter()
         .map(|&e| {
-            gate_exps.is_device_resident(e)
-                && up_exps.is_device_resident(e)
-                && down_exps.is_device_resident(e)
+            !force_host
+                && (streamed
+                    || (gate.exps.is_device_resident(e)
+                        && up.exps.is_device_resident(e)
+                        && down.exps.is_device_resident(e)))
         })
         .collect();
 
+    // **Gathered only for the groups that are going to the device.** A
+    // `MatmulOp` needs one contiguous `[n_tokens, n_embd]` run to upload, and
+    // a group's tokens are scattered through `hidden`; the host path needs no
+    // such thing, because `project_expert` takes `&[&[f32]]` and is perfectly
+    // happy with slices of `hidden` itself — which is exactly what the
+    // per-expert path hands it.
+    //
+    // Gathering for every group made entering this function cost **+253 ms**
+    // of a 850 ms expert stage on a `pp` 512 prefill, charged whether or not
+    // a single expert was device-resident. That overhead is what made the
+    // device path look like a loss: with it removed from the comparison,
+    // moving 11.8% of experts to the device *saves* 96 ms rather than costing
+    // 126. Every earlier measurement of "the device expert path" on this
+    // model was really measuring this gather.
     let xs: Vec<Vec<f32>> = members
         .iter()
-        .map(|members| {
+        .zip(on_device.iter())
+        .map(|(members, &device)| {
+            if !device {
+                return Vec::new();
+            }
             let mut x = Vec::with_capacity(members.len() * n_embd);
             for &(token, _) in members {
                 x.extend_from_slice(&hidden[token * n_embd..(token + 1) * n_embd]);
@@ -390,12 +612,16 @@ pub(crate) fn evaluate_routed_experts_batched(
         })
         .collect();
 
-    // Views first, then ops: a `MatmulOp` borrows its weight.
+    // Views first, then ops: a `MatmulOp` borrows its weight. `rows` is what
+    // makes a fused gate/up tensor two projections rather than one.
     let gate_views: Vec<_> = experts
         .iter()
-        .map(|&e| gate_exps.expert_matrix(e))
+        .map(|&e| gate.exps.expert_matrix(e).rows(gate.first_row, gate.n_rows))
         .collect();
-    let up_views: Vec<_> = experts.iter().map(|&e| up_exps.expert_matrix(e)).collect();
+    let up_views: Vec<_> = experts
+        .iter()
+        .map(|&e| up.exps.expert_matrix(e).rows(up.first_row, up.n_rows))
+        .collect();
     let mut ops: Vec<MatmulOp<'_>> = Vec::new();
     let mut op_group: Vec<usize> = Vec::new();
     for group in 0..experts.len() {
@@ -414,47 +640,92 @@ pub(crate) fn evaluate_routed_experts_batched(
         });
         op_group.push(group);
     }
-    let batched = matmul_batch_mixed(backend, &ops);
+    // **The device batch and the host remainder run concurrently.** They ran
+    // one after the other, which defeats the only reason this function
+    // exists: it splits a layer's experts between two *different* processors,
+    // and a split whose halves are serialized costs the sum of both instead
+    // of the larger. That is not a small effect at a partial residency —
+    // with 11.8% of experts on the device it made the whole layer 14%
+    // *slower* than leaving every expert on the host, because the device's
+    // share was added to the host's rather than hidden behind it.
+    let (batched, host_gate_up) = rayon::join(
+        || matmul_batch_mixed(backend, &ops),
+        || -> Vec<HostProjections> {
+            (0..experts.len())
+                .filter(|&group| !on_device[group])
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|group| {
+                    let inputs: Vec<&[f32]> = members[group]
+                        .iter()
+                        .map(|&(token, _)| &hidden[token * n_embd..(token + 1) * n_embd])
+                        .collect();
+                    let gate_out = project_expert(
+                        backend,
+                        gate.exps,
+                        experts[group],
+                        gate.first_row,
+                        gate.n_rows,
+                        &inputs,
+                    );
+                    let up_out = project_expert(
+                        backend,
+                        up.exps,
+                        experts[group],
+                        up.first_row,
+                        up.n_rows,
+                        &inputs,
+                    );
+                    (group, (gate_out.concat(), up_out.concat()))
+                })
+                .collect()
+        },
+    );
     // Back into per-group slots, so the activation loop reads the same way
     // whichever path produced a group's projections.
     let mut slots: Vec<Option<(Vec<f32>, Vec<f32>)>> = (0..experts.len()).map(|_| None).collect();
     for (slot, group) in op_group.iter().enumerate() {
         slots[*group] = Some((batched[slot * 2].clone(), batched[slot * 2 + 1].clone()));
     }
-    for group in 0..experts.len() {
-        if on_device[group] {
-            continue;
-        }
-        let inputs: Vec<&[f32]> = (0..members[group].len())
-            .map(|m| &xs[group][m * n_embd..(m + 1) * n_embd])
-            .collect();
-        let gate = project_expert(
-            backend,
-            gate_exps,
-            experts[group],
-            0,
-            gate_exps.out_dim,
-            &inputs,
-        );
-        let up = project_expert(
-            backend,
-            up_exps,
-            experts[group],
-            0,
-            up_exps.out_dim,
-            &inputs,
-        );
-        slots[group] = Some((gate.concat(), up.concat()));
+    for (group, projections) in host_gate_up {
+        slots[group] = Some(projections);
     }
-    let projected: Vec<(Vec<f32>, Vec<f32>)> = slots
+    let mut projected: Vec<(Vec<f32>, Vec<f32>)> = slots
         .into_iter()
         .map(|p| p.expect("every group took one path or the other"))
         .collect();
 
+    // The per-expert output scalars, on the projections' outputs and before
+    // the activation — see `ExpertProjection::scale` for why they are not
+    // folded into the rows. Applied identically to both paths, so the device
+    // and host halves of one layer stay comparable.
+    projected
+        .par_iter_mut()
+        .zip(experts.par_iter())
+        .for_each(|(projected, &expert)| {
+            if let Some(scale) = gate.scale {
+                let s = scale[expert];
+                projected.0.iter_mut().for_each(|v| *v *= s);
+            }
+            if let Some(scale) = up.scale {
+                let s = scale[expert];
+                projected.1.iter_mut().for_each(|v| *v *= s);
+            }
+        });
+
     // Activation, per member, into one contiguous run per group — the down
     // projection's operand.
-    let ffn_dim = gate_exps.out_dim;
+    let ffn_dim = gate.n_rows;
+    // **Parallel across groups**, like every other stage here. These three
+    // passes — the per-expert scales above, this activation, and the weighted
+    // accumulation below — walk the same data volume the projections do, and
+    // ran single-threaded. That is the whole reason this helper cost 280 ms
+    // more per `pp` 512 prefill than the per-expert path it replaces, which
+    // does its activation *inside* the per-expert parallel task and so never
+    // had a serial pass at all. The activation is the expensive one: a GELU
+    // and a multiply for every member of every group, ~3M elements per layer.
     let hs: Vec<Vec<f32>> = (0..experts.len())
+        .into_par_iter()
         .map(|group| {
             let (gate, up) = &projected[group];
             let mut h = Vec::with_capacity(members[group].len() * ffn_dim);
@@ -468,7 +739,7 @@ pub(crate) fn evaluate_routed_experts_batched(
 
     let down_views: Vec<_> = experts
         .iter()
-        .map(|&e| down_exps.expert_matrix(e))
+        .map(|&e| down.exps.expert_matrix(e).rows(down.first_row, down.n_rows))
         .collect();
     let mut down_ops: Vec<MatmulOp<'_>> = Vec::new();
     let mut down_group: Vec<usize> = Vec::new();
@@ -483,46 +754,81 @@ pub(crate) fn evaluate_routed_experts_batched(
         });
         down_group.push(group);
     }
-    let down_batched = matmul_batch_mixed(backend, &down_ops);
-    let mut down: Vec<Option<Vec<f32>>> = (0..experts.len()).map(|_| None).collect();
+    // Overlapped for the same reason as the gate/up half above.
+    let ffn_dim_in = down.exps.in_dim;
+    let (down_batched, host_down) = rayon::join(
+        || matmul_batch_mixed(backend, &down_ops),
+        || -> Vec<(usize, Vec<f32>)> {
+            (0..experts.len())
+                .filter(|&group| !on_device[group])
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|group| {
+                    let inputs: Vec<&[f32]> = (0..members[group].len())
+                        .map(|m| &hs[group][m * ffn_dim_in..(m + 1) * ffn_dim_in])
+                        .collect();
+                    (
+                        group,
+                        project_expert(
+                            backend,
+                            down.exps,
+                            experts[group],
+                            down.first_row,
+                            down.n_rows,
+                            &inputs,
+                        )
+                        .concat(),
+                    )
+                })
+                .collect()
+        },
+    );
+    let mut down_out: Vec<Option<Vec<f32>>> = (0..experts.len()).map(|_| None).collect();
     for (slot, group) in down_group.iter().enumerate() {
-        down[*group] = Some(down_batched[slot].clone());
+        down_out[*group] = Some(down_batched[slot].clone());
     }
-    let ffn_dim_in = down_exps.in_dim;
-    for group in 0..experts.len() {
-        if on_device[group] {
-            continue;
-        }
-        let inputs: Vec<&[f32]> = (0..members[group].len())
-            .map(|m| &hs[group][m * ffn_dim_in..(m + 1) * ffn_dim_in])
-            .collect();
-        down[group] = Some(
-            project_expert(
-                backend,
-                down_exps,
-                experts[group],
-                0,
-                down_exps.out_dim,
-                &inputs,
-            )
-            .concat(),
-        );
+    for (group, projection) in host_down {
+        down_out[group] = Some(projection);
     }
-    let down: Vec<Vec<f32>> = down
+    let down_out: Vec<Vec<f32>> = down_out
         .into_iter()
         .map(|d| d.expect("every group took one path or the other"))
         .collect();
 
-    let out_dim = down_exps.out_dim;
+    let out_dim = down.n_rows;
     let mut out: Vec<Vec<Vec<f32>>> = selection
         .iter()
         .map(|picks| vec![Vec::new(); picks.len()])
         .collect();
-    for group in 0..experts.len() {
-        for (m, &(token, weight)) in members[group].iter().enumerate() {
-            let mut contribution = down[group][m * out_dim..(m + 1) * out_dim].to_vec();
-            contribution.iter_mut().for_each(|v| *v *= weight);
-            out[token][ranks[group][m]] = contribution;
+    // Parallel too, and this is the largest of the three passes by data
+    // touched: one `n_embd`-wide copy-and-scale per *member*, where the other
+    // two are `n_ff`-wide. Scaling happens in the parallel half and only the
+    // placement is serial, because `out[token][rank]` is a scattered write
+    // that rayon cannot be shown to be disjoint — it is (every `(token,
+    // rank)` is written exactly once, by construction of `ranks`), but moving
+    // an already-built `Vec` into place costs nothing next to building it.
+    let scaled: Vec<Vec<(usize, usize, Vec<f32>)>> = (0..experts.len())
+        .into_par_iter()
+        .map(|group| {
+            // The down projection's per-expert scalar and the routing weight
+            // are both scalars on the same vector, so they multiply out once
+            // rather than in two passes.
+            let expert_scale = down.scale.map_or(1.0, |s| s[experts[group]]);
+            members[group]
+                .iter()
+                .enumerate()
+                .map(|(m, &(token, weight))| {
+                    let mut contribution = down_out[group][m * out_dim..(m + 1) * out_dim].to_vec();
+                    let scale = expert_scale * weight;
+                    contribution.iter_mut().for_each(|v| *v *= scale);
+                    (token, ranks[group][m], contribution)
+                })
+                .collect()
+        })
+        .collect();
+    for group in scaled {
+        for (token, rank, contribution) in group {
+            out[token][rank] = contribution;
         }
     }
     out
@@ -576,9 +882,69 @@ pub(crate) fn matmul_host_fallback(
 /// touches lands in the backend's weight arena, which never evicts. On a
 /// model whose experts exceed VRAM that is driver paging, and the number it
 /// produces is meaningless. Point it at a device that can hold them.
+/// Whether `ORANGU_EXPERT_STREAM=1` asked for routed-expert weights to be
+/// **streamed** into a bounded device region per call, instead of admitting a
+/// fixed subset of them to the permanent arena up front.
+///
+/// Separate from [`gpu_experts`] on purpose: that knob decides whether expert
+/// matmuls go to the device at all, this one decides how their weights get
+/// there. Both are off by default, and this one implies nothing on its own —
+/// it only widens what `gpu_experts` can reach, from the ~12% of a large
+/// model's experts that fit a card to all of them.
+pub(crate) fn expert_streaming() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_flag("ORANGU_EXPERT_STREAM"))
+}
+
 pub(crate) fn gpu_experts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ORANGU_GPU_EXPERTS").is_some())
+    *ON.get_or_init(|| env_flag("ORANGU_GPU_EXPERTS"))
+}
+
+/// An on/off knob that reads `0` as **off** rather than as "set, therefore
+/// on".
+///
+/// Presence alone is the usual convention here and is right for a knob one
+/// exports by hand. It is wrong for one that gets **swept**: `--sweep
+/// VAR=0,1` sets the variable at every point, so a presence test reports the
+/// feature on for the control arm too and the A/B silently compares the
+/// feature against itself — which is not visible in the result, only in the
+/// two arms agreeing suspiciously well.
+fn env_flag(name: &str) -> bool {
+    flag_is_on(std::env::var(name).ok().as_deref())
+}
+
+/// [`env_flag`]'s decision, separated from the environment so it can be
+/// tested without one test's `set_var` reaching another's thread.
+fn flag_is_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "no" | "off" | "false"
+        )
+    })
+}
+
+/// Whether one routed expert may be dispatched to the device.
+///
+/// All four terms are necessary, and `resident` is the one that is easy to
+/// leave out — it is also the only one that fails *silently and expensively*
+/// when it is missing. `VulkanBackend::weight_buffer`'s arena never evicts,
+/// so an expert that reaches the device stays there for the model's life;
+/// `main::plan_expert_tier` therefore chooses a bounded resident set up
+/// front, and this flag is that decision. Dispatching without consulting it
+/// does not merely ignore the plan, it *inverts* it: every expert the
+/// routing touches is admitted, the arena grows past the budget the tier was
+/// given, and the driver starts paging device memory on a path whose whole
+/// purpose was to avoid host traffic. `evaluate_routed_experts_batched`
+/// consults it for the architectures that take the batched path; this is the
+/// same check for the ones that do not.
+///
+/// Split out from [`gpu_project_expert`] so the policy can be pinned by a
+/// test on a machine with no GPU, where the call site's other terms are
+/// unreachable.
+fn device_expert_admissible(enabled: bool, has_gpu: bool, kernel: bool, resident: bool) -> bool {
+    enabled && has_gpu && kernel && resident
 }
 
 /// One expert's projection on the GPU, or `None` to take the host path.
@@ -591,9 +957,10 @@ pub(crate) fn gpu_experts() -> bool {
 /// `engine::expert_tier` is written against.
 ///
 /// Returns `None` — the host path — when the knob is off, the backend has
-/// no GPU, or the backend has no kernel for this quantization. That last
-/// one matters: the `IQ*` types the Vulkan backend lacks are exactly the
-/// ones large MoE models are shipped in.
+/// no GPU, the backend has no kernel for this quantization, or the expert
+/// is not one the device tier holds. The kernel term matters because the
+/// `IQ*` types the Vulkan backend lacks are exactly the ones large MoE
+/// models are shipped in; the residency term is what keeps the tier a tier.
 fn gpu_project_expert(
     backend: &dyn crate::engine::backend::Backend,
     weights: &crate::engine::loader::ExpertQuantMatrix,
@@ -602,8 +969,12 @@ fn gpu_project_expert(
     n_rows: usize,
     inputs: &[&[f32]],
 ) -> Option<Vec<Vec<f32>>> {
-    if !gpu_experts() || backend.as_wgpu().is_none() || !backend.supports_type(weights.ggml_type())
-    {
+    if !device_expert_admissible(
+        gpu_experts(),
+        backend.as_wgpu().is_some(),
+        backend.supports_type(weights.ggml_type()),
+        weights.is_device_resident(expert),
+    ) {
         return None;
     }
     let in_dim = weights.in_dim;
@@ -1221,14 +1592,60 @@ pub trait ModelForward: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertGating, ExpertRouting, attend, evaluate_routed_experts, matmul_host_fallback,
-        project_expert, top_k_indices,
+        ExpertGating, ExpertProjection, ExpertRouting, attend, device_expert_admissible,
+        evaluate_routed_experts, evaluate_routed_experts_batched_views, flag_is_on,
+        matmul_host_fallback, project_expert, restore_order, top_k_indices,
     };
     use crate::engine::backend::Backend;
     use crate::engine::loader::{QuantMatrix, test_quant_matrix};
     use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_Q8_0};
     use crate::engine::tensor;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Streaming splits a layer's experts into a device group and a host
+    /// group by width, and the two come back in their own orders. Every
+    /// expert's result then has to land on the expert it belongs to.
+    ///
+    /// Getting this wrong is invisible from the outside: each expert still
+    /// receives a well-formed vector of the right length, just another
+    /// expert's, and generation continues fluently from it. There is no
+    /// panic, no shape error, and nothing in a throughput number that would
+    /// hint at it.
+    #[test]
+    fn results_from_the_device_and_host_groups_land_on_their_own_ops() {
+        // Ops 0..5 with 1, 3 on the host and 0, 2, 4 on the device — the
+        // interleaving is the point; contiguous groups would pass under a
+        // naive concatenation too.
+        let device = (vec![0, 2, 4], vec![vec![0.0], vec![2.0], vec![4.0]]);
+        let host = (vec![1, 3], vec![vec![1.0], vec![3.0]]);
+        let out = restore_order(5, vec![device, host]);
+        assert_eq!(
+            out,
+            vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0]]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "different number of results")]
+    fn a_group_that_returns_the_wrong_number_of_results_is_not_silently_shifted() {
+        restore_order(3, vec![(vec![0, 1, 2], vec![vec![0.0], vec![1.0]])]);
+    }
+
+    /// `VAR=0` has to mean **off**, or a sweep of `VAR=0,1` runs the feature
+    /// on both arms and reports the difference between two identical
+    /// configurations as the patch's effect. That is not a hypothetical: it
+    /// is how the first streaming A/B was set up, and the only outward sign
+    /// was two arms agreeing closely.
+    #[test]
+    fn a_knob_set_to_zero_is_off_and_an_unset_one_stays_off() {
+        for off in ["0", "", "  ", "no", "off", "false", "FALSE", " Off "] {
+            assert!(!flag_is_on(Some(off)), "{off:?} should read as off");
+        }
+        for on in ["1", "yes", "on", "true", "2"] {
+            assert!(flag_is_on(Some(on)), "{on:?} should read as on");
+        }
+        assert!(!flag_is_on(None));
+    }
 
     /// A backend that panics on any type it does not list, the way
     /// `engine::backend::vulkan` panics when asked for a shader it has no
@@ -1257,6 +1674,256 @@ mod tests {
     /// that can reach a forward pass in a type the device cannot run. The
     /// fallback has to notice and route it to the host instead of handing the
     /// backend a call it will panic on.
+    /// One `project_expert` call over a row range must equal two calls over
+    /// its halves, concatenated.
+    ///
+    /// This is what lets a fused `ffn_gate_up_exps` be projected in one call
+    /// instead of two, which is not a refactor but the point: each call is
+    /// its own `rayon` region with its own join, its own `expert_store`
+    /// lease, and — because both halves take the *same* activation — its own
+    /// redundant `quantize_act` of a byte-identical input.
+    ///
+    /// It could fail for a real reason rather than a typo. `project_expert`
+    /// parallelizes over rows and its kernel selection reads `in_dim`, not
+    /// `n_rows`, so widening the range must not change how any single row is
+    /// computed. If a future kernel ever picked a different accumulation for
+    /// a wider range, the two forms would drift and this is what would say so.
+    #[test]
+    fn one_projection_over_both_halves_equals_two_over_each() {
+        use crate::engine::backend::CpuBackend;
+        use crate::engine::loader::test_expert_matrix;
+
+        const N_EXPERT: usize = 3;
+        const N_FF: usize = 5;
+        const N_EMBD: usize = 4;
+
+        let gate_up = test_expert_matrix(N_EXPERT, 2 * N_FF, N_EMBD);
+        let a: Vec<f32> = (0..N_EMBD).map(|i| (i as f32 + 1.0) * 0.03).collect();
+        let b: Vec<f32> = (0..N_EMBD).map(|i| 0.4 - i as f32 * 0.07).collect();
+        let inputs: Vec<&[f32]> = vec![&a, &b];
+
+        for expert in 0..N_EXPERT {
+            let gate = project_expert(&CpuBackend, &gate_up, expert, 0, N_FF, &inputs);
+            let up = project_expert(&CpuBackend, &gate_up, expert, N_FF, N_FF, &inputs);
+            let both = project_expert(&CpuBackend, &gate_up, expert, 0, 2 * N_FF, &inputs);
+
+            for input in 0..inputs.len() {
+                assert_eq!(both[input].len(), 2 * N_FF);
+                assert_eq!(
+                    &both[input][..N_FF],
+                    gate[input].as_slice(),
+                    "expert {expert} input {input}: first half is not the gate"
+                );
+                assert_eq!(
+                    &both[input][N_FF..],
+                    up[input].as_slice(),
+                    "expert {expert} input {input}: second half is not the up"
+                );
+            }
+            // The halves must differ, or the equality above holds for a
+            // projection that read the same rows twice.
+            assert_ne!(gate[0], up[0], "expert {expert}: halves are identical");
+        }
+    }
+
+    /// A fused gate/up tensor, addressed as two row ranges, must compute
+    /// exactly what two calls against the two halves compute.
+    ///
+    /// This is the whole of what the row-range form adds, and every way of
+    /// getting it wrong is silent: an off-by-`n_ff` `first_row` reads the up
+    /// weights as the gate, a `n_rows` taken from the tensor rather than the
+    /// half reads both halves as one projection, and a per-expert scalar
+    /// indexed by *group* rather than by *expert* is correct exactly when the
+    /// routing happens to select experts in ascending order — which it does
+    /// in most small tests. The reference here is the per-expert path this
+    /// replaces, run on the same weights, so a disagreement is this code's.
+    ///
+    /// No expert is device-resident (`test_expert_matrix` builds none), so
+    /// both sides run the same host kernel and the comparison is exact
+    /// rather than approximate. What the device does with these ops is the
+    /// batched dispatch six other architectures already share.
+    #[test]
+    fn a_fused_gate_up_tensor_as_two_row_ranges_matches_the_per_expert_path() {
+        use crate::engine::backend::CpuBackend;
+        use crate::engine::loader::{test_expert_matrix, test_expert_matrix_resident};
+
+        const N_EXPERT: usize = 4;
+        const N_FF: usize = 3;
+        const N_EMBD: usize = 5;
+
+        // Gate and up fused: rows `0..N_FF` are the gate, `N_FF..2*N_FF` the up.
+        let gate_up = test_expert_matrix(N_EXPERT, 2 * N_FF, N_EMBD);
+        let down_exps = test_expert_matrix(N_EXPERT, N_EMBD, N_FF);
+        // Per-expert scalars, distinct and not in expert order, so indexing
+        // by group instead of by expert produces different numbers.
+        let gate_up_scale: Vec<f32> = vec![1.75, 0.5, 2.25, 0.125];
+        let down_scale: Vec<f32> = vec![0.375, 3.0, 0.75, 1.5];
+
+        // Small and **positive**: `test_expert_matrix`'s weights run to ~50
+        // for the higher expert indices, so an activation that sums negative
+        // drives every gate output far enough negative that GELU returns
+        // zero, the products are zero, and the two paths agree on a vector
+        // of zeros. That is a test that passes while proving nothing, and
+        // the assertion at the end of this one exists because it happened.
+        let hidden: Vec<f32> = (0..2 * N_EMBD).map(|i| (i as f32 + 1.0) * 0.004).collect();
+        // Descending experts in the first token's picks: an implementation
+        // that indexes a scalar by group order disagrees here and not on a
+        // sorted selection.
+        let selection: Vec<Vec<(usize, f32)>> =
+            vec![vec![(3, 0.6), (1, 0.4)], vec![(0, 0.7), (3, 0.3)]];
+
+        let activate = |gate: &[f32], up: &[f32]| {
+            let mut h = gate.to_vec();
+            tensor::gelu_inplace(&mut h);
+            tensor::mul_inplace(&mut h, up);
+            h
+        };
+
+        // The reference: exactly the shape the per-expert path had.
+        let expected = evaluate_routed_experts(&selection, |expert, members| {
+            let inputs: Vec<&[f32]> = members
+                .iter()
+                .map(|&(t, _)| &hidden[t * N_EMBD..(t + 1) * N_EMBD])
+                .collect();
+            let mut gate = project_expert(&CpuBackend, &gate_up, expert, 0, N_FF, &inputs);
+            let mut up = project_expert(&CpuBackend, &gate_up, expert, N_FF, N_FF, &inputs);
+            let s = gate_up_scale[expert];
+            for row in gate.iter_mut().chain(up.iter_mut()) {
+                row.iter_mut().for_each(|v| *v *= s);
+            }
+            let hs: Vec<Vec<f32>> = gate.iter().zip(&up).map(|(g, u)| activate(g, u)).collect();
+            let refs: Vec<&[f32]> = hs.iter().map(Vec::as_slice).collect();
+            project_expert(&CpuBackend, &down_exps, expert, 0, N_EMBD, &refs)
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    let scale = down_scale[expert] * weight;
+                    contribution.iter_mut().for_each(|v| *v *= scale);
+                    contribution
+                })
+                .collect()
+        });
+
+        let actual = evaluate_routed_experts_batched_views(
+            &CpuBackend,
+            &selection,
+            &hidden,
+            N_EMBD,
+            &ExpertProjection {
+                exps: &gate_up,
+                first_row: 0,
+                n_rows: N_FF,
+                scale: Some(&gate_up_scale),
+            },
+            &ExpertProjection {
+                exps: &gate_up,
+                first_row: N_FF,
+                n_rows: N_FF,
+                scale: Some(&gate_up_scale),
+            },
+            &ExpertProjection {
+                scale: Some(&down_scale),
+                ..ExpertProjection::whole(&down_exps)
+            },
+            activate,
+        );
+
+        assert_eq!(actual, expected, "row-range form disagreed with per-expert");
+        // And the comparison is not vacuous: a contribution is a real vector.
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].len(), 2);
+        assert_eq!(actual[0][0].len(), N_EMBD);
+        for (token, picks) in actual.iter().enumerate() {
+            for (rank, contribution) in picks.iter().enumerate() {
+                assert!(
+                    contribution.iter().any(|v| *v != 0.0),
+                    "token {token} rank {rank} contributed only zeros, so the \
+                     comparison proved nothing about it"
+                );
+            }
+        }
+        // The two tokens must not agree either, or a path that ignored its
+        // input entirely would still match.
+        assert_ne!(actual[0][0], actual[1][0]);
+
+        // The same call again with every expert marked resident, which is
+        // the *other* branch: batched `matmul_batch` over row-range views
+        // instead of per-group `project_expert`. Those views are the only
+        // place `first_row` reaches the dispatch path, and with no residency
+        // no test reaches them at all. `CpuBackend` runs the batch, so this
+        // compares bookkeeping rather than kernels — but a wrong row range
+        // is a wrong *weight*, which no tolerance hides.
+        let gate_up_res = test_expert_matrix_resident(N_EXPERT, 2 * N_FF, N_EMBD);
+        let down_res = test_expert_matrix_resident(N_EXPERT, N_EMBD, N_FF);
+        let dispatched = evaluate_routed_experts_batched_views(
+            &CpuBackend,
+            &selection,
+            &hidden,
+            N_EMBD,
+            &ExpertProjection {
+                exps: &gate_up_res,
+                first_row: 0,
+                n_rows: N_FF,
+                scale: Some(&gate_up_scale),
+            },
+            &ExpertProjection {
+                exps: &gate_up_res,
+                first_row: N_FF,
+                n_rows: N_FF,
+                scale: Some(&gate_up_scale),
+            },
+            &ExpertProjection {
+                scale: Some(&down_scale),
+                ..ExpertProjection::whole(&down_res)
+            },
+            activate,
+        );
+        for (token, picks) in dispatched.iter().enumerate() {
+            for (rank, contribution) in picks.iter().enumerate() {
+                let reference = &expected[token][rank];
+                assert_eq!(contribution.len(), reference.len());
+                for (i, (got, want)) in contribution.iter().zip(reference).enumerate() {
+                    assert!(
+                        (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "batched dispatch disagreed at token {token} rank {rank} \
+                         element {i}: {got} against {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A routed expert may only be dispatched to the device when the tier
+    /// actually holds it.
+    ///
+    /// The three other terms are properties of the build and the file and
+    /// are stable for a whole run; `resident` is per expert, and it is the
+    /// only thing bounding an arena that never evicts. A dispatch policy
+    /// that admits a non-resident expert grows the arena past the budget
+    /// `main::plan_expert_tier` set, so the tier stops being one — and the
+    /// symptom is not a wrong answer, it is device-memory paging, which
+    /// reads as "the GPU expert path is slow" rather than as a defect. This
+    /// pins the term so it cannot be dropped quietly.
+    #[test]
+    fn a_routed_expert_reaches_the_device_only_when_the_tier_holds_it() {
+        // Everything else admissible, residency the only variable.
+        assert!(device_expert_admissible(true, true, true, true));
+        assert!(
+            !device_expert_admissible(true, true, true, false),
+            "a non-resident expert must take the host path even with the knob on, \
+             a GPU present and a kernel for its type"
+        );
+        // And the default a model without a tier presents: no expert is
+        // resident, so no expert is dispatched, whatever the knob says.
+        for &enabled in &[true, false] {
+            assert!(!device_expert_admissible(enabled, true, true, false));
+        }
+        // The other three terms each still veto on their own.
+        assert!(!device_expert_admissible(false, true, true, true));
+        assert!(!device_expert_admissible(true, false, true, true));
+        assert!(!device_expert_admissible(true, true, false, true));
+    }
+
     #[test]
     fn matmul_host_fallback_routes_a_type_the_backend_lacks_to_the_host() {
         // One row of eight `f32` weights, all 1.0, as `F32` — so the host

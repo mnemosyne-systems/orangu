@@ -338,6 +338,101 @@ fn main_reduce_suffix(n_rows: usize, subgroup: bool) -> String {
     s
 }
 
+/// The **block-hoisted reduce** `main`, generic over *any* block size — the
+/// third algorithm written against the per-type contract, alongside
+/// [`main_reduce_suffix`] and [`unroll_suffix`].
+///
+/// It exists because the other two do not cover the same set.
+/// `main_reduce_suffix` works for every type and is slow; `unroll_suffix` is
+/// fast and works only for the K-quants, because it hardcodes their 256-element
+/// super-block as a fixed 4×64 geometry (`x0..x3` at `local`, `64+local`,
+/// `128+local`, `192+local`). A 32-element block cannot be expressed in that
+/// shape, so every legacy and `IQ` type fell back to the slow one.
+///
+/// **What makes the slow one slow is not bandwidth, it is the block header.**
+/// `main_reduce_suffix` calls `dequant_element` once per *element*, and every
+/// such call re-reads the block's scale bytes and re-runs `f16_to_f32` — for a
+/// 32-element block, 32 times over. Measured across four quantizations of one
+/// model, the types with a hoisted kernel stream at ~82 GiB/s and the types
+/// without at ~26.
+///
+/// The fix needs no new geometry, only a different work assignment: **one lane
+/// owns a whole block** and strides over blocks, so the header is decoded once
+/// per block instead of once per element. The per-type contract shrinks
+/// accordingly, from `dequant_element(byte_offset, k)` to a single
+/// `block_dot(byte_offset, x_off) -> f32` — this block's whole contribution to
+/// one output row, given where its bytes start and where its `BLOCK_ELEMS`
+/// activations start. That contract says nothing about block size, scale
+/// layout or bit packing, which is what makes it work for every type rather
+/// than three.
+///
+/// Activations are read contiguously within a lane and strided across lanes,
+/// the transpose of the element-wise path's access. That is the one thing
+/// given up here, and it is cheap: `x` is a single `[in_dim]` row that stays
+/// in cache, while `weights` — the operand that actually has to stream — keeps
+/// the same per-lane contiguous run it always had.
+fn block_hoisted_suffix(n_rows: usize, subgroup: bool) -> String {
+    let mut s = format!(
+        "var<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    );
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o_base = rg * {n_rows}u;\n"));
+    for i in 0..n_rows {
+        s.push_str(&format!("    let o{i} = o_base + {i}u;\n"));
+    }
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    // Whole blocks only. A row whose `in_dim` is not a multiple of
+    // `BLOCK_ELEMS` cannot exist — a quantized tensor is stored in whole
+    // blocks — so there is no tail to handle, unlike the element-wise path
+    // whose stride is the workgroup rather than the block.
+    // `LANES_PER_BLOCK` **adjacent** lanes share one block, each taking a
+    // contiguous slice of its bytes, so those lanes issue one coalesced burst
+    // across the row instead of scattering.
+    //
+    // Giving a lane a whole block to itself was the first thing tried here and
+    // it is **34% slower than the element-wise path it was meant to beat**
+    // (5.76 against 8.73 tok/s on a `Q8_0` model, reproduced): sixty-four lanes
+    // then read sixty-four *different* byte runs at once, and losing coalescing
+    // costs far more than decoding a block header once per element saves. The
+    // engine sat at 99% busy with memory at 9% — the signature of a kernel
+    // waiting on scattered reads rather than streaming.
+    //
+    // The shape here is instead the one the *fast* K-quant kernel already uses:
+    // `shader_source_reduce_q4k_light` splits its 32-lane workgroup as
+    // `itid = tid % 16`, several lanes to a super-block. Header decoding is
+    // still amortized — `LANES_PER_BLOCK` times per block instead of
+    // `BLOCK_ELEMS` — but not at the cost of the access pattern.
+    s.push_str("\n    let sub = local % LANES_PER_BLOCK;\n    let slot = local / LANES_PER_BLOCK;\n    let blocks_in_flight = 64u / LANES_PER_BLOCK;\n");
+    s.push_str("    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = slot;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
+    s.push_str(
+        "        let block_off = b * BLOCK_BYTES;\n        let x_off = x_base + b * BLOCK_ELEMS;\n",
+    );
+    s.push_str(
+        "        partial0 = partial0 + block_dot(o0 * params.row_bytes + block_off, x_off, sub);\n",
+    );
+    for i in 1..n_rows {
+        s.push_str(&format!(
+            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + block_dot(o{i} * params.row_bytes + block_off, x_off, sub);\n        }}\n"
+        ));
+    }
+    s.push_str("        b = b + blocks_in_flight;\n    }\n\n");
+    s.push_str(&reduce_combine_block(n_rows, subgroup));
+    s.push_str("}\n");
+    s
+}
+
 /// The block-unroll `main` shared by every block-unroll kernel (`Q4_K`/
 /// `Q5_K`/`Q6_K`, scalar and packed-`f16`) for an arbitrary `n_rows` — see
 /// [`main_reduce_suffix`]'s own doc comment for the `n_rows` generalization
@@ -2011,6 +2106,141 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 /// is concatenated with, so the type coverage lives here once. Four
 /// entry points used to each carry their own copy of this match, which is
 /// four places a newly supported type has to be remembered in.
+/// `block_q4_0` for [`block_hoisted_suffix`]: the whole 32-element block
+/// dotted against 32 contiguous activations, with the block's `f16` scale
+/// read **once** instead of once per element.
+///
+/// The nibble split is `Q4_0_COOP_MIDDLE`'s: element `k < 16` is the low
+/// nibble of byte `2+k` and element `k+16` the high nibble of the same byte,
+/// so one byte read serves two elements — half the loads of the element-wise
+/// path even before the header saving.
+///
+/// `d` is multiplied into each element rather than factored out of the sum,
+/// so each *term* is bit-identical to `dequant_element`'s. The **order the
+/// terms are summed in still changes** — a lane here accumulates a
+/// contiguous run within a block, where the element-wise path accumulates a
+/// workgroup-strided one — so this is not bit-identical output, and it does
+/// flip a greedy argmax on a near-tie.
+///
+/// Measured rather than assumed, against an exact `f64` reference at
+/// `in_dim = 2816`: worst relative error **6.3e-7 for this kernel against
+/// 1.6e-6 for the element-wise path** it replaces (the CPU path is 4.5e-7).
+/// It is the *more* accurate of the two, which is the direction a longer
+/// contiguous run should go. The cross-check's 1% tolerance is far too loose
+/// to have shown that, which is why it was measured separately.
+const Q4_0_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 2u + j);
+        acc = acc + (f32(i32(byte & 0xFu) - 8) * d) * x[x_off + j];
+        acc = acc + (f32(i32(byte >> 4u) - 8) * d) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_q8_0` for [`block_hoisted_suffix`] — see [`Q4_0_BLOCK_MIDDLE`] for
+/// why `d` stays inside the loop. One signed byte per element, and the same
+/// `>= 128` sign fold `Q8_0_COOP_MIDDLE` uses.
+const Q8_0_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 34u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 4u) {
+            break;
+        }
+        let j = sub * 4u + m;
+        var v: i32 = i32(read_u8(byte_offset + 2u + j));
+        if (v >= 128) {
+            v = v - 256;
+        }
+        acc = acc + (f32(v) * d) * x[x_off + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_q4_1` for [`block_hoisted_suffix`]: `Q4_0`'s nibble split with a
+/// stored per-block minimum added instead of a fixed 8 subtracted.
+const Q4_1_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 20u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let mn = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 4u + j);
+        acc = acc + (f32(byte & 0xFu) * d + mn) * x[x_off + j];
+        acc = acc + (f32(byte >> 4u) * d + mn) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// The per-type half of [`block_hoisted_suffix`], or `None` for a type that
+/// has no block-hoisted implementation yet and so keeps the element-wise
+/// path.
+///
+/// **Deliberately a growable list, not a closed one.** Every entry is a
+/// dozen lines against a contract that says nothing about block size or bit
+/// packing, so adding `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K` or the `IQ` family is
+/// mechanical — each is worth roughly the 3× the types below measured, and
+/// none of them needs a new kernel, a new dispatch path or a new tuning
+/// knob. What stops a type being here is only that nobody has written its
+/// dozen lines and cross-checked them.
+fn block_hoisted_middle(ggml_type: u32) -> Option<&'static str> {
+    Some(match ggml_type {
+        t if t == GGML_TYPE_Q4_0 => Q4_0_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q4_1 => Q4_1_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q8_0 => Q8_0_BLOCK_MIDDLE,
+        _ => return None,
+    })
+}
+
+/// The complete WGSL for `ggml_type`'s **block-hoisted** decode pipeline, or
+/// `None` if it has no [`block_hoisted_middle`] yet.
+///
+/// Same three-layer assembly as [`shader_source_reduce`] — shared I/O
+/// prelude, per-type quantization middle, algorithm suffix — with only the
+/// middle and suffix differing. That is the point: a new decode algorithm
+/// costs one suffix, and a new quantization costs one middle, and neither
+/// costs a kernel per (type × algorithm).
+pub fn shader_source_reduce_block_hoisted(
+    ggml_type: u32,
+    n_rows: usize,
+    subgroup: bool,
+) -> Option<String> {
+    let middle = block_hoisted_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
+    let suffix = block_hoisted_suffix(n_rows, subgroup);
+    Some(format!("{prelude}\n{middle}\n{suffix}"))
+}
+
 fn coop_middle(ggml_type: u32) -> Option<&'static str> {
     Some(match ggml_type {
         t if t == GGML_TYPE_F32 => F32_COOP_MIDDLE,

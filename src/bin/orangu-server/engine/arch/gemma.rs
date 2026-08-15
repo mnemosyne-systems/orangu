@@ -1115,9 +1115,7 @@ impl GemmaModel {
         // that submission's own GPU time. Opt in with
         // `ORANGU_PREFILL_TRACE=1`; off by default (`eprintln!` per
         // submission is real overhead at high layer/token counts).
-        static PREFILL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let prefill_trace =
-            *PREFILL_TRACE.get_or_init(|| std::env::var_os("ORANGU_PREFILL_TRACE").is_some());
+        let prefill_trace = submission_trace();
 
         for (il, layer) in self.layers.iter().enumerate() {
             let head_dim = layer.head_dim;
@@ -2785,6 +2783,7 @@ impl GemmaModel {
     /// takes [`Backend::matmul_decode`] — see that method's doc comment.
     fn moe_router_logits(
         &self,
+        il: usize,
         moe: &GemmaMoe,
         attn_out: &[f32],
         n_tokens: usize,
@@ -2802,11 +2801,14 @@ impl GemmaModel {
             }
         }
         // `[n_tokens, n_expert]` — one router score per expert per token.
-        if decode {
+        let t0 = Instant::now();
+        let logits = if decode {
             self.backend.matmul_decode(&tmp, n_tokens, &moe.gate_inp)
         } else {
             self.backend.matmul(&tmp, n_tokens, &moe.gate_inp)
-        }
+        };
+        trace_submission(il, "moe_router", n_tokens, t0);
+        logits
     }
 
     /// A MoE gemma4 layer's FFN contribution *before* the shared
@@ -2839,7 +2841,11 @@ impl GemmaModel {
     /// than assume it. Measurement only: nothing acts on the guess yet.
     fn predict_next_routing(&self, next_layer: usize, next: &GemmaMoe, x: &[f32], n_tokens: usize) {
         let n_expert = next.gate_inp.out_dim;
-        let logits = self.moe_router_logits(next, x, n_tokens, false);
+        // `next_layer`, not the current one: the submission this makes
+        // belongs to the layer whose router is being run early, and a trace
+        // that attributed it to the caller would double-count a layer and
+        // leave a hole where the lookahead actually spent the time.
+        let logits = self.moe_router_logits(next_layer, next, x, n_tokens, false);
         let predicted: Vec<Vec<usize>> = (0..n_tokens)
             .map(|t| {
                 let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
@@ -2883,11 +2889,88 @@ impl GemmaModel {
         n_tokens: usize,
         decode: bool,
     ) -> Vec<f32> {
+        // The two branches read the same `attn_out` and are summed at the
+        // end, so nothing in one depends on the other — and they use
+        // *different processors*: the shared MLP is three device matmuls, the
+        // routed branch is host `vecdot` work with one small router matmul in
+        // front of it. Run sequentially, each waits out the other, which is
+        // why a decode step leaves the GPU engine and the CPU both around 60%
+        // idle no matter how many sequences are in flight.
+        //
+        // `rayon::join` rather than a thread: the routed branch is itself a
+        // `par_iter` over experts, so it has to run on the pool that owns
+        // those workers, and the shared branch's blocking device polls then
+        // occupy one worker while the rest keep evaluating experts. The sum
+        // below is in a fixed order and each branch is internally
+        // deterministic, so the result does not depend on which finishes
+        // first — `rayon::join` returns a pair, not a race. The end-to-end
+        // check is `real_model_tests::gemma4_predicts_paris_after_capital_of_france`,
+        // which runs the whole forward against real weights.
+        //
+        // Worth **+8.6% at decode and +9.2% at `pp` 1024** on
+        // `gemma-4-26B-A4B`. [`moe_overlap_min_tokens`] keeps the sequential
+        // form reachable as the control for that measurement; it is not a
+        // tuning knob, because both measured widths agree.
+        // **The router runs before the join, not inside it.** It is a device
+        // matmul at the head of an otherwise host-side branch, and leaving it
+        // in the parallel region put it in a queue behind the shared MLP's
+        // submissions on the same device — the two branches use different
+        // processors only *after* this point. Measured per token with the
+        // overlap on and off, the difference is entirely queueing rather than
+        // work: `moe_router` 13.68 ms against 3.11, `moe_shared_down` 21.05
+        // against 4.40. Hoisting it costs nothing (it is on the routed
+        // branch's critical path either way, since the routing decides which
+        // experts run) and hands the join two halves that genuinely do not
+        // contend.
+        //
+        // `ORANGU_MOE_ROUTER_IN_JOIN=1` puts it back inside, as the control
+        // for that measurement — the hoist has no other switch, and a change
+        // this small is not worth believing on a cross-session comparison.
+        let hoist = std::env::var_os("ORANGU_MOE_ROUTER_IN_JOIN").is_none();
+        let hoisted = hoist.then(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
+        if n_tokens >= moe_overlap_min_tokens() {
+            let (mut result, moe_out) = rayon::join(
+                || self.moe_shared_mlp(il, layer, moe, attn_out, n_tokens, decode),
+                || {
+                    let owned = hoisted
+                        .is_none()
+                        .then(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
+                    let logits = hoisted
+                        .as_deref()
+                        .or(owned.as_deref())
+                        .expect("one of the two");
+                    self.moe_routed_branch(il, moe, attn_out, n_tokens, logits)
+                },
+            );
+            tensor::add_inplace(&mut result, &moe_out);
+            return result;
+        }
+        let logits =
+            hoisted.unwrap_or_else(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
+        let mut result = self.moe_shared_mlp(il, layer, moe, attn_out, n_tokens, decode);
+        let moe_out = self.moe_routed_branch(il, moe, attn_out, n_tokens, &logits);
+        tensor::add_inplace(&mut result, &moe_out);
+        result
+    }
+
+    /// The dense shared-MLP branch of a MoE layer (GEGLU) — the exact
+    /// dense-FFN computation, using this layer's
+    /// `ffn_norm`/`ffn_gate`/`ffn_up`/`ffn_down`, then its own
+    /// `post_ffw_norm_1`.
+    ///
+    /// Split out of [`Self::moe_ffn_result`] so it can run beside the routed
+    /// branch rather than before it; see that function for why.
+    fn moe_shared_mlp(
+        &self,
+        il: usize,
+        layer: &GemmaLayer,
+        moe: &GemmaMoe,
+        attn_out: &[f32],
+        n_tokens: usize,
+        decode: bool,
+    ) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
-
-        // Dense shared-MLP branch (GEGLU) — the exact dense-FFN computation,
-        // using this layer's ffn_norm/ffn_gate/ffn_up/ffn_down.
         let mut mlp_normed = attn_out.to_vec();
         tensor::rmsnorm_inplace(&mut mlp_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
         let ops = [
@@ -2902,28 +2985,47 @@ impl GemmaModel {
                 w: &layer.ffn_up,
             },
         ];
+        let t0 = Instant::now();
         let mut gate_up = if decode {
             self.backend.matmul_batch_decode(&ops)
         } else {
             self.backend.matmul_batch(&ops)
         };
+        trace_submission(il, "moe_shared_gate_up", n_tokens, t0);
         let up = gate_up.pop().unwrap();
         let mut gate = gate_up.pop().unwrap();
         tensor::gelu_inplace(&mut gate);
         tensor::mul_inplace(&mut gate, &up);
+        let t0 = Instant::now();
         let mut result = if decode {
             self.backend.matmul_decode(&gate, n_tokens, &layer.ffn_down)
         } else {
             self.backend.matmul(&gate, n_tokens, &layer.ffn_down)
         };
+        trace_submission(il, "moe_shared_down", n_tokens, t0);
         tensor::rmsnorm_inplace(&mut result, &moe.post_norm_1, n_tokens, n_embd, eps);
+        result
+    }
 
-        // Routed-expert branch. Expert input is its own `pre_ffw_norm_2`-normed
-        // residual; the routing weights come from the (differently-normed)
-        // `attn_out` — see `moe_router_logits`.
+    /// The routed-expert branch of a MoE layer, through its own
+    /// `post_ffw_norm_2` — everything [`Self::moe_shared_mlp`] is not.
+    fn moe_routed_branch(
+        &self,
+        il: usize,
+        moe: &GemmaMoe,
+        attn_out: &[f32],
+        n_tokens: usize,
+        logits: &[f32],
+    ) -> Vec<f32> {
+        let n_embd = self.config.n_embd;
+        let eps = self.rms_eps();
+
+        // Expert input is its own `pre_ffw_norm_2`-normed residual; the
+        // routing weights come from the (differently-normed) `attn_out` and
+        // are computed by the caller — see `moe_ffn_result` for why the
+        // router does not belong inside this branch.
         let mut expert_in = attn_out.to_vec();
         tensor::rmsnorm_inplace(&mut expert_in, &moe.pre_norm_2, n_tokens, n_embd, eps);
-        let logits = self.moe_router_logits(moe, attn_out, n_tokens, decode);
         let n_expert = moe.gate_inp.out_dim;
 
         // Route every token first (cheap, sequential): softmax its logits,
@@ -2984,46 +3086,36 @@ impl GemmaModel {
         // dequantized once and dotted with every token that routed to this
         // expert. See `super::evaluate_routed_experts`, including why the
         // contributions come back in selection order.
-        let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
-            // gate/up projection (fused or separate), dequantized once for
-            // every token that routed here. A per-expert `.scale`, if present,
-            // multiplies that expert's raw gate/up *output* before the GELU
-            // (matches `build_lora_mm_id`) — applied to the dot products
-            // below, never folded into the rows here. `(x · row) * s` and
-            // `x · (row * s)` are different `f32`s: one rounds a single
-            // product, the other rounds every term of the accumulation. The
-            // first is what this architecture computed before, so it is what
-            // it has to keep computing.
-            let inputs: Vec<&[f32]> = members
-                .iter()
-                .map(|&(t, _)| &expert_in[t * n_embd..(t + 1) * n_embd])
-                .collect();
-
-            // The fused tensor's first half is the gate and its second half
-            // the up, so the two are the same matrix under two row ranges.
-            let (mut gate, mut up, gate_scale, up_scale) = match &moe.gate_up {
+        //
+        // The GPU expert path instead batches the three projections across
+        // experts, which is the only form of it worth dispatching — see
+        // `super::evaluate_routed_experts_batched`. It is expressed over row
+        // ranges here because this architecture's gate and up are two halves
+        // of one `ffn_gate_up_exps` tensor, and over
+        // `super::ExpertProjection::scale` because the per-expert QAT scalars
+        // have to land on the projections' outputs either way.
+        // Timed as one stage rather than per projection: on the host path it
+        // is a `rayon` region, not a submission, and what the trace is for is
+        // the split between "the routed branch" and "everything the layer
+        // sends to the device around it".
+        let t_experts = Instant::now();
+        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+            let (gate_proj, up_proj) = match &moe.gate_up {
                 GemmaExpertGateUp::Fused { gate_up, scale } => {
                     let n_ff = gate_up.out_dim / 2;
-                    let scale = scale.as_ref().map(|s| s[expert]);
                     (
-                        super::project_expert(
-                            self.backend.as_ref(),
-                            gate_up,
-                            expert,
-                            0,
-                            n_ff,
-                            &inputs,
-                        ),
-                        super::project_expert(
-                            self.backend.as_ref(),
-                            gate_up,
-                            expert,
-                            n_ff,
-                            n_ff,
-                            &inputs,
-                        ),
-                        scale,
-                        scale,
+                        super::ExpertProjection {
+                            exps: gate_up,
+                            first_row: 0,
+                            n_rows: n_ff,
+                            scale: scale.as_deref(),
+                        },
+                        super::ExpertProjection {
+                            exps: gate_up,
+                            first_row: n_ff,
+                            n_rows: n_ff,
+                            scale: scale.as_deref(),
+                        },
                     )
                 }
                 GemmaExpertGateUp::Separate {
@@ -3032,66 +3124,157 @@ impl GemmaModel {
                     gate_scale,
                     up_scale,
                 } => (
-                    super::project_expert(
-                        self.backend.as_ref(),
-                        gate,
-                        expert,
-                        0,
-                        gate.out_dim,
-                        &inputs,
-                    ),
-                    super::project_expert(
-                        self.backend.as_ref(),
-                        up,
-                        expert,
-                        0,
-                        up.out_dim,
-                        &inputs,
-                    ),
-                    gate_scale.as_ref().map(|s| s[expert]),
-                    up_scale.as_ref().map(|s| s[expert]),
+                    super::ExpertProjection {
+                        scale: gate_scale.as_deref(),
+                        ..super::ExpertProjection::whole(gate)
+                    },
+                    super::ExpertProjection {
+                        scale: up_scale.as_deref(),
+                        ..super::ExpertProjection::whole(up)
+                    },
                 ),
             };
-            if let Some(scale) = gate_scale {
-                gate.iter_mut()
-                    .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
-            }
-            if let Some(scale) = up_scale {
-                up.iter_mut()
-                    .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
-            }
-
-            let hidden: Vec<Vec<f32>> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(mut gate, up)| {
-                    tensor::gelu_inplace(&mut gate);
-                    tensor::mul_inplace(&mut gate, &up);
-                    gate
-                })
-                .collect();
-            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-
-            // Down projection, then the per-expert down `.scale` (if any) and
-            // the routing weight — both scalars, folded into one.
-            let down_scale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]);
-            super::project_expert(
+            let down_proj = super::ExpertProjection {
+                scale: moe.down_scale.as_deref(),
+                ..super::ExpertProjection::whole(&moe.down_exps)
+            };
+            super::evaluate_routed_experts_batched_views(
                 self.backend.as_ref(),
-                &moe.down_exps,
-                expert,
-                0,
-                moe.down_exps.out_dim,
-                &hidden_refs,
+                &selection,
+                &expert_in,
+                n_embd,
+                &gate_proj,
+                &up_proj,
+                &down_proj,
+                |gate, up| {
+                    let mut h = gate.to_vec();
+                    tensor::gelu_inplace(&mut h);
+                    tensor::mul_inplace(&mut h, up);
+                    h
+                },
             )
-            .into_iter()
-            .zip(members)
-            .map(|(mut contribution, &(_, weight))| {
-                let dscale = down_scale * weight;
-                contribution.iter_mut().for_each(|v| *v *= dscale);
-                contribution
+        } else {
+            super::evaluate_routed_experts(&selection, |expert, members| {
+                // gate/up projection (fused or separate), dequantized once for
+                // every token that routed here. A per-expert `.scale`, if present,
+                // multiplies that expert's raw gate/up *output* before the GELU
+                // (matches `build_lora_mm_id`) — applied to the dot products
+                // below, never folded into the rows here. `(x · row) * s` and
+                // `x · (row * s)` are different `f32`s: one rounds a single
+                // product, the other rounds every term of the accumulation. The
+                // first is what this architecture computed before, so it is what
+                // it has to keep computing.
+                let inputs: Vec<&[f32]> = members
+                    .iter()
+                    .map(|&(t, _)| &expert_in[t * n_embd..(t + 1) * n_embd])
+                    .collect();
+
+                // The fused tensor's first half is the gate and its second half
+                // the up, so the two are one contiguous row range rather than
+                // two — **one** `project_expert` call, not two.
+                //
+                // The rows this reads and the arithmetic on each are
+                // identical either way; what the single call removes is the
+                // per-call overhead, three times over. Each call opens its own
+                // `rayon` region with its own join barrier, claims its own
+                // `engine::expert_store` lease over the same expert, and
+                // quantizes the *same* activation vector again — `inputs` is
+                // byte-identical between the two halves, so the second
+                // `quantize_act` recomputed a result the first had already
+                // produced. At decode a layer's routed branch was
+                // `3 * n_expert_used` regions; this makes it `2 *
+                // n_expert_used`.
+                let (mut gate, mut up, gate_scale, up_scale) = match &moe.gate_up {
+                    GemmaExpertGateUp::Fused { gate_up, scale } => {
+                        let n_ff = gate_up.out_dim / 2;
+                        let scale = scale.as_ref().map(|s| s[expert]);
+                        let both = super::project_expert(
+                            self.backend.as_ref(),
+                            gate_up,
+                            expert,
+                            0,
+                            2 * n_ff,
+                            &inputs,
+                        );
+                        let mut gate = Vec::with_capacity(both.len());
+                        let mut up = Vec::with_capacity(both.len());
+                        for mut row in both {
+                            // `split_off` rather than two copies: the head
+                            // keeps the allocation it already has.
+                            let tail = row.split_off(n_ff);
+                            gate.push(row);
+                            up.push(tail);
+                        }
+                        (gate, up, scale, scale)
+                    }
+                    GemmaExpertGateUp::Separate {
+                        gate,
+                        up,
+                        gate_scale,
+                        up_scale,
+                    } => (
+                        super::project_expert(
+                            self.backend.as_ref(),
+                            gate,
+                            expert,
+                            0,
+                            gate.out_dim,
+                            &inputs,
+                        ),
+                        super::project_expert(
+                            self.backend.as_ref(),
+                            up,
+                            expert,
+                            0,
+                            up.out_dim,
+                            &inputs,
+                        ),
+                        gate_scale.as_ref().map(|s| s[expert]),
+                        up_scale.as_ref().map(|s| s[expert]),
+                    ),
+                };
+                if let Some(scale) = gate_scale {
+                    gate.iter_mut()
+                        .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
+                }
+                if let Some(scale) = up_scale {
+                    up.iter_mut()
+                        .for_each(|row| row.iter_mut().for_each(|v| *v *= scale));
+                }
+
+                let hidden: Vec<Vec<f32>> = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(mut gate, up)| {
+                        tensor::gelu_inplace(&mut gate);
+                        tensor::mul_inplace(&mut gate, &up);
+                        gate
+                    })
+                    .collect();
+                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+
+                // Down projection, then the per-expert down `.scale` (if any) and
+                // the routing weight — both scalars, folded into one.
+                let down_scale = moe.down_scale.as_ref().map_or(1.0, |s| s[expert]);
+                super::project_expert(
+                    self.backend.as_ref(),
+                    &moe.down_exps,
+                    expert,
+                    0,
+                    moe.down_exps.out_dim,
+                    &hidden_refs,
+                )
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    let dscale = down_scale * weight;
+                    contribution.iter_mut().for_each(|v| *v *= dscale);
+                    contribution
+                })
+                .collect()
             })
-            .collect()
-        });
+        };
+        trace_submission(il, "moe_experts", n_tokens, t_experts);
         experts.loaded_once_per_distinct_expert();
         experts.commit(n_tokens);
 
@@ -3105,9 +3288,68 @@ impl GemmaModel {
             }
         }
         tensor::rmsnorm_inplace(&mut moe_out, &moe.post_norm_2, n_tokens, n_embd, eps);
+        moe_out
+    }
+}
 
-        tensor::add_inplace(&mut result, &moe_out);
-        result
+/// Batch width at which a MoE layer's two FFN branches are evaluated
+/// concurrently rather than one after the other, from
+/// `ORANGU_MOE_OVERLAP_MIN_TOKENS`.
+///
+/// The branches use different processors — the shared MLP is device
+/// matmuls, the routed branch is host `vecdot` — and running them in
+/// sequence is why a MoE decode leaves both around 60% idle. Overlapping
+/// them costs one worker blocked in `device.poll`, which is why it is a
+/// width threshold and not a plain `true`.
+///
+/// **`1` — overlap at every width, including a single token.** An earlier
+/// version defaulted to 24 on the reading that a decode step's narrow
+/// fan-out could not spare a worker to a blocking `device.poll`. That
+/// reading came from comparing two runs taken an hour apart, and it was
+/// wrong: a *controlled* A/B through this variable, alternating the two
+/// settings against one another and repeated, gives **6.19 against 6.72
+/// tok/s — the overlap is +8.6% at decode** and reproduced to three
+/// significant figures on the repeat. Prefill is +9.2% at 1024 tokens. The
+/// two widths agree, so there is no crossover to place.
+///
+/// The threshold survives as the escape hatch and as the control for that
+/// A/B: a large value restores the sequential form. Decode throughput on
+/// this machine drifts several percent over a long session, which is what
+/// produced the wrong reading — compare settings with `orangu-bench
+/// --sweep`, never across sessions.
+fn moe_overlap_min_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_MOE_OVERLAP_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+/// Whether `ORANGU_PREFILL_TRACE=1` asked for a wall-clock line around each
+/// GPU submission the CPU-orchestrated path makes.
+///
+/// One predicate rather than one per call site, because the MoE forward is
+/// spread over three functions and a trace that covered only the one it
+/// started in is what made the routed-FFN submissions invisible.
+pub(crate) fn submission_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ORANGU_PREFILL_TRACE").is_some())
+}
+
+/// One `[prefill-trace]` line, in the format the layer loop already emits.
+///
+/// Timing *around* a `Backend::matmul` is an accurate proxy for that
+/// submission's own GPU time because every one of them blocks on
+/// `device.poll(wait_indefinitely)` before returning — which is also exactly
+/// the property that makes the submission count matter.
+fn trace_submission(il: usize, stage: &str, n_tokens: usize, started: Instant) {
+    if submission_trace() {
+        eprintln!(
+            "orangu-server: [prefill-trace] layer {il} {stage} n_tokens={n_tokens}: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -3183,6 +3425,127 @@ mod real_model_tests {
             return;
         };
         check_predicts_paris(Arc::new(metal));
+    }
+
+    /// The next-token distribution on a fixed 28-token context, against
+    /// what real `llama.cpp` produces for the same tokens.
+    ///
+    /// Written to bisect a reported garbling of generated C code —
+    /// `-------------------------` runs and `|` where newlines belong — and
+    /// it is what showed the *forward pass is not at fault*. Both backends
+    /// agree with the reference here:
+    ///
+    /// ```text
+    ///                '\n' (107)      runner-up (2819)
+    ///   llama.cpp      -0.238           -1.668
+    ///   CpuBackend     -0.284           -1.539
+    ///   Vulkan         -0.293           -1.484
+    /// ```
+    ///
+    /// The cause was `SamplingParams::default()`'s `repeat_penalty`, then
+    /// `1.1` over `repeat_last_n: 64`: `'\n'` occurs four times in this very
+    /// prompt, and penalising it drops it below `2819` — which is exactly
+    /// the token the server emitted. In code, where the newline is by far
+    /// the most repeated token, that is what substitutes rule-off runs for
+    /// line breaks. The default is now `1.0`; see that `Default` impl.
+    ///
+    /// So this test guards the *engine* side of that boundary: if it ever
+    /// stops matching the reference, the forward pass has regressed and the
+    /// sampler is not the explanation. `ORANGU_TEST_BACKEND=vulkan` picks
+    /// the GPU, `ORANGU_TEST_KV_CAPACITY` resizes the cache, and
+    /// `ORANGU_TEST_NO_BOS` drops the leading BOS — all three were bisection
+    /// controls and all three are worth keeping, the last especially:
+    /// dropping BOS *does* reproduce the wrong answer, so a future BOS
+    /// regression would look exactly like this bug.
+    ///
+    /// Run with `ORANGU_TEST_MODEL=… cargo test --release --bin
+    /// orangu-server gemma4_next_token -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gemma4_next_token_matches_the_reference_distribution() {
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        // `ORANGU_TEST_BACKEND=vulkan` runs the identical context through the
+        // GPU instead, so the two halves of the bisect differ in the backend
+        // and in nothing else — not the server, not sampling, not who owns
+        // the KV cache. One process per run rather than both in one, because
+        // `wgpu` wants a single device per process.
+        let backend: Arc<dyn crate::engine::backend::Backend> =
+            if std::env::var("ORANGU_TEST_BACKEND").as_deref() == Ok("vulkan") {
+                match crate::engine::backend::vulkan::VulkanBackend::try_init() {
+                    Some(vulkan) => Arc::new(vulkan),
+                    None => {
+                        eprintln!("{NO_GPU_SKIP}");
+                        return;
+                    }
+                }
+            } else {
+                Arc::new(crate::engine::backend::CpuBackend)
+            };
+        let model = GemmaModel::load_with_backend(&loaded, backend).expect("build model");
+
+        // `"/**\n * Function: deleteNode\n * ---------------------\n * Deletes
+        // a node from a doubly linked list.\n * "`, as both engines tokenize
+        // it, with the BOS the server prepends.
+        let mut tokens: Vec<u32> = vec![
+            2, 5673, 107, 808, 12939, 236787, 9311, 4740, 107, 808, 236743, 2819, 30104, 107, 808,
+            1783, 59700, 496, 5349, 699, 496, 85233, 12809, 1694, 236761, 107, 808, 236743,
+        ];
+        // `ORANGU_TEST_NO_BOS=1` drops the leading BOS. Real `llama.cpp`
+        // logs `override 'tokenizer.ggml.add_bos_token' to 'true' for
+        // Gemma4` on this file, i.e. the GGUF asks for no BOS and the
+        // reference overrides it — so whether one is prepended is a genuine
+        // difference between implementations, not a detail.
+        if std::env::var("ORANGU_TEST_NO_BOS").is_ok() {
+            tokens.remove(0);
+        }
+        eprintln!("tokens = {} (bos = {})", tokens.len(), tokens[0] == 2);
+        // Cache capacity is a variable, not a detail: this architecture has
+        // sliding-window layers whose geometry is sized from it, and the
+        // server runs a far larger context than a test's usual 64.
+        let capacity: usize = std::env::var("ORANGU_TEST_KV_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        eprintln!("kv capacity = {capacity}");
+        let mut cache = model.new_kv_cache(capacity);
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
+
+        // Log-softmax, so the numbers are directly comparable to the
+        // reference logprobs quoted above rather than to raw logits.
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = logits.iter().map(|v| (v - max).exp()).sum();
+        let log_z = max + sum_exp.ln();
+        let mut ranked: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| (i, v - log_z))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        eprintln!("CpuBackend top-8 (token id, logprob):");
+        for (id, lp) in ranked.iter().take(8) {
+            eprintln!("  {id:>7}  {lp:.3}");
+        }
+        const NEWLINE: usize = 107;
+        const RUNNER_UP: usize = 2819;
+        let rank_of_newline = ranked.iter().position(|(id, _)| *id == NEWLINE);
+        eprintln!(
+            "top-1 = {}, '\\n' (107) at rank {rank_of_newline:?}",
+            ranked[0].0
+        );
+        if std::env::var("ORANGU_TEST_NO_BOS").is_ok() {
+            // The control: without BOS the model genuinely prefers 2819, which
+            // is what makes this a useful guard rather than a tautology.
+            assert_eq!(ranked[0].0, RUNNER_UP, "no-BOS context should prefer 2819");
+            return;
+        }
+        assert_eq!(
+            ranked[0].0, NEWLINE,
+            "forward pass disagrees with llama.cpp on this context; the sampler \
+             is not in play here, so this is the engine"
+        );
     }
 
     fn check_predicts_paris(backend: Arc<dyn crate::engine::backend::Backend>) {

@@ -942,6 +942,26 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   `temperature=0.7, top_p=0.8, top_k=20, min_p=0` (broader, more varied
   output); every other role keeps the engine's existing defaults
   (`temperature=0.8, top_k=40, top_p=0.95, min_p=0.05`).
+
+  The **repetition penalty is off by default** (`repeat_penalty=1.0`) for
+  every role. It is applied per token id, so it weighs most on whichever
+  token repeats most — and in source code that is the newline. Left on, it
+  pushes line breaks down far enough that the model substitutes whatever else
+  fits, which in a block comment is a rule of dashes or a `|`; the visible
+  result is code that comes back with `---------------` runs where its line
+  breaks should be. Ask for a penalty per request when a workload actually
+  needs one, rather than paying it on output whose whitespace carries
+  meaning.
+
+  All three generation endpoints — `/completion`, `/v1/completions` and
+  `/v1/chat/completions` — accept `temperature`, `top_p`, `top_k`, `min_p`,
+  `repeat_penalty` and `seed`, and an omitted field keeps the role's default
+  rather than resetting to zero. The two `/v1/` endpoints used to accept
+  fewer: a request naming one they lacked was **silently ignored**, since
+  unknown JSON keys are dropped rather than refused. That is worth knowing
+  even now it is fixed, because it is indistinguishable from a setting that
+  had no effect — if a knob appears to do nothing, check that the endpoint
+  names it before concluding anything about the knob.
 - **Whether the generation endpoints are served at all.** `embedding`
   disables `/v1/chat/completions`, `/v1/completions`, and `/completion` —
   a clear `501` instead of silently running text generation against a
