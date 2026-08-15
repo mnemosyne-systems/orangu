@@ -724,6 +724,13 @@ impl ModelSource {
 /// directory: it names the model already in this file. In a binary with no
 /// bundle it isn't reserved at all and resolves like any other name, which
 /// is the honest outcome — there is nothing embedded for it to mean.
+///
+/// The label handed back is the resolved group's own `MODEL` name, not the
+/// spec as typed: an `NR` from `list`'s first column is a position in a
+/// listing, and carrying it forward would make `orangu-server 84` call
+/// itself `84` in the banner, on `/v1/models`, in every response's `model`
+/// field, and in the web console's header. A spec naming nothing on disk
+/// (a Hugging Face repo to fetch) keeps the spelling it was given.
 fn resolve_model_spec(
     models_dir: &Path,
     spec: &str,
@@ -734,9 +741,9 @@ fn resolve_model_spec(
     {
         return Ok((ModelSource::Embedded(bundle), bundle.model.clone()));
     }
-    let path = orangu::model_spec::resolve_or_fetch_model(models_dir, spec)
+    let (path, label) = orangu::model_spec::resolve_load_target(models_dir, spec)
         .with_context(|| format!("resolving model '{spec}'"))?;
-    Ok((ModelSource::File(path), spec.to_string()))
+    Ok((ModelSource::File(path), label))
 }
 
 fn auto_pair_dflash_target(
@@ -3184,7 +3191,9 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Command, label_carries_tag, resolve_workspace, terminal_title};
+    use super::{
+        Args, Command, label_carries_tag, resolve_model_spec, resolve_workspace, terminal_title,
+    };
 
     /// Every subcommand clap parses has a `mode()` name for the terminal
     /// title, spelled exactly the way the user typed it — the title is only
@@ -3318,5 +3327,61 @@ mod tests {
         assert!(label_carries_tag("unsloth/gemma-4-E2B-it-GGUF:Q4_K_M"));
         // A `:` above the file itself is part of a directory name, not a tag.
         assert!(!label_carries_tag("/mnt/models:old/gemma-4-E2B-it.gguf"));
+    }
+
+    /// `orangu-server 84` names a *position* in `list`'s output, not a model.
+    /// The label resolution keeps has to be the model's own `MODEL` name, or
+    /// the number is what the startup banner, `/v1/models`, every response's
+    /// `model` field and the web console header all report as the model.
+    #[test]
+    fn an_nr_spec_is_labelled_with_the_models_own_name() {
+        let dir = tempfile::tempdir().expect("models directory");
+        write_minimal_gguf(&dir.path().join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"));
+
+        let (source, label) = resolve_model_spec(dir.path(), "1", None).expect("resolved");
+
+        assert_eq!(label, "Llama-3.2-3B-Instruct-Q4_K_M");
+        assert!(
+            source.path().ends_with("Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "{:?}",
+            source.path()
+        );
+    }
+
+    /// A `MODEL` name is already the id it resolves to, so it survives
+    /// unchanged — the fix for the `NR` case must not rewrite what was
+    /// spelled correctly to begin with.
+    #[test]
+    fn a_model_name_spec_is_kept_as_written() {
+        let dir = tempfile::tempdir().expect("models directory");
+        write_minimal_gguf(&dir.path().join("Llama-3.2-3B-Instruct-Q4_K_M.gguf"));
+
+        let (_, label) =
+            resolve_model_spec(dir.path(), "Llama-3.2-3B-Instruct-Q4_K_M", None).expect("resolved");
+
+        assert_eq!(label, "Llama-3.2-3B-Instruct-Q4_K_M");
+    }
+
+    /// Writes a minimal GGUF — enough header for the models-directory scan
+    /// behind `resolve_model_spec` to count it as a model.
+    fn write_minimal_gguf(path: &std::path::Path) {
+        use std::io::Write;
+
+        let architecture = "llama";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+        let key = "general.architecture";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
+        buf.extend_from_slice(&(architecture.len() as u64).to_le_bytes());
+        buf.extend_from_slice(architecture.as_bytes());
+        std::fs::File::create(path)
+            .expect("create gguf")
+            .write_all(&buf)
+            .expect("write gguf");
     }
 }
