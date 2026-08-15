@@ -934,9 +934,31 @@ fn prepare(args: Args) -> Result<Prepared> {
     let mut gpu_tuning = backend
         .as_wgpu()
         .map(engine::backend::VulkanBackend::tuning_report);
+    // The banner reports the kernels *this* model's own weights decode
+    // through, most-common type first. A file named for a K-quant is often
+    // mostly something else — `unsloth/Qwen3.8-27B-GGUF:IQ2_XXS` has no
+    // `Q4_K` tensor at all — so naming a fixed pair of types would answer a
+    // question nobody asked. Floats are excluded: they carry the norms and
+    // biases, never the weight bytes decode throughput is made of.
+    let dominant_types = {
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (_, ty) in loaded.tensor_types() {
+            let is_float = ty == engine::quant::GGML_TYPE_F32
+                || ty == engine::quant::GGML_TYPE_F16
+                || ty == engine::quant::GGML_TYPE_BF16;
+            if !is_float {
+                *counts.entry(ty).or_default() += 1;
+            }
+        }
+        let mut types: Vec<(u32, usize)> = counts.into_iter().collect();
+        // Count first, then type id, so the line is the same on two runs of
+        // the same file rather than following `HashMap` iteration order.
+        types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        types.into_iter().map(|(ty, _)| ty).collect::<Vec<_>>()
+    };
     let gpu_tuning_summary = backend
         .as_wgpu()
-        .map(engine::backend::VulkanBackend::tuning_summary);
+        .map(|v| v.tuning_summary_for(&dominant_types));
     // The backend itself, when it is a `wgpu` one, so `/gpu-timings` can drain
     // its accumulated timestamp breakdown. Kept as the `dyn Backend` the state
     // already holds rather than a second concrete handle: `as_wgpu` is how

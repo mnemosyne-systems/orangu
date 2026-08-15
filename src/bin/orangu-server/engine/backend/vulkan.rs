@@ -136,10 +136,11 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// startup, instead of silently shifting every later table.
 fn iq_grid_words() -> Vec<u32> {
     use crate::engine::iq_grids::{
-        IQ2S_GRID, IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+        KVALUES_IQ4NL,
     };
 
-    let mut words = Vec::with_capacity(3876);
+    let mut words = Vec::with_capacity(8484);
     for &g in IQ2XS_GRID.iter().chain(IQ2S_GRID.iter()) {
         words.push(g as u32);
         words.push((g >> 32) as u32);
@@ -159,7 +160,23 @@ fn iq_grid_words() -> Vec<u32> {
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])),
     );
-    assert_eq!(words.len(), 3876, "packed IQ grid size");
+    // The two grids appended last are the ones that make `IQ2_XXS`, `IQ1_S`
+    // and `IQ1_M` GPU types at all: `IQ2XXS_GRID` is `IQ2_XXS`'s own
+    // 256-point lattice, and `IQ1S_GRID` is shared by both `iq1*` types.
+    // `IQ1S_GRID` is 16 KiB by itself, which is why the whole buffer is
+    // ~33 KiB rather than the ~15 KiB it was — still a rounding error next
+    // to any weight tensor, and read-only storage cached like one.
+    assert_eq!(words.len(), 3876, "kvalues must end at IQ2XXS_GRID_OFF");
+    for &g in IQ2XXS_GRID.iter() {
+        words.push(g as u32);
+        words.push((g >> 32) as u32);
+    }
+    assert_eq!(words.len(), 4388, "iq2_xxs grid must end at IQ1S_GRID_OFF");
+    for &g in IQ1S_GRID.iter() {
+        words.push(g as u32);
+        words.push((g >> 32) as u32);
+    }
+    assert_eq!(words.len(), 8484, "packed IQ grid size");
     words
 }
 
@@ -2787,6 +2804,9 @@ const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_Q4_K,
     crate::engine::quant::GGML_TYPE_Q5_K,
     crate::engine::quant::GGML_TYPE_Q6_K,
+    crate::engine::quant::GGML_TYPE_IQ1_S,
+    crate::engine::quant::GGML_TYPE_IQ1_M,
+    crate::engine::quant::GGML_TYPE_IQ2_XXS,
     crate::engine::quant::GGML_TYPE_IQ2_XS,
     crate::engine::quant::GGML_TYPE_IQ2_S,
     crate::engine::quant::GGML_TYPE_IQ3_XXS,
@@ -3156,13 +3176,37 @@ impl VulkanBackend {
     /// (`/props`); this is what fits on a terminal line and is enough to spot
     /// "that is not the kernel I meant to measure" before a run rather than
     /// after it.
-    pub fn tuning_summary(&self) -> String {
+    ///
+    /// `types` is the model's own quantized types in the caller's priority
+    /// order (most tensors first), and only the first two this backend has a
+    /// pipeline for are shown. It is a parameter rather than a fixed
+    /// `Q4_K`/`Q6_K` pair because the banner is read as an answer to "which
+    /// kernel is *my* model on", and a "dynamic" release makes a fixed pair
+    /// wrong rather than merely incomplete: `unsloth/Qwen3.8-27B-GGUF:
+    /// IQ2_XXS` has no `Q4_K` tensor at all, so the fixed line reported
+    /// `q4_k-light` for a model decoding entirely on other kernels.
+    pub fn tuning_summary_for(&self, types: &[u32]) -> String {
         let q = |ty: u32| self.pipeline_for_named(ty, 4096, 1).1;
         let tiles = vulkan_shaders::coop_vec4_tiles(self.wgpu_backend);
+        let mut shown = types
+            .iter()
+            .copied()
+            .filter(|&ty| SUPPORTED_TYPES.contains(&ty))
+            .map(|ty| {
+                format!(
+                    "{} {}",
+                    orangu::gguf::ggml_type_name(ty).to_lowercase(),
+                    q(ty)
+                )
+            });
+        let first = shown.next().unwrap_or_else(|| "none".to_string());
+        let second = shown.next();
         format!(
-            "q4_k {} · q6_k {} · kv {:?} · coop-tiles {} · attn {} · prefill≥{} tok",
-            q(crate::engine::quant::GGML_TYPE_Q4_K),
-            q(crate::engine::quant::GGML_TYPE_Q6_K),
+            "{} · kv {:?} · coop-tiles {} · attn {} · prefill≥{} tok",
+            match &second {
+                Some(second) => format!("{first} · {second}"),
+                None => first,
+            },
             self.kv_storage,
             // `w/x` rather than one word: the two tiles can differ, and which
             // one is on the scalar form is exactly the thing worth noticing.
@@ -14297,10 +14341,11 @@ mod tests {
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-        GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
     /// The RMSNorm width rule must reproduce every width it was measured at,
@@ -15835,6 +15880,32 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
                 out.extend(next_bytes(seed, 16));
             }
+            t if t == GGML_TYPE_IQ2_XXS => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 64));
+            }
+            t if t == GGML_TYPE_IQ1_S => {
+                out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+                out.extend(next_bytes(seed, 32));
+                out.extend(next_bytes(seed, 16));
+            }
+            // The one type with no `d` field at all: its `f16` block scale is
+            // four nibbles scattered across the top of the four `scales`
+            // `u16`s, so random bytes there *are* a random `f16` — exponent
+            // included, where every other arm draws its scale through
+            // `next_bounded_f32`. The top nibble of the last `u16` (byte 7's
+            // high half) is the `f16`'s own top nibble, so pinning it to
+            // `0x3` keeps the block scale a positive normal of order 1
+            // instead of an occasional `inf`/`NaN`, which would make the
+            // comparison below vacuous rather than strict. Every other bit,
+            // including the rest of the exponent, stays random.
+            t if t == GGML_TYPE_IQ1_M => {
+                out.extend(next_bytes(seed, 32));
+                out.extend(next_bytes(seed, 16));
+                let mut scales = next_bytes(seed, 8);
+                scales[7] = (scales[7] & 0x0F) | 0x30;
+                out.extend(scales);
+            }
             other => panic!("build_block: unhandled ggml_type {other}"),
         }
         out
@@ -16164,10 +16235,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         // The banner line is built from the same selector, so it can't
         // disagree either — but it is what a reader actually sees, so prove
         // it is populated rather than an empty format string.
-        let summary = vulkan.tuning_summary();
+        let summary = vulkan.tuning_summary_for(&[GGML_TYPE_Q4_K, GGML_TYPE_Q6_K]);
         assert!(
             summary.contains("q4_k") && summary.contains("kv "),
-            "tuning_summary is not the banner line it claims to be: {summary}"
+            "tuning_summary_for is not the banner line it claims to be: {summary}"
+        );
+        // A model carrying none of the types this backend has a pipeline for
+        // still has to produce a line rather than a panic or an empty
+        // prefix — that is a CPU-only file whose banner still reports the
+        // GPU's other settings.
+        let none = vulkan.tuning_summary_for(&[]);
+        assert!(
+            none.starts_with("none · kv "),
+            "an empty type list should still yield a banner: {none}"
         );
     }
 
@@ -16787,6 +16867,35 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cross_check(GGML_TYPE_IQ2_XS, 512, 5);
     }
 
+    /// The three types this backend gained a shader for at once, and the
+    /// reason the `IQ*` codebook buffer grew from ~15 KiB to ~33 KiB: they
+    /// are what a `UD`-style 2-bit release is actually made of
+    /// (`unsloth/Qwen3.8-27B-GGUF:IQ2_XXS` is 96 `IQ1_M` tensors and 48
+    /// `IQ2_XXS` ones), and until they existed such a file could not use a
+    /// GPU at all — `engine::backend::unsupported_tensor_types` rejected the
+    /// whole model up front.
+    ///
+    /// `IQ1_S` and `IQ1_M` are the only quantizations here whose codebook
+    /// values are **signed** and which carry no sign field, so a `±delta` on
+    /// each weight is the whole per-group freedom. Reading the grid byte as
+    /// unsigned — the shape every `iq2*`/`iq3*` shader above uses — is a
+    /// mistake that stays well formed and produces plausible output, which
+    /// is what this catches.
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xxs() {
+        cross_check(GGML_TYPE_IQ2_XXS, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_s() {
+        cross_check(GGML_TYPE_IQ1_S, 512, 5);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_m() {
+        cross_check(GGML_TYPE_IQ1_M, 512, 5);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_for_iq2_s() {
         cross_check(GGML_TYPE_IQ2_S, 512, 5);
@@ -16893,6 +17002,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cross_check_n_tokens(GGML_TYPE_IQ3_XXS, 512, 5, 130);
     }
 
+    /// The three new types on the *prefill* side too. Their per-token
+    /// (`block_dot`) and prefill (`dequant_element`) restatements of the same
+    /// layout are written separately and can disagree with each other while
+    /// each looks right on its own, so both are checked against the same CPU
+    /// ground truth.
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq2_xxs() {
+        cross_check_n_tokens(GGML_TYPE_IQ2_XXS, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq1_s() {
+        cross_check_n_tokens(GGML_TYPE_IQ1_S, 512, 5, 130);
+    }
+
+    #[test]
+    fn matmul_matches_cpu_backend_cooperative_path_iq1_m() {
+        cross_check_n_tokens(GGML_TYPE_IQ1_M, 512, 5, 130);
+    }
+
     #[test]
     fn matmul_matches_cpu_backend_cooperative_path_iq3_s() {
         cross_check_n_tokens(GGML_TYPE_IQ3_S, 512, 5, 130);
@@ -16931,6 +17060,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     /// error ~1e-4, nothing over 1e-2. So the weight data is not the variable,
     /// and neither is a warm shared backend with hundreds of cached ops.
     ///
+    /// It also covers the `IQ*` family on real weights, which is the only
+    /// place they are checked outside synthetic blocks. `unsloth/
+    /// Qwen3.8-27B-GGUF:IQ2_XXS` (`IQ1_M`, `IQ2_S`, `IQ2_XXS`, `IQ2_XS`,
+    /// `IQ3_XXS`, `IQ4_XS`, `Q2_K`, `Q3_K`) and its `Q3_K_XL` sibling
+    /// (`IQ4_XS`, `IQ3_S`, `Q5_K`, `Q3_K`): **42 tensors each, both widths,
+    /// 0 bad.**
+    ///
     /// `#[ignore]` because it needs the model file: run with
     /// `ORANGU_PROBE_GGUF=/path/to/model.gguf cargo test real_gguf_weights -- --ignored --nocapture`.
     #[test]
@@ -16955,7 +17091,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 eprintln!("  {name}: not present");
                 continue;
             };
-            for nt in [91usize] {
+            // Both sides of the `coop_min_n_tokens` crossover. `91` is the
+            // tiled prefill path this test was written for; `1` is the decode
+            // matmul-vec, which is a *different kernel per quantization*
+            // (`pipeline_for_named`) and so a separate restatement of the
+            // same block layout — the two can disagree with each other while
+            // each looks right on synthetic blocks.
+            for nt in [1usize, 91usize] {
                 let mut x = vec![0f32; nt * w.in_dim];
                 for v in x.iter_mut() {
                     *v = (next_byte(&mut seed) as f32 - 128.0) / 512.0;

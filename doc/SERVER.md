@@ -1563,10 +1563,11 @@ architecture families: Llama-style (`general.architecture` one of `llama`,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
-embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`),
-Qwen3.5 dense (`qwen35` — the same hybrid full-attention/gated-DeltaNet layer
-shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing), Qwen3-Next
-(`qwen3next`), DeepSeek-V4 (`deepseek4`, e.g.
+embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
+`unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
+`unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
+layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing),
+Qwen3-Next (`qwen3next`), DeepSeek-V4 (`deepseek4`, e.g.
 `unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
 per token, one shared key/value vector serving every query head, compressed
 attention blocks on top of a sliding window, and hash-routed experts),
@@ -1824,6 +1825,12 @@ of the two figures that decide whether a model is usable: it is neither
 weight that must be resident nor weight that can stream, because it is never
 read at all.
 
+That shape is not unique to this model. `glm-dsa` and the whole Qwen 3.5
+family do the same, and `unsloth/Qwen3.8-27B-GGUF` is the plainest example:
+`block_count` is 65, `blk.64` is the draft head, and the trunk is the 64
+blocks before it. All of them are handled the same way — the head is
+identified from `nextn_predict_layers` and never loaded.
+
 Not implemented for this model: embeddings requests, and reporting its
 reasoning separately as `reasoning_content`. It reasons inline before
 answering, with no marker tokens around the reasoning, so a
@@ -1853,14 +1860,21 @@ but not a multiple of 256, so the file that download produces is mostly
 loads and runs; what the label predicts is the size, not a single tensor type.
 
 Type coverage differs by backend. Only `cpu` reads every type listed above.
-`vulkan` and `metal` — the same kernels — cover all of them except `IQ1_S`,
-`IQ1_M`, the three `IQ1_*` types below them, and `IQ2_XXS`; `cuda`,
+`vulkan` and `metal` — the same kernels — cover all of them except the three
+`IQ1_*` types below `IQ1_S` (`IQ1_XS`, `IQ1_XXS`, `IQ1_XXXS`); `cuda`,
 `opencl`, and `rocm` cover the float types, the legacy quants,
 `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and `IQ4_NL`. What's missing in each case
 is the `IQ*` types that index a lattice codebook the backend has no uploaded
 buffer for. A model carrying a type the selected backend lacks is refused at
 startup, naming each missing type, rather than failing partway through the
 first request.
+
+`IQ1_S`, `IQ1_M` and `IQ2_XXS` were in that missing list until recently, and
+what they cost was whole models rather than speed: a "dynamic" 2-bit build
+such as `unsloth/Qwen3.8-27B-GGUF:IQ2_XXS` is 96 `IQ1_M` and 48 `IQ2_XXS`
+tensors, so the startup check refused the GPU for the entire file. All three
+now have kernels, at the price of a codebook buffer that grew from about 15
+KiB to about 33 KiB.
 
 Six further types load that upstream cannot read at all: `Q4_0_4_4`,
 `Q4_0_4_8`, `Q4_0_8_8`, and the `IQ4_NL_4_4`/`_4_8`/`_8_8` equivalents.

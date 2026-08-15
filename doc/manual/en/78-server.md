@@ -1122,23 +1122,44 @@ mod`), so adding a family is additive rather than a rewrite:
   `src/models/gemma4.cpp`), with `gemma`/`gemma2`/`gemma3` as subsets of
   its hyperparameter set: soft-capping, sliding-window attention,
   per-layer embeddings (PLE), and GEGLU.
+- `qwen_hybrid.rs` — **not an architecture**: the hybrid full-attention /
+  gated-DeltaNet trunk the three Qwen 3.5-family modules below all run,
+  mirroring the way `qwen35.cpp`, `qwen35moe.cpp` and `qwen3next.cpp`
+  upstream all call one `llm_build_delta_net_base` and differ only in
+  `build_layer_ffn`. It owns the hyper-parameters, the layer-kind mask, both
+  layer loaders, both forward halves, and the KV-cache layout, and is generic
+  over one trait — `HybridFfn` — which is the only thing the three differ in.
+  Two variations it absorbs so the architecture modules need not: recurrent
+  QKV+gate as either the split `attn_qkv`/`attn_gate` or one fused `ssm_in`,
+  and beta/alpha as either the split `ssm_beta`/`ssm_alpha` or one packed
+  `ssm_ba` (`ssm_beta_alpha` in older conversions) whose rows interleave the
+  two per K/V group.
+
+  Its `trunk_layer_count` is `block_count` *less* `nextn_predict_layers`, as
+  in `glm.rs` and `nemotron.rs`: releases that ship a multi-token-prediction
+  head count it as the last `block_count` entry rather than putting it past
+  the end, and it carries no attention tensors, so reading it as a trunk
+  layer fails on `blk.N.attn_qkv.weight` rather than running the wrong thing.
+  That trim used to be in `qwen35moe.rs` only, which is exactly the drift a
+  shared trunk removes — `unsloth/Qwen3.8-27B-GGUF` is a *dense* `qwen35`
+  file with `nextn_predict_layers = 1` and could not be loaded at all.
 - `qwen35moe.rs` — Qwen3.5/3.6-MoE (confirmed against upstream
-  `src/models/qwen35moe.cpp`/`delta-net-base.cpp`): a genuinely different
-  shape, with mixture-of-experts FFN routing. Its trunk is `block_count`
-  *less* `nextn_predict_layers`, as in `glm.rs` and `nemotron.rs`: the
-  trillion-parameter releases count their multi-token-prediction head as
-  the last `block_count` entry rather than putting it past the end, and it
-  carries no attention tensors, so reading it as a trunk layer fails on
-  `blk.N.attn_qkv.weight` rather than running the wrong thing.
-- `qwen35.rs` — Qwen3.5 dense (confirmed against upstream `src/models/
-  qwen35.cpp`), e.g. `unsloth/Ornith-1.0-9B-GGUF`: identical hybrid
-  full-attention/gated-DeltaNet layer shape to `qwen35moe.rs` (they share
-  `llm_build_delta_net_base` upstream), but a plain SwiGLU FFN in place of
-  MoE routing.
+  `src/models/qwen35moe.cpp`/`delta-net-base.cpp`), e.g.
+  `unsloth/Qwen3.6-35B-A3B-GGUF`: `qwen_hybrid::Trunk` with
+  `qwen_hybrid::MoeFfn` — softmax top-k routing (renormalized) over routed
+  experts plus a separately-`sigmoid`-gated shared expert.
+- `qwen35.rs` — Qwen3.5-family dense (confirmed against upstream
+  `src/models/qwen35.cpp`), e.g. `unsloth/Ornith-1.0-9B-GGUF` and
+  `unsloth/Qwen3.8-27B-GGUF`: the same trunk with `qwen_hybrid::DenseFfn`, a
+  plain SwiGLU FFN in place of MoE routing. That FFN is `arch::swiglu_ffn`,
+  shared with `llama.rs` — which is what serves `qwen2` and `qwen3` — since
+  `LLM_FFN_SILU`/`LLM_FFN_PAR` is one computation whatever the block around
+  it looks like.
 - `qwen3next.rs` — Qwen3-Next (confirmed against upstream `src/models/
-  qwen3next.cpp`), e.g. `unsloth/Qwen3-Coder-Next-GGUF`: the same full-
-  attention and MoE FFN shape as `qwen35moe.rs`, but with `ssm_beta_alpha`
-  packed into one tensor and legacy recurrent `ssm_in.weight` support.
+  qwen3next.cpp`), e.g. `unsloth/Qwen3-Coder-Next-GGUF`: the same trunk and
+  the same `MoeFfn` as `qwen35moe.rs`. It differs only in which recurrent
+  tensor-naming variants its files use, which the trunk's loader already
+  takes, so this module carries no forward pass of its own.
 - `deepseek4.rs` — DeepSeek-V4 (`general.architecture = "deepseek4"`),
   e.g. `unsloth/DeepSeek-V4-Flash-0731-GGUF:IQ1_M`, confirmed against
   upstream `src/models/deepseek4.cpp` and the block planner in
@@ -2083,6 +2104,7 @@ only (set to `1`), except where noted.
 | `ORANGU_PREFILL_BATCH` | `512` (integer, not a presence flag) | **Ceiling** on how many prompt tokens go into one forward pass; the actual width is chosen per chunk by `ORANGU_PREFILL_CHUNK_MS` below and never exceeds this. `0` disables chunking entirely — the whole prompt in one submission, which is what prefill did unconditionally before this existed and which loses the device on any long prompt. Measured on a 4 GiB RX 5500M holding 2.5 GiB of weights, with a 17.5k-token prompt — no chunking: device lost after 21s; `2048`: device lost after 3m54s; `512`: completed in 4m13s, with peak VRAM identical (3.67 GiB) in all three. Not a throughput tax: at 8k tokens on the same card `512` prefilled at 115.4 tok/s against 105.5 unchunked, since a smaller working set pages less. |
 | `ORANGU_PREFILL_CHUNK_MS` | `3000` (integer) | Wall-clock target for one prefill submission. A chunk is timed and the next is scaled by the rate just measured, because cost per token climbs with context: a fixed 512-token chunk measured 2.3 s at position 512 and **10.1 s at position 6 656**, past the ~10 s `amdgpu` allows before it resets the device (see *Losing the GPU device*). A token-count limit alone therefore stops protecting anything on a long prompt. With this, a 48 000-token prompt that used to reset the device at position 7 680 completes with a slowest submission of 3.3 s. Lower it if resets still happen; the default leaves room for the estimate to lag a rate that only rises. |
 | `ORANGU_NO_MLP_UNROLL` | unset (block-unroll **on**) | Set to **disable** the block-unroll reduce kernel for K-quant (`Q4_K`/`Q5_K`/`Q6_K`) decode and fall back to the scalar per-element reduce kernel. The block-unroll iterates whole super-blocks, loading each block header once and issuing several weight/activation loads before the dependent dot; it is the default decode path. |
+| `ORANGU_NO_BLOCK_HOISTED` | unset (block-hoisted **on**) | Set to **disable** the block-hoisted decode kernel and fall back to the scalar per-element `reduce` for every type that has one. The block-unroll above is fast and covers only `Q4_K`/`Q5_K`/`Q6_K` (it hardcodes their 256-element super-block as a fixed 4x64 geometry); the element-wise `reduce` covers everything and re-decodes each block's header once *per element*, which for a 32-element block is 32 times over. The block-hoisted kernel is the third algorithm: several adjacent lanes share one block and take contiguous byte slices of it, so the header is amortized while the coalesced access shape is kept. It covers every remaining quantized type — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` — and is the control for any A/B of it. Term-for-term identical arithmetic to the element-wise path but a different summation order, so output is not bit-identical and a greedy argmax can flip on a near-tie. Ask a running server which kernel a type resolves to: `/props` -> `gpu.kernels.decode`. |
 | `ORANGU_NO_DUAL_NIBBLE` | unset (dual **on** for `Q4_K` and `Q6_K` decode) | Set to **disable** the dual decode kernels for both `Q4_K` and `Q6_K` and fall back to the two-wave block-unroll. Each two-wave kernel splits a 64-thread workgroup into two halves that re-read shared weight bytes — `Q4_K` streams every qs byte twice (once per nibble half), `Q6_K` re-reads every `qh` byte (once per `w_lo` half). The dual kernels use a 32-thread (single-subgroup) workgroup that loads each such byte once, cutting decode GPU-execution time (~22% for `Q4_K`, a further ~4–8% for `Q6_K`) with identical greedy output. They reorder the per-lane float adds, so they cross-check against the CPU backend within a tolerance rather than bit-for-bit. No effect on `Q4_K` when `ORANGU_PACKED_DOT=1`, or on either when `ORANGU_NO_MLP_UNROLL=1`. |
 | `ORANGU_NO_Q6K_DUAL` | unset (`Q6_K` dual **on**) | Set to **disable** only the `Q6_K` dual kernel (reverting `Q6_K` tensors — e.g. `ffn_down` — to the two-wave block-unroll) while leaving the `Q4_K` dual kernel on. For A/B isolation of the `Q6_K` kernel; `ORANGU_NO_DUAL_NIBBLE=1` disables both. |
 | `ORANGU_Q4K_CONTIG` | unset (off) | Set to select an alternative `Q4_K` decode kernel with a contiguous thread→element mapping: each lane loads a `u32` of four consecutive qs bytes (all used) plus two `vec4<f32>` activations, ~3× fewer VMEM load instructions than the default dual kernel. Correctness-verified (byte-identical greedy output) but measured **no faster** on this hardware — the `Q4_K` matmul is memory-latency-bound rather than load-issue-bound — so it is off by default. Kept for other GPUs where issue rate may bind. |
@@ -2224,13 +2246,27 @@ into the kernel source, and the reason a `Q2_K` download of a model whose
 rows aren't 256-divisible (see the Scope section of the server chapter) is
 runnable here at all.
 
-`VulkanBackend`'s own coverage is a subset too — it has no shader for
-`IQ1_S`, `IQ1_M`, the three narrow `IQ1_*` types, or `IQ2_XXS`. Every GPU
-backend therefore overrides
+`VulkanBackend`'s own coverage is a subset too — it has no shader for the
+three narrow `IQ1_*` types (ids 64-66). Every GPU backend therefore overrides
 `Backend::supports_type`, and `engine::backend::unsupported_tensor_types`
 walks every shard's tensor directory once at startup so a gap is reported as
 an error naming each missing type. Before that check existed, the gap
 surfaced as a panic from inside `matmul` partway through the first request.
+
+That list used to include `IQ1_S`, `IQ1_M` and `IQ2_XXS`, and dropping them
+from it is what makes a "dynamic" 2-bit release runnable on a GPU at all:
+`unsloth/Qwen3.8-27B-GGUF:IQ2_XXS` is 96 `IQ1_M` tensors and 48 `IQ2_XXS`
+ones, so the startup check refused the device for the whole model rather than
+for those tensors. `iq_grid_words` now uploads `IQ2XXS_GRID` and `IQ1S_GRID`
+alongside the four it already carried, taking the codebook buffer from ~15
+KiB to ~33 KiB — `IQ1S_GRID` is 2048 eight-byte lattice points, 16 KiB by
+itself. The `iq1*` pair needed one thing the others did not: their codebook
+values are **signed** and they carry no sign field at all, the per-group
+freedom being whether a `±0.125` delta is added or subtracted, so
+`IQ_GRID_PRELUDE` gained `iq_grid8_signed` beside `iq_grid8`. Reading an
+`iq1*` grid byte as unsigned is well formed and produces plausible output,
+which is why `matmul_matches_cpu_backend_for_iq1_m` exists rather than being
+folded into a generic sweep.
 
 `cudarc` and the resolved `opencl3` version both dlopen their vendor
 library (`libcuda.so`/`libnvrtc.so`, `libOpenCL.so`) at runtime and return

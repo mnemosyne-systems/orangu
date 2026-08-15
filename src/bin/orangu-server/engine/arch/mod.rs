@@ -19,7 +19,9 @@
 //! attention temperature scaling), `qwen35` (hybrid full-attention/gated-
 //! DeltaNet, dense FFN), `qwen35moe` (the same hybrid attention shape,
 //! mixture-of-experts FFN), `qwen3next` (the Qwen3-Next hybrid
-//! attention + MoE path), `deepseek4` (DeepSeek-V4: hyper-connections,
+//! attention + MoE path — those three sharing one trunk in `qwen_hybrid`,
+//! which is not itself an architecture), `deepseek4` (DeepSeek-V4:
+//! hyper-connections,
 //! shared-key attention over a sliding window plus compressed blocks, and
 //! hash-routed experts), `glm` (GLM with DeepSeek sparse attention:
 //! absorbed multi-head latent attention plus a lightning indexer), `kimi3`
@@ -51,6 +53,7 @@ pub mod phi;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3next;
+pub mod qwen_hybrid;
 
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::ModelConfig;
@@ -834,6 +837,45 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     out
 }
 
+/// The plain SwiGLU FFN — `LLM_FFN_SILU`/`LLM_FFN_PAR`: `down(silu(gate(x))
+/// * up(x))`.
+///
+/// One computation, shared by every dense model in this engine that has it:
+/// `llama` (which serves Qwen2 and Qwen3 as well as Llama and Mistral) and
+/// the dense FFN of the Qwen 3.5 hybrid trunk (`engine::arch::qwen_hybrid::
+/// DenseFfn`). `gate` and `up` are independent projections of the same input,
+/// so they go out as one batched dispatch rather than two sequential
+/// round-trips (see `Backend::matmul_batch`).
+pub(crate) fn swiglu_ffn(
+    backend: &dyn crate::engine::backend::Backend,
+    normed: &[f32],
+    n_tokens: usize,
+    gate_w: &crate::engine::loader::QuantMatrix,
+    up_w: &crate::engine::loader::QuantMatrix,
+    down_w: &crate::engine::loader::QuantMatrix,
+) -> Vec<f32> {
+    use crate::engine::backend::MatmulOp;
+    let mut gate_up = backend.matmul_batch(&[
+        MatmulOp {
+            x: normed,
+            n_tokens,
+            w: gate_w,
+        },
+        MatmulOp {
+            x: normed,
+            n_tokens,
+            w: up_w,
+        },
+    ]);
+    let up = gate_up.pop().unwrap();
+    let mut gate = gate_up.pop().unwrap();
+    for g in gate.iter_mut() {
+        *g = tensor::silu(*g);
+    }
+    tensor::mul_inplace(&mut gate, &up);
+    backend.matmul(&gate, n_tokens, down_w)
+}
+
 /// `Backend::matmul`, falling back to the host when the selected backend has
 /// no kernel for this tensor's quantization.
 ///
@@ -850,8 +892,10 @@ pub(crate) fn evaluate_routed_experts_batched_views(
 /// That exemption is what makes this function necessary: a shared expert can
 /// be a type the device has no shader for, and `VulkanBackend` *panics* on
 /// that rather than returning zeros. So every shared-expert matmul has to go
-/// through here. `qwen35moe` and `qwen3next` each carry their own copy of
-/// this check for the same reason.
+/// through here. `qwen_hybrid::MoeFfn` — which is what `qwen35moe` and
+/// `qwen3next` both run — carries its own copy of this check for the same
+/// reason, spelled out inline because it also decides which backend the
+/// `down` projection goes to.
 pub(crate) fn matmul_host_fallback(
     backend: &dyn crate::engine::backend::Backend,
     x: &[f32],

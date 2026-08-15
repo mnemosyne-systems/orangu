@@ -46,10 +46,11 @@
 //! lattice points up in.
 
 use crate::engine::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS,
-    GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
+    GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -150,6 +151,8 @@ const IQ3XXS_GRID_OFF: u32 = 3072u;
 const IQ3S_GRID_OFF: u32 = 3328u;
 const KSIGNS_OFF: u32 = 3840u;
 const KVALUES_IQ4NL_OFF: u32 = 3872u;
+const IQ2XXS_GRID_OFF: u32 = 3876u;
+const IQ1S_GRID_OFF: u32 = 4388u;
 
 // Byte `j` (0..8) of the 8-element lattice point `idx` in an `iq2*` grid,
 // which stores two `u32` words per entry.
@@ -179,6 +182,23 @@ fn iq_kvalue(i: u32) -> f32 {
     }
     return f32(v);
 }
+
+// Byte `j` (0..8) of an `iq1*` lattice point, sign-extended from the
+// `int8_t` it is stored as. The `iq1*` grids carry **signed** values and no
+// sign field at all, unlike every `iq2*`/`iq3*` grid above — see
+// `quant::push_iq1_grid`.
+fn iq_grid8_signed(base: u32, idx: u32, j: u32) -> f32 {
+    let b = iq_grid8(base, idx, j);
+    var v: i32 = i32(b);
+    if (v >= 128) {
+        v = v - 256;
+    }
+    return f32(v);
+}
+
+// `IQ1S_DELTA`/`IQ1M_DELTA` — the `±` offset every `iq1*` weight carries on
+// top of its codebook value.
+const IQ1_DELTA: f32 = 0.125;
 
 // `kmask_iq2xs[j]` is `1 << j`, so the sign of element `j` is bit `j`.
 fn iq_sign(signs: u32, j: u32) -> f32 {
@@ -1963,6 +1983,119 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_iq2_xxs`: mirrors `quant::dequantize_iq2_xxs`. The tightest of the
+/// `iq2*` formats — no `scales` array at all. Each 32-weight group reads two
+/// `u32` out of `qs`: the first is four 8-bit codebook indices, the second
+/// four 7-bit `ksigns` indices plus, in its top nibble, the group's scale.
+const IQ2_XXS_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 66u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let ib32 = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let base = qs_off + 8u * ib32;
+    let aux0 = read_u8(base) | (read_u8(base + 1u) << 8u)
+        | (read_u8(base + 2u) << 16u) | (read_u8(base + 3u) << 24u);
+    let aux1 = read_u8(base + 4u) | (read_u8(base + 5u) << 8u)
+        | (read_u8(base + 6u) << 16u) | (read_u8(base + 7u) << 24u);
+    let db = d * (0.5 + f32(aux1 >> 28u)) * 0.25;
+    let idx = (aux0 >> (8u * l)) & 0xFFu;
+    let signs = iq_ksigns((aux1 >> (7u * l)) & 127u);
+    let g = iq_grid8(IQ2XXS_GRID_OFF, idx, j);
+    return db * f32(g) * iq_sign(signs, j);
+}
+"#;
+
+/// `block_iq1_s`: mirrors `quant::dequantize_iq1_s`. Each group's `qh` `u16`
+/// carries three things — a 3-bit scale (bits 12..15), the sign of the
+/// group's `delta` (bit 15), and the high 3 bits of each of its four 11-bit
+/// lattice indices (bits 0..9). The grid values are already signed and there
+/// is no sign field, hence `iq_grid8_signed` rather than `iq_sign`.
+const IQ1_S_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 50u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 34u;
+    let ib = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    let qh = read_u8(qh_off + 2u * ib) | (read_u8(qh_off + 2u * ib + 1u) << 8u);
+    let dl = d * f32(2u * ((qh >> 12u) & 7u) + 1u);
+    var delta: f32 = IQ1_DELTA;
+    if ((qh & 0x8000u) != 0u) {
+        delta = -IQ1_DELTA;
+    }
+    let idx = read_u8(qs_off + 4u * ib + l) | (((qh >> (3u * l)) & 7u) << 8u);
+    return dl * (iq_grid8_signed(IQ1S_GRID_OFF, idx, j) + delta);
+}
+"#;
+
+/// `block_iq1_m`: mirrors `quant::dequantize_iq1_m`. The only quantization
+/// here with **no `d` field**: the block's `f16` scale is scattered four
+/// nibbles at a time across the top of the four `scales` `u16`s and has to be
+/// reassembled before it can be read as a half. Each group also gets *two*
+/// 3-bit sub-scales (one per 16 weights) rather than one, and `delta`'s sign
+/// moves to two bits of each `qh` byte.
+const IQ1_M_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 56u;
+const BLOCK_ELEMS: u32 = 256u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn iq1m_scale_u16(scales_off: u32, i: u32) -> u32 {
+    return read_u8(scales_off + 2u * i) | (read_u8(scales_off + 2u * i + 1u) << 8u);
+}
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let qs_off = byte_offset;
+    let qh_off = byte_offset + 32u;
+    let scales_off = byte_offset + 48u;
+    let s0 = iq1m_scale_u16(scales_off, 0u);
+    let s1 = iq1m_scale_u16(scales_off, 1u);
+    let s2 = iq1m_scale_u16(scales_off, 2u);
+    let s3 = iq1m_scale_u16(scales_off, 3u);
+    let packed = (s0 >> 12u) | ((s1 >> 8u) & 0x00F0u) | ((s2 >> 4u) & 0x0F00u) | (s3 & 0xF000u);
+    let d = f16_to_f32(packed);
+    let ib = k / 32u;
+    let l = (k % 32u) / 8u;
+    let j = k % 8u;
+    var s: u32 = s0;
+    if (ib / 2u == 1u) {
+        s = s1;
+    } else if (ib / 2u == 2u) {
+        s = s2;
+    } else if (ib / 2u == 3u) {
+        s = s3;
+    }
+    let shift = 6u * (ib % 2u);
+    var sub: u32 = shift;
+    if (l >= 2u) {
+        sub = shift + 3u;
+    }
+    let dl = d * f32(2u * ((s >> sub) & 7u) + 1u);
+    var qhb: u32 = read_u8(qh_off + 2u * ib);
+    if (l >= 2u) {
+        qhb = read_u8(qh_off + 2u * ib + 1u);
+    }
+    var hshift: u32 = 8u;
+    var bit: u32 = 0x08u;
+    if ((l % 2u) == 1u) {
+        hshift = 4u;
+        bit = 0x80u;
+    }
+    let idx = read_u8(qs_off + 4u * ib + l) | ((qhb << hshift) & 0x700u);
+    var delta: f32 = IQ1_DELTA;
+    if ((qhb & bit) != 0u) {
+        delta = -IQ1_DELTA;
+    }
+    return dl * (iq_grid8_signed(IQ1S_GRID_OFF, idx, j) + delta);
+}
+"#;
+
 /// `block_iq2_s`: mirrors `quant::dequantize_iq2_s` — `IQ2_XS`'s scales and
 /// decomposition, but a 10-bit lattice index (8 bits from `qs`, 2 more from
 /// the group's `qh` byte) and an explicit sign byte rather than a 7-bit
@@ -2202,22 +2335,604 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 }
 "#;
 
+/// `block_q5_0` for [`block_hoisted_suffix`]: [`Q4_0_BLOCK_MIDDLE`]'s
+/// nibble split with the fifth bit of each weight taken from the 32-bit
+/// `qh` field, which is decoded **once** per block here rather than
+/// reassembled from four `read_u8` calls per element.
+const Q5_0_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 22u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qh = read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u)
+        | (read_u8(byte_offset + 4u) << 16u) | (read_u8(byte_offset + 5u) << 24u);
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 6u + j);
+        let xh_0 = ((qh >> j) << 4u) & 0x10u;
+        let xh_1 = (qh >> (j + 12u)) & 0x10u;
+        acc = acc + (f32(i32((byte & 0xFu) | xh_0) - 16) * d) * x[x_off + j];
+        acc = acc + (f32(i32((byte >> 4u) | xh_1) - 16) * d) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_q5_1` for [`block_hoisted_suffix`]: [`Q5_0_BLOCK_MIDDLE`]'s fifth
+/// bit with [`Q4_1_BLOCK_MIDDLE`]'s stored minimum.
+const Q5_1_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 24u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let mn = f16_to_f32(read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u));
+    let qh = read_u8(byte_offset + 4u) | (read_u8(byte_offset + 5u) << 8u)
+        | (read_u8(byte_offset + 6u) << 16u) | (read_u8(byte_offset + 7u) << 24u);
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 8u + j);
+        let xh_0 = ((qh >> j) << 4u) & 0x10u;
+        let xh_1 = (qh >> (j + 12u)) & 0x10u;
+        acc = acc + (f32((byte & 0xFu) | xh_0) * d + mn) * x[x_off + j];
+        acc = acc + (f32((byte >> 4u) | xh_1) * d + mn) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq4_nl` for [`block_hoisted_suffix`]: [`Q4_0_BLOCK_MIDDLE`]'s
+/// 18-byte block and nibble split, the nibble selecting one of 16
+/// non-uniformly spaced codebook levels. The one `IQ*` type whose block is
+/// 32 elements rather than 256, so it takes the 8-lane geometry the legacy
+/// types use rather than the 16-lane one every super-block type below does.
+const IQ4_NL_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 2u + j);
+        acc = acc + (d * iq_kvalue(byte & 0xFu)) * x[x_off + j];
+        acc = acc + (d * iq_kvalue(byte >> 4u)) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_q2_K` for [`block_hoisted_suffix`], and the first of the
+/// 256-element super-block types, which all share one geometry:
+/// `LANES_PER_BLOCK = 16`, a lane owning 16 **consecutive** elements
+/// `k = sub*16 .. sub*16+16`.
+///
+/// That choice is what makes these middles short. Every K-quant and `IQ*`
+/// index decomposition in this file is built from `k / 128`,
+/// `(k % 128) / 32`, `(k % 32) / 16`, `k / 32` and `(k % 32) / 8` — and
+/// because 16 divides every one of those boundaries, a 16-element run holds
+/// all of them constant except the innermost. So the sub-block index, the
+/// scale, the shift and the nibble half are decoded once per lane and only
+/// the byte offset moves inside the loop, which is the whole point of
+/// hoisting. Sixteen lanes per block also keeps `blocks_in_flight` at 4 for
+/// a 64-lane workgroup, so four super-blocks stream at once, and adjacent
+/// lanes read adjacent (or identical) 16-byte runs — the coalescing shape
+/// [`block_hoisted_suffix`] documents as the one that matters.
+///
+/// Here specifically: a lane's 16 elements share one `n`/`s`/`h`, so the
+/// 4-bit scale and 4-bit min are unpacked once and the loop is a
+/// shift-and-mask over 16 consecutive `qs` bytes.
+const Q2_K_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let scales_off = byte_offset;
+    let qs_off = byte_offset + 16u;
+    let d = f16_to_f32(read_u8(byte_offset + 80u) | (read_u8(byte_offset + 81u) << 8u));
+    let dmin = f16_to_f32(read_u8(byte_offset + 82u) | (read_u8(byte_offset + 83u) << 8u));
+    let n = sub / 8u;
+    let s = (sub % 8u) / 2u;
+    let h = sub % 2u;
+    let sc = read_u8(scales_off + n * 8u + s * 2u + h);
+    let dl = d * f32(sc & 0xFu);
+    let ml = dmin * f32(sc >> 4u);
+    let base = qs_off + n * 32u + h * 16u;
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var l: u32 = 0u;
+    loop {
+        if (l >= 16u) {
+            break;
+        }
+        let byte = read_u8(base + l);
+        acc = acc + (dl * f32((byte >> (2u * s)) & 3u) - ml) * x[x_lane + l];
+        l = l + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_q3_K` for [`block_hoisted_suffix`]. [`Q2_K_BLOCK_MIDDLE`]'s
+/// decomposition with the third quant bit from `hmask` — whose byte index
+/// deliberately excludes `n` (one 32-byte mask covers all 256 weights) and
+/// whose bit is *inverted*: set means "don't subtract 4". The 6-bit scale is
+/// still hoisted once per lane.
+const Q3_K_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let hmask_off = byte_offset;
+    let qs_off = byte_offset + 32u;
+    let scales_off = byte_offset + 96u;
+    let d_all = f16_to_f32(read_u8(byte_offset + 108u) | (read_u8(byte_offset + 109u) << 8u));
+    let n = sub / 8u;
+    let s = (sub % 8u) / 2u;
+    let h = sub % 2u;
+    let m = 1u << (n * 4u + s);
+    let dl = d_all * f32(i32(q3k_scale(scales_off, n * 8u + s * 2u + h)) - 32);
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var l: u32 = 0u;
+    loop {
+        if (l >= 16u) {
+            break;
+        }
+        let idx = h * 16u + l;
+        var hi: i32 = 4;
+        if ((read_u8(hmask_off + idx) & m) != 0u) {
+            hi = 0;
+        }
+        let q = (read_u8(qs_off + n * 32u + idx) >> (2u * s)) & 3u;
+        acc = acc + (dl * f32(i32(q) - hi)) * x[x_lane + l];
+        l = l + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq4_xs` for [`block_hoisted_suffix`]. A lane's 16 elements are one
+/// whole nibble half of one 32-element group, so the group's 6-bit scale —
+/// split across `scales_l` and `scales_h` — is assembled once and the loop
+/// reads 16 contiguous `qs` bytes, taking the same nibble from each.
+const IQ4_XS_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 136u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let scales_h = read_u8(byte_offset + 2u) | (read_u8(byte_offset + 3u) << 8u);
+    let scales_l_off = byte_offset + 4u;
+    let qs_off = byte_offset + 8u;
+    let ib = sub / 2u;
+    let high_half = sub % 2u;
+    let low = (read_u8(scales_l_off + ib / 2u) >> (4u * (ib % 2u))) & 0xFu;
+    let high = (scales_h >> (2u * ib)) & 3u;
+    let dl = d * f32(i32(low | (high << 4u)) - 32);
+    let base = qs_off + 16u * ib;
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var l: u32 = 0u;
+    loop {
+        if (l >= 16u) {
+            break;
+        }
+        let byte = read_u8(base + l);
+        var nib: u32 = byte & 0xFu;
+        if (high_half == 1u) {
+            nib = byte >> 4u;
+        }
+        acc = acc + (dl * iq_kvalue(nib)) * x[x_lane + l];
+        l = l + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq2_xs` for [`block_hoisted_suffix`]. A lane's 16 elements are
+/// exactly two of the group's four 8-element lattice lookups, so the outer
+/// loop runs twice and each iteration decodes one `u16` index, one scale
+/// nibble and one 7-bit sign field before its eight codebook bytes.
+const IQ2_XS_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 74u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let scales_off = byte_offset + 66u;
+    let ib32 = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let sc_byte = read_u8(scales_off + ib32);
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let qo = qs_off + 2u * (4u * ib32 + l);
+        let q = read_u8(qo) | (read_u8(qo + 1u) << 8u);
+        let sc = (sc_byte >> (4u * (l / 2u))) & 0xFu;
+        let db = d * (0.5 + f32(sc)) * 0.25;
+        let signs = iq_ksigns(q >> 9u);
+        let grid = q & 511u;
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            let g = iq_grid8(IQ2XS_GRID_OFF, grid, j);
+            acc = acc + (db * f32(g) * iq_sign(signs, j)) * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq2_s` for [`block_hoisted_suffix`]: [`IQ2_XS_BLOCK_MIDDLE`]'s
+/// two-lookup shape with a 10-bit lattice index (two bits from the group's
+/// `qh` byte) and an explicit sign byte from the second half of `qs`.
+const IQ2_S_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 82u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 66u;
+    let scales_off = byte_offset + 74u;
+    let signs_off = qs_off + 32u;
+    let ib32 = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let qh = read_u8(qh_off + ib32);
+    let sc_byte = read_u8(scales_off + ib32);
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let idx = read_u8(qs_off + 4u * ib32 + l) | ((qh << (8u - 2u * l)) & 0x300u);
+        let sc = (sc_byte >> (4u * (l / 2u))) & 0xFu;
+        let db = d * (0.5 + f32(sc)) * 0.25;
+        let signs = read_u8(signs_off + 4u * ib32 + l);
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            let g = iq_grid8(IQ2S_GRID_OFF, idx, j);
+            acc = acc + (db * f32(g) * iq_sign(signs, j)) * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq3_xxs` for [`block_hoisted_suffix`]. The group's `aux32` — four
+/// 7-bit sign fields and a 4-bit scale in its top nibble — is read once per
+/// lane instead of once per element. Its lattice points are 4 elements wide,
+/// so an 8-element run is two index bytes, selected by `j >> 2`.
+const IQ3_XXS_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 98u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let aux_off = qs_off + 64u;
+    let ib32 = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let ao = aux_off + 4u * ib32;
+    let aux32 = read_u8(ao) | (read_u8(ao + 1u) << 8u)
+        | (read_u8(ao + 2u) << 16u) | (read_u8(ao + 3u) << 24u);
+    let db = d * (0.5 + f32(aux32 >> 28u)) * 0.5;
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let signs = iq_ksigns((aux32 >> (7u * l)) & 127u);
+        let idx_lo = read_u8(qs_off + 8u * ib32 + 2u * l);
+        let idx_hi = read_u8(qs_off + 8u * ib32 + 2u * l + 1u);
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            var idx: u32 = idx_lo;
+            if (j >= 4u) {
+                idx = idx_hi;
+            }
+            let g = iq_grid4(IQ3XXS_GRID_OFF, idx, j & 3u);
+            acc = acc + (db * f32(g) * iq_sign(signs, j)) * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq3_s` for [`block_hoisted_suffix`]: [`IQ3_XXS_BLOCK_MIDDLE`]'s
+/// two-lookup shape with a 9-bit lattice index whose ninth bit comes from a
+/// *different* bit of the group's `qh` byte per lookup half, signs stored
+/// outright, and a `1 + 2*s` scale rather than `(0.5 + s) * 0.25`.
+const IQ3_S_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 66u;
+    let signs_off = byte_offset + 74u;
+    let scales_off = byte_offset + 106u;
+    let ib32 = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let sc = (read_u8(scales_off + ib32 / 2u) >> (4u * (ib32 % 2u))) & 0xFu;
+    let db = d * f32(1u + 2u * sc);
+    let hb = read_u8(qh_off + ib32);
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let signs = read_u8(signs_off + 4u * ib32 + l);
+        let idx_lo = read_u8(qs_off + 8u * ib32 + 2u * l) | ((hb << (8u - 2u * l)) & 256u);
+        let idx_hi = read_u8(qs_off + 8u * ib32 + 2u * l + 1u)
+            | ((hb << (7u - 2u * l)) & 256u);
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            var idx: u32 = idx_lo;
+            if (j >= 4u) {
+                idx = idx_hi;
+            }
+            let g = iq_grid4(IQ3S_GRID_OFF, idx, j & 3u);
+            acc = acc + (db * f32(g) * iq_sign(signs, j)) * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq2_xxs` for [`block_hoisted_suffix`]: [`IQ2_XS_BLOCK_MIDDLE`]'s
+/// two-lookup shape, with both `u32` of the group's `qs` pair — the four
+/// codebook indices and the four sign fields plus scale — decoded once per
+/// lane instead of once per element. That is eight `read_u8` calls saved
+/// fifteen times over per lane.
+const IQ2_XXS_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 66u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let ib32 = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let base = qs_off + 8u * ib32;
+    let aux0 = read_u8(base) | (read_u8(base + 1u) << 8u)
+        | (read_u8(base + 2u) << 16u) | (read_u8(base + 3u) << 24u);
+    let aux1 = read_u8(base + 4u) | (read_u8(base + 5u) << 8u)
+        | (read_u8(base + 6u) << 16u) | (read_u8(base + 7u) << 24u);
+    let db = d * (0.5 + f32(aux1 >> 28u)) * 0.25;
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let idx = (aux0 >> (8u * l)) & 0xFFu;
+        let signs = iq_ksigns((aux1 >> (7u * l)) & 127u);
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            let g = iq_grid8(IQ2XXS_GRID_OFF, idx, j);
+            acc = acc + (db * f32(g) * iq_sign(signs, j)) * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq1_s` for [`block_hoisted_suffix`]. A lane's 16 elements are two
+/// of the group's four lattice lookups, so the group's `qh` `u16` — scale,
+/// delta sign and index-high bits all at once — is decoded once rather than
+/// sixteen times.
+const IQ1_S_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 50u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let qs_off = byte_offset + 2u;
+    let qh_off = byte_offset + 34u;
+    let ib = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    let qh = read_u8(qh_off + 2u * ib) | (read_u8(qh_off + 2u * ib + 1u) << 8u);
+    let dl = d * f32(2u * ((qh >> 12u) & 7u) + 1u);
+    var delta: f32 = IQ1_DELTA;
+    if ((qh & 0x8000u) != 0u) {
+        delta = -IQ1_DELTA;
+    }
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        let idx = read_u8(qs_off + 4u * ib + l) | (((qh >> (3u * l)) & 7u) << 8u);
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            acc = acc + (dl * (iq_grid8_signed(IQ1S_GRID_OFF, idx, j) + delta))
+                * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_iq1_m` for [`block_hoisted_suffix`]. The scattered `f16` block
+/// scale — four nibbles across the top of four `scales` `u16`s — costs eight
+/// `read_u8` calls and a reassembly to recover, and the element-wise path
+/// pays that **per element**. Here it is paid once per lane, which is the
+/// largest header saving of any type in this file.
+const IQ1_M_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 56u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn iq1m_scale_u16(scales_off: u32, i: u32) -> u32 {
+    return read_u8(scales_off + 2u * i) | (read_u8(scales_off + 2u * i + 1u) << 8u);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let qs_off = byte_offset;
+    let qh_off = byte_offset + 32u;
+    let scales_off = byte_offset + 48u;
+    let s0 = iq1m_scale_u16(scales_off, 0u);
+    let s1 = iq1m_scale_u16(scales_off, 1u);
+    let s2 = iq1m_scale_u16(scales_off, 2u);
+    let s3 = iq1m_scale_u16(scales_off, 3u);
+    let packed = (s0 >> 12u) | ((s1 >> 8u) & 0x00F0u) | ((s2 >> 4u) & 0x0F00u) | (s3 & 0xF000u);
+    let d = f16_to_f32(packed);
+    let ib = sub / 2u;
+    let l0 = (sub % 2u) * 2u;
+    var s: u32 = s0;
+    if (ib / 2u == 1u) {
+        s = s1;
+    } else if (ib / 2u == 2u) {
+        s = s2;
+    } else if (ib / 2u == 3u) {
+        s = s3;
+    }
+    let shift = 6u * (ib % 2u);
+    let x_lane = x_off + sub * 16u;
+    var acc: f32 = 0.0;
+    var lh: u32 = 0u;
+    loop {
+        if (lh >= 2u) {
+            break;
+        }
+        let l = l0 + lh;
+        var sub_shift: u32 = shift;
+        if (l >= 2u) {
+            sub_shift = shift + 3u;
+        }
+        let dl = d * f32(2u * ((s >> sub_shift) & 7u) + 1u);
+        var qhb: u32 = read_u8(qh_off + 2u * ib);
+        if (l >= 2u) {
+            qhb = read_u8(qh_off + 2u * ib + 1u);
+        }
+        var hshift: u32 = 8u;
+        var bit: u32 = 0x08u;
+        if ((l % 2u) == 1u) {
+            hshift = 4u;
+            bit = 0x80u;
+        }
+        let idx = read_u8(qs_off + 4u * ib + l) | ((qhb << hshift) & 0x700u);
+        var delta: f32 = IQ1_DELTA;
+        if ((qhb & bit) != 0u) {
+            delta = -IQ1_DELTA;
+        }
+        var j: u32 = 0u;
+        loop {
+            if (j >= 8u) {
+                break;
+            }
+            acc = acc + (dl * (iq_grid8_signed(IQ1S_GRID_OFF, idx, j) + delta))
+                * x[x_lane + lh * 8u + j];
+            j = j + 1u;
+        }
+        lh = lh + 1u;
+    }
+    return acc;
+}
+"#;
+
 /// The per-type half of [`block_hoisted_suffix`], or `None` for a type that
 /// has no block-hoisted implementation yet and so keeps the element-wise
 /// path.
 ///
 /// **Deliberately a growable list, not a closed one.** Every entry is a
 /// dozen lines against a contract that says nothing about block size or bit
-/// packing, so adding `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K` or the `IQ` family is
-/// mechanical — each is worth roughly the 3× the types below measured, and
-/// none of them needs a new kernel, a new dispatch path or a new tuning
-/// knob. What stops a type being here is only that nobody has written its
-/// dozen lines and cross-checked them.
+/// packing, and the list now covers every type this backend has a shader for
+/// *except* the three the block-unroll already serves faster (`Q4_K`,
+/// `Q5_K`, `Q6_K` — see [`unroll_suffix`]) and the pass-through float types,
+/// which have no block header to hoist.
+///
+/// The `IQ*` entries are what a `UD`-style mixed quantization actually needs:
+/// `unsloth/Qwen3.8-27B-GGUF:Q3_K_XL` is 357 `IQ4_XS` tensors and 130
+/// `IQ3_S` against a single `Q3_K` one, so before these it decoded almost
+/// entirely on the element-wise path while its name promised a K-quant.
 fn block_hoisted_middle(ggml_type: u32) -> Option<&'static str> {
     Some(match ggml_type {
         t if t == GGML_TYPE_Q4_0 => Q4_0_BLOCK_MIDDLE,
         t if t == GGML_TYPE_Q4_1 => Q4_1_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q5_0 => Q5_0_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q5_1 => Q5_1_BLOCK_MIDDLE,
         t if t == GGML_TYPE_Q8_0 => Q8_0_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q2_K => Q2_K_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_Q3_K => Q3_K_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ1_S => IQ1_S_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ1_M => IQ1_M_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ2_XXS => IQ2_XXS_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ2_XS => IQ2_XS_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ2_S => IQ2_S_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ3_XXS => IQ3_XXS_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ3_S => IQ3_S_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ4_NL => IQ4_NL_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_IQ4_XS => IQ4_XS_BLOCK_MIDDLE,
         _ => return None,
     })
 }
@@ -2256,6 +2971,9 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_Q4_K => Q4_K_COOP_MIDDLE,
         t if t == GGML_TYPE_Q5_K => Q5_K_COOP_MIDDLE,
         t if t == GGML_TYPE_Q6_K => Q6_K_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ1_S => IQ1_S_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ1_M => IQ1_M_COOP_MIDDLE,
+        t if t == GGML_TYPE_IQ2_XXS => IQ2_XXS_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ2_XS => IQ2_XS_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ2_S => IQ2_S_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ3_XXS => IQ3_XXS_COOP_MIDDLE,
@@ -2269,7 +2987,10 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
 /// Whether `ggml_type`'s `dequant_element` reads the `IQ*` codebooks, and so
 /// needs [`IQ_GRID_PRELUDE`]'s `@binding(4)` declaration.
 fn needs_iq_grids(ggml_type: u32) -> bool {
-    ggml_type == GGML_TYPE_IQ2_XS
+    ggml_type == GGML_TYPE_IQ1_S
+        || ggml_type == GGML_TYPE_IQ1_M
+        || ggml_type == GGML_TYPE_IQ2_XXS
+        || ggml_type == GGML_TYPE_IQ2_XS
         || ggml_type == GGML_TYPE_IQ2_S
         || ggml_type == GGML_TYPE_IQ3_XXS
         || ggml_type == GGML_TYPE_IQ3_S

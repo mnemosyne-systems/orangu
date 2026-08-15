@@ -894,25 +894,18 @@ impl LlamaModel {
                     n_embd,
                     cfg.rms_eps,
                 );
-                let mut gate_up = self.backend.matmul_batch(&[
-                    MatmulOp {
-                        x: &normed2,
-                        n_tokens,
-                        w: &layer.w_gate,
-                    },
-                    MatmulOp {
-                        x: &normed2,
-                        n_tokens,
-                        w: &layer.w_up,
-                    },
-                ]);
-                let up = gate_up.pop().unwrap();
-                let mut gate = gate_up.pop().unwrap();
-                for g in gate.iter_mut() {
-                    *g = tensor::silu(*g);
-                }
-                tensor::mul_inplace(&mut gate, &up);
-                let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
+                // Shared with the dense FFN of the Qwen 3.5 hybrid trunk —
+                // `LLM_FFN_SILU`/`LLM_FFN_PAR` is one computation and this
+                // family (Llama, Mistral, Qwen2, Qwen3) and that one run the
+                // same one.
+                let down = super::swiglu_ffn(
+                    self.backend.as_ref(),
+                    &normed2,
+                    n_tokens,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                );
                 tensor::add_inplace(&mut x, &down);
             }
         }
