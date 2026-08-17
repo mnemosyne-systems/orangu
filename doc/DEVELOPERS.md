@@ -46,45 +46,30 @@ helper. Anything a gated test alone uses (a fixture, an import) needs the
 same gate, or Windows builds it and warns that it is unused. A local
 `cargo test` cannot see any of this; only the Windows job can.
 
-### The cached model
+### No model in CI
 
-The `#[ignore]`d real-model tests need a GGUF, and re-downloading ~4 GB from
-Hugging Face for every job on every run is not viable. A `model` job fetches
-it once with `orangu-server download` and puts it in the GitHub Actions
-cache; the three `test` jobs restore it.
+CI runs no model. It builds, lints, audits and runs the ordinary `cargo
+test` suite, and nothing more — no weights are downloaded, and none are kept
+in the Actions cache. A gate that depends on a multi-gigabyte file living in
+a 7-day cache is a gate that fails for reasons unrelated to the change under
+test, which is exactly what it did.
 
-Notes on how it is set up, and why:
+The `#[ignore]`d real-model tests are therefore a local step. Point
+`ORANGU_TEST_MODEL` at a chat GGUF and name the test:
 
-- **One job fetches.** Three matrix jobs missing the cache in parallel would
-  each download the same file and then race to save the same key, of which
-  only the first write wins.
-- **One file is cached, not the Hugging Face tree.** `download` also fetches
-  the ~1 GB `mmproj` sibling, which nothing here tests, and lays the model
-  out as `blobs`/`snapshots` symlinks that do not survive a restore onto
-  Windows. The job flattens it to a single `model.gguf` and caches that.
-- **One cache entry is shared across all three platforms**, via
-  `enableCrossOsArchive: true`. A repository gets 10 GB of cache in total,
-  shared with the `Swatinem/rust-cache` entries, so three per-OS copies of
-  the model would evict everything else.
-- **Caches are evicted after 7 days without a hit**, so a quiet week costs
-  one re-download. That is deliberate — the alternative is pinning the key
-  to the upstream commit, which turns any re-upload by the model author into
-  a surprise 4 GB download in an unrelated pull request.
-- To force a re-download, bump the trailing version in `MODEL_CACHE_KEY`
-  (`gguf-gemma-4-E2B-it-Q4_K_M-v1`). Cache entries are immutable, so
-  changing what the job stores requires a new key.
+```
+ORANGU_TEST_MODEL=/path/to/model.gguf cargo test --release --bin orangu-server \
+  engine::arch::gemma::real_model_tests::gemma4_predicts_paris_after_capital_of_france \
+  -- --ignored --exact --nocapture
+```
 
-`orangu-server download` resolves its target against
-`[orangu-server].models`, so the job writes a `~/.orangu/orangu-server.conf`
-first, pointing at the workspace and pinning `backend = cpu` (no GPU on a
-runner) with `web = 0` (no second listener to bind).
-
-Only the two tests the cached gemma-4-E2B GGUF actually satisfies are run,
-named individually. `-- --ignored` as a whole would not work: the other
-ignored tests want a different model (`ORANGU_TEST_MOE_MODEL`,
-`ORANGU_TEST_PLKV_MODEL`, a qwen or embedding GGUF), a Vulkan device, or are
-`_scratch_` benchmarks. They also need `--release`; a CPU forward pass of a
-5B model in a debug build turns seconds into a timeout.
+`--release` is not optional: a CPU forward pass of a 5B model in a debug
+build turns seconds into minutes. `-- --ignored` as a whole is not useful
+either — the ignored tests want different models (`ORANGU_TEST_MODEL`,
+`ORANGU_TEST_MOE_MODEL`, `ORANGU_TEST_PLKV_MODEL`, a qwen or embedding
+GGUF), a Vulkan device, or are `_scratch_` benchmarks. Name the ones you
+want. `orangu-server download` fetches a model if you need one; it resolves
+its target against `[orangu-server].models`.
 
 ### Reference fixtures
 
