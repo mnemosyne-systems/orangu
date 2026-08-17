@@ -134,10 +134,12 @@ theme = classic
 | `terminal` | No | Launch command used to open `$EDITOR` for terminal editors in a new window for `/open_file` (for example `xterm -e` or `kitty`). When unset, a terminal emulator is auto-detected |
 | `platform` | No | Code-hosting platform driven for `/pull`, `/pull_request`, `/merge`, and `/comment`. Defaults to `github` (uses the `gh` CLI). Options: `github`, `gitlab` (uses the `glab` CLI) |
 | `system_prompt` | No | Override the base system prompt sent to the model. When empty (the default) orangu uses its built-in coding-assistant prompt. The discovered Agent Skills index is appended to whichever prompt is in effect |
-| `model_verbosity` | No | Set the model's chattiness. Defaults to `normal`. Options: `terse`, `normal`, `verbose` |
 | `review_confidence_threshold` | No | Minimum confidence score (0–100) for `/auto_review` findings; findings below this threshold are silently dropped. Defaults to `80`. Set to `0` to disable filtering |
+| `compression` | No | Enable the built-in compression layer: context deduplication, file-read stubbing, and shell-output compression. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0`. See the Compression chapter |
+| `auto_downsample_lines` | No | Line count above which an unbounded file read is returned as signatures instead of the whole file, with a note saying so. Defaults to `300`; `0` reads every file in full. Only applies while `compression` is on, and never to a read that asked for a `mode` or a line range |
 | `diff_file_cap` | No | Maximum number of files kept when a `git diff` is compressed. Defaults to `20`. See the Compression chapter |
 | `world_state_max_bytes` | No | Ceiling on the `world_state_changes` fragment prepended to a turn when the working tree has changed, in bytes. Defaults to `8192`; `0` disables the cap. See [Workspace change budget](#workspace-change-budget) |
+| `semantic_budget_tokens` | No | Token budget for the code chunks `/search` injects into a turn. Hits are added in rank order until the next one would exceed it, so the cap bounds what semantic search costs in context rather than the number of results. Defaults to `16384`; the top hit is always kept |
 
 ### Workspace change budget
 
@@ -280,6 +282,7 @@ model = ggml-org/gemma-4-E4B-it-GGUF
 | `model` | No | Model identifier used in chat completion requests. Overrides the general `[orangu].model` when set |
 | `api_key` | No | API key sent as `Authorization: Bearer <key>` on every request to the server. Required when `orangu-server` runs with `--api-key` |
 | `role` | No | A specific role this server fulfills. Valid roles are: `all` (default), `code`, `review`, `explorer`, and `embeddings`. If a specific subsystem needs a server and one is tagged with its role, it will use that server instead of the default. `embeddings` designates the server that embeds code for semantic `/search`; an `all` server also serves it, and search auto-enables when that endpoint responds at startup. Ignored behind a confirmed orangu-coordinator — it alone decides which model backs each role, so a single server section is enough there |
+| `model_verbosity` | No | How chatty this server's model should be. Defaults to `normal`. Options: `terse`, `normal`, `verbose`. It is a per-server key: writing it in `[orangu]` has no effect |
 
 - At least one of `[orangu].model` or a server's own `model` must be set, so every server resolves to a non-empty model
 - The endpoint may be configured either with or without `/v1`
@@ -305,11 +308,30 @@ Use a `[mcp.<name>]` section, or set `mcp = true` in a section, for an
 already-running Streamable HTTP MCP service. The endpoint normally ends in
 `/mcp`.
 
-`timeout` sets the default for initialization, discovery, and tool calls;
-`startup_timeout` and `tool_timeout` set those limits separately. `enabled = off`
-keeps a service unavailable, while `required = on` makes a failed connection
-abort workspace startup. `enabled_tools` and `disabled_tools` accept
-comma-separated tool names (the denylist wins).
+```ini
+[mcp.weather]
+endpoint = http://localhost:9000/mcp
+timeout = 30
+approval_mode = writes
+```
+
+| Key | Required | Description |
+| :-- | :-- | :-- |
+| `endpoint` | Yes | Streamable HTTP URL of the running service, normally ending in `/mcp` |
+| `mcp` | Only for the shortcut form | Set to `on` in a section that is not named `mcp.<name>` to read that section as an MCP service too. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `timeout` | No | Seconds allowed for initialization, tool discovery, and tool calls alike. Defaults to `30`, and supplies the default for the two keys below |
+| `startup_timeout` | No | Seconds for connection and tool discovery alone. Defaults to `timeout`. Must be greater than zero |
+| `tool_timeout` | No | Seconds for a single tool call. Defaults to `timeout`. Must be greater than zero |
+| `enabled` | No | Whether the service is used at all. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `required` | No | Make a failed connection abort workspace startup instead of disabling the service with a warning. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `enabled_tools` | No | Comma-separated allowlist of tool names. Empty (the default) offers every discovered tool |
+| `disabled_tools` | No | Comma-separated denylist of tool names. The denylist wins over `enabled_tools` |
+| `approval_mode` | No | How tool calls are confirmed. Defaults to `auto`. Options: `auto`, `prompt`, `writes`, `deny` |
+
+The section name after `mcp.` is the service name used in the
+`mcp__<server>__<tool>` prefix, and it accepts ASCII letters, digits, `_` and
+`-`. Configuring the same name twice — once as `[mcp.<name>]` and once through
+the `mcp = on` shortcut — is a startup error.
 
 `approval_mode` controls MCP execution: `auto` runs tools directly, `prompt`
 asks for each call, `writes` asks unless the MCP tool declares `readOnlyHint`,

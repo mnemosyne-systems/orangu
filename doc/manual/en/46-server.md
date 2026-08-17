@@ -1101,6 +1101,7 @@ shown.
 | `device_split` | `off` | spread one model across several devices |
 | `threads` | rayon's choice | CPU worker threads |
 | `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding` |
+| `web` | `0` | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does |
 
 | `[web]` | default | what it does |
 | :-- | :-- | :-- |
@@ -1116,6 +1117,20 @@ shown.
 | `max_concurrent` | `0` | requests this tenant may have in flight at once; `0` is unlimited |
 | `requests_per_minute` | `0` | arrival rate over the last minute; `0` is unlimited |
 | `tokens_per_minute` | `0` | prompt + generated tokens over the last minute; `0` is unlimited |
+
+Every section that is none of the above — not `[orangu-server]`, not `[web]`,
+not `[tenant:<name>]` — is read as an **MCP server**, named after the section.
+These are an inventory for the web console's MCP panel, which lists them and
+shows one on request; the server itself neither connects to them nor calls
+them, so an entry here changes nothing about inference. A section with no
+`endpoint` is rejected at startup, which is also what a misspelled section
+name looks like.
+
+| `[<mcp-name>]` | default | what it does |
+| :-- | :-- | :-- |
+| `endpoint` | *required* | URL of the MCP service, as shown in the console |
+| `enabled` | `yes` | whether the console reports it as enabled |
+| `approval_mode` | `writes` | approval policy recorded for it: `auto`, `prompt`, `writes`, `deny` |
 
 Environment variables override the file where one exists: `ORANGU_API_KEY` for
 `api_key` and `ORANGU_KV_CACHE` for `kv_cache`. Both exist so a secret or a
