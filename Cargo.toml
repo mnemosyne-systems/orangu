@@ -39,7 +39,7 @@ html2text = "0.17.1"
 ignore = "0.4.33"
 markdown = "1.0.0"
 merman = { version = "0.7.0", features = ["render"] }
-printpdf = { version = "0.12.5", default-features = false, features = ["text_layout", "png"] }
+printpdf = { version = "0.12.6", default-features = false, features = ["text_layout", "png"] }
 regex = "1.13"
 resvg = { version = "0.48.1", default-features = false, features = ["text"] }
 rmcp = { version = "3.1.2", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
@@ -60,7 +60,6 @@ rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"
-shell-words = "1.1"
 syntect = { version = "5.3.0", features = ["html"] }
 terminal_size = "0.4.4"
 ttf-parser = "0.25.1"
@@ -103,8 +102,8 @@ tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "component"] }
-minijinja = "2.21"
-minijinja-contrib = { version = "2.21", features = ["pycompat"] }
+minijinja = "2.24"
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 half = "2.7"
 memmap2 = "0.9"
 rand = "0.10"
@@ -113,7 +112,7 @@ wgpu = { version = "30.0.0", default-features = false, features = ["vulkan", "me
 ash = "0.38"
 pollster = "1.0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-cudarc = { version = "0.19.8", features = ["cuda-12000"] }
+cudarc = { version = "0.19.9", features = ["cuda-12000"] }
 opencl3 = "0.12.3"
 cubecl-hip-sys = { version = "7", optional = true }
 ratatui = "0.30.2"

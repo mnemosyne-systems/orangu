@@ -1,10 +1,17 @@
+# Every entry here is an advisory that has been read and accepted. An id whose
+# advisory no longer matches the lockfile does not belong in the list: it is
+# dead weight that would silently re-suppress the advisory if a dependency ever
+# resolved back into the affected range. Check before adding, and drop entries
+# once the dependency is patched.
 [advisories]
 ignore = [
     "RUSTSEC-2024-0320", # yaml-rust is pulled in by syntect
     "RUSTSEC-2025-0141", # bincode is pulled in by syntect
-    "RUSTSEC-2026-0187", # lopdf is pulled in by printpdf; orangu only generates PDFs, never parses untrusted input
-    "RUSTSEC-2024-0370", # proc-macro-error (unmaintained) pulled in transitively via printpdf -> allsorts -> ouroboros; build-time only
-    "RUSTSEC-2026-0194", # quick-xml is pulled in by plist -> syntect; orangu only calls ThemeSet::load_defaults()/SyntaxSet::load_defaults_newlines(), which read compiled-in dumps, never syntect's plist-XML loading path
-    "RUSTSEC-2026-0195", # same quick-xml/plist/syntect path as RUSTSEC-2026-0194, and unreachable for the same reason
 ]
-informational_warnings = ["unmaintained"]
+
+# `informational_warnings` is not additive — it *replaces* the set of
+# informational advisory kinds that get reported. Narrowing it to
+# `["unmaintained"]` therefore did not enable unmaintained warnings, it silently
+# discarded every `unsound` one, and two were being hidden that way. Leave it
+# unset so the default set applies; if it ever has to be written out, it must
+# name every kind, not the one that happens to be of interest that day.
