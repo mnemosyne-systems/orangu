@@ -684,6 +684,12 @@ pub(crate) struct Trunk<F> {
 }
 
 impl<F: HybridFfn> Trunk<F> {
+    /// Trunk layers loaded — `block_count` less `nextn_predict_layers`, since
+    /// `load` stops before any multi-token-prediction block.
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
     /// Loads every trunk layer, calling `make_ffn(layer_index)` for each
     /// layer's FFN. Everything else — the layer kind, the attention or
     /// recurrent tensors, the embedding and output heads — is the same for

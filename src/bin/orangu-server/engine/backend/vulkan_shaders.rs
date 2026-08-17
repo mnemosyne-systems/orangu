@@ -832,7 +832,7 @@ pub const COOP_GEOM_DEFAULT: CoopGeom = CoopGeom {
 /// `ORANGU_COOP_F16_TILES=1`. Needs `SHADER_F16`, which the caller checks.
 pub fn coop_f16_tiles() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var_os("ORANGU_COOP_F16_TILES").is_some())
+    *F.get_or_init(|| crate::engine::env::flag_on("ORANGU_COOP_F16_TILES"))
 }
 
 /// Which of the tiled GEMM's two shared tiles may be held as `vec4` — see
@@ -953,7 +953,7 @@ fn forced_scalar_tiles(spec: &str) -> (bool, bool) {
 /// per-element activation fill — see [`ROLLED_X_FILL`] for what it restores
 /// and [`coop_vec4_tiles`] for why the answer also decides `tile_x`'s form.
 fn rolled_x_fill() -> bool {
-    std::env::var_os("ORANGU_NO_TILE_X_STRAIGHT").is_some()
+    crate::engine::env::flag_on("ORANGU_NO_TILE_X_STRAIGHT")
 }
 
 /// The geometry in force, read once from `ORANGU_COOP_GEOM`.
@@ -4731,7 +4731,7 @@ pub fn shader_source_reduce_q6k_light(n_rows: usize, subgroup: bool) -> String {
 pub fn shader_source_reduce_q4k_light(n_rows: usize, subgroup: bool) -> String {
     // `ORANGU_GEMV_STUB=1` swaps the block reader for a load-preserving,
     // arithmetic-free stub — see `Q4K_LIGHT_STUB_SB`. Wrong output on purpose.
-    let mut s = if std::env::var_os("ORANGU_GEMV_STUB").is_some() {
+    let mut s = if crate::engine::env::flag_on("ORANGU_GEMV_STUB") {
         let start = Q4K_LIGHT_PRELUDE
             .find("\nfn sb(")
             .expect("prelude defines sb");
@@ -4873,7 +4873,7 @@ fn reduce_block_unroll() -> usize {
 /// site. `ORANGU_REDUCE_ROW_LOOP=1`.
 fn row_loop() -> bool {
     static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *R.get_or_init(|| std::env::var_os("ORANGU_REDUCE_ROW_LOOP").is_some())
+    *R.get_or_init(|| crate::engine::env::flag_on("ORANGU_REDUCE_ROW_LOOP"))
 }
 
 /// See [`reduce_block_unroll`]. **1** — measured flat at 2, 4 and 8
@@ -5530,7 +5530,7 @@ pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: CoopVec4Tiles) -> Op
     // `ORANGU_NO_TILE_DEQUANT_RUN=1` restores the per-element fill this
     // replaced, so the two can be A/B'd in one build. Same output either way —
     // it is a knob for measuring the change, not for choosing behaviour.
-    let amortized = std::env::var_os("ORANGU_NO_TILE_DEQUANT_RUN").is_none();
+    let amortized = !crate::engine::env::flag_on("ORANGU_NO_TILE_DEQUANT_RUN");
     let (w_fill, run_fill) = coop_tiled_weight_fill(ggml_type, run, amortized);
     let suffix = MAIN_COOP_TILED_SUFFIX
         .replace("%TILE_DECL%", &tile_decl)

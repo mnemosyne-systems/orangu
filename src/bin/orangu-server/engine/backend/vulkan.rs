@@ -2281,14 +2281,14 @@ const ROLE_PLE: usize = 400;
 /// was never tight, and returns 40% of the card where it was.
 fn pool_prefill_regions() -> bool {
     static POOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POOL.get_or_init(|| std::env::var_os("ORANGU_NO_POOL_PREFILL_REGIONS").is_none())
+    *POOL.get_or_init(|| !crate::engine::env::flag_on("ORANGU_NO_POOL_PREFILL_REGIONS"))
 }
 
 /// Whether [`padded_stripe_len`] rounds tail stripes to the full stripe width —
 /// `ORANGU_PAD_STRIPE_FULL`, default off. See that function.
 fn pad_stripe_full() -> bool {
     static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FULL.get_or_init(|| std::env::var_os("ORANGU_PAD_STRIPE_FULL").is_some())
+    *FULL.get_or_init(|| crate::engine::env::flag_on("ORANGU_PAD_STRIPE_FULL"))
 }
 
 /// `rows × row_len` widened to `padded × row_len` with zeros, or borrowed
@@ -2535,7 +2535,7 @@ const ATTN_SPLIT_K_DEFAULT: u32 = 8;
 /// throughput is the priority.
 fn busy_poll() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("ORANGU_BUSY_POLL").is_some())
+    *B.get_or_init(|| crate::engine::env::flag_on("ORANGU_BUSY_POLL"))
 }
 
 /// How long [`VulkanBackend::wait_mapped`] keeps polling for a buffer's map
@@ -2609,7 +2609,7 @@ impl MapWait {
 /// stage's total and its internal split come out of one run rather than two.
 fn ple_trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("ORANGU_PREFILL_TRACE").is_some())
+    *TRACE.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_TRACE"))
 }
 
 /// How many times [`VulkanBackend::fused_ple_prefill`] records its dispatch
@@ -2814,6 +2814,30 @@ const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
 ];
+
+/// The KV storage the configuration asked for, for backends built after
+/// `main` has read it.
+///
+/// A process-wide cell rather than a parameter because a backend is brought up
+/// through half a dozen entry points — `try_init`, `try_init_selected`, the
+/// Metal and DX12 wrappers, and the test harness — and threading one setting
+/// through all of them would put the same argument in six signatures to be
+/// read in one place. Set once, before the first device comes up.
+static KV_CACHE_PREFERENCE: std::sync::OnceLock<crate::config::KvCache> =
+    std::sync::OnceLock::new();
+
+/// Records what `[orangu-server].kv_cache` asked for. Called by `main` before
+/// any backend exists; later calls are ignored, so a second one cannot change
+/// the storage out from under a device that already compiled shaders for it.
+pub fn set_kv_cache_preference(preference: crate::config::KvCache) {
+    let _ = KV_CACHE_PREFERENCE.set(preference);
+}
+
+/// The recorded preference, or the default for a process that never set one —
+/// every test, and every path that builds a backend without a config file.
+fn kv_cache_preference() -> crate::config::KvCache {
+    KV_CACHE_PREFERENCE.get().copied().unwrap_or_default()
+}
 
 impl VulkanBackend {
     /// Looks for a usable Vulkan adapter and builds every quant type's
@@ -3293,7 +3317,7 @@ impl VulkanBackend {
         // need it present at device-creation time even if only one (or
         // neither) ends up used.
         let supports_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
-        let kv_f16 = supports_f16 && std::env::var_os("ORANGU_NO_KV_F16").is_none();
+        let kv_f16 = supports_f16 && !crate::engine::env::flag_on("ORANGU_NO_KV_F16");
         // **Opt-in** (`ORANGU_KV_Q8_0=1`,
         // unlike `kv_f16`'s opt-out default): a new, unswept storage kind,
         // not yet measured end-to-end at the scale that would justify
@@ -3302,13 +3326,28 @@ impl VulkanBackend {
         // feature) — `KvStorage::Q8_0`'s own doc comment covers why —
         // so it's available even on an adapter `kv_f16` itself can't use.
         // Takes precedence over `kv_f16` when both would otherwise apply.
-        let kv_q8_0 = std::env::var_os("ORANGU_KV_Q8_0").is_some();
-        let kv_storage = if kv_q8_0 {
-            vulkan_shaders::KvStorage::Q8_0
-        } else if kv_f16 {
-            vulkan_shaders::KvStorage::F16
+        let kv_q8_0 = crate::engine::env::flag_on("ORANGU_KV_Q8_0");
+        // Three ways in, in precedence order. The two legacy flags win where
+        // they are set, so a sweep or a bug report's repro line keeps working
+        // unchanged; then `ORANGU_KV_CACHE`, which is the one that can name
+        // every value; then the config file. An adapter without `SHADER_F16`
+        // cannot honour `f16` at all and falls back to `f32` — a *capability*
+        // outranking a preference, which is why that check is applied last.
+        let requested = if kv_q8_0 {
+            crate::config::KvCache::Q8_0
+        } else if !kv_f16 && supports_f16 {
+            // `ORANGU_NO_KV_F16=1` — an explicit "not f16", which means f32.
+            crate::config::KvCache::F32
         } else {
-            vulkan_shaders::KvStorage::F32
+            std::env::var("ORANGU_KV_CACHE")
+                .ok()
+                .and_then(|raw| crate::config::KvCache::parse(&raw))
+                .unwrap_or_else(kv_cache_preference)
+        };
+        let kv_storage = match requested {
+            crate::config::KvCache::Q8_0 => vulkan_shaders::KvStorage::Q8_0,
+            crate::config::KvCache::F16 if supports_f16 => vulkan_shaders::KvStorage::F16,
+            _ => vulkan_shaders::KvStorage::F32,
         };
         // Flash split-k phase-1 kernel (coalesced-LDS-staged K). **Opt-in**
         // (`ORANGU_FLASH_ATTN=1`) and only when KV is `f16` — the staging
@@ -3316,16 +3355,16 @@ impl VulkanBackend {
         // and `f32`/`q8_0` KV don't fit the LDS budget / aren't `f16`-exact.
         // See `attn_split_pipeline_for` and `shader_source_attention_split_flash`.
         let flash_attn = matches!(kv_storage, vulkan_shaders::KvStorage::F16)
-            && std::env::var_os("ORANGU_FLASH_ATTN").is_some();
+            && crate::engine::env::flag_on("ORANGU_FLASH_ATTN");
         // See `Self::q4_k_mmvq`. Integer-dot quantized Q4_K matmul (verification
         // path). Opt-in; needs the `dot4I8Packed` builtin, which naga lowers to
         // native `v_dot4_i32_i8` on this device.
-        let q4_k_mmvq = std::env::var_os("ORANGU_Q4K_MMVQ").is_some();
+        let q4_k_mmvq = crate::engine::env::flag_on("ORANGU_Q4K_MMVQ");
         // See `Self::attn_gqa`. GQA-grouped split-k attention (opt-in).
-        let attn_gqa = std::env::var_os("ORANGU_ATTN_GQA").is_some();
+        let attn_gqa = crate::engine::env::flag_on("ORANGU_ATTN_GQA");
         // See `Self::
         // packed_dot_f16`'s own doc comment.
-        let packed_dot_f16 = supports_f16 && std::env::var_os("ORANGU_PACKED_DOT").is_some();
+        let packed_dot_f16 = supports_f16 && crate::engine::env::flag_on("ORANGU_PACKED_DOT");
         // See `Self::tiled_prefill`'s own doc comment — on by default
         // (opt out with `ORANGU_NO_TILED_PREFILL=1`), same convention as
         // `kv_f16`/`wide_unroll`. Measured, not just correctness-verified:
@@ -3339,7 +3378,7 @@ impl VulkanBackend {
         // kernel's bounded per-workgroup tile avoids that failure mode
         // entirely and is measurably faster at prompt lengths where both
         // variants can still complete.
-        let tiled_prefill = std::env::var_os("ORANGU_NO_TILED_PREFILL").is_none();
+        let tiled_prefill = !crate::engine::env::flag_on("ORANGU_NO_TILED_PREFILL");
         // Whether the tiled kernel's shared tiles may be `vec4` — a
         // correctness question this API's own behaviour decides, not a
         // tuning knob. See `vulkan_shaders::coop_vec4_tiles`.
@@ -3379,7 +3418,7 @@ impl VulkanBackend {
         // doc comment. No `supports_f16` gate, unlike `kv_f16`/
         // `packed_dot_f16` above — these kernels only use core-WGSL
         // `unpack2x16float`, available on every adapter.
-        let wide_load = std::env::var_os("ORANGU_WIDE_LOAD").is_some();
+        let wide_load = crate::engine::env::flag_on("ORANGU_WIDE_LOAD");
         // See `Self::wide_unroll`'s own doc comment. **On by default** (opt
         // *out* with `ORANGU_NO_MLP_UNROLL=1`), unlike every other kernel
         // toggle in this file: it's a strict, bit-for-bit-correct, hardware-
@@ -3387,7 +3426,7 @@ impl VulkanBackend {
         // decode reduce loop. No `supports_f16`
         // gate — the arithmetic is all `f32`, only `unpack2x16float` (core
         // WGSL) touches half-floats.
-        let wide_unroll = std::env::var_os("ORANGU_NO_MLP_UNROLL").is_none();
+        let wide_unroll = !crate::engine::env::flag_on("ORANGU_NO_MLP_UNROLL");
         // See `Self::q4_k_dual_pipeline`'s own doc comment. **On by default**
         // for `Q4_K` decode (opt out with `ORANGU_NO_DUAL_NIBBLE=1`), the
         // same convention as `wide_unroll`/`tiled_prefill`. Only active when
@@ -3397,7 +3436,7 @@ impl VulkanBackend {
         // adds vs. the two-wave kernel, so unlike `wide_unroll` it
         // cross-checks against `CpuBackend` within a tolerance, not
         // bit-for-bit.
-        let dual_nibble = std::env::var_os("ORANGU_NO_DUAL_NIBBLE").is_none();
+        let dual_nibble = !crate::engine::env::flag_on("ORANGU_NO_DUAL_NIBBLE");
         // Split-k attention — **on by
         // default** (opt out with `ORANGU_NO_ATTN_SPLIT=1`), same
         // precedent as `wide_unroll`/`kv_f16`: measured
@@ -3410,14 +3449,14 @@ impl VulkanBackend {
         // core WGSL plus whatever `kv_f16`/`subgroup_reduce` themselves
         // already gate, nothing this flag needs its own capability check
         // for.
-        let attn_split = std::env::var_os("ORANGU_NO_ATTN_SPLIT").is_none();
+        let attn_split = !crate::engine::env::flag_on("ORANGU_NO_ATTN_SPLIT");
         // See `Self::gpu_sample`'s own doc comment — on by default (opt
         // out with `ORANGU_NO_GPU_SAMPLE=1`), same convention as
         // `kv_f16`/`wide_unroll`/`attn_split`, despite the measured
         // end-to-end result being within noise: it's correctness-verified
         // and strictly no worse, the same "keep it, no measured
         // regression" precedent set elsewhere in this module.
-        let gpu_sample = std::env::var_os("ORANGU_NO_GPU_SAMPLE").is_none();
+        let gpu_sample = !crate::engine::env::flag_on("ORANGU_NO_GPU_SAMPLE");
         // `subgroupAdd`/`subgroupMax` hardware reductions in place
         // of the classic 6-round `workgroupBarrier` pairwise-tree
         // reductions — selects the subgroup-reduce shader source for the
@@ -3453,12 +3492,12 @@ impl VulkanBackend {
         // variants coexisting, chosen between per-call) there is nothing
         // left for any call site to branch on afterward.
         let supports_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
-        let subgroup_reduce = supports_subgroup && std::env::var_os("ORANGU_SUBGROUP").is_some();
+        let subgroup_reduce = supports_subgroup && crate::engine::env::flag_on("ORANGU_SUBGROUP");
         // See `Self::attn_coop`. Cooperative-reduction (subgroup-parallel head_dim)
         // attention — **on by default** when subgroups are supported (opt out with
         // `ORANGU_NO_ATTN_COOP`). Falls back to the classic split kernel per-layer
         // when `head_dim % 32 != 0`. The large long-context decode win.
-        let attn_coop = supports_subgroup && std::env::var_os("ORANGU_NO_ATTN_COOP").is_none();
+        let attn_coop = supports_subgroup && (!crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP"));
         // Effective decode-attention split-k. An explicit `ORANGU_ATTN_SPLIT_K`
         // always wins; otherwise the cooperative kernel — serial over positions
         // per split — wants more splits than the classic kernel to shorten that
@@ -3502,7 +3541,7 @@ impl VulkanBackend {
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let supports_timestamp_query = has_timestamp_query && has_timestamp_in_encoders;
-        let wants_timestamps = std::env::var_os("ORANGU_GPU_TIMESTAMPS").is_some();
+        let wants_timestamps = crate::engine::env::flag_on("ORANGU_GPU_TIMESTAMPS");
         // Say why, rather than accepting the flag and printing nothing. A
         // diagnostic that silently does nothing is worse than one that is
         // absent: it invites the reader to conclude the thing it measures
@@ -3543,7 +3582,7 @@ impl VulkanBackend {
             && adapter
                 .features()
                 .contains(wgpu::Features::PASSTHROUGH_SHADERS);
-        let q4k_glsl = supports_passthrough && std::env::var_os("ORANGU_Q4K_GLSL").is_some();
+        let q4k_glsl = supports_passthrough && crate::engine::env::flag_on("ORANGU_Q4K_GLSL");
         let mut required_features = if supports_f16 {
             wgpu::Features::SHADER_F16
         } else {
@@ -3628,7 +3667,7 @@ impl VulkanBackend {
         // number. The kernels do bound their own row/token/k ranges, but that
         // is an argument for the clamps being redundant, not for the safety
         // net being unnecessary.
-        let trusted = std::env::var_os("ORANGU_TRUSTED_SHADERS").is_some();
+        let trusted = crate::engine::env::flag_on("ORANGU_TRUSTED_SHADERS");
         let build_pipeline = |source: String| {
             let desc = wgpu::ShaderModuleDescriptor {
                 label: Some("orangu-server matmul shader"),
@@ -3965,7 +4004,7 @@ impl VulkanBackend {
         // the same order, one block header decode instead of `BLOCK_ELEMS`),
         // so there is no threshold to tune and nothing to gate on.
         let block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline> =
-            if std::env::var_os("ORANGU_NO_BLOCK_HOISTED").is_none() {
+            if !crate::engine::env::flag_on("ORANGU_NO_BLOCK_HOISTED") {
                 SUPPORTED_TYPES
                     .iter()
                     .filter_map(|&ggml_type| {
@@ -4015,7 +4054,7 @@ impl VulkanBackend {
         // load-issue-bound — so the simpler dual kernel stays the default.
         // Kept, correctness-verified, for other hardware / further study.
         // Checked ahead of the dual pipeline in `pipeline_for` when built.
-        let q4k_contig = std::env::var_os("ORANGU_Q4K_CONTIG").is_some();
+        let q4k_contig = crate::engine::env::flag_on("ORANGU_Q4K_CONTIG");
         let q4_k_contig_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16 && q4k_contig)
             .then(|| {
                 build_pipeline(vulkan_shaders::shader_source_reduce_q4k_contig(
@@ -4031,7 +4070,7 @@ impl VulkanBackend {
         // pipelines in `pipeline_for` when built. Same `REDUCE_N_ROWS` dispatch.
         // The dual pipeline stays built as the A/B fallback for
         // `ORANGU_NO_Q4K_LIGHT`.
-        let q4k_light = std::env::var_os("ORANGU_NO_Q4K_LIGHT").is_none();
+        let q4k_light = !crate::engine::env::flag_on("ORANGU_NO_Q4K_LIGHT");
         let q4_k_light_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16 && q4k_light)
             .then(|| {
                 build_pipeline(vulkan_shaders::shader_source_reduce_q4k_light(
@@ -4044,7 +4083,7 @@ impl VulkanBackend {
         // `ORANGU_NO_Q5K_LIGHT=1`), same convention as the `Q4_K` twin, and
         // gated on the block-unroll it replaces being on at all. The
         // block-unroll pipeline stays built as the A/B fallback.
-        let q5k_light = std::env::var_os("ORANGU_NO_Q5K_LIGHT").is_none();
+        let q5k_light = !crate::engine::env::flag_on("ORANGU_NO_Q5K_LIGHT");
         let q5_k_light_pipeline = (wide_unroll && q5k_light).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q5k_light(
                 reduce_n_rows(),
@@ -4055,7 +4094,7 @@ impl VulkanBackend {
         // See `Self::q6_k_light_pipeline`. **On by default** (opt out with
         // `ORANGU_NO_Q6K_LIGHT=1`), same convention and gating as the `Q5_K`
         // twin.
-        let q6k_light = std::env::var_os("ORANGU_NO_Q6K_LIGHT").is_none();
+        let q6k_light = !crate::engine::env::flag_on("ORANGU_NO_Q6K_LIGHT");
         let q6_k_light_pipeline = (wide_unroll && q6k_light).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q6k_light(
                 reduce_n_rows(),
@@ -4091,7 +4130,7 @@ impl VulkanBackend {
                 cache: pipeline_cache.as_ref(),
             })
         });
-        if std::env::var_os("ORANGU_Q4K_GLSL").is_some() {
+        if crate::engine::env::flag_on("ORANGU_Q4K_GLSL") {
             eprintln!(
                 "orangu-server: [q4k-glsl] passthrough={supports_passthrough} \
                  kernel_active={}",
@@ -4105,7 +4144,7 @@ impl VulkanBackend {
         // plus an independent `ORANGU_NO_Q6K_DUAL` opt-out so the `Q6_K`
         // kernel can be reverted to the two-wave block-unroll while the
         // `Q4_K` dual kernel stays on (A/B isolation).
-        let q6k_dual = std::env::var_os("ORANGU_NO_Q6K_DUAL").is_none();
+        let q6k_dual = !crate::engine::env::flag_on("ORANGU_NO_Q6K_DUAL");
         let q6_k_dual_pipeline = (wide_unroll && dual_nibble && q6k_dual).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q6k_dual(
                 reduce_n_rows(),
@@ -4254,9 +4293,9 @@ impl VulkanBackend {
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
             attn_pipeline,
-            prefill_attn: std::env::var_os("ORANGU_NO_PREFILL_ATTN").is_none(),
-            prefill_fused_attn: std::env::var_os("ORANGU_PREFILL_FUSED_ATTN").is_some(),
-            prefill_gqa: attn_coop && std::env::var_os("ORANGU_NO_PREFILL_GQA").is_none(),
+            prefill_attn: (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_ATTN")),
+            prefill_fused_attn: crate::engine::env::flag_on("ORANGU_PREFILL_FUSED_ATTN"),
+            prefill_gqa: attn_coop && (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_GQA")),
             attn_prefill_pipelines: Mutex::new(HashMap::new()),
             attn_split_pipelines: Mutex::new(HashMap::new()),
             attn_pipeline_layout,
@@ -7855,10 +7894,11 @@ impl VulkanBackend {
         // for the split gelu→mul, `normed` for the split rmsnorm→add) and bind
         // groups are allocated *only* when needed, so the fully-fused path
         // (the default) allocates no PLE scratch beyond `per_layer_buf`/`x3`.
-        let fused_postnorm = std::env::var_os("ORANGU_NO_FUSED_PLE_POSTNORM").is_none();
-        let fused_gm = !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_GELU_MUL").is_none();
+        let fused_postnorm = !crate::engine::env::flag_on("ORANGU_NO_FUSED_PLE_POSTNORM");
+        let fused_gm =
+            !self.q4_k_mmvq && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_GELU_MUL"));
         let shared_input =
-            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+            !self.q4_k_mmvq && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"));
 
         // Split gelu→mul fallback scratch + bind groups (only when the fused
         // gelu·mul is off: MMVQ, or `ORANGU_NO_FUSED_GELU_MUL`).
@@ -8145,7 +8185,7 @@ impl VulkanBackend {
         // A/B knob: `ORANGU_NO_FUSED_SHARED_INPUT=1` forces the old copy path for
         // measurement. Default on (non-MMVQ).
         let shared_input =
-            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+            !self.q4_k_mmvq && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"));
         let (bg_gate_matmul, bg_up_matmul) = if !shared_input {
             (None, None)
         } else {
@@ -8190,16 +8230,14 @@ impl VulkanBackend {
         // (`gelu_out` never round-trips through VRAM). Replaces the bg_gelu +
         // bg_mul pair. A/B knob `ORANGU_NO_FUSED_GELU_MUL=1` restores the pair.
         // Read once per layer here (cached), never per token.
-        let bg_gelu_mul = std::env::var_os("ORANGU_NO_FUSED_GELU_MUL")
-            .is_none()
-            .then(|| {
-                self.elem4_bind_group(
-                    gate_g.output_src(),
-                    up_g.output_src(),
-                    BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
-                    &meta_ffn_plain,
-                )
-            });
+        let bg_gelu_mul = (!crate::engine::env::flag_on("ORANGU_NO_FUSED_GELU_MUL")).then(|| {
+            self.elem4_bind_group(
+                gate_g.output_src(),
+                up_g.output_src(),
+                BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
+                &meta_ffn_plain,
+            )
+        });
         // `ffn_down`'s own post-matmul norm+add, same fusion — the residual
         // here is `x1` (this sub-layer's own pre-FFN residual stream), not
         // `residual_buf` (that's `bg_attn_post_norm_add`'s own residual).
@@ -8229,8 +8267,8 @@ impl VulkanBackend {
         // standalone `scale` pass below.
         let fuse_scale_into_ple = input.ple.is_some()
             && input.layer_output_scale.is_some()
-            && std::env::var_os("ORANGU_NO_FUSED_PLE_POSTNORM").is_none()
-            && std::env::var_os("ORANGU_NO_FUSED_SCALE").is_none();
+            && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_PLE_POSTNORM"))
+            && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SCALE"));
         let ple_out_scale = fuse_scale_into_ple.then(|| input.layer_output_scale.unwrap());
 
         let ple = if let (Some(ple), Some((ple_gate_g, ple_proj_g))) = (&input.ple, ple_g) {
@@ -11113,7 +11151,7 @@ impl VulkanBackend {
         // PLE. Only on the non-MMVQ decode path (GPU `normed`); MMVQ quantizes
         // `x_buffer` in place so it keeps the copy.
         let shared_input =
-            !self.q4_k_mmvq && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none();
+            !self.q4_k_mmvq && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"));
         let (bg_wq_matmul, bg_wk_matmul, bg_wv_matmul) = match (shared_input, input.normed) {
             (true, GpuInput::Gpu(nb, noff)) => {
                 let noff_b = (noff as u64) * 4;
@@ -11458,7 +11496,7 @@ impl VulkanBackend {
         // built in the cached layer resources on the non-MMVQ GPU path), skip
         // the `normed → {q,k,v}.x` copies. Otherwise (MMVQ / CPU input) copy.
         let attn_shared = !self.q4_k_mmvq
-            && std::env::var_os("ORANGU_NO_FUSED_SHARED_INPUT").is_none()
+            && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"))
             && matches!(input.normed, GpuInput::Gpu(..));
         let normed_gpu: Option<(&wgpu::Buffer, u64)> = match &input.normed {
             GpuInput::Gpu(b, o) => Some((*b, (*o as u64) * 4)),
@@ -14333,6 +14371,36 @@ pub(crate) struct OpCaptureBuffers {
     pub output_offset: u64,
     pub output_len: u64,
     pub workgroups: (u32, u32, u32),
+}
+
+#[cfg(test)]
+mod kv_cache_selection_tests {
+    use super::*;
+
+    /// Every spelling the config file and the override accept, and the two
+    /// that are deliberately the same value.
+    #[test]
+    fn kv_cache_names_round_trip() {
+        use crate::config::KvCache;
+        for value in [KvCache::F16, KvCache::Q8_0, KvCache::F32] {
+            assert_eq!(KvCache::parse(value.tag()), Some(value), "{}", value.tag());
+        }
+        // Case and padding are the shapes a hand-edited config file produces.
+        assert_eq!(KvCache::parse("  Q8_0 "), Some(KvCache::Q8_0));
+        assert_eq!(KvCache::parse("q8"), Some(KvCache::Q8_0));
+        // Anything else is an error at the call site, never a silent default:
+        // a typo that fell back to `f16` would be a quality setting nobody
+        // chose and nothing would say so.
+        assert_eq!(KvCache::parse("int8"), None);
+        assert_eq!(KvCache::parse(""), None);
+    }
+
+    /// The default is `f16`, and a process that never set a preference gets
+    /// it — which is every test, and every backend built without a config.
+    #[test]
+    fn the_unset_preference_is_f16() {
+        assert_eq!(kv_cache_preference(), crate::config::KvCache::F16);
+    }
 }
 
 #[cfg(test)]

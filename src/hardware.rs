@@ -113,6 +113,271 @@ impl MemoryKind {
     }
 }
 
+/// Where the machine is drawing power from right now.
+///
+/// Worth detecting because it is the one environmental fact that silently
+/// changes what the same model on the same machine will do: on battery, both
+/// the CPU governor and the GPU power state drop under the platform's own
+/// power management, and a sustained decode loop is exactly the workload
+/// those are tuned to suppress.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PowerSource {
+    /// Mains — or a machine with no battery at all, which is the same thing
+    /// for every decision made from this.
+    Mains,
+    /// Running down a battery.
+    Battery,
+    /// No source on this platform could say. Distinct from `Mains` on
+    /// purpose: "we did not find out" must not read as "you are plugged in".
+    ///
+    /// The default, so a `PowerInfo` nobody filled in claims nothing.
+    #[default]
+    Unknown,
+}
+
+/// One temperature sensor, as `sysinfo` reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThermalInfo {
+    /// The sensor's own name — chip and channel, e.g. `k10temp Tctl`. Left
+    /// exactly as the platform gives it: these are searchable strings, and
+    /// prettifying them would only make them harder to look up.
+    pub label: String,
+    pub celsius: f32,
+    /// The temperature at which the platform says this component halts or
+    /// throttles hard, when it declares one. Most sensors do not.
+    pub critical_celsius: Option<f32>,
+}
+
+impl ThermalInfo {
+    /// How far this sensor is from its own critical threshold, as a fraction
+    /// — `1.0` being at it. `None` when the platform declares no threshold,
+    /// which is the common case and is not the same as "plenty of room".
+    pub fn critical_fraction(&self) -> Option<f32> {
+        self.critical_celsius
+            .filter(|c| *c > 0.0)
+            .map(|c| self.celsius / c)
+    }
+}
+
+/// Power source, battery charge, and temperature sensors.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PowerInfo {
+    pub source: PowerSource,
+    /// Battery charge, 0–100, when the machine has a battery that reports
+    /// one. `None` on a desktop, and on a laptop whose platform will not say.
+    pub battery_percent: Option<u8>,
+    /// Sensors that reported a real reading, **warmest first**. Empty where
+    /// the platform exposes none, which is normal in a container and on some
+    /// virtualised hosts.
+    pub thermals: Vec<ThermalInfo>,
+}
+
+impl PowerInfo {
+    /// The warmest sensor, or `None` where nothing reported.
+    pub fn warmest(&self) -> Option<&ThermalInfo> {
+        self.thermals.first()
+    }
+}
+
+/// Detects power source, battery charge, and temperature sensors.
+///
+/// **Temperatures come from `sysinfo`; the battery does not.** `sysinfo`
+/// exposes components and their temperatures on every platform this targets,
+/// which is worth having rather than writing three sysfs/SMC/WMI readers by
+/// hand — but it has no battery or AC-line API at all, at any version, so
+/// that half is per-platform below.
+pub fn detect_power() -> PowerInfo {
+    let mut thermals: Vec<ThermalInfo> = sysinfo::Components::new_with_refreshed_list()
+        .list()
+        .iter()
+        .filter_map(|component| {
+            // A sensor present but not reporting comes back `None`, and one
+            // reporting exactly 0 °C is a sensor that is not wired up rather
+            // than a component at freezing — the integrated GPU's memory
+            // channel does this. Neither belongs in a report about heat.
+            let celsius = component.temperature()?;
+            (celsius > 0.0).then(|| ThermalInfo {
+                label: component.label().to_string(),
+                celsius,
+                critical_celsius: component.critical().filter(|c| c.is_finite() && *c > 0.0),
+            })
+        })
+        .collect();
+    // Warmest first: the only sensor anybody acts on is the one closest to
+    // its limit, and a machine can report a dozen.
+    thermals.sort_by(|a, b| {
+        b.celsius
+            .partial_cmp(&a.celsius)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let (source, battery_percent) = detect_power_source();
+    PowerInfo {
+        source,
+        battery_percent,
+        thermals,
+    }
+}
+
+/// Linux: `/sys/class/power_supply`, the same interface every desktop
+/// battery indicator reads.
+///
+/// A `Mains` supply that is `online` settles it outright — that is the AC
+/// adapter reporting itself connected, and it is authoritative whatever the
+/// battery says. Only with no mains supply online does a battery's own
+/// `status` decide, because a laptop that is plugged in but has a full
+/// battery reports `Not charging`, which must not read as "on battery".
+#[cfg(target_os = "linux")]
+fn detect_power_source() -> (PowerSource, Option<u8>) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        return (PowerSource::Unknown, None);
+    };
+    let read = |dir: &std::path::Path, name: &str| -> Option<String> {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+
+    let mut mains_online = false;
+    let mut battery_percent = None;
+    let mut battery_discharging = false;
+
+    let mut dirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        match read(&dir, "type").as_deref() {
+            Some("Mains") => mains_online |= read(&dir, "online").as_deref() == Some("1"),
+            Some("Battery") => {
+                battery_percent = battery_percent.or_else(|| {
+                    read(&dir, "capacity").and_then(|c| c.parse::<u8>().ok().map(|p| p.min(100)))
+                });
+                battery_discharging |= read(&dir, "status").as_deref() == Some("Discharging");
+            }
+            _ => {}
+        }
+    }
+
+    (
+        classify_power_source(mains_online, battery_discharging),
+        battery_percent,
+    )
+}
+
+/// Turns "is an AC line connected" and "is a battery draining" into a
+/// [`PowerSource`].
+///
+/// Split out from the `sysfs` walk above because the walk is unremarkable and
+/// this is where the one real trap is: a laptop that is plugged in with a full
+/// battery reports its battery `status` as **`Not charging`**, not
+/// `Charging`. Deciding from the battery alone would therefore have to treat
+/// `Not charging` as mains and `Discharging` as battery, which reads
+/// backwards and is easy to get inverted. Asking the AC line first removes
+/// the question — an adapter reporting itself online is authoritative,
+/// whatever the battery is doing.
+///
+/// A machine with neither an AC line nor a draining battery is a desktop, a
+/// server, or a container, and `Mains` is the right answer for all three:
+/// every caller uses this to ask "is my power about to run out", and there
+/// the answer is no.
+///
+/// Compiled into the tests on every platform, not just the one that calls it,
+/// so the rule is checked wherever the suite runs.
+#[cfg(any(target_os = "linux", test))]
+fn classify_power_source(mains_online: bool, battery_discharging: bool) -> PowerSource {
+    if !mains_online && battery_discharging {
+        PowerSource::Battery
+    } else {
+        PowerSource::Mains
+    }
+}
+
+/// macOS: `pmset -g batt`, whose first line names the source
+/// (`'AC Power'` / `'Battery Power'`) and whose second carries the
+/// percentage. Parsed rather than read from IOKit for the same reason
+/// `detect_macos_gpus` shells out to `system_profiler`: no extra dependency,
+/// and the tool is present on every install.
+#[cfg(target_os = "macos")]
+fn detect_power_source() -> (PowerSource, Option<u8>) {
+    let Ok(output) = std::process::Command::new("pmset")
+        .args(["-g", "batt"])
+        .output()
+    else {
+        return (PowerSource::Unknown, None);
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let source = if text.contains("'AC Power'") {
+        PowerSource::Mains
+    } else if text.contains("'Battery Power'") {
+        PowerSource::Battery
+    } else {
+        // No battery at all — a desktop Mac prints no source line.
+        PowerSource::Mains
+    };
+    let percent = text
+        .split_whitespace()
+        .find_map(|word| word.strip_suffix("%;").or_else(|| word.strip_suffix('%')))
+        .and_then(|n| n.parse::<u8>().ok())
+        .map(|p| p.min(100));
+    (source, percent)
+}
+
+/// Windows: `GetSystemPowerStatus`, declared here rather than pulled in.
+///
+/// The rest of this module reaches Windows through PowerShell because WMI is
+/// the only way to the data it wants. This is not that: `GetSystemPowerStatus`
+/// is a single `kernel32` call filling a six-field struct, and it is *the*
+/// canonical answer to "am I on mains" — going through PowerShell instead
+/// would spawn a process costing several hundred milliseconds, on the startup
+/// path, to learn one byte. The declaration is three lines and the ABI has
+/// been fixed since Windows 95, so there is nothing here a crate would carry
+/// for us.
+#[cfg(target_os = "windows")]
+fn detect_power_source() -> (PowerSource, Option<u8>) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+
+    let mut status = SystemPowerStatus::default();
+    // SAFETY: `GetSystemPowerStatus` writes at most `sizeof(SYSTEM_POWER_STATUS)`
+    // bytes into the pointer it is given, and `status` is exactly that layout,
+    // owned here, and outlives the call.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return (PowerSource::Unknown, None);
+    }
+
+    // 255 means the percentage is unknown; anything above 100 is not a
+    // percentage either way.
+    let percent = (status.battery_life_percent <= 100).then_some(status.battery_life_percent);
+    // Bit 7 of `battery_flag` is "no system battery" — a desktop, which is
+    // `Mains` for every purpose here whatever the AC line says.
+    if status.battery_flag & 128 != 0 {
+        return (PowerSource::Mains, None);
+    }
+    let source = match status.ac_line_status {
+        0 => PowerSource::Battery,
+        1 => PowerSource::Mains,
+        // 255, documented as "unknown status".
+        _ => PowerSource::Unknown,
+    };
+    (source, percent)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn detect_power_source() -> (PowerSource, Option<u8>) {
+    (PowerSource::Unknown, None)
+}
+
 pub fn detect_cpu() -> CpuInfo {
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing()
@@ -605,13 +870,113 @@ pub fn performance_advisories() -> Vec<String> {
     Vec::new()
 }
 
+/// How close to its critical threshold a sensor has to be before the report
+/// says anything.
+///
+/// Set where it is because the point is to explain *throughput*, not to warn
+/// about hardware. Silicon throttles well before it halts, so a component at
+/// nine tenths of the temperature at which the platform would shut it down is
+/// already losing clock, and that is the thing a reader watching slow tokens
+/// needs told. Below it, a warm machine is just a machine doing work.
+const THERMAL_ADVISORY_FRACTION: f32 = 0.9;
+
+/// Machine state that will hold throughput down, in words a reader can act
+/// on. Empty when there is nothing to say, which is the normal case on a
+/// plugged-in machine that is not already hot.
+///
+/// Separate from [`performance_advisories`] because the two are different
+/// kinds of finding. Those are settings, they are Linux-only, and every one
+/// of them ships the `sudo` line that fixes it. These are conditions: they
+/// hold on every platform, and neither of them has a command as an answer —
+/// one is answered by a cable and the other by airflow. Reporting them
+/// together and fixing neither is the honest arrangement.
+pub fn power_advisories(power: &PowerInfo) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if power.source == PowerSource::Battery {
+        let charge = power
+            .battery_percent
+            .map(|p| format!(" ({p}% remaining)"))
+            .unwrap_or_default();
+        out.push(format!(
+            "Running on battery{charge}. Sustained decode is exactly the workload platform power \
+             management clocks down, so throughput here is not what this machine does on mains — \
+             and a long generation will empty the battery. Plug in before measuring anything."
+        ));
+    }
+
+    // Only the warmest sensor, however many are close. A reader acts on the
+    // hottest component; listing five is a wall of text saying one thing.
+    if let Some(hot) = power.thermals.iter().find(|t| {
+        t.critical_fraction()
+            .is_some_and(|f| f >= THERMAL_ADVISORY_FRACTION)
+    }) {
+        out.push(format!(
+            "{} is at {:.1} °C, against a critical {:.1} °C, before any work has started. \
+             Sustained decode will thermally throttle from here, which reads as the engine being \
+             slow rather than as the machine being hot.",
+            hot.label,
+            hot.celsius,
+            hot.critical_celsius.unwrap_or_default(),
+        ));
+    }
+
+    out
+}
+
 /// The whole `orangu-server system` report: the OS section (formatted by
 /// [`crate::os::format_section`], which owns everything OS-level), then this
 /// module's CPU and GPU inventory. The OS comes first because it frames how
 /// the two below it should be read — a container memory limit or a WSL2
 /// kernel says more about what a model will do on this machine than its core
 /// count does.
-pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
+/// How many sensors the report lists.
+///
+/// A laptop reports nine and a server can report dozens, nearly all of them
+/// telling the reader nothing — an idle NVMe controller is not why decode is
+/// slow. Three is enough to show the CPU, the GPU and whatever is unexpectedly
+/// above both, which is the whole diagnostic value on offer.
+const SENSORS_REPORTED: usize = 3;
+
+/// The `POWER` section: where the machine is drawing from, and how hot it is
+/// before any work starts.
+///
+/// Skipped entirely when there is nothing to say — no sensors and an unknown
+/// source, which is the normal state inside a container. An empty heading is
+/// worse than no heading.
+fn format_power_section(power: &PowerInfo) -> String {
+    if power.thermals.is_empty() && power.source == PowerSource::Unknown {
+        return String::new();
+    }
+    let mut out = String::from("\nPOWER\n");
+    let source = match power.source {
+        PowerSource::Mains => "Mains".to_string(),
+        PowerSource::Battery => "Battery".to_string(),
+        // Named as the non-answer it is, so nobody reads a blank as "mains".
+        PowerSource::Unknown => "Unknown".to_string(),
+    };
+    let charge = power
+        .battery_percent
+        .map(|p| format!(" (battery {p}%)"))
+        .unwrap_or_default();
+    out.push_str(&format!("  Source           : {source}{charge}\n"));
+
+    for sensor in power.thermals.iter().take(SENSORS_REPORTED) {
+        // The critical figure only when the platform declares one — printing
+        // "critical n/a" on every line would bury the sensors that have one.
+        let critical = sensor
+            .critical_celsius
+            .map(|c| format!(" (critical {c:.1} °C)"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {:<17}: {:.1} °C{critical}\n",
+            sensor.label, sensor.celsius
+        ));
+    }
+    out
+}
+
+pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo], power: &PowerInfo) -> String {
     let mut out = crate::os::format_section(os);
     out.push('\n');
     out.push_str("CPU\n");
@@ -653,6 +1018,8 @@ pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
         "  AVX512           : {}\n",
         yes_no(cpu.features.avx512f)
     ));
+
+    out.push_str(&format_power_section(power));
 
     // No GPU at all means no GPU section: a heading over a single "none
     // found" line is two lines of report saying nothing the reader can act
@@ -742,7 +1109,7 @@ mod tests {
     /// there, so it also ends without a trailing blank line.
     #[test]
     fn the_gpu_section_is_omitted_when_no_gpu_was_detected() {
-        let report = format_report(&crate::os::detect(), &cpu(), &[]);
+        let report = format_report(&crate::os::detect(), &cpu(), &[], &PowerInfo::default());
         assert!(
             !report.contains("\nGPU\n"),
             "unexpected GPU section:\n{report}"
@@ -758,7 +1125,7 @@ mod tests {
     /// the CPU and GPU inventories under it should be read.
     #[test]
     fn the_os_section_comes_first() {
-        let report = format_report(&crate::os::detect(), &cpu(), &[]);
+        let report = format_report(&crate::os::detect(), &cpu(), &[], &PowerInfo::default());
         assert!(report.starts_with("OS\n"), "report:\n{report}");
         assert!(
             report.find("\nCPU\n") < report.find("\nGPU\n").or(Some(usize::MAX)),
@@ -774,6 +1141,7 @@ mod tests {
             &crate::os::detect(),
             &cpu(),
             &[gpu(MemoryKind::Dedicated, Some(4 * 1024 * 1024 * 1024))],
+            &PowerInfo::default(),
         );
         assert!(report.contains("\nGPU\n"), "report:\n{report}");
         assert!(report.contains("[0] Test GPU"), "report:\n{report}");
@@ -860,5 +1228,175 @@ mod tests {
             windows_memory_kind("AMD Radeon(TM) Graphics"),
             MemoryKind::Unknown
         );
+    }
+
+    fn sensor(label: &str, celsius: f32, critical: Option<f32>) -> ThermalInfo {
+        ThermalInfo {
+            label: label.to_string(),
+            celsius,
+            critical_celsius: critical,
+        }
+    }
+
+    /// The one case worth pinning: a laptop that is plugged in with a full
+    /// battery reports `Not charging`, not `Charging`.
+    ///
+    /// Deciding from the battery alone means reading `Not charging` as
+    /// "on mains", which is the sort of double negative that gets inverted
+    /// and would have every desk-bound laptop told it was running down a
+    /// battery. Asking the AC line first is what avoids it, so this asserts
+    /// the AC line wins in every combination.
+    #[test]
+    fn a_connected_adapter_settles_the_power_source_whatever_the_battery_says() {
+        // Plugged in: full ("Not charging"), charging, and even the odd case
+        // of draining under too weak a charger.
+        assert_eq!(classify_power_source(true, false), PowerSource::Mains);
+        assert_eq!(classify_power_source(true, true), PowerSource::Mains);
+        // Unplugged and draining is the only battery answer.
+        assert_eq!(classify_power_source(false, true), PowerSource::Battery);
+        // No AC line and nothing draining: a desktop, a server, or a
+        // container. Nothing is going to run out, which is what every caller
+        // means by mains.
+        assert_eq!(classify_power_source(false, false), PowerSource::Mains);
+    }
+
+    /// Being on battery is worth interrupting for; being on mains is not.
+    #[test]
+    fn only_battery_power_raises_an_advisory() {
+        let on_battery = PowerInfo {
+            source: PowerSource::Battery,
+            battery_percent: Some(64),
+            thermals: Vec::new(),
+        };
+        let notes = power_advisories(&on_battery);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("battery"), "{notes:?}");
+        assert!(notes[0].contains("64%"), "{notes:?}");
+
+        assert!(
+            power_advisories(&PowerInfo {
+                source: PowerSource::Mains,
+                battery_percent: Some(64),
+                thermals: Vec::new(),
+            })
+            .is_empty()
+        );
+        // An unknown source must not be reported as a problem: not finding
+        // out is not the same as finding something wrong.
+        assert!(power_advisories(&PowerInfo::default()).is_empty());
+    }
+
+    /// A warm machine is a machine doing work; a machine near its own
+    /// shutdown threshold is about to lose clock. Only the second is worth a
+    /// line, and only against a threshold the platform actually declared.
+    #[test]
+    fn a_thermal_advisory_needs_a_declared_critical_and_real_proximity() {
+        let near = PowerInfo {
+            source: PowerSource::Mains,
+            battery_percent: None,
+            thermals: vec![sensor("gpu junction", 95.0, Some(100.0))],
+        };
+        let notes = power_advisories(&near);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("gpu junction"), "{notes:?}");
+        assert!(notes[0].contains("throttle"), "{notes:?}");
+
+        // Warm, but with room — no note.
+        assert!(
+            power_advisories(&PowerInfo {
+                thermals: vec![sensor("gpu junction", 80.0, Some(100.0))],
+                source: PowerSource::Mains,
+                battery_percent: None,
+            })
+            .is_empty()
+        );
+        // Hot, but the platform declared no threshold, so there is no
+        // proximity to claim. Most sensors are in this state, and inventing a
+        // fixed limit for them would fire on machines that are perfectly fine.
+        assert!(
+            power_advisories(&PowerInfo {
+                thermals: vec![sensor("cpu package", 95.0, None)],
+                source: PowerSource::Mains,
+                battery_percent: None,
+            })
+            .is_empty()
+        );
+    }
+
+    /// However many sensors are close, the reader gets the hottest one. A
+    /// machine can report a dozen and they all say the same thing.
+    #[test]
+    fn the_thermal_advisory_names_one_sensor_not_every_hot_one() {
+        let notes = power_advisories(&PowerInfo {
+            source: PowerSource::Mains,
+            battery_percent: None,
+            thermals: vec![
+                sensor("hottest", 99.0, Some(100.0)),
+                sensor("also hot", 96.0, Some(100.0)),
+                sensor("hot too", 95.0, Some(100.0)),
+            ],
+        });
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("hottest"), "{notes:?}");
+    }
+
+    /// The section reports what it found and disappears when it found
+    /// nothing — an empty `POWER` heading is worse than no heading, and a
+    /// container reports neither a power source nor a sensor.
+    #[test]
+    fn the_power_section_is_omitted_when_nothing_is_known() {
+        assert!(format_power_section(&PowerInfo::default()).is_empty());
+
+        let section = format_power_section(&PowerInfo {
+            source: PowerSource::Battery,
+            battery_percent: Some(98),
+            thermals: vec![
+                sensor("a", 90.0, Some(100.0)),
+                sensor("b", 80.0, None),
+                sensor("c", 70.0, None),
+                sensor("d", 60.0, None),
+            ],
+        });
+        assert!(
+            section.contains("Source           : Battery (battery 98%)"),
+            "{section}"
+        );
+        assert!(section.contains("(critical 100.0 °C)"), "{section}");
+        // Capped, and it is the coolest that gets dropped.
+        assert!(section.contains("a "), "{section}");
+        assert!(!section.contains("\n  d "), "{section}");
+    }
+
+    /// An unknown source is printed as unknown rather than left blank, so a
+    /// reader never takes a missing line for "you are plugged in".
+    #[test]
+    fn an_unknown_power_source_is_named_rather_than_omitted() {
+        let section = format_power_section(&PowerInfo {
+            source: PowerSource::Unknown,
+            battery_percent: None,
+            thermals: vec![sensor("a", 40.0, None)],
+        });
+        assert!(section.contains("Source           : Unknown"), "{section}");
+    }
+
+    /// Whatever this machine is, detection must not panic and must not
+    /// report a temperature that is obviously not one.
+    #[test]
+    fn detect_power_returns_something_sane_on_this_machine() {
+        let power = detect_power();
+        for sensor in &power.thermals {
+            assert!(
+                sensor.celsius > 0.0 && sensor.celsius < 200.0,
+                "implausible sensor: {sensor:?}"
+            );
+        }
+        // Warmest first, which is what makes `warmest` and the advisory the
+        // same sensor.
+        for pair in power.thermals.windows(2) {
+            assert!(pair[0].celsius >= pair[1].celsius, "{:?}", power.thermals);
+        }
+        if let Some(percent) = power.battery_percent {
+            assert!(percent <= 100);
+        }
     }
 }

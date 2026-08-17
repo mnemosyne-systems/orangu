@@ -379,7 +379,14 @@ impl Coordinator {
             .timeout(HEALTH_CHECK_TIMEOUT)
             .send()
             .await;
-        if probe.is_ok_and(|response| response.status().is_success()) {
+        // **Any** HTTP response proves the process is there — including one
+        // that refuses. Requiring `is_success` conflates reachability with
+        // authorization, and the moment the server is given an
+        // `[orangu-server].api_key` this unauthenticated probe starts getting
+        // `401`, is read as "stopped answering", and restarts a perfectly
+        // healthy child on every request. The question here is whether the
+        // child is alive, and a `401` answers it.
+        if probe.is_ok() {
             return Ok(entry.origin());
         }
 
@@ -603,9 +610,10 @@ impl Coordinator {
                 .http_client
                 .get(&probe_url)
                 .timeout(HEALTH_CHECK_TIMEOUT);
-            if let Ok(response) = request.send().await
-                && response.status().is_success()
-            {
+            // Any answer means the listener is up and serving, which is what
+            // "ready" means here — a `401` from an authenticated server is a
+            // server that started, not one that failed to.
+            if request.send().await.is_ok() {
                 return Ok(());
             }
 

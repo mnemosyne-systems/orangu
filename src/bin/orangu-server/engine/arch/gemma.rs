@@ -853,7 +853,7 @@ impl GemmaModel {
         // that cannot arise — cheaply, and in the one place a future
         // per-run PLE would have to change.
         let has_ple =
-            per_layer > 0 && layers.start == 0 && std::env::var_os("ORANGU_SKIP_PLE").is_none();
+            per_layer > 0 && layers.start == 0 && (!crate::engine::env::flag_on("ORANGU_SKIP_PLE"));
 
         let ple_buf = if has_ple {
             let gathered = self.gather_per_layer_tok_embd(&[token], 1);
@@ -1847,7 +1847,7 @@ impl GemmaModel {
                     n_dispatch as f64 / self.layers.len() as f64,
                     n_copy as f64 / self.layers.len() as f64,
                 );
-                if std::env::var_os("ORANGU_REPLAY_HISTO").is_some() {
+                if crate::engine::env::flag_on("ORANGU_REPLAY_HISTO") {
                     use std::collections::BTreeMap;
                     let mut histo: BTreeMap<String, u32> = BTreeMap::new();
                     for s in steps.iter() {
@@ -2236,8 +2236,8 @@ impl ModelForward for GemmaModel {
         // it is off by default and kept for capture/replay study.
         // `ORANGU_REPLAY_FORCE` still bypasses the support check for debugging
         // incomplete captures.
-        let force = std::env::var_os("ORANGU_REPLAY_FORCE").is_some();
-        let replay_on = std::env::var_os("ORANGU_REPLAY").is_some();
+        let force = crate::engine::env::flag_on("ORANGU_REPLAY_FORCE");
+        let replay_on = crate::engine::env::flag_on("ORANGU_REPLAY");
         // MoE models never take the fully-fused Vulkan paths (the fused
         // record path is dense-FFN-only) — they run CPU-orchestrated via
         // `Self::forward`'s `else` branch, so short-circuit to it here.
@@ -2926,7 +2926,7 @@ impl GemmaModel {
         // `ORANGU_MOE_ROUTER_IN_JOIN=1` puts it back inside, as the control
         // for that measurement — the hoist has no other switch, and a change
         // this small is not worth believing on a cross-session comparison.
-        let hoist = std::env::var_os("ORANGU_MOE_ROUTER_IN_JOIN").is_none();
+        let hoist = !crate::engine::env::flag_on("ORANGU_MOE_ROUTER_IN_JOIN");
         let hoisted = hoist.then(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
         if n_tokens >= moe_overlap_min_tokens() {
             let (mut result, moe_out) = rayon::join(
@@ -3335,7 +3335,7 @@ fn moe_overlap_min_tokens() -> usize {
 /// started in is what made the routed-FFN submissions invisible.
 pub(crate) fn submission_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ORANGU_PREFILL_TRACE").is_some())
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_TRACE"))
 }
 
 /// One `[prefill-trace]` line, in the format the layer loop already emits.

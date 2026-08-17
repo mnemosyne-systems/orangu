@@ -125,10 +125,24 @@ struct MoeLayer {
     down_shexp: QuantMatrix,
 }
 
+/// A plain two-matrix FFN block — the dense `nemotron_h`'s FFN where
+/// `nemotron_h_moe` routes experts.
+///
+/// Same activation as everything else here (`down(relu(up(x))^2)`, no gate),
+/// which is why this is two tensors and no new arithmetic: the dense file
+/// simply carries `ffn_up`/`ffn_down` where the MoE file carries the routed
+/// and shared expert stacks.
+struct FfnLayer {
+    norm: Vec<f32>,
+    up: QuantMatrix,
+    down: QuantMatrix,
+}
+
 enum Layer {
     Ssm(SsmLayer),
     Attn(AttnLayer),
     Moe(MoeLayer),
+    Ffn(FfnLayer),
 }
 
 pub struct NemotronModel {
@@ -202,13 +216,15 @@ impl NemotronModel {
             "ssm.time_step_rank ({n_ssm_head}) must be a multiple of ssm.group_count ({n_group})"
         );
 
-        let n_expert = loaded
-            .metadata_u64("expert_count")
-            .context("missing expert_count")? as usize;
+        // Absent on the dense sibling, which has no experts to count. `0` is
+        // that file's own answer rather than a fallback, and it is what
+        // selects the dense FFN branch below — so it must not be an error
+        // here, and equally must not be invented for a file that *is* MoE
+        // (one declaring routed blocks without an `expert_count` fails on
+        // the router width instead, where the number is checked).
+        let n_expert = loaded.metadata_u64("expert_count").unwrap_or(0) as usize;
         let routing = ExpertRouting {
-            n_expert_used: loaded
-                .metadata_u64("expert_used_count")
-                .context("missing expert_used_count")? as usize,
+            n_expert_used: loaded.metadata_u64("expert_used_count").unwrap_or(0) as usize,
             // Fixed by the architecture rather than read from the file,
             // which carries no `expert_gating_func` key for it.
             gating: ExpertGating::Sigmoid,
@@ -274,7 +290,20 @@ impl NemotronModel {
             };
 
             let norm = get("attn_norm.weight")?;
-            if n_ff[i] != 0 {
+            if n_ff[i] != 0 && n_expert == 0 {
+                // The dense sibling: this block's FFN is two ordinary
+                // matrices where the MoE file stacks experts. Chosen on
+                // `expert_count` rather than on the architecture string,
+                // because it is the file's own statement about what its FFN
+                // blocks contain — and a file declaring no experts whose
+                // blocks were read as routed would fail on a tensor that
+                // does not exist.
+                layers.push(Layer::Ffn(FfnLayer {
+                    norm,
+                    up: get_matrix("ffn_up.weight")?,
+                    down: get_matrix("ffn_down.weight")?,
+                }));
+            } else if n_ff[i] != 0 {
                 let up_exps = get_expert_matrix("ffn_up_exps.weight")?;
                 anyhow::ensure!(
                     up_exps.n_expert == n_expert,
@@ -397,6 +426,10 @@ impl ModelForward for NemotronModel {
         &self.config
     }
 
+    fn n_trunk_layer(&self) -> usize {
+        self.layers.len()
+    }
+
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         let kv_dims: Vec<usize> = self
             .layers
@@ -452,12 +485,14 @@ impl ModelForward for NemotronModel {
                 Layer::Ssm(l) => &l.norm,
                 Layer::Attn(l) => &l.norm,
                 Layer::Moe(l) => &l.norm,
+                Layer::Ffn(l) => &l.norm,
             };
             tensor::rmsnorm_inplace(&mut normed, norm, n_tokens, n_embd, self.rms_eps);
             let sub_out = match layer {
                 Layer::Ssm(l) => self.ssm_block(l, cache, &normed, n_tokens),
                 Layer::Attn(l) => self.attn_block(l, cache, &normed, n_tokens, start_pos),
                 Layer::Moe(l) => self.moe_block(l, &normed, n_tokens),
+                Layer::Ffn(l) => self.ffn_block(l, &normed, n_tokens),
             };
             tensor::add_inplace(&mut x, &sub_out);
         }
@@ -763,6 +798,22 @@ impl NemotronModel {
     }
 }
 
+impl NemotronModel {
+    /// `down(relu(up(x))^2)`, the dense counterpart of [`Self::moe_block`]'s
+    /// shared-expert branch.
+    ///
+    /// Through `matmul_host_fallback` for the same reason that branch is:
+    /// these are ordinary per-layer weights rather than stacked experts, but
+    /// a quantization the device has no kernel for still has to reach the
+    /// host rather than panic inside the backend.
+    fn ffn_block(&self, layer: &FfnLayer, normed: &[f32], n_tokens: usize) -> Vec<f32> {
+        let mut up =
+            super::matmul_host_fallback(self.backend.as_ref(), normed, n_tokens, &layer.up);
+        relu_squared(&mut up);
+        super::matmul_host_fallback(self.backend.as_ref(), &up, n_tokens, &layer.down)
+    }
+}
+
 /// This architecture's FFN activation, in place: `max(0, x)^2`.
 ///
 /// Squaring after the clamp, not `x * |x|` or `x * relu(x)` — negatives are
@@ -783,5 +834,30 @@ mod tests {
         let mut x = [-2.0f32, -0.5, 0.0, 0.5, 3.0];
         relu_squared(&mut x);
         assert_eq!(x, [0.0, 0.0, 0.0, 0.25, 9.0]);
+    }
+
+    /// The dense and MoE siblings are told apart by the file's own
+    /// `expert_count`, not by its architecture string.
+    ///
+    /// Both declare `nemotron_h*` and share every other tensor in the trunk;
+    /// what differs is whether an FFN block carries `ffn_up`/`ffn_down` or a
+    /// stack of experts. Reading that from `general.architecture` instead
+    /// would be a second source of truth for something the file already
+    /// states — and the string is exactly what a mislabelled conversion gets
+    /// wrong.
+    #[test]
+    fn a_file_declaring_no_experts_selects_the_dense_ffn() {
+        // `metadata_u64` answering `None` is the dense file's own statement;
+        // `Some(0)` would be a file that declares zero experts, which means
+        // the same thing. Both must take the dense branch, and any positive
+        // count must not.
+        for (declared, dense) in [(None, true), (Some(0u64), true), (Some(128), false)] {
+            let n_expert = declared.unwrap_or(0) as usize;
+            assert_eq!(
+                n_expert == 0,
+                dense,
+                "expert_count {declared:?} chose the wrong FFN branch"
+            );
+        }
     }
 }

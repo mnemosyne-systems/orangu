@@ -51,11 +51,110 @@ pub struct SlotPool {
     /// Signalled when any slot is released, so [`SlotPool::acquire`] — which
     /// wants *whichever* slot frees first — can wait without polling.
     released: Notify,
+    /// Ticketing for [`SlotPool::acquire`], so waiters are served in the order
+    /// they arrived.
+    ///
+    /// Without it the wait is a scramble: a released slot wakes one sleeper,
+    /// which then rescans — and a request that arrived in the meantime can
+    /// call `try_take_any` first and take the slot out from under it. Under
+    /// steady load that is unbounded waiting for whoever is unlucky, with
+    /// nothing in the system that would ever report it.
+    ///
+    /// Not solvable with a global semaphore, fair though `tokio`'s is:
+    /// [`SlotPool::acquire_slot`] bypasses admission by design (a pinned
+    /// request is waiting for one specific slot's warm cache), so a global
+    /// permit count would drift out of step with the slots actually free —
+    /// the failure this pool's own comment above records having removed one
+    /// for.
+    admission: Mutex<Admission>,
+    /// How many waiters [`SlotPool::acquire`] will hold before refusing.
+    /// `0` means unbounded, which is the previous behaviour.
+    max_queue: usize,
+}
+
+/// The ticket dispenser. Only the holder of `serving` may take a slot, which
+/// is what makes the order first-come-first-served rather than first-to-wake.
+#[derive(Default)]
+struct Admission {
+    next: u64,
+    serving: u64,
+    /// Waiters holding a ticket and not yet served — the queue depth an
+    /// operator can see and an admission limit is compared against.
+    depth: usize,
+}
+
+/// A place in the admission queue.
+///
+/// Its `Drop` is the load-bearing part: a waiter can vanish at any moment —
+/// the client hung up, the request timed out, the runtime cancelled the task —
+/// and a ticket that outlived its holder would leave `serving` pointing at a
+/// number nobody will ever claim, stalling every request behind it for the
+/// life of the process. Releasing it on drop makes cancellation safe by
+/// construction rather than by remembering.
+struct Ticket {
+    pool: Arc<SlotPool>,
+    number: u64,
+    /// Set once this ticket has taken a slot, so `Drop` knows whether to
+    /// advance `serving` (it already did) or to step over an abandoned place.
+    served: bool,
+}
+
+impl Ticket {
+    /// Whether it is this ticket's turn.
+    fn is_serving(&self) -> bool {
+        self.pool.admission.lock().unwrap().serving == self.number
+    }
+
+    /// Records that this ticket claimed a slot and hands the queue on.
+    fn serve(&mut self) {
+        self.served = true;
+        let mut admission = self.pool.admission.lock().unwrap();
+        admission.serving = admission.serving.max(self.number + 1);
+        admission.depth = admission.depth.saturating_sub(1);
+        // The guard is dropped before waking anyone, so a woken waiter does
+        // not immediately block on a lock this thread still holds.
+        drop(admission);
+        self.pool.released.notify_waiters();
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if self.served {
+            return;
+        }
+        let mut admission = self.pool.admission.lock().unwrap();
+        // Step over this place if it was at the head, so the next waiter is
+        // not blocked behind a request that no longer exists.
+        admission.serving = admission.serving.max(self.number + 1);
+        admission.depth = admission.depth.saturating_sub(1);
+        drop(admission);
+        self.pool.released.notify_waiters();
+    }
 }
 
 impl SlotPool {
+    /// An unbounded pool. Test-only since production reads
+    /// `[orangu-server].queue_limit` and goes through
+    /// [`with_queue_limit`](Self::with_queue_limit); kept because a test
+    /// saying `new(2)` reads better than one repeating `, 0` it does not care
+    /// about.
+    #[cfg(test)]
     pub fn new(n: usize) -> Arc<Self> {
+        Self::with_queue_limit(n, 0)
+    }
+
+    /// A pool that refuses a request once `max_queue` are already waiting.
+    ///
+    /// `0` keeps the previous unbounded behaviour. A bound is what turns
+    /// overload from "every client waits, indefinitely, with no signal" into
+    /// an answer the caller can act on — a `503` arriving in milliseconds is
+    /// more useful than a token arriving in minutes, and it is the difference
+    /// between a queue and a pile.
+    pub fn with_queue_limit(n: usize, max_queue: usize) -> Arc<Self> {
         Arc::new(Self {
+            admission: Mutex::new(Admission::default()),
+            max_queue,
             slots: (0..n)
                 .map(|id| {
                     Mutex::new(SlotState {
@@ -87,23 +186,80 @@ impl SlotPool {
 
     /// Waits for whichever slot frees first, marks it busy, and returns a
     /// guard that releases it on drop.
+    /// [`try_acquire`](Self::try_acquire) on a pool that cannot refuse.
+    ///
+    /// Test-only for the same reason as [`new`](Self::new): production has an
+    /// admission limit to honour and must handle a refusal.
+    #[cfg(test)]
     pub async fn acquire(self: &Arc<Self>) -> SlotGuard {
+        self.try_acquire()
+            .await
+            .expect("an unbounded pool never refuses")
+    }
+
+    /// [`SlotPool::acquire`], returning `None` when the queue is already full.
+    ///
+    /// Waiters are served **in arrival order**. A ticket is taken up front and
+    /// only its holder may claim a slot, so a request that arrives while
+    /// someone is asleep cannot take the slot they were woken for.
+    ///
+    /// The ticket is released on drop, which matters more than it looks:
+    /// dropping this future is exactly what a disconnected client does, and a
+    /// cancelled waiter that kept its ticket would stall everyone behind it
+    /// forever.
+    pub async fn try_acquire(self: &Arc<Self>) -> Option<SlotGuard> {
+        let mut ticket = self.take_ticket()?;
         loop {
-            if let Some((index, lock)) = self.try_take_any() {
+            if ticket.is_serving()
+                && let Some((index, lock)) = self.try_take_any()
+            {
                 self.mark_busy(index);
-                return SlotGuard {
+                ticket.serve();
+                return Some(SlotGuard {
                     pool: self.clone(),
                     index,
                     lock: Some(lock),
-                };
+                });
             }
             // `notify_one` (not `notify_waiters`) on the release side, so a
             // slot freed between the scan above and this await stores a
             // permit rather than being missed — the woken waiter simply
             // rescans. Without that, a release landing in the gap would
             // leave a request asleep next to an idle slot.
+            //
+            // Registered *before* the checks above would be tidier, but the
+            // ticket makes it unnecessary: a waiter that is not yet at the
+            // head has nothing to race for, and the head is woken by every
+            // release.
             self.released.notified().await;
         }
+    }
+
+    /// Takes a queue ticket, or `None` when the queue is full.
+    fn take_ticket(self: &Arc<Self>) -> Option<Ticket> {
+        let mut admission = self.admission.lock().unwrap();
+        if self.max_queue > 0 && admission.depth >= self.max_queue {
+            return None;
+        }
+        let number = admission.next;
+        admission.next += 1;
+        admission.depth += 1;
+        Some(Ticket {
+            pool: self.clone(),
+            number,
+            served: false,
+        })
+    }
+
+    /// Waiters holding a ticket right now — queue depth, for `/metrics` and
+    /// for anyone deciding whether this server is the bottleneck.
+    pub fn queued(&self) -> usize {
+        self.admission.lock().unwrap().depth
+    }
+
+    /// The configured admission limit, `0` for unbounded.
+    pub fn queue_limit(&self) -> usize {
+        self.max_queue
     }
 
     fn try_take_any(&self) -> Option<(usize, OwnedSemaphorePermit)> {
@@ -237,6 +393,187 @@ mod tests {
     /// a busy slot while unpinned requests keep arriving. `acquire` takes its
     /// concurrency permit before looking for a lock, and whoever holds the
     /// contended lock already holds a permit, so everyone makes progress.
+    /// Overload has to be answerable. With a bound, the request beyond it is
+    /// refused in microseconds instead of joining a pile nothing measures.
+    #[tokio::test]
+    async fn a_full_queue_refuses_instead_of_growing() {
+        let pool = SlotPool::with_queue_limit(1, 2);
+        let _busy = pool.acquire().await;
+
+        // Two waiters fill the queue.
+        let a = tokio::spawn({
+            let p = pool.clone();
+            async move { p.try_acquire().await.is_some() }
+        });
+        let b = tokio::spawn({
+            let p = pool.clone();
+            async move { p.try_acquire().await.is_some() }
+        });
+        // Give both a chance to take their tickets before asking about depth.
+        for _ in 0..100 {
+            if pool.queued() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pool.queued(), 2, "both waiters should be queued");
+
+        // The third is refused rather than queued.
+        assert!(
+            pool.try_acquire().await.is_none(),
+            "a full queue must refuse"
+        );
+
+        drop(_busy);
+        assert!(
+            a.await.unwrap() && b.await.unwrap(),
+            "queued waiters served"
+        );
+    }
+
+    /// An unbounded pool is the previous behaviour and must stay reachable —
+    /// a limit nobody asked for would turn working deployments into ones that
+    /// start refusing.
+    #[tokio::test]
+    async fn an_unbounded_pool_never_refuses() {
+        let pool = SlotPool::new(1);
+        let _busy = pool.acquire().await;
+        assert_eq!(pool.queue_limit(), 0);
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let p = pool.clone();
+                tokio::spawn(async move { p.try_acquire().await.is_some() })
+            })
+            .collect();
+        for _ in 0..200 {
+            if pool.queued() == 8 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pool.queued(), 8);
+        drop(_busy);
+        for w in waiters {
+            assert!(w.await.unwrap(), "nobody is refused without a limit");
+        }
+    }
+
+    /// Only the head of the queue may take a slot, even when one is free.
+    ///
+    /// **This is the test that discriminates.** The end-to-end order test
+    /// below does not: with every waiter already asleep, `tokio`'s `Notify`
+    /// wakes them first-in-first-out anyway, so it passes with the ticket
+    /// check removed. What first-to-wake actually loses to is a request
+    /// *arriving* in the gap between a release and the woken waiter's rescan,
+    /// and that race cannot be staged deterministically. So the rule is
+    /// asserted directly instead: a ticket that is not at the head must not be
+    /// serving, however free the pool is.
+    #[test]
+    fn only_the_head_of_the_queue_may_take_a_slot() {
+        let pool = SlotPool::new(4);
+        let first = pool.take_ticket().expect("unbounded");
+        let second = pool.take_ticket().expect("unbounded");
+        assert_eq!(pool.queued(), 2);
+
+        // Four slots are free and `second` still may not take one.
+        assert!(first.is_serving());
+        assert!(!second.is_serving(), "a later arrival must wait its turn");
+
+        drop(first);
+        assert!(second.is_serving(), "the queue advances when the head goes");
+        drop(second);
+        assert_eq!(pool.queued(), 0);
+    }
+
+    /// Waiters are served in arrival order, end to end.
+    ///
+    /// A regression guard for the observable property rather than proof the
+    /// ticket is doing the work — see
+    /// [`only_the_head_of_the_queue_may_take_a_slot`], which is the one that
+    /// fails without it.
+    #[tokio::test]
+    async fn waiters_are_served_in_arrival_order() {
+        let pool = SlotPool::with_queue_limit(1, 0);
+        let busy = pool.acquire().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for i in 0..5u32 {
+            // Each waiter is fully queued before the next one starts, so
+            // arrival order is unambiguous.
+            let p = pool.clone();
+            let seen = order.clone();
+            let want = i as usize + 1;
+            handles.push(tokio::spawn(async move {
+                let guard = p.acquire().await;
+                seen.lock().unwrap().push(i);
+                drop(guard);
+            }));
+            for _ in 0..500 {
+                if pool.queued() == want {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(pool.queued(), want, "waiter {i} did not queue");
+        }
+
+        drop(busy);
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![0, 1, 2, 3, 4],
+            "served out of arrival order"
+        );
+    }
+
+    /// A waiter that goes away must not stall the queue behind it.
+    ///
+    /// This is not hypothetical — dropping the future is exactly what a
+    /// disconnected client does, and a ticket that outlived its holder would
+    /// leave the head pointing at a number nobody will ever claim, hanging
+    /// every later request for the life of the process.
+    #[tokio::test]
+    async fn an_abandoned_waiter_does_not_stall_the_queue() {
+        let pool = SlotPool::with_queue_limit(1, 0);
+        let busy = pool.acquire().await;
+
+        let doomed = tokio::spawn({
+            let p = pool.clone();
+            async move { p.acquire().await }
+        });
+        for _ in 0..500 {
+            if pool.queued() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let behind = tokio::spawn({
+            let p = pool.clone();
+            async move { p.acquire().await.id() }
+        });
+        for _ in 0..500 {
+            if pool.queued() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The head of the queue vanishes.
+        doomed.abort();
+        let _ = doomed.await;
+        drop(busy);
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), behind)
+            .await
+            .expect("the queue stalled behind an abandoned ticket")
+            .unwrap();
+        assert_eq!(served, 0);
+        assert_eq!(pool.queued(), 0, "no ticket should be left behind");
+    }
+
     #[tokio::test]
     async fn a_pinned_waiter_does_not_starve_or_deadlock_unpinned_requests() {
         let pool = SlotPool::new(2);

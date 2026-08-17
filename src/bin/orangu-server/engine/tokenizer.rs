@@ -236,6 +236,9 @@ pub struct Tokenizer {
     /// overhead in the tokenizer hot loop.
     token_to_id: FxHashMap<String, u32>,
     id_to_token: Vec<String>,
+    /// [`Tokenizer::token_bytes`]'s table, built on first use and only when a
+    /// request constrains its output.
+    token_bytes: std::sync::OnceLock<std::sync::Arc<Vec<Vec<u8>>>>,
     /// **Interned** merge table: `(left_id, right_id) -> (rank,
     /// merged_id)`. Keyed by the two operand token *ids*, not their strings, so
     /// the BPE merge loop looks merges up with an 8-byte integer key and never
@@ -516,6 +519,7 @@ impl Tokenizer {
         Ok(Self {
             token_to_id,
             id_to_token: tokens,
+            token_bytes: std::sync::OnceLock::new(),
             merge_map,
             byte_to_char,
             char_to_byte,
@@ -834,31 +838,64 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            if let Some(&b) = self.byte_fallback.get(&id) {
-                bytes.push(b);
-                continue;
-            }
-            let Some(token) = self.id_to_token.get(id as usize) else {
-                continue;
-            };
-            if self.vocab_kind == VocabKind::Gpt2Byte {
-                for ch in token.chars() {
-                    if let Some(&b) = self.char_to_byte.get(&ch) {
-                        bytes.push(b);
-                    }
+            self.append_token_bytes(id, &mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The bytes one token id contributes to decoded output.
+    ///
+    /// Split out of [`decode`](Self::decode) rather than duplicated because
+    /// [`token_bytes`](Self::token_bytes) needs the same answer per token, and
+    /// a second copy of this would be a second opinion on what a token *is* —
+    /// byte-fallback ids, the GPT-2 byte alphabet and `SPM_SPACE` all have to
+    /// be unwound the same way or a constrained decoder would be reasoning
+    /// about text the model is not actually emitting.
+    fn append_token_bytes(&self, id: u32, out: &mut Vec<u8>) {
+        if let Some(&b) = self.byte_fallback.get(&id) {
+            out.push(b);
+            return;
+        }
+        let Some(token) = self.id_to_token.get(id as usize) else {
+            return;
+        };
+        if self.vocab_kind == VocabKind::Gpt2Byte {
+            for ch in token.chars() {
+                if let Some(&b) = self.char_to_byte.get(&ch) {
+                    out.push(b);
                 }
-            } else {
-                for ch in token.chars() {
-                    if ch == SPM_SPACE {
-                        bytes.push(b' ');
-                    } else {
-                        let mut buf = [0u8; 4];
-                        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
+            }
+        } else {
+            for ch in token.chars() {
+                if ch == SPM_SPACE {
+                    out.push(b' ');
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Every token's emitted bytes, indexed by id — built once, on first use.
+    ///
+    /// Only a constrained decoder asks for this, and it asks on every sampled
+    /// token, so the per-id work has to happen once rather than per step.
+    /// Nothing builds it unless a request actually constrains its output.
+    /// The same table, shared. A constrained request holds one for its whole
+    /// life, so it takes a handle rather than borrowing the tokenizer.
+    pub fn token_bytes_shared(&self) -> std::sync::Arc<Vec<Vec<u8>>> {
+        std::sync::Arc::clone(self.token_bytes.get_or_init(|| {
+            std::sync::Arc::new(
+                (0..self.vocab_size() as u32)
+                    .map(|id| {
+                        let mut out = Vec::new();
+                        self.append_token_bytes(id, &mut out);
+                        out
+                    })
+                    .collect(),
+            )
+        }))
     }
 
     /// Cross-token cleanup a `"gemma4"` vocab needs once the *complete*

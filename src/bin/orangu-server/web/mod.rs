@@ -354,7 +354,8 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
         state.backend_label,
         state.workspace.display(),
     );
-    report.push_str(&orangu::hardware::format_report(&os, &cpu, &gpus));
+    let power = orangu::hardware::detect_power();
+    report.push_str(&orangu::hardware::format_report(&os, &cpu, &gpus, &power));
     (
         StatusCode::OK,
         [
@@ -704,6 +705,8 @@ async fn send_message(
     let mut rx = state
         .engine
         .generate(GenerateRequest {
+            // These endpoints have no structured-output field of their own.
+            json_output: false,
             prompt_tokens: tokens,
             sampling: SamplingParams::default(),
             max_tokens: MAX_TOKENS,
@@ -713,6 +716,11 @@ async fn send_message(
             // notion of a slot; any free one is right.
             id_slot: None,
             timings_per_token: false,
+            // The console is served on its own listener, behind its own
+            // `[web].host`, and presents no bearer token — there is no tenant
+            // to charge, and inventing one would put the operator's own
+            // browsing against somebody's budget.
+            charge: None,
         })
         .await;
 
@@ -762,6 +770,11 @@ async fn send_message(
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
                         .data(json!({"type": "done", "html": html, "content": full, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
+                    break;
+                }
+                StreamEvent::Overloaded => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
                     break;
                 }
                 StreamEvent::Error(err) => {

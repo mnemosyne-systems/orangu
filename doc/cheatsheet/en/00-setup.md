@@ -15,8 +15,9 @@ into `~/.local/bin`. On Windows: `install.cmd`.
 
 | Command | What it does |
 | --- | --- |
-| `orangu-server -i` | Configure the server: models directory, role, host, port 8100, web console. |
-| `orangu-server download unsloth/gemma-4-E2B-it-GGUF` | Fetch a model. Append `:Q8_0` to pin a quant; `HF_TOKEN` for gated repos. |
+| `orangu-server -i` | Configure the server: models directory, role, host, port 8100, web console. Answering anything but a loopback `host` also asks for an `api_key`. |
+| `orangu-server download unsloth/gemma-4-E2B-it-GGUF` | Fetch a model, after reporting what it needs to run here. Append `:Q8_0` to pin a quant; `HF_TOKEN` for gated repos; `-y` to skip the cannot-run prompt. |
+| `orangu-server plan 3` | Same report for a model already on disk, by `list` NR. Reads only the headers, so a 434 GiB model takes a moment. |
 | `orangu-server --all unsloth/gemma-4-E2B-it-GGUF` | Serve it on `http://localhost:8100/v1`. Roles: `--all`, `--code`, `--review`, `--explorer`, `--embedding`. |
 | `orangu -i` | Configure orangu. Enter that URL; the wizard reads the model off the server. |
 | `orangu` | Start, in your project directory. |
@@ -26,6 +27,10 @@ into `~/.local/bin`. On Windows: `install.cmd`.
 | Command | What it does |
 | --- | --- |
 | `~/.orangu/` | Holds `orangu.conf`, `orangu-server.conf` and `skills/`. A local `./orangu.conf` wins over it. |
+| `api_key` / `tls_cert` + `tls_key` | `[orangu-server]` keys that close the two gaps before exposing a server: bearer auth (`401` without it) and HTTPS on the same port. `ORANGU_API_KEY` overrides the file. |
+| `[tenant:<name>]` | A named key with `max_concurrent`, `requests_per_minute` and `tokens_per_minute` of its own (`0` = unlimited). Over one, the model endpoints answer `429`. Usage per tenant is on `/metrics`, limits or not. |
+| `/metrics` `/ready` | Prometheus latency histograms (queue wait, time to first token, inter-token) and outcome counters; `/ready` is `503` when the queue is full, where `/health` stays `200`. Both open without an `api_key`. |
+| `draft_model` | Speculative decoding: a smaller model guesses, the served one verifies. Same answer, different speed — and not always faster, so measure. Greedy requests only. |
 | `orangu -w /path/to/project` | Work on another tree. `-r <uuid>` resumes a session, `-l` lists them, `-a` reopens the previous run's tabs, `-p "<prompt>"` runs one prompt and exits. |
 | `orangu -s` | Print the shell completions. |
 | `/help` `/manual` `/model` | Every command, the full manual offline, and model switching — from the prompt. |

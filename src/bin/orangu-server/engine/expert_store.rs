@@ -18,16 +18,25 @@
 //!
 //! A model whose experts do not fit in RAM needs a *policy*: which experts to
 //! keep close, which to let go, and what to fetch before it is asked for.
-//! orangu has no such policy — placement is whatever the OS page cache does
-//! with an `mmap`. This module is the seam that policy will attach to, and its
-//! first implementation is the incumbent: [`MmapExpertStore`], which changes
-//! nothing and *measures* what the page cache is already achieving.
+//! There are two implementations of that here, behind one trait:
 //!
-//! That measurement is the point of building the seam before the policy. A
-//! residency policy is only worth having if it beats the page cache, and the
-//! page cache's own hit rate cannot be compared against a replacement's unless
-//! both are measured through the same interface. Built afterwards, the
-//! comparison would be retrospective and the baseline a reconstruction.
+//! - [`MmapExpertStore`], the incumbent and the default. Weights are read
+//!   straight out of the `mmap` and placement is whatever the kernel decides.
+//!   It is not a placeholder — it is the control arm, and it reports the page
+//!   cache's own hit rate so a replacement is compared against a measurement
+//!   rather than an assumption.
+//! - [`TieredExpertStore`], owned copies of hot experts under a byte budget
+//!   (`ORANGU_EXPERT_CACHE_GB`), replaced by one of the [`Policy`] rules.
+//!   **Off unless asked for**, because on a model that fits in RAM the page
+//!   cache already holds every expert and a tier can only duplicate memory
+//!   and lose.
+//!
+//! Building the seam before the policy is what made the comparison honest: the
+//! baseline is a measurement taken through the same interface as its
+//! replacement, rather than a reconstruction made afterwards. It has since
+//! earned that twice over — the first policy written here, frequency-first
+//! LFRU with an admission margin, **lost to plain LRU at every budget tried**
+//! and the default was flipped on the evidence. `BIG.md`'s M8 has the table.
 //!
 //! # The lease
 //!
@@ -111,6 +120,17 @@ pub struct ExpertStoreStats {
     /// Experts a lookahead asked the kernel to read ahead, and their bytes.
     pub prefetched: u64,
     pub prefetched_bytes: u64,
+    /// Which replacement rule produced these numbers, or `None` for the
+    /// page-cache incumbent, which has no rule of its own.
+    ///
+    /// Reported so a sweep's output says which arm it actually ran rather than
+    /// which arm it was asked to. The policy is chosen from the environment
+    /// once per process, and an environment variable that did not reach the
+    /// server — a typo, a wrapper that dropped it, a stale process still
+    /// holding the port — is invisible in the numbers and produces two arms
+    /// that are secretly the same one. This project has paid for that failure
+    /// before.
+    pub policy: Option<&'static str>,
 }
 
 impl ExpertStoreStats {
@@ -135,6 +155,7 @@ impl ExpertStoreStats {
             "tier_bytes": self.tier_bytes,
             "prefetched": self.prefetched,
             "prefetched_bytes": self.prefetched_bytes,
+            "policy": self.policy,
             "hit_rate": self.hit_rate(),
         })
     }
@@ -309,13 +330,16 @@ impl ExpertStore for MmapExpertStore {
             unmeasured: self.unmeasured.swap(0, Ordering::Relaxed),
             resident_bytes: self.resident_bytes.swap(0, Ordering::Relaxed),
             acquired_bytes: self.acquired_bytes.swap(0, Ordering::Relaxed),
-            // No tier: nothing is admitted, declined, evicted or held.
+            // No tier: nothing is admitted, declined, evicted or held, and
+            // there is no replacement rule to name — placement is the
+            // kernel's, which is the point of this arm.
             admitted: 0,
             declined: 0,
             evicted: 0,
             tier_bytes: 0,
             prefetched: PREFETCHED_EXPERTS.swap(0, Ordering::Relaxed),
             prefetched_bytes: PREFETCHED_BYTES.swap(0, Ordering::Relaxed),
+            policy: None,
         }
     }
 }
@@ -367,12 +391,60 @@ pub enum Policy {
     /// doing what it was designed to do; it is simply the wrong trade here.
     /// See BIG.md's M8 for the table.
     Lfru,
+    /// [`Lfru`](Self::Lfru)'s scoring with [`Lru`](Self::Lru)'s admission:
+    /// frequency decides who leaves, but every miss gets in.
+    ///
+    /// The arm that separates two things M8 could not tell apart. LFRU lost to
+    /// LRU by 12x at a small budget, and its counters implicated the **margin**
+    /// — 42,654 declines against 381 evictions, a cache frozen around whatever
+    /// it admitted first. But the margin and the frequency signal changed
+    /// together, so that run cannot say whether frequency was also wrong. This
+    /// holds the signal and drops the margin, which is the only way to ask.
+    ///
+    /// **Measured, and it beats LRU where the budget is tight**: on a model
+    /// whose experts genuinely do not fit (75 GiB of them against 45 GiB of
+    /// RAM), a 1 GiB tier hits 1.17% under this rule against **0.00%** under
+    /// LRU — recency gets no hits at all there, because a routing pass is a
+    /// scan and LRU evicts everything before it comes round again. So the
+    /// margin was not the only thing wrong with LFRU on the earlier model:
+    /// the frequency signal is doing real work, and which rule wins depends
+    /// on the regime rather than on the rule. `BIG.md` M8 has both tables.
+    Lfu,
     /// Textbook LRU: every miss is admitted, and the least recently used
     /// resident makes room. No notion of how often anything was used.
     ///
-    /// The default, on evidence rather than on principle.
+    /// The default, on evidence rather than on principle — and the evidence
+    /// is now **split by regime**, which is why it stays the default rather
+    /// than being replaced by whichever policy won most recently. It beat
+    /// LFRU by 12x on a model that fits in RAM under an artificially small
+    /// budget; it is beaten by both frequency policies, from zero hits, on a
+    /// model that genuinely streams. One more measurement does not settle a
+    /// disagreement between two, and picking a default by the newest number
+    /// is how a policy gets overfitted to whatever was benchmarked last.
     #[default]
     Lru,
+}
+
+impl Policy {
+    /// Whether a miss is admitted unconditionally once the budget is full.
+    ///
+    /// Only [`Lfru`](Self::Lfru) says no. Stated as its own question rather
+    /// than matched inline at the two places that ask, because "how do we
+    /// score" and "do we admit" are the two independent axes this enum exists
+    /// to cross, and writing them as one match is what made the first
+    /// measurement unable to separate them.
+    fn admits_every_miss(self) -> bool {
+        !matches!(self, Policy::Lfru)
+    }
+
+    /// The name this policy answers to in `ORANGU_EXPERT_CACHE_POLICY`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Policy::Lfru => "lfru",
+            Policy::Lfu => "lfu",
+            Policy::Lru => "lru",
+        }
+    }
 }
 
 /// How many acquisitions between halvings of every expert's heat.
@@ -490,7 +562,9 @@ impl TieredExpertStore {
     /// This tier's score for an expert, under whichever policy it follows.
     fn score(&self, heat: u32, last: u32, clock: u32) -> u64 {
         match self.policy {
-            Policy::Lfru => lfru_score(heat, last, clock),
+            // Same score for both frequency policies: they differ only in
+            // whether a miss has to earn its way in, which is the point.
+            Policy::Lfru | Policy::Lfu => lfru_score(heat, last, clock),
             // Recency alone, and *not* run through the recency window:
             // textbook LRU orders by when, without saturating, so the oldest
             // resident is always identifiable however long ago it was used.
@@ -563,10 +637,12 @@ impl TieredExpertStore {
             .map(|(k, r)| (self.score(r.heat, r.last, clock), *k))
             .min_by_key(|(score, _)| *score)
         {
-            // LRU has no admission decision to make: every miss goes in, and
-            // the oldest resident is what pays for it. The margin is LFRU's,
-            // and giving LRU one would make it a different policy.
-            Some(_) if self.policy == Policy::Lru => Touch::Admit,
+            // LRU and LFU have no admission decision to make: every miss goes
+            // in, and the coldest resident under that policy's own score is
+            // what pays for it. The margin is LFRU's alone — giving it to
+            // either of the others would make them a different policy, and
+            // would re-confound the one variable this arm exists to isolate.
+            Some(_) if self.policy.admits_every_miss() => Touch::Admit,
             Some((coldest, _)) if beats_with_hysteresis(newcomer, coldest) => Touch::Admit,
             Some(_) => Touch::Decline,
             // Budget too small to hold even one expert.
@@ -820,6 +896,7 @@ impl ExpertStore for TieredExpertStore {
             tier_bytes: self.resident_bytes(),
             prefetched: PREFETCHED_EXPERTS.swap(0, Ordering::Relaxed),
             prefetched_bytes: PREFETCHED_BYTES.swap(0, Ordering::Relaxed),
+            policy: Some(self.policy.tag()),
         }
     }
 }
@@ -834,7 +911,7 @@ impl ExpertStore for TieredExpertStore {
 /// reported as `unmeasured` rather than as a miss.
 fn residency_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ORANGU_EXPERT_RESIDENCY").is_some_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| crate::engine::env::flag_on("ORANGU_EXPERT_RESIDENCY"))
 }
 
 /// The store every expert read goes through.
@@ -878,16 +955,20 @@ pub fn global() -> &'static dyn ExpertStore {
 /// this box am I giving to expert weights" — and a value that does not parse
 /// is treated as no tier rather than as a default size, so a typo cannot
 /// quietly hand the cache a budget nobody chose.
-/// `ORANGU_EXPERT_CACHE_POLICY=lfru` selects the frequency-first policy.
+/// `ORANGU_EXPERT_CACHE_POLICY` selects the replacement rule: `lfru`,
+/// `lfu`, or the default `lru`.
 ///
-/// The comparison this exists for has now been run, and it went the other way:
-/// LRU won at every budget, so LRU is the default and LFRU is the arm. Being
-/// one env var apart rather than two builds apart is what made that A/B
-/// trustworthy — two arms of one binary cannot be confounded by a stale
-/// build, which is a failure this project has paid for before.
+/// The comparison this exists for has been run twice and gone both ways —
+/// LRU won on a model that fits in RAM, and lost from zero hits on one that
+/// streams. Being one env var apart rather than two builds apart is what made
+/// both A/Bs trustworthy: two arms of one binary cannot be confounded by a
+/// stale build, which is a failure this project has paid for before. The
+/// active rule is reported back in `/moe-stats` for the same reason, so a
+/// sweep's own output says which arm actually ran.
 fn tier_policy() -> Policy {
     match std::env::var("ORANGU_EXPERT_CACHE_POLICY").as_deref() {
         Ok("lfru") => Policy::Lfru,
+        Ok("lfu") => Policy::Lfu,
         _ => Policy::Lru,
     }
 }
@@ -1155,6 +1236,107 @@ mod tests {
             "LRU should be the one churning: {} vs {}",
             lru.evicted,
             lfru.evicted
+        );
+    }
+
+    /// The two frequency policies must differ in exactly one way — whether a
+    /// miss has to earn its seat — and be identical in every other.
+    ///
+    /// This is the property the whole `Lfu` arm rests on. M8 changed the
+    /// scoring rule and the admission rule together and so could not say which
+    /// one lost; if these two ever diverge in scoring as well, the next
+    /// measurement inherits the same confound.
+    #[test]
+    fn lfu_is_lfru_without_the_admission_margin() {
+        fn run(policy: Policy) -> ExpertStoreStats {
+            let weights = test_expert_matrix(64, 4, 8);
+            let store = TieredExpertStore::with_policy(weights.expert_bytes(), policy);
+            for visitor in 1..40 {
+                drop(store.acquire(&weights, 0));
+                drop(store.acquire(&weights, visitor));
+            }
+            store.take_stats()
+        }
+        let lfru = run(Policy::Lfru);
+        let lfu = run(Policy::Lfu);
+
+        // Same score function, so the same expert is always the coldest.
+        assert_eq!(
+            lfru_score(7, 3, 9),
+            {
+                let store = TieredExpertStore::with_policy(1, Policy::Lfu);
+                store.score(7, 3, 9)
+            },
+            "the frequency policies must score identically"
+        );
+        // The one difference: LFRU turns newcomers away, LFU never does.
+        assert!(lfru.declined > 0, "lfru declined {}", lfru.declined);
+        assert_eq!(lfu.declined, 0, "lfu must admit every miss");
+        assert!(
+            lfu.evicted > lfru.evicted,
+            "admitting everything has to cost evictions: {} vs {}",
+            lfu.evicted,
+            lfru.evicted
+        );
+    }
+
+    /// Frequency-first eviction is a real rule, not LRU wearing a different
+    /// name: a scan longer than the cache must not flush a working set that
+    /// has earned its heat.
+    ///
+    /// Without this the `Lfu` arm could be silently equivalent to `Lru`, and
+    /// the sweep comparing them would report a difference of zero and call
+    /// that a finding.
+    ///
+    /// **Getting the trace right took a failure.** The obvious version —
+    /// one hot expert alternating with visitors, two seats — has LFU and LRU
+    /// tie at 38 hits each, because there the hot expert is *also* always the
+    /// most recently used, so recency keeps it for free. The two rules only
+    /// diverge where the coldest by frequency is not the coldest by recency,
+    /// which is exactly what a scan past a working set produces.
+    #[test]
+    fn a_scan_flushes_the_working_set_under_lru_but_not_under_lfu() {
+        fn run(policy: Policy) -> ExpertStoreStats {
+            let weights = test_expert_matrix(64, 4, 32);
+            // Three seats: two for the working set, one for the scan to churn
+            // through. A scan with no room of its own would evict by pressure
+            // rather than by policy.
+            let store = TieredExpertStore::with_policy(weights.expert_bytes() * 3, policy);
+            // Earn heat on two experts.
+            for _ in 0..20 {
+                drop(store.acquire(&weights, 0));
+                drop(store.acquire(&weights, 1));
+            }
+            // Then walk past far more experts than the cache can hold, each
+            // exactly once — the shape of a routing pass over a broad layer.
+            for visitor in 2..30 {
+                drop(store.acquire(&weights, visitor));
+            }
+            // Everything above is setup; only what the working set costs
+            // *after* the scan is the measurement.
+            store.take_stats();
+            for _ in 0..5 {
+                drop(store.acquire(&weights, 0));
+                drop(store.acquire(&weights, 1));
+            }
+            store.take_stats()
+        }
+        let lfu = run(Policy::Lfu);
+        let lru = run(Policy::Lru);
+        assert_eq!(
+            lfu.misses, 0,
+            "the scan should not have displaced experts with 20 uses each"
+        );
+        assert!(
+            lru.misses > 0,
+            "LRU should have lost the working set to the scan; it did not, so \
+             this trace no longer discriminates and the comparison below is empty"
+        );
+        assert!(
+            lfu.hits > lru.hits,
+            "LFU {} hits vs LRU {} — frequency scoring is doing nothing",
+            lfu.hits,
+            lru.hits
         );
     }
 

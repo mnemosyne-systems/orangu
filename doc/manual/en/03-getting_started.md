@@ -80,6 +80,8 @@ orangu-server download unsloth/gemma-4-E2B-it-GGUF
 
 The argument is a Hugging Face repo, `<user>/<model>[:quant]`. With no `:quant`, `Q4_K_M` is preferred, then `Q8_0`, then the first GGUF file in the repo; append one to pin it, e.g. `unsloth/gemma-4-E2B-it-GGUF:Q8_0`. Every shard of a multi-part model is fetched, plus the matching `mmproj-*` sidecar when the repo has one.
 
+Before anything is fetched, the repo is planned against this machine: each shard's GGUF header is read over the network — a few hundred kilobytes rather than the model — and the result reports how much of the model has to stay resident and how much can stream from disk. A model that cannot run here at all stops to confirm first; `-y` skips that. `orangu-server plan` gives the same report for a model already downloaded.
+
 Files land under the `models` directory from step 1 in Hugging Face hub-cache layout. Free space is checked up front, an interrupted transfer resumes where it stopped, and progress is redrawn in place — one line per file plus a total — ending with:
 
 ```text

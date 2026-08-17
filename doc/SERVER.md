@@ -126,7 +126,32 @@ directory (see **Configuration** below):
 ```sh
 orangu-server download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
 orangu-server download ggml-org/embeddinggemma-300M-GGUF   # no :quant -> prefers Q4_K_M, then Q8_0
+orangu-server download unsloth/Kimi-K3-GGUF -y             # skip the cannot-run confirmation
 ```
+
+Every download **plans the repo against this machine first** — the same
+report `plan` gives for a local model, from each shard's GGUF header
+fetched over HTTP rather than from the model. Only the headers are
+transferred and the connection is then dropped, so planning a 1.3 TiB repo
+costs seconds:
+
+```
+Download   unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M · 4f2c9ab · 18.30 GiB
+Model      qwen3 · 1 shard · 17.04 GiB on disk
+Dense      3.12 GiB — attention, norms, embeddings, shared experts. Must be resident.
+Experts    13.92 GiB — 128 per layer x 48 layers, 111.40 MiB each. Can stream.
+Per token  891.20 MiB of experts (8 of 128 per layer, 48 layers)
+This box   24.41 GiB RAM available, 3.98 GiB VRAM (AMD Radeon RX 5500M)
+Verdict    fits entirely in RAM (7.37 GiB to spare); nothing needs to stream
+Device     3.12 GiB of weights on a 3.98 GiB GPU — fits, 878.08 MiB spare
+```
+
+Only a model whose **dense** part does not fit stops to confirm — that one
+cannot run at any speed. A model whose *experts* do not fit never prompts:
+those stream, which is what the streaming path is for. `-y`/`--yes` skips
+the confirmation. Planning is advisory and never a gate: an unreachable
+Hub, a private repo, or an unparseable header prints one line and the
+download proceeds, since it is about to report the real problem itself.
 
 ```
 Downloading Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf: 47% [1/1]
@@ -205,6 +230,12 @@ CPU
   SSE4.2           : Yes
   AVX2             : Yes
   AVX512           : No
+
+POWER
+  Source           : Mains (battery 98%)
+  k10temp Tctl     : 70.8 °C
+  acpitz_0 temp1   : 58.0 °C
+  amdgpu junction  : 52.0 °C (critical 100.0 °C)
 
 GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
@@ -298,6 +329,23 @@ according to `amdgpu`, but system RAM (62.19 GiB) is the real ceiling on how
 much it can actually draw on, and the only figure worth showing as its
 total.
 
+The `POWER` section answers two environmental questions. **Source** is where
+the machine is drawing from: on battery, platform power management drops the
+CPU governor and the GPU clock, so a throughput figure measured there is not
+a figure about this machine. No battery reads `Mains`; a platform that will
+not say reads `Unknown`, never a blank. Under it are the three warmest
+sensors, hottest first, with the critical threshold where the platform
+declares one. Temperatures come from `sysinfo`; the power source does not
+(it has no battery API) — `sysfs` on Linux, `pmset` on macOS,
+`GetSystemPowerStatus` on Windows. The whole section is omitted where
+neither is known, which is normal in a container.
+
+At startup the same data drives `Note` lines: one when running on battery,
+and one when a sensor is already within a tenth of a critical threshold the
+platform declared. Neither has a command as a fix, unlike the CPU-governor
+and GPU-power-level notes beside them, which is why they are reported
+separately.
+
 ### `suggest`: a hardware-based model-size suggestion
 
 ```sh
@@ -386,6 +434,12 @@ overhead. Since there's no real GGUF file to read yet, hidden size and layer
 count are themselves estimated from the parameter count via the standard
 transformer parameter-count approximation (params ≈ 12 × layers ×
 hidden_size²).
+
+Because every figure here is an estimate from a parameter count, the report
+closes by pointing at the two commands that do not have to estimate:
+`download` reads a repo's real tensor tables before fetching it, and `plan`
+reads a local model's. A size class is where model selection starts, not
+where it ends.
 
 ### `list` and `show`: reading GGUF files
 
@@ -893,12 +947,24 @@ model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 host = all
 port = 8100
 slots = 1
+api_key = a-long-random-string
+tls_cert = ~/certs/cert.pem
+tls_key = ~/certs/key.pem
+queue_limit = 0
+draft_model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 backend = auto
+kv_cache = f16
 role = all
 
 [web]
 port = 8101
 reexec = yes
+
+[tenant:web]
+api_key = another-long-random-string
+max_concurrent = 2
+requests_per_minute = 120
+tokens_per_minute = 40000
 ```
 
 - `models` — the base directory a model spec resolves into: what `list`/
@@ -955,6 +1021,48 @@ reexec = yes
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
+- `tls_cert` / `tls_key` — PEM paths for serving HTTPS. Both or neither; one
+  alone is a startup error, because the alternative is serving in the clear
+  while looking configured. PKCS#8, PKCS#1 and SEC1 keys all load. Terminating
+  in a reverse proxy stays valid — this exists so one binary on one machine is
+  not forced into one.
+- `api_key` — bearer token every request must carry (`Authorization: Bearer
+  <key>`). Unset by default: the server is open, which suits the loopback bind
+  it also defaults to and does not suit a widened `host`. `ORANGU_API_KEY`
+  overrides the file so the secret need not be written down. Only `/health` is
+  exempt; everything else answers `401` with `WWW-Authenticate: Bearer`.
+- `[tenant:<name>]` sections — named keys, each with `max_concurrent`,
+  `requests_per_minute` and `tokens_per_minute` of its own (all `0`, meaning
+  unlimited, by default). `api_key_env` names an environment variable holding
+  the key instead of writing it here. Declaring a tenant turns authentication
+  on by itself; `api_key` above stays the operator's own key and is never
+  limited. Over a limit the five model-running endpoints answer `429` with
+  `Retry-After` and `X-Orangu-Rate-Limit`; metadata endpoints are never
+  metered. Per-tenant usage, refusals and bounds are on `/metrics`. See
+  **Tenants** in the manual.
+- `device` — *which* card when `backend` finds more than one: `auto` (the
+  default), an index as printed at startup, or any part of the device's name.
+- `device_split` — spread one model's layers across several devices; `off` by
+  default. See **Splitting a model across devices**.
+- `threads` — CPU worker threads; rayon's own choice by default.
+- `queue_limit` — how many requests may wait for a slot before the server
+  refuses with `503` + `Retry-After` (default `0`, unbounded). `id_slot`-pinned
+  requests bypass it. Depth and limit are exported on `/metrics` as
+  `orangu_server_queue_depth` / `orangu_server_queue_limit`.
+- `draft_model` / `draft_tokens` — speculative decoding: a second, smaller
+  model guesses `draft_tokens` tokens (default 4) and the served model verifies
+  them in one forward, keeping the longest prefix it would have produced
+  itself. The output is unchanged; only the time taken differs. The pair must
+  share a vocabulary and both must have a multi-position forward (`gemma4`,
+  `deepseek4`, `glm-dsa`, `muse-glimmer`), both checked at startup. Greedy,
+  unconstrained requests only. Whether it pays depends on the hardware — see
+  **Speculative decoding** in the manual for a measurement where it does not.
+- `kv_cache` — how the GPU-side KV mirror is stored: `f16` (the default),
+  `q8_0`, or `f32`. `q8_0` is ~44% smaller than `f16` and cuts attention's
+  read bandwidth at long context (−32% attention GPU time at ~295 tokens,
+  growing with the cache), buying context and concurrent `slots` out of the
+  same VRAM — and is the only **lossy** setting here, which is why it is
+  opt-in. Vulkan-family backends only. `ORANGU_KV_CACHE` overrides it.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
   `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
@@ -1466,29 +1574,41 @@ the API and (if enabled) the web UI listener stop together.
 
 ## Endpoint reference
 
+Four answers apply to every row rather than to any one of them: `401` when
+`api_key` or a `[tenant:…]` section is set and the request carries no valid
+bearer token (`GET /health` and `GET /ready` excepted); `503` with `Retry-After` when
+`queue_limit` is reached; `429` with `Retry-After` and `X-Orangu-Rate-Limit`
+when a tenant is over one of its own limits, on the five endpoints that run the
+model; and `https` on the same port when `tls_cert`/`tls_key` are set.
+
 | Endpoint | |
 | :-- | :-- |
 | `GET /v1/models` | |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding`. Accepts `response_format` — `{"type": "json_object"}` constrains sampling so only tokens keeping the output a valid JSON object can be chosen, and withholds end-of-sequence until the document is complete. `json_schema` is treated the same way: valid JSON, not the schema's shape |
 | `POST /v1/completions` | legacy OpenAI completion, no chat template needed; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized |
-| `GET /health` | |
+| `GET /health` | liveness — stays `200` while the server is busy |
+| `GET /ready` | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health` |
 | `GET /props` | model + server metadata |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text |
+| `GET /metrics` | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens; plus per-tenant usage, refusals and bounds when `[tenant:…]` sections are declared |
 | `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, the per-layer-call union, rows and bytes dequantized, plus the process's fault and RSS figures. Drain once before a workload and again after to measure exactly that window. Dense models report `layer_calls: 0` |
 | `orangu-server plan <model> [--deep]` | (a subcommand, not an endpoint) Reports what a model would need to run here **without loading it** — dense vs routed-expert bytes, experts streamed per token, and a verdict. Reads only the GGUF tensor tables, so a 434 GiB 11-shard model takes well under a second. `--deep` also checks every shard is present and the architecture supported |
+| `GET /gpu-timings` | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them |
+| `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
 | `GET /model-cache` | how many of the model's bytes are in the page cache right now. `resident_bytes` is `null` where the platform cannot measure it — never `0`, which would make "unknowable" read as "cold" |
 | `POST /model-cache/drop` | evict the model from the page cache so the next request reads it from disk; loopback-only. Reports residency before and after rather than a success flag, because a partial drop is the realistic failure and looks identical from outside |
 
 `/moe-stats` also carries a `store` block describing where routed experts'
 weights came from. Three environment variables govern it, all off by default:
 
+**Boolean flags read `0`, `false`, `no`, `off` and the empty string as OFF**, and anything else as on. They used to be presence-checked, so `FLAG=0` switched the feature *on* and a sweep of `0,1` measured it against itself. The variables that carry a value or a path — `ORANGU_NORM_WG`, `ORANGU_COOP_GEOM`, `ORANGU_DUMP_SHADERS`, `ORANGU_EXPERT_USAGE`, `ORANGU_PREFIX_CACHE_DIR` — are parsed or presence-checked instead, as their descriptions say.
+
 | variable | effect |
 | :-- | :-- |
-| `ORANGU_EXPERT_CACHE_GB` | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory |
+| `ORANGU_EXPERT_CACHE_GB` | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory. Even above it, measurement has not yet found a budget where the cache beats the page cache — it competes with it for the same RAM, and the page cache gets the rest of the machine |
 | `ORANGU_EXPERT_READ` | Where the expert cache's copies are read from: `mmap` (default — a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM |
-| `ORANGU_EXPERT_CACHE_POLICY` | `lfru` selects frequency-first replacement with colibri's admission margin. The default is plain LRU, which measured better at every budget tried on real MoE routing — by 12x at a small budget — because the margin declines almost every newcomer and the cache stops adapting |
+| `ORANGU_EXPERT_CACHE_POLICY` | Replacement rule: `lfru` (frequency-first with an admission margin), `lfu` (the same scoring, admitting every miss), or the default `lru`. Which one wins depends on the regime, so the default is not a recommendation: on a model that fits in RAM under a small budget, LRU measured 12x better than LFRU; on one whose experts genuinely do not fit, LRU gets **zero** hits at a tight budget while both frequency rules score, because a routing pass is a scan and recency evicts every expert before it comes round again. The rule actually in force is reported back in `/moe-stats` |
 | `ORANGU_PREFIX_CACHE_DIR` | Directory for a durable snapshot of the prefix-cache pool, so a conversation survives a restart instead of re-prefilling. Needs `ORANGU_PREFIX_CACHE` as well. A snapshot carries the model's fingerprint and is refused for any other model — a KV cache from elsewhere would match on token ids and answer from the wrong state. Sized per entry as a whole KV cache (~330 KB per position on a 26B MoE), so it is opt-in |
 | `ORANGU_EXPERT_BUDGET` | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes** — the only setting here that does — and is off by default. Never applied to prefill, and never leaves a position with nothing routed |
 | `ORANGU_ROUTE_AHEAD` / `ORANGU_PREFETCH_K` | Measure how predictable the next layer's routing is, and prefetch the top `k` of that prediction. `k` above 2 wastes more than 20% of what it fetches on the model this was measured on |
@@ -1779,8 +1899,9 @@ Not implemented for this model: reporting reasoning separately as
 invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
 
-Nemotron-H (`nemotron_h_moe`, e.g.
-`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`) runs on the CPU
+Nemotron-H (`nemotron_h_moe` and the dense `nemotron_h`, e.g.
+`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` and
+`bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`) runs on the CPU
 path only, and breaks the assumption every other architecture here shares:
 a block is **not** an attention sub-layer plus an FFN sub-layer. It is one
 or the other — or neither. Each block holds exactly one mixer under one

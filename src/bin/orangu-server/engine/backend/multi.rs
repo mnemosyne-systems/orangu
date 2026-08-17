@@ -93,7 +93,7 @@ use crate::engine::loader::QuantMatrix;
 /// `ORANGU_NO_TILED_PREFILL`.
 fn no_split_fusion() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("ORANGU_NO_SPLIT_FUSION").is_some())
+    *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_SPLIT_FUSION"))
 }
 
 /// A `Backend` that forwards each operation to the device holding its

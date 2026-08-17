@@ -38,9 +38,10 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use crate::engine::loader;
+use crate::engine::loader::block_index;
 use crate::engine::quant;
 use orangu::gguf::GgufFile;
 
@@ -57,6 +58,17 @@ pub struct Plan {
     pub dense_bytes: u64,
     /// Weights only the router's choices touch.
     pub expert_bytes: u64,
+    /// Weights a GPU backend would upload, by
+    /// [`crate::engine::backend::is_cpu_only_tensor`]'s own rule rather than
+    /// a second copy of it.
+    ///
+    /// Not the same as [`dense_bytes`](Self::dense_bytes), and the difference
+    /// is the point: routed *and* shared experts have no GPU path, so on a
+    /// mixture-of-experts model the device holds less than the dense part —
+    /// shared experts are dense (every token runs them) yet still live in
+    /// host memory. Charging them to a card would overstate what a plan says
+    /// the GPU has to hold.
+    pub device_bytes: u64,
     /// Weights belonging to a trailing multi-token-prediction (draft) block,
     /// which this engine does not run — see [`trunk_block_count`]. `0` for
     /// the models that have none, which is most of them.
@@ -83,6 +95,37 @@ impl Plan {
 
     pub fn is_moe(&self) -> bool {
         self.moe_layers > 0 && self.n_expert > 0
+    }
+
+    /// Whether the model can run here **at all**, as distinct from running
+    /// slowly.
+    ///
+    /// The dense part is what every token touches, so it is the part that has
+    /// to be resident: below this line a model does not work, and above it a
+    /// model whose experts also do not fit is merely slow, because experts
+    /// stream. One expression covers both kinds of model — on a dense one,
+    /// everything *is* the dense part.
+    ///
+    /// This is the same test both verdict lines are written from, and the one
+    /// `orangu-server download` asks before deciding whether fetching the
+    /// model is worth confirming. Keeping it here is what stops the prompt and
+    /// the printed verdict from ever disagreeing.
+    pub fn dense_fits_in(&self, available_ram: u64) -> bool {
+        self.dense_bytes <= available_ram
+    }
+
+    /// How much larger than `vram` the weights a GPU backend would upload
+    /// are, or `None` when they fit.
+    ///
+    /// The same question `engine::footprint`'s `shortfall_on` asks *after*
+    /// loading, asked here from the file's tensor table instead. It exists
+    /// because the two used to disagree by construction: a plan that only
+    /// weighed system RAM answered "fits in RAM with 23.9 GiB to spare" for
+    /// a model that then reported being 17.3 GiB larger than the card the
+    /// server actually selected. A verdict is only useful against the
+    /// hardware the model is going to land on.
+    pub fn device_shortfall(&self, vram: u64) -> Option<u64> {
+        (self.device_bytes > vram).then(|| self.device_bytes - vram)
     }
 }
 
@@ -114,12 +157,6 @@ fn trunk_block_count(gguf: &GgufFile, architecture: &str) -> Option<usize> {
         .map(|n| n as usize)
 }
 
-/// The block index in a `blk.<i>.<...>` tensor name, or `None` for a tensor
-/// that belongs to no block (`token_embd`, `output_norm`, `output`).
-fn block_index(name: &str) -> Option<usize> {
-    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
-}
-
 /// Reads every shard's tensor table and classifies it.
 ///
 /// A tensor is a routed expert when its name ends in `_exps.weight` — the GGUF
@@ -134,6 +171,38 @@ fn block_index(name: &str) -> Option<usize> {
 /// nothing else.
 pub fn analyze(path: &Path) -> Result<Plan> {
     let first = GgufFile::open(path)?;
+    // Shard 1's table is already parsed; re-opening it would be a second read
+    // of the same few hundred kilobytes.
+    let rest: Vec<_> = loader::shard_paths(path, &first)?
+        .into_iter()
+        .skip(1)
+        .collect();
+    analyze_shards(std::iter::once(Ok(first)).chain(rest.iter().map(|shard| GgufFile::open(shard))))
+}
+
+/// [`analyze`] over shards that have already been parsed, or that come from
+/// somewhere other than this machine's disk.
+///
+/// Every number a [`Plan`] carries comes from tensor tables and a handful of
+/// metadata keys, and neither depends on where the bytes were read from. That
+/// is what lets `orangu-server download` plan a model **it has not
+/// downloaded** — `orangu::model_download::RemoteModel::headers` yields the
+/// same `GgufFile` values over HTTP that [`analyze`] gets from `open`, and
+/// this classifier cannot tell the difference.
+///
+/// The first shard supplies the architecture and the expert-count metadata;
+/// every shard, the first included, supplies tensors. Shards are consumed
+/// lazily and dropped as they go, so a model with dozens of them never holds
+/// more than one table at a time.
+pub fn analyze_shards<I>(shards: I) -> Result<Plan>
+where
+    I: IntoIterator<Item = Result<GgufFile>>,
+{
+    let mut shards = shards.into_iter();
+    let first = shards
+        .next()
+        .ok_or_else(|| anyhow!("a model needs at least one shard to plan"))??;
+
     let architecture = first
         .metadata
         .iter()
@@ -143,37 +212,35 @@ pub fn analyze(path: &Path) -> Result<Plan> {
             _ => None,
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let meta_u64 = |suffix: &str| -> Option<u64> {
-        let key = format!("{architecture}.{suffix}");
-        first
-            .metadata
-            .iter()
-            .find(|(k, _)| *k == key)
-            .and_then(|(_, v)| v.as_u64())
+    let (n_expert, n_expert_used) = {
+        let meta_u64 = |suffix: &str| -> Option<u64> {
+            let key = format!("{architecture}.{suffix}");
+            first
+                .metadata
+                .iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v.as_u64())
+        };
+        (
+            meta_u64("expert_count").unwrap_or(0) as usize,
+            meta_u64("expert_used_count").unwrap_or(0) as usize,
+        )
     };
-    let n_expert = meta_u64("expert_count").unwrap_or(0) as usize;
-    let n_expert_used = meta_u64("expert_used_count").unwrap_or(0) as usize;
 
     let trunk_blocks = trunk_block_count(&first, &architecture);
 
-    let shards = loader::shard_paths(path, &first)?;
+    let mut shard_count = 0usize;
     let mut total_bytes = 0u64;
     let mut draft_bytes = 0u64;
+    let mut device_bytes = 0u64;
     let mut expert_bytes = 0u64;
     let mut moe_layers = std::collections::HashSet::new();
     let mut per_layer_expert_bytes = 0u64;
     let mut seen_first_moe_layer: Option<String> = None;
 
-    for (index, shard) in shards.iter().enumerate() {
-        // Shard 1's table is already parsed; re-opening it would be a second
-        // read of the same few hundred kilobytes.
-        let reopened;
-        let gguf = if index == 0 {
-            &first
-        } else {
-            reopened = GgufFile::open(shard)?;
-            &reopened
-        };
+    for gguf in std::iter::once(Ok(first)).chain(shards) {
+        let gguf = gguf?;
+        shard_count += 1;
         for tensor in &gguf.tensors {
             let elements: u64 = tensor.dims.iter().product();
             let bytes = quant::tensor_byte_size(tensor.ggml_type, elements).unwrap_or(0);
@@ -186,6 +253,12 @@ pub fn analyze(path: &Path) -> Result<Plan> {
             {
                 draft_bytes += bytes;
                 continue;
+            }
+            // Asked of the backend rather than decided here, so a plan's
+            // "what has to fit on the card" cannot drift from what the
+            // backend actually uploads.
+            if !crate::engine::backend::is_cpu_only_tensor(&tensor.name) {
+                device_bytes += bytes;
             }
             if !tensor.name.ends_with("_exps.weight") {
                 continue;
@@ -219,13 +292,14 @@ pub fn analyze(path: &Path) -> Result<Plan> {
         0
     };
     Ok(Plan {
-        shards: shards.len(),
+        shards: shard_count,
         architecture,
         total_bytes,
         dense_bytes: total_bytes
             .saturating_sub(expert_bytes)
             .saturating_sub(draft_bytes),
         expert_bytes,
+        device_bytes,
         draft_bytes,
         n_expert,
         n_expert_used,
@@ -234,61 +308,138 @@ pub fn analyze(path: &Path) -> Result<Plan> {
     })
 }
 
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+/// One byte figure, in whichever unit reads best for it.
+///
+/// `orangu::format::format_bytes` rather than a fixed unit, and rather than a
+/// formatter of this module's own: it is what `list` prints a model's size
+/// with and what `engine::footprint` prints the startup weight lines with, so
+/// a plan and the server now render agreeing numbers identically instead of
+/// merely agreeing about them.
+///
+/// Every figure here used to carry a hardcoded unit — `{:.1} GiB` for the
+/// large ones, `{:.1} MiB` for the per-expert ones — which broke at both ends
+/// of the range a plan has to cover. A 318 MiB embedding model read
+/// `0.3 GiB on disk`, throwing away most of the precision it had; a large
+/// mixture-of-experts model read `Per token 14473.1 MiB`, a number nobody
+/// can weigh against the GiB figures three lines above it.
+fn size(bytes: u64) -> String {
+    orangu::format::format_bytes(bytes)
 }
+
+/// The GPU a plan is judged against: the card the server would actually
+/// select, its capacity, and its name.
+///
+/// A pair rather than a bare byte count because a machine with several GPUs
+/// makes a lone number unreadable — the integrated one reports the whole of
+/// system RAM as its memory, so a plan that named no card would look like it
+/// had tens of gigabytes to play with on a box whose real target is a 4 GiB
+/// discrete card. `None` on a machine with no dedicated GPU, where system
+/// RAM is the only ceiling that matters.
+pub type PlanDevice<'a> = Option<(&'a str, u64)>;
 
 /// The plan as a report, with the machine's own memory beside it.
 ///
 /// Deliberately states the *verdict* rather than only the numbers. The numbers
 /// are what a reader would have to combine themselves to answer the question
 /// they actually have, which is whether to press on.
-pub fn format_plan(plan: &Plan, available_ram: u64, vram: Option<u64>) -> String {
+///
+/// Both ceilings are reported, because a model has to clear both and they fail
+/// differently: too big for RAM is fatal, while too big for the card is the
+/// driver paging weights in and out on every token — slow rather than broken,
+/// and invisible unless something says so.
+pub fn format_plan(plan: &Plan, available_ram: u64, device: PlanDevice<'_>) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Model      {} · {} shard{} · {:.1} GiB on disk\n",
+        "Model      {} · {} shard{} · {} on disk\n",
         plan.architecture,
         plan.shards,
         if plan.shards == 1 { "" } else { "s" },
-        gib(plan.total_bytes),
+        size(plan.total_bytes),
     ));
 
     if !plan.is_moe() {
         out.push_str(&format!(
-            "Dense      {:.1} GiB — every byte is touched by every token\n",
-            gib(plan.dense_bytes)
+            "Dense      {} — every byte is touched by every token\n",
+            size(plan.dense_bytes)
         ));
         out.push_str(&draft_line(plan));
-        out.push_str(&verdict_dense(plan.dense_bytes, available_ram));
+        out.push_str(&this_box(available_ram, device));
+        out.push_str(&verdict_dense(plan, available_ram));
+        out.push_str(&device_verdict(plan, device));
         return out;
     }
 
     out.push_str(&format!(
-        "Dense      {:.1} GiB — attention, norms, embeddings, shared experts. Must be resident.\n",
-        gib(plan.dense_bytes)
+        "Dense      {} — attention, norms, embeddings, shared experts. Must be resident.\n",
+        size(plan.dense_bytes)
     ));
     out.push_str(&format!(
-        "Experts    {:.1} GiB — {} per layer x {} layers, {:.1} MiB each. Can stream.\n",
-        gib(plan.expert_bytes),
+        "Experts    {} — {} per layer x {} layers, {} each. Can stream.\n",
+        size(plan.expert_bytes),
         plan.n_expert,
         plan.moe_layers,
-        plan.bytes_per_expert as f64 / (1024.0 * 1024.0),
+        size(plan.bytes_per_expert),
     ));
     out.push_str(&format!(
-        "Per token  {:.1} MiB of experts ({} of {} per layer, {} layers)\n",
-        plan.expert_bytes_per_token() as f64 / (1024.0 * 1024.0),
+        "Per token  {} of experts ({} of {} per layer, {} layers)\n",
+        size(plan.expert_bytes_per_token()),
         plan.n_expert_used,
         plan.n_expert,
         plan.moe_layers,
     ));
     out.push_str(&draft_line(plan));
-    out.push_str(&format!(
-        "This box   {:.1} GiB RAM available{}\n",
-        gib(available_ram),
-        vram.map_or(String::new(), |v| format!(", {:.1} GiB VRAM", gib(v))),
-    ));
+    out.push_str(&this_box(available_ram, device));
     out.push_str(&verdict_moe(plan, available_ram));
+    out.push_str(&device_verdict(plan, device));
     out
+}
+
+/// What the machine has, on one line — RAM always, and the GPU by name when
+/// there is one worth judging against.
+///
+/// Printed for a dense model too. It used to appear only under the
+/// mixture-of-experts branch, which meant the *most* common case got a
+/// verdict with nothing beside it to check the verdict against.
+fn this_box(available_ram: u64, device: PlanDevice<'_>) -> String {
+    format!(
+        "This box   {} RAM available{}\n",
+        size(available_ram),
+        device.map_or(String::new(), |(name, vram)| format!(
+            ", {} VRAM ({name})",
+            size(vram)
+        )),
+    )
+}
+
+/// The GPU half of the verdict: silent when the weights fit the card, or
+/// when there is no card to fit them.
+///
+/// The wording deliberately matches what `engine::footprint` prints at
+/// startup once the model is loaded, because it is the same finding — the
+/// point of saying it here is that here it arrives while it can still change
+/// the decision.
+fn device_verdict(plan: &Plan, device: PlanDevice<'_>) -> String {
+    // The card is named once, on the `This box` line above. Repeating it here
+    // is what made this line wrap: real GPU names run to sixty characters
+    // ("Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]").
+    let Some((_, vram)) = device else {
+        return String::new();
+    };
+    let Some(short) = plan.device_shortfall(vram) else {
+        return format!(
+            "Device     {} of weights on a {} GPU — fits, {} spare\n",
+            size(plan.device_bytes),
+            size(vram),
+            size(vram - plan.device_bytes),
+        );
+    };
+    format!(
+        "Device     {} too large for this GPU ({}) — the driver will page weights\n           \
+         in and out on every token, which is slow rather than fatal. A smaller\n           \
+         quantization, or `backend = cpu`, avoids it.\n",
+        size(short),
+        size(vram),
+    )
 }
 
 /// The draft-head line, or nothing at all for a model without one.
@@ -301,46 +452,47 @@ fn draft_line(plan: &Plan) -> String {
         return String::new();
     }
     format!(
-        "Draft head {:.1} GiB — a multi-token-prediction block this engine does not run. Never loaded.\n",
-        gib(plan.draft_bytes),
+        "Draft head {} — a multi-token-prediction block this engine does not run. Never loaded.\n",
+        size(plan.draft_bytes),
     )
 }
 
-fn verdict_dense(total: u64, available_ram: u64) -> String {
-    if total <= available_ram {
+fn verdict_dense(plan: &Plan, available_ram: u64) -> String {
+    let total = plan.dense_bytes;
+    if plan.dense_fits_in(available_ram) {
         format!(
-            "Verdict    fits in RAM with {:.1} GiB to spare\n",
-            gib(available_ram - total)
+            "Verdict    fits in RAM with {} to spare\n",
+            size(available_ram - total)
         )
     } else {
         format!(
-            "Verdict    does NOT fit: {:.1} GiB short, and a dense model has nothing to stream\n",
-            gib(total - available_ram)
+            "Verdict    does NOT fit: {} short, and a dense model has nothing to stream\n",
+            size(total - available_ram)
         )
     }
 }
 
 fn verdict_moe(plan: &Plan, available_ram: u64) -> String {
-    if plan.dense_bytes > available_ram {
+    if !plan.dense_fits_in(available_ram) {
         return format!(
-            "Verdict    will NOT work: the dense part alone is {:.1} GiB short of RAM, and it is \
+            "Verdict    will NOT work: the dense part alone is {} short of RAM, and it is \
              touched by every token\n",
-            gib(plan.dense_bytes - available_ram)
+            size(plan.dense_bytes - available_ram)
         );
     }
     let spare = available_ram - plan.dense_bytes;
     if plan.expert_bytes <= spare {
         format!(
-            "Verdict    fits entirely in RAM ({:.1} GiB to spare); nothing needs to stream\n",
-            gib(spare - plan.expert_bytes)
+            "Verdict    fits entirely in RAM ({} to spare); nothing needs to stream\n",
+            size(spare - plan.expert_bytes)
         )
     } else {
         format!(
-            "Verdict    runnable by streaming: dense fits, {:.1} GiB of experts do not and will \
-             come off disk\n           at {:.1} MiB per token, the storage under the model sets \
+            "Verdict    runnable by streaming: dense fits, {} of experts do not and will \
+             come off disk\n           at {} per token, the storage under the model sets \
              the speed\n",
-            gib(plan.expert_bytes - spare),
-            plan.expert_bytes_per_token() as f64 / (1024.0 * 1024.0),
+            size(plan.expert_bytes - spare),
+            size(plan.expert_bytes_per_token()),
         )
     }
 }
@@ -356,6 +508,7 @@ mod tests {
             total_bytes: 400 << 30,
             dense_bytes: 10 << 30,
             expert_bytes: 390 << 30,
+            device_bytes: 10 << 30,
             draft_bytes: 0,
             n_expert: 256,
             n_expert_used: 8,
@@ -380,7 +533,7 @@ mod tests {
         plan.dense_bytes = 40 << 30;
         let report = format_plan(&plan, 20 << 30, None);
         assert!(report.contains("will NOT work"), "{report}");
-        assert!(report.contains("20.0 GiB short"), "{report}");
+        assert!(report.contains("20.00 GiB short"), "{report}");
     }
 
     #[test]
@@ -410,7 +563,7 @@ mod tests {
         plan.draft_bytes = 5 << 30;
         plan.dense_bytes = 5 << 30;
         let report = format_plan(&plan, 60 << 30, None);
-        assert!(report.contains("Draft head 5.0 GiB"), "{report}");
+        assert!(report.contains("Draft head 5.00 GiB"), "{report}");
         assert!(report.contains("does not run"), "{report}");
         // And the three parts still account for the whole file.
         assert_eq!(
@@ -481,6 +634,7 @@ mod tests {
             total_bytes: 30 << 30,
             dense_bytes: 30 << 30,
             expert_bytes: 0,
+            device_bytes: 30 << 30,
             draft_bytes: 0,
             n_expert: 0,
             n_expert_used: 0,
@@ -492,5 +646,350 @@ mod tests {
         assert!(short.contains("does NOT fit"), "{short}");
         assert!(short.contains("nothing to stream"), "{short}");
         assert!(format_plan(&plan, 60 << 30, None).contains("fits in RAM"));
+    }
+
+    /// One `f32` tensor of `elements` elements, named `name`. `f32` because
+    /// its byte size is exactly four per element, so a test can state the
+    /// numbers it expects rather than reproduce a quantization's block
+    /// arithmetic to predict them.
+    fn f32_tensor(name: &str, elements: u64) -> orangu::gguf::TensorInfo {
+        orangu::gguf::TensorInfo {
+            name: name.to_string(),
+            dims: vec![elements],
+            // `GGML_TYPE_F32`.
+            ggml_type: 0,
+            offset: 0,
+        }
+    }
+
+    fn shard(
+        metadata: &[(&str, u64)],
+        tensors: Vec<orangu::gguf::TensorInfo>,
+    ) -> orangu::gguf::GgufFile {
+        orangu::gguf::GgufFile {
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        if *k == "general.architecture" {
+                            orangu::gguf::GgufValue::String("testmoe".to_string())
+                        } else {
+                            orangu::gguf::GgufValue::U64(*v)
+                        },
+                    )
+                })
+                .collect(),
+            tensors,
+            data_offset: 0,
+            alignment: 32,
+            version: 3,
+        }
+    }
+
+    /// The classifier is the same one whether the tables came off this disk or
+    /// off the network, and this is the test that says so: nothing here opens
+    /// a file. It is what lets `download` plan a repo it has not fetched.
+    ///
+    /// Also pins the two things easiest to get wrong when summing across
+    /// shards — that a tensor is classified by its *name* wherever it lands,
+    /// and that one expert's size comes from **one** layer rather than from
+    /// every layer summed.
+    #[test]
+    fn analyze_shards_classifies_tables_from_anywhere() {
+        // 4 experts, 2 used, two MoE layers split across two shards. Each
+        // layer carries one 4096-element expert tensor = 16 KiB, so one
+        // expert is 4 KiB.
+        let meta = &[
+            ("general.architecture", 0),
+            ("testmoe.expert_count", 4),
+            ("testmoe.expert_used_count", 2),
+        ];
+        let plan = analyze_shards(vec![
+            Ok(shard(
+                meta,
+                vec![
+                    f32_tensor("token_embd.weight", 1024),
+                    f32_tensor("blk.0.attn_norm.weight", 1024),
+                    f32_tensor("blk.0.ffn_gate_exps.weight", 4096),
+                ],
+            )),
+            Ok(shard(
+                meta,
+                vec![
+                    f32_tensor("blk.1.attn_norm.weight", 1024),
+                    f32_tensor("blk.1.ffn_gate_exps.weight", 4096),
+                    // A *shared* expert runs for every token, so it is dense
+                    // however much its name looks like a routed one.
+                    f32_tensor("blk.1.ffn_gate_shexp.weight", 1024),
+                ],
+            )),
+        ])
+        .unwrap();
+
+        assert_eq!(plan.shards, 2);
+        assert_eq!(plan.architecture, "testmoe");
+        assert_eq!(plan.moe_layers, 2);
+        assert_eq!(plan.expert_bytes, 2 * 4096 * 4);
+        // One layer's expert tensors over `n_expert`, not two layers' worth.
+        assert_eq!(plan.bytes_per_expert, 4096 * 4 / 4);
+        assert_eq!(plan.dense_bytes, 4 * 1024 * 4);
+        assert_eq!(plan.total_bytes, plan.dense_bytes + plan.expert_bytes);
+        assert_eq!(plan.expert_bytes_per_token(), (4096 * 4 / 4) * 2 * 2);
+    }
+
+    /// Metadata comes from the first shard, and later shards contribute
+    /// tensors only — a shard that repeats the architecture key must not be
+    /// able to change the answer, and a plan of one shard must not differ
+    /// from a plan of the same shard followed by more.
+    #[test]
+    fn analyze_shards_takes_its_metadata_from_the_first_shard() {
+        let plan = analyze_shards(vec![Ok(shard(
+            &[("general.architecture", 0)],
+            vec![f32_tensor("token_embd.weight", 1024)],
+        ))])
+        .unwrap();
+        assert_eq!(plan.shards, 1);
+        assert_eq!(plan.n_expert, 0);
+        assert!(!plan.is_moe());
+        assert_eq!(plan.dense_bytes, 1024 * 4);
+    }
+
+    /// A shard that will not parse — a truncated header, a dropped
+    /// connection part-way through a remote fetch — must fail the plan
+    /// rather than silently produce one that undercounts by a shard.
+    #[test]
+    fn analyze_shards_propagates_a_failed_shard() {
+        let err = analyze_shards(vec![
+            Ok(shard(
+                &[("general.architecture", 0)],
+                vec![f32_tensor("token_embd.weight", 1024)],
+            )),
+            Err(anyhow!("connection reset")),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+    }
+
+    #[test]
+    fn analyze_shards_rejects_a_model_with_no_shards() {
+        assert!(analyze_shards(Vec::new()).is_err());
+    }
+
+    /// The prompt `download` shows and the verdict `format_plan` prints are
+    /// two readings of one predicate, and this is what keeps them from
+    /// drifting: for every case, "the report says it will not work" and
+    /// "`dense_fits_in` says no" must be the same answer. A model whose
+    /// *experts* overflow is explicitly not that case — it streams, so it is
+    /// slow rather than broken, and `download` must not stop to warn about
+    /// the workload orangu is built for.
+    #[test]
+    fn dense_fits_in_agrees_with_every_printed_verdict() {
+        let unworkable_moe = Plan {
+            dense_bytes: 40 << 30,
+            ..moe_plan()
+        };
+        let dense = Plan {
+            shards: 1,
+            architecture: "llama".into(),
+            total_bytes: 30 << 30,
+            dense_bytes: 30 << 30,
+            expert_bytes: 0,
+            device_bytes: 30 << 30,
+            draft_bytes: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            moe_layers: 0,
+            bytes_per_expert: 0,
+        };
+        for (plan, ram) in [
+            (&moe_plan(), 60 << 30),     // streams: runnable
+            (&moe_plan(), 400 << 30),    // fits outright
+            (&unworkable_moe, 20 << 30), // dense part short
+            (&dense, 60 << 30),          // fits
+            (&dense, 8 << 30),           // short
+        ] {
+            let report = format_plan(plan, ram, None);
+            let says_no = report.contains("does NOT fit") || report.contains("will NOT work");
+            assert_eq!(
+                plan.dense_fits_in(ram),
+                !says_no,
+                "predicate and verdict disagree at {ram} bytes:\n{report}"
+            );
+        }
+    }
+
+    /// The bug this whole device path exists for.
+    ///
+    /// `Qwen3.8-27B-Q6_K` planned as "fits in RAM with 23.9 GiB to spare" and
+    /// then, on being served, reported that its weights were 17.3 GiB larger
+    /// than the card the server had just selected and would be paged in and
+    /// out on every token. Both statements were true; the plan was simply
+    /// answering a question about the wrong ceiling, and printing no `This
+    /// box` line for a dense model meant there was nothing beside the verdict
+    /// to notice that with.
+    #[test]
+    fn a_model_that_fits_ram_but_not_the_card_says_so() {
+        let plan = Plan {
+            shards: 1,
+            architecture: "qwen35".into(),
+            total_bytes: 21300 << 20,
+            dense_bytes: 21000 << 20,
+            expert_bytes: 0,
+            device_bytes: 21000 << 20,
+            draft_bytes: 300 << 20,
+            n_expert: 0,
+            n_expert_used: 0,
+            moe_layers: 0,
+            bytes_per_expert: 0,
+        };
+        let report = format_plan(&plan, 44 << 30, Some(("AMD Radeon RX 5500M", 3980 << 20)));
+
+        // The RAM verdict is unchanged and still true.
+        assert!(report.contains("fits in RAM"), "{report}");
+        // What used to be missing entirely.
+        assert!(report.contains("This box"), "{report}");
+        assert!(report.contains("AMD Radeon RX 5500M"), "{report}");
+        assert!(report.contains("Device"), "{report}");
+        assert!(report.contains("too large for this GPU"), "{report}");
+        assert!(report.contains("page weights"), "{report}");
+        assert!(report.contains("`backend = cpu`"), "{report}");
+        assert_eq!(plan.device_shortfall(3980 << 20), Some(17020 << 20));
+    }
+
+    /// A dense model used to print no `This box` line at all — that block sat
+    /// under the mixture-of-experts branch, so the commonest kind of model got
+    /// a verdict with nothing to check it against.
+    #[test]
+    fn a_dense_plan_states_the_machine_it_was_judged_against() {
+        let mut plan = moe_plan();
+        plan.moe_layers = 0;
+        plan.n_expert = 0;
+        assert!(!plan.is_moe());
+        assert!(format_plan(&plan, 60 << 30, None).contains("This box"));
+    }
+
+    /// With no dedicated card there is no second ceiling, and the report must
+    /// not invent one — nor name a GPU it was not given.
+    #[test]
+    fn no_device_means_no_device_verdict() {
+        for plan in [
+            moe_plan(),
+            Plan {
+                moe_layers: 0,
+                n_expert: 0,
+                ..moe_plan()
+            },
+        ] {
+            let report = format_plan(&plan, 60 << 30, None);
+            assert!(!report.contains("Device"), "{report}");
+            assert!(!report.contains("VRAM"), "{report}");
+        }
+    }
+
+    /// Shared experts are dense — every token runs them — but they have no
+    /// GPU path, so they belong to `dense_bytes` and *not* to `device_bytes`.
+    /// Conflating the two would have a plan tell a card to hold weights that
+    /// never reach it, overstating an MoE model's device footprint by most of
+    /// its shared-expert mass.
+    #[test]
+    fn shared_experts_are_dense_but_not_device_resident() {
+        let meta = &[
+            ("general.architecture", 0),
+            ("testmoe.expert_count", 4),
+            ("testmoe.expert_used_count", 2),
+        ];
+        let plan = analyze_shards(vec![Ok(shard(
+            meta,
+            vec![
+                f32_tensor("token_embd.weight", 1024),
+                f32_tensor("blk.0.attn_norm.weight", 1024),
+                f32_tensor("blk.0.ffn_gate_exps.weight", 4096),
+                f32_tensor("blk.0.ffn_gate_shexp.weight", 2048),
+            ],
+        ))])
+        .unwrap();
+
+        // Dense counts the shared expert; the device does not.
+        assert_eq!(plan.dense_bytes, (1024 + 1024 + 2048) * 4);
+        assert_eq!(plan.device_bytes, (1024 + 1024) * 4);
+        assert_eq!(plan.expert_bytes, 4096 * 4);
+    }
+
+    /// A draft block is never uploaded either, so it must not be charged to
+    /// the card any more than it is charged to RAM.
+    #[test]
+    fn the_draft_block_is_not_charged_to_the_device() {
+        let plan = analyze_shards(vec![Ok(shard(
+            &[
+                ("general.architecture", 0),
+                ("testmoe.block_count", 2),
+                ("testmoe.nextn_predict_layers", 1),
+            ],
+            vec![
+                f32_tensor("blk.0.attn_norm.weight", 1024),
+                f32_tensor("blk.1.attn_norm.weight", 4096),
+            ],
+        ))])
+        .unwrap();
+        assert_eq!(plan.draft_bytes, 4096 * 4);
+        assert_eq!(plan.dense_bytes, 1024 * 4);
+        assert_eq!(plan.device_bytes, 1024 * 4);
+    }
+
+    /// Every figure scales to its own size, at both ends of the range a plan
+    /// has to cover.
+    ///
+    /// A fixed unit is wrong twice over, and the report used to carry two of
+    /// them. `{:.1} MiB` on the per-token line made a large mixture-of-experts
+    /// model read `Per token 14473.1 MiB` — four digits nobody can weigh
+    /// against the `GiB` figures three lines above. `{:.1} GiB` on the size
+    /// lines rounded a 318 MiB embedding model down to `0.3 GiB on disk`,
+    /// discarding most of the precision it had.
+    ///
+    /// Asserted as "the wrong unit does not appear" rather than by matching
+    /// the exact rendering, so this keeps biting if the formatter's decimals
+    /// or spacing change but its scaling does not.
+    #[test]
+    fn every_figure_is_printed_in_a_unit_that_suits_it() {
+        // 20 MiB per expert x 8 used x 75 layers = 11.72 GiB per token.
+        let report = format_plan(&moe_plan(), 60 << 30, None);
+        let per_token = report
+            .lines()
+            .find(|line| line.starts_with("Per token"))
+            .expect("a per-token line");
+        assert!(
+            per_token.contains("GiB"),
+            "11.72 GiB per token printed in the wrong unit: {per_token}"
+        );
+        // The per-expert figure on the line above is genuinely MiB-scale and
+        // must stay that way — scaling everything to GiB would be the same
+        // mistake pointing the other way.
+        let experts = report
+            .lines()
+            .find(|line| line.starts_with("Experts"))
+            .expect("an experts line");
+        assert!(
+            experts.contains("20.00 MiB each"),
+            "a 20 MiB expert printed in the wrong unit: {experts}"
+        );
+
+        // A model far below a gigabyte keeps its precision.
+        let small = Plan {
+            shards: 1,
+            architecture: "gemma-embedding".into(),
+            total_bytes: 318 << 20,
+            dense_bytes: 318 << 20,
+            expert_bytes: 0,
+            device_bytes: 318 << 20,
+            draft_bytes: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            moe_layers: 0,
+            bytes_per_expert: 0,
+        };
+        let report = format_plan(&small, 60 << 30, None);
+        assert!(report.contains("318.00 MiB on disk"), "{report}");
+        assert!(!report.contains("0.3 GiB"), "{report}");
     }
 }

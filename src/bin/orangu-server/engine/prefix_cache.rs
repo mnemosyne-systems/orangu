@@ -54,13 +54,30 @@ impl CachedPrefill {
     /// [`PrefixCache::take_best_match`]'s own doc comment for why each cap
     /// matters.
     pub fn reusable_prefix_len(&self, prompt: &[u32]) -> usize {
-        let cached_len = self
-            .cache
-            .layers
-            .iter()
-            .map(|l| l.len)
-            .max()
-            .unwrap_or(self.tokens.len());
+        // `KvCache::committed_len`, not a second copy of it. This used to
+        // recompute the same maximum inline, which made two implementations of
+        // one rule — and they had already diverged in the way that matters:
+        // this one read a block-compressed slot's row count as a token count,
+        // where the shared one now converts through the slot's stride.
+        // `host_committed_len`, not `committed_len`: the fused GPU decode
+        // path commits a token's key and value to the device mirror only
+        // (`LayerCache::advance_gpu_only`), so a cache that generated N tokens
+        // has a `len` N rows ahead of the host buffers every reader here works
+        // from. Bounding by `len` copied off the end of them — a panic, and
+        // before `V4` sized the buffers to their contents, silently reused
+        // zeros instead.
+        //
+        // The practical cost is small: what is lost is reuse of the *generated
+        // tail*, which the next turn re-prefills, while the prompt prefix —
+        // the large part, and CPU-prefilled — still reuses in full.
+        let cached_len = if self.cache.layers.is_empty() {
+            // No attention layers at all (a purely recurrent architecture):
+            // there is no host buffer to bound by, and the entry's own token
+            // count is the length its state stands for.
+            self.tokens.len()
+        } else {
+            self.cache.host_committed_len()
+        };
         let prefix_len = common_prefix_len(&self.tokens, prompt).min(cached_len);
         if prefix_len == 0 {
             return 0;

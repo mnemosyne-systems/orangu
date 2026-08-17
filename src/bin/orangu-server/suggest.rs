@@ -151,12 +151,12 @@ const WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 /// (see [`WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES`]) above the threshold
 /// counts too.
 #[cfg(not(target_os = "windows"))]
-fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
+pub(crate) fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
     gpu.memory_kind == MemoryKind::Dedicated
 }
 
 #[cfg(target_os = "windows")]
-fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
+pub(crate) fn is_dedicated_for_budget(gpu: &GpuInfo) -> bool {
     gpu.memory_kind == MemoryKind::Dedicated
         || (gpu.memory_kind == MemoryKind::Unknown
             && gpu.vram_total_bytes.unwrap_or(0) >= WINDOWS_UNKNOWN_DEDICATED_THRESHOLD_BYTES)
@@ -206,7 +206,7 @@ fn dedicated_vram_budget_bytes(gpus: &[GpuInfo]) -> u64 {
 /// The GPU [`dedicated_vram_budget_bytes`] took its number from — so the
 /// report can name it rather than leaving the reader to work out which of
 /// the machine's cards a bare byte count refers to.
-fn largest_dedicated_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+pub(crate) fn largest_dedicated_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
     gpus.iter()
         .filter(|g| is_dedicated_for_budget(g) && g.vram_total_bytes.is_some())
         .max_by_key(|g| g.vram_total_bytes.unwrap_or(0))
@@ -324,7 +324,7 @@ fn push_suggestion_block(out: &mut String, label: &str, budget: u64, source: Opt
 /// dedicated GPU VRAM alone (the fast path), one against the largest memory
 /// pool on the machine, GPU or system RAM (see [`total_budget_bytes`]).
 pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
-    let mut out = system::format_report(os, cpu, gpus);
+    let mut out = system::format_report(os, cpu, gpus, &system::detect_power());
 
     // A "Dedicated" budget of 0 (no GPU with real, hard-ceiling VRAM at
     // all) would just print an estimated budget of 0 B and a table of
@@ -350,8 +350,26 @@ pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String
         ),
     );
 
+    out.push_str(NEXT_STEP);
     out
 }
+
+/// Where the estimate ends and a real answer begins.
+///
+/// Every figure above it is derived from a parameter count and the standard
+/// transformer approximation, because at this point no model has been chosen
+/// and there is no file to read. `download` does not have that problem: it
+/// reads the repo's actual tensor tables before fetching anything and reports
+/// what *that* model needs. Saying so here is what turns a size class into a
+/// next step, and it is the difference between a suggestion the user has to
+/// act on blind and one that gets checked against reality before any
+/// bandwidth is spent.
+const NEXT_STEP: &str = "\n\
+    Every figure above is estimated from a parameter count — no model has been\n\
+    chosen yet, so there is no file to read. Once you have picked one,\n\
+    `orangu-server download <user>/<model>[:quant]` reads its real tensor tables\n\
+    before fetching it and reports what that model actually needs here;\n\
+    `orangu-server plan` does the same for a model already downloaded.\n";
 
 #[cfg(test)]
 mod tests {

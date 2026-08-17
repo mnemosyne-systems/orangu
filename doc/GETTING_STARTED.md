@@ -75,6 +75,13 @@ the repo — so pin one explicitly when it matters:
 orangu-server download unsloth/gemma-4-E2B-it-GGUF:Q8_0
 ```
 
+Before anything is fetched, the repo is planned against this machine — each
+shard's GGUF header is read over the network, which is a few hundred kilobytes
+rather than the model, and the result says how much of the model must stay
+resident and how much can stream from disk. A model that cannot run here stops
+to confirm; `-y` skips that. `orangu-server plan` gives the same report for a
+model already on disk.
+
 Every shard of a multi-part model is fetched, along with the matching
 `mmproj-*` sidecar when the repo has one. Files land in the `models` directory
 from step 1, in Hugging Face hub-cache layout. Free space is checked up front,

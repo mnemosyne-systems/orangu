@@ -237,7 +237,7 @@ impl LlamaModel {
 /// would itself be measurable.
 pub fn no_fused_qkv() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("ORANGU_NO_FUSED_QKV").is_some())
+    *CACHED.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_FUSED_QKV"))
 }
 
 /// Narrowest batch the fused pre-attention chain is worth taking.
@@ -273,7 +273,7 @@ pub fn min_fused_tokens() -> usize {
 
 pub fn no_fused_post_attention() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("ORANGU_NO_FUSED_POST_ATTN").is_some())
+    *CACHED.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_FUSED_POST_ATTN"))
 }
 
 impl LlamaModel {

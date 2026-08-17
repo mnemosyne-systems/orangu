@@ -128,6 +128,17 @@ struct GpuLayerCache {
     /// it, so [`LayerCache::sync_gpu`]'s CPU→GPU upload path can check it
     /// without needing its own copy.
     kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    /// Rows this mirror was allocated for — **not** the layer's `capacity`.
+    ///
+    /// The mirror used to be sized to the whole capacity on first use, which
+    /// meant a request's `max_tokens` was reserved in VRAM whether or not it
+    /// was ever generated. Measured on a 3.98 GiB card with a two-token
+    /// prompt: 2191 MiB at `max_tokens = 64` against **3727 MiB** at
+    /// `max_tokens = 32768`, for the same one-word answer. Host buffers do
+    /// not have this problem — a large zeroed `Vec` is `mmap`ed and the
+    /// kernel commits pages only as they are written — but device memory is
+    /// not overcommitted, so on the GPU the reservation is real.
+    rows: usize,
     /// Cached attention-dispatch resources, keyed by the *calling layer's*
     /// `wq` tensor identity (`QuantMatrix::cache_key()`) — see
     /// [`GpuAttnDispatch`]'s doc comment for why one `LayerCache` can need
@@ -271,13 +282,18 @@ fn gpu_layer_bytes(
 }
 
 impl GpuLayerCache {
+    /// Allocates a mirror for exactly `rows` positions.
+    ///
+    /// `rows` is what [`LayerCache::sync_gpu`] decided to grow to, never the
+    /// layer's capacity — see [`Self::rows`].
     fn new(
         device: &wgpu::Device,
-        capacity: usize,
+        rows: usize,
         kv_dim: usize,
         n_head: usize,
         kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> Self {
+        let capacity = rows;
         // `Q8_0`'s 9-word (36-byte), 32-element blocks aren't expressible
         // as a fixed per-element byte count the way `f32`/`f16` are — size
         // by block count directly instead.
@@ -309,7 +325,13 @@ impl GpuLayerCache {
         let kv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server kv cache (k|v)"),
             size: v_off + v_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // `COPY_SRC` as well as `COPY_DST`: growing the mirror copies the
+            // rows already on the device straight across rather than
+            // re-uploading them from the host, which would put the whole
+            // cache back over the bus every time it doubled.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let probs_scratch = device.create_buffer(&wgpu::BufferDescriptor {
@@ -327,12 +349,59 @@ impl GpuLayerCache {
             probs_scratch,
             synced_len: 0,
             kv_storage,
+            rows,
             attn_dispatch: std::collections::HashMap::new(),
         }
     }
 }
 
+/// How many rows a mirror holding `len` positions is allocated for.
+///
+/// Doubling from a small floor, capped at the layer's own capacity. Doubling
+/// rather than a fixed block because the cost of being wrong is a buffer
+/// reallocation plus a device-side copy: a fixed block size would pay that
+/// every `BLOCK` tokens for the whole generation, where doubling pays it
+/// `log2` times in total and then never again.
+///
+/// The floor keeps a short answer — the overwhelmingly common case — to one
+/// allocation, and the cap means a request that really does run to its full
+/// budget ends up with exactly what it would have had before, having paid a
+/// handful of copies to get there.
+/// Bytes `rows` stored positions occupy in one k or v region.
+///
+/// The same arithmetic [`GpuLayerCache::new`] sizes a region with, named once
+/// so the grow-copy cannot disagree with the allocation it is copying between.
+fn row_bytes(
+    rows: usize,
+    kv_dim: usize,
+    kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+) -> u64 {
+    match kv_storage {
+        crate::engine::backend::vulkan_shaders::KvStorage::F32 => (rows * kv_dim * 4) as u64,
+        crate::engine::backend::vulkan_shaders::KvStorage::F16 => (rows * kv_dim * 2) as u64,
+        crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => (rows * kv_dim / 32 * 36) as u64,
+    }
+}
+
+fn mirror_rows_for(rows_needed: usize, capacity: usize) -> usize {
+    let len = rows_needed;
+    const FLOOR: usize = 256;
+    let mut rows = FLOOR;
+    while rows < len {
+        rows = rows.saturating_mul(2);
+    }
+    rows.min(capacity).max(len).max(1)
+}
+
 impl LayerCache {
+    /// An ordinary per-token slot — `new_strided` at stride 1.
+    ///
+    /// Test-only since every constructor was funnelled through
+    /// [`KvCache::build`]: production has one shape of call and this spelling
+    /// only survives because a test that says `new(4, 6)` reads better than
+    /// one that says `new_strided(4, 6, 1)` and leaves the reader wondering
+    /// what the 1 was about.
+    #[cfg(test)]
     fn new(capacity: usize, kv_dim: usize) -> Self {
         Self::new_strided(capacity, kv_dim, 1)
     }
@@ -344,8 +413,15 @@ impl LayerCache {
         assert!(stride > 0, "a KV slot's stride must be at least one token");
         let rows = capacity.div_ceil(stride);
         Self {
-            k: vec![0.0; rows * kv_dim],
-            v: vec![0.0; rows * kv_dim],
+            // Reserved, not filled. `k.len()` tracks the committed rows from
+            // here on, which is what lets a reused prefix hand its buffers
+            // over wholesale instead of being copied into a pre-sized one —
+            // see [`Self::adopt`]. Reserving the whole context up front still
+            // costs nothing until it is written: a large allocation is
+            // `mmap`ed and the kernel commits pages lazily, measured at 0.0
+            // MiB of RSS for two gigabytes.
+            k: Vec::with_capacity(rows * kv_dim),
+            v: Vec::with_capacity(rows * kv_dim),
             kv_dim,
             capacity: rows,
             len: 0,
@@ -416,9 +492,41 @@ impl LayerCache {
             return;
         }
         self.len = new_len;
+        // The buffers carry the committed rows and nothing else now, so
+        // rolling back the length has to roll them back too. `Vec::truncate`
+        // keeps the allocation, which is right: the rows are about to be
+        // written again by whatever replaces them.
+        self.k.truncate(new_len * self.kv_dim);
+        self.v.truncate(new_len * self.kv_dim);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.synced_len = gpu.synced_len.min(new_len);
         }
+    }
+
+    /// Takes `src`'s committed rows as this layer's own, without copying them.
+    ///
+    /// The buffers move; `self` keeps its own `capacity`, `kv_dim` and
+    /// `stride`, because those describe *this* request and the rows are just
+    /// bytes. The GPU mirror is dropped for the same reason
+    /// [`Self::copy_prefix_from`] drops it — it belonged to the old cache's
+    /// buffers and has to be rebuilt against these.
+    ///
+    /// Only valid where the caller owns `src` outright.
+    /// `engine::prefix_cache::PrefixCache::take_best_match` *removes* the
+    /// entry it returns, so the reuse path does; `engine::slot_store` retains
+    /// its snapshot for the slot's next request and therefore cannot, and
+    /// still copies.
+    fn adopt(&mut self, src: &mut LayerCache) {
+        debug_assert_eq!(self.kv_dim, src.kv_dim);
+        self.k = std::mem::take(&mut src.k);
+        self.v = std::mem::take(&mut src.v);
+        self.len = src.len;
+        // One reallocation now, at a known point, rather than one during
+        // whichever decode step first runs past the old request's ceiling.
+        let want = self.capacity * self.kv_dim;
+        self.k.reserve(want.saturating_sub(self.k.len()));
+        self.v.reserve(want.saturating_sub(self.v.len()));
+        self.gpu = None;
     }
 
     /// A CPU-only snapshot (no GPU mirror) for building an independent
@@ -431,9 +539,10 @@ impl LayerCache {
         self.duplicate()
     }
 
-    /// Lazily builds this layer's GPU-resident mirror (sized once, for the
-    /// cache's whole lifetime — `n_head` is a fixed model property, always
-    /// the same across every call for a given layer) and uploads any
+    /// Lazily builds this layer's GPU-resident mirror — **grown to the rows
+    /// actually in use, not to the layer's capacity** (`n_head` is a fixed
+    /// model property, always the same across every call for a given layer)
+    /// — and uploads any
     /// positions [`Self::push`]ed since the last sync. The first call
     /// after a multi-token prefill uploads that whole range in one bulk
     /// `write_buffer`; every call after that uploads at most the one new
@@ -448,9 +557,66 @@ impl LayerCache {
     ) -> GpuKvRefs {
         let capacity = self.capacity;
         let kv_dim = self.kv_dim;
-        let gpu = self.gpu.get_or_insert_with(|| {
-            GpuLayerCache::new(device, capacity, kv_dim, n_head, kv_storage)
-        });
+        // `len + 1`, not `len`: the fused decode path binds these buffers and
+        // then writes the *current* token's key and value at row `len`, before
+        // the host-side `push` that will make that row committed. Sizing to
+        // `len` leaves that write one row past the end of the k region — which
+        // lands inside the shared k|v buffer rather than outside it, so the
+        // driver never objects and the damage is silent: it lands on row 0 of
+        // v. Sizing to `capacity` used to hide this, because capacity always
+        // exceeds `len`.
+        let want = mirror_rows_for(self.len + 1, capacity);
+        // Grow before syncing, never shrink. A mirror that is already big
+        // enough is left exactly as it is, so the steady state — every decode
+        // step after the first — does no work here at all.
+        match &self.gpu {
+            None => {
+                self.gpu = Some(GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage));
+            }
+            Some(gpu) if gpu.rows < self.len + 1 => {
+                let old = self.gpu.take().expect("checked present");
+                let mut grown = GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage);
+                // Carry the rows already on the device across on the device.
+                // They are identical bytes in an identical layout — only the
+                // region length changed — so this is two straight copies, and
+                // it keeps `synced_len` meaningful instead of forcing the
+                // whole cache back over the bus.
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("orangu-server kv mirror grow"),
+                });
+                // Clamped to what the source actually holds. `synced_len`
+                // should never exceed it, and if a future path makes it
+                // possible again this copies a short prefix instead of reading
+                // off the end of a buffer.
+                let carried = old.synced_len.min(old.rows);
+                let synced_bytes = row_bytes(carried, kv_dim, kv_storage);
+                if synced_bytes > 0 {
+                    encoder.copy_buffer_to_buffer(
+                        &old.kv_buffer,
+                        old.k_off,
+                        &grown.kv_buffer,
+                        grown.k_off,
+                        synced_bytes,
+                    );
+                    encoder.copy_buffer_to_buffer(
+                        &old.kv_buffer,
+                        old.v_off,
+                        &grown.kv_buffer,
+                        grown.v_off,
+                        synced_bytes,
+                    );
+                }
+                queue.submit(std::iter::once(encoder.finish()));
+                grown.synced_len = carried;
+                // The cached bind groups name the *old* buffer, so they are
+                // stale the moment it is replaced. Dropped rather than
+                // rebuilt: the caller rebuilds on a miss, and rebuilding here
+                // would need the resources only it has.
+                self.gpu = Some(grown);
+            }
+            Some(_) => {}
+        }
+        let gpu = self.gpu.as_mut().expect("mirror present after growth");
         if gpu.synced_len < self.len {
             let start = gpu.synced_len * kv_dim;
             let end = self.len * kv_dim;
@@ -588,9 +754,9 @@ impl LayerCache {
         );
         debug_assert_eq!(k.len(), self.kv_dim);
         debug_assert_eq!(v.len(), self.kv_dim);
-        let start = self.len * self.kv_dim;
-        self.k[start..start + self.kv_dim].copy_from_slice(k);
-        self.v[start..start + self.kv_dim].copy_from_slice(v);
+        debug_assert_eq!(self.k.len(), self.len * self.kv_dim);
+        self.k.extend_from_slice(k);
+        self.v.extend_from_slice(v);
         self.len += 1;
     }
 
@@ -639,6 +805,43 @@ impl LayerCache {
         if let Some(gpu) = &mut self.gpu {
             gpu.synced_len = self.len;
         }
+    }
+
+    /// This layer's committed length **in tokens**.
+    ///
+    /// [`len`](Self::len) counts *rows*, and a block-compressed row stands for
+    /// [`stride`](Self::stride) tokens, so the two are the same number only on
+    /// an ordinary per-token slot. Every other length-converting operation
+    /// here — [`truncate`](Self::truncate), [`copy_prefix_from`] — already
+    /// goes through `stride`; this is the read-side counterpart, so a caller
+    /// asking "how many tokens does this hold" cannot get rows back.
+    fn committed_tokens(&self) -> usize {
+        self.len * self.stride
+    }
+
+    /// How many rows are actually **in the host buffers**.
+    ///
+    /// Not the same as [`len`](Self::len), and the gap is the whole reason
+    /// this exists. The fused GPU decode path writes a token's key and value
+    /// straight into the device mirror and calls
+    /// [`advance_gpu_only`](Self::advance_gpu_only), which moves `len` without
+    /// pushing anything here — so after N decode steps `len` is N rows ahead
+    /// of `k`/`v`. Anything that reads the host side (prefix reuse, slot save,
+    /// CPU attention) has to bound itself by *this*, not by `len`.
+    ///
+    /// Derived from the buffer rather than tracked in a field on purpose: a
+    /// second counter is a second thing to keep in step, and this one cannot
+    /// drift from what it describes.
+    fn host_len(&self) -> usize {
+        if self.kv_dim == 0 {
+            return 0;
+        }
+        self.k.len() / self.kv_dim
+    }
+
+    /// [`host_len`](Self::host_len) in tokens rather than rows.
+    fn host_tokens(&self) -> usize {
+        self.host_len() * self.stride
     }
 
     /// The key vector at cached position `pos` for KV head `kv_head`
@@ -694,14 +897,24 @@ impl LayerCache {
             "reused prefix ({len}) exceeds this request's own KV capacity ({})",
             self.capacity
         );
+        // Against the *host* rows, not `src.len`: a cache whose generated
+        // tail was written by the fused GPU path has a `len` that runs past
+        // its host buffers, and copying against `len` reads off the end of
+        // them. Callers clamp before getting here
+        // (`KvCache::host_committed_len`); this is the backstop that names
+        // the real bound if one ever does not.
         assert!(
-            len <= src.len,
-            "reused prefix ({len}) exceeds the source cache's own committed length ({})",
+            len <= src.host_len(),
+            "reused prefix ({len}) exceeds the source cache's host-resident length ({}); \
+             its `len` is {} because the fused decode path wrote those rows to the device only",
+            src.host_len(),
             src.len
         );
         let n = len * self.kv_dim;
-        self.k[..n].copy_from_slice(&src.k[..n]);
-        self.v[..n].copy_from_slice(&src.v[..n]);
+        self.k.clear();
+        self.v.clear();
+        self.k.extend_from_slice(&src.k[..n]);
+        self.v.extend_from_slice(&src.v[..n]);
         self.len = len;
         self.gpu = None;
     }
@@ -719,6 +932,32 @@ pub struct KvCache {
 }
 
 impl KvCache {
+    /// The one constructor. Every other is a thin wrapper that fills in the
+    /// parts its callers do not vary.
+    ///
+    /// Written this way because it was not: there were four independent
+    /// constructors, and between them they could express per-layer dims,
+    /// per-layer strides, and recurrent state — but *not* strides and
+    /// recurrent state together, because the two grew on separate branches
+    /// and nothing joined them. No architecture needs that combination today.
+    /// The next one to need it should find a constructor rather than a fifth
+    /// entry point, and every shape should already flow through the same code
+    /// so a change to how rows are allocated lands in one place.
+    fn build(capacity: usize, kv_dims: &[(usize, usize)], recurrent: &[RecurrentSpec]) -> Self {
+        Self {
+            layers: kv_dims
+                .iter()
+                .map(|&(dim, stride)| LayerCache::new_strided(capacity, dim, stride))
+                .collect(),
+            recurrent: recurrent
+                .iter()
+                .copied()
+                .map(RecurrentLayerState::new)
+                .collect(),
+        }
+    }
+
+    /// A uniform cache: `n_layer` per-token slots of the same width.
     pub fn new(n_layer: usize, capacity: usize, kv_dim: usize) -> Self {
         Self::new_with_dims(capacity, &vec![kv_dim; n_layer])
     }
@@ -727,13 +966,8 @@ impl KvCache {
     /// architectures where key/value head size varies by layer (e.g.
     /// Gemma's SWA vs. full-attention layers using different head dims).
     pub fn new_with_dims(capacity: usize, kv_dims: &[usize]) -> Self {
-        Self {
-            layers: kv_dims
-                .iter()
-                .map(|&dim| LayerCache::new(capacity, dim))
-                .collect(),
-            recurrent: Vec::new(),
-        }
+        let strided: Vec<(usize, usize)> = kv_dims.iter().map(|&dim| (dim, 1)).collect();
+        Self::build(capacity, &strided, &[])
     }
 
     /// Like [`KvCache::new_with_dims`], but each slot also carries a
@@ -744,13 +978,7 @@ impl KvCache {
     /// in the same positional cache as its per-token keys, so rollback,
     /// prefix reuse, and slot persistence apply to all of it unchanged.
     pub fn new_with_strided_dims(capacity: usize, kv_dims: &[(usize, usize)]) -> Self {
-        Self {
-            layers: kv_dims
-                .iter()
-                .map(|&(dim, stride)| LayerCache::new_strided(capacity, dim, stride))
-                .collect(),
-            recurrent: Vec::new(),
-        }
+        Self::build(capacity, kv_dims, &[])
     }
 
     /// Device bytes this cache's *shape* would need at `token_capacity`
@@ -819,13 +1047,8 @@ impl KvCache {
         kv_dims: &[usize],
         recurrent_specs: &[RecurrentSpec],
     ) -> Self {
-        let mut cache = Self::new_with_dims(capacity, kv_dims);
-        cache.recurrent = recurrent_specs
-            .iter()
-            .copied()
-            .map(RecurrentLayerState::new)
-            .collect();
-        cache
+        let strided: Vec<(usize, usize)> = kv_dims.iter().map(|&dim| (dim, 1)).collect();
+        Self::build(capacity, &strided, recurrent_specs)
     }
 
     /// Reuses `src`'s already-computed positions `[0, len)` instead of
@@ -855,6 +1078,45 @@ impl KvCache {
         }
     }
 
+    /// Takes `src`'s first `len` token positions as this cache's own, moving
+    /// the buffers instead of copying them.
+    ///
+    /// The same result as [`Self::copy_prefix_from`] and the same
+    /// preconditions — `self` freshly allocated, `len` already bounded by
+    /// `CachedPrefill::reusable_prefix_len` — but it consumes `src`, which is
+    /// what makes the move sound. Only a caller that owns the source outright
+    /// may use it: `engine::prefix_cache::PrefixCache::take_best_match`
+    /// *removes* the entry it hands back, so the cross-request pool qualifies,
+    /// while `engine::slot_store` keeps its snapshot for the same slot's next
+    /// request and must go on copying.
+    ///
+    /// Worth the second method because the copy is not small. Measured on a
+    /// 2001-token conversational prefix (16 layers, `kv_dim` 512): **67.7 ms**
+    /// the first time and **18.1 ms** warm, against a total reuse-path prefill
+    /// of 167 ms — and the copy transiently doubles the prefix's resident
+    /// footprint, on the machine least able to spare it, at the exact moment
+    /// the source is about to be dropped.
+    pub fn adopt_prefix(&mut self, mut src: KvCache, len: usize) {
+        // Trim the source to what is actually being reused before taking its
+        // buffers — the caller's `len` can be shorter than what the source
+        // holds, because the reuse path always leaves at least one prompt
+        // token for the forward pass to have something to do.
+        //
+        // Skipped when there is nothing to trim, which is also the only case a
+        // recurrent cache can be in: its state has no per-position history to
+        // roll back, so `reusable_prefix_len` forces all-or-nothing there and
+        // `truncate` refuses recurrent caches outright.
+        if src.committed_len() > len {
+            src.truncate(len);
+        }
+        for (dst, s) in self.layers.iter_mut().zip(src.layers.iter_mut()) {
+            dst.adopt(s);
+        }
+        for (dst, s) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
+            dst.copy_from(s);
+        }
+    }
+
     /// Rolls every attention layer back to `new_len` positions (see
     /// [`LayerCache::truncate`]). Only valid for a cache with no recurrent
     /// (SSM / gated-delta-net) layers: those carry a single evolving state with
@@ -876,8 +1138,42 @@ impl KvCache {
     /// cross-layer KV-donor slot (`engine::arch::gemma`'s `kv_donor`) never
     /// drags the count to zero. `0` for a freshly allocated, never-pushed
     /// cache. This is what a saved slot reports as its reusable token count.
+    /// How much of this cache another request may actually reuse.
+    ///
+    /// [`committed_len`](Self::committed_len) counts every position the cache
+    /// *logically* holds, including rows the fused GPU decode path wrote only
+    /// to the device mirror. Those rows are real for continuing this request
+    /// and unreadable to anyone else, so reuse is bounded by the host side —
+    /// and by the **shortest** layer, not the longest, because a prefix is
+    /// only reusable to the depth every layer can supply it.
+    pub fn host_committed_len(&self) -> usize {
+        self.layers
+            .iter()
+            // Layers that hold nothing are skipped rather than counted as
+            // zero: `engine::arch::gemma`'s cross-layer KV donor is
+            // permanently empty by design, and a plain minimum would read it
+            // as "no prefix is reusable" and switch reuse off for the whole
+            // architecture. `LayerCache::copy_prefix_from` returns early on an
+            // empty source, so a donor is safe to leave out of the bound.
+            .filter(|layer| layer.len > 0)
+            .map(LayerCache::host_tokens)
+            .min()
+            .unwrap_or(0)
+    }
+
     pub fn committed_len(&self) -> usize {
-        self.layers.iter().map(|l| l.len).max().unwrap_or(0)
+        // `committed_tokens`, not `len`: a block-compressed slot's `len` is a
+        // *row* count. Taking the raw maximum happens to give the right answer
+        // on every architecture built so far, because each of them also has
+        // ordinary per-token slots and those are always the longest — but that
+        // is a coincidence of the current models rather than a property
+        // anything guarantees, and it is the kind of coincidence a change to
+        // how the cache is allocated would quietly break.
+        self.layers
+            .iter()
+            .map(LayerCache::committed_tokens)
+            .max()
+            .unwrap_or(0)
     }
 
     /// A CPU-only deep copy (no GPU mirror) of the whole cache — the
@@ -908,6 +1204,12 @@ impl KvCache {
         push_u32(&mut out, self.layers.len() as u32);
         for l in &self.layers {
             push_u32(&mut out, l.kv_dim as u32);
+            // Part of the shape, and it was missing: two caches differing only
+            // in stride are laid out differently and mean different things by
+            // a row, so a signature that omitted it did not describe the
+            // structure it claims to. Masked until now by the model label the
+            // caller hashes alongside this, which is not the same as correct.
+            push_u32(&mut out, l.stride as u32);
         }
         push_u32(&mut out, self.recurrent.len() as u32);
         for r in &self.recurrent {
@@ -1252,6 +1554,88 @@ mod tests {
     use super::*;
     use crate::engine::backend::vulkan_shaders::KvStorage;
 
+    /// A cache in the state the fused GPU decode path leaves it: a prefill
+    /// pushed to the host, then decode steps committed to the device mirror
+    /// only.
+    fn cache_with_gpu_only_tail(prefilled: usize, decoded: usize) -> KvCache {
+        let mut cache = KvCache::new(1, 512, 4);
+        for i in 0..prefilled {
+            cache.layers[0].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        for _ in 0..decoded {
+            cache.layers[0].advance_gpu_only();
+        }
+        cache
+    }
+
+    /// **The crash this pair of methods exists to prevent.**
+    ///
+    /// `len` counts every position the cache logically holds, including the
+    /// ones the fused decode path wrote straight to the device. The host
+    /// buffers hold only the prefilled part, so anything that reuses this
+    /// cache has to bound itself by `host_committed_len` — bounding by
+    /// `committed_len` reads off the end of `k`/`v`.
+    ///
+    /// Found in the wild, not in review: a second conversational turn against
+    /// a slot's retained cache panicked with `range end index 31488 out of
+    /// range for slice of length 30592` — 246 rows claimed against 239 held,
+    /// the difference being exactly the tokens the first turn generated.
+    #[test]
+    fn a_gpu_written_tail_counts_toward_len_but_not_toward_what_can_be_reused() {
+        let cache = cache_with_gpu_only_tail(239, 7);
+        assert_eq!(cache.committed_len(), 246, "the cache holds 246 positions");
+        assert_eq!(
+            cache.host_committed_len(),
+            239,
+            "but only 239 of them can be read back on the host"
+        );
+    }
+
+    /// The reuse bound must be per-*layer*, and taken from the shortest
+    /// layer that holds anything.
+    #[test]
+    fn the_reuse_bound_follows_the_shortest_layer_that_holds_anything() {
+        let mut cache = KvCache::new(3, 512, 4);
+        for i in 0..100 {
+            cache.layers[0].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        for i in 0..40 {
+            cache.layers[1].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        // Layer 2 stays empty, standing in for gemma's cross-layer KV donor.
+        assert_eq!(cache.host_committed_len(), 40);
+    }
+
+    /// An empty donor layer must not switch reuse off for the whole cache —
+    /// a plain minimum over every layer would read it as "nothing reusable".
+    #[test]
+    fn a_permanently_empty_donor_layer_does_not_veto_reuse() {
+        let mut cache = KvCache::new(2, 512, 4);
+        for i in 0..64 {
+            cache.layers[0].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        assert_eq!(cache.host_committed_len(), 64);
+    }
+
+    /// Copying exactly the host-resident length is fine; the row past it is
+    /// what used to panic on a slice index instead of on the bound.
+    #[test]
+    fn copying_up_to_the_host_length_succeeds_and_past_it_is_refused() {
+        let src = cache_with_gpu_only_tail(239, 7);
+        let mut dst = KvCache::new(1, 512, 4);
+        dst.copy_prefix_from(&src, src.host_committed_len());
+        assert_eq!(dst.layers[0].len, 239);
+
+        let mut dst = KvCache::new(1, 512, 4);
+        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dst.copy_prefix_from(&src, src.committed_len())
+        }));
+        assert!(
+            over.is_err(),
+            "copying past the host rows must not be allowed"
+        );
+    }
+
     /// [`gpu_layer_bytes`] has to agree with what [`GpuLayerCache::new`]
     /// actually allocates, and nothing but a reading of both enforces it —
     /// the allocation needs a `wgpu::Device`, so this restates its
@@ -1475,6 +1859,253 @@ mod tests {
     fn commit_gpu_written_rejects_a_partial_row() {
         let mut cache = LayerCache::new(4, 4);
         cache.commit_gpu_written(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+    }
+
+    /// `committed_len` must answer in **tokens** even when every slot is
+    /// block-compressed.
+    ///
+    /// This is the shape no architecture builds today: `deepseek4` is the only
+    /// one that strides at all, and it always has ordinary per-token slots
+    /// alongside, which are the longest — so the old `max(len)` returned the
+    /// token count by coincidence rather than by construction. A change to how
+    /// the cache is allocated is exactly what would remove that coincidence,
+    /// and it would show up as a prefix cache quietly reusing a fraction of
+    /// what it could, which nothing would fail on.
+    #[test]
+    fn committed_len_is_tokens_even_when_every_slot_is_strided() {
+        let mut cache = KvCache::new_with_strided_dims(64, &[(4, 4), (4, 4)]);
+        for _ in 0..5 {
+            for layer in &mut cache.layers {
+                layer.push(&[1.0; 4], &[2.0; 4]);
+            }
+        }
+        // Five rows of stride 4 stand for twenty token positions.
+        assert_eq!(cache.layers[0].len, 5, "rows");
+        assert_eq!(cache.committed_len(), 20, "tokens");
+    }
+
+    /// A mixed cache compares its slots in one unit.
+    #[test]
+    fn committed_len_compares_slots_in_the_same_unit() {
+        // One per-token slot at 8 tokens, one stride-4 slot at 3 rows — which
+        // is 12 tokens, and therefore the longer of the two. Reading rows as
+        // tokens would pick the 8.
+        let mut cache = KvCache::new_with_strided_dims(64, &[(4, 1), (4, 4)]);
+        for _ in 0..8 {
+            cache.layers[0].push(&[1.0; 4], &[2.0; 4]);
+        }
+        for _ in 0..3 {
+            cache.layers[1].push(&[1.0; 4], &[2.0; 4]);
+        }
+        assert_eq!(cache.committed_len(), 12);
+    }
+
+    /// The structural signature has to distinguish two caches that differ
+    /// only in stride — they lay their rows out differently and mean
+    /// different things by one.
+    ///
+    /// Reachable only through the slot fingerprint, where the model label is
+    /// hashed alongside and masks it. That makes this a latent gap rather than
+    /// a live bug, and a signature that is right only because something else
+    /// is also checked is not one worth relying on.
+    #[test]
+    fn the_structure_tag_distinguishes_stride() {
+        let plain = KvCache::new_with_strided_dims(64, &[(4, 1)]);
+        let strided = KvCache::new_with_strided_dims(64, &[(4, 4)]);
+        assert_ne!(
+            plain.structure_tag(),
+            strided.structure_tag(),
+            "two different KV layouts share a structural signature"
+        );
+        // Same shape, different capacity, is still the same structure —
+        // capacity is a per-request size, not a property of the model.
+        assert_eq!(
+            KvCache::new_with_strided_dims(64, &[(4, 4)]).structure_tag(),
+            KvCache::new_with_strided_dims(128, &[(4, 4)]).structure_tag(),
+        );
+    }
+
+    /// Adoption and copying must leave the destination in exactly the same
+    /// state — same committed length, same bytes, same readback.
+    ///
+    /// This is the whole correctness claim of moving the buffers instead of
+    /// copying them, and it is checked against the copy rather than against a
+    /// hand-written expectation, so the two paths cannot drift.
+    #[test]
+    fn adopting_a_prefix_leaves_the_same_state_as_copying_it() {
+        let source = || {
+            let mut c = KvCache::new(2, 16, 4);
+            for i in 0..10u32 {
+                for layer in &mut c.layers {
+                    let f = i as f32;
+                    layer.push(&[f, f + 1.0, f + 2.0, f + 3.0], &[-f, -f, -f, -f]);
+                }
+            }
+            c
+        };
+        for len in [1, 5, 9, 10] {
+            let mut copied = KvCache::new(2, 16, 4);
+            copied.copy_prefix_from(&source(), len);
+            let mut adopted = KvCache::new(2, 16, 4);
+            adopted.adopt_prefix(source(), len);
+
+            assert_eq!(adopted.committed_len(), copied.committed_len(), "len {len}");
+            for (a, c) in adopted.layers.iter().zip(copied.layers.iter()) {
+                assert_eq!(a.len, c.len, "len {len}");
+                for pos in 0..c.len {
+                    assert_eq!(
+                        a.key_at(pos, 0, 4),
+                        c.key_at(pos, 0, 4),
+                        "len {len} pos {pos}"
+                    );
+                    assert_eq!(
+                        a.value_at(pos, 0, 4),
+                        c.value_at(pos, 0, 4),
+                        "len {len} pos {pos}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An adopted cache is still this request's cache: it keeps the capacity
+    /// it was built with, not the source's, and can be pushed to right up to
+    /// that ceiling.
+    ///
+    /// The failure this guards is a conversation that reuses a short earlier
+    /// turn and then panics part-way through generating a long answer,
+    /// because it inherited the earlier turn's smaller ceiling.
+    #[test]
+    fn an_adopted_cache_keeps_its_own_capacity() {
+        let mut short = KvCache::new(1, 4, 4);
+        for i in 0..4u32 {
+            short.layers[0].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        let mut long = KvCache::new(1, 64, 4);
+        long.adopt_prefix(short, 4);
+        assert_eq!(
+            long.layers[0].capacity(),
+            64,
+            "capacity came from the source"
+        );
+        // Everything the new request is still entitled to generate.
+        for i in 4..64u32 {
+            long.layers[0].push(&[i as f32; 4], &[i as f32; 4]);
+        }
+        assert_eq!(long.committed_len(), 64);
+        assert_eq!(long.layers[0].key_at(63, 0, 4), &[63.0; 4]);
+    }
+
+    /// Recurrent state is carried across, and it is copied rather than moved —
+    /// it is a fixed-size evolving state, not a per-position history, so there
+    /// is nothing to take.
+    #[test]
+    fn adopting_carries_recurrent_state() {
+        let spec = RecurrentSpec::delta_net(4, 2, 2, 2);
+        let mut src = KvCache::new_mixed(8, &[4], &[spec]);
+        src.layers[0].push(&[1.0; 4], &[2.0; 4]);
+        src.recurrent[0].delta_state_mut(0)[0] = 42.0;
+
+        let mut dst = KvCache::new_mixed(8, &[4], &[spec]);
+        dst.adopt_prefix(src, 1);
+        assert_eq!(dst.committed_len(), 1);
+        assert_eq!(dst.recurrent[0].delta_state_mut(0)[0], 42.0);
+    }
+
+    /// The mirror is sized to what has been generated, not to what was asked
+    /// for — which is the whole change.
+    ///
+    /// Measured before it, on a 3.98 GiB card with a two-token prompt and the
+    /// same one-word answer: 2191 MiB of VRAM at `max_tokens = 64` against
+    /// 3727 MiB at `max_tokens = 32768`. Host buffers never had this problem,
+    /// because a large zeroed `Vec` is `mmap`ed and the kernel commits pages
+    /// only as they are written; device memory is not overcommitted, so there
+    /// the reservation was real.
+    #[test]
+    fn the_mirror_is_sized_to_what_was_generated_not_what_was_asked_for() {
+        let huge = 32768;
+        // A short answer in a request that asked for a lot: one floor-sized
+        // allocation, not the budget.
+        assert_eq!(mirror_rows_for(1, huge), 256);
+        assert_eq!(mirror_rows_for(200, huge), 256);
+        // Then doubling, so a long generation pays a handful of copies rather
+        // than one per block for its whole length.
+        assert_eq!(mirror_rows_for(257, huge), 512);
+        assert_eq!(mirror_rows_for(1000, huge), 1024);
+        // And a request that really does run to its budget ends up with
+        // exactly what it would have been given up front.
+        assert_eq!(mirror_rows_for(huge, huge), huge);
+    }
+
+    /// The mirror must always have room for **one row past the committed
+    /// length**, and this is the test that says why.
+    ///
+    /// The fused decode path binds the mirror and then writes the current
+    /// token's key and value at row `len`, *before* the host-side `push` that
+    /// makes that row committed. A mirror sized to exactly `len` puts that
+    /// write one row past the end of the k region — and because k and v are
+    /// two sub-ranges of one buffer, it lands on row 0 of v rather than
+    /// outside the allocation, so the driver raises nothing and the corruption
+    /// is silent.
+    ///
+    /// Sizing to `capacity` hid this for as long as the mirror was allocated
+    /// that way, because capacity always exceeds `len`. It surfaced within an
+    /// hour of sizing to demand — as a buffer-overrun validation error one
+    /// growth step later, when the *copy* tried to carry more rows than the
+    /// source held.
+    #[test]
+    fn the_mirror_always_has_room_for_the_row_decode_is_about_to_write() {
+        for capacity in [1, 2, 255, 256, 257, 4096] {
+            for len in 0..capacity {
+                // The call site asks for `len + 1`; this is that contract.
+                let rows = mirror_rows_for(len + 1, capacity);
+                assert!(
+                    rows > len,
+                    "a layer at {len} of {capacity} got {rows} rows — no room for the \
+                     in-flight row, which would land on row 0 of the value region"
+                );
+                assert!(rows <= capacity, "{rows} rows over capacity {capacity}");
+            }
+        }
+    }
+
+    /// Growth never exceeds the capacity the layer was built for, and never
+    /// returns fewer rows than are already committed — the two ways a sizing
+    /// rule can be wrong are over-allocating the thing this exists to stop
+    /// and under-allocating into an out-of-bounds write.
+    #[test]
+    fn mirror_growth_stays_between_the_committed_length_and_the_capacity() {
+        for capacity in [1, 7, 256, 300, 4096, 100_000] {
+            for len in [0, 1, 2, 255, 256, 257, 1023, 4096, 99_999] {
+                if len > capacity {
+                    continue;
+                }
+                let rows = mirror_rows_for(len, capacity);
+                assert!(rows >= len, "{rows} rows for {len} committed");
+                assert!(rows <= capacity, "{rows} rows over capacity {capacity}");
+                assert!(rows >= 1, "a mirror always has at least one row");
+            }
+        }
+    }
+
+    /// The grow-copy and the allocation have to agree about how many bytes a
+    /// row takes, or growth copies the wrong range — silently, since both
+    /// sides would still be in bounds.
+    #[test]
+    fn row_bytes_agrees_with_the_allocation_for_every_storage() {
+        use crate::engine::backend::vulkan_shaders::KvStorage;
+        let (rows, kv_dim, n_head) = (64, 128, 4);
+        for storage in [KvStorage::F32, KvStorage::F16, KvStorage::Q8_0] {
+            let region = row_bytes(rows, kv_dim, storage);
+            // `gpu_layer_bytes` is the independently-written sizing the
+            // footprint report uses: two regions plus the scratch.
+            let whole = gpu_layer_bytes(rows, kv_dim, n_head, storage, 4);
+            assert_eq!(
+                whole,
+                region.max(1).next_multiple_of(4) + region.max(1) + (rows * n_head * 4) as u64,
+                "{storage:?}"
+            );
+        }
     }
 
     #[test]

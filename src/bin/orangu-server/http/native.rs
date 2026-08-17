@@ -38,6 +38,65 @@ pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// Whether this server should be sent traffic *right now*.
+///
+/// Distinct from `/health`, and the distinction is the point. `/health` asks
+/// "is this process alive" — the answer a supervisor uses to decide whether to
+/// restart it, and one that must stay `200` while the server is merely busy,
+/// because restarting a loaded server under load is the worst possible
+/// response to load. `/ready` asks "would a request sent now be served" — the
+/// answer a load balancer uses to decide where to route, where "busy" is
+/// exactly the case worth reporting.
+///
+/// Two things make it `503`:
+///
+/// - **The admission queue is full.** A new unpinned request would be refused
+///   with `503` anyway (see `[orangu-server].queue_limit`), so saying so
+///   up front lets a balancer send it somewhere that can take it instead of
+///   spending a round trip to find out. Only meaningful with a `queue_limit`
+///   set; an unbounded queue never refuses and so is never unready for this
+///   reason.
+/// - **The GPU device was lost.** This process is on its way out
+///   (`crate::device_lost`) and every request from here on is answered with
+///   one sentence about a driver reset. It has not stopped being *alive* —
+///   `/health` keeps saying so, and a supervisor restarting it is precisely
+///   the intended recovery — but nothing should be routed to it meanwhile.
+///
+/// The body names which, because a probe that only flips a status code leaves
+/// an operator with the alert and none of the reason.
+pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let queued = state.engine.slots.queued();
+    let limit = state.engine.slots.queue_limit();
+    let (status, reason) = readiness(crate::device_lost::is_lost(), queued, limit);
+    (
+        status,
+        Json(serde_json::json!({
+            "status": reason,
+            "queue_depth": queued,
+            "queue_limit": limit,
+            "slots_busy": state.engine.slots.busy_count(),
+            "slots_total": state.engine.slots.total(),
+        })),
+    )
+}
+
+/// The readiness decision, apart from the state it reads.
+///
+/// Separated so the rule can be tested at all: the alternative is standing up
+/// an `AppState` — a loaded model and a backend — to assert five lines of
+/// comparison, which is why rules like this usually go untested.
+fn readiness(device_lost: bool, queued: usize, limit: usize) -> (StatusCode, &'static str) {
+    if device_lost {
+        // Checked first: a lost device makes every answer wrong, including a
+        // cheerful one about an empty queue.
+        (StatusCode::SERVICE_UNAVAILABLE, "device lost")
+    } else if limit > 0 && queued >= limit {
+        (StatusCode::SERVICE_UNAVAILABLE, "queue full")
+    } else {
+        (StatusCode::OK, "ok")
+    }
+}
+
 pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.engine.model.config();
     Json(serde_json::json!({
@@ -159,6 +218,11 @@ pub async fn moe_stats() -> impl IntoResponse {
         // `engine::route_ahead`, which measures this before anything is built
         // on it.
         "route_ahead": route_ahead.to_json(),
+        // Mean fused-batch size, or null when `ORANGU_BATCH_DECODE` is off.
+        // A batching measurement is uninterpretable without it.
+        "batch": crate::engine::batch::batch_stats().map(|(batches, seqs, mean)| {
+            serde_json::json!({"batches": batches, "sequences": seqs, "mean_batch": mean})
+        }),
     }))
 }
 
@@ -319,20 +383,137 @@ struct SlotActionBody {
 pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snapshot = state.engine.slots.snapshot();
     let busy = snapshot.iter().filter(|s| s.busy).count();
-    let body = format!(
+    let mut body = format!(
         "# HELP orangu_server_slots_total Configured concurrent request slots.\n\
          # TYPE orangu_server_slots_total gauge\n\
          orangu_server_slots_total {}\n\
          # HELP orangu_server_slots_busy Slots currently generating.\n\
          # TYPE orangu_server_slots_busy gauge\n\
-         orangu_server_slots_busy {busy}\n",
+         orangu_server_slots_busy {busy}\n\
+         # HELP orangu_server_queue_depth Requests waiting for a slot.\n\
+         # TYPE orangu_server_queue_depth gauge\n\
+         orangu_server_queue_depth {}\n\
+         # HELP orangu_server_queue_limit Waiting requests allowed before refusing; 0 is unbounded.\n\
+         # TYPE orangu_server_queue_limit gauge\n\
+         orangu_server_queue_limit {}\n",
         state.engine.slots.total(),
+        state.engine.slots.queued(),
+        state.engine.slots.queue_limit(),
     );
+    body.push_str(&state.engine.metrics.render());
+    body.push_str(&tenant_metrics(&state.tenants));
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
         body,
     )
+}
+
+/// Per-tenant series, or nothing at all when no tenant is declared.
+///
+/// Emitted even for a tenant with no limits set, because attribution is the
+/// half of this that is useful before anyone decides on a number: "who is
+/// using the machine, and for how many tokens" is the question an operator has
+/// to answer *first*, and a limit chosen without it is a guess.
+///
+/// `denied_total` matters more than it looks. A limit that is quietly refusing
+/// requests looks, from the server's side, exactly like a limit that is never
+/// reached — both are a tenant with nothing in flight — and the difference is
+/// the whole of whether the number was set right.
+fn tenant_metrics(tenants: &crate::tenant::TenantRegistry) -> String {
+    if tenants.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# HELP orangu_server_tenant_requests_total Requests admitted for a tenant.\n\
+         # TYPE orangu_server_tenant_requests_total counter\n",
+    );
+    for meter in tenants.meters() {
+        out.push_str(&format!(
+            "orangu_server_tenant_requests_total{{tenant=\"{}\"}} {}\n",
+            meter.name(),
+            meter.total_requests()
+        ));
+    }
+    out.push_str(
+        "# HELP orangu_server_tenant_tokens_total Prompt and generated tokens charged to a tenant.\n\
+         # TYPE orangu_server_tenant_tokens_total counter\n",
+    );
+    for meter in tenants.meters() {
+        out.push_str(&format!(
+            "orangu_server_tenant_tokens_total{{tenant=\"{}\"}} {}\n",
+            meter.name(),
+            meter.total_tokens()
+        ));
+    }
+    out.push_str(
+        "# HELP orangu_server_tenant_in_flight Requests a tenant has in flight now.\n\
+         # TYPE orangu_server_tenant_in_flight gauge\n",
+    );
+    for meter in tenants.meters() {
+        out.push_str(&format!(
+            "orangu_server_tenant_in_flight{{tenant=\"{}\"}} {}\n",
+            meter.name(),
+            meter.in_flight()
+        ));
+    }
+    out.push_str(
+        "# HELP orangu_server_tenant_tokens_in_window Tokens a tenant spent in the last minute.\n\
+         # TYPE orangu_server_tenant_tokens_in_window gauge\n",
+    );
+    for meter in tenants.meters() {
+        out.push_str(&format!(
+            "orangu_server_tenant_tokens_in_window{{tenant=\"{}\"}} {}\n",
+            meter.name(),
+            meter.tokens_in_window()
+        ));
+    }
+    out.push_str(
+        "# HELP orangu_server_tenant_requests_in_window Requests a tenant made in the last minute.\n\
+         # TYPE orangu_server_tenant_requests_in_window gauge\n",
+    );
+    for meter in tenants.meters() {
+        out.push_str(&format!(
+            "orangu_server_tenant_requests_in_window{{tenant=\"{}\"}} {}\n",
+            meter.name(),
+            meter.requests_in_window()
+        ));
+    }
+    out.push_str(
+        "# HELP orangu_server_tenant_denied_total Requests refused by a tenant limit.\n\
+         # TYPE orangu_server_tenant_denied_total counter\n",
+    );
+    for meter in tenants.meters() {
+        for limit in crate::tenant::Limit::ALL {
+            out.push_str(&format!(
+                "orangu_server_tenant_denied_total{{tenant=\"{}\",limit=\"{}\"}} {}\n",
+                meter.name(),
+                limit.label(),
+                meter.denied(limit)
+            ));
+        }
+    }
+    // The configured bounds themselves, so a dashboard can draw usage against
+    // its limit without the limit having to be configured a second time in the
+    // dashboard — the copy that goes stale.
+    out.push_str(
+        "# HELP orangu_server_tenant_limit The configured bound; 0 is unlimited.\n\
+         # TYPE orangu_server_tenant_limit gauge\n",
+    );
+    for meter in tenants.meters() {
+        let limits = meter.limits();
+        for (label, value) in [
+            ("concurrency", limits.max_concurrent as u64),
+            ("requests", limits.requests_per_minute),
+            ("tokens", limits.tokens_per_minute),
+        ] {
+            out.push_str(&format!(
+                "orangu_server_tenant_limit{{tenant=\"{}\",limit=\"{label}\"}} {value}\n",
+                meter.name(),
+            ));
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -408,6 +589,7 @@ fn default_n_predict() -> usize {
 
 pub async fn completion(
     State(state): State<Arc<AppState>>,
+    charge: super::Charge,
     Json(req): Json<CompletionRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -429,6 +611,8 @@ pub async fn completion(
     let mut rx = state
         .engine
         .generate(GenerateRequest {
+            // These endpoints have no structured-output field of their own.
+            json_output: false,
             prompt_tokens: tokens,
             sampling,
             max_tokens: req.n_predict,
@@ -436,6 +620,7 @@ pub async fn completion(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
+            charge: charge.0,
         })
         .await;
 
@@ -450,6 +635,7 @@ pub async fn completion(
                     timings = super::openai::timings_json(&stats);
                     break;
                 }
+                StreamEvent::Overloaded => return crate::http::overloaded_response(),
                 StreamEvent::Error(err) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
                 }
@@ -484,6 +670,11 @@ pub async fn completion(
                         })
                         .to_string(),
                     ));
+                }
+                StreamEvent::Overloaded => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
+                    break;
                 }
                 StreamEvent::Error(err) => {
                     yield Ok(axum::response::sse::Event::default()
@@ -537,16 +728,24 @@ pub struct EmbeddingResponse {
 
 pub async fn embedding(
     State(state): State<Arc<AppState>>,
+    charge: super::Charge,
     Json(req): Json<EmbeddingRequest>,
 ) -> axum::response::Response {
     match super::openai::pooled_embedding(&state, &req.content).await {
         // llama.cpp's native `/embedding` carries the vector and nothing else,
-        // so the token count `PooledEmbedding` also returns is dropped here on
-        // purpose; `/v1/embeddings` is where it surfaces, as `usage`.
-        Ok(pooled) => Json(EmbeddingResponse {
-            embedding: pooled.embedding,
-        })
-        .into_response(),
+        // so the token count `PooledEmbedding` also returns is dropped from
+        // the *response* on purpose; `/v1/embeddings` is where it surfaces, as
+        // `usage`. It is still charged — what the caller is shown and what the
+        // machine spent are different questions.
+        Ok(pooled) => {
+            if let Some(meter) = &charge.0 {
+                meter.charge(pooled.prompt_tokens as u64);
+            }
+            Json(EmbeddingResponse {
+                embedding: pooled.embedding,
+            })
+            .into_response()
+        }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
@@ -593,5 +792,47 @@ pub async fn apply_template(
             Json(ApplyTemplateResponse { prompt }).into_response()
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unbounded queue is never "full", so a server without a
+    /// `queue_limit` must never report itself unready for depth — it would
+    /// take itself out of rotation for a condition it does not have.
+    #[test]
+    fn an_unbounded_queue_is_always_ready_however_deep_it_gets() {
+        for queued in [0, 1, 1000] {
+            assert_eq!(readiness(false, queued, 0).0, StatusCode::OK, "{queued}");
+        }
+    }
+
+    /// Ready right up to the limit and not past it, matching exactly when
+    /// `SlotPool::try_acquire` starts refusing. A boundary off by one here
+    /// either takes a server out of rotation while it can still serve, or
+    /// keeps sending it requests it will answer with `503`.
+    #[test]
+    fn readiness_flips_at_the_same_depth_the_queue_starts_refusing() {
+        assert_eq!(readiness(false, 1, 2).0, StatusCode::OK);
+        assert_eq!(readiness(false, 2, 2).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(readiness(false, 3, 2).1, "queue full");
+    }
+
+    /// A lost device outranks everything: an empty queue on a dead GPU is
+    /// still a server nothing should be routed to.
+    #[test]
+    fn a_lost_device_is_unready_even_with_an_empty_queue() {
+        let (status, reason) = readiness(true, 0, 0);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reason, "device lost");
+    }
+
+    /// Every reason is a distinct string — a dashboard groups by it.
+    #[test]
+    fn each_reason_names_itself() {
+        assert_eq!(readiness(false, 0, 0).1, "ok");
+        assert_ne!(readiness(true, 0, 0).1, readiness(false, 5, 5).1);
     }
 }

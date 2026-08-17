@@ -96,6 +96,10 @@ Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (llama arch, CPU/AVX2, 26 layers, 
 UI         disabled
 API        http://0.0.0.0:8100
 Workspace  /home/user/src/orangu
+Note       Running on battery (64% remaining). Sustained decode is exactly the workload
+           platform power management clocks down, so throughput here is not what this
+           machine does on mains — and a long generation will empty the battery. Plug in
+           before measuring anything.
 ```
 
 The model line names the model as `MODEL:QUANT` — the quantization the
@@ -110,6 +114,25 @@ lists every device it saw and marks the one it took — see **Choosing a
 device**. The workspace line is the directory
 tree this server operates in (see **Workspace** below).
 
+`Note` lines are machine state that will hold throughput down, printed
+only when there is something to say — a clean, plugged-in, cool machine
+prints none. They come in two kinds. **Settings** are things the machine
+has been configured to do and you can configure back: a CPU frequency
+governor that lets a core drop its clock during the GPU wait between
+tokens, or a GPU left in an auto power state that lets its core clock idle
+down between submissions. Each of those carries the command that fixes it,
+because the server can't — they're root-owned. **Conditions** are things no
+command fixes: running on battery, and a component already close to its
+critical temperature before any work has started. Those are printed
+because they explain a slow number that would otherwise look like the
+engine's fault.
+
+The thermal note fires only against a threshold the platform itself
+declares, and only within a tenth of it. Most sensors declare none, so a
+hot reading with no declared limit is reported in the `POWER` section and
+not warned about: silicon runs hot under load, and a fixed limit invented
+here would fire on machines that are working perfectly.
+
 Every completed request logs a throughput line, orangu-server-style:
 
 ```
@@ -118,9 +141,9 @@ orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 
 
 ## GGUF inventory
 
-Seven subcommands cover getting, choosing, keeping current, and cleaning up
-a model, all sharing the same `orangu-server.conf` and its `models`
-directory (see **Configuration** below).
+Eight subcommands cover getting, sizing, choosing, keeping current, and
+cleaning up a model, all sharing the same `orangu-server.conf` and its
+`models` directory (see **Configuration** below).
 
 Each of them names itself in the **terminal title** while it runs —
 `orangu-server download`, `orangu-server list`, `orangu-server prune`, and
@@ -143,6 +166,51 @@ than fetching it again:
 orangu-server download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
 orangu-server download ggml-org/embeddinggemma-300M-GGUF   # no :quant -> prefers Q4_K_M, then Q8_0
 ```
+
+Every download **plans the model against this machine first**, and prints
+what it found before fetching anything:
+
+```
+Download   unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M · 4f2c9ab · 18.30 GiB
+Model      qwen3 · 1 shard · 17.04 GiB on disk
+Dense      3.12 GiB — attention, norms, embeddings, shared experts. Must be resident.
+Experts    13.92 GiB — 128 per layer x 48 layers, 111.40 MiB each. Can stream.
+Per token  891.20 MiB of experts (8 of 128 per layer, 48 layers)
+This box   24.41 GiB RAM available, 3.98 GiB VRAM (AMD Radeon RX 5500M)
+Verdict    fits entirely in RAM (7.37 GiB to spare); nothing needs to stream
+Device     3.12 GiB of weights on a 3.98 GiB GPU — fits, 878.08 MiB spare
+```
+
+This is the same report `plan` gives for a model already on disk, and it
+costs the same almost-nothing: a GGUF file states what it needs in its
+**tensor table**, which sits at the front, so each shard's header — a few
+hundred kilobytes — is enough to answer the question. Only the headers are
+transferred; the rest of the connection is dropped. Planning a 1.3 TiB repo
+therefore takes seconds, not the download.
+
+The point of doing it *before* rather than after is that the answer can
+still change the decision. **Dense** is what every token touches, so it has
+to be resident; **Experts** are touched a handful at a time, so on a
+mixture-of-experts model they can stream from disk. A model whose experts
+don't fit is slow. A model whose *dense* part doesn't fit will not work at
+all, and that is the only case that stops to ask:
+
+```
+Verdict    will NOT work: the dense part alone is 12.4 GiB short of RAM, and it is touched by every token
+
+This model cannot run on this machine. Download anyway? [y/N]:
+```
+
+Anything but `y`/`yes` — including an empty line, or no terminal at all —
+leaves the model unfetched. `-y`/`--yes` downloads without asking, for
+scripts and for the case where you're fetching a model for a *different*
+machine. A model that merely has to stream its experts never prompts: that
+is the workload the streaming path exists for, not a problem.
+
+Planning is a courtesy and never a gate. If the Hub can't be reached, the
+repo is private, or a header won't parse, the reason is printed on one line
+and the download proceeds anyway — whatever the real problem is, the
+download itself is about to report it better.
 
 ```
 Downloading Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf: 47% [1/1]
@@ -270,6 +338,12 @@ CPU
   AVX2             : Yes
   AVX512           : No
 
+POWER
+  Source           : Mains (battery 98%)
+  k10temp Tctl     : 70.8 °C
+  acpitz_0 temp1   : 58.0 °C
+  amdgpu junction  : 52.0 °C (critical 100.0 °C)
+
 GPU
   [0] AMD Navi 14 [Radeon RX 5500/5500M / Pro 5300/5300M/5500M]
       Memory type  : Dedicated
@@ -303,6 +377,27 @@ edition, build, hostname, uptime, swap. Nothing here shells out: the
 portable fields come from [`sysinfo`](https://docs.rs/sysinfo), the POSIX
 ones from `libc`, and the Linux-specific ones from plain `procfs`/`sysfs`
 file reads.
+
+The `POWER` section answers the two environmental questions that change
+what the same model on the same machine will do. **Source** is where the
+power is coming from: on battery, the platform's own power management drops
+both the CPU governor and the GPU clock, and a sustained decode loop is
+exactly the workload those are tuned to suppress — so a throughput figure
+measured on battery is not a figure about this machine. A machine with no
+battery reads `Mains`, which is what it means for every decision made from
+it; a platform that would not say reads `Unknown`, never a blank.
+
+Under it are the three warmest temperature sensors, hottest first, each
+with the critical threshold beside it where the platform declares one (most
+sensors do not). A machine can report a dozen sensors and the only one
+anybody acts on is the one closest to its limit, so the rest are left out.
+Temperatures come from [`sysinfo`](https://docs.rs/sysinfo), which reads
+them on every supported platform; the power source does not, because
+`sysinfo` has no battery or AC-line API — that half is `sysfs` on Linux,
+`pmset` on macOS, and `GetSystemPowerStatus` on Windows.
+
+The section is omitted entirely on a machine that reports neither a source
+nor a sensor, which is the normal state inside a container.
 
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
@@ -358,6 +453,15 @@ as parameters × bits-per-weight ÷ 8, KV cache bytes scale with context
 length × layers × hidden size, plus a small fixed runtime overhead. Both
 budgets are sized against total memory rather than what happens to be free
 right now, so treat them as hardware ceilings, not promises.
+
+Every figure in the table is *estimated*, and the report closes by saying
+so. No model has been chosen at this point, so there is no file to read:
+layer count and hidden size are themselves derived from the parameter count
+via the standard transformer approximation. This is a size class, not an
+answer about a particular model. Once you have picked one, `download` reads
+that repo's real tensor tables before fetching it — and `plan` does the
+same for a model already on disk. Both give the exact figures this table can
+only approximate.
 
 **`list`** recursively scans the configured `models` directory for `.gguf`
 files and prints one row per model (a multi-shard model collapses into a
@@ -434,6 +538,91 @@ well over 100,000 entries) is truncated to a short preview by default —
 `--full` disables that. Tensor data itself is never read, only the header,
 metadata, and tensor-info table, so `list`/`show` stay fast even against
 multi-gigabyte model files.
+
+**`plan`** reports what a model already on disk would need to run here —
+**without loading it**. It resolves its argument exactly as `show` does,
+and prints the same report `download` prints before fetching a model:
+
+```sh
+orangu-server plan 4                       # NR from `list`
+orangu-server plan unsloth/GLM-5.2-GGUF    # MODEL from `list`
+orangu-server plan                         # no argument: list, then pick an NR
+orangu-server plan 4 --deep                # also verify shards and architecture
+```
+
+```
+Model      glm-dsa · 11 shards · 433.83 GiB on disk
+Dense      10.24 GiB — attention, norms, embeddings, shared experts. Must be resident.
+Experts    423.59 GiB — 256 per layer x 75 layers, 22.60 MiB each. Can stream.
+Per token  13.24 GiB of experts (8 of 256 per layer, 75 layers)
+This box   62.19 GiB RAM available, 3.98 GiB VRAM (AMD Radeon RX 5500M)
+Verdict    runnable by streaming: dense fits, 371.64 GiB of experts do not and will
+           come off disk at 13.24 GiB per token, the storage under the model sets the speed
+Device     6.14 GiB too large for this GPU (3.98 GiB) — the driver will page weights
+           in and out on every token, which is slow rather than fatal. A smaller
+           quantization, or `backend = cpu`, avoids it.
+```
+
+Only the GGUF tensor tables are read — a few hundred kilobytes at the head
+of each shard — so planning that 434 GiB model costs about as long as `ls`,
+not a thirty-minute load.
+
+The split is the answer, not the file size. **Dense** weights are touched by
+every token, so they must be resident. **Experts** on a mixture-of-experts
+model are touched a handful at a time, so they can live on disk and be
+fetched as the router asks for them; **Per token** is how much of them one
+token pulls, which is what decides whether streaming is usable rather than
+merely possible. A model whose dense part doesn't fit will not work at any
+speed; a model whose experts don't fit is slow, and how slow depends on the
+storage under it.
+
+Each figure is printed in whichever unit suits it, the same way `list`
+prints a model's size and the server prints its startup weight lines — so a
+per-expert figure reads `22.60 MiB` while the per-token total above it reads
+`13.24 GiB`, and a 318 MiB embedding model keeps its precision instead of
+collapsing to `0.3 GiB`.
+
+No yes/no verdict is offered beyond that wording, deliberately: weights page
+in lazily, so a model that exceeds memory is slow rather than broken, and a
+flat "no" would be wrong about exactly the case orangu's expert streaming
+exists for.
+
+**Two ceilings, reported separately.** `Verdict` is about system RAM and
+`Device` is about the GPU, because a model has to clear both and they fail
+differently. Too big for RAM is fatal. Too big for the card is the driver
+paging weights in and out on every token — slow rather than broken, and
+otherwise invisible until you notice the tokens crawling. A dense 21 GiB
+model on a machine with 44 GiB of RAM and a 4 GiB card clears the first
+comfortably and fails the second by 17 GiB, and only the `Device` line says
+so:
+
+```
+This box   44.71 GiB RAM available, 3.98 GiB VRAM (Navi 14 [Radeon RX 5500M])
+Verdict    fits in RAM with 23.74 GiB to spare
+Device     16.98 GiB too large for this GPU (3.98 GiB) — the driver will page weights
+           in and out on every token, which is slow rather than fatal. A smaller
+           quantization, or `backend = cpu`, avoids it.
+```
+
+The GPU named is the largest **dedicated** one — the same card
+`orangu-server` itself would select, since a discrete GPU outranks an
+integrated one. An integrated GPU is deliberately not a candidate: it
+reports the whole of system RAM as its memory, which is already on the RAM
+line beside it, so counting it would both double-count and hide the real
+ceiling behind a number an order of magnitude too large. On a machine with
+no dedicated card there is no second ceiling and no `Device` line.
+
+What the `Device` figure weighs is not the `Dense` figure. Routed *and*
+shared experts have no GPU path, so on a mixture-of-experts model the card
+holds less than the dense part — shared experts run for every token and
+still live in host memory. The draft head, likewise, is charged to neither.
+
+`--deep` adds a check that the plan is worth acting on: every shard present
+and non-empty, and the architecture one this build actually implements.
+
+```
+Check      11 shard(s) readable, architecture supported
+```
 
 **`delete`** removes a model from disk, resolving its argument the same
 way `show` does (or, omitted, the same interactive `list` + `NR` prompt
@@ -730,8 +919,13 @@ model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 host = all
 port = 8100
 slots = 1
+api_key = a-long-random-string
+tls_cert = ~/certs/cert.pem
+tls_key = ~/certs/key.pem
+queue_limit = 0
 backend = auto
 device = auto
+kv_cache = f16
 role = all
 
 [web]
@@ -786,6 +980,67 @@ reexec = yes
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
+- `tls_cert` / `tls_key` — PEM paths for serving **HTTPS** instead of HTTP.
+  Both or neither: setting one alone is a startup error rather than a
+  half-enabled server, because the alternative is serving in the clear while
+  the config looks like it does not. The banner then reads `API
+  https://…`, and a certificate that will not load is a startup failure naming
+  the file — a server that quietly fell back to plain HTTP because a key was
+  unreadable is the failure worth being loud about. Any PEM key works
+  (PKCS#8, PKCS#1 or SEC1), since which one a tool emits is not something you
+  choose. Terminating TLS in a reverse proxy in front of the server remains
+  perfectly valid and is what most fleets do; this exists so that a single
+  binary on one machine, with no package manager, is not forced into one.
+
+  ```sh
+  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+    -subj "/CN=your-host" -addext "subjectAltName=DNS:your-host" \
+    -keyout key.pem -out cert.pem
+  ```
+- `api_key` — the bearer token every request must carry. Unset by default,
+  which leaves the server open; that is right for the loopback address it also
+  defaults to, and becomes wrong the moment `host` is widened. Nothing about
+  binding to a network should silently also mean publishing an inference
+  engine, so set this whenever you set `host`. Clients send it as
+  `Authorization: Bearer <key>` — the orangu client already does, from its own
+  `api_key`, and so does every OpenAI-shaped client. **`ORANGU_API_KEY`
+  overrides the file**, which is the spelling a real deployment wants: a
+  secret in a config file is a secret on disk and in every backup of it. Only
+  `/health` stays reachable without the key: it says the process is up and
+  nothing else, and a liveness probe that needs a credential is a liveness
+  probe that fails before credentials are distributed. Everything else —
+  `/v1/*`, `/metrics`, `/slots`, `/v1/shutdown` — answers `401` with
+  `WWW-Authenticate: Bearer`.
+- `[tenant:<name>]` sections — more than one key, each with limits of its own.
+  See **Tenants** below. `api_key` above stays the operator's own key and is
+  never limited.
+- `queue_limit` — how many requests may **wait** for a slot before the server
+  starts refusing (default `0`, unbounded). Beyond the limit a request is
+  answered immediately with `503 Service Unavailable` and `Retry-After: 1`
+  rather than joining the queue. Unbounded is fine for one developer at a
+  workstation, where the only thing behind you is you; a shared server wants a
+  number, because without one overload turns into every client waiting
+  indefinitely with nothing to tell them why. A `503` arriving in milliseconds
+  is more useful than a token arriving in minutes. Requests pinned to a slot
+  with `id_slot` bypass the limit — they are waiting for one specific slot's
+  warm cache, not competing for admission. Current depth and the limit are
+  both on `/metrics`.
+- `kv_cache` — how the GPU-side KV mirror is stored: `f16` (the default),
+  `q8_0`, or `f32`. The KV cache is re-read in full by every attention
+  dispatch and grows with context, so its storage width multiplies attention's
+  memory traffic directly. `q8_0` is about **44% smaller than `f16`** and cuts
+  attention's read bandwidth at long context — measured −32% attention GPU
+  time at ~295 tokens, the saving growing as the cache grows, at a slight cost
+  at short context from the per-write quantize. It is also the only setting
+  here that is **lossy**: it changes generated text, which is why it is not
+  the default and why it is worth choosing deliberately rather than being
+  switched on for you. Set it when memory is the binding constraint — it buys
+  context and concurrent `slots` out of the same VRAM. `f32` is larger and
+  slower than `f16` for no measured quality gain, and exists mainly because
+  it is what an adapter without `f16` support falls back to anyway. Only the
+  Vulkan-family backends (Vulkan, Metal, DX12) have a GPU-side mirror; on
+  CPU, CUDA, OpenCL and ROCm the key has no effect. `ORANGU_KV_CACHE`
+  overrides it for one run.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
   `cuda`, `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
@@ -821,6 +1076,260 @@ reexec = yes
   overridable by typing another. That prompt only appears when no model was
   given on the CLI either; an attached run that names a model and no role
   flag is `all`, as before.
+
+### Every key, in one place
+
+The prose above explains the ones with real trade-offs; this is the reference.
+Every key is optional except `models`, and an unset key takes the default
+shown.
+
+| `[orangu-server]` | default | what it does |
+| :-- | :-- | :-- |
+| `models` | *required* | base directory model specs resolve against |
+| `model` | — | model to serve when none is given on the command line (required for `--daemon`) |
+| `host` | `127.0.0.1` | bind address; `all` means every interface |
+| `port` | `8100` | HTTP API port |
+| `slots` | per role | concurrent requests, each with its own KV cache |
+| `queue_limit` | `0` | requests allowed to wait for a slot before `503`; `0` is unbounded |
+| `api_key` | — | bearer token every request must carry; unset leaves the server open |
+| `tls_cert` / `tls_key` | — | PEM paths for serving HTTPS; both or neither |
+| `kv_cache` | `f16` | GPU KV mirror storage: `f16`, `q8_0`, or `f32` |
+| `draft_model` | — | a second, smaller model whose guesses the served model verifies |
+| `draft_tokens` | `4` | tokens the draft proposes per verification |
+| `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm` |
+| `device` | `auto` | which card: an index, part of a name, or `auto` |
+| `device_split` | `off` | spread one model across several devices |
+| `threads` | rayon's choice | CPU worker threads |
+| `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding` |
+
+| `[web]` | default | what it does |
+| :-- | :-- | :-- |
+| `port` | `8101` | web console port; `0` disables it |
+| `host` | follows `[orangu-server].host` | bind address for the console alone |
+| `reexec` | `yes` | let the console switch the served model |
+| `delete` | `no` | let the console delete models from disk |
+
+| `[tenant:<name>]` | default | what it does |
+| :-- | :-- | :-- |
+| `api_key` | *one of these two* | the bearer token that identifies this tenant |
+| `api_key_env` | *one of these two* | name of an environment variable holding it instead |
+| `max_concurrent` | `0` | requests this tenant may have in flight at once; `0` is unlimited |
+| `requests_per_minute` | `0` | arrival rate over the last minute; `0` is unlimited |
+| `tokens_per_minute` | `0` | prompt + generated tokens over the last minute; `0` is unlimited |
+
+Environment variables override the file where one exists: `ORANGU_API_KEY` for
+`api_key` and `ORANGU_KV_CACHE` for `kv_cache`. Both exist so a secret or a
+sweep does not have to be written into a file — see the tuning-variable table
+in the *Inference server internals* chapter for the rest.
+
+### Monitoring: `/metrics` and `/ready`
+
+`/metrics` is Prometheus text. Beyond the slot and queue gauges it carries four
+latency **histograms**, which is what makes a latency question answerable at
+all: a mean is dominated by whichever requests happened to be long, and the
+useful questions are about the tail.
+
+| metric | what it measures |
+| :-- | :-- |
+| `orangu_server_queue_wait_seconds` | arrival to holding a slot |
+| `orangu_server_time_to_first_token_seconds` | arrival to the first generated token |
+| `orangu_server_inter_token_seconds` | the gap between consecutive tokens, one observation *per token* |
+| `orangu_server_request_seconds` | arrival to the last token |
+
+Each is a standard histogram (`_bucket{le="…"}`, `_sum`, `_count`), so a
+quantile is a query rather than a setting:
+
+```
+histogram_quantile(0.95, rate(orangu_server_time_to_first_token_seconds_bucket[5m]))
+```
+
+**Queue wait is the one to reach for first.** "Slow" and "overloaded" look
+identical from outside and have opposite fixes: if queue wait is near zero the
+requests themselves are expensive (bigger model than the device holds, longer
+prompts), and if it is not, the server is short of slots.
+
+Counters carry the totals a rate is taken from:
+
+| counter | notes |
+| :-- | :-- |
+| `orangu_server_requests_total{outcome="…"}` | `stop`, `length`, `cancelled`, `overloaded`, `error` — every label is exported from the start, at zero |
+| `orangu_server_prompt_tokens_total` | prompt tokens accepted, cached or not |
+| `orangu_server_cached_prompt_tokens_total` | the part served from a reused KV prefix; the two together are the cache-hit rate |
+| `orangu_server_generated_tokens_total` | tokens generated |
+
+`outcome="overloaded"` counts requests refused by `queue_limit` and is the one
+to alert on. `outcome="length"` is not an error — it counts answers truncated
+by `max_tokens` — but a rate that climbs usually means clients are asking for
+less room than the model wants.
+
+`outcome="cancelled"` counts clients that disconnected mid-generation. The
+server stops within a token of noticing and frees the slot, so a rate here is
+not a fault — but one that climbs usually means a client-side timeout set below
+what this server can deliver.
+
+**`/ready` is not `/health`.** `/health` answers "is this process alive" — what
+a supervisor uses to decide whether to restart it, and it stays `200` while the
+server is merely busy, because restarting a loaded server is the worst possible
+answer to load. `/ready` answers "would a request sent now be served" — what a
+load balancer uses to decide where to route:
+
+```json
+{"status": "queue full", "queue_depth": 2, "queue_limit": 2, "slots_busy": 1, "slots_total": 1}
+```
+
+`503` when the admission queue is full (so a balancer can route elsewhere
+rather than spend a round trip discovering the same `503` from the API), or
+when the GPU device has been lost and this process is on its way out. `200`
+otherwise. With no `queue_limit` set the queue never refuses, so it is never
+unready for that reason. Both probes stay reachable without an `api_key` — a
+readiness probe that needed a credential would fail closed exactly when a
+balancer most needs an answer.
+
+### Speculative decoding (`draft_model`)
+
+A small model guesses the next few tokens; the served model checks all of them
+in one forward and keeps the longest prefix it would have produced itself.
+Wrong guesses are discarded, so **the answer is exactly the answer you would
+have got without it** — only the time taken changes.
+
+```ini
+[orangu-server]
+draft_model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+draft_tokens = 4
+```
+
+`draft_model` takes the same kind of spec as `model` — a path, an `NR`/`MODEL`
+label, or a Hugging Face repo. `draft_tokens` is how many tokens it proposes
+per verification; `ORANGU_SPEC_DRAFT` overrides it for one run.
+
+**Requirements, both checked at startup rather than discovered later.** The
+pair must share a vocabulary — speculation compares token *ids*, so two models
+that disagree about what an id means produce wrong or needlessly slow output
+with nothing to see — and both must be an architecture with a multi-position
+forward (`gemma4`, `deepseek4`, `glm-dsa`, `muse-glimmer` today). Either
+failure stops the server with a message naming what is wrong.
+
+**Speculation only runs for greedy requests** (`temperature: 0`), unconstrained
+by `response_format`, and not while `ORANGU_BATCH_DECODE` is fusing decode
+steps. A drafted token is accepted only when it equals what the sampler would
+itself have chosen, which is what makes the output identical — and that
+comparison has no meaning for a sampled or grammar-constrained request.
+
+**Whether it pays is a question about your hardware, not about the models.**
+Measured here on a 4 GiB card with a target that does not fit on it
+(`gemma-4-12B-it:Q4_K_M`, 1.43 tok/s unassisted):
+
+| drafter | tok/s | accepted per verification |
+| :-- | ---: | ---: |
+| none | 1.43 | — |
+| prompt-lookup (`ORANGU_SPECULATIVE=1`) | **3.01** | 1.67 |
+| `draft_model` (`gemma-4-E4B`), 4 tokens | 1.02 | 2.15 |
+| `draft_model` (`gemma-4-E4B`), 8 tokens | 0.67 | 2.56 |
+
+The draft model *predicts better* than prompt-lookup and still loses, because
+each of its guesses costs a forward pass through a second set of weights
+competing for the same device memory the target already overflows. Prompt
+lookup — which copies a continuation out of the context and calls no model at
+all — wins outright here. A draft model is worth its cost when it is small
+enough not to disturb the target's residency; when in doubt, measure both, and
+read the acceptance line the server logs at the end of each request:
+
+```text
+orangu-server: [speculative/draft model] 43 drafted tokens accepted over 20 steps (2.15 extra tokens/forward)
+```
+
+Prompt-lookup speculation needs no second model and stays behind
+`ORANGU_SPECULATIVE`; see the *Inference server internals* chapter. Setting
+`draft_model` takes precedence over it.
+
+### Tenants: named keys with their own limits
+
+`queue_limit` above keeps the server from collapsing. It does nothing about
+how the capacity is *divided*: one client opening thirty streams fills the
+queue, and everybody else gets `503` from a server that is perfectly healthy
+and completely useless to them. A `[tenant:<name>]` section is the other half —
+a limit on one caller, so that caller's excess is refused before it becomes
+everyone's outage.
+
+```ini
+[orangu-server]
+models = ~/models
+host = all
+api_key = the-operators-own-key
+
+[tenant:web]
+api_key = web-app-key
+max_concurrent = 2
+requests_per_minute = 120
+tokens_per_minute = 40000
+
+[tenant:ci]
+api_key_env = ORANGU_CI_KEY
+max_concurrent = 1
+```
+
+Declaring a tenant **turns authentication on**, with or without
+`[orangu-server].api_key`: saying who may call is a statement that not everyone
+may, and a server that still answered anonymous requests would be metering
+nobody. `api_key` itself stays the operator's own key and is never limited — a
+deployment that adds tenants around it should not discover that its own key
+acquired bounds it never set.
+
+Use `api_key_env` where you would have used `ORANGU_API_KEY`: it names an
+environment variable holding the key, so multi-tenancy does not force every
+secret onto disk. A variable that is unset at startup stops the server and says
+which one, rather than leaving a tenant nobody can authenticate as.
+
+**The three limits, and what each is for.**
+
+- `max_concurrent` bounds requests in flight. This is the direct bound on the
+  scarce thing: a generation holds a slot from admission to its last token,
+  and slots are what everyone is queueing for. It is also held for the whole
+  of a *streamed* response, not just until the response starts.
+- `requests_per_minute` bounds arrival rate. Concurrency alone does not stop a
+  loop firing thousands of one-token requests — each is over before the next
+  begins, so none is ever concurrent with any other.
+- `tokens_per_minute` bounds work done, counting prompt and generated tokens
+  together. It is the only one denominated in what a request actually costs:
+  two requests are not two units of anything when one is forty tokens and the
+  next four thousand.
+
+Every limit defaults to `0`, meaning unlimited, so a tenant declared with
+nothing but a key is authenticated and unmetered — which is a reasonable place
+to start, because `/metrics` reports per-tenant usage whether or not a limit is
+set, and the usage is what tells you which number to pick.
+
+**What a refusal looks like.** `429 Too Many Requests`, with `Retry-After` and
+an `X-Orangu-Rate-Limit` header naming which of the three was hit
+(`concurrency`, `requests` or `tokens`):
+
+```text
+HTTP/1.1 429 Too Many Requests
+retry-after: 56
+x-orangu-rate-limit: requests
+
+rate limit exceeded (requests): 3 requests per minute for tenant 'alice'. Retry in 56s.
+```
+
+`429`, not the `503` a full queue gets, because they mean different things:
+`503` says the server is saturated and every client is seeing it, `429` says
+this caller is over its own bound while the server may be idle. The refusal is
+immediate rather than a wait — making the request queue instead would put it in
+the very resource the limit exists to keep it out of.
+
+`Retry-After` is a real number rather than a constant: for a rate window it is
+when the oldest counted second rolls off, which is the earliest moment there
+is room.
+
+**Two things worth knowing before you pick numbers.** The limits apply to the
+endpoints that run the model — `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/completion`, `/embedding` — and not to metadata like
+`/props`, `/slots`, `/metrics` or `/v1/models`. A monitoring scrape holding a
+tenant key would otherwise spend that tenant's generation budget on nothing.
+And a token budget is checked against tokens *already* spent, so the request in
+flight can overshoot it by its own length: what a generation will cost is not
+knowable until it stops, and the overshoot is bounded by `max_tokens` and
+repaid out of the next minute.
 
 ### The `[web]` section
 
@@ -879,8 +1388,13 @@ order every subcommand above resolves it in too, not just serving.
 `-i`/`--init` writes `~/.orangu/orangu-server.conf` interactively — it also
 prompts for `role` (TAB-completing over the five valid names, defaulting to
 `all`), right after `model`, and only writes the `role =` line when a
-non-default value was chosen. A `models` directory that doesn't exist yet is
-created, parents included, rather than refused. `-d`/`--daemon` detaches
+non-default value was chosen. **Answering `host` with anything but a loopback
+address then prompts for an `api_key`** — that is the question the wizard just
+created by widening the address, and asking it here is the difference between
+walking someone into an exposed server and letting them decide. Leaving it
+blank is still allowed and still writes no key; the prompt names the
+consequence rather than insisting. A `models` directory that doesn't exist yet
+is created, parents included, rather than refused. `-d`/`--daemon` detaches
 from the terminal and runs in the background (Unix-only) — it requires
 `model` to be set in the config, since there's no attached terminal left to
 pass a CLI argument to or prompt on; the config and model are resolved, and
@@ -1309,7 +1823,23 @@ Two things worth knowing before reaching for `all`:
   because `all` had put 14 of 16 layers on the integrated card. Explicit
   proportions are the answer if you want that back; the default is left alone
   because one machine's ratio is not a throughput model for anyone else's.
-  Read the per-device lines above to see where the layers actually went.
+  Read the per-device lines above to see where the layers actually went — and
+  the server now says so itself: when the largest share lands on an integrated
+  device while a discrete one is present, it prints a line naming both.
+
+  **The gap widens with concurrency**, which the single-stream figures above
+  understate. On Qwen2.5-Coder-0.5B, `all` (4 layers discrete, 20 integrated)
+  against an explicit `20,4`:
+
+  | | `device_split = all` | `device_split = 20,4` | |
+  | :-- | ---: | ---: | ---: |
+  | 1 stream | 22.7 tok/s | 31.7 tok/s | 1.4x |
+  | 4 streams | 46.8 tok/s | 92.2 tok/s | **2.0x** |
+
+  The reason is that the integrated card is the bottleneck stage, and at one
+  stream it is only partly loaded; adding streams saturates it sooner than it
+  saturates the discrete card. So the worse the placement, the more concurrency
+  costs you.
 - **Layers are handed out in contiguous runs**, never interleaved, so the
   hidden state crosses the bus once per boundary — twice for three devices,
   not once per layer.
@@ -1876,6 +2406,49 @@ processing thousands of tokens per second while doing almost nothing —
 exactly how much was skipped. The flag governs only what a request *reads*: the
 resulting cache is still stored for later requests either way.
 
+### Structured output (`response_format`)
+
+`POST /v1/chat/completions` and `/v1/completions` accept OpenAI's
+`response_format`. With `{"type": "json_object"}` the server does not ask the
+model for JSON — it makes anything else **unsampleable**:
+
+```sh
+curl -s localhost:8100/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Give me a person record with a name and an age."}],
+  "response_format": {"type": "json_object"},
+  "temperature": 0
+}'
+```
+
+Unconstrained, the same request returns `Here is a person record with a name
+and an age:` followed by prose. Constrained, it returns
+`{"Name": "John Doe", "Age": 32}`.
+
+At every step the sampler is offered only tokens that keep the output a prefix
+of some valid JSON object, and the end-of-sequence token is withheld until the
+document is **complete** — so a model cannot stop at `{"a":` and leave a caller
+parsing a fragment. Once the document is complete, stopping is the only move
+left, which is what keeps a model from trailing blank lines to `max_tokens`
+after it has finished.
+
+`json_object` means an **object**, matching the field's name: a bare string is
+technically valid JSON, and a caller asking for a record and receiving
+`"Name: Sophia, Age: 32"` gets something that parses and then fails at
+`result["name"]`, which is worse than failing outright. `json_schema` is
+accepted and treated the same way — output is constrained to valid JSON, but
+**not** to the schema's shape. Constraining to a schema is a larger job and is
+not implemented; the type is honoured rather than ignored so that a caller
+asking for it is not silently given free text.
+
+Two limits worth knowing. A constrained request cannot use the GPU's
+argmax fast path or prompt-lookup speculation, because both pick tokens without
+consulting the constraint — so constrained decoding is somewhat slower than
+unconstrained. And a constraint makes invalid output unreachable; it cannot
+make a model cooperate. Told *"reply with the single word hello, do not use
+JSON"*, the model spends its budget on whitespace and returns no document at
+all — the response is then not valid JSON, and `finish_reason` is `length`.
+Ask for JSON in the prompt as well as the parameter.
+
 ### Tool calling
 
 `/v1/chat/completions` accepts OpenAI's `tools` array and answers with OpenAI's
@@ -1898,19 +2471,31 @@ transcript replayed on turn N+1 shows an assistant message with empty content
 and no record of any call, and the model calls the same tool again.
 
 **Reading the model's answer back.** There is no standard for how a model
-*writes* a call — its template teaches it one. Three delimiter-anchored forms
-are recognised:
+*writes* a call — its template teaches it one, and the forms differ far more
+than the OpenAI shape they all become. Six delimiter-anchored forms are
+recognised:
 
 | Family | Form |
 | :-- | :-- |
 | gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens) |
 | Qwen / Hermes | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+| GLM | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` |
+| Nemotron | `<tool_call><function=NAME><parameter=k>v</parameter>…</function></tool_call>` |
 | Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
+| Muse-Glimmer, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
+
+Note the three that share `<tool_call>`: the delimiters are the same and the
+bodies are not, so the body's own leading structure decides which it is. A
+value is read as JSON where it parses as JSON and as a plain string otherwise,
+so `3` stays a number and a sentence stays a sentence; where a format marks a
+parameter `string="true"`, that wins, and a version like `1.20` is not quietly
+turned into `1.2`.
 
 Only these delimiters count. A bare JSON object that merely *looks* like a call
 is left as ordinary content — an answer that explains an API must not be
-mistaken for a request to invoke one. A span that opens and never closes, or one
-that cannot be parsed, is also left as content rather than silently dropped.
+mistaken for a request to invoke one, and a model asked to *write* a tool call
+has to be able to. A span that opens and never closes, or whose body matches
+none of the forms, is also left as content rather than silently dropped.
 
 A turn that produced calls reports `finish_reason: "tool_calls"` and carries
 them in `choices[0].message.tool_calls` (non-streaming) or in a
@@ -1957,16 +2542,34 @@ pin — there is no later turn to keep a cache warm for.
 
 ## Endpoint reference
 
+Four things apply to every endpoint below rather than to any one of them, and
+are easy to miss looking down a table:
+
+- **`401`** — when `[orangu-server].api_key` is set, every endpoint except
+  `GET /health` and `GET /ready` requires `Authorization: Bearer <key>` and answers `401` with
+  `WWW-Authenticate: Bearer` without it.
+- **`503`** — when `queue_limit` is set and that many requests are already
+  waiting for a slot, a generating endpoint answers `503` with `Retry-After`
+  instead of joining the queue.
+- **`429`** — when the key belongs to a `[tenant:<name>]` with a limit it has
+  reached, the five endpoints that run the model answer `429` with
+  `Retry-After` and `X-Orangu-Rate-Limit`. Metadata endpoints are never
+  metered. See **Tenants** above.
+- **`https`** — when `tls_cert`/`tls_key` are set, every endpoint is served
+  over TLS on the same port; there is no plaintext listener alongside.
+
+
 | Endpoint | |
 | :-- | :-- |
 | `GET /v1/models` | |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; OpenAI `tools`/`tool_calls`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
-| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`; disabled under `--embedding` |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; OpenAI `tools`/`tool_calls` and `response_format`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
+| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
-| `GET /health` | |
+| `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
+| `GET /ready` | readiness: would a request sent now be served. `503` with a reason when the admission queue is full or the GPU device was lost. Reachable without an `api_key`, like `/health` |
 | `GET /props` | model + server metadata: the `backend` and device the model is running on (plus every other device that backend saw, and under `gpu.footprint` what this model costs on it), and `version`/`commit` — which build is answering |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text |
+| `GET /metrics` | Prometheus text: slots and queue depth as gauges; latency histograms (queue wait, time to first token, inter-token, request duration); counters for requests by outcome and for prompt/cached/generated tokens; and — when tenants are declared — per-tenant usage, refusals and bounds |
 | `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /tokenize` / `POST /detokenize` | |
 | `POST /embedding` | native embeddings |
@@ -1979,6 +2582,11 @@ pin — there is no later turn to keep a cache warm for.
 | `POST /v1/create_directory` | file lifecycle: create one directory, with optional permissions |
 | `POST /v1/move_directory` | file lifecycle: move an entire directory tree |
 | `POST /v1/delete_directory` | file lifecycle: delete an empty directory |
+| `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, bytes dequantized, the expert store's hit rate, and `batch.mean_batch` when fused decode batching is on. Drain once before a workload and again after to measure exactly that window |
+| `GET /gpu-timings` | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them |
+| `GET /model-cache` | how much of the model is in the page cache right now; `resident_bytes` is `null` where the platform cannot measure it, never `0` |
+| `POST /model-cache/drop` | evict the model from the page cache so the next request reads from disk; loopback-only. Reports residency before and after rather than a success flag |
+| `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache (see **Session management**) |
 | `POST /v1/shutdown` | not part of the standard API — orangu-server's own |
 
 Those eight are orangu-server's own JSON API for the whole life cycle of a
@@ -2257,8 +2865,9 @@ Not implemented for this model: reporting reasoning separately as
 invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
 
-Nemotron-H (`nemotron_h_moe`, e.g.
-`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`) runs on the CPU
+Nemotron-H (`nemotron_h_moe` and the dense `nemotron_h`, e.g.
+`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` and
+`bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`) runs on the CPU
 path only, and breaks the assumption every other architecture here shares:
 a block is **not** an attention sub-layer plus an FFN sub-layer. It is one
 or the other — or neither. Each block holds exactly one mixer under one

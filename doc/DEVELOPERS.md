@@ -11,6 +11,13 @@ This project is a local coding-environment client built around a direct OpenAI-c
 - `src/tools.rs` - local workspace tools for reading, editing, listing, fetching, and shell commands
 - `src/tui.rs` - banner and prompt frame rendering
 
+The inference engine is a separate program with its own shape, and it has its
+own map: **[`doc/ENGINE.md`](ENGINE.md)** — where the architecture and backend
+modules sit, what a new one has to implement, and the handful of rules that
+are invisible from inside the module they bite. Read that before adding a
+model architecture or a device backend; `doc/SERVER.md` covers running the
+server rather than extending it.
+
 ## Development workflow
 
 ```sh

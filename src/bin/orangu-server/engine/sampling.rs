@@ -97,15 +97,102 @@ impl SamplingParams {
     }
 }
 
+/// What a constrained request is holding while it generates.
+pub struct Constraint {
+    grammar: crate::engine::constraint::JsonPrefix,
+    /// Every token's emitted bytes, from the tokenizer — shared, built once.
+    token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+    /// Ids that end generation. Masked until the document is complete, so a
+    /// model cannot stop half-way through an object and leave a caller
+    /// parsing `{"a":`.
+    stop_ids: Vec<u32>,
+}
+
+impl Constraint {
+    pub fn json(token_bytes: std::sync::Arc<Vec<Vec<u8>>>, stop_ids: Vec<u32>) -> Self {
+        Self {
+            grammar: crate::engine::constraint::JsonPrefix::object(),
+            token_bytes,
+            stop_ids,
+        }
+    }
+
+    /// Whether this token may be sampled next.
+    fn allows(&self, id: u32) -> bool {
+        if self.stop_ids.contains(&id) {
+            return self.grammar.is_complete();
+        }
+        // Once the document is complete, **only** stopping is allowed. The
+        // grammar would go on accepting trailing whitespace forever, and a
+        // model that has just closed its object reaches for a newline far more
+        // readily than for end-of-sequence — measured, before this: `{}`
+        // followed by four hundred characters of blank lines, running all the
+        // way to `max_tokens`. A constrained request asked for one document;
+        // once it has one there is nothing left to generate.
+        //
+        // Skipped when the request declared no stop tokens at all, since then
+        // masking everything would leave the sampler with no legal move.
+        //
+        // Whitespace *before* and *within* the document stays legal, and that
+        // is deliberate. Banning whitespace-only tokens was tried and made the
+        // output worse: with no room to hesitate the model opens `{` on the
+        // first step and, having committed with nothing planned, closes it
+        // again — `{}` where allowing it to pause produced
+        // `{"Name": "John Doe", "Age": 32}`.
+        if self.grammar.is_complete() && !self.stop_ids.is_empty() {
+            return false;
+        }
+        match self.token_bytes.get(id as usize) {
+            // A token with no printable bytes (a special marker) cannot make
+            // the document invalid, but it also must not appear inside one —
+            // letting it through is how a `<|im_end|>` ends up in the middle
+            // of a string.
+            Some(bytes) if bytes.is_empty() => false,
+            Some(bytes) => self.grammar.allows(bytes),
+            None => false,
+        }
+    }
+
+    /// Commits a token that was actually chosen.
+    fn accept(&mut self, id: u32) {
+        if self.stop_ids.contains(&id) {
+            return;
+        }
+        if let Some(bytes) = self.token_bytes.get(id as usize) {
+            self.grammar.push_bytes(bytes);
+        }
+    }
+}
+
 pub struct Sampler {
     params: SamplingParams,
     rng: StdRng,
+    /// `None` for an unconstrained request, which is every request that did
+    /// not ask for a `response_format`.
+    constraint: Option<Constraint>,
 }
 
 impl Sampler {
     pub fn new(params: SamplingParams) -> Self {
         let rng = StdRng::seed_from_u64(params.seed);
-        Self { params, rng }
+        Self {
+            params,
+            rng,
+            constraint: None,
+        }
+    }
+
+    /// Restricts this sampler to tokens the constraint still allows.
+    pub fn with_constraint(mut self, constraint: Constraint) -> Self {
+        self.constraint = Some(constraint);
+        self
+    }
+
+    /// Whether a constraint is in force — the decode loop's cue that its GPU
+    /// argmax fast path cannot be used, since that samples without ever
+    /// consulting the mask.
+    pub fn is_constrained(&self) -> bool {
+        self.constraint.is_some()
     }
 
     /// `true` iff `sample` would take its argmax fast path (`temperature
@@ -128,11 +215,28 @@ impl Sampler {
     /// penalizing any token id present in `recent_tokens`' last
     /// `repeat_last_n` entries.
     pub fn sample(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
+        let id = self.pick(logits, recent_tokens);
+        if let Some(constraint) = self.constraint.as_mut() {
+            constraint.accept(id);
+        }
+        id
+    }
+
+    fn pick(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
         let mut logits: Vec<f32> = logits.to_vec();
         apply_repeat_penalty(&mut logits, recent_tokens, &self.params);
 
         if self.params.temperature <= 0.0 {
-            return argmax(&logits);
+            return match &self.constraint {
+                // Exactly the argmax over allowed tokens, and usually one
+                // check: walking the vocabulary in descending logit order and
+                // stopping at the first token the grammar accepts is the same
+                // answer as masking everything else to negative infinity, at a
+                // fraction of the work. The model's preferred token is legal
+                // far more often than not.
+                Some(c) => argmax_allowed(&logits, c),
+                None => argmax(&logits),
+            };
         }
 
         for v in logits.iter_mut() {
@@ -158,6 +262,32 @@ impl Sampler {
         }
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
+        // Masked here — after `top_k`, before the softmax — so the surviving
+        // probabilities are renormalized over the allowed tokens rather than
+        // over all of them. Filtering after `top_p`/`min_p` instead would let
+        // those thresholds spend their budget on tokens the grammar was going
+        // to reject anyway.
+        //
+        // Exact given `top_k`, which is the truncation the caller already
+        // asked for (40 by default). If every one of the top `k` is rejected,
+        // the field is refilled from the whole vocabulary in descending order
+        // rather than failing — a legal token always exists while the document
+        // is unfinished, it may simply be an unlikely one.
+        if let Some(c) = &self.constraint {
+            candidates.retain(|&(id, _)| c.allows(id));
+            if candidates.is_empty() {
+                let mut all: Vec<(u32, f32)> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i as u32, v))
+                    .filter(|&(id, _)| c.allows(id))
+                    .collect();
+                all.sort_by(|a, b| b.1.total_cmp(&a.1));
+                all.truncate(self.params.top_k.max(1));
+                candidates = all;
+            }
+        }
+
         softmax_pairs(&mut candidates);
         apply_top_p(&mut candidates, self.params.top_p);
         apply_min_p(&mut candidates, self.params.min_p);
@@ -174,7 +304,36 @@ impl Sampler {
     }
 }
 
-fn argmax(logits: &[f32]) -> u32 {
+/// The highest-scoring token the constraint still allows.
+///
+/// Falls back to the plain argmax when nothing is allowed, which should not
+/// happen while a document is unfinished — but a sampler that returned no
+/// token at all would hang the decode loop, and a wrong token is recoverable
+/// where a hang is not.
+fn argmax_allowed(logits: &[f32], constraint: &Constraint) -> u32 {
+    // The overwhelmingly common case: the model's own preferred token is
+    // already legal, so one grammar probe settles it and nothing is sorted.
+    // Sorting 262k entries on every generated token to answer a question that
+    // is almost always "yes" would make the constraint cost more than the
+    // forward pass it decorates.
+    let best = argmax(logits);
+    if constraint.allows(best) {
+        return best;
+    }
+    let mut order: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1));
+    order
+        .iter()
+        .find(|&&(id, _)| constraint.allows(id))
+        .map(|&(id, _)| id)
+        .unwrap_or(best)
+}
+
+pub(crate) fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
@@ -302,5 +461,109 @@ mod tests {
         apply_top_p(&mut candidates, 0.0001);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, 0);
+    }
+}
+
+#[cfg(test)]
+mod constraint_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A tiny vocabulary whose ids are indices into this table.
+    fn vocab() -> Arc<Vec<Vec<u8>>> {
+        Arc::new(vec![
+            b"{".to_vec(),     // 0
+            b"}".to_vec(),     // 1
+            b"\"a\"".to_vec(), // 2
+            b":".to_vec(),     // 3
+            b"1".to_vec(),     // 4
+            b"hello".to_vec(), // 5
+            b" ".to_vec(),     // 6
+            Vec::new(),        // 7 — a special token with no printable bytes
+        ])
+    }
+    const EOS: u32 = 99;
+
+    fn json_constraint() -> Constraint {
+        Constraint::json(vocab(), vec![EOS])
+    }
+
+    /// The document has to open with `{`, and prose cannot get in.
+    #[test]
+    fn only_tokens_keeping_the_output_valid_are_allowed() {
+        let c = json_constraint();
+        assert!(c.allows(0), "`{{` opens the object");
+        assert!(c.allows(6), "leading whitespace is legal JSON");
+        assert!(!c.allows(5), "`hello` is not a JSON document");
+        assert!(!c.allows(1), "`}}` cannot open one");
+        assert!(!c.allows(2), "a bare string is not an object");
+    }
+
+    /// A token that decodes to nothing is a special marker, and one of those
+    /// landing mid-document is how `<|im_end|>` ends up inside a string.
+    #[test]
+    fn tokens_with_no_printable_bytes_are_refused() {
+        assert!(!json_constraint().allows(7));
+    }
+
+    /// Stopping is masked until the document is complete — the failure this
+    /// exists to prevent is a model emitting `{"a":` and calling it done.
+    #[test]
+    fn stopping_is_masked_until_the_document_is_complete() {
+        let mut c = json_constraint();
+        assert!(!c.allows(EOS), "nothing has been written yet");
+        for id in [0, 2, 3] {
+            assert!(c.allows(id));
+            c.accept(id);
+        }
+        assert!(!c.allows(EOS), "`{{\"a\":` is a prefix, not a document");
+        c.accept(4);
+        assert!(!c.allows(EOS), "`{{\"a\":1` still has an object open");
+        c.accept(1);
+        assert!(c.allows(EOS), "`{{\"a\":1}}` is a whole document");
+    }
+
+    /// And once it *is* complete, stopping is the only thing left — otherwise
+    /// the model trails whitespace to `max_tokens`.
+    #[test]
+    fn a_complete_document_allows_nothing_but_stopping() {
+        let mut c = json_constraint();
+        c.accept(0);
+        c.accept(1);
+        assert!(c.allows(EOS));
+        for id in 0..8u32 {
+            assert!(!c.allows(id), "token {id} after a complete document");
+        }
+    }
+
+    /// With no stop tokens declared there is nothing to steer towards, so the
+    /// mask must not close down to nothing — a sampler with no legal move
+    /// cannot make progress at all.
+    #[test]
+    fn a_request_with_no_stop_tokens_is_never_left_without_a_move() {
+        let mut c = Constraint::json(vocab(), Vec::new());
+        c.accept(0);
+        c.accept(1);
+        assert!(
+            (0..8u32).any(|id| c.allows(id)),
+            "every token masked and no stop token to pick"
+        );
+    }
+
+    /// The sampler honours the mask on the greedy path even when the model
+    /// would rather write prose — the logit for `hello` is the highest here.
+    #[test]
+    fn greedy_sampling_takes_the_best_allowed_token() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut sampler = Sampler::new(params.clone()).with_constraint(json_constraint());
+        // `hello` (5) is the model's favourite; `{` (0) is its second.
+        let logits = vec![9.0, 1.0, 1.0, 1.0, 1.0, 10.0, 0.5, 0.0];
+        assert_eq!(sampler.sample(&logits, &[]), 0, "must not pick `hello`");
+        // Unconstrained, the same logits give the prose token.
+        let mut plain = Sampler::new(params);
+        assert_eq!(plain.sample(&logits, &[]), 5);
     }
 }

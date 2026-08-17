@@ -97,7 +97,7 @@ impl DeviceFootprint {
         slots: usize,
     ) -> Self {
         let (weights_device_bytes, weights_host_bytes) =
-            device_resident_split(model.tensor_sizes());
+            device_resident_split(model.resident_tensor_sizes());
         let kv_bytes_per_step = kv_storage
             .map(|storage| probe.gpu_mirror_bytes(CONTEXT_STEP, model.config.n_head, storage))
             .unwrap_or(0);
@@ -168,7 +168,7 @@ impl DeviceFootprint {
     /// the rule would eventually produce.
     pub fn weights_per_device(model: &LoadedModel, n_devices: usize) -> Vec<u64> {
         let mut per_device = vec![0u64; n_devices.max(1)];
-        for (name, bytes) in model.tensor_sizes() {
+        for (name, bytes) in model.resident_tensor_sizes() {
             let (device_bytes, _) = device_resident_split(std::iter::once((name, bytes)));
             if device_bytes == 0 {
                 continue;
@@ -193,7 +193,7 @@ impl DeviceFootprint {
     /// charging them to a layer would misplace the boundary by their size.
     pub fn weights_per_layer(model: &LoadedModel, n_layer: usize) -> Vec<u64> {
         let mut per_layer = vec![0u64; n_layer];
-        for (name, bytes) in model.tensor_sizes() {
+        for (name, bytes) in model.resident_tensor_sizes() {
             let (device_bytes, _) = device_resident_split(std::iter::once((name, bytes)));
             if device_bytes == 0 {
                 continue;

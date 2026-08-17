@@ -105,9 +105,8 @@ pub fn prefetch_width() -> usize {
 /// Whether to run the lookahead router at all.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ORANGU_ROUTE_AHEAD").is_some_and(|v| v == "1") || prefetch_width() > 0
-    })
+    *ENABLED
+        .get_or_init(|| crate::engine::env::flag_on("ORANGU_ROUTE_AHEAD") || prefetch_width() > 0)
 }
 
 /// Records what layer `layer`'s router is expected to pick, one predicted

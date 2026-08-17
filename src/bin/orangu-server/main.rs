@@ -42,6 +42,8 @@ mod reexec;
 mod refresh;
 mod shell;
 mod suggest;
+mod tenant;
+mod tls;
 mod web;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -65,6 +67,7 @@ use engine::arch::qwen3next::Qwen3NextModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::device;
+use engine::backend::device::DeviceClass;
 use engine::backend::vulkan_shaders::KvStorage;
 use engine::backend::{
     Backend, CpuBackend, CudaBackend, DeviceCandidate, DeviceError, DeviceErrorKind, DeviceRequest,
@@ -338,12 +341,15 @@ enum Command {
         tensors: bool,
     },
     /// Download a GGUF model from Hugging Face into the configured models
-    /// directory.
+    /// directory, planning it against this machine first.
     Download {
         /// A Hugging Face repo, `<user>/<model>[:quant]`. Without `:quant`,
         /// prefers Q4_K_M then Q8_0, falling back to the first GGUF file
         /// found.
         repo: String,
+        /// Download without confirming a model this machine cannot run.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Delete a GGUF model (every shard) from the configured models
     /// directory, reclaiming its Hugging Face hub-cache blob(s) too when
@@ -600,6 +606,16 @@ fn main() -> ExitCode {
 /// loop.
 struct Prepared {
     engine: Arc<Engine>,
+    /// `[orangu-server].api_key` / `ORANGU_API_KEY`, resolved once — the
+    /// bearer token `http::require_api_key` checks. `None` leaves the server
+    /// open.
+    api_key: Option<String>,
+    /// The `[tenant:<name>]` sections, resolved once into the live meters the
+    /// middleware admits against. Empty unless the config declares tenants.
+    tenants: Arc<tenant::TenantRegistry>,
+    /// `[orangu-server].tls_cert`/`tls_key`, resolved once. `None` serves
+    /// plain HTTP.
+    tls: Option<(PathBuf, PathBuf)>,
     /// Where to write the prefix-cache snapshot on the way out, and the model
     /// identity that snapshot is only valid for. `None` unless
     /// `ORANGU_PREFIX_CACHE_DIR` asked for it — carried here rather than
@@ -897,6 +913,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     // and `build_global` can only be called once.
     let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
     let mut loaded = source.load().context("loading model weights")?;
+    // Before the first device comes up, because bringing one up compiles the
+    // attention shaders against whichever storage this names — the choice
+    // cannot be revisited afterwards without rebuilding them.
+    engine::backend::vulkan::set_kv_cache_preference(conf.kv_cache);
     let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(
         conf.backend,
         &requested_device(device_flag.as_deref(), &conf.device),
@@ -905,7 +925,8 @@ fn prepare(args: Args) -> Result<Prepared> {
     // which is readable straight from the loaded tensor table — the KV side
     // needs a built model, and the model cannot be built until placement is
     // decided, since building it is what stamps each tensor's device.
-    let (weights_device_bytes, _) = engine::backend::device_resident_split(loaded.tensor_sizes());
+    let (weights_device_bytes, _) =
+        engine::backend::device_resident_split(loaded.resident_tensor_sizes());
     let per_layer_bytes =
         engine::footprint::DeviceFootprint::weights_per_layer(&loaded, loaded.config.n_layer);
     let (backend, backend_label, split) = apply_device_split(
@@ -988,53 +1009,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         );
     }
     let architecture = loaded.config.architecture.clone();
-    let model: Arc<dyn ModelForward> = match engine::loader::resolve_arch_family(&architecture)? {
-        ArchFamily::LlamaStyle => Arc::new(
-            LlamaModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Gemma => Arc::new(
-            GemmaModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen35Moe => Arc::new(
-            Qwen35MoeModel::load_with_backend(&loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::Qwen35 => Arc::new(
-            Qwen35Model::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen3Next => Arc::new(
-            Qwen3NextModel::load_with_backend(&loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::DFlash => {
-            Arc::new(DFlashModel::load_with_backend(&loaded).context("building model")?)
-        }
-        ArchFamily::Deepseek4 => Arc::new(
-            Deepseek4Model::load_with_backend(&loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::GlmDsa => Arc::new(
-            GlmModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::KimiK3 => Arc::new(
-            Kimi3Model::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Phi3 => Arc::new(
-            PhiModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Mistral3 => Arc::new(
-            MistralModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Muse => Arc::new(
-            MuseModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Inkling => Arc::new(
-            InklingModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::NemotronHMoe => Arc::new(
-            NemotronModel::load_with_backend(&loaded, backend.clone()).context("building model")?,
-        ),
-    };
+    let model = build_model(&loaded, &backend)?;
 
     // What this model puts on the chosen device, against what that device
     // has — reported here, where both are finally known, and before the
@@ -1058,7 +1033,8 @@ fn prepare(args: Args) -> Result<Prepared> {
         // never built. Standing this in its place keeps `/props` describing
         // the run rather than going silent on the configuration that most
         // needs describing.
-        let (_, weights_host_bytes) = engine::backend::device_resident_split(loaded.tensor_sizes());
+        let (_, weights_host_bytes) =
+            engine::backend::device_resident_split(loaded.resident_tensor_sizes());
         gpu_tuning = Some(split.to_json(&footprints, weights_host_bytes));
     }
     let footprint = backend.as_wgpu().map(|wgpu| {
@@ -1092,7 +1068,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
     }
 
-    let slots = SlotPool::new(conf.slots);
+    let slots = SlotPool::with_queue_limit(conf.slots, conf.queue_limit);
     // Cross-sequence GEMM batching, off by default: a real, reproducible
     // concurrent-load measurement (`ORANGU_BATCH_DECODE=1` vs. without,
     // same `slots` count, 4 concurrent 100-token generations) showed it
@@ -1101,7 +1077,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // own doc comment for the numbers and the likely cause. Only built at
     // all when `slots > 1` (nothing to batch across otherwise) *and* the
     // env var is set.
-    let batch_coordinator = (conf.slots > 1 && std::env::var_os("ORANGU_BATCH_DECODE").is_some())
+    let batch_coordinator = (conf.slots > 1 && crate::engine::env::flag_on("ORANGU_BATCH_DECODE"))
         .then(|| engine::batch::BatchCoordinator::new(slots.clone()));
     // Cross-request KV-cache prefix reuse (`engine::prefix_cache`),
     // **off by default; opt in with `ORANGU_PREFIX_CACHE=1`**. Unlike
@@ -1119,8 +1095,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // lengths), so this is sized to stay well within ordinary system RAM,
     // not tuned per-deployment.
     const PREFIX_CACHE_ENTRIES: usize = 4;
-    let prefix_cache = std::env::var_os("ORANGU_PREFIX_CACHE")
-        .is_some()
+    let prefix_cache = crate::engine::env::flag_on("ORANGU_PREFIX_CACHE")
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
 
     // Durable version of that pool (`ORANGU_PREFIX_CACHE_DIR=<dir>`), so a
@@ -1167,8 +1142,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // unresolvable) makes the endpoints report "not supported," matching a
     // llama.cpp server started without `--slot-save-path` — which is exactly
     // what the orangu client already degrades against.
-    let slot_store = std::env::var_os("ORANGU_NO_SLOT_SAVE")
-        .is_none()
+    let slot_store = (!crate::engine::env::flag_on("ORANGU_NO_SLOT_SAVE"))
         .then(|| {
             let structure_tag = model.new_kv_cache(1).structure_tag();
             let fingerprint = engine::slot_store::SlotStore::fingerprint(
@@ -1180,8 +1154,33 @@ fn prepare(args: Args) -> Result<Prepared> {
         })
         .flatten();
 
+    let draft = match &conf.draft_model {
+        Some(spec) => {
+            let draft = load_draft_model(
+                &conf.models,
+                spec,
+                draft_tokens(conf.draft_tokens),
+                &tokenizer,
+                &backend,
+                &backend_label,
+            )
+            .with_context(|| format!("loading draft model '{spec}'"))?;
+            // Both halves are probed before anything is served, because
+            // `forward_all_logits` is optional on `ModelForward` and the
+            // architectures that implement it are a minority. Discovering
+            // that on the first request would mean a server that starts,
+            // reports a draft on its banner, and then fails every generation.
+            supports_multi_position(model.as_ref(), &architecture)?;
+            supports_multi_position(draft.model.as_ref(), &draft.label)?;
+            Some(Arc::new(draft))
+        }
+        None => None,
+    };
+
     let engine = Arc::new(Engine {
+        metrics: Arc::new(engine::metrics::ServerMetrics::new()),
         model,
+        draft,
         tokenizer,
         chat_template_source,
         slots,
@@ -1246,6 +1245,9 @@ fn prepare(args: Args) -> Result<Prepared> {
     }
 
     Ok(Prepared {
+        api_key: conf.api_key.clone(),
+        tenants: Arc::new(tenant::TenantRegistry::new(&conf.tenants)),
+        tls: conf.tls.clone(),
         engine,
         prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
         model_label,
@@ -1347,8 +1349,173 @@ fn listener_fd(listener: &tokio::net::TcpListener) -> i32 {
     }
 }
 
+/// How many tokens the draft proposes per verification: the config key,
+/// overridden for one run by `ORANGU_SPEC_DRAFT` — the variable the
+/// prompt-lookup path already used, kept so a sweep of drafting depth reads
+/// the same whichever drafter is in play.
+fn draft_tokens(configured: usize) -> usize {
+    std::env::var("ORANGU_SPEC_DRAFT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(configured)
+}
+
+/// Loads the draft half of a speculative pair.
+///
+/// The vocabulary check is the whole reason this is not two lines. A draft
+/// model proposes *token ids*, and the target verifies them against its own
+/// logits — so two models whose id 1234 means different text do not fail, they
+/// agree at chance and produce a slower version of the right answer, or agree
+/// spuriously and produce a wrong one. There is no symptom to notice. Checked
+/// once here, against the token strings rather than only the vocabulary size,
+/// because two tokenizers of the same size that disagree about what is in them
+/// is exactly the case a size comparison passes.
+fn load_draft_model(
+    models_dir: &Path,
+    spec: &str,
+    tokens: usize,
+    target_tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    backend_label: &str,
+) -> Result<engine::generate::DraftModel> {
+    let (path, label) = orangu::model_spec::resolve_load_target(models_dir, spec)
+        .with_context(|| format!("resolving draft model '{spec}'"))?;
+    let gguf = GgufFile::open(&path)?;
+    let draft_tokenizer = Tokenizer::from_gguf(&gguf).context("building draft tokenizer")?;
+    if let Some(mismatch) = vocabulary_mismatch(target_tokenizer, &draft_tokenizer) {
+        bail!(
+            "draft model {label} does not share the served model's vocabulary ({mismatch}). \
+             Speculation compares token ids between the two, so a pair that disagrees about \
+             what an id means produces wrong or needlessly slow output with nothing to see"
+        );
+    }
+    let loaded = engine::loader::LoadedModel::open(&path).context("loading draft weights")?;
+    // The same backend as the target: a draft is only worth having if it runs
+    // where the target runs, and a pair split across a device boundary would
+    // pay a transfer per drafted token. No device split either — a draft small
+    // enough to be worth drafting with is small enough to place whole.
+    let unsupported = engine::backend::unsupported_tensor_types(loaded.tensor_types(), &**backend);
+    if !unsupported.is_empty() {
+        bail!(
+            "backend {backend_label} has no kernel for the draft model's tensor type(s) {}",
+            unsupported.join(", ")
+        );
+    }
+    let model = build_model(&loaded, backend).context("building draft model")?;
+    Ok(engine::generate::DraftModel {
+        model,
+        tokens,
+        label,
+    })
+}
+
+/// Refuses a model that cannot run a multi-position forward.
+///
+/// Probed rather than declared, because `ModelForward::forward_all_logits` is
+/// a defaulted trait method — there is nothing to ask a type about, only
+/// something to try. One token through it costs a single forward at startup
+/// and answers the question for certain, which beats a hand-kept list of which
+/// architectures implement it going quietly out of date.
+fn supports_multi_position(model: &dyn ModelForward, label: &str) -> Result<()> {
+    let mut cache = model.new_kv_cache(1);
+    // Token 0 exists in every vocabulary; what comes back is discarded.
+    model
+        .forward_all_logits(&mut cache, &[0], 0, 0)
+        .with_context(|| {
+            format!(
+                "{label} cannot be used in a speculative pair: speculation verifies several \
+                 positions in one forward, and this architecture has no multi-position path"
+            )
+        })?;
+    Ok(())
+}
+
+/// How two tokenizers differ, or `None` when they agree.
+///
+/// Compares the token strings themselves, not a count: the failure worth
+/// catching is two vocabularies of identical size whose contents diverge,
+/// which is what a same-family model at a different scale can easily be.
+fn vocabulary_mismatch(target: &Tokenizer, draft: &Tokenizer) -> Option<String> {
+    if target.vocab_size() != draft.vocab_size() {
+        return Some(format!(
+            "{} tokens against the served model's {}",
+            draft.vocab_size(),
+            target.vocab_size()
+        ));
+    }
+    let differing = (0..target.vocab_size() as u32)
+        .find(|&id| target.token_text(id) != draft.token_text(id))?;
+    Some(format!(
+        "same size, but token {differing} is {:?} in the draft and {:?} in the served model",
+        draft.token_text(differing).unwrap_or_default(),
+        target.token_text(differing).unwrap_or_default()
+    ))
+}
+
+/// Builds the architecture's `ModelForward` from a loaded checkpoint.
+///
+/// One function rather than an inline `match`, because a speculative pair
+/// loads two models and the second must go through exactly the same
+/// construction as the first — an architecture reachable as the served model
+/// but not as a draft would be a gap nothing announced.
+fn build_model(
+    loaded: &engine::loader::LoadedModel,
+    backend: &Arc<dyn Backend>,
+) -> Result<Arc<dyn ModelForward>> {
+    let architecture = loaded.config.architecture.clone();
+    let model: Arc<dyn ModelForward> = match engine::loader::resolve_arch_family(&architecture)? {
+        ArchFamily::LlamaStyle => Arc::new(
+            LlamaModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Gemma => Arc::new(
+            GemmaModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Qwen35Moe => Arc::new(
+            Qwen35MoeModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Qwen35 => Arc::new(
+            Qwen35Model::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Qwen3Next => Arc::new(
+            Qwen3NextModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::DFlash => {
+            Arc::new(DFlashModel::load_with_backend(loaded).context("building model")?)
+        }
+        ArchFamily::Deepseek4 => Arc::new(
+            Deepseek4Model::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::GlmDsa => Arc::new(
+            GlmModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::KimiK3 => Arc::new(
+            Kimi3Model::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Phi3 => Arc::new(
+            PhiModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Mistral3 => Arc::new(
+            MistralModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Muse => Arc::new(
+            MuseModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Inkling => Arc::new(
+            InklingModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::NemotronHMoe => Arc::new(
+            NemotronModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+    };
+    Ok(model)
+}
+
 async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
+        api_key,
+        tenants,
+        tls,
         engine,
         prefix_cache_snapshot,
         model_label,
@@ -1379,6 +1546,20 @@ async fn serve(prepared: Prepared) -> Result<()> {
 
     let listener = tokio::net::TcpListener::from_std(api_listener)
         .context("failed to attach listener to the async runtime")?;
+    // Loaded before anything is served, so a bad certificate is a startup
+    // failure naming the file rather than a server that came up in the clear.
+    let tls_config = match &tls {
+        Some((cert, key)) => Some(tls::server_config(&tls::TlsPaths {
+            cert: cert.clone(),
+            key: key.clone(),
+        })?),
+        None => None,
+    };
+    let scheme = if tls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let web_listener = match web_listener {
         Some(l) => Some(
             tokio::net::TcpListener::from_std(l)
@@ -1399,9 +1580,16 @@ async fn serve(prepared: Prepared) -> Result<()> {
         None => model_label.clone(),
     };
 
+    // Captured before `api_key` moves into `AppState`, for the exposure note
+    // further down. A declared tenant counts: it is a key the server checks,
+    // so a deployment that uses only named keys is authenticated and must not
+    // be told otherwise.
+    let has_api_key = api_key.is_some() || !tenants.is_empty();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
+        api_key,
+        tenants: tenants.clone(),
         model_label: model_label.clone(),
         backend_label: backend_label.clone(),
         gpu_tuning,
@@ -1416,13 +1604,35 @@ async fn serve(prepared: Prepared) -> Result<()> {
         let os = orangu::os::detect();
         let cpu = orangu::hardware::detect_cpu();
         let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-        print!("{}", orangu::hardware::format_report(&os, &cpu, &gpus));
+        let power = orangu::hardware::detect_power();
+        print!(
+            "{}",
+            orangu::hardware::format_report(&os, &cpu, &gpus, &power)
+        );
         println!();
         println!(
             "Model      {model_display} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
-            engine.model.config().n_layer,
+            // Trunk layers, not `block_count`. On a file carrying a
+            // multi-token-prediction block the two differ, and the banner
+            // must name what the forward pass runs — `Qwen3.8-27B` declares
+            // 65 blocks and runs 64.
+            engine.model.n_trunk_layer(),
             engine.model.config().n_ctx_train,
         );
+        // Speculation changes how fast an answer arrives and never what it
+        // says, so it belongs on the banner rather than in a note: it is a
+        // property of this server worth seeing beside the model, and a pair
+        // whose acceptance is poor is a configuration to notice, not a fault
+        // to warn about.
+        if let Some(draft) = &engine.draft {
+            println!(
+                "Draft      {} ({} arch, {} layers, {} tokens/step)",
+                draft.label,
+                draft.model.config().architecture,
+                draft.model.n_trunk_layer(),
+                draft.tokens,
+            );
+        }
         // Which kernels the device actually got, on the line under the device
         // that got them. A decode number is only comparable against another
         // one taken with the same kernels, and on a GPU whose defaults were
@@ -1444,14 +1654,73 @@ async fn serve(prepared: Prepared) -> Result<()> {
             );
         }
         match &web_listener {
-            Some(l) => println!("UI         http://{}", l.local_addr()?),
+            Some(l) => println!("UI         {scheme}://{}", l.local_addr()?),
             None => println!("UI         disabled"),
         }
         // The bound address, not the configured `host`: `all` says nothing
         // about where to point a client, `0.0.0.0:8100` does.
-        println!("API        http://{}", listener.local_addr()?);
+        println!("API        {scheme}://{}", listener.local_addr()?);
         println!("Workspace  {}", workspace.display());
-        for advisory in orangu::hardware::performance_advisories() {
+        // Who may call, and under what bound. Printed because a limit nobody
+        // can see is indistinguishable from a limit that is not applied — and
+        // this one is spelled in a section header, which is exactly the kind
+        // of key a typo turns into an MCP server nobody notices.
+        for meter in tenants.meters() {
+            let limits = meter.limits();
+            let bounds = if limits.any() {
+                [
+                    (limits.max_concurrent as u64, "concurrent"),
+                    (limits.requests_per_minute, "req/min"),
+                    (limits.tokens_per_minute, "tok/min"),
+                ]
+                .iter()
+                .filter(|(value, _)| *value > 0)
+                .map(|(value, unit)| format!("{value} {unit}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+            } else {
+                "no limits".to_string()
+            };
+            println!("Tenant     {} ({bounds})", meter.name());
+        }
+        // The two deployment gates, said once, where someone will see it.
+        //
+        // Binding to a network is a deliberate act; serving an inference
+        // engine on it unauthenticated and in the clear usually is not. The
+        // default is loopback precisely so this cannot happen by accident, so
+        // the only way to reach this line is to have widened `host` — at which
+        // point the omission is worth naming rather than leaving for someone
+        // to discover from the outside.
+        if !listener.local_addr()?.ip().is_loopback() {
+            // The fix names only what is actually absent. Telling an operator
+            // to set `api_key` on a server that already authenticates — which
+            // is what a tenant-only deployment looks like — sends them to
+            // check a key that is working, and makes the half of the note that
+            // *is* true easier to dismiss.
+            let key_fix =
+                "[orangu-server].api_key (or ORANGU_API_KEY, or a [tenant:<name>] section)";
+            let tls_fix = "tls_cert/tls_key, or terminate TLS in front of it";
+            let missing = match (has_api_key, tls_config.is_some()) {
+                (true, true) => None,
+                (false, true) => Some(("no authentication", format!("Set {key_fix}."))),
+                (true, false) => Some(("no TLS", format!("Set {tls_fix}."))),
+                (false, false) => Some((
+                    "no authentication and no TLS",
+                    format!("Set {key_fix}, and {tls_fix}."),
+                )),
+            };
+            if let Some((missing, fix)) = missing {
+                println!("Note       reachable off this machine with {missing}. {fix}");
+            }
+        }
+        // Settings first, then conditions. The settings advisories each ship
+        // the command that fixes them and are therefore the ones worth acting
+        // on immediately; being on battery or already hot is context for
+        // whatever number the reader is about to see.
+        for advisory in orangu::hardware::performance_advisories()
+            .into_iter()
+            .chain(orangu::hardware::power_advisories(&power))
+        {
             println!("Note       {advisory}");
         }
     }
@@ -1528,9 +1797,23 @@ async fn serve(prepared: Prepared) -> Result<()> {
         });
     }
 
+    // One `select!` and one shutdown path either way — the TLS listener is an
+    // `axum::serve::Listener` like the plain one, so only the listener changes.
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let serve_api = async move {
+        match tls_config {
+            Some(config) => axum::serve(
+                tls::TlsListener::new(listener, config).with_connect_info(),
+                service,
+            )
+            .await
+            .context("server error"),
+            None => axum::serve(listener, service).await.context("server error"),
+        }
+    };
     tokio::select! {
-        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {
-            result.context("server error")?;
+        result = serve_api => {
+            result?;
         }
         _ = tokio::signal::ctrl_c() => {
             if !daemon {
@@ -1709,7 +1992,11 @@ fn run_command(
                 .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            print!("{}", orangu::hardware::format_report(&os, &cpu, &gpus));
+            let power = orangu::hardware::detect_power();
+            print!(
+                "{}",
+                orangu::hardware::format_report(&os, &cpu, &gpus, &power)
+            );
             Ok(())
         }
         Command::Suggest => {
@@ -1746,10 +2033,13 @@ fn run_command(
             let plan = engine::plan::analyze(&path)?;
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            let vram = gpus.iter().filter_map(|g| g.vram_total_bytes).max();
             print!(
                 "{}",
-                engine::plan::format_plan(&plan, cpu.available_memory_bytes, vram)
+                engine::plan::format_plan(
+                    &plan,
+                    cpu.available_memory_bytes,
+                    plan_device(&gpus).as_ref().map(|(n, v)| (n.as_str(), *v)),
+                )
             );
             if deep {
                 // Everything the plan assumed, checked. A plan is only worth
@@ -1796,8 +2086,12 @@ fn run_command(
             print!("{}", format_show(&gguf, full, tensors));
             Ok(())
         }
-        Command::Download { repo } => {
+        Command::Download { repo, yes } => {
             let conf = load_config(config_arg, None, false)?;
+            if !plan_before_download(&repo, yes)? {
+                println!("Nothing downloaded.");
+                return Ok(());
+            }
             let path = orangu::model_download::download_model(&conf.models, &repo)?;
             println!("Downloaded to {}", path.display());
             Ok(())
@@ -1987,6 +2281,91 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
     nr.checked_sub(1)
         .and_then(|index| groups.into_iter().nth(index))
         .ok_or_else(|| anyhow!("no model with NR {nr} ({count} model(s) listed)"))
+}
+
+/// Plans a `download` target against this machine **before** fetching it,
+/// and answers whether the download should go ahead.
+///
+/// A GGUF file states what it needs in its tensor table, and the table sits
+/// at the front of the file, so `engine::plan` can answer "what would this
+/// cost to run here" from a few hundred kilobytes of each shard's header
+/// rather than from the model. That is the whole reason to do this before
+/// the download instead of after it: the answer arrives while it can still
+/// change the decision, in seconds, against a repo that may be hundreds of
+/// gigabytes.
+///
+/// Only a model that **cannot run here** stops to ask. The test is
+/// `Plan::dense_fits_in` — the same one the printed verdict is written from,
+/// so the prompt can never contradict the report above it. A model whose
+/// experts do not fit does *not* prompt: those stream from disk, so that
+/// model is slow rather than broken, and a warning there would be crying
+/// wolf on the case orangu is specifically built to handle.
+///
+/// Planning is a courtesy and never a gate. Every failure — no network, a
+/// rate limit, a private repo, a header this build cannot parse — returns
+/// `true` and lets the download proceed. The one thing this must not do is
+/// turn a working download into a failure because the advisory step ahead
+/// of it did not work.
+fn plan_before_download(repo: &str, yes: bool) -> Result<bool> {
+    // Resolution failures are silent on purpose. Everything that can go
+    // wrong here — the repo missing, the token rejected, no file matching
+    // the `:quant` — is something `download_model` is about to hit while
+    // making the very same two Hub calls, and reporting it twice tells the
+    // user nothing the second line didn't. A *plan* failure below is
+    // different: the download will sail past a header this build cannot
+    // parse, so nothing else would ever mention it.
+    let Ok(model) = orangu::model_download::resolve_remote_model(repo) else {
+        return Ok(true);
+    };
+    let plan = match engine::plan::analyze_shards(model.headers()) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("orangu-server: could not plan {repo} before downloading: {err}");
+            return Ok(true);
+        }
+    };
+
+    let cpu = orangu::hardware::detect_cpu();
+    let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+    println!(
+        "Download   {} · {} · {}",
+        repo,
+        model.commit.chars().take(7).collect::<String>(),
+        orangu::format::format_bytes(model.total_bytes()),
+    );
+    print!(
+        "{}",
+        engine::plan::format_plan(
+            &plan,
+            cpu.available_memory_bytes,
+            plan_device(&gpus).as_ref().map(|(n, v)| (n.as_str(), *v)),
+        )
+    );
+
+    if plan.dense_fits_in(cpu.available_memory_bytes) || yes {
+        return Ok(true);
+    }
+    confirm("\nThis model cannot run on this machine. Download anyway? [y/N]: ")
+}
+
+/// The GPU a plan should be judged against — the one the server would load
+/// onto — as `(name, capacity)`, or `None` on a machine with no dedicated
+/// card.
+///
+/// The largest *dedicated* GPU, which is `suggest`'s own
+/// `largest_dedicated_gpu` rather than a second rule, and which agrees with
+/// what `engine::backend::device`'s preference order picks: discrete
+/// outranks integrated, so on a laptop with both, the 4 GiB discrete card is
+/// the target even though the integrated one reports far more.
+///
+/// That last point is the whole reason this is not a one-liner. The obvious
+/// spelling — the largest `vram_total_bytes` over every GPU — reads an
+/// integrated GPU's *shared* pool, which is all of system RAM, and so
+/// reports 62 GiB of "VRAM" on a machine whose real ceiling is 4 GiB. It
+/// also double-counts: that memory is already on the RAM line beside it.
+fn plan_device(gpus: &[orangu::hardware::GpuInfo]) -> Option<(String, u64)> {
+    let gpu = suggest::largest_dedicated_gpu(gpus)?;
+    Some((gpu.name.clone(), gpu.vram_total_bytes?))
 }
 
 /// Reads a Yes/No confirmation from stdin, defaulting to No on an empty
@@ -2491,6 +2870,7 @@ fn apply_device_split(
     // make a device look over-subscribed when it is merely holding back
     // room for the KV cache.
     let reported_capacities: Vec<Option<u64>> = set.iter().map(|c| c.vram_total_bytes).collect();
+    let mut device_classes: Vec<DeviceClass> = set.iter().map(|c| c.class).collect();
     let mut capacities: Vec<Option<u64>> = set
         .iter()
         .map(|c| {
@@ -2526,6 +2906,9 @@ fn apply_device_split(
         capacities.push(None);
         reported_capacities.push(None);
         names.push(cpu_label());
+        // The host tier is not a GPU at all; classed as software so the
+        // placement note never mistakes it for a card worth preferring.
+        device_classes.push(DeviceClass::Software);
     }
 
     let Some(plan) = placement::plan(mode, per_layer_bytes, &capacities, weights_bytes) else {
@@ -2578,6 +2961,7 @@ fn apply_device_split(
             plan,
             device_names: names,
             device_capacities: reported_capacities,
+            device_classes,
             device_kv_storage: kv_storage,
         }),
     ))
@@ -2595,6 +2979,12 @@ struct SplitReport {
     plan: SplitPlan,
     device_names: Vec<String>,
     device_capacities: Vec<Option<u64>>,
+    /// What each device *is* — discrete, integrated, software. Carried
+    /// alongside the capacities because shares are proportional to reported
+    /// memory, and an integrated device reports system RAM: the two numbers
+    /// are not the same quantity, and comparing them is how the largest share
+    /// ends up on the slowest card. See [`Self::placement_note`].
+    device_classes: Vec<DeviceClass>,
     /// How each device stores its KV mirror, captured while the concrete
     /// backends were still in hand. `None` for the host overflow tier, which
     /// has no GPU mirror at all.
@@ -2607,6 +2997,64 @@ struct SplitReport {
 }
 
 impl SplitReport {
+    /// A warning when the split handed its largest share to an integrated
+    /// device while a discrete one was in the set.
+    ///
+    /// Shares are proportional to each device's *reported* memory, which is
+    /// the right rule for a set of discrete cards and a trap on a laptop: an
+    /// integrated GPU reports system RAM, so it can advertise five times a
+    /// discrete card's VRAM while being several times slower. The result is a
+    /// split that assigns most of the model to the slowest device — and
+    /// nothing about the layer ranges says so, because "20 layers on Radeon
+    /// Graphics" looks like a bigger card getting more work.
+    ///
+    /// Measured on this shape (24-layer model, 4 GiB discrete card beside an
+    /// integrated GPU reporting 21 GiB): the memory-proportional split gave
+    /// 4 layers to the discrete card and 20 to the integrated one, and
+    /// reversing that with an explicit ratio was 1.4x faster at one stream
+    /// and 2.0x at four. That is larger than anything the split itself buys
+    /// back, so it is worth a line rather than a doc paragraph nobody reads
+    /// at the moment it applies.
+    ///
+    /// Named as a *possible* improvement, not a misconfiguration: the
+    /// integrated device may genuinely be the one with room, which is the
+    /// whole reason the split exists.
+    fn placement_note(&self) -> Option<String> {
+        let (largest, _) = self
+            .plan
+            .per_device_layers
+            .iter()
+            .enumerate()
+            .max_by_key(|&(index, layers)| (layers, std::cmp::Reverse(index)))?;
+        if self.device_classes.get(largest) != Some(&DeviceClass::Integrated) {
+            return None;
+        }
+        let discrete = self
+            .device_classes
+            .iter()
+            .position(|class| *class == DeviceClass::Discrete)?;
+        Some(format!(
+            "orangu-server: [{}] most layers ({}) went to {}, which is integrated — shares are \
+             proportional to reported memory, and an integrated device reports system RAM rather \
+             than dedicated VRAM. If {} has the room, an explicit device_split ratio favouring it \
+             is usually faster.",
+            self.api,
+            self.plan
+                .per_device_layers
+                .get(largest)
+                .copied()
+                .unwrap_or(0),
+            self.device_names
+                .get(largest)
+                .cloned()
+                .unwrap_or_else(|| format!("device {largest}")),
+            self.device_names
+                .get(discrete)
+                .cloned()
+                .unwrap_or_else(|| format!("device {discrete}")),
+        ))
+    }
+
     /// The startup lines: the layer ranges, what each device holds against
     /// what it has, and what the split costs.
     ///
@@ -2710,6 +3158,7 @@ impl SplitReport {
             self.plan.boundaries(),
             if self.plan.boundaries() == 1 { "" } else { "s" }
         ));
+        lines.extend(self.placement_note());
         lines
     }
 
@@ -3192,8 +3641,73 @@ fn is_x86_feature_detected() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Command, label_carries_tag, resolve_model_spec, resolve_workspace, terminal_title,
+        Args, Command, DeviceClass, SplitReport, label_carries_tag, resolve_model_spec,
+        resolve_workspace, terminal_title,
     };
+    use crate::engine::placement::SplitPlan;
+
+    fn report(layers: &[usize], classes: &[DeviceClass]) -> SplitReport {
+        SplitReport {
+            api: "vulkan".to_string(),
+            plan: SplitPlan {
+                per_device_layers: layers.to_vec(),
+                layer_device: layers
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(device, n)| std::iter::repeat_n(device, *n))
+                    .collect(),
+            },
+            device_names: (0..classes.len()).map(|i| format!("dev{i}")).collect(),
+            device_capacities: vec![None; classes.len()],
+            device_classes: classes.to_vec(),
+            device_kv_storage: vec![None; classes.len()],
+        }
+    }
+
+    /// The trap the note exists for: shares are proportional to reported
+    /// memory, an integrated GPU reports system RAM, and so the largest share
+    /// lands on the slowest device while the layer ranges look unremarkable.
+    #[test]
+    fn the_placement_note_fires_when_the_integrated_device_took_the_most_layers() {
+        let note = report(&[4, 20], &[DeviceClass::Discrete, DeviceClass::Integrated])
+            .placement_note()
+            .expect("integrated device holds the most layers");
+        assert!(note.contains("integrated"), "{note}");
+        assert!(
+            note.contains("dev1"),
+            "names the device that took them: {note}"
+        );
+        assert!(
+            note.contains("dev0"),
+            "names the discrete alternative: {note}"
+        );
+    }
+
+    /// Silent when the split already favours the discrete card — the note is
+    /// advice, and advice that fires when nothing is wrong is noise that
+    /// teaches operators to ignore the line.
+    #[test]
+    fn the_placement_note_is_silent_when_the_split_already_favours_the_discrete_card() {
+        assert!(
+            report(&[20, 4], &[DeviceClass::Discrete, DeviceClass::Integrated])
+                .placement_note()
+                .is_none()
+        );
+    }
+
+    /// Silent with no discrete device to move work to: on a machine whose
+    /// only GPU is integrated, "prefer the discrete one" is not advice.
+    #[test]
+    fn the_placement_note_is_silent_without_a_discrete_alternative() {
+        assert!(
+            report(
+                &[12, 12],
+                &[DeviceClass::Integrated, DeviceClass::Integrated]
+            )
+            .placement_note()
+            .is_none()
+        );
+    }
 
     /// Every subcommand clap parses has a `mode()` name for the terminal
     /// title, spelled exactly the way the user typed it — the title is only
@@ -3219,6 +3733,7 @@ mod tests {
             .mode(),
             Command::Download {
                 repo: String::new(),
+                yes: false,
             }
             .mode(),
             Command::Delete {
@@ -3264,12 +3779,126 @@ mod tests {
         }
     }
 
+    /// The subcommand names a completion script actually *offers*, as
+    /// opposed to merely mentions.
+    ///
+    /// The distinction is the whole point of the test below. A description
+    /// string can contain a subcommand's name — `--deep`'s reads "Also
+    /// verify plan's shards and architecture" — so a substring search over
+    /// the script passes while Tab still offers nothing, which is precisely
+    /// the bug being guarded against. Each of these parses the one
+    /// construct that puts a word in front of the user.
+    fn offered_subcommands(shell: &str, script: &str) -> Vec<String> {
+        match shell {
+            // One `compgen -W "$(_orangu_server_models) <names...>"` list.
+            "bash" => {
+                let marker = "_orangu_server_models) ";
+                let start = script.find(marker).expect("bash subcommand list") + marker.len();
+                let rest = &script[start..];
+                let end = rest.find('"').expect("unterminated bash word list");
+                rest[..end].split_whitespace().map(String::from).collect()
+            }
+            // `_values` entries, each `'<name>[description]'`.
+            "zsh" => script
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim_start().strip_prefix('\'')?;
+                    Some(line[..line.find('[')?].to_string())
+                })
+                .collect(),
+            // `complete ... '__fish_use_subcommand' -a <name> -d '...'`.
+            "fish" => script
+                .lines()
+                .filter(|line| line.contains("'__fish_use_subcommand'"))
+                .filter_map(|line| {
+                    let after = line.split(" -a ").nth(1)?;
+                    Some(after.split_whitespace().next()?.to_string())
+                })
+                .collect(),
+            other => panic!("no parser for {other}"),
+        }
+    }
+
+    /// Every subcommand clap parses is offered by all three completion
+    /// scripts.
+    ///
+    /// Written because `plan` was not: it was added to clap and to the
+    /// terminal title, and `shell.rs` — three hand-written scripts with no
+    /// generator behind them — was never updated, so the one command whose
+    /// entire purpose is answering a question *before* you commit to a
+    /// download was the one command Tab would not offer. Nothing else in the
+    /// tree connects clap to those scripts, and a shell script has no
+    /// compiler to notice.
+    #[test]
+    fn every_subcommand_is_offered_by_every_completion_script() {
+        use clap::CommandFactory;
+
+        let parsed: Vec<String> = Args::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .collect();
+
+        for (shell, script) in [
+            ("bash", crate::shell::BASH),
+            ("zsh", crate::shell::ZSH),
+            ("fish", crate::shell::FISH),
+        ] {
+            let offered = offered_subcommands(shell, script);
+            for name in &parsed {
+                assert!(
+                    offered.contains(name),
+                    "the {shell} completion script does not offer `{name}` — it offers {offered:?}"
+                );
+            }
+        }
+    }
+
+    /// The parsers above must be able to fail, or the test they serve is
+    /// decoration. Each is handed its own script with one subcommand's
+    /// *offer* removed while every mention of the name stays put, which is
+    /// exactly the shape the real bug had.
+    #[test]
+    fn the_completion_parsers_notice_a_missing_offer() {
+        for (shell, script, remove) in [
+            ("bash", crate::shell::BASH, "show plan download"),
+            (
+                "zsh",
+                crate::shell::ZSH,
+                "'plan[Report what a model needs to run here, without loading it]' \\",
+            ),
+            (
+                "fish",
+                crate::shell::FISH,
+                "complete -c orangu-server -n '__fish_use_subcommand' -a plan     -d 'Report what a model needs to run here, without loading it'",
+            ),
+        ] {
+            assert!(
+                script.contains(remove),
+                "{shell}: the text this test removes is no longer in the script"
+            );
+            let replacement = if shell == "bash" { "show download" } else { "" };
+            let crippled = script.replace(remove, replacement);
+            // The name survives elsewhere — in `--deep`'s description, and
+            // in the argument-completion lines — so a substring search would
+            // still pass here. The parser must not.
+            assert!(
+                crippled.contains("plan"),
+                "{shell}: nothing left to fool a substring search"
+            );
+            assert!(
+                !offered_subcommands(shell, &crippled).contains(&"plan".to_string()),
+                "{shell}: the parser still reports `plan` as offered after its offer was removed"
+            );
+        }
+    }
+
     #[test]
     fn the_title_is_the_binary_then_the_mode() {
         assert_eq!(
             terminal_title(
                 Command::Download {
-                    repo: String::new()
+                    repo: String::new(),
+                    yes: false,
                 }
                 .mode()
             ),

@@ -46,6 +46,8 @@
 //! whether or not a thread has picked it up yet, so all of them stay visible
 //! at once until the last one is done.
 
+use crate::gguf::GgufFile;
+
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -254,6 +256,106 @@ pub fn download_model_reporting(
     }
 
     Ok(snapshot_dir.join(primary_path))
+}
+
+/// How long one shard's header fetch may take before
+/// [`RemoteModel::headers`] gives up on it. Generous for a few hundred
+/// kilobytes, because the timeout covers connecting and redirect-following
+/// too, but bounded: planning a download is a courtesy the download itself
+/// must never wait indefinitely on.
+const HEADER_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A model on the Hub resolved down to the files that make it up, with none
+/// of them downloaded.
+///
+/// The point of the type is [`headers`](Self::headers): a GGUF file states
+/// what it needs in its tensor table, which sits at the front, so what a
+/// model would cost to run here is answerable *before* fetching it rather
+/// than after. `orangu-server download` uses this to plan a repo against
+/// this machine before spending the bandwidth on it.
+///
+/// Resolution is exactly [`download_model`]'s — the same commit lookup, the
+/// same file listing, the same [`select_files_to_download`] rules — so the
+/// files described here are the files a download would actually place. The
+/// one deliberate difference is the `mmproj` sidecar: [`download_model`]
+/// fetches it, and this leaves it out, because it is a separate
+/// CLIP-architecture model whose tensors would be counted as this model's
+/// weights by anything reading the tables below.
+pub struct RemoteModel {
+    pub repo: String,
+    pub commit: String,
+    /// The model's own shards, in shard order. Never empty — resolution
+    /// fails rather than returning a model with no files.
+    pub shards: Vec<RepoFile>,
+    client: reqwest::blocking::Client,
+    token: Option<String>,
+}
+
+/// Resolves `spec` (`<user>/<model>[:quant]`) to a [`RemoteModel`] without
+/// downloading anything: two Hub API calls, the same two
+/// [`download_model`] makes before it starts fetching.
+pub fn resolve_remote_model(spec: &str) -> Result<RemoteModel> {
+    let (repo, tag) = split_repo_tag(spec)?;
+    let client = build_client(Some(HEADER_FETCH_TIMEOUT))?;
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+    let commit = resolve_commit(&client, &repo, token.as_deref())?;
+    let files = list_repo_files(&client, &repo, &commit, token.as_deref())?;
+    let shards = select_files_to_download(&files, tag.as_deref())
+        .with_context(|| format!("no matching GGUF file in {repo}"))?
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(RemoteModel {
+        repo,
+        commit,
+        shards,
+        client,
+        token,
+    })
+}
+
+impl RemoteModel {
+    /// What downloading this model would transfer, across every shard.
+    pub fn total_bytes(&self) -> u64 {
+        self.shards.iter().map(|f| f.size).sum()
+    }
+
+    /// Each shard's GGUF header, in shard order, fetched as the iterator is
+    /// advanced.
+    ///
+    /// Lazy on purpose: a consumer that fails on shard 1 — an architecture
+    /// it cannot read, a truncated table — never pays for the remaining ten.
+    /// A failure is yielded rather than swallowed, since a header that will
+    /// not parse is exactly the kind of thing worth knowing before the
+    /// download and not after it.
+    pub fn headers(&self) -> impl Iterator<Item = Result<GgufFile>> + '_ {
+        self.shards.iter().map(move |file| self.header(file))
+    }
+
+    /// One shard's header. Streams the file and stops at the end of the
+    /// tensor table — dropping the response cancels the rest of the
+    /// transfer, so this costs the header rather than the file.
+    fn header(&self, file: &RepoFile) -> Result<GgufFile> {
+        let url = format!(
+            "{HUB_ENDPOINT}/{}/resolve/{}/{}",
+            self.repo,
+            self.commit,
+            urlencode_path(&file.path)
+        );
+        // Not `authed_get`: that asks for JSON, and this asks for the front
+        // of a binary file.
+        let request = match &self.token {
+            Some(token) => self.client.get(&url).bearer_auth(token),
+            None => self.client.get(&url),
+        };
+        let response = request
+            .send()
+            .with_context(|| format!("failed to fetch the header of {}", file.path))?
+            .error_for_status()
+            .with_context(|| format!("failed to fetch the header of {}", file.path))?;
+        GgufFile::read_from(std::io::BufReader::new(response))
+            .with_context(|| format!("failed to parse the GGUF header of {}", file.path))
+    }
 }
 
 fn build_client(timeout: Option<std::time::Duration>) -> Result<reqwest::blocking::Client> {

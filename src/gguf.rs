@@ -184,6 +184,25 @@ impl GgufFile {
             .with_context(|| format!("failed to parse GGUF file {}", path.display()))
     }
 
+    /// Reads the GGUF structure from any byte stream, rather than from a file
+    /// on this machine.
+    ///
+    /// The parser is strictly sequential and stops at the end of the tensor
+    /// table, reading none of the tensor data behind it. A caller holding a
+    /// network response can therefore hand it the response body and drop the
+    /// connection the moment this returns, having transferred the few hundred
+    /// kilobytes of header rather than the file — which may be hundreds of
+    /// gigabytes. `orangu::model_download::RemoteModel::headers` is that
+    /// caller, and it is why this exists; every path that has the file
+    /// already goes through [`open`](Self::open) or
+    /// [`open_at`](Self::open_at) instead.
+    ///
+    /// Wrap `inner` in a [`BufReader`] unless it is already buffered: the
+    /// parser issues many small reads.
+    pub fn read_from<R: Read>(inner: R) -> Result<GgufFile> {
+        Self::read(inner)
+    }
+
     fn read<R: Read>(inner: R) -> Result<GgufFile> {
         let mut reader = Reader {
             inner,
@@ -586,6 +605,34 @@ mod tests {
             .map(|(_, value)| value)
             .unwrap();
         assert!(matches!(tokens, GgufValue::Array(items) if items.len() == 3));
+    }
+
+    /// The property `orangu::model_download::RemoteModel::headers` is built
+    /// on, and the reason planning a model before downloading it is cheap:
+    /// the parser stops at the end of the tensor table and reads none of the
+    /// tensor data behind it.
+    ///
+    /// Stated as a test because it is a promise made to a *network* caller,
+    /// where it is the difference between transferring a few hundred
+    /// kilobytes and transferring hundreds of gigabytes — and where nothing
+    /// about a passing parse would reveal that the promise had been broken.
+    /// A parser that read to EOF would still return the right `GgufFile`
+    /// here; only the bytes left unread show the difference.
+    #[test]
+    fn read_from_stops_at_the_end_of_the_tensor_table() {
+        let header = build_minimal_gguf();
+        let mut bytes = header.clone();
+        // Stand-in for the tensor data a real file carries behind its table.
+        bytes.extend(std::iter::repeat_n(0xABu8, 4096));
+
+        let mut cursor = Cursor::new(bytes);
+        let file = GgufFile::read_from(&mut cursor).unwrap();
+        assert_eq!(file.tensors.len(), 1);
+        assert_eq!(
+            cursor.position(),
+            header.len() as u64,
+            "the parser read past the tensor table into the tensor data"
+        );
     }
 
     /// The removed ids must still name themselves — a real `bartowski`

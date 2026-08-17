@@ -56,6 +56,21 @@ pub fn run_init() -> Result<()> {
     )?;
     let host = prompt_host(&default_host())?;
     let port = prompt_line("port", &default_port().to_string())?;
+    // Asked only when the answer above made it matter. On loopback the server
+    // is reachable by whoever is already on the machine and a key buys
+    // nothing; the moment the address is widened it is the difference between
+    // a private tool and a published inference engine — and this wizard is
+    // where that decision is actually being made, so it is the place to ask.
+    // Empty leaves the server open, which stays the default rather than
+    // becoming a thing you have to know to ask for.
+    let api_key = if is_public_host(&host) {
+        prompt_line(
+            "api_key (blank = no authentication, and the server is reachable off this machine)",
+            "",
+        )?
+    } else {
+        String::new()
+    };
     // The web console is a section of its own, so it is one yes/no question
     // rather than a port that has to be guessed at (and `0` remembered as
     // the way to decline). Declining writes no `[web]` section at all.
@@ -81,6 +96,9 @@ pub fn run_init() -> Result<()> {
         contents.push_str(&format!("role = {}\n", role.label()));
     }
     contents.push_str(&format!("host = {host}\nport = {port}\n"));
+    if !api_key.trim().is_empty() {
+        contents.push_str(&format!("api_key = {}\n", api_key.trim()));
+    }
     if let Some((web_host, web_port, reexec, delete)) = &web {
         // `host` and `port` together, the same pair `[orangu-server]` writes
         // unconditionally above — a section that names where it listens
@@ -801,6 +819,24 @@ fn host_completion_options(interfaces: &[(String, IpAddr)]) -> Vec<HostOption> {
 /// hostname the machine resolves, or an address on an interface that only
 /// exists once this config is deployed elsewhere, are both legitimate, and
 /// `bind` reports the ones that aren't at startup.
+/// Whether this bind address makes the server reachable from another machine.
+///
+/// `all` and `0.0.0.0`/`::` obviously do; a literal address that is not a
+/// loopback one does too, and answering `192.168.1.10` is a perfectly ordinary
+/// way to reach this state. Anything unparseable is treated as public, because
+/// the failure of guessing wrong in that direction is one extra question,
+/// where guessing wrong the other way is silence about an exposed server.
+fn is_public_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case(HOST_ALL) || host.eq_ignore_ascii_case(HOST_ALL_ALIAS) {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
 fn prompt_host(default: &str) -> Result<String> {
     let config = Config::builder()
         .completion_type(rustyline::CompletionType::List)
@@ -879,6 +915,29 @@ fn prompt_bool_yes_default(label: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    /// The wizard asks for a key exactly when the address it just wrote makes
+    /// one matter.
+    ///
+    /// Getting this wrong in one direction costs a question nobody needed; in
+    /// the other it means the wizard walked an operator into an exposed server
+    /// without mentioning it, which is the whole reason the prompt exists.
+    #[test]
+    fn a_key_is_offered_only_for_an_address_reachable_off_this_machine() {
+        for public in [
+            "all",
+            "0.0.0.0",
+            "::",
+            "192.168.1.10",
+            "10.0.0.1",
+            "nonsense",
+        ] {
+            assert!(is_public_host(public), "{public:?} should prompt for a key");
+        }
+        for private in ["127.0.0.1", "::1", "  127.0.0.1  "] {
+            assert!(!is_public_host(private), "{private:?} should not prompt");
+        }
+    }
+
     use super::*;
     use orangu::model_spec::ModelGroup;
 

@@ -566,7 +566,7 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     // never does: it hands `project_expert` slices of `hidden` directly. That
     // gather is charged to every group, not only the resident ones, so it is
     // not visible in any comparison that toggles residency.
-    let force_host = std::env::var_os("ORANGU_MOE_FORCE_HOST_GROUPS").is_some();
+    let force_host = crate::engine::env::flag_on("ORANGU_MOE_FORCE_HOST_GROUPS");
     // **With streaming on, residency stops deciding this.** The permanent
     // weight arena never evicts, so `is_device_resident` is a plan made
     // before the first token against total VRAM — on a card holding 4.00 GiB
@@ -1491,6 +1491,20 @@ pub struct BatchDecodeItem<'a> {
 
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
+
+    /// How many layers the forward pass actually runs.
+    ///
+    /// `config().n_layer` is the file's `block_count`, and on a file carrying
+    /// a trailing multi-token-prediction block that counts one this engine
+    /// never executes. The architectures able to load such a file stop before
+    /// it and override this; for everything else the two are the same number.
+    ///
+    /// Reported rather than derived at the call site because the startup
+    /// banner said `65 layers` for a `Qwen3.8-27B` that runs 64, and a layer
+    /// count nobody can act on is worse than none.
+    fn n_trunk_layer(&self) -> usize {
+        self.config().n_layer
+    }
 
     /// This model's Vulkan backend, when it has one.
     ///

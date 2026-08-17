@@ -71,6 +71,24 @@ pub struct SlotStore {
     retained: Vec<Mutex<Option<CachedPrefill>>>,
 }
 
+/// A retained-cache slot's guard, recovering from a poisoned lock.
+///
+/// `lock().unwrap()` was wrong here in a way that turned one bad request into
+/// a dead server: a panic anywhere under this lock poisons it, and every later
+/// request — on *every* slot's code path through this module — then panics on
+/// the `unwrap` instead of serving. A caught panic that leaves the process
+/// alive but unable to answer anything is worse than the crash it replaced.
+///
+/// This is a cache. The worst a poisoned entry can be is stale or
+/// half-written, and the caller's contract already allows it to be absent, so
+/// recovering the guard and letting the entry be overwritten or read as a
+/// miss is both sound and the smallest possible blast radius.
+fn retained(
+    cell: &Mutex<Option<CachedPrefill>>,
+) -> std::sync::MutexGuard<'_, Option<CachedPrefill>> {
+    cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl SlotStore {
     /// A stable hash of everything that must match for a saved KV cache to be
     /// safely reusable: the architecture, the model label (`general.name` /
@@ -116,7 +134,7 @@ impl SlotStore {
     /// out-of-range `slot_id` (never happens for a real `SlotGuard`).
     pub fn retain(&self, slot_id: usize, tokens: Vec<u32>, cache: KvCache) {
         if let Some(cell) = self.retained.get(slot_id) {
-            *cell.lock().unwrap() = Some(CachedPrefill { tokens, cache });
+            *retained(cell) = Some(CachedPrefill { tokens, cache });
         }
     }
 
@@ -138,7 +156,7 @@ impl SlotStore {
         let Some(cell) = self.retained.get(slot_id) else {
             return 0;
         };
-        let guard = cell.lock().unwrap();
+        let guard = retained(cell);
         let Some(entry) = guard.as_ref() else {
             return 0;
         };
@@ -170,7 +188,7 @@ impl SlotStore {
         let Some(cell) = self.retained.get(slot_id) else {
             bail!("slot {slot_id} out of range");
         };
-        let guard = cell.lock().unwrap();
+        let guard = retained(cell);
         let Some(entry) = guard.as_ref() else {
             return Ok(0);
         };
@@ -211,7 +229,7 @@ impl SlotStore {
         };
         let restored = cache.committed_len();
         // `get` re-checked above, so this index is in range.
-        *self.retained[slot_id].lock().unwrap() = Some(CachedPrefill { tokens, cache });
+        *retained(&self.retained[slot_id]) = Some(CachedPrefill { tokens, cache });
         Ok(restored)
     }
 

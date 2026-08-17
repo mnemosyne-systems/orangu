@@ -76,7 +76,14 @@ dependency on any C or C++ inference library.
 - `engine/footprint.rs` — what *this model* costs on that device: weights
   split device/host, headroom, and how much context the headroom buys.
   Distinct from `engine/plan.rs`, which answers the same family of question
-  about a GGUF nobody has opened yet, in terms of system RAM.
+  about a GGUF nobody has opened yet. The two now weigh the same quantities
+  — `Plan::device_bytes` applies `is_cpu_only_tensor`, the backend's own
+  rule, and excludes the draft block exactly as `resident_tensor_sizes`
+  does — so a plan's `Device` line and the startup footprint agree on a
+  model they have both seen. They used to be incomparable: a plan spoke
+  only of system RAM, so it could report "fits in RAM with 23.9 GiB to
+  spare" for a model the footprint would then call 17.3 GiB too large for
+  the card.
 - `engine/placement.rs` — which device runs which layer when a model is
   spread across several: `SplitMode`, and the pure apportionment that turns
   capacities into contiguous layer runs.
@@ -475,6 +482,49 @@ independently picked `mmproj-BF16.gguf`), so fetching it up front here means
 to the file list `download_model` fetches, alongside whatever shards the
 primary model itself has.
 
+**Planning the model before fetching it (`RemoteModel`).** `resolve_commit`
+and `list_repo_files` answer everything `engine::plan` needs *except* the
+tensor tables, and those are not behind the download either — a GGUF file
+puts its header at the front, so the tables are the first few hundred
+kilobytes of each shard. `resolve_remote_model` performs exactly the two
+Hub calls above and stops there, returning a `RemoteModel` that names the
+commit and the selected shards with nothing fetched;
+`RemoteModel::headers` then streams each shard from
+`/<repo>/resolve/<commit>/<path>` into `GgufFile::read_from` and yields the
+parsed header.
+
+Two properties make this cost the header rather than the file. The GGUF
+parser is strictly sequential and stops at the end of the tensor-info
+table — pinned by `read_from_stops_at_the_end_of_the_tensor_table`, which
+asserts the reader's final position rather than merely that the parse
+succeeded, because a parser that read to EOF would return the same
+`GgufFile` and only the unread bytes reveal the difference. And dropping a
+`reqwest` response cancels the rest of its transfer, so returning from
+`RemoteModel::header` closes the connection. Planning a 1.3 TiB repo
+therefore transfers a few megabytes.
+
+`headers` is lazy, so a consumer that fails on shard 1 never pays for the
+remaining ten, and it yields `Result` rather than swallowing failures: a
+header that will not parse is precisely the thing worth knowing before a
+multi-hour download. `RemoteModel` deliberately excludes the `mmproj`
+sidecar that `download_model` fetches — it is a separate CLIP-architecture
+model, and its tensors would be counted as this model's weights by anything
+reading the tables.
+
+`main.rs`'s `plan_before_download` is the only caller. It hands
+`RemoteModel::headers` to `engine::plan::analyze_shards` — the same
+classifier `plan` uses on local files, which cannot tell where the tables
+came from — prints the report, and consults `Plan::dense_fits_in` to decide
+whether to confirm. It confirms on the dense part alone, never on the
+experts: experts stream, so a model that overflows on them is slow rather
+than broken, and prompting there would cry wolf on the workload the expert
+path exists for. Every failure in this whole path reports one line and
+returns "go ahead", since `download_model` is about to attempt the same
+repo and is the better place for the real error to surface. It sits outside
+`download_model_reporting` on purpose: that function also serves the web
+console's model manager and model-spec resolution ahead of serving, neither
+of which has a terminal to confirm on.
+
 **Fetching bytes, concurrently.** `download_model` first walks `selected`
 sequentially just to decide what needs fetching at all — a blob already
 present on disk with a matching size is skipped entirely rather than
@@ -679,10 +729,56 @@ keeps the other two, without a `cfg` deciding it per platform.
 
 CPU statistics (brand, vendor, architecture, physical/logical core counts,
 peak frequency, total/available RAM) come from
-[`sysinfo`](https://docs.rs/sysinfo), used with only its `system` feature
-(no `disk`/`network`/`component`/`user`) to keep the dependency footprint
-minimal — the same dependency, and the same feature, `orangu::os` uses
-above.
+[`sysinfo`](https://docs.rs/sysinfo), used with its `system` and `component`
+features only (no `disk`/`network`/`user`) to keep the dependency footprint
+small — the same dependency `orangu::os` uses above.
+
+**Power and thermals (`detect_power`).** `component` is the second feature,
+and it is there for temperatures: `sysinfo::Components` reads sensors on
+every platform this targets, which is worth a dependency rather than
+writing three `hwmon`/SMC/WMI readers by hand. Sensors reporting `None`, or
+exactly `0.0`, are dropped — the latter is a channel that is not wired up
+rather than a component at freezing, and an integrated GPU's memory channel
+does report it. What survives is sorted warmest first, because the only
+sensor anybody acts on is the one nearest its limit.
+
+The power *source* is not from `sysinfo`, which has no battery or AC-line
+API at any version, so each platform is read natively:
+
+- **Linux** walks `/sys/class/power_supply`, the interface every desktop
+  battery indicator reads.
+- **macOS** parses `pmset -g batt`, following `detect_macos_gpus`'s existing
+  precedent of shelling out to the platform's own tool.
+- **Windows** declares `GetSystemPowerStatus` and calls it directly. This is
+  the one place that does *not* go through PowerShell, deliberately: the
+  rest of this module needs WMI, whereas this is a single `kernel32` call
+  filling a six-field struct, and spawning a shell to learn one byte would
+  put several hundred milliseconds on the startup path. The ABI has been
+  fixed since Windows 95, so a crate would carry nothing for us.
+
+`classify_power_source` is split out from the Linux walk and compiled into
+the tests on every platform, because it holds the one real trap: a laptop
+plugged in with a full battery reports its battery status as **`Not
+charging`**, not `Charging`. Deciding from the battery alone therefore means
+reading a double negative that is easy to invert, and inverting it would
+tell every desk-bound laptop it was running down a battery. Asking the AC
+line first removes the question — an adapter reporting itself online is
+authoritative whatever the battery says. A machine with neither an online
+adapter nor a draining battery is a desktop, a server, or a container, and
+all three answer `Mains`: every caller is really asking "is my power about
+to run out".
+
+`power_advisories` is kept separate from `performance_advisories` because
+the two are different kinds of finding. Those are settings, Linux-only, and
+each ships the `sudo` line that fixes it. These are conditions, hold on
+every platform, and neither has a command as an answer — one is answered by
+a cable and the other by airflow. The thermal one fires only against a
+threshold the platform itself declared and only within
+`THERMAL_ADVISORY_FRACTION` of it, which means a hot sensor that declares no
+threshold is reported in the `POWER` section and never warned about. That is
+deliberate: silicon runs hot under load, `Tctl` on AMD parts is a control
+offset rather than a junction temperature, and a fixed limit invented here
+would fire on machines that are working perfectly.
 
 GPU detection has no single cross-platform API, so `detect_gpus` layers
 several best-effort, independent sources and concatenates whatever each
@@ -836,6 +932,18 @@ curated list of common open-weight parameter counts, largest first — and
 returns the first whose `estimate_total_vram_bytes` result (at that cell's
 context length and bits-per-weight) fits within the budget, or `None` if
 even the smallest rung (1B) doesn't (rendered as `-`).
+
+**Where the estimate ends.** `format_suggestion` closes with `NEXT_STEP`, a
+fixed paragraph naming `download` and `plan` as the two commands that do
+not have to estimate. It is there because every figure above it is derived
+from a parameter count and the approximation described above — at this
+point no model has been chosen, so there is no file to read, and
+`engine::plan` (which reads real tensor tables) has nothing to read *from*.
+`suggest` therefore cannot be made exact; what it can do is hand the user
+the command that is. `download` plans the repo's real tables before
+fetching it and `plan` does the same for a local model, so the size class
+`suggest` produces gets checked against reality before any bandwidth is
+spent on it.
 
 **Two budgets, (up to) two tables.** `format_suggestion` computes two
 separate budgets and prints a labeled `push_suggestion_block` for each,
@@ -1473,6 +1581,68 @@ mod`), so adding a family is additive rather than a rewrite:
   the short ones instead, so a logit-level comparison has to pass a
   matching `-c`.
 
+### Constrained decoding (`engine::constraint`, `engine::sampling::Constraint`)
+
+`JsonPrefix` is a byte-level recogniser for **prefixes** of valid JSON. At
+every point it answers "could this still become valid JSON", which is what a
+mask needs, and separately whether what it has *is already* a complete document
+(`is_complete`), which is what a stop condition needs. Both are required and
+they are different questions: `{"a":` satisfies the first and not the second.
+
+It is a hand-written state machine rather than a parser generator because the
+state has to be **cheap to clone** — testing a candidate token is "clone, feed
+its bytes, see if it survived", and that happens per candidate per step. The
+state is a small enum, a stack of `{`/`[` frames, and two flags.
+
+Two details are easy to get wrong and are pinned by tests, having both been
+wrong first:
+
+- **A trailing comma is not an empty container.** `[1,]` and `{"a":1,}` arrive
+  at "a value/key is expected" exactly as `[]` and `{}` do, so the state after
+  `[` is a distinct `ValueOrClose` from the state after `,`. Collapsing them
+  accepts both trailing commas.
+- **Object keys and values are both strings.** A closing quote means "expect
+  `:`" after a key and "expect `,` or `}`" after a value, so the machine tracks
+  which one it opened. Without that, `{"a" "b"}` reads as two values in a row.
+
+`Constraint` joins the grammar to a vocabulary. It holds the tokenizer's
+`token_bytes` table — built once, on the first constrained request, and shared
+by `Arc`, so a deployment that never constrains anything never pays for it. The
+table comes from the same `append_token_bytes` that `Tokenizer::decode` uses,
+because a constraint reasoning about text the model is not actually emitting
+would be worse than none.
+
+**Where the mask is applied, and what it costs.** On the greedy path the plain
+argmax is tested first and returned if it is legal, which it almost always is —
+one grammar probe, nothing sorted. Only when the model's preferred token is
+illegal is the vocabulary ordered and walked. On the sampled path the mask is
+applied after `top_k` and *before* the softmax, so probabilities are
+renormalized over the allowed set; if every one of the top `k` is rejected the
+field is refilled from the whole vocabulary rather than failing.
+
+**Three things a constrained request gives up**, all because they choose tokens
+without consulting the mask: the device-side argmax fast path, the batch
+coordinator's greedy sampling, and prompt-lookup speculation. Each is gated on
+`Sampler::is_constrained`. A speculative draft accepted on "this is what greedy
+would have produced" would sail straight past the grammar.
+
+**Stopping.** End-of-sequence ids are masked until the document is complete,
+and once it *is* complete they are the only ids left. The second half is not
+symmetry for its own sake: measured without it, a model that had just written
+`{}` went on emitting blank lines to `max_tokens`, because whitespace after a
+finished document is legal JSON and far more probable to that model than
+end-of-sequence.
+
+**Whitespace before the document is deliberately still legal.** Banning
+whitespace-only tokens was tried, and it made the output worse rather than
+better: with no room to hesitate the model opens `{` on the first step and,
+having committed with nothing planned, immediately closes it — `{}` where
+allowing it to pause produced `{"Name": "John Doe", "Age": 32}`. The cost is
+that a model which refuses to emit JSON at all stalls on whitespace until
+`max_tokens`. A constraint can make invalid output unreachable; it cannot make
+a model cooperate, and pretending otherwise would trade a visible failure for a
+worthless document.
+
 ### Request scheduling and continuous batching
 
 `engine::scheduler`'s `SlotPool` bounds how many requests generate
@@ -1498,8 +1668,464 @@ path (below) was specifically built to eliminate, and that cost outweighs
 the weight-bandwidth savings batching provides at this scale on the
 hardware this was measured on. Left available behind the flag rather than
 removed, since a genuinely GPU-resident batched-and-fused pipeline could
-plausibly flip this positive on different hardware or at higher
-concurrency.
+plausibly flip this positive on different hardware — but **not at higher
+concurrency**, which has now been measured and does not flip it. See below.
+
+
+**The fused path has been measured at real batch sizes, and it loses.**
+`ORANGU_BATCH_DECODE=1` routes concurrent decode steps through
+`engine::batch::BatchCoordinator`, which collects whatever arrives inside a
+window (`ORANGU_BATCH_WAIT_MS`, 4 ms by default) and runs them as one
+`forward_batch_decode`. At 32 concurrent streams:
+
+| window | mean batch | aggregate tok/s |
+| ---: | ---: | ---: |
+| 4 ms | 2.21 | 65.02 |
+| 25 ms | 13.86 | 45.47 |
+| 100 ms | 22.55 | 44.67 |
+| 400 ms | 26.98 | 42.75 |
+
+The first row is why `/moe-stats` reports `batch.mean_batch`: an earlier
+comparison at the default window concluded "batching is 3% slower" when the
+mean batch size was 2, so it had measured a rendezvous rather than a batch. At
+a mean of 27 the fused path is 34% *slower* than not batching.
+
+Unbatched decode reads ~78 GiB/s of weights here, at the card's ceiling;
+batched at mean 27 reads ~1.9 GiB/s and still delivers fewer tokens. Fusing
+does remove the weight-bandwidth bottleneck, and what remains — the
+per-sequence attention, RoPE and KV write the fused path leaves per-sequence,
+plus the window every sequence pays on every token — costs more than it saves.
+
+A rendezvous can only build a batch by making sequences wait, and the waiting
+loses at every size tried, so there is no window setting that wins. Closing
+this gap means a scheduler that batches whatever is ready on each step without
+waiting for stragglers, not a larger constant.
+
+### Serving over TLS (`tls.rs`)
+
+Built in rather than delegated to a reverse proxy, because "one static binary,
+nothing to install" is the property this project trades other things for, and
+"put nginx in front of it" spends exactly that property in the deployments the
+binary exists for — air-gapped, sovereign, one machine, no package manager.
+Terminating in front stays valid and is what most fleets will do; it just is
+not the only way to reach the server safely over a network.
+
+It cost glue and no cryptography: `rustls` and `tokio-rustls` were already in
+the tree for `reqwest`'s HTTPS, so what was added is an acceptor and a PEM
+reader — the latter through `rustls_pki_types`' own `PemObject`, already
+present as a `rustls` dependency, rather than `rustls-pemfile`, which is the
+historical spelling and is now flagged unmaintained.
+
+`TlsListener` implements `axum::serve::Listener` — accept a connection, report
+the local address — so it drops into the existing `axum::serve` call and keeps
+one serving path, one shutdown `select!`, and the `ConnectInfo<SocketAddr>` the
+loopback-only routes rely on. A hand-rolled accept loop feeding `hyper` would
+have duplicated all of that to add one wrapper.
+
+**`accept` cannot fail, and that shapes the error handling.** A refused
+handshake is not a server error: on any network-reachable port it happens
+constantly — scanners, plain HTTP sent to an HTTPS port, clients with no shared
+cipher — so the loop drops those and continues. Giving up would turn background
+noise into an outage; logging each one would flood the log with it.
+
+**`ConnectInfo` needed an idiom.** `axum` implements
+`Connected<IncomingStream<'_, L>>` for `SocketAddr` only for its own
+`TcpListener`, plus a blanket impl for anything wrapped in `TapIo`. Writing the
+impl here is not allowed — both types are foreign and a local type appearing
+only as a type parameter does not satisfy the orphan rule — so
+`TlsListener::with_connect_info` wraps in a `TapIo` that does nothing and earns
+the blanket impl. Worth the indirection because the alternative was dropping
+`ConnectInfo` to make it compile, which would have quietly widened what
+`/model-cache/drop` accepts.
+
+Both keys or neither: `tls_cert` alone is a configuration error, because the
+alternative is a server that starts in the clear while the config looks like it
+does not. Certificate loading happens before anything is served, so a bad file
+is a startup failure naming it.
+
+**A note at startup when the server is exposed without either gate.** Binding
+off-loopback is deliberate; serving an inference engine there unauthenticated
+and in the clear usually is not. The default bind is loopback precisely so that
+cannot happen by accident, so the only way to reach that line is to have
+widened `host` — at which point the omission is worth naming rather than
+leaving to be discovered from outside.
+
+### Authentication (`http::require_api_key`)
+
+A `route_layer` over the whole API router. With no `[orangu-server].api_key`
+(or `ORANGU_API_KEY`) configured it passes everything through, which is the
+behaviour before it existed and the right default for the loopback address the
+server also defaults to.
+
+`Authorization: Bearer <key>` rather than a scheme of this project's own,
+because the orangu client **already sent one** — `orangu::llm`'s `bearer_auth`,
+from the client's own `api_key` config — and every OpenAI-shaped client sends
+one. The server was the only half of this that was missing, so the work was
+checking a header that was already arriving, not designing a protocol.
+
+The comparison is constant-time. A `==` on secrets returns at the first
+differing byte, so its duration reports how many leading bytes were right —
+enough, over many attempts, to recover a key one byte at a time. The cost of
+avoiding that is a few nanoseconds on a path about to run a forward pass.
+
+`OPEN_PATHS` is `/health` and nothing else. `/health` names no model, reports
+no load, and returns the same bytes to everyone, so requiring a secret for it
+buys nothing and costs what every deployment needs: a probe that works from a
+load balancer with no credentials.
+
+**`/v1/models` is deliberately closed, and the coordinator was changed rather
+than the exemption widened.** Its `ensure_reachable` and startup health check
+both probed `/v1/models` and required `is_success()` — so the first server
+given an `api_key` would have answered `401`, been read as "stopped
+answering", and been restarted on every request, in a loop. Both now accept
+**any** HTTP response as proof of life, which is what they were actually
+asking: a `401` proves a process is there just as well as a `200`. Conflating
+reachability with authorization is the bug; exempting the path would only have
+hidden it.
+
+Proxied requests need nothing: `proxy` forwards every header verbatim, so a
+client's `Authorization` reaches the backend unchanged.
+
+### Admission: a bounded, first-come-first-served queue
+
+`SlotPool::try_acquire` takes a **ticket** before it waits, and only the holder
+of the head ticket may claim a slot. Without that the wait is a scramble: a
+release wakes one sleeper, which then rescans, and a request arriving in that
+gap can call `try_take_any` first and take the slot it was woken for. Under
+steady load that is unbounded waiting for whoever is unlucky, with nothing in
+the system that would ever report it.
+
+A global semaphore would be the obvious fix and does not work here, fair though
+`tokio`'s is: `acquire_slot` bypasses admission by design — a pinned request is
+waiting for one specific slot's warm cache, not competing for one — so a global
+permit count drifts out of step with the slots actually free. That is the same
+failure this pool's own comment records having removed a global semaphore for
+once already.
+
+**The ticket's `Drop` is the load-bearing part.** A waiter can vanish at any
+moment: the client hangs up, the request times out, the runtime cancels the
+task. A ticket that outlived its holder would leave the head pointing at a
+number nobody will ever claim, stalling every request behind it for the life of
+the process. Releasing on drop makes cancellation safe by construction rather
+than by remembering, and
+`an_abandoned_waiter_does_not_stall_the_queue` fails — by hanging — without it.
+
+`[orangu-server].queue_limit` bounds the depth. Past it `try_acquire` returns
+`None`, which becomes a `StreamEvent::Overloaded` and then `503` with
+`Retry-After`. It is its own event rather than an `Error` because the two mean
+different things to a caller: an error is a request that cannot be served, and
+this is one that could be served later. `/metrics` exports
+`orangu_server_queue_depth` and `orangu_server_queue_limit`, because a bound
+nobody can see is half a feature.
+
+**Client disconnects already free their slot, and did before any of this.**
+Both the streaming and non-streaming paths consume the same channel, so a
+dropped receiver makes the next `tx.send` fail and generation stops at the next
+token. Measured: a non-streaming client killed three seconds into a 2000-token
+request left the slot `busy: false` one second later, 125 tokens in, and the
+next request was served immediately. No cancellation plumbing was needed.
+
+**What this does not do** is stop one long generation from occupying a slot
+while short requests wait. That needs preemption, which is a scheduler
+question rather than an admission one — see the batching section above for why
+the scheduler is the real gap.
+
+### The host-resident bound on prefix reuse
+
+`LayerCache::len` counts every position the cache logically holds. The host
+buffers do not always hold all of them: the fused GPU decode path writes a
+token's key and value straight into the device mirror and calls
+`advance_gpu_only`, which moves `len` without pushing anything host-side. After
+N decode steps `len` is N rows ahead of `k`/`v`.
+
+Everything that reads the host side — cross-request prefix reuse, per-slot
+retained caches, slot save, CPU attention — therefore has to bound itself by
+`KvCache::host_committed_len`, not by `committed_len`. Bounding by the wrong
+one is not a subtle inaccuracy: it indexes off the end of the buffer.
+
+That was a live crash, on the commonest usage there is — the same slot, a
+growing conversation, a GPU backend. The second turn panicked with `range end
+index 31488 out of range for slice of length 30592`: 246 rows claimed against
+239 held, the difference being exactly the tokens the first turn generated.
+`advance_gpu_only`'s own doc comment had named the hazard in advance ("*If
+prompt-prefix reuse (slot save/restore) is ever built, this becomes unsafe*"),
+and before the host buffers were sized to their contents it read zeros instead
+of panicking, which is worse.
+
+Two details of the bound are load-bearing. It is **derived** from the buffer
+length rather than tracked in a second field, so it cannot drift from what it
+describes. And it takes the shortest layer that holds *anything*, skipping
+permanently-empty ones: `engine::arch::gemma`'s cross-layer KV donor is empty
+by design, and a plain minimum would read it as "no prefix is reusable" and
+switch reuse off for the whole architecture.
+
+What this costs is reuse of the *generated tail*, which the next turn
+re-prefills. Measured on a four-turn conversation: 695 of 923 tokens reused,
+the shortfall being the eight tokens the previous turn generated.
+
+`engine::slot_store` also stopped locking its cells with `lock().unwrap()`.
+One panic under that lock poisoned it, and every later request on every slot
+then panicked on the `unwrap` rather than being served — a process that stayed
+alive and answered `500` to everything. It is a cache: a poisoned entry is at
+worst stale, the caller already handles absence, so it recovers the guard and
+reads as a miss.
+
+### Latency histograms and readiness (`engine::metrics`)
+
+`/metrics` was three gauges and a limit. Gauges answer "what is happening right
+now", which is the wrong question for latency — the useful questions are all
+about the tail, and a mean is dominated by whichever requests happened to be
+long. Four Prometheus histograms answer them instead: queue wait, time to first
+token, inter-token, and request duration.
+
+**Bucket counts are per-bucket and made cumulative only at render.** A
+cumulative *write* would mean touching every bucket at or above the observed
+value on every observation, and the inter-token histogram is observed once per
+generated token. The format requires cumulative buckets, so the conversion has
+to happen somewhere; doing it on the read side costs a scrape and not a decode
+step.
+
+**Sums are microseconds in a `u64`, not a float.** `AtomicU64` is lock-free
+everywhere this runs, while a float sum accumulated by compare-and-swap would
+be slower *and* non-deterministic in its last digits across runs — which makes
+two measurements of the same workload disagree for no reason.
+
+**Two bucket sets, because one cannot span both.** A request is milliseconds to
+a minute; a decode step is milliseconds to a second. Putting inter-token gaps
+on the request bounds lands almost every observation in one bucket, which is a
+histogram that reports nothing.
+
+**Time to first token counts from arrival**, so it carries the queue wait and
+the prefill together — what an interactive caller actually waits through. It is
+the first token *produced*, not the first the client sees: a chat format's
+structural prefix is filtered out of the stream (`MessageHeader`), and charging
+the template's shape to the server's latency would make two models of the same
+speed report different numbers.
+
+**Outcomes are recorded by a `Drop` guard, not at each exit.** `run` has five
+places that report an error and return, one that returns on a client
+disconnect, and a `catch_unwind` above it that turns a panic into a reply. A
+counter with a path that forgets to increment it is worse than no counter,
+because the total silently stops matching the request count. `OutcomeGuard`
+defaults to `error` and is told otherwise on the paths that know better, so a
+failure path added later is counted correctly without anyone noticing it needed
+to be. A refusal is counted through its own entry point rather than as a
+zero-duration request: folding a handful of microseconds into the latency
+histogram would drag every quantile down exactly when the server is under the
+load those quantiles are being watched for.
+
+**Verified by arithmetic rather than by looking plausible.** One 24-token
+request produced one time-to-first-token observation and twenty-three
+inter-token observations, and the two sums added to the request duration
+exactly (1.724549 + 1.157920 = 2.882525 s). Parts that add up to the whole is
+the check worth having, because every individual number here looks reasonable
+whether or not it is right.
+
+**`/ready` is not `/health`, and the split is the point.** `/health` asks "is
+this process alive" — a supervisor's question, and one that must stay `200`
+while the server is merely busy, because restarting a loaded server is the
+worst possible response to load. `/ready` asks "would a request sent now be
+served" — a load balancer's question, where busy is exactly the case worth
+reporting. It is `503` when the admission queue is already at `queue_limit`
+(the request would be refused anyway, so saying so saves a round trip) or when
+the GPU device has been lost. The decision is a free function taking
+`(device_lost, queued, limit)` rather than reading `AppState`, so the rule can
+be tested at all — the alternative is standing up a loaded model to assert five
+comparisons, which is why rules like this usually go untested.
+
+`/ready` joins `/health` in `OPEN_PATHS`, which is a deliberate widening: it
+does disclose load, where `/health` discloses nothing. That is the one fact the
+probe exists to report, it is bounded (depths and slot counts, no model name
+and no request content), and anyone able to send a request learns the same
+thing from the `503` they would get instead.
+
+**What this immediately found, and the care the finding needed.**
+`outcome="cancelled"` sat at zero under a test that should have produced one,
+which looked like the disconnect abort not working at all. It was not that. The
+abort rode on *sending a token* — `tx.send(…).is_err()` — so it only ran for a
+token that produced visible text, and the model under test rendered one
+character for forty tokens. Almost every iteration skipped the check entirely.
+
+That is a real hole rather than a quirk of one model: a chat format's
+structural markers are suppressed, and under `--review` a whole reasoning body
+is, so a request could generate to `max_tokens` — holding the slot every other
+request is queued for — for a client that hung up at the first token.
+
+The check is now `tx.is_closed()`, asked every token whether or not there was
+anything to send. Measured on the model that leaked: a 2000-token request whose
+client sent a TCP reset at four seconds used to run to completion and finish as
+`length`; it now stops within about four seconds and finishes as `cancelled`.
+On a model with ordinary visible output the behaviour was already correct, and
+still is — which is why the first reading of the zero counter, that disconnect
+abort did not work at all, was itself wrong.
+
+### Draft-model speculative decoding
+
+`[orangu-server].draft_model` puts a second, smaller model in front of the
+served one: it proposes `draft_tokens` continuations, the target verifies all
+of them in a single multi-position forward, and the longest prefix the target
+would itself have produced is kept. Everything after that prefix is thrown
+away, so the emitted text is byte-for-byte what greedy decoding alone would
+have emitted — a drafter can only change how fast an answer arrives.
+
+**The verification machinery already existed** for prompt-lookup drafting, and
+the two now differ only in where the candidate tokens come from. That is the
+whole abstraction: one enum with a `draft` and a `commit`, and the source with
+no model behind it simply has nothing to commit. Their cost profiles are
+opposite, which is why both are kept — prompt lookup produces nothing unless
+the context repeats itself but its misses are free, while a draft model always
+produces a draft and always pays a forward pass per token for it.
+
+**Both models need `forward_all_logits`, and the reason is not the obvious
+one.** The target needs it because verification *is* a multi-position forward.
+The draft needs it because it is the only entry point that keeps the KV rows on
+the host: a single-token `forward` takes the fused GPU decode path, which
+writes key and value straight into the device mirror and leaves the host rows
+unpopulated. `KvCache::advance_gpu_only`'s own doc comment had predicted the
+consequence in as many words — "a resumed cache could need this position's real
+data for a later multi-token prefill's CPU attention path, which would silently
+read zeros instead" — and a draft cache is exactly that: rolled back to the
+accepted prefix and re-read on every step. Running the draft through `forward`
+produced both failures the warning describes, one loud (a read one row past the
+end of the host buffer) and one silent (garbage where zeros were read). Both
+models are probed with a one-token forward at startup rather than checked
+against a list of architectures, because the method is defaulted and there is
+nothing to ask a type about.
+
+**The draft's cache follows the target's exactly.** After verification the
+target truncates to `start_pos + 1 + accepted`, and the draft truncates to the
+same count; when everything was accepted the draft is left one token short and
+the next step's catch-up fills it in. Getting this wrong has no visible symptom
+— the target re-derives every token either way — beyond an acceptance rate
+quietly falling to zero, which is why `commit` is asserted directly rather than
+through output.
+
+**Two guards worth naming.** The draft is capped by the room left in the KV
+cache, because a verification forward appends the whole draft at once and the
+GPU mirror is sized to the request's capacity — a bound only reachable in the
+last few tokens of a full context, which is why it survived unnoticed on the
+prompt-lookup path. And the pair's vocabularies are compared *by token string*,
+not by size: two tokenizers of the same size whose contents diverge is exactly
+what a same-family model at a different scale can be, and speculation compares
+token ids.
+
+**Measured, and it lost.** On a 4 GiB card serving a target that overflows it
+(`gemma-4-12B-it:Q4_K_M`, 1.43 tok/s unassisted), a `gemma-4-E4B` draft
+achieved a *better* acceptance rate than prompt lookup — 2.15 accepted per
+verification against 1.67 — and still ran at 1.02 tok/s where prompt lookup ran
+at 3.01. Drafting deeper made it worse in exactly the way that identifies the
+cost: eight tokens per step raised acceptance to 2.56 and dropped throughput to
+0.67, so the cost is per drafted token, not per step. Each draft forward is a
+pass through a second set of weights competing for device memory the target
+already overflows. The condition for a draft model to pay is therefore not
+about prediction quality at all — it is that the draft must be small enough not
+to disturb the target's residency.
+
+*Not built:* the DFlash sidecar format's own draft-and-verify loop. A DFlash
+draft is not a standalone model — it reads the target's hidden states at named
+layers (`dflash.target_layers`) and fuses them through its own `fc` — so
+running one needs `ModelForward` to expose intermediate hidden states, which
+would be an interface change landing on every architecture at once for one
+sidecar format. `engine::arch::dflash` still resolves such a file to its paired
+target and serves that. Sampled (non-greedy) acceptance is also not built: it
+needs the draft's own probability distribution and a rejection-and-resample
+rule, which is a different algorithm from "did the draft match the argmax",
+not a relaxation of it.
+
+### Per-tenant limits (`tenant`)
+
+`queue_limit` protects the *server*. It says nothing about how the capacity is
+divided, so one client opening thirty streams fills the queue and every other
+client sees `503` from a server that is perfectly healthy. `[tenant:<name>]`
+is the other half: a limit per caller, which needs a notion of who a caller is
+and so could not exist before the server checked a bearer token at all.
+
+**Three limits, because they fail differently.** `max_concurrent` bounds the
+scarce thing directly — a generation holds a slot from admission to its last
+token. `requests_per_minute` bounds arrival rate, which concurrency cannot:
+a loop firing thousands of one-token requests is never concurrent with itself.
+`tokens_per_minute` bounds work done, and is the only one denominated in what a
+request actually costs — two requests are not two units of anything when one is
+forty tokens and the next four thousand.
+
+**The rate window is 60 one-second buckets**, indexed by `second % 60` and
+stamped with the second they stand for, so a bucket last written over a minute
+ago reads as empty with nothing sweeping it: fixed size, no allocation, no
+background task. A single fixed window would have been less code and is the
+usual shortcut, but it lets a caller spend one minute's budget in the last
+second of a window and the next minute's in the first second of the following —
+twice the configured rate, arriving as a burst, which is the shape the limit
+exists to prevent. The clock is a monotonic `Instant`, not the wall clock: a
+limit that unblocks or hangs when the machine synchronises its time is worse
+than no limit.
+
+**Refusal, not queueing.** Over a limit the answer is `429` immediately.
+Making the request wait would put it in the admission queue — the shared
+resource the limit exists to keep it out of — so a tenant over its bound would
+still be occupying capacity, just invisibly. `429` rather than `503` because
+they mean different things to a client: `503` says every caller is seeing it,
+`429` says this one is over its own bound while the server may be idle.
+
+**The concurrency claim is taken before the rate checks**, so two requests
+arriving together cannot both read "one below the limit" and both proceed. The
+guard is built immediately after the claim, so a refusal further down releases
+it by dropping rather than by remembering to —
+`a_rate_refusal_releases_the_concurrency_claim_it_took` fails without that, and
+a leak there is invisible until the tenant is locked out permanently.
+
+**Where the guard is dropped is the whole question.** Dropping it when the
+handler returns looks equivalent and is not: a streaming generation returns its
+response as soon as the SSE stream *exists* and then generates for as long as
+the answer takes, so a guard released there would count every streamed request
+as instantaneous — `max_concurrent = 1` would admit a thousand of them, and the
+one shape of request the limit exists for would be the one it did not bound. So
+the guard rides on the response body and is dropped when the body is: at the
+last frame, or when the client disconnects and the connection tears the body
+down. Both are exactly when the work stops.
+
+That wrapper implements `http_body::Body` and forwards `size_hint` and
+`is_end_stream` rather than re-streaming the body. Re-wrapping it as a stream
+of unknown length would have been shorter and would have quietly moved every
+response on the server to chunked transfer-encoding in order to add a `Drop`.
+Verified: a metered tenant's JSON response still carries `Content-Length`.
+
+**Tokens are charged at the one point a generation ends** — where
+`StreamEvent::Done` is constructed — rather than at each endpoint's `usage`.
+There are seven places that compute `usage` and one place a generation
+finishes, so charging at the end accounts for every generating endpoint,
+including any added later, without anyone remembering to. The charge lands
+*before* the `Done` event, so a client that reads `usage` and immediately fires
+its next request cannot arrive ahead of its own bill. Embeddings do not go
+through that path and are charged per input in the two handlers that call
+`pooled_embedding`.
+
+**A token budget is checked against tokens already spent**, so the request in
+flight can overshoot it by its own length. Unavoidable rather than sloppy: what
+a generation will cost is not known until it stops, and refusing on a guess
+would refuse requests that fit. The overshoot is bounded by `max_tokens` and
+repaid out of the next minute — stated as its own test, because it is the
+behaviour a reader would otherwise call a bug.
+
+**Only the endpoints that run the model are metered.** Metering `/metrics` or
+`/props` would be wrong in both directions: a monitoring scrape holding a
+tenant key would spend a generation budget on nothing, and
+`requests_per_minute = 60` would come to mean "sixty seconds of Prometheus, and
+no inference at all". `every_endpoint_that_runs_the_model_is_metered` asserts
+the list both ways, because an endpoint added later and left off it would be
+unlimited silently.
+
+**Ambiguous keys are a startup error**, not a first-match win: two tenants
+sharing a token, or a tenant sharing `[orangu-server].api_key`, would attribute
+every limit and every usage figure to whichever the lookup happened to reach,
+which is not a policy but a coin flip that looks like one. Resolution scans
+every entry with no early exit and compares each in constant time.
+
+`/metrics` reports per-tenant requests, tokens, in-flight count, window totals,
+refusals by limit, and the configured bounds. `denied_total` matters more than
+it looks: from the server's side a limit that is quietly refusing requests
+looks exactly like one that is never reached — both are a tenant with nothing
+in flight — and the difference is the whole of whether the number was set
+right.
 
 ### Durable slot persistence (`engine::slot_store`)
 
@@ -1524,6 +2150,32 @@ request that ran on it, and
   path (and the same `CachedPrefill::reusable_prefix_len` committed-length and
   recurrent-state rules) as the prefix pool, instead of re-prefilling.
 
+Prefix reuse from the cross-request pool **moves** the source's buffers rather
+than copying them. `PrefixCache::take_best_match` removes the entry it returns,
+so the request owns it outright and nothing else can still be reading it;
+`KvCache::adopt_prefix` trims the source to the reused length and takes its
+layer buffers, keeping this request's own capacity, `kv_dim` and stride. On a
+2001-token conversational prefix that is **0.26 ms against 18.1 ms** for the
+copy it replaced, and it removes the transient doubling of the prefix's
+resident footprint at the moment the source was about to be dropped. The host
+buffers grow with the committed length instead of being pre-filled to the
+context ceiling, which is what makes the move possible.
+
+`engine::slot_store` still copies, and the asymmetry is deliberate: it retains
+its snapshot for the same slot's *next* request, so it does not own the source
+and cannot move out of it. Both paths go on sharing
+`CachedPrefill::reusable_prefix_len`, so the matching rules stay
+single-sourced even though the transfer differs.
+
+A committed length is a **token** count, and on a block-compressed slot that is
+not its row count — one row stands for `stride` tokens. `KvCache::committed_len`
+converts through the stride, and `reusable_prefix_len` calls it rather than
+recomputing the maximum inline, which is what it used to do. Both readings gave
+the same answer on every architecture built so far, because `deepseek4` is the
+only one that strides and it always carries ordinary per-token slots that are
+longer — a coincidence of the current models rather than a rule, and exactly
+the sort that a change to how rows are allocated would remove silently.
+
 This is what survives the cases the RAM pool cannot: eviction under cache
 pressure, a server restart, and — most relevant behind `orangu-coordinator` —
 a model swap that tears the server down. The client saves a tab's slot
@@ -1532,7 +2184,12 @@ the still-active server and lands on disk; the later restore repopulates a
 freshly (re)started server.
 
 `<fingerprint>` is a SHA-256 of the architecture, the model label, and the KV
-structure tag (layer count, per-layer `kv_dim`, recurrent specs). A snapshot
+structure tag (layer count, per-layer `kv_dim` **and stride**, recurrent
+specs). The stride was missing until it was audited for: two caches differing
+only in how many token positions one row stands for laid their rows out
+differently and shared a signature, which the model label hashed alongside
+happened to mask — a signature that is right only because something else is
+also checked is not one worth relying on. A snapshot
 saved for one model therefore resolves to a different directory than any other
 model's, and every file also carries the fingerprint internally — a mismatched
 or corrupt file is treated as "nothing to restore" (`n_restored: 0`, a normal
@@ -1669,17 +2326,59 @@ Each backend's `try_init()` (no index) still exists but is now `#[cfg(test)]`:
 tests want a device and don't care which, while the server proper always
 goes through enumerate → select → report → `try_init_selected`.
 
+### The KV mirror grows with the sequence
+
+`LayerCache::sync_gpu` allocates the GPU-side mirror for the rows in use,
+doubling from a 256-row floor and capped at the layer's capacity. It used to
+allocate the whole capacity — which is `prompt + max_tokens` — on first use, so
+a request that asked for a large budget reserved it in VRAM whether or not it
+generated anything. On a 3.98 GiB card, the same two-token prompt and one-word
+answer took 2191 MiB at `max_tokens = 64` and **3727 MiB** at 32768; it is now
+flat at ~2185 MiB across both.
+
+Host buffers never had this problem and were not changed: a large zeroed `Vec`
+is `mmap`ed, and the kernel commits pages only as they are written — two
+gigabytes of `vec![0.0f32; ..]` adds no resident memory at all. Device memory
+is not overcommitted, which is why the same over-reservation that costs nothing
+on the host costs the whole card on the GPU.
+
+Growth copies the rows already on the device across with
+`copy_buffer_to_buffer` rather than re-uploading them, so a doubling costs
+device-local bandwidth instead of putting the whole cache back over the bus;
+`synced_len` carries over unchanged. Cached attention bind groups name the old
+buffer, so they are dropped on growth and rebuilt through the caller's existing
+cache-miss path.
+
+**The mirror is sized to `len + 1`, and that is load-bearing.** The fused
+decode path binds these buffers and then writes the current token's key and
+value at row `len`, *before* the host-side `push` that commits it. Sizing to
+exactly `len` puts that write one row past the end of the k region — and
+because k and v are two sub-ranges of a single buffer, it lands on row 0 of v
+rather than outside the allocation, so no validation fires and the corruption
+is silent. Reserving the full capacity hid this indefinitely; it appeared one
+growth step after demand-sizing landed, as an overrun on the grow-copy.
+
 ### Device footprint
 
 `engine::footprint::DeviceFootprint` measures the loaded model against the
 chosen device, at startup, and prints it under the inventory.
 
-- **Weights** come from `LoadedModel::tensor_sizes` split by
+- **Weights** come from `LoadedModel::resident_tensor_sizes` split by
   `engine::backend::device_resident_split`, which reuses the same
   `is_cpu_only_tensor` predicate the startup type check uses. That is what
   keeps a MoE model's routed experts — which have no GPU path at all —
   from being charged against VRAM: a 20.6 GiB Qwen3.6-35B-A3B reports
   2.26 GiB on device and 18.35 GiB in host memory.
+- `resident_tensor_sizes` rather than `tensor_sizes`, and the difference is
+  the trailing multi-token-prediction block. Its tensors are mapped like any
+  other and the forward pass never reaches one, so counting them inflated
+  every device figure by the draft head: `Qwen3.8-27B-Q6_K` reported
+  `weights 21.30 GiB on device` where `plan` — which had excluded the draft
+  head from the start — said 21.0 GiB, and the two now agree at 20.97 GiB.
+  `device_resident_split`'s own doc comment justified the loose bound with
+  "every layer of a served model is reached by the first token", which is
+  true of every layer except this one. `tensor_sizes` is unchanged and still
+  reports what the *file* holds; memory questions ask the other one.
 - **KV** comes from `KvCache::gpu_mirror_bytes`, called on a
   `new_kv_cache(1)` probe. The per-layer `kv_dim`/`stride` is fixed model
   geometry, so a one-token cache — which `main` already builds for the
@@ -2096,8 +2795,17 @@ target.
 The Vulkan backend reads these environment variables at startup to select
 between alternative compute kernels. Each is read once when the backend
 initializes; changing one takes effect on the next server start. All are
-correctness-verified against `CpuBackend`. Values are checked for presence
-only (set to `1`), except where noted.
+correctness-verified against `CpuBackend`.
+
+**Boolean flags read `0`, `false`, `no`, `off` and the empty string as OFF**,
+and anything else as on — `engine::env::flag_on`, which every one of them goes
+through. That matters because these knobs exist to be swept: they were
+previously read for *presence*, so `FLAG=0` switched the feature **on** and a
+sweep of `0,1` ran it on both arms, reporting the difference between a thing
+and itself. The handful of variables that carry a *value* rather than a
+boolean — `ORANGU_NORM_WG`, `ORANGU_COOP_GEOM`, `ORANGU_DUMP_SHADERS`,
+`ORANGU_EXPERT_USAGE`, `ORANGU_PREFIX_CACHE_DIR` — are still presence-checked
+or parsed, and are noted as such where they appear.
 
 | Variable | Default | Effect |
 | :-- | :-- | :-- |
@@ -2114,13 +2822,15 @@ only (set to `1`), except where noted.
 | `ORANGU_ATTN_SPLIT_K` | `8` (must be a power of two, `1..=32`) | Split-k factor for decode attention: how many workgroups each query head's KV-position range is split across (`n_head × k_num` phase-1 workgroups, merged by a phase-2 pass). Each head attends a KV range that *grows with context*, so more splits expose more parallelism the longer a generation runs, at the cost of more phase-2 merge overhead when the range is short. Raised from `4` to `8` after re-sweeping in the full decode chain at real context lengths (the earlier sweep was on the isolated dispatch at short context): on real `E2B`/`RX 5500M`, `k_num=8` cut per-token GPU time at ~245 tokens of context from 35.6 to 32.4 ms while staying neutral at short context, and had the best end-to-end throughput of `{4,8,16}`; `16` wins only once context is very long. Byte-identical output across values. Workloads dominated by very long contexts may prefer `16`. Pure runtime uniform — no shader rebuild. |
 | `ORANGU_PACKED_DOT` | unset (off) | Dequantizes `Q4_K` weight elements in pairs and accumulates the dot product as `vec2<f16>` instead of two scalar `f32` multiplies. Requires an adapter with WGSL `f16` support. When set together with the block-unroll, selects the combined unroll+packed `Q4_K` decode kernel. |
 | `ORANGU_WIDE_LOAD` | unset (off) | Binds the weight buffer as `array<vec4<u32>>` (16-byte reads) instead of `array<u32>` (byte-wise reads), consolidating each `Q4_K`/`Q5_K` block header into one 16-byte read. Covers all supported quant types. |
-| `ORANGU_NO_KV_F16` | unset (`f16` **on** when the adapter supports it) | Set to **disable** storing the per-request KV-cache GPU mirror as `f16` and fall back to `f32`. `f16` (the default on an adapter with WGSL `f16` support) halves KV-read memory traffic per attention dispatch, with a per-write cast, and matches the ecosystem's default KV cache type. |
-| `ORANGU_KV_Q8_0` | unset (off) | Set to store the per-request KV-cache GPU mirror as `q8_0` (8-bit block-quantized) instead of `f16`, dequantized inline in the attention shader. Halves KV-read bytes again vs `f16`, directly cutting attention's cost at long context — measured **−32%** attention GPU time at ~295 tokens on real `E2B`/`RX 5500M` (5.87 → 3.99 ms), the saving growing with context, at a slight cost at short context (per-write quantize overhead). Takes precedence over `f16`. **Lossy** (unlike `f16`), so off by default; the recommended lever for long-context / long-generation workloads, where per-token decode slows as the KV cache grows. |
+| `ORANGU_NO_KV_F16` | unset (`f16` **on** when the adapter supports it) | `1` **disables** storing the per-request KV-cache GPU mirror as `f16` and fall back to `f32`. `f16` (the default on an adapter with WGSL `f16` support) halves KV-read memory traffic per attention dispatch, with a per-write cast, and matches the ecosystem's default KV cache type. |
+| `ORANGU_KV_Q8_0` | unset (off) | `1` stores the per-request KV-cache GPU mirror as `q8_0` (8-bit block-quantized) instead of `f16`, dequantized inline in the attention shader. Halves KV-read bytes again vs `f16`, directly cutting attention's cost at long context — measured **−32%** attention GPU time at ~295 tokens on real `E2B`/`RX 5500M` (5.87 → 3.99 ms), the saving growing with context, at a slight cost at short context (per-write quantize overhead). Takes precedence over `f16`. **Lossy** (unlike `f16`), so off by default; the recommended lever for long-context / long-generation workloads, where per-token decode slows as the KV cache grows. Superseded by `[orangu-server].kv_cache`, which names every value rather than one; kept because existing repro lines and sweeps use it. |
+| `ORANGU_KV_CACHE` | unset (the config file's `kv_cache`) | `f16`, `q8_0` or `f32` — the same three values `[orangu-server].kv_cache` takes, overriding it for one run. The variable a sweep should use: it is the only one that can name all three arms, so a sweep does not have to express "not the other one". |
 | `ORANGU_NO_TILED_PREFILL` | unset (tiled prefill **on**) | Set to **disable** the `16×64`-output-tile GEMM for prefill (`n_tokens >= 64`) and fall back to the plain cooperative kernel (one workgroup per output row, looping over the whole prompt internally) — measured on real hardware to drive real requests into GPU-driver hangs at ordinary prompt lengths (~170-450 tokens) and, even where both complete, ~10x slower. Not recommended; kept for A/B comparison. |
 | `ORANGU_COOP_MIN_TOKENS` | `64` (integer, `>= 1`) | The token count at or above which a matmul takes the weight-amortizing tiled-GEMM path instead of the reduce family. The reduce kernels dispatch `n_row_groups × n_tokens` workgroups, so **each token re-streams the whole weight matrix** (their cost grows with `n_tokens`); the tiled kernel loads a `16×in_dim` weight tile into shared memory once and reuses it across a `64`-wide token tile (cost ~flat in `n_tokens`). Below the threshold the per-token re-stream is cheaper because it keeps far more wavefronts in flight to hide this GPU's weight-load latency. Lowering it to route the "missing middle" (K ≈ 2…63, e.g. speculative or small-chunk prefill) onto the tiled path was measured **slower on `RX 5500M`** (this matmul is latency-bound, not bandwidth-bound — see `SERVER_ROADMAP.md` Step 13), so the default keeps that split at `64`; exposed as a knob for GPUs where the crossover sits lower and as the A/B harness for a future small-K kernel. `1` forces every matmul tiled; a value past the longest batch keeps everything on the reduce path. |
 | `ORANGU_NO_GPU_SAMPLE` | unset (GPU sampling **on**) | Set to **disable** running greedy (temperature-0) argmax sampling with repeat penalty on the GPU in the same submission as the forward pass (reading back one token id instead of the full `[n_vocab]` logits vector) and fall back to a CPU-side readback + sample. |
 | `ORANGU_DECODE_CHUNKS` | `7` (integer, not a presence flag) | How many `queue.submit()` calls one decode step's layer loop is split across. `1` records the whole token and submits once (the historical behaviour); `> 1` submits the first `chunks - 1` groups of layers as soon as they are recorded, so the GPU starts executing them while the CPU is still recording and validating the later ones — overlapping the CPU-side submission cost with GPU execution instead of serialising it. Clamped to `1..=n_layers`. On real `E2B`/`RX 5500M` this raised decode throughput from 14.4 tok/s (`1`) to 18.8 tok/s (`7`, the default), with byte-identical output; `35` (one submit per layer) reaches 19.4 tok/s but adds per-submission overhead for a marginal gain. |
 | `ORANGU_BATCH_DECODE` | unset (off) | Fuses the matmul steps of concurrent requests that submit a decode step within a short window into one batched call (attention/RoPE/KV-write stay per-sequence). Only takes effect when `slots > 1`. |
+| `ORANGU_BATCH_WAIT_MS` | `4` | How long a fused-decode collection window stays open. Only meaningful with `ORANGU_BATCH_DECODE`. Raising it is the only way batches actually form — at 32 concurrent streams the 4 ms default gives a mean batch of 2.2 and 400 ms gives 27 — but aggregate throughput falls monotonically as it rises (65 → 42.75 tok/s), because every sequence pays the wait on every token. The mean batch size achieved is reported as `batch.mean_batch` on `/moe-stats`; a batching measurement cannot be read without it. |
 | `ORANGU_PREFILL_FUSED_ATTN` | unset (**off**) | Set to **enable** running a prefill layer's whole pre-attention half as one submission — the Q/K/V projections, the per-head Q/K norms, RoPE, V's weightless norm, the KV-cache write for the whole batch, and attention itself — and fall back to the step-by-step path (projections read back to the CPU, norms and RoPE on the CPU, a per-token cache push, then a separate attention dispatch). The fused path keeps everything between the projections and attention in GPU memory, so nothing but attention's output and the K/V rows for the host mirror crosses the bus. Correctness-verified against the step-by-step path, but currently **slower**: re-measured against correct output it loses ~10% at a 158-token prompt and is a wash at 1120. Off until the transfers it removes pay for the work it adds. Automatically declined (with the same fallback) under `ORANGU_Q4K_MMVQ` and for a non-causal batch longer than one submission chunk. |
 | `ORANGU_PREFILL_ATTN` | unset (off) | Set to run the **standalone** prefill attention dispatch where the fused path above declines, instead of the CPU attention loop. Unlike the fused path this pays a Q upload and an attention-output readback per layer, which the CPU loop does not, so it wins only at long prompts. A measurement aid rather than a recommended setting. |
 | `ORANGU_NO_PREFILL_GQA` | unset (GQA sharing **on**) | Set to **disable** sharing each KV head's reads across the query heads that use it in the prefill attention kernel, falling back to one workgroup per `(head, query)`. Only affects models whose `n_head` exceeds `n_head_kv`. |
@@ -2129,7 +2839,7 @@ only (set to `1`), except where noted.
 | `ORANGU_DUMP_SHADERS` | unset (a directory path) | Set to a directory to write the generated WGSL of the decode-path kernels (Q4_K/Q6_K matmul-vec, RMSNorm, split-attention) into it as `.wgsl` files at startup, then continue normally. A profiling aid: pair it with the driver's own `RADV_DEBUG=shaders,shaderstats` (which dumps the compiled ACO ISA and register/occupancy stats for this GPU), or hand the WGSL to an offline analyzer such as Radeon GPU Analyzer on an RDNA3+ machine. No effect on the computation. |
 | `ORANGU_SPECULATIVE` | unset (off) | Enables prompt-lookup speculative decoding: each step drafts the next few tokens by matching recent output against an earlier point in the context and verifies the whole draft in one forward, so the weights stream once for several tokens. Greedy-only (the output is identical to non-speculative greedy decoding); ignored for non-greedy sampling and for multi-slot batched decode. **Currently slower on this GPU** — see `SERVER_ROADMAP.md` Step 12 — because the multi-token verify runs the CPU-orchestrated forward; kept for hardware/paths where a resident multi-position forward makes it a win. Off by default. |
 | `ORANGU_SPEC_NGRAM` | `2` | With `ORANGU_SPECULATIVE`, how many trailing tokens must match an earlier point in the context to trigger a draft. Lower drafts more often (more speculative work, more misses); higher drafts only on a longer exact echo. |
-| `ORANGU_SPEC_DRAFT` | `4` | With `ORANGU_SPECULATIVE`, how many tokens to draft (and verify in one forward) once a match is found. The ceiling on tokens a single accepted step can produce. |
+| `ORANGU_SPEC_DRAFT` | `4` | How many tokens to draft (and verify in one forward) once a match is found. The ceiling on tokens a single accepted step can produce. Also overrides `[orangu-server].draft_tokens` for a run using a draft *model*, so a sweep of drafting depth reads the same whichever drafter is in play. |
 | `ORANGU_GPU_TIMESTAMPS` | unset (off) | Logs a per-decode-step GPU timing breakdown to stderr — the per-layer-embedding (PLE) projection, the sum/average/slowest across all model layers, and the output-norm-plus-`lm_head` tail, in milliseconds. Also logs a `[gpu-op-breakdown]` line splitting each token into **qkv-side** (Q/K/V matmuls + norm/RoPE + KV write), **attention** (split-k), and **ffn-side** (wo/gate/up/down matmuls + their norms + GELU/mul + PLE + copies) — so matmul vs attention vs overhead is measured, not estimated. Requires an adapter with `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_ENCODERS`; a diagnostic, no effect on the computation. **Unavailable on a split model**: a query set belongs to one device and a split resolves none, so `GET /gpu-timings` answers `{"enabled": false, "timings": null, "unavailable": "split"}` — the reason is named rather than left as an empty result, since a client that reports nothing when it receives nothing makes a split run look like one whose GPU stages cost nothing. `--flamegraph` still profiles the CPU side. |
 
 Shader compilation is cached to disk across restarts

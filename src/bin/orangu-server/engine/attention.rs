@@ -191,7 +191,7 @@ pub fn attention_decode_on_device(
     params: &Params<'_>,
     window: impl Fn(usize) -> (usize, usize) + Sync,
 ) -> Option<wgpu::Buffer> {
-    if params.n_tokens != 1 || std::env::var_os("ORANGU_NO_ATTN_ON_DEVICE").is_some() {
+    if params.n_tokens != 1 || crate::engine::env::flag_on("ORANGU_NO_ATTN_ON_DEVICE") {
         return None;
     }
     // The same guard `attention` applies, so the two cannot disagree about the

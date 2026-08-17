@@ -89,6 +89,14 @@ impl GenerateStats {
 pub struct GenerateRequest {
     pub prompt_tokens: Vec<u32>,
     pub sampling: SamplingParams,
+    /// Constrain the output to valid JSON — OpenAI's
+    /// `response_format: {"type": "json_object"}`.
+    ///
+    /// Not a sampler parameter, because it is not a knob on the distribution:
+    /// it decides which tokens *exist* at each step rather than how likely
+    /// they are, and it needs the tokenizer, which `SamplingParams` has no
+    /// business knowing about.
+    pub json_output: bool,
     pub max_tokens: usize,
     pub stop_token_ids: Vec<u32>,
     /// Whether this request may reuse an already-computed KV cache for
@@ -117,6 +125,15 @@ pub struct GenerateRequest {
     /// channel message per token, which is nothing next to a forward pass but
     /// is pure waste for a caller that never reads it.
     pub timings_per_token: bool,
+    /// Who to charge this request's tokens to, or `None` for a request with no
+    /// tenant — an open server, the operator's own key, or the web console.
+    ///
+    /// Carried on the request rather than charged by each endpoint from the
+    /// `usage` it already computes, because there are seven places that
+    /// compute `usage` and exactly one place a generation ends. Charging at
+    /// the end means every generating endpoint — including any added later —
+    /// is accounted for without anyone remembering to account for it.
+    pub charge: Option<Arc<crate::tenant::TenantMeter>>,
 }
 
 impl Default for GenerateRequest {
@@ -124,17 +141,28 @@ impl Default for GenerateRequest {
         Self {
             prompt_tokens: Vec::new(),
             sampling: SamplingParams::default(),
+            json_output: false,
             max_tokens: 0,
             stop_token_ids: Vec::new(),
             cache_prompt: true,
             id_slot: None,
             timings_per_token: false,
+            charge: None,
         }
     }
 }
 
 pub enum StreamEvent {
     Token(String),
+    /// The admission queue was full, so this request was refused before it
+    /// ever reached a slot.
+    ///
+    /// Its own event rather than an `Error`, because the two mean different
+    /// things to a caller: an error is a request that cannot be served, and
+    /// this is one that could be served later. It becomes a `503` with
+    /// `Retry-After`, which a client can act on, where a `500` invites a
+    /// bug report.
+    Overloaded,
     /// Emitted after each prefill chunk, while the prompt is still being
     /// processed. Until this existed the only progress report was the `Done`
     /// event at the very end, so a client had nothing to show during the part
@@ -159,8 +187,37 @@ pub enum StreamEvent {
     Error(String),
 }
 
+/// A second, smaller model used to draft tokens the served model then
+/// verifies — `[orangu-server].draft_model`.
+///
+/// Held whole rather than as a bare `Arc<dyn ModelForward>` because the two
+/// things a speculative step needs beyond the forward pass — how many tokens
+/// to draft, and what to call the pair in a log line — have nowhere else to
+/// live that both the request path and the startup banner can reach.
+pub struct DraftModel {
+    pub model: Arc<dyn ModelForward>,
+    /// How many tokens to draft per verification. See
+    /// `[orangu-server].draft_tokens`.
+    pub tokens: usize,
+    /// The draft's own model label, for the banner and the acceptance log.
+    pub label: String,
+}
+
 pub struct Engine {
     pub model: Arc<dyn ModelForward>,
+    /// The draft half of a speculative pair, when one is configured.
+    ///
+    /// `None` — the default — leaves decoding exactly as it was.
+    ///
+    /// **Both** models must implement `ModelForward::forward_all_logits`, not
+    /// only the target. The target obviously needs it — verification is one
+    /// multi-position forward — but so does the draft, for a less obvious
+    /// reason: it is the only entry point that keeps the KV rows on the host,
+    /// and a draft cache is rolled back and re-read on every single step. A
+    /// draft running through the single-token `forward` would take the fused
+    /// GPU decode path instead, whose rows exist only on the device. See
+    /// [`draft_forward`].
+    pub draft: Option<Arc<DraftModel>>,
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template_source: Option<String>,
     pub slots: Arc<SlotPool>,
@@ -236,6 +293,12 @@ pub struct Engine {
     /// sampling parameters, generation-endpoint gating, and (`Review`
     /// only) reasoning suppression. See `config::Role`'s own doc comment.
     pub role: crate::config::Role,
+    /// Latency distributions and totals for `/metrics` — see
+    /// `engine::metrics`. Always present: an unscraped deployment pays a
+    /// handful of relaxed atomic adds per request and one per token, which is
+    /// nothing beside a forward pass, and a metric that only exists when
+    /// something is configured is one nobody can ask for after the fact.
+    pub metrics: Arc<super::metrics::ServerMetrics>,
 }
 
 /// What a caught generation panic is reported to the caller as: the panic's
@@ -278,6 +341,7 @@ impl Engine {
         let model = self.model.clone();
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
+        let draft = self.draft.clone();
         let batch_coordinator = self.batch_coordinator.clone();
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
@@ -286,13 +350,39 @@ impl Engine {
         // reasoning decision is made (`Role::enable_thinking`, which the
         // HTTP layers pass to the chat template).
         let role = self.role;
+        let metrics = self.metrics.clone();
+        // Before the spawn, not inside it: what an operator means by "how long
+        // did this request take" starts when the request arrives, and a task
+        // that has not been scheduled yet is already waiting.
+        let arrived = Instant::now();
 
         let id_slot = req.id_slot;
         tokio::spawn(async move {
             let guard = match id_slot {
+                // A pinned request is waiting for one specific slot's warm
+                // cache and is not competing for admission, so the queue limit
+                // does not apply to it — the same reason it bypasses the
+                // ticket queue entirely.
                 Some(index) => slots.acquire_slot(index).await,
-                None => slots.acquire().await,
+                None => match slots.try_acquire().await {
+                    Some(guard) => guard,
+                    None => {
+                        // Refused, not queued. The caller gets an answer in
+                        // microseconds instead of joining a pile — see
+                        // `SlotPool::with_queue_limit`.
+                        metrics.observe_refusal();
+                        let _ = tx.send(StreamEvent::Overloaded);
+                        return;
+                    }
+                },
             };
+            // Only for a request that actually queued. A pinned request waits
+            // for one named slot's warm cache rather than for capacity, so
+            // folding its wait in here would make cache affinity read as
+            // server overload.
+            if id_slot.is_none() {
+                metrics.observe_queue_wait(arrived.elapsed());
+            }
             let task_tx = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // `catch_unwind` here (not left to `spawn_blocking`'s own
@@ -309,12 +399,15 @@ impl Engine {
                     run(
                         model.as_ref(),
                         tokenizer.as_ref(),
+                        draft.as_deref(),
                         batch_coordinator.as_deref(),
                         prefix_cache.as_deref(),
                         slot_store.as_deref(),
                         &guard,
                         req,
                         role,
+                        &metrics,
+                        arrived,
                         task_tx.clone(),
                     )
                 }));
@@ -344,18 +437,68 @@ impl Engine {
     }
 }
 
+/// Records exactly one outcome for a request, however it leaves [`run`].
+///
+/// A `Drop` rather than a call at each exit, because `run` has five places
+/// that report an error and return, one that returns on a client disconnect,
+/// and a `catch_unwind` above it that turns a panic into a reply — and an
+/// outcome counter with a path that forgets to increment it is worse than no
+/// counter, since the total silently stops matching the request count.
+/// Defaulting to `Error` and being told otherwise means a new failure path is
+/// counted correctly without anyone noticing it needed to be.
+struct OutcomeGuard<'a> {
+    metrics: &'a super::metrics::ServerMetrics,
+    arrived: Instant,
+    /// `None` until something says how this ended.
+    finished: Option<(super::metrics::Outcome, usize, usize, usize)>,
+}
+
+impl OutcomeGuard<'_> {
+    fn finish(
+        &mut self,
+        outcome: super::metrics::Outcome,
+        prompt: usize,
+        cached: usize,
+        generated: usize,
+    ) {
+        self.finished = Some((outcome, prompt, cached, generated));
+    }
+}
+
+impl Drop for OutcomeGuard<'_> {
+    fn drop(&mut self) {
+        // A request that failed contributes to the error counter but not to
+        // the token totals: those count work *delivered*, and a rate taken
+        // over them should not move because something broke.
+        let (outcome, prompt, cached, generated) =
+            self.finished
+                .take()
+                .unwrap_or((super::metrics::Outcome::Error, 0, 0, 0));
+        self.metrics
+            .observe_request(self.arrived.elapsed(), outcome, prompt, cached, generated);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     model: &dyn ModelForward,
     tokenizer: &Tokenizer,
+    draft: Option<&DraftModel>,
     batch_coordinator: Option<&BatchCoordinator>,
     prefix_cache: Option<&PrefixCache>,
     slot_store: Option<&super::slot_store::SlotStore>,
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
     role: crate::config::Role,
+    metrics: &super::metrics::ServerMetrics,
+    arrived: Instant,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<()> {
+    let mut outcome = OutcomeGuard {
+        metrics,
+        arrived,
+        finished: None,
+    };
     let config = model.config();
     let capacity = (req.prompt_tokens.len() + req.max_tokens).min(config.n_ctx_train.max(1));
     if req.prompt_tokens.len() > capacity {
@@ -391,7 +534,11 @@ fn run(
     {
         let matched = matched.min(req.prompt_tokens.len().saturating_sub(1));
         if matched > 0 {
-            new_cache.copy_prefix_from(&entry.cache, matched);
+            // Moved, not copied: `take_best_match` removed this entry from the
+            // pool, so nothing else can still be reading it and its buffers
+            // can become this request's own. The slot store below cannot do
+            // the same — it keeps its snapshot for the slot's next request.
+            new_cache.adopt_prefix(entry.cache, matched);
             reused_len = matched;
         }
     }
@@ -413,6 +560,15 @@ fn run(
     // cost (this is never actually `None` except mid-swap).
     let mut cache = Some(new_cache);
     let mut sampler = Sampler::new(req.sampling);
+    if req.json_output {
+        // The byte table is built on the tokenizer's first constrained
+        // request and shared from then on, so an unconstrained deployment
+        // never pays for it.
+        sampler = sampler.with_constraint(crate::engine::sampling::Constraint::json(
+            tokenizer.token_bytes_shared(),
+            req.stop_token_ids.clone(),
+        ));
+    }
     let mut history = req.prompt_tokens.clone();
 
     let prompt_start = Instant::now();
@@ -460,15 +616,40 @@ fn run(
     let finish_reason;
     let mut last_report = Instant::now();
     let mut reported = false;
-    // Prompt-lookup speculative decoding (opt-in, greedy-only, single-slot).
-    // `spec_buf` holds tokens a speculative step already verified and committed
-    // to the KV cache, waiting to be emitted before the next forward.
-    let speculative =
-        speculative_config().filter(|_| sampler.is_greedy() && batch_coordinator.is_none());
+    // Speculative decoding, greedy-only, and not while fused batching is
+    // running the decode step. `spec_buf` holds tokens a speculative step
+    // already verified and committed to the KV cache, waiting to be emitted
+    // before the next forward.
+    //
+    // Not under a constraint: speculation drafts several tokens and accepts
+    // them where they match what greedy decoding *would* have produced, and
+    // greedy decoding knows nothing about the grammar. A drafted token the
+    // constraint forbids would be accepted on that comparison alone.
+    let may_speculate =
+        sampler.is_greedy() && !sampler.is_constrained() && batch_coordinator.is_none();
+    // A configured draft model wins over prompt-lookup rather than being
+    // combined with it. Both are guesses at the same tokens, and running the
+    // free one first would only turn its misses into a second, wasted
+    // verification forward — the drafter that is always available is the one
+    // worth having when there is one.
+    let mut drafter = match (may_speculate, draft, speculative_config()) {
+        (false, _, _) => None,
+        (true, Some(draft), _) => Some(Drafter::Model {
+            model: draft.model.as_ref(),
+            tokens: draft.tokens,
+            cache: draft.model.new_kv_cache(capacity),
+            committed: 0,
+        }),
+        (true, None, Some((ngram, max_draft))) => Some(Drafter::PromptLookup { ngram, max_draft }),
+        (true, None, None) => None,
+    };
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
     let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
+    // When the previous token was produced, so the gap to the next one can be
+    // observed. `None` until there is a previous one to measure from.
+    let mut last_token_at: Option<Instant> = None;
     loop {
         if generated >= req.max_tokens {
             finish_reason = FinishReason::Length;
@@ -481,6 +662,21 @@ fn run(
         history.push(next);
         generated += 1;
         guard.set_generated_tokens(generated);
+        // Time to first token counts from arrival, so it carries the queue
+        // wait and the prefill together — which is what an interactive caller
+        // actually waits through. Every later token contributes a gap.
+        //
+        // The first token *produced*, not the first the client sees: a chat
+        // format's structural prefix is filtered out of the stream
+        // (`MessageHeader`), and charging the template's shape to the
+        // server's latency would make two models with the same speed report
+        // different numbers.
+        let now = Instant::now();
+        match last_token_at {
+            None => metrics.observe_first_token(now.duration_since(arrived)),
+            Some(previous) => metrics.observe_inter_token(now.duration_since(previous)),
+        }
+        last_token_at = Some(now);
         // Structural tokens (a chat format's turn/channel/tool markers, and
         // any stray BOS/EOS) still go into `history` so the KV cache and any
         // continued generation stay correct, but are not rendered to the
@@ -511,10 +707,31 @@ fn run(
             // while it is a message body the role hides.
             header.observe_text(tokenizer.decode(&[next]))
         };
-        if let Some(text) = emitted
-            && tx.send(StreamEvent::Token(text)).is_err()
-        {
-            // Receiver dropped (client disconnected) — stop generating.
+        if let Some(text) = emitted {
+            let _ = tx.send(StreamEvent::Token(text));
+        }
+        // Whether anyone is still listening, asked **every token** rather than
+        // only when there was text to send.
+        //
+        // The check used to ride on the send, which meant a token rendering to
+        // nothing never made it. That is not a rare case: a chat format's
+        // structural markers are suppressed, and a whole reasoning body is
+        // suppressed under `--review`, so a request could generate to
+        // `max_tokens` — holding the slot every other request is queued for —
+        // for a client that hung up at the first token. Measured on a model
+        // whose output was almost entirely suppressed: a disconnected 2000-token
+        // request ran to completion; on one with visible text the same request
+        // stopped within a token.
+        //
+        // Its own outcome, not an error: nothing went wrong, and the tokens
+        // generated so far were real work a rate should see.
+        if tx.is_closed() {
+            outcome.finish(
+                super::metrics::Outcome::Cancelled,
+                req.prompt_tokens.len(),
+                reused_len,
+                generated,
+            );
             return Ok(());
         }
         // Not after the first token: it was sampled from the prefill's own
@@ -571,10 +788,10 @@ fn run(
             // A token an earlier speculative step already verified and
             // committed to the KV cache — emit it without another forward.
             tok
-        } else if let Some((ngram, max_draft)) = speculative {
-            // Draft a continuation from the context and verify it in one
-            // multi-position forward; returns the model's own next token (any
-            // further accepted tokens are queued in `spec_buf`).
+        } else if let Some(drafter) = drafter.as_mut() {
+            // Draft a continuation and verify it in one multi-position
+            // forward; returns the model's own next token (any further
+            // accepted tokens are queued in `spec_buf`).
             match speculative_next(
                 model,
                 cache
@@ -584,8 +801,8 @@ fn run(
                 &history,
                 next,
                 start_pos,
-                ngram,
-                max_draft,
+                capacity,
+                drafter,
                 guard.id(),
                 &mut spec_buf,
                 &mut spec_accepted,
@@ -608,9 +825,11 @@ fn run(
                     .expect("cache is always Some between iterations"),
                 token: next,
                 start_pos,
-                greedy_sample: sampler.is_greedy().then(|| OwnedGreedySample {
-                    recent_tokens: history[recent_start..].to_vec(),
-                    repeat_penalty: sampler.repeat_penalty(),
+                greedy_sample: (sampler.is_greedy() && !sampler.is_constrained()).then(|| {
+                    OwnedGreedySample {
+                        recent_tokens: history[recent_start..].to_vec(),
+                        repeat_penalty: sampler.repeat_penalty(),
+                    }
                 }),
                 slot_id: guard.id(),
             };
@@ -625,10 +844,15 @@ fn run(
                 }
             }
         } else {
-            let greedy_sample = sampler.is_greedy().then(|| GreedySampleParams {
-                recent_tokens: &history[recent_start..],
-                repeat_penalty: sampler.repeat_penalty(),
-            });
+            // The device-side argmax picks a token without ever consulting
+            // the grammar, so a constrained request has to come back to the
+            // CPU sampler for every step. It costs the fast path; the
+            // alternative is a constraint that silently does not apply.
+            let greedy_sample =
+                (sampler.is_greedy() && !sampler.is_constrained()).then(|| GreedySampleParams {
+                    recent_tokens: &history[recent_start..],
+                    repeat_penalty: sampler.repeat_penalty(),
+                });
             // GPU submissions for this one decode step. `gemma.rs` had this
             // instrumentation privately; it belongs here, because the number it
             // reports is *the* difference between the two decode paths and
@@ -674,9 +898,14 @@ fn run(
         // Draft acceptance: `spec_accepted` drafted tokens confirmed across
         // `spec_steps` forwards, i.e. this many extra tokens produced beyond the
         // one each forward always yields — the whole payoff of speculation.
+        // The drafter is named because the two have completely different cost
+        // profiles: prompt-lookup's misses are free, a draft model's are a
+        // forward pass each, so the same acceptance figure is a win for one
+        // and a loss for the other.
         eprintln!(
-            "orangu-server: [speculative] {spec_accepted} drafted tokens accepted over \
+            "orangu-server: [speculative/{}] {spec_accepted} drafted tokens accepted over \
              {spec_steps} steps ({:.2} extra tokens/forward)",
+            drafter.as_ref().map_or("none", Drafter::label),
             spec_accepted as f64 / spec_steps as f64
         );
     }
@@ -717,6 +946,22 @@ fn run(
         "{prefix}orangu-server: [slot {}] {}\x1b[K",
         guard.id(),
         stats.log_line()
+    );
+    // Charged here, at the one point a generation is over, rather than at each
+    // endpoint's `usage` — and charged before the `Done` event, so a client
+    // that reads `usage` and immediately fires its next request cannot arrive
+    // ahead of its own bill.
+    if let Some(meter) = &req.charge {
+        meter.charge((stats.prompt_tokens + stats.generated_tokens) as u64);
+    }
+    outcome.finish(
+        match finish_reason {
+            FinishReason::Stop => super::metrics::Outcome::Stop,
+            FinishReason::Length => super::metrics::Outcome::Length,
+        },
+        stats.prompt_tokens,
+        stats.cached_tokens,
+        stats.generated_tokens,
     );
     let _ = tx.send(StreamEvent::Done {
         stats,
@@ -1094,7 +1339,7 @@ const PREFILL_CHUNK_BUDGET_MS_DEFAULT: u64 = 3_000;
 /// Read once — this sits in the decode loop, which runs once per token.
 fn gpu_trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("ORANGU_GPU_TRACE").is_some())
+    *TRACE.get_or_init(|| crate::engine::env::flag_on("ORANGU_GPU_TRACE"))
 }
 
 fn speculative_config() -> Option<(usize, usize)> {
@@ -1109,6 +1354,164 @@ fn speculative_config() -> Option<(usize, usize)> {
             .unwrap_or(default)
     };
     Some((read("ORANGU_SPEC_NGRAM", 2), read("ORANGU_SPEC_DRAFT", 4)))
+}
+
+/// Where a speculative step's candidate tokens come from.
+///
+/// The two sources have opposite cost profiles, and that is the whole reason
+/// both exist. Prompt-lookup calls no model at all, so a wrong guess costs
+/// nothing beyond the wider verification forward — but it produces nothing
+/// unless the context happens to repeat itself. A draft model always produces
+/// a draft and always pays a forward pass per token for it, so it wins on
+/// ordinary prose and loses whenever the pair agrees too rarely to cover the
+/// drafting cost.
+///
+/// Verification does not care which one produced the tokens: it re-derives
+/// what the served model would have said and keeps the matching prefix, so the
+/// emitted text is identical either way. A drafter can only change how fast
+/// the answer arrives, never what it is.
+enum Drafter<'a> {
+    /// Copy the continuation of an earlier occurrence of the trailing n-gram.
+    PromptLookup { ngram: usize, max_draft: usize },
+    /// Run a second, smaller model autoregressively.
+    Model {
+        model: &'a dyn ModelForward,
+        tokens: usize,
+        /// The draft's own KV cache, which tracks the same committed token
+        /// sequence as the target's.
+        cache: KvCache,
+        /// How many of `history` this cache holds. Kept explicitly rather
+        /// than read off the cache, because a block-compressed slot's `len`
+        /// is a row count and one row can stand for several tokens
+        /// (`KvCache::committed_tokens`) — a draft architecture with a stride
+        /// would otherwise desynchronise silently.
+        committed: usize,
+    },
+}
+
+impl Drafter<'_> {
+    /// The tokens to speculate on, continuing after all of `history`.
+    ///
+    /// `room` caps the draft at what the KV cache can still hold. It is not a
+    /// tuning knob: a verification forward appends the whole draft to the
+    /// cache at once, so a draft longer than the remaining context writes past
+    /// the allocation — on the GPU mirror, which is sized to the request's
+    /// capacity, that is a write into whatever is next rather than an error.
+    /// Only reachable in the last few tokens of a full context, which is why
+    /// it survived unnoticed on the prompt-lookup path.
+    fn draft(&mut self, history: &[u32], room: usize, slot_id: usize) -> Result<Vec<u32>> {
+        if room == 0 {
+            return Ok(Vec::new());
+        }
+        match self {
+            Drafter::PromptLookup { ngram, max_draft } => {
+                Ok(ngram_draft(history, *ngram, (*max_draft).min(room)))
+            }
+            Drafter::Model {
+                model,
+                tokens,
+                cache,
+                committed,
+            } => {
+                let tokens = &(*tokens).min(room);
+                // Everything committed that this cache has not seen yet — the
+                // whole prompt on the first step, one token on every step
+                // after.
+                let catch_up = &history[*committed..];
+                if catch_up.is_empty() {
+                    // `history` always ends with the token the target is about
+                    // to forward, and `committed` never runs past it.
+                    anyhow::bail!("draft cache is ahead of the committed history");
+                }
+                let mut logits = draft_forward(*model, cache, catch_up, *committed, slot_id)?;
+                *committed = history.len();
+                let mut drafted = Vec::with_capacity(*tokens);
+                for i in 0..*tokens {
+                    // Plain argmax, not the request's sampler: a draft is a
+                    // guess, and its only effect is how often the guess is
+                    // accepted. Running the caller's temperature here would
+                    // make the *draft* random without making the output any
+                    // less determined by the target.
+                    let token = crate::engine::sampling::argmax(&logits);
+                    drafted.push(token);
+                    // The last drafted token is never fed back: nothing would
+                    // read its logits, and committing it to the draft cache
+                    // would put the cache a token ahead of what the target can
+                    // possibly accept.
+                    if i + 1 == *tokens {
+                        break;
+                    }
+                    logits = draft_forward(*model, cache, &[token], *committed, slot_id)?;
+                    *committed += 1;
+                }
+                Ok(drafted)
+            }
+        }
+    }
+
+    /// Rolls the draft's own cache back to the tokens the target actually
+    /// committed.
+    ///
+    /// Without this the rejected tail stays in the draft cache and every
+    /// later position is written one slot too far along — the draft would
+    /// keep producing tokens, they would simply stop resembling anything the
+    /// target would say, and the only symptom would be an acceptance rate
+    /// quietly falling to zero.
+    fn commit(&mut self, committed_tokens: usize) {
+        if let Drafter::Model {
+            cache, committed, ..
+        } = self
+            && *committed > committed_tokens
+        {
+            cache.truncate(committed_tokens);
+            *committed = committed_tokens;
+        }
+    }
+
+    /// What the acceptance log calls this drafter.
+    fn label(&self) -> &'static str {
+        match self {
+            Drafter::PromptLookup { .. } => "prompt-lookup",
+            Drafter::Model { .. } => "draft model",
+        }
+    }
+}
+
+/// Runs the draft model forward and returns the last position's logits.
+///
+/// **`forward_all_logits`, never `forward`, and that is the whole point of
+/// this function existing.** A single-token `forward` takes the GPU-fused
+/// decode path on the backends that have one, and that path writes the key and
+/// value straight into the GPU mirror without populating the host-side rows —
+/// `KvCache::advance_gpu_only` says so, and warns in as many words that a
+/// cache treated this way cannot later be read by a CPU attention pass.
+///
+/// A draft cache is read that way constantly: every step rolls it back to what
+/// the target accepted and then runs a multi-position pass over it. Mixing the
+/// two produced exactly the two failures the warning predicts — a read one row
+/// past the end of the host buffer, and, where the buffer happened to be long
+/// enough, an acceptance rate of zero from a model drafting for *itself*.
+///
+/// Chunked for the same reason [`prefill`] is: the first call carries the
+/// whole prompt, and one large submission is what resets the device.
+fn draft_forward(
+    model: &dyn ModelForward,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    start_pos: usize,
+    slot_id: usize,
+) -> Result<Vec<f32>> {
+    let batch = prefill_batch();
+    let chunk = if batch == 0 { tokens.len() } else { batch };
+    let mut last = Vec::new();
+    for (i, part) in tokens.chunks(chunk.max(1)).enumerate() {
+        let logits = model.forward_all_logits(cache, part, start_pos + i * chunk, slot_id)?;
+        last = logits
+            .into_iter()
+            .next_back()
+            .ok_or_else(|| anyhow::anyhow!("the draft model returned no logits"))?;
+    }
+    Ok(last)
 }
 
 /// Prompt-lookup draft: find the most recent earlier occurrence of the last
@@ -1133,13 +1536,13 @@ fn ngram_draft(history: &[u32], ngram: usize, max_draft: usize) -> Vec<u32> {
     Vec::new()
 }
 
-/// One prompt-lookup speculative step. Drafts a continuation of `current` from
-/// the context, verifies the whole draft in a single multi-position forward,
-/// keeps the longest prefix the model would itself have produced greedily, and
-/// rolls the rejected tail off the KV cache. Returns the model's own next
-/// token (identical to what plain greedy decoding produces here) and pushes any
-/// further accepted tokens onto `spec_buf` for the loop to emit before its next
-/// forward. `accepted`/`steps` accumulate acceptance stats for the final log.
+/// One speculative step. Takes a draft from `drafter`, verifies the whole of
+/// it in a single multi-position forward, keeps the longest prefix the model
+/// would itself have produced greedily, and rolls the rejected tail off both
+/// KV caches. Returns the model's own next token (identical to what plain
+/// greedy decoding produces here) and pushes any further accepted tokens onto
+/// `spec_buf` for the loop to emit before its next forward.
+/// `accepted`/`steps` accumulate acceptance stats for the final log.
 ///
 /// Only sound for greedy sampling: a draft token is accepted only when it
 /// equals the sampler's own pick at that position, so the emitted sequence is
@@ -1152,14 +1555,16 @@ fn speculative_next(
     history: &[u32],
     current: u32,
     start_pos: usize,
-    ngram: usize,
-    max_draft: usize,
+    capacity: usize,
+    drafter: &mut Drafter<'_>,
     slot_id: usize,
     spec_buf: &mut VecDeque<u32>,
     accepted: &mut usize,
     steps: &mut usize,
 ) -> Result<u32> {
-    let draft = ngram_draft(history, ngram, max_draft);
+    // `current` takes the first of the remaining rows; the draft gets the rest.
+    let room = capacity.saturating_sub(start_pos + 1);
+    let draft = drafter.draft(history, room, slot_id)?;
     let mut input = Vec::with_capacity(1 + draft.len());
     input.push(current);
     input.extend_from_slice(&draft);
@@ -1187,7 +1592,12 @@ fn speculative_next(
     // last element of `chosen` is the model's own token past the accepted
     // prefix — its key/value is not committed (it was never an accepted input),
     // so it becomes the next frontier the loop forwards.
-    cache.truncate(start_pos + chosen.len());
+    let committed_tokens = start_pos + chosen.len();
+    cache.truncate(committed_tokens);
+    // The draft's cache follows the target's exactly, which is what keeps the
+    // two models looking at the same context. A drafter with no cache of its
+    // own ignores this.
+    drafter.commit(committed_tokens);
     *accepted += matched;
     *steps += 1;
     for &t in &chosen[1..] {
@@ -1462,6 +1872,22 @@ mod tests {
         /// prefix reuse actually skipped work, not just that it didn't
         /// change the result.
         forwarded_tokens: AtomicUsize,
+        /// Disagree with the base rule on every `n`th call, so an instance
+        /// can stand in for a *draft* model: one that mostly predicts what
+        /// the target would say and sometimes does not. `0` never disagrees,
+        /// which makes the draft a perfect oracle.
+        ///
+        /// Counted per call rather than per token so the disagreement lands
+        /// at positions the caller cannot arrange for, which is the point —
+        /// a draft that failed only where a test expected it to would not
+        /// exercise the rollback at all.
+        disagree_every: usize,
+        calls: AtomicUsize,
+        /// Entries into `forward`/`forward_all_logits`, however many tokens
+        /// each carried. This — not the token count — is what speculation
+        /// reduces: a verification forward is one call carrying the whole
+        /// draft, where plain decoding would have made one call per token.
+        forward_calls: AtomicUsize,
     }
 
     impl DeterministicModel {
@@ -1482,7 +1908,41 @@ mod tests {
                     pooling_type: PoolingType::Mean,
                 },
                 forwarded_tokens: AtomicUsize::new(0),
+                disagree_every: 0,
+                calls: AtomicUsize::new(0),
+                forward_calls: AtomicUsize::new(0),
             }
+        }
+
+        /// The same model, wrong every `n`th call — a stand-in for a draft
+        /// model that is usually but not always right.
+        fn drafting(n_vocab: usize, disagree_every: usize) -> Self {
+            Self {
+                disagree_every,
+                ..Self::new(n_vocab)
+            }
+        }
+
+        /// The winner this model's rule picks for a cache in its current
+        /// state, with the deliberate disagreement applied.
+        fn winner(&self, layer: &crate::engine::kv_cache::LayerCache) -> usize {
+            let mut acc = 0f32;
+            for p in 0..layer.len {
+                acc += layer.key_at(p, 0, 1)[0];
+            }
+            let base = (acc.abs() as u64 as usize) % self.config.n_vocab;
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.disagree_every > 0 && call.is_multiple_of(self.disagree_every) {
+                (base + 1) % self.config.n_vocab
+            } else {
+                base
+            }
+        }
+
+        fn logits_for(&self, winner: usize) -> Vec<f32> {
+            let mut logits = vec![0f32; self.config.n_vocab];
+            logits[winner] = 10.0;
+            logits
         }
     }
 
@@ -1504,20 +1964,39 @@ mod tests {
         ) -> Result<Vec<f32>> {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
+            self.forward_calls.fetch_add(1, Ordering::Relaxed);
             let layer = &mut cache.layers[0];
             for (i, &t) in tokens.iter().enumerate() {
                 let val = t as f32 * 1000.0 + (start_pos + i) as f32;
                 layer.push(&[val], &[val]);
             }
-            let len = layer.len;
-            let mut acc = 0f32;
-            for p in 0..len {
-                acc += layer.key_at(p, 0, 1)[0];
+            let winner = self.winner(layer);
+            Ok(self.logits_for(winner))
+        }
+
+        /// Per-position logits, each identical to what `forward` would have
+        /// returned had the tokens been fed one at a time — the property
+        /// speculative verification is built on, and the reason this is
+        /// written as the same incremental rule rather than a batched one.
+        fn forward_all_logits(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            _slot_id: usize,
+        ) -> Result<Vec<Vec<f32>>> {
+            self.forwarded_tokens
+                .fetch_add(tokens.len(), Ordering::Relaxed);
+            self.forward_calls.fetch_add(1, Ordering::Relaxed);
+            let layer = &mut cache.layers[0];
+            let mut out = Vec::with_capacity(tokens.len());
+            for (i, &t) in tokens.iter().enumerate() {
+                let val = t as f32 * 1000.0 + (start_pos + i) as f32;
+                layer.push(&[val], &[val]);
+                let winner = self.winner(layer);
+                out.push(self.logits_for(winner));
             }
-            let winner = (acc.abs() as u64 as usize) % self.config.n_vocab;
-            let mut logits = vec![0f32; self.config.n_vocab];
-            logits[winner] = 10.0;
-            Ok(logits)
+            Ok(out)
         }
 
         fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
@@ -1552,6 +2031,40 @@ mod tests {
         Tokenizer::from_gguf(&gguf).unwrap()
     }
 
+    /// [`letter_tokenizer`], but every token is a CONTROL token.
+    ///
+    /// Which makes every one of them *suppressed*: nothing reaches the stream,
+    /// exactly as a chat format's structural markers and a hidden reasoning
+    /// body do. That is the shape in which "stop when the client goes away"
+    /// used to fail, so it is the shape a test for it has to use.
+    fn suppressed_tokenizer(n_vocab: usize) -> Tokenizer {
+        let tokens: Vec<GgufValue> = (0..n_vocab)
+            .map(|i| GgufValue::String(char::from_u32('a' as u32 + i as u32).unwrap().to_string()))
+            .collect();
+        let gguf = GgufFile {
+            version: 3,
+            metadata: vec![
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    GgufValue::Array(tokens),
+                ),
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    GgufValue::String("llama".to_string()),
+                ),
+                (
+                    // 3 is llama.cpp's `LLAMA_TOKEN_TYPE_CONTROL`.
+                    "tokenizer.ggml.token_type".to_string(),
+                    GgufValue::Array((0..n_vocab).map(|_| GgufValue::I32(3)).collect()),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        Tokenizer::from_gguf(&gguf).unwrap()
+    }
+
     fn greedy_params() -> SamplingParams {
         SamplingParams {
             temperature: 0.0,
@@ -1573,6 +2086,7 @@ mod tests {
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Done { .. } => ok = true,
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
+                StreamEvent::Overloaded => panic!("unexpected refusal: these pools are unbounded"),
             }
         }
         (text, ok)
@@ -1595,6 +2109,56 @@ mod tests {
         )
     }
 
+    /// `run_request`, with a draft model attached.
+    ///
+    /// Everything else is identical, which is what makes the comparison
+    /// worth anything: speculation is only allowed to change how many
+    /// forwards a request costs, never a byte of what it emits.
+    fn run_request_drafted(
+        model: &DeterministicModel,
+        draft: Arc<DeterministicModel>,
+        tokenizer: &Tokenizer,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        draft_tokens: usize,
+    ) -> (String, bool) {
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = GenerateRequest {
+            json_output: false,
+            prompt_tokens,
+            sampling: greedy_params(),
+            max_tokens,
+            stop_token_ids: vec![],
+            cache_prompt: true,
+            id_slot: None,
+            timings_per_token: false,
+            charge: None,
+        };
+        let draft = DraftModel {
+            model: draft,
+            tokens: draft_tokens,
+            label: "test-draft".to_string(),
+        };
+        run(
+            model,
+            tokenizer,
+            Some(&draft),
+            None,
+            None,
+            None,
+            &guard,
+            req,
+            crate::config::Role::default(),
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+        )
+        .unwrap();
+        drain(rx)
+    }
+
     /// `run_request` with explicit control over whether the request is allowed
     /// to read a cache (`GenerateRequest::cache_prompt`).
     fn run_request_cached(
@@ -1609,6 +2173,7 @@ mod tests {
         let guard = pollster::block_on(slots.acquire());
         let (tx, rx) = mpsc::unbounded_channel();
         let req = GenerateRequest {
+            json_output: false,
             prompt_tokens,
             sampling: greedy_params(),
             max_tokens,
@@ -1616,16 +2181,20 @@ mod tests {
             cache_prompt,
             id_slot: None,
             timings_per_token: false,
+            charge: None,
         };
         run(
             model,
             tokenizer,
+            None,
             None,
             prefix_cache,
             None,
             &guard,
             req,
             crate::config::Role::default(),
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
             tx,
         )
         .unwrap();
@@ -2044,6 +2613,8 @@ mod tests {
         crate::panic_capture::install();
 
         let engine = Engine {
+            metrics: Arc::new(crate::engine::metrics::ServerMetrics::new()),
+            draft: None,
             model: Arc::new(PanickingModel::new()),
             tokenizer: Arc::new(letter_tokenizer(8)),
             chat_template_source: None,
@@ -2056,6 +2627,7 @@ mod tests {
 
         let mut rx = engine
             .generate(GenerateRequest {
+                json_output: false,
                 prompt_tokens: vec![1, 2, 3],
                 sampling: greedy_params(),
                 max_tokens: 4,
@@ -2063,6 +2635,7 @@ mod tests {
                 cache_prompt: true,
                 id_slot: None,
                 timings_per_token: false,
+                charge: None,
             })
             .await;
 
@@ -2104,6 +2677,251 @@ mod tests {
         assert_eq!(lost, crate::device_lost::CLIENT_MESSAGE);
         assert!(!lost.contains("backtrace"));
         assert!(!lost.contains("vulkan.rs"));
+    }
+
+    /// A request whose client has gone away stops, even when every token it
+    /// produces is suppressed.
+    ///
+    /// **This is the case the old check missed**, and it missed it silently.
+    /// The disconnect test used to ride on sending a token, so a generation
+    /// that rendered nothing — structural markers, or a reasoning body the
+    /// role hides — never asked whether anyone was listening and ran to
+    /// `max_tokens`, holding the slot every other request is queued for.
+    ///
+    /// Asserted on the target's forward calls rather than on elapsed time, so
+    /// it fails on a slow machine for the right reason or not at all.
+    #[test]
+    fn generation_stops_when_the_client_goes_away_even_with_nothing_to_send() {
+        let model = DeterministicModel::new(8);
+        let tokenizer = suppressed_tokenizer(8);
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        // The client is already gone before the first token.
+        drop(rx);
+
+        let max_tokens = 500;
+        run(
+            &model,
+            &tokenizer,
+            None,
+            None,
+            None,
+            None,
+            &guard,
+            GenerateRequest {
+                prompt_tokens: vec![1, 2, 3],
+                sampling: greedy_params(),
+                max_tokens,
+                ..Default::default()
+            },
+            crate::config::Role::default(),
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+        )
+        .unwrap();
+
+        // One prefill plus a couple of decode steps, not five hundred.
+        let calls = model.forward_calls.load(Ordering::Relaxed);
+        assert!(
+            calls < 5,
+            "kept generating for a client that had gone: {calls} forward calls"
+        );
+    }
+
+    /// **The property the whole feature rests on.** A draft model may only
+    /// change how fast an answer arrives, never what it says — so greedy
+    /// output with a draft attached must be byte-identical to greedy output
+    /// without one, whatever the draft proposes.
+    ///
+    /// Swept over how often the draft is wrong (never, every other call,
+    /// every third, always) and over the draft depth, because the interesting
+    /// failures are all in the rollback: a cache left one token long, or a
+    /// draft cache that quietly desynchronises from the target's, shows up as
+    /// divergence only at particular acceptance patterns.
+    #[test]
+    fn a_draft_model_never_changes_what_greedy_decoding_emits() {
+        let tokenizer = letter_tokenizer(8);
+        let prompt = vec![1u32, 2, 3, 4, 1, 2];
+        let plain = {
+            let model = DeterministicModel::new(8);
+            run_request(&model, &tokenizer, None, prompt.clone(), 40)
+        };
+        assert!(plain.1, "the baseline run must finish");
+        assert!(!plain.0.is_empty(), "the baseline run must emit something");
+
+        for disagree_every in [0usize, 1, 2, 3, 5] {
+            for draft_tokens in [1usize, 2, 4, 7] {
+                let model = DeterministicModel::new(8);
+                let draft = Arc::new(DeterministicModel::drafting(8, disagree_every));
+                let drafted = run_request_drafted(
+                    &model,
+                    draft.clone(),
+                    &tokenizer,
+                    prompt.clone(),
+                    40,
+                    draft_tokens,
+                );
+                assert_eq!(
+                    drafted.0, plain.0,
+                    "speculation changed the output (disagree_every={disagree_every}, \
+                     draft_tokens={draft_tokens})"
+                );
+                assert!(drafted.1, "the drafted run must finish");
+                assert!(
+                    draft.forwarded_tokens.load(Ordering::Relaxed) > 0,
+                    "the draft model was never actually run"
+                );
+            }
+        }
+    }
+
+    /// A perfect draft must actually save forwards, or the path is inert and
+    /// the test above would pass on a `Drafter` that returned nothing.
+    ///
+    /// Counted in *forward calls*, not tokens: the target still processes
+    /// every token — a verification forward carries the whole draft — so
+    /// tokens are exactly what speculation does not reduce. What it reduces
+    /// is how many times the model has to be entered, which on a
+    /// bandwidth-bound decode is one full pass over the weights each.
+    #[test]
+    fn a_perfect_draft_costs_the_target_fewer_forward_calls() {
+        let tokenizer = letter_tokenizer(8);
+        let prompt = vec![1u32, 2, 3, 4, 1, 2];
+
+        let plain_model = DeterministicModel::new(8);
+        let plain = run_request(&plain_model, &tokenizer, None, prompt.clone(), 40);
+        let plain_calls = plain_model.forward_calls.load(Ordering::Relaxed);
+
+        let model = DeterministicModel::new(8);
+        // `disagree_every = 0` never disagrees, so every drafted token is
+        // exactly what the target would have produced.
+        let draft = Arc::new(DeterministicModel::drafting(8, 0));
+        let drafted = run_request_drafted(&model, draft, &tokenizer, prompt, 40, 4);
+        assert_eq!(drafted.0, plain.0);
+
+        let calls = model.forward_calls.load(Ordering::Relaxed);
+        // One prefill plus one verification per five tokens, against one
+        // prefill plus one call per token.
+        assert!(
+            calls * 3 < plain_calls,
+            "a perfect 4-token draft should cut the target's forward calls several-fold: \
+             {calls} vs {plain_calls}"
+        );
+        assert!(
+            model.forwarded_tokens.load(Ordering::Relaxed) > 0,
+            "the target must still have run"
+        );
+    }
+
+    /// A draft that is always wrong must still be correct, and must not
+    /// wedge: every step rejects everything, so the loop makes progress only
+    /// through the target's own token.
+    #[test]
+    fn an_always_wrong_draft_still_terminates_with_the_right_answer() {
+        let tokenizer = letter_tokenizer(8);
+        let prompt = vec![5u32, 5, 5];
+        let plain = {
+            let model = DeterministicModel::new(8);
+            run_request(&model, &tokenizer, None, prompt.clone(), 25)
+        };
+        let model = DeterministicModel::new(8);
+        let draft = Arc::new(DeterministicModel::drafting(8, 1));
+        let drafted = run_request_drafted(&model, draft, &tokenizer, prompt, 25, 4);
+        assert_eq!(drafted.0, plain.0);
+        assert!(drafted.1);
+    }
+
+    /// No drafter may propose more tokens than the KV cache can still hold.
+    ///
+    /// A verification forward appends `1 + draft.len()` positions at once, so
+    /// a draft longer than the remaining context writes past the allocation —
+    /// and on the GPU mirror, sized to the request's capacity, that is a write
+    /// into whatever is next rather than an error. Only reachable in the last
+    /// few tokens of a full context, which is exactly why it needs a test
+    /// rather than a run to find it.
+    #[test]
+    fn a_draft_never_runs_past_the_end_of_the_context() {
+        let history: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 1, 2, 3];
+        for room in 0..6 {
+            let mut lookup = Drafter::PromptLookup {
+                ngram: 2,
+                max_draft: 8,
+            };
+            let drafted = lookup.draft(&history, room, 0).expect("prompt lookup");
+            assert!(
+                drafted.len() <= room,
+                "prompt-lookup drafted {} with room for {room}",
+                drafted.len()
+            );
+
+            let draft_model = DeterministicModel::new(8);
+            let cache = draft_model.new_kv_cache(64);
+            let mut model = Drafter::Model {
+                model: &draft_model,
+                tokens: 8,
+                cache,
+                committed: 0,
+            };
+            let drafted = model.draft(&history, room, 0).expect("draft model");
+            assert!(
+                drafted.len() <= room,
+                "the draft model drafted {} with room for {room}",
+                drafted.len()
+            );
+        }
+    }
+
+    /// The draft cache is rolled back to exactly what the target committed.
+    ///
+    /// Asserted directly rather than through output, because the symptom of
+    /// getting it wrong is not a wrong answer — the target re-derives every
+    /// token either way — but an acceptance rate silently falling to zero as
+    /// the draft reads a context shifted out from under it.
+    #[test]
+    fn commit_rolls_the_draft_cache_back_to_what_the_target_kept() {
+        let draft_model = DeterministicModel::new(8);
+        let mut cache = draft_model.new_kv_cache(64);
+        // Ten tokens in the draft's cache, standing for eight committed plus
+        // two drafted-and-about-to-be-rejected.
+        for pos in 0..10 {
+            draft_model
+                .forward(&mut cache, &[1], pos, 0)
+                .expect("test model");
+        }
+        let mut drafter = Drafter::Model {
+            model: &draft_model,
+            tokens: 4,
+            cache,
+            committed: 10,
+        };
+        drafter.commit(8);
+        match &drafter {
+            Drafter::Model {
+                cache, committed, ..
+            } => {
+                assert_eq!(*committed, 8);
+                assert_eq!(
+                    cache.layers[0].len, 8,
+                    "the rejected tail was not rolled off"
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Committing further ahead than the cache reaches is the
+        // all-accepted case, and must leave the cache alone for the next
+        // step's catch-up to fill in rather than pretend it holds more.
+        drafter.commit(12);
+        match &drafter {
+            Drafter::Model {
+                cache, committed, ..
+            } => {
+                assert_eq!(*committed, 8);
+                assert_eq!(cache.layers[0].len, 8);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

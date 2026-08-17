@@ -61,6 +61,10 @@ impl ModelForward for Qwen35MoeModel {
         &self.trunk.config
     }
 
+    fn n_trunk_layer(&self) -> usize {
+        self.trunk.layer_count()
+    }
+
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         self.trunk.new_kv_cache(capacity)
     }

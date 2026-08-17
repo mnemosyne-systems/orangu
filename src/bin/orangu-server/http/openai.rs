@@ -22,8 +22,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::AppState;
 use super::native::finish_reason_str;
+use super::{AppState, Charge};
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::loader::PoolingType;
@@ -144,6 +144,12 @@ pub struct ChatCompletionRequest {
     /// indefinite spinner.
     #[serde(default)]
     return_progress: bool,
+    /// OpenAI's structured-output request. `{"type": "json_object"}`
+    /// constrains generation so that only tokens keeping the output a valid
+    /// JSON prefix can be sampled, and so that generation cannot stop until
+    /// the document is complete — see `engine::constraint`.
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
     /// OpenAI's tool array, handed to the chat template as `tools`. Kept as
     /// raw JSON: what a tool declaration must contain is the template's
     /// business, and every field this server invented an opinion about would
@@ -154,6 +160,25 @@ pub struct ChatCompletionRequest {
 
 pub(crate) fn default_cache_prompt() -> bool {
     true
+}
+
+/// Whether `response_format` asks for JSON.
+///
+/// OpenAI's field is an object, `{"type": "json_object"}`. `json_schema` is
+/// recognised too and treated as `json_object` — the output is constrained to
+/// valid JSON, but **not** to the schema's shape, which is a strictly larger
+/// job. Answering "the type I do not implement is simply ignored" would be
+/// worse: a caller asking for a schema and receiving free text has no way to
+/// tell that the field never arrived, which is the exact failure this file's
+/// own comment about silently-dropped sampler fields already records.
+///
+/// Anything else — including `{"type": "text"}`, the default — is
+/// unconstrained.
+fn wants_json(response_format: Option<&serde_json::Value>) -> bool {
+    response_format
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| matches!(t, "json_object" | "json_schema"))
 }
 
 /// `Role::Review`'s reasoning-suppression approximation: real llama-server
@@ -259,6 +284,7 @@ fn tool_calls_json(calls: &[tool_calls::ParsedToolCall], created: u64) -> serde_
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    charge: Charge,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -340,9 +366,11 @@ pub async fn chat_completions(
             sampling,
             max_tokens,
             stop_token_ids,
+            json_output: wants_json(req.response_format.as_ref()),
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: req.stream && req.timings_per_token,
+            charge: charge.0,
         })
         .await;
 
@@ -367,6 +395,7 @@ pub async fn chat_completions(
                     timings = timings_json(&stats);
                     break;
                 }
+                StreamEvent::Overloaded => return crate::http::overloaded_response(),
                 StreamEvent::Error(err) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
                 }
@@ -507,6 +536,11 @@ pub async fn chat_completions(
                     yield Ok(axum::response::sse::Event::default().data("[DONE]"));
                     break;
                 }
+                StreamEvent::Overloaded => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
+                    break;
+                }
                 StreamEvent::Error(err) => {
                     yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
                     break;
@@ -584,6 +618,11 @@ pub struct CompletionsRequest {
     repeat_penalty: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Not part of OpenAI's completions schema, accepted anyway for the same
+    /// reason the sampler fields above are: a caller that reaches for it and
+    /// is silently ignored concludes the feature does not work.
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
     #[serde(default)]
     stream: bool,
     /// Keep generating to `max_tokens` even if the model emits EOS (llama.cpp's
@@ -603,6 +642,7 @@ pub struct CompletionsRequest {
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    charge: Charge,
     Json(req): Json<CompletionsRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -648,9 +688,11 @@ pub async fn completions(
             sampling,
             max_tokens,
             stop_token_ids,
+            json_output: wants_json(req.response_format.as_ref()),
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
+            charge: charge.0,
         })
         .await;
 
@@ -683,6 +725,11 @@ pub async fn completions(
                         yield Ok(axum::response::sse::Event::default().data("[DONE]"));
                         break;
                     }
+                    StreamEvent::Overloaded => {
+                        yield Ok(axum::response::sse::Event::default()
+                            .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
+                        break;
+                    }
                     StreamEvent::Error(err) => {
                         yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
                         break;
@@ -710,6 +757,7 @@ pub async fn completions(
                 timings = timings_json(&stats);
                 break;
             }
+            StreamEvent::Overloaded => return crate::http::overloaded_response(),
             StreamEvent::Error(err) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
             }
@@ -749,6 +797,7 @@ struct EmbeddingDatum {
 
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
+    charge: Charge,
     Json(req): Json<EmbeddingsRequest>,
 ) -> axum::response::Response {
     let inputs = match req.input {
@@ -760,6 +809,13 @@ pub async fn embeddings(
     for (index, text) in inputs.into_iter().enumerate() {
         match pooled_embedding(&state, &text).await {
             Ok(pooled) => {
+                // Charged per input rather than once at the end, so a batch
+                // that fails half way through has still been paid for: the
+                // forward passes that ran are the machine's time whether or
+                // not the caller got a response.
+                if let Some(meter) = &charge.0 {
+                    meter.charge(pooled.prompt_tokens as u64);
+                }
                 prompt_tokens += pooled.prompt_tokens;
                 data.push(EmbeddingDatum {
                     object: "embedding",

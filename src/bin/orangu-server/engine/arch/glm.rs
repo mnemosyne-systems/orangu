@@ -858,6 +858,10 @@ impl ModelForward for GlmModel {
         &self.config
     }
 
+    fn n_trunk_layer(&self) -> usize {
+        self.layers.len()
+    }
+
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         KvCache::new_with_strided_dims(capacity, &self.kv_dims)
     }

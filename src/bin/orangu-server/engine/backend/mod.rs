@@ -346,7 +346,7 @@ pub fn device_resident_split<'a>(tensors: impl Iterator<Item = (&'a str, u64)>) 
     (device, host)
 }
 
-fn is_cpu_only_tensor(name: &str) -> bool {
+pub(crate) fn is_cpu_only_tensor(name: &str) -> bool {
     name.ends_with(".ffn_gate_exps.weight")
         || name.ends_with(".ffn_up_exps.weight")
         || name.ends_with(".ffn_down_exps.weight")

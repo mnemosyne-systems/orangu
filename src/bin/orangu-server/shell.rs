@@ -64,7 +64,7 @@ _orangu_server() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     COMPREPLY=()
 
-    if [[ "$prev" == "show" || "$prev" == "delete" || "$prev" == "refresh" ]]; then
+    if [[ "$prev" == "show" || "$prev" == "plan" || "$prev" == "delete" || "$prev" == "refresh" ]]; then
         COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
         return 0
     fi
@@ -102,12 +102,12 @@ _orangu_server() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "-c --config -w --workspace --host -p --port --web -i --init -s --shell-completions -d --daemon \
-             --all --code --review --explorer --embedding -o --output --binary -y --yes -h --help -V --version" -- "$cur") )
+             --all --code --review --explorer --embedding -o --output --binary --deep -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show download delete refresh bundle prune help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$(_orangu_server_models) system suggest list show plan download delete refresh bundle prune help" -- "$cur") )
         return 0
     fi
 }
@@ -150,6 +150,7 @@ _orangu_server_commands() {
         'suggest[Suggest a GGUF model size for this machine'"'"'s hardware]' \
         'list[List every .gguf file under the models directory]' \
         'show[Print a GGUF file'"'"'s full metadata]' \
+        'plan[Report what a model needs to run here, without loading it]' \
         'download[Download a GGUF model from Hugging Face]' \
         'delete[Delete a GGUF model from disk]' \
         'refresh[Delete a GGUF model and download it again]' \
@@ -177,7 +178,8 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding)--embedding[Embeddings-only role]' \
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
-        '(-y --yes)'{-y,--yes}'[Skip delete'"'"'s/bundle'"'"'s/prune'"'"'s confirmation prompt]' \
+        '--deep[Also verify plan'"'"'s shards and architecture]' \
+        '(-y --yes)'{-y,--yes}'[Skip a confirmation prompt (download/delete/bundle/prune)]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
         '1: :->command' \
@@ -191,7 +193,7 @@ _orangu_server() {
                 'commands:command:_orangu_server_commands'
             ;;
         arg)
-            [[ ${line[1]} == show || ${line[1]} == delete || ${line[1]} == refresh || ${line[1]} == bundle ]] && _orangu_server_models
+            [[ ${line[1]} == show || ${line[1]} == plan || ${line[1]} == delete || ${line[1]} == refresh || ${line[1]} == bundle ]] && _orangu_server_models
             [[ ${line[1]} == prune ]] && _orangu_server_sessions
             ;;
     esac
@@ -229,6 +231,7 @@ complete -c orangu-server -n '__fish_use_subcommand' -a system   -d 'Detect the 
 complete -c orangu-server -n '__fish_use_subcommand' -a suggest  -d 'Suggest a GGUF model size for this machine\'s hardware'
 complete -c orangu-server -n '__fish_use_subcommand' -a list     -d 'List every .gguf file under the models directory'
 complete -c orangu-server -n '__fish_use_subcommand' -a show     -d 'Print a GGUF file\'s full metadata'
+complete -c orangu-server -n '__fish_use_subcommand' -a plan     -d 'Report what a model needs to run here, without loading it'
 complete -c orangu-server -n '__fish_use_subcommand' -a download -d 'Download a GGUF model from Hugging Face'
 complete -c orangu-server -n '__fish_use_subcommand' -a delete   -d 'Delete a GGUF model from disk'
 complete -c orangu-server -n '__fish_use_subcommand' -a refresh  -d 'Delete a GGUF model and download it again'
@@ -236,6 +239,7 @@ complete -c orangu-server -n '__fish_use_subcommand' -a bundle   -d 'Write a sel
 complete -c orangu-server -n '__fish_use_subcommand' -a prune    -d 'Delete chat sessions'
 complete -c orangu-server -n '__fish_use_subcommand' -a help     -d 'Print this message or the help of the given subcommand(s)'
 complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from plan' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from refresh' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from bundle' -a '(__orangu_server_models)'
@@ -256,7 +260,8 @@ complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
-complete -c orangu-server -s y -l yes                     -d 'Skip delete\'s/bundle\'s/prune\'s confirmation prompt'
+complete -c orangu-server -l deep                         -d 'Also verify plan\'s shards and architecture'
+complete -c orangu-server -s y -l yes                     -d 'Skip a confirmation prompt (download/delete/bundle/prune)'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
 "#;

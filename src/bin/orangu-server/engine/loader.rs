@@ -231,10 +231,58 @@ const MUSE_ARCHITECTURES: &[&str] = &["muse-glimmer"];
 const INKLING_ARCHITECTURES: &[&str] = &["inkling"];
 /// `nemotron_h_moe` (e.g. `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-
 /// GGUF`) — see [`ArchFamily::NemotronHMoe`] and `engine::arch::nemotron`.
-/// The dense `nemotron_h` and the unrelated, ordinary-transformer `nemotron`
-/// are *not* here: only the mixture-of-experts variant has been confirmed
-/// against a real file.
-const NEMOTRON_ARCHITECTURES: &[&str] = &["nemotron_h_moe"];
+/// `nemotron_h` is the dense sibling — the same one-sub-layer-per-block
+/// trunk with an ordinary two-matrix FFN where the MoE variant routes
+/// experts (`engine::arch::nemotron`'s `Layer::Ffn`), confirmed against
+/// `bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`. The unrelated,
+/// ordinary-transformer `nemotron` is *not* here.
+const NEMOTRON_ARCHITECTURES: &[&str] = &["nemotron_h_moe", "nemotron_h"];
+
+/// Architectures this engine recognises by name and deliberately does **not**
+/// serve, with the reason.
+///
+/// Every entry is a *near miss*: a name one character or one word away from a
+/// supported family, whose graph differs in a way that would produce
+/// plausible, wrong output rather than an error. Those are exactly the files
+/// someone reaches for a workaround over — "it says `glm4`, and `glm-dsa` is
+/// supported, so surely…" — and exactly the ones where a workaround is worst.
+///
+/// The reasons are not new analysis: they were already written down beside the
+/// lists above, where only someone reading the source could find them. Saying
+/// them in the error is the whole point, because the person who needs them is
+/// holding a file that will not load and has no reason to open `loader.rs`.
+const KNOWN_UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "glm4",
+        "an ordinary GQA model; the supported 'glm-dsa' is a different graph \
+         (latent attention with a sparse indexer), not a newer version of this one",
+    ),
+    (
+        "glm4moe",
+        "an ordinary GQA model with routed experts; the supported 'glm-dsa' shares its \
+         name and not its graph",
+    ),
+    (
+        "kimi-linear",
+        "shares delta-net attention with the supported 'kimi-k3', but none of its \
+         cross-layer residuals, latent MoE or situ activation",
+    ),
+    (
+        "phi2",
+        "a different shape from the supported 'phi3': LayerNorm rather than RMSNorm, \
+         GELU rather than SwiGLU, parallel attention and FFN branches, biases throughout",
+    ),
+    (
+        "phimoe",
+        "the supported 'phi3' attention block with routed experts, which that module \
+         has no path for",
+    ),
+    (
+        "nemotron",
+        "an ordinary transformer, unrelated to the supported 'nemotron_h_moe' despite the \
+         shared name",
+    ),
+];
 
 pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LLAMA_STYLE_ARCHITECTURES.contains(&architecture) {
@@ -278,6 +326,22 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     }
     if NEMOTRON_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::NemotronHMoe);
+    }
+    // A recognised near miss gets its own reason. The alternative — dropping
+    // the reader into a list of fourteen names that looks like it *should*
+    // contain theirs — is what makes an out-of-tree alias mechanism sound
+    // attractive, and an alias is the one answer that produces wrong output
+    // instead of no output.
+    if let Some((_, why)) = KNOWN_UNSUPPORTED
+        .iter()
+        .find(|(name, _)| *name == architecture)
+    {
+        bail!(
+            "architecture '{architecture}' is recognised but not supported: {why}. \
+             Serving it needs its own forward pass, verified against a real checkpoint — \
+             see doc/ENGINE.md. Pointing this file at a similar architecture would load \
+             and generate confident nonsense."
+        );
     }
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
@@ -983,6 +1047,18 @@ pub(crate) fn shard_paths(path: &Path, gguf: &GgufFile) -> Result<Vec<std::path:
     Ok(paths)
 }
 
+/// The block index in a `blk.<i>.<...>` tensor name, or `None` for a tensor
+/// that belongs to no block (`token_embd`, `output_norm`, `output`).
+///
+/// Lives here rather than in `engine::plan` because both need it and this is
+/// the module the other one already depends on: a plan reads it off a GGUF
+/// tensor table, `resident_tensor_sizes` reads it off a loaded model, and the
+/// two must agree about which block a tensor belongs to or their byte totals
+/// will not.
+pub(crate) fn block_index(name: &str) -> Option<usize> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
 impl LoadedModel {
     /// Every tensor's `(name, ggml_type)`, across **every** shard — unlike
     /// walking a single [`GgufFile`]'s directory, which for a split model
@@ -1092,6 +1168,44 @@ impl LoadedModel {
         self.tensors
             .iter()
             .map(|(name, loc)| (name.as_str(), loc.len as u64))
+    }
+
+    /// The first `blk.<n>` index belonging to a trailing multi-token-
+    /// prediction block, or `None` when the file declares none — which is
+    /// most files.
+    ///
+    /// `block_count` counts the MTP block, and the architectures that can
+    /// load such a file (`glm`, `deepseek4`, `nemotron`, and the shared
+    /// `qwen_hybrid` trunk) all stop before it, so its tensors are mapped and
+    /// never read. See `engine::plan`'s `trunk_block_count`, which asks the
+    /// same question of a GGUF nobody has opened.
+    pub fn draft_block_start(&self) -> Option<usize> {
+        let n_draft = self
+            .metadata_u64("nextn_predict_layers")
+            .filter(|&n| n > 0)?;
+        self.metadata_u64("block_count")?
+            .checked_sub(n_draft)
+            .map(|n| n as usize)
+    }
+
+    /// [`tensor_sizes`](Self::tensor_sizes) without the tensors nothing ever
+    /// loads — the trailing draft block.
+    ///
+    /// The right input for every memory question, and the reason it is a
+    /// separate accessor rather than a change to `tensor_sizes`: those bytes
+    /// really are in the file, so a caller asking what the *file* holds
+    /// should still see them. A caller asking what a *run* holds should not.
+    /// Counting them made `orangu-server` report `weights 21.30 GiB on
+    /// device` for a model whose plan said 21.0 GiB, the 0.3 GiB difference
+    /// being a block the forward pass never reaches.
+    pub fn resident_tensor_sizes(&self) -> impl Iterator<Item = (&str, u64)> {
+        let draft_start = self.draft_block_start();
+        self.tensor_sizes().filter(move |(name, _)| {
+            let Some(start) = draft_start else {
+                return true;
+            };
+            block_index(name).is_none_or(|block| block < start)
+        })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -1744,12 +1858,15 @@ mod tests {
         }
     }
 
-    /// The dense sibling and the unrelated older `nemotron` share a name
-    /// prefix but not this module's block structure, so a prefix match would
-    /// promise a load that then fails on the first missing tensor.
+    /// The dense sibling now loads through the same module — it is the same
+    /// trunk with a two-matrix FFN — but the unrelated older `nemotron` still
+    /// must not, sharing a name prefix and none of the block structure.
     #[test]
-    fn resolve_arch_family_rejects_the_other_nemotron_architectures() {
-        assert!(resolve_arch_family("nemotron_h").is_err());
+    fn the_dense_sibling_loads_and_the_unrelated_nemotron_does_not() {
+        assert_eq!(
+            resolve_arch_family("nemotron_h").unwrap(),
+            ArchFamily::NemotronHMoe
+        );
         assert!(resolve_arch_family("nemotron").is_err());
     }
 
@@ -1758,6 +1875,57 @@ mod tests {
         for arch in QWEN3NEXT_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen3Next);
         }
+    }
+
+    /// Every near miss refuses with **its own** reason, naming the family it
+    /// is not.
+    ///
+    /// A bare "not supported" is what makes an out-of-tree alias mechanism
+    /// look attractive, and an alias is the one answer here that produces
+    /// wrong output rather than no output: these graphs differ in ways no
+    /// structural check catches, because they have the tensors the similar
+    /// architecture expects.
+    #[test]
+    fn a_recognised_near_miss_refuses_with_the_reason_rather_than_a_list() {
+        for (name, _) in KNOWN_UNSUPPORTED {
+            let err = resolve_arch_family(name).unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: {err}");
+            assert!(
+                err.contains("recognised but not supported"),
+                "{name} fell through to the generic list: {err}"
+            );
+            // The message has to say what to do, not only what went wrong.
+            assert!(err.contains("doc/ENGINE.md"), "{name}: {err}");
+            assert!(
+                err.contains("real checkpoint"),
+                "{name} must say why it cannot simply be aliased: {err}"
+            );
+        }
+    }
+
+    /// **The test that keeps the table from going stale.** Adding support for
+    /// one of these means deleting its entry; leaving both would make
+    /// `resolve_arch_family` answer "supported" while the error text still
+    /// explains why it is not.
+    #[test]
+    fn nothing_is_both_supported_and_listed_as_a_near_miss() {
+        for (name, _) in KNOWN_UNSUPPORTED {
+            assert!(
+                resolve_arch_family(name).is_err(),
+                "'{name}' is supported now — remove it from KNOWN_UNSUPPORTED"
+            );
+        }
+    }
+
+    /// A name nobody has heard of still gets the list. The near-miss table is
+    /// an addition to that path, not a replacement for it.
+    #[test]
+    fn an_entirely_unknown_architecture_still_gets_the_supported_list() {
+        let err = resolve_arch_family("not-a-real-architecture")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not yet supported"), "{err}");
+        assert!(err.contains("llama"), "the list is still there: {err}");
     }
 
     #[test]
@@ -1789,8 +1957,14 @@ mod tests {
     #[test]
     fn resolve_arch_family_rejects_other_phi_architectures() {
         for arch in ["phi2", "phimoe"] {
-            let err = resolve_arch_family(arch).unwrap_err();
-            assert!(err.to_string().contains("not yet supported"), "{err}");
+            let err = resolve_arch_family(arch).unwrap_err().to_string();
+            // Rejected is the property; the wording is whichever refusal
+            // applies. Both are recognised near misses, so both name their
+            // own reason rather than falling through to the generic list —
+            // see `KNOWN_UNSUPPORTED`.
+            assert!(err.contains(arch), "{err}");
+            assert!(err.contains("not supported"), "{err}");
+            assert!(err.contains("phi3"), "names the family it is not: {err}");
         }
     }
 

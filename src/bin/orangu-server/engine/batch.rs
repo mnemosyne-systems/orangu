@@ -48,7 +48,7 @@
 //! can re-check. Otherwise it waits on the condvar (bounded by `POLL_
 //! INTERVAL`, so it always re-checks the deadline even if no notification
 //! ever arrives) and loops. Every request either becomes a leader itself
-//! or gets swept up by one within `MAX_BATCH_WAIT` of when it first
+//! or gets swept up by one within `max_batch_wait()` of when it first
 //! arrived — no participant can wait past that bound, and no batch can
 //! grow forever waiting for stragglers, since the deadline is fixed the
 //! moment the *first* request in a fresh window arrives, never extended by
@@ -67,7 +67,51 @@ use super::scheduler::SlotPool;
 /// many sequences joined — bounds every request's added latency from
 /// going through the coordinator instead of calling `forward_maybe_
 /// sampling` directly.
-const MAX_BATCH_WAIT: Duration = Duration::from_millis(4);
+const MAX_BATCH_WAIT_DEFAULT_MS: u64 = 4;
+
+/// [`MAX_BATCH_WAIT_DEFAULT_MS`], overridable with `ORANGU_BATCH_WAIT_MS`.
+///
+/// A knob because the default turned out to decide the answer rather than
+/// tune it. Measured with 32 concurrent streams: each sequence produces a
+/// token roughly every 500 ms under that much contention, so arrivals are
+/// ~16 ms apart and a 4 ms window catches almost none of them — **mean batch
+/// size 1.6 to 2.2**. The comparison that concluded "fused batching is
+/// slower" was therefore not measuring fused batching; it was measuring
+/// unbatched decode plus a rendezvous.
+/// Running mean batch size, reported at shutdown.
+///
+/// A fused-batching measurement is only interpretable next to the batch sizes
+/// it actually achieved — the first run of this A/B looked like "batching is
+/// 3% slower" and was really "batching did not happen".
+static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BATCHED_SEQS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_batch_size(n: usize) {
+    use std::sync::atomic::Ordering;
+    BATCHES.fetch_add(1, Ordering::Relaxed);
+    BATCHED_SEQS.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+/// `(batches, sequences, mean batch size)` since start, or `None` when the
+/// coordinator never ran.
+pub fn batch_stats() -> Option<(u64, u64, f64)> {
+    use std::sync::atomic::Ordering;
+    let batches = BATCHES.load(Ordering::Relaxed);
+    let seqs = BATCHED_SEQS.load(Ordering::Relaxed);
+    (batches > 0).then(|| (batches, seqs, seqs as f64 / batches as f64))
+}
+
+fn max_batch_wait() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        crate::engine::backend::env_tuning_value(
+            "ORANGU_BATCH_WAIT_MS",
+            MAX_BATCH_WAIT_DEFAULT_MS,
+            "a positive number of milliseconds",
+            |ms| ms > 0,
+        )
+    }))
+}
 /// How often a waiting thread re-checks the batch/deadline state — short
 /// enough that a batch closes promptly once its target size or deadline
 /// is reached, long enough not to spin.
@@ -144,7 +188,7 @@ impl BatchCoordinator {
         let (tx, rx) = mpsc::channel();
         let mut guard = self.state.lock().expect("batch coordinator mutex poisoned");
         if guard.pending.is_empty() {
-            guard.deadline = Some(Instant::now() + MAX_BATCH_WAIT);
+            guard.deadline = Some(Instant::now() + max_batch_wait());
         }
         guard.pending.push((req, tx));
         self.cv.notify_all();
@@ -180,6 +224,7 @@ impl BatchCoordinator {
             });
             if become_leader {
                 let batch: Vec<_> = guard.pending.drain(..).collect();
+                record_batch_size(batch.len());
                 guard.deadline = None;
                 drop(guard);
                 Self::process_batch(model, batch);
