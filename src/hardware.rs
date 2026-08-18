@@ -808,66 +808,33 @@ fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
 
-/// Best-effort, read-only check for machine power settings that cap
-/// throughput on a latency-critical, bursty decode loop: a scaling CPU
-/// frequency governor (which lets a core drop its clock during the GPU
-/// wait between tokens) and an AMD GPU left in an auto/low power state
-/// (which lets the core clock idle down between submissions). Returns one
-/// advisory line per finding, each including the command to fix it — the
-/// server can't change these itself (they're root-owned `sysfs`), so it
-/// only reports them. Empty when everything is already at maximum, on
-/// non-Linux, or when the files aren't present.
+/// The CPU's scaling frequency governor, capitalized for display
+/// (`Performance`, `Powersave`, `Schedutil`, …), or `None` on a platform or
+/// a kernel that does not expose one.
+///
+/// A *state* rather than an advisory, and reported as one: the server prints
+/// it on its startup banner alongside the rest of what it resolved, because
+/// the governor decides whether a core holds its clock through the bursty
+/// CPU work between GPU submissions — which is most of what decode latency
+/// is. `Performance` is the answer that makes a throughput number
+/// comparable; anything else is worth seeing *before* reading one, not only
+/// when something is already wrong.
+///
+/// Changing it is `sudo cpupower frequency-set -g performance`, which this
+/// process cannot do for itself: the file is root-owned `sysfs`.
 #[cfg(target_os = "linux")]
-pub fn performance_advisories() -> Vec<String> {
-    let mut out = Vec::new();
-
-    if let Ok(gov) =
-        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-    {
-        let gov = gov.trim();
-        if !gov.is_empty() && gov != "performance" {
-            out.push(format!(
-                "CPU frequency governor is '{gov}', not 'performance'. Decode is latency-bound on \
-                 bursty CPU work between GPU submissions; pinning it raises throughput. Fix: \
-                 sudo cpupower frequency-set -g performance"
-            ));
-        }
-    }
-
-    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-        let mut cards: Vec<_> = entries
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
-            })
-            .collect();
-        cards.sort_by_key(|e| e.file_name());
-        for e in cards {
-            let path = e.path().join("device/power_dpm_force_performance_level");
-            if let Ok(level) = std::fs::read_to_string(&path) {
-                let level = level.trim();
-                // "auto"/"low" let the core clock idle down; "high"/"manual"
-                // /"profile_*" hold it up. Only warn on the idling ones.
-                if level == "auto" || level == "low" {
-                    out.push(format!(
-                        "GPU {} power level is '{level}', not 'high'. Its core clock can idle down \
-                         between tokens. Fix: echo high | sudo tee {}",
-                        e.file_name().to_string_lossy(),
-                        path.display()
-                    ));
-                }
-            }
-        }
-    }
-
-    out
+pub fn cpu_governor() -> Option<String> {
+    let raw =
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").ok()?;
+    let raw = raw.trim();
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().collect::<String>() + chars.as_str())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn performance_advisories() -> Vec<String> {
-    Vec::new()
+pub fn cpu_governor() -> Option<String> {
+    None
 }
 
 /// How close to its critical threshold a sensor has to be before the report
@@ -884,12 +851,15 @@ const THERMAL_ADVISORY_FRACTION: f32 = 0.9;
 /// on. Empty when there is nothing to say, which is the normal case on a
 /// plugged-in machine that is not already hot.
 ///
-/// Separate from [`performance_advisories`] because the two are different
-/// kinds of finding. Those are settings, they are Linux-only, and every one
-/// of them ships the `sudo` line that fixes it. These are conditions: they
-/// hold on every platform, and neither of them has a command as an answer —
-/// one is answered by a cable and the other by airflow. Reporting them
-/// together and fixing neither is the honest arrangement.
+/// These are the only advisories left, and they are *conditions*: they hold
+/// on every platform, and neither has a command as an answer — one is
+/// answered by a cable and the other by airflow. The **settings** that used
+/// to print beside them do not, because both have somewhere better to be: a
+/// scaling CPU governor is [`cpu_governor`], a banner row with a value on
+/// every start, and an AMD card left at `power_dpm_force_performance_level
+/// = auto` is documented rather than warned about, since a machine with
+/// several cards printed a line per card on every start to say the same
+/// thing about each. See `doc/SERVER.md`.
 pub fn power_advisories(power: &PowerInfo) -> Vec<String> {
     let mut out = Vec::new();
 
@@ -1074,6 +1044,59 @@ pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo], power: &Power
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The governor is a banner *value*, so it is capitalized for display
+    /// and reported whatever it says — including `Performance`, which the
+    /// advisory it replaced could only communicate by staying silent.
+    ///
+    /// On a machine with no `cpufreq` (every non-Linux target, and some
+    /// virtualized Linux ones) there is no row at all rather than a made-up
+    /// one.
+    #[test]
+    fn the_cpu_governor_is_reported_as_a_capitalized_value_or_not_at_all() {
+        // `None` on a box with no cpufreq, where the banner prints no row
+        // and there is nothing to assert.
+        if let Some(governor) = cpu_governor() {
+            assert!(!governor.is_empty());
+            assert!(
+                governor.starts_with(|c: char| c.is_uppercase()),
+                "governor {governor:?} should be capitalized for the banner"
+            );
+            assert!(
+                !governor.ends_with('\n'),
+                "governor {governor:?} still carries sysfs's trailing newline"
+            );
+        }
+    }
+
+    /// Every remaining advisory is a *condition* — something no command
+    /// answers. The machine settings that used to print beside them are a
+    /// banner row and a manual page now, so an advisory naming one would be
+    /// saying it twice.
+    ///
+    /// Checked against a machine that is both on battery and hot, so the
+    /// two conditions really are produced and this is not asserting over an
+    /// empty list.
+    #[test]
+    fn advisories_are_conditions_only_and_never_repeat_a_machine_setting() {
+        let power = PowerInfo {
+            source: PowerSource::Battery,
+            battery_percent: Some(31),
+            thermals: vec![ThermalInfo {
+                label: "k10temp Tctl".to_string(),
+                celsius: 95.0,
+                critical_celsius: Some(100.0),
+            }],
+        };
+        let advisories = power_advisories(&power);
+        assert_eq!(advisories.len(), 2, "{advisories:?}");
+        for advisory in &advisories {
+            assert!(
+                !advisory.contains("frequency governor") && !advisory.contains("power level"),
+                "a machine setting leaked back into an advisory: {advisory}"
+            );
+        }
+    }
 
     fn gpu(memory_kind: MemoryKind, vram_total_bytes: Option<u64>) -> GpuInfo {
         GpuInfo {

@@ -96,7 +96,10 @@ GPU
 Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
 API        http://0.0.0.0:8100
+API key    No
+TLS        No
 Workspace  /home/user/src/orangu
+Frequency  Powersave
 ```
 
 The model line names the model as `MODEL:QUANT` — the quantization the
@@ -108,6 +111,47 @@ ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `Metal/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
 was used (see **GPU backend** below). The workspace line is the directory
 tree this server operates in (see **Workspace** below).
+
+`API key` and `TLS` are the two deployment gates, each simply `Yes` or `No`,
+reported on every start rather than only when something is missing — a row
+that always has a value is one you can check, where a warning that appears
+conditionally is one you learn to expect the absence of. Read them against
+the address on the line above: two `No`s beside a loopback bind are the
+default and are fine, and the same two beside `0.0.0.0` mean the machine is
+serving an inference engine to the network unauthenticated and in the clear.
+`api_key` and `tls_cert`/`tls_key` under **Configuration** below are the
+settings that answer them.
+
+`Frequency` is the CPU's scaling governor: it decides whether a core holds
+its clock through the bursty CPU work between GPU submissions, so
+`Performance` is what makes a throughput number comparable and anything else
+is worth seeing before reading one. Change it with `sudo cpupower
+frequency-set -g performance`; the server cannot, the file being root-owned
+`sysfs`. On a machine with no `cpufreq` at all the row is absent rather than
+guessed.
+
+An AMD GPU has the same kind of setting and it is **not** on the banner:
+`power_dpm_force_performance_level`, which at its default `auto` lets the
+core clock idle down between submissions — and decode submits in short
+bursts with gaps, which is exactly the pattern that setting reads as idle.
+Check it per card and pin it before measuring anything:
+
+```sh
+cat /sys/class/drm/card1/device/power_dpm_force_performance_level
+echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level
+```
+
+`auto` and `low` let the clock drop; `high`, `manual` and the `profile_*`
+levels hold it up. Card numbering is the kernel's, not this server's — a
+machine with a discrete card and an integrated one has both, and only the
+card actually serving the model matters (the GPU listing above the banner
+names the one that was taken). The setting does not survive a reboot.
+
+The server does not change it — the file is root-owned — and no longer
+warns about it either: it used to print one `Note` per card on every start,
+which on a machine with a discrete card and an integrated one is two lines
+saying the same thing, every time, whether or not the card in question was
+the one serving the model.
 
 Every completed request logs a throughput line, orangu-server-style:
 
@@ -340,11 +384,13 @@ declares one. Temperatures come from `sysinfo`; the power source does not
 `GetSystemPowerStatus` on Windows. The whole section is omitted where
 neither is known, which is normal in a container.
 
-At startup the same data drives `Note` lines: one when running on battery,
-and one when a sensor is already within a tenth of a critical threshold the
-platform declared. Neither has a command as a fix, unlike the CPU-governor
-and GPU-power-level notes beside them, which is why they are reported
-separately.
+At startup the same data drives the `Note` lines: one when running on
+battery, and one when a sensor is already within a tenth of a critical
+threshold the platform declared. Those two are all that remain — they are
+*conditions*, and neither has a command as a fix. The machine *settings*
+that once printed beside them are elsewhere now: the CPU governor is the
+banner's `Frequency` row, and AMD GPU power levels are documented under
+**Quick start**, beside it, rather than reprinted per card on every start.
 
 ### `suggest`: a hardware-based model-size suggestion
 
@@ -741,7 +787,10 @@ Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, CPU/AVX2, 30 layers,
 Bundled    2.89 GiB embedded in /home/you/orangu-server-bundle-x86_64
 UI         http://127.0.0.1:8200
 API        http://127.0.0.1:8100
+API key    No
+TLS        No
 Workspace  /home/you
+Frequency  Performance
 ```
 
 That is the whole point: one file to copy to a machine, and a working

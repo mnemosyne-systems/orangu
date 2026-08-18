@@ -95,7 +95,10 @@ GPU
 Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
 API        http://0.0.0.0:8100
+API key    No
+TLS        No
 Workspace  /home/user/src/orangu
+Frequency  Powersave
 Note       Running on battery (64% remaining). Sustained decode is exactly the workload
            platform power management clocks down, so throughput here is not what this
            machine does on mains — and a long generation will empty the battery. Plug in
@@ -114,18 +117,61 @@ lists every device it saw and marks the one it took — see **Choosing a
 device**. The workspace line is the directory
 tree this server operates in (see **Workspace** below).
 
-`Note` lines are machine state that will hold throughput down, printed
-only when there is something to say — a clean, plugged-in, cool machine
-prints none. They come in two kinds. **Settings** are things the machine
-has been configured to do and you can configure back: a CPU frequency
-governor that lets a core drop its clock during the GPU wait between
-tokens, or a GPU left in an auto power state that lets its core clock idle
-down between submissions. Each of those carries the command that fixes it,
-because the server can't — they're root-owned. **Conditions** are things no
-command fixes: running on battery, and a component already close to its
-critical temperature before any work has started. Those are printed
-because they explain a slow number that would otherwise look like the
-engine's fault.
+`API key` and `TLS` are the two deployment gates, each simply `Yes` or `No`,
+reported on every start rather than only when something is missing — a row
+that always has a value is one you can check, where a warning that appears
+conditionally is one you learn to expect the absence of. Read them against
+the address on the line above: two `No`s beside a loopback bind are the
+default and are fine, and the same two beside `0.0.0.0` mean the machine is
+serving an inference engine to the network unauthenticated and in the clear.
+`api_key` and `tls_cert`/`tls_key` under **Configuration** below are the
+settings that answer them.
+
+`Frequency` is the CPU's scaling governor: it decides whether a core holds
+its clock through the bursty CPU work between GPU submissions, so
+`Performance` is what makes a throughput number comparable and anything else
+is worth seeing before reading one. Change it with `sudo cpupower
+frequency-set -g performance`; the server cannot, the file being root-owned
+`sysfs`. On a machine with no `cpufreq` at all the row is absent rather than
+guessed.
+
+An AMD GPU has the same kind of setting and it is **not** on the banner:
+`power_dpm_force_performance_level`, which at its default `auto` lets the
+core clock idle down between submissions — and decode submits in short
+bursts with gaps, which is exactly the pattern that setting reads as idle.
+Check it per card and pin it before measuring anything:
+
+```sh
+cat /sys/class/drm/card1/device/power_dpm_force_performance_level
+echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level
+```
+
+`auto` and `low` let the clock drop; `high`, `manual` and the `profile_*`
+levels hold it up. Card numbering is the kernel's, not this server's — a
+machine with a discrete card and an integrated one has both, and only the
+card actually serving the model matters (the GPU listing above the banner
+names the one that was taken). The setting does not survive a reboot.
+
+The server does not change it — the file is root-owned — and no longer
+warns about it either: it used to print one `Note` per card on every start,
+which on a machine with a discrete card and an integrated one is two lines
+saying the same thing, every time, whether or not the card in question was
+the one serving the model.
+
+`Note` lines are machine *conditions* that will hold throughput down,
+printed only when there is something to say — a clean, plugged-in, cool
+machine prints none. There are two: running on battery, and a component
+already close to its critical temperature before any work has started.
+Neither has a command as a fix — one is answered by a cable and the other
+by airflow — and both are printed because they explain a slow number that
+would otherwise look like the engine's fault.
+
+Machine *settings* are not notes. They have a value on every start rather
+than only on the starts where they are wrong, so printing them as warnings
+meant the reader saw nothing on a well-configured machine and a wall of
+repeated text on a badly-configured one. The CPU governor is the
+`Frequency` row above; AMD GPU power levels are documented above rather
+than printed, one line per card, every time the server starts.
 
 The thermal note fires only against a threshold the platform itself
 declares, and only within a tenth of it. Most sensors declare none, so a
@@ -719,7 +765,10 @@ Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, CPU/AVX2, 30 layers,
 Bundled    2.89 GiB embedded in /home/you/orangu-server-bundle-x86_64
 UI         http://127.0.0.1:8200
 API        http://127.0.0.1:8100
+API key    No
+TLS        No
 Workspace  /home/you
+Frequency  Performance
 ```
 
 One file to copy to a machine, and a working OpenAI-compatible server on it.
@@ -984,7 +1033,8 @@ reexec = yes
   Both or neither: setting one alone is a startup error rather than a
   half-enabled server, because the alternative is serving in the clear while
   the config looks like it does not. The banner then reads `API
-  https://…`, and a certificate that will not load is a startup failure naming
+  https://…` and `TLS Yes`, and a certificate that will not load is a
+  startup failure naming
   the file — a server that quietly fell back to plain HTTP because a key was
   unreadable is the failure worth being loud about. Any PEM key works
   (PKCS#8, PKCS#1 or SEC1), since which one a tool emits is not something you
@@ -1001,7 +1051,9 @@ reexec = yes
   which leaves the server open; that is right for the loopback address it also
   defaults to, and becomes wrong the moment `host` is widened. Nothing about
   binding to a network should silently also mean publishing an inference
-  engine, so set this whenever you set `host`. Clients send it as
+  engine, so set this whenever you set `host`. The startup banner's `API key`
+  row reports which it is on every start, `Yes` or `No`, on the line under
+  the address it gates. Clients send it as
   `Authorization: Bearer <key>` — the orangu client already does, from its own
   `api_key`, and so does every OpenAI-shaped client. **`ORANGU_API_KEY`
   overrides the file**, which is the spelling a real deployment wants: a

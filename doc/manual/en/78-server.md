@@ -768,11 +768,17 @@ adapter nor a draining battery is a desktop, a server, or a container, and
 all three answer `Mains`: every caller is really asking "is my power about
 to run out".
 
-`power_advisories` is kept separate from `performance_advisories` because
-the two are different kinds of finding. Those are settings, Linux-only, and
-each ships the `sudo` line that fixes it. These are conditions, hold on
-every platform, and neither has a command as an answer — one is answered by
-a cable and the other by airflow. The thermal one fires only against a
+`power_advisories` is the only advisory source left, and everything it
+returns is a *condition*: it holds on every platform, and neither of its two
+findings has a command as an answer — one is answered by a cable and the
+other by airflow. Machine *settings* used to sit beside them in a
+`performance_advisories` function that no longer exists, because a setting
+has a value on every start and an advisory can only speak when that value is
+wrong. The CPU governor became `cpu_governor`, a banner row; AMD's
+`power_dpm_force_performance_level` became a documented check, since a
+machine with a discrete card and an integrated one printed a line per card,
+on every start, to say the same thing about each. The thermal one fires only
+against a
 threshold the platform itself declared and only within
 `THERMAL_ADVISORY_FRACTION` of it, which means a hot sensor that declares no
 threshold is reported in the `POWER` section and never warned about. That is

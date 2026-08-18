@@ -1455,6 +1455,19 @@ fn vocabulary_mismatch(target: &Tokenizer, draft: &Tokenizer) -> Option<String> 
 /// loads two models and the second must go through exactly the same
 /// construction as the first — an architecture reachable as the served model
 /// but not as a draft would be a gap nothing announced.
+/// One startup-banner deployment gate: `Yes` when it is configured, `No`
+/// when it is not.
+///
+/// Just the value, on every start, whatever the bind — the banner is a
+/// table of what this server resolved, and a row that sometimes carries
+/// advice is not a table. What to do about a `No` is in the manual, under
+/// `api_key` and `tls_cert`/`tls_key`; the line directly above these two is
+/// the bound address, which is the other half of the question and is
+/// already on screen.
+fn gate(configured: bool) -> &'static str {
+    if configured { "Yes" } else { "No" }
+}
+
 fn build_model(
     loaded: &engine::loader::LoadedModel,
     backend: &Arc<dyn Backend>,
@@ -1656,41 +1669,30 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // The bound address, not the configured `host`: `all` says nothing
         // about where to point a client, `0.0.0.0:8100` does.
         println!("API        {scheme}://{}", listener.local_addr()?);
+        // The two deployment gates, on the two lines under the address they
+        // are gates on, and printed on *every* start rather than only on the
+        // ones where they are missing. A row that always has a value is a
+        // thing a reader can check; a warning that appears conditionally is
+        // a thing they learn to expect the absence of. What a `No` costs and
+        // how to answer it is documented, not reprinted here — see `gate`.
+        println!("API key    {}", gate(has_api_key));
+        println!("TLS        {}", gate(tls_config.is_some()));
         println!("Workspace  {}", workspace.display());
-        // The two deployment gates, said once, where someone will see it.
-        //
-        // Binding to a network is a deliberate act; serving an inference
-        // engine on it unauthenticated and in the clear usually is not. The
-        // default is loopback precisely so this cannot happen by accident, so
-        // the only way to reach this line is to have widened `host` — at which
-        // point the omission is worth naming rather than leaving for someone
-        // to discover from the outside.
-        if !listener.local_addr()?.ip().is_loopback() {
-            // The fix names only what is actually absent, so the half of the
-            // note that *is* true is not easier to dismiss.
-            let key_fix = "[orangu-server].api_key (or ORANGU_API_KEY)";
-            let tls_fix = "tls_cert/tls_key, or terminate TLS in front of it";
-            let missing = match (has_api_key, tls_config.is_some()) {
-                (true, true) => None,
-                (false, true) => Some(("no authentication", format!("Set {key_fix}."))),
-                (true, false) => Some(("no TLS", format!("Set {tls_fix}."))),
-                (false, false) => Some((
-                    "no authentication and no TLS",
-                    format!("Set {key_fix}, and {tls_fix}."),
-                )),
-            };
-            if let Some((missing, fix)) = missing {
-                println!("Note       reachable off this machine with {missing}. {fix}");
-            }
+        // The governor is a *state*, not a finding: it has an answer on
+        // every machine, and `Performance` is as worth seeing as anything
+        // else — it is what makes the throughput numbers below it
+        // comparable. See `hardware::cpu_governor`.
+        if let Some(governor) = orangu::hardware::cpu_governor() {
+            println!("Frequency  {governor}");
         }
-        // Settings first, then conditions. The settings advisories each ship
-        // the command that fixes them and are therefore the ones worth acting
-        // on immediately; being on battery or already hot is context for
-        // whatever number the reader is about to see.
-        for advisory in orangu::hardware::performance_advisories()
-            .into_iter()
-            .chain(orangu::hardware::power_advisories(&power))
-        {
+        // What is left as a `Note` is *conditions* — on battery, or already
+        // near a critical temperature. Neither has a command as an answer,
+        // and both explain a slow number that would otherwise look like the
+        // engine's fault. The machine *settings* that used to print here are
+        // documented instead: the CPU governor is the `Frequency` row above,
+        // and GPU power levels are in the manual, where a line per card does
+        // not have to be reprinted on every start.
+        for advisory in orangu::hardware::power_advisories(&power) {
             println!("Note       {advisory}");
         }
     }
@@ -3611,10 +3613,19 @@ fn is_x86_feature_detected() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Command, DeviceClass, SplitReport, label_carries_tag, resolve_model_spec,
+        Args, Command, DeviceClass, SplitReport, gate, label_carries_tag, resolve_model_spec,
         resolve_workspace, terminal_title,
     };
     use crate::engine::placement::SplitPlan;
+
+    /// A deployment-gate row is a value and nothing else — the banner is a
+    /// table, and a cell that sometimes grows a sentence of advice is what
+    /// stops it being one. The advice lives in the manual.
+    #[test]
+    fn a_deployment_gate_row_is_only_yes_or_no() {
+        assert_eq!(gate(true), "Yes");
+        assert_eq!(gate(false), "No");
+    }
 
     fn report(layers: &[usize], classes: &[DeviceClass]) -> SplitReport {
         SplitReport {
