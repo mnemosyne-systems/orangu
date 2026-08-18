@@ -379,3 +379,127 @@ fn modern_chrome_draws_the_rounded_prompt_box() {
 
     crate::tui::Theme::apply_named("classic").expect("restore classic");
 }
+
+/// Render `/review` and return the rendered rows plus the buffer's cells.
+fn draw_review(
+    files: &[ReviewEntry],
+    line: usize,
+    scroll: usize,
+    commented: &[usize],
+    width: u16,
+    height: u16,
+) -> Terminal<TestBackend> {
+    let mut terminal = setup_test_terminal(width, height);
+    terminal
+        .draw(|frame| {
+            crate::tui::review_native::draw_review_screen(
+                frame,
+                ReviewScreenArgs {
+                    files,
+                    selected: 0,
+                    list_offset: 0,
+                    line,
+                    scroll,
+                    x_offset: 0,
+                    word_wrap: false,
+                    feedback: None,
+                    comment_editor: None,
+                    commented_lines: commented,
+                    current_model: "m",
+                    prompt_branch: None,
+                    input: "",
+                    cursor: 0,
+                    ghost: "",
+                    left_status: None,
+                    pending_count: 0,
+                    actual_width: width as usize,
+                    actual_height: height as usize,
+                },
+            );
+        })
+        .unwrap();
+    terminal
+}
+
+fn review_file(diff_lines: Vec<String>) -> ReviewEntry {
+    ReviewEntry {
+        path: "a.rs".to_string(),
+        status: ReviewStatus::Unreviewed,
+        diff_lines,
+        patch: String::new(),
+    }
+}
+
+/// The height scrolling is clamped against must be the height actually drawn,
+/// or the last rows of a diff can never be scrolled into view.
+#[test]
+fn review_diff_body_height_matches_the_rendered_pane() {
+    // The active theme selects the screen chrome, which reshapes the layout.
+    let _guard = crate::tui::theme::theme_test_guard();
+    for height in [12u16, 20, 30, 47] {
+        let lines: Vec<String> = (0..200).map(|i| format!("|{i}|")).collect();
+        let files = vec![review_file(lines.clone())];
+        let terminal = draw_review(&files, 0, 0, &[], 80, height);
+        let drawn = screen_rows(&terminal, 80, height)
+            .iter()
+            .filter(|row| lines.iter().any(|line| row.contains(line.as_str())))
+            .count();
+        assert_eq!(
+            drawn,
+            review_diff_body_height(height as usize, "", 80),
+            "rendered diff rows at height {height}"
+        );
+    }
+}
+
+/// Scrolled to the end, the final diff line has to be on screen.
+#[test]
+fn review_shows_the_last_diff_line_when_scrolled_to_the_end() {
+    // The active theme selects the screen chrome, which reshapes the layout.
+    let _guard = crate::tui::theme::theme_test_guard();
+    let (width, height) = (80u16, 24u16);
+    let lines: Vec<String> = (0..200).map(|i| format!("|{i}|")).collect();
+    let files = vec![review_file(lines.clone())];
+    let body = review_diff_body_height(height as usize, "", width as usize);
+    // The maximum scroll offset `ReviewState::clamp` allows.
+    let scroll = lines.len().saturating_sub(body);
+    let terminal = draw_review(&files, lines.len() - 1, scroll, &[], width, height);
+    let rows = screen_rows(&terminal, width, height);
+    assert!(
+        rows.iter().any(|row| row.contains("|199|")),
+        "last diff line missing:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The highlight has to cover the whole row, including the part of the line
+/// that follows an ANSI reset in the diff's own colors.
+#[test]
+fn review_cursor_line_is_highlighted_across_the_whole_row() {
+    // The active theme selects the screen chrome, which reshapes the layout.
+    let _guard = crate::tui::theme::theme_test_guard();
+    let (width, height) = (60u16, 16u16);
+    let files = vec![review_file(vec![
+        "\u{1b}[36m@@ -1,4 +1,5 @@\u{1b}[m fn foo() {".to_string(),
+        " context".to_string(),
+    ])];
+    let terminal = draw_review(&files, 0, 0, &[0], width, height);
+    let buffer = terminal.backend().buffer();
+    let row = screen_rows(&terminal, width, height)
+        .iter()
+        .position(|row| row.contains("@@ -1,4 +1,5 @@"))
+        .expect("cursor line not rendered") as u16;
+    let highlight = Theme::current().cursor_line_bg.bg.expect("no highlight bg");
+    // Columns 0 and `width - 1` are the pane border and the right pane.
+    let left = 1;
+    let right = width - crate::tui::review_right_width(&files, width as usize) as u16 - 1;
+    for x in left..right {
+        assert_eq!(
+            buffer.cell((x, row)).unwrap().bg,
+            highlight,
+            "column {x} of the highlighted row is not highlighted"
+        );
+    }
+    // The comment marker sits on the last column inside the pane.
+    assert_eq!(buffer.cell((right - 1, row)).unwrap().symbol(), "\u{25cf}");
+}

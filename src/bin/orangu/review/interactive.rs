@@ -117,11 +117,16 @@ impl ReviewState {
     }
 
     pub(crate) fn new(launch: ReviewLaunch) -> Self {
+        let line = launch
+            .files
+            .first()
+            .map(review_first_content_line)
+            .unwrap_or(0);
         Self {
             files: launch.files,
             selected: 0,
             list_offset: 0,
-            line: 0,
+            line,
             scroll: 0,
             x_offset: 0,
             feedback: None,
@@ -162,6 +167,22 @@ impl ReviewState {
         let max_scroll = Self::max_scroll_for_lines(self.selected_lines().len(), body_height);
         Self::apply_scroll_offset(&mut self.scroll, delta, max_scroll);
         self.line = self.line.min(self.selected_lines().len().saturating_sub(1));
+    }
+
+    /// Move the highlighted line a page at a time, taking the view with it so
+    /// the highlight keeps its place on screen.
+    pub(crate) fn page_diff(&mut self, delta: isize, body_height: usize) {
+        let last = self.selected_lines().len().saturating_sub(1);
+        self.line = self.line.saturating_add_signed(delta).min(last);
+        let max_scroll = Self::max_scroll_for_lines(self.selected_lines().len(), body_height);
+        self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
+        // At either end the two run out of room at different points; keep the
+        // highlight inside the pane.
+        if self.line < self.scroll {
+            self.scroll = self.line;
+        } else if body_height > 0 && self.line >= self.scroll + body_height {
+            self.scroll = self.line + 1 - body_height;
+        }
     }
 
     pub(crate) fn scroll_feedback(&mut self, delta: isize, body_height: usize) {
@@ -297,19 +318,27 @@ impl ReviewState {
     pub(crate) fn select_next(&mut self) {
         if self.selected + 1 < self.files.len() {
             self.selected += 1;
-            self.line = 0;
-            self.scroll = 0;
-            self.x_offset = 0;
+            self.reset_view();
         }
     }
 
     pub(crate) fn select_prev(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.line = 0;
-            self.scroll = 0;
-            self.x_offset = 0;
+            self.reset_view();
         }
+    }
+
+    /// Show the selected file from the top, with the highlight on the first
+    /// line of its content rather than on the diff preamble.
+    pub(crate) fn reset_view(&mut self) {
+        self.line = self
+            .files
+            .get(self.selected)
+            .map(review_first_content_line)
+            .unwrap_or(0);
+        self.scroll = 0;
+        self.x_offset = 0;
     }
 
     pub(crate) fn set_status(&mut self, status: ReviewStatus) {
@@ -378,42 +407,85 @@ fn review_findings_by_category(
     ordered.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     for comment in ordered {
         let index = comment.category.min(count - 1);
-        buckets[index].push(format!(
-            "**{}:{}**: {}",
-            comment.file,
-            review_comment_display_line(files, comment),
-            comment.text
-        ));
+        let location = match review_comment_display_line(files, comment) {
+            Some(line) => format!("{}:{line}", comment.file),
+            None => comment.file.clone(),
+        };
+        buckets[index].push(format!("**{location}**: {}", comment.text));
     }
     buckets
 }
 
-/// The 1-based line a comment is shown at: its **source-file** line, mapped from
-/// the diff position it was recorded against through the file's patch, or the
-/// diff position itself (`line + 1`) when the source line cannot be determined
-/// (e.g. no matching file, or a paged diff the position cannot be traced in).
-fn review_comment_display_line(files: &[ReviewEntry], comment: &ReviewComment) -> usize {
+/// The **source-file** line a comment is shown at, mapped from the diff row it
+/// was recorded against. `None` when that row shows no source line (a header
+/// row, or a rendering that cannot be traced back to the patch) — the location
+/// is then reported without a line rather than with the row's own index, which
+/// is not a line number and, through a pager, not even close to one.
+fn review_comment_display_line(files: &[ReviewEntry], comment: &ReviewComment) -> Option<usize> {
     files
         .iter()
         .find(|file| file.path == comment.file)
-        .and_then(|file| review_comment_source_line(&file.patch, comment.line))
-        .unwrap_or(comment.line + 1)
+        .and_then(|file| review_comment_source_line(file, comment.line))
 }
 
-/// The new-file source line for diff-line index `index` into a file's unified
-/// `patch` (the right side of the diff). New-file lines are counted across `@@`
-/// hunk headers, context, and `+` lines (a `-` line removes content and so
-/// occupies no new-file line). `None` when the index is before the first hunk or
-/// past the end of the patch.
-pub(crate) fn review_comment_source_line(patch: &str, index: usize) -> Option<usize> {
+/// Index of the first row of the file's own diff content — the first row below
+/// the `diff --git`/`index`/`---`/`+++` preamble and the hunk header, so the
+/// highlight starts on real code. Falls back to the top when no row can be
+/// traced back to the patch (a binary file, or an unrecognizable rendering).
+pub(crate) fn review_first_content_line(file: &ReviewEntry) -> usize {
+    review_row_source_lines(file)
+        .iter()
+        .position(Option::is_some)
+        .unwrap_or(0)
+}
+
+/// A vertical rule, the character a pager draws its gutters with.
+const GUTTER_RULE: char = '\u{2502}';
+
+/// The new-file source line each rendered diff row shows, or `None` for a row
+/// that shows none (the preamble, and any header a pager draws of its own).
+///
+/// `/review` renders each diff through the configured git pager, which is free
+/// to add rows, merge a removed and an added line onto one row, and wrap a long
+/// line over several — so a row's index says nothing about its position in the
+/// patch. Only two renderings can be read exactly, and anything else is left
+/// unmapped rather than guessed at: an unpaged diff, whose rows *are* the patch
+/// lines, and a pager that numbers its rows, where the row states its own line.
+fn review_row_source_lines(file: &ReviewEntry) -> Vec<Option<usize>> {
+    let rows: Vec<String> = file
+        .diff_lines
+        .iter()
+        .map(|line| visible_text(line))
+        .collect();
+    if is_unpaged_diff(&rows, &file.patch) {
+        return (0..rows.len())
+            .map(|index| patch_position_source_line(&file.patch, index))
+            .collect();
+    }
+    gutter_source_lines(&rows)
+}
+
+/// Whether the rendered rows are the patch's own lines: a hunk header is on
+/// screen and no row was added, merged or wrapped away.
+fn is_unpaged_diff(rows: &[String], patch: &str) -> bool {
+    rows.len() == patch.lines().count() && rows.iter().any(|row| row.starts_with("@@"))
+}
+
+/// The new-file source line for row `index` of an unpaged diff, counted through
+/// the patch: new-file lines advance across `@@` hunk headers, context and `+`
+/// lines (a `-` line removes content and so occupies no new-file line of its
+/// own, anchoring to the next one). `None` for a row above the first hunk, and
+/// for a hunk header itself.
+fn patch_position_source_line(patch: &str, index: usize) -> Option<usize> {
     let mut new_line = 0usize;
     let mut in_hunk = false;
     for (position, line) in patch.lines().enumerate() {
         if let Some(start) = review_hunk_new_start(line) {
             new_line = start;
             in_hunk = true;
+            // The hunk header is a header row: it shows no line of its own.
             if position == index {
-                return Some(new_line);
+                return None;
             }
             continue;
         }
@@ -424,10 +496,8 @@ pub(crate) fn review_comment_source_line(patch: &str, index: usize) -> Option<us
             continue;
         }
         match line.as_bytes().first() {
-            // A removed line has no new-file line; anchor to the next one.
             Some(b'-') if position == index => return Some(new_line.max(1)),
             Some(b'-') => {}
-            // Context, added, or any other body line occupies a new-file line.
             _ => {
                 if position == index {
                     return Some(new_line.max(1));
@@ -437,6 +507,133 @@ pub(crate) fn review_comment_source_line(patch: &str, index: usize) -> Option<us
         }
     }
     None
+}
+
+/// The line each row states in the gutter a pager numbered it with. A row whose
+/// new-file gutter is blank — a removed line, or a wrapped continuation — takes
+/// the line above it; the pager's own header rows, above every gutter, stay
+/// unmapped. All `None` when the rendering has no numbered gutters at all.
+fn gutter_source_lines(rows: &[String]) -> Vec<Option<usize>> {
+    let columns = gutter_columns(rows);
+    let Some(field) = new_file_gutter_field(rows, &columns) else {
+        return vec![None; rows.len()];
+    };
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut last = None;
+    for row in rows {
+        let line = gutter_fields(row, &columns)
+            .get(field)
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        if line.is_some() {
+            last = line;
+        }
+        lines.push(last);
+    }
+    lines
+}
+
+/// The character columns a pager's gutters sit at, taken across the whole file
+/// so that a vertical rule inside the content of one row cannot be mistaken for
+/// a gutter.
+fn gutter_columns(rows: &[String]) -> Vec<usize> {
+    let mut counts: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for row in rows {
+        for (column, character) in row.chars().enumerate() {
+            if character == GUTTER_RULE {
+                *counts.entry(column).or_default() += 1;
+            }
+        }
+    }
+    // Every gutter is drawn on every content row, so the busiest columns are
+    // the gutters; a rule inside one row's content never comes close.
+    let peak = counts.values().copied().max().unwrap_or(0);
+    let threshold = peak.div_ceil(2).max(2);
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold)
+        .map(|(column, _)| column)
+        .collect()
+}
+
+/// The text between each pair of gutter columns, in order.
+fn gutter_fields(row: &str, columns: &[usize]) -> Vec<String> {
+    let characters: Vec<char> = row.chars().collect();
+    columns
+        .windows(2)
+        .map(|pair| {
+            characters
+                .get(pair[0] + 1..pair[1])
+                .map(|slice| slice.iter().collect())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Which gutter field carries the new-file line: the last one that holds a
+/// number anywhere in the file. A pager prints the old-file line first and the
+/// new-file line last, whether it lays the two sides out side by side or puts
+/// both numbers in front of one column of text. `None` when no field is ever a
+/// number — a rendering with no line numbers to read.
+fn new_file_gutter_field(rows: &[String], columns: &[usize]) -> Option<usize> {
+    let mut field = None;
+    for row in rows {
+        for (index, value) in gutter_fields(row, columns).iter().enumerate() {
+            let value = value.trim();
+            if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+                field = Some(field.map_or(index, |current: usize| current.max(index)));
+            }
+        }
+    }
+    field
+}
+
+/// `line` with its ANSI escape sequences removed, so a colorized diff line can
+/// be matched on its text.
+fn visible_text(line: &str) -> String {
+    let mut text = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            text.push(ch);
+            continue;
+        }
+        // A CSI/OSC sequence runs to its terminating byte and draws nothing.
+        match chars.peek() {
+            Some(&'[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' || c == '@' {
+                        break;
+                    }
+                }
+            }
+            Some(&']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    text
+}
+
+/// The new-file source line the diff row at `index` of `file` shows — the line
+/// a comment recorded there belongs to. `None` when the row shows no source
+/// line of its own (the preamble, or a header the pager drew).
+pub(crate) fn review_comment_source_line(file: &ReviewEntry, index: usize) -> Option<usize> {
+    review_row_source_lines(file).get(index).copied().flatten()
 }
 
 /// The new-file start line of a unified-diff hunk header (`@@ -a,b +c,d @@`),
@@ -639,11 +836,22 @@ pub(crate) fn run_review_mode(
 ) -> Result<ReviewSignal> {
     let mut escape_cancel = EscapeCancelState::default();
     loop {
-        let body_height = review_pane_body_height(
-            viewport.actual_height,
-            input_state.as_str(),
-            viewport.actual_width,
-        );
+        // The feedback popup covers the whole pane area; the diff pane is
+        // three rows shorter (mode header plus its own borders). Clamping
+        // against the wrong one leaves the last rows of a diff unreachable.
+        let body_height = if state.feedback.is_some() {
+            review_pane_body_height(
+                viewport.actual_height,
+                input_state.as_str(),
+                viewport.actual_width,
+            )
+        } else {
+            review_diff_body_height(
+                viewport.actual_height,
+                input_state.as_str(),
+                viewport.actual_width,
+            )
+        };
         let right_width = orangu::tui::review_right_width(&state.files, viewport.actual_width);
         let left_width = viewport.actual_width.saturating_sub(right_width).max(1);
         state.clamp(body_height, left_width, viewport.actual_width);
@@ -663,7 +871,7 @@ pub(crate) fn run_review_mode(
         let prefix = orangu::tui::screen::prompt_prefix();
         let input_lines_count = orangu::tui::screen::wrapped_input_lines(
             input_state.as_str(),
-            viewport.actual_width,
+            orangu::tui::screen::input_wrap_width(viewport.actual_width),
             &prefix,
         )
         .len();
@@ -725,8 +933,7 @@ pub(crate) fn run_review_mode(
                             let file_index = list_start + click_y;
                             if file_index < state.files.len() {
                                 state.selected = file_index;
-                                state.line = 0;
-                                state.scroll = 0;
+                                state.reset_view();
                             }
                         }
                     }
@@ -887,17 +1094,18 @@ pub(crate) fn run_review_mode(
                     });
                 }
             }
-            // Left-pane scrolling (Alt+arrows / PageUp/Down), mirroring the
-            // main output window.
+            // Left-pane scrolling (Alt+arrows), mirroring the main output
+            // window: the view moves under the highlight.
             (KeyCode::Up, true, _) => state.scroll_diff(-1, body_height),
             (KeyCode::Down, true, _) => state.scroll_diff(1, body_height),
             (KeyCode::Left, true, _) => state.x_offset = state.x_offset.saturating_sub(1),
             (KeyCode::Right, true, _) => state.x_offset = state.x_offset.saturating_add(1),
-            (KeyCode::PageUp, _, _) => state.scroll_diff(
+            // A page at a time, the highlight travelling with the view.
+            (KeyCode::PageUp, _, _) => state.page_diff(
                 -(crate::input::page_scroll_lines(body_height) as isize),
                 body_height,
             ),
-            (KeyCode::PageDown, _, _) => state.scroll_diff(
+            (KeyCode::PageDown, _, _) => state.page_diff(
                 crate::input::page_scroll_lines(body_height) as isize,
                 body_height,
             ),
@@ -1023,6 +1231,110 @@ pub(crate) async fn run_review_request(
 mod tests {
 
     #[test]
+    fn the_highlight_starts_on_the_first_line_of_the_file() {
+        use crate::commands::ReviewLaunch;
+        use crate::review::{ReviewState, review_first_content_line};
+        use orangu::tui::{ReviewEntry, ReviewStatus};
+
+        let colored = |lines: &[&str]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|line| format!("\x1b[36m{line}\x1b[m"))
+                .collect()
+        };
+        let entry = |path: &str, lines: Vec<String>, patch: &str| ReviewEntry {
+            path: path.to_string(),
+            status: ReviewStatus::Unreviewed,
+            diff_lines: lines,
+            patch: patch.to_string(),
+        };
+
+        let patch = "diff --git a/a.c b/a.c\n\
+                     index 1111111..2222222 100644\n\
+                     --- a/a.c\n\
+                     +++ b/a.c\n\
+                     @@ -10,6 +10,7 @@ static int f(void)\n\
+                     \n\
+                     \n\
+                     int main(void)\n\
+                     +   return 0;\n";
+
+        // Unpaged (or `--color-only`): the line below the `@@` hunk header.
+        let plain = entry(
+            "a.c",
+            colored(&[
+                "diff --git a/a.c b/a.c",
+                "index 1111111..2222222 100644",
+                "--- a/a.c",
+                "+++ b/a.c",
+                "@@ -10,6 +10,7 @@ static int f(void)",
+                "",
+                "",
+                " int main(void)",
+                "+   return 0;",
+            ]),
+            patch,
+        );
+        assert_eq!(review_first_content_line(&plain), 5);
+
+        // A pager drawing its own headers and no `@@` line: anchor on the row
+        // showing the patch's first substantial line, then step back over the
+        // two blank lines above it.
+        let paged = entry(
+            "a.c",
+            colored(&[
+                "",
+                "Δ a.c",
+                "──────────────────────",
+                "",
+                "─────────────┐",
+                "• 10: static int f(void) │",
+                "─────────────┘",
+                "│ 10 │              │ 10 │",
+                "│ 11 │              │ 11 │",
+                "│ 12 │int main(void)│ 12 │int main(void)",
+                "│    │              │ 13 │   return 0;",
+            ]),
+            patch,
+        );
+        assert_eq!(review_first_content_line(&paged), 7);
+
+        // No hunk at all (a binary file): stay at the top.
+        assert_eq!(
+            review_first_content_line(&entry(
+                "x.bin",
+                colored(&["Binary files a/x.bin and b/x.bin differ"]),
+                "diff --git a/x.bin b/x.bin\nBinary files differ\n",
+            )),
+            0
+        );
+        // A hunk header with nothing after it: stay at the top.
+        assert_eq!(
+            review_first_content_line(&entry("a.c", colored(&["@@ -1 +1 @@"]), "@@ -1 +1 @@\n")),
+            0
+        );
+
+        let second = entry(
+            "b.c",
+            colored(&["diff --git a/b.c b/b.c", "@@ -1 +1 @@", "-old", "+new"]),
+            "diff --git a/b.c b/b.c\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let mut state = ReviewState::new(ReviewLaunch {
+            files: vec![paged, second],
+            immediate: false,
+            deep: false,
+        });
+        assert_eq!(state.line, 7, "opens on the first content line");
+        assert_eq!(state.scroll, 0, "the header is still shown above it");
+        state.select_next();
+        assert_eq!(
+            state.line, 2,
+            "switching file lands on its first content line"
+        );
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
     fn review_state_navigation_shows_only_selected_file_diff() {
         use crate::review::ReviewState;
         use orangu::tui::{ReviewEntry, ReviewStatus};
@@ -1126,6 +1438,58 @@ mod tests {
             state.cursor_down(body);
         }
         assert_eq!(state.line, 19);
+    }
+
+    #[test]
+    fn review_paging_moves_the_highlight_with_the_view() {
+        use crate::review::ReviewState;
+        use orangu::tui::{ReviewEntry, ReviewStatus};
+
+        let mut state = ReviewState {
+            files: vec![ReviewEntry {
+                path: "a.txt".to_string(),
+                status: ReviewStatus::Unreviewed,
+                diff_lines: (0..40).map(|i| format!("a {i}")).collect(),
+                patch: String::new(),
+            }],
+            selected: 0,
+            list_offset: 0,
+            line: 2,
+            scroll: 0,
+            x_offset: 0,
+            feedback: None,
+            comments: Vec::new(),
+            general_notes: Vec::new(),
+            comment_editor: None,
+        };
+
+        // A page down takes the highlight with it, at the same place on screen.
+        let body = 10;
+        state.page_diff(8, body);
+        assert_eq!(state.line, 10);
+        assert_eq!(state.scroll, 8);
+        assert_eq!(state.line - state.scroll, 2, "same row of the pane");
+
+        // And back up again.
+        state.page_diff(-8, body);
+        assert_eq!(state.line, 2);
+        assert_eq!(state.scroll, 0);
+
+        // At the top the view runs out first; the highlight stays inside it.
+        state.page_diff(-8, body);
+        assert_eq!(state.line, 0);
+        assert_eq!(state.scroll, 0);
+
+        // At the end the highlight reaches the last line and stays visible.
+        for _ in 0..10 {
+            state.page_diff(8, body);
+        }
+        assert_eq!(state.line, 39, "the last line of the diff");
+        assert_eq!(state.scroll, 30, "scrolled to the end");
+        assert!(
+            state.line >= state.scroll && state.line < state.scroll + body,
+            "the highlight is on screen"
+        );
     }
 
     #[test]
@@ -1340,11 +1704,14 @@ mod tests {
         use crate::review::{ReviewComment, review_exit_output};
         use orangu::tui::{ReviewEntry, ReviewStatus};
 
+        // An unpaged diff: the rendered rows are the patch's own lines, so a
+        // comment's row maps straight through to a source line.
+        let patch = "@@ -1,2 +1,3 @@\n ctx\n+x";
         let entry = |path: &str, status| ReviewEntry {
             path: path.to_string(),
             status,
-            diff_lines: vec!["+x".to_string()],
-            patch: String::new(),
+            diff_lines: patch.lines().map(str::to_string).collect(),
+            patch: patch.to_string(),
         };
 
         let files = vec![
@@ -1355,13 +1722,13 @@ mod tests {
         let comments = vec![
             ReviewComment {
                 file: "b.txt".to_string(),
-                line: 2,
+                line: 2,     // the `+x` row: new-file line 2
                 category: 2, // Security
                 text: "fix this".to_string(),
             },
             ReviewComment {
                 file: "a.txt".to_string(),
-                line: 0,
+                line: 1,     // the ` ctx` row: new-file line 1
                 category: 0, // Overall
                 text: "nit".to_string(),
             },
@@ -1389,7 +1756,7 @@ mod tests {
              \n\
              ## Security\n\
              \n\
-             - **b.txt:3**: fix this\n\
+             - **b.txt:2**: fix this\n\
              \n\
              ## Memory\n\
              \n\
@@ -1423,6 +1790,7 @@ mod tests {
     #[test]
     fn review_comment_source_line_maps_through_the_patch() {
         use crate::review::review_comment_source_line;
+        use orangu::tui::{ReviewEntry, ReviewStatus};
 
         let patch = "diff --git a/a.rs b/a.rs\n\
                      index 0000000..1111111 100644\n\
@@ -1433,14 +1801,62 @@ mod tests {
                       ctx2\n\
                      +added\n\
                       ctx3";
-        // The hunk starts at new-file line 5; the `+added` line sits at index 7.
-        assert_eq!(review_comment_source_line(patch, 5), Some(5)); // ctx1
-        assert_eq!(review_comment_source_line(patch, 6), Some(6)); // ctx2
-        assert_eq!(review_comment_source_line(patch, 7), Some(7)); // +added
-        assert_eq!(review_comment_source_line(patch, 8), Some(8)); // ctx3
-        // A position before the first hunk has no source line; an empty patch too.
-        assert_eq!(review_comment_source_line(patch, 0), None);
-        assert_eq!(review_comment_source_line("", 0), None);
+        let entry = |lines: Vec<String>| ReviewEntry {
+            path: "a.rs".to_string(),
+            status: ReviewStatus::Unreviewed,
+            diff_lines: lines,
+            patch: patch.to_string(),
+        };
+
+        // Unpaged: the rendered rows are the patch lines themselves.
+        let plain = entry(patch.lines().map(str::to_string).collect());
+        // The hunk starts at new-file line 5; the `+added` row sits at index 7.
+        assert_eq!(review_comment_source_line(&plain, 5), Some(5)); // ctx1
+        assert_eq!(review_comment_source_line(&plain, 6), Some(6)); // ctx2
+        assert_eq!(review_comment_source_line(&plain, 7), Some(7)); // +added
+        assert_eq!(review_comment_source_line(&plain, 8), Some(8)); // ctx3
+        // A row above the first hunk shows no source line; an empty patch too.
+        assert_eq!(review_comment_source_line(&plain, 0), None);
+        assert_eq!(
+            review_comment_source_line(
+                &ReviewEntry {
+                    path: "a.rs".to_string(),
+                    status: ReviewStatus::Unreviewed,
+                    diff_lines: vec!["x".to_string()],
+                    patch: String::new(),
+                },
+                0
+            ),
+            None
+        );
+
+        // Paged: the same patch through a pager that draws its own headers,
+        // numbers the rows, wraps a long line, and never emits `@@`. The row
+        // index no longer matches the patch position, but the mapping does.
+        let paged = entry(
+            [
+                "",
+                "Δ a.rs",
+                "──────────────",
+                "",
+                "──────────────┐",
+                "• 5: fn a() {  │",
+                "──────────────┘",
+                "│ 5 │ctx1      │ 5 │ctx1",
+                "│ 6 │ctx2      │ 6 │ctx2",
+                "│   │          │ 7 │added",
+                "│ 8 │ctx3      │ 8 │ctx3",
+            ]
+            .iter()
+            .map(|line| format!("\x1b[34m{line}\x1b[m"))
+            .collect(),
+        );
+        assert_eq!(review_comment_source_line(&paged, 0), None, "header row");
+        assert_eq!(review_comment_source_line(&paged, 6), None, "header row");
+        assert_eq!(review_comment_source_line(&paged, 7), Some(5));
+        assert_eq!(review_comment_source_line(&paged, 8), Some(6));
+        assert_eq!(review_comment_source_line(&paged, 9), Some(7));
+        assert_eq!(review_comment_source_line(&paged, 10), Some(8));
     }
 
     #[test]
@@ -1458,7 +1874,8 @@ mod tests {
         let files = vec![ReviewEntry {
             path: "a.rs".to_string(),
             status: ReviewStatus::Rejected,
-            diff_lines: vec!["@@".to_string()],
+            // Unpaged: the rendered rows are the patch's own lines.
+            diff_lines: patch.lines().map(str::to_string).collect(),
             patch: patch.to_string(),
         }];
         // The comment is recorded against diff index 3 (the `+line 7` line is the

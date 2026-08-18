@@ -164,7 +164,9 @@ fn draw_review_panes(
         horizontal: 1,
     });
     let body_height = left_inner_area.height as usize;
-    let right_body_height = right_area.height.saturating_sub(1) as usize;
+    // The right pane paragraph has one row of top padding and spends its
+    // first content row on the `Files` heading.
+    let right_body_height = right_area.height.saturating_sub(2) as usize;
 
     // Header Badges
     let mut header_spans = vec![Span::styled(
@@ -238,6 +240,11 @@ fn draw_review_panes(
                 format!(" {}", file.path),
                 Style::default().fg(theme.text_primary),
             ));
+
+            // Pad to the pane width so the selection bar spans the whole row.
+            let row_width = right_area.width.saturating_sub(2) as usize;
+            let used = right_spans.iter().map(|s| s.width()).sum::<usize>();
+            right_spans.push(Span::raw(" ".repeat(row_width.saturating_sub(used))));
 
             let mut line = Line::from(right_spans);
             if file_index == args.selected {
@@ -368,11 +375,14 @@ fn draw_review_panes(
                 }
 
                 if has_comment(diff_index) {
+                    // Reserve the last two columns for the marker so the row
+                    // still ends exactly on the pane's inner width.
                     let w = spans.iter().map(|s| s.width()).sum::<usize>();
-                    let pad =
-                        " ".repeat(
-                            left_area.width.saturating_sub(2).saturating_sub(w as u16) as usize
-                        );
+                    let pad = " ".repeat(
+                        (left_inner_area.width as usize)
+                            .saturating_sub(w)
+                            .saturating_sub(2),
+                    );
                     spans.push(Span::raw(pad));
                     spans.push(Span::raw(" "));
                     spans.push(Span::styled("●", theme.warning));
@@ -385,6 +395,15 @@ fn draw_review_panes(
                 let mut line = Line::from(spans);
                 if is_cursor {
                     line = line.style(theme.cursor_line_bg);
+                    // A reset in the diff's own color codes sets an explicit
+                    // background on every span after it, which would punch a
+                    // hole in the highlight; re-apply it span by span so the
+                    // row is highlighted end to end.
+                    if let Some(bg) = theme.cursor_line_bg.bg {
+                        for span in &mut line.spans {
+                            span.style = span.style.bg(bg);
+                        }
+                    }
                 }
                 left_lines.push(line);
             } else {

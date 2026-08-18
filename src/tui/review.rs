@@ -106,6 +106,16 @@ pub fn review_pane_body_height(actual_height: usize, input: &str, actual_width: 
         .max(1)
 }
 
+/// Number of diff rows visible in the left pane of `/review`: the scrollable
+/// area (`review_pane_body_height`), minus the second row of the mode header
+/// and the pane's own top and bottom border rows. Scrolling is clamped against
+/// this so the last lines of a diff can always be reached.
+pub fn review_diff_body_height(actual_height: usize, input: &str, actual_width: usize) -> usize {
+    review_pane_body_height(actual_height, input, actual_width)
+        .saturating_sub(3)
+        .max(1)
+}
+
 /// Width of the right (file list) pane: as small as possible while still
 /// fitting the longest full file path, capped so the left pane stays usable.
 pub fn review_right_width(files: &[ReviewEntry], actual_width: usize) -> usize {
@@ -116,7 +126,9 @@ pub fn review_right_width(files: &[ReviewEntry], actual_width: usize) -> usize {
         .map(|file| 4 + file.path.chars().count())
         .max()
         .unwrap_or(0);
-    let desired = longest.max("Files".chars().count());
+    // Plus the pane's one-column padding on each side, so the longest path is
+    // not clipped by two columns.
+    let desired = longest.max("Files".chars().count()) + 2;
     // Give the code (left pane) priority by capping the file list (right pane)
     // at 25% of the screen (or 25 columns on very small terminals).
     let cap = (actual_width / 4)
@@ -216,9 +228,11 @@ mod tests {
             review_entry("README.md", ReviewStatus::Unreviewed, &[]),
             review_entry("src/bin/orangu/main.rs", ReviewStatus::Approved, &[]),
         ];
+        // "[x] " prefix plus the path, plus the pane's one-column padding on
+        // each side.
         assert_eq!(
             review_right_width(&files, 200),
-            4 + "src/bin/orangu/main.rs".len()
+            4 + "src/bin/orangu/main.rs".len() + 2
         );
     }
 

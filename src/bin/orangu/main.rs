@@ -68,8 +68,8 @@ use orangu::{
         FEEDBACK_ERR, FEEDBACK_OK, ReviewCommentEditor, ReviewEntry, ReviewFeedbackView,
         ReviewScreenArgs, ReviewStatus, ScreenRenderArgs, StatusFragment, TabStatus,
         WorkspaceTabsView, auto_review_pane_body_height, render_thinking_status,
-        render_tool_running_status, render_working_status, review_pane_body_height,
-        terminal_height, terminal_width,
+        render_tool_running_status, render_working_status, review_diff_body_height,
+        review_pane_body_height, terminal_height, terminal_width,
     },
     workspaces::{normalize_path, resolve_workspace_root},
 };
