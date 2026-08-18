@@ -2394,7 +2394,7 @@ recognised:
 | :-- | :-- |
 | gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens) |
 | Qwen / Hermes | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
-| GLM | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` |
+| GLM, Ling 3.0 | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` (Ling spells all six delimiters as special tokens) |
 | Nemotron | `<tool_call><function=NAME><parameter=k>v</parameter>…</function></tool_call>` |
 | Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
 | Muse-Glimmer, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
@@ -2592,7 +2592,12 @@ weight normalization with two always-on shared ones), and Nemotron-H
 `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
 blocks are a *single* sub-layer each rather than the usual
 attention-plus-FFN pair: a selective state-space mixer, an unrotated
-attention, or a squared-ReLU mixture-of-experts FFN) — using
+attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
+(`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` — three-in-four Kimi
+Delta Attention layers alternating with gated, *rotated* absorbed latent
+attention, over sigmoid-routed experts whose selection is group-limited:
+the experts form `expert_group_count` groups and only the best
+`expert_group_used_count` of them may serve a token) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
@@ -2833,6 +2838,68 @@ Not implemented for this model: embeddings requests, and reporting its
 reasoning separately as `reasoning_content`. It reasons inline before
 answering, with no marker tokens around the reasoning, so a
 reasoning-suppressing role cannot separate the two.
+
+Ling 3.0 (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` and
+`bartowski/Ling-3.0-flash-GGUF`) runs on the CPU path only. Its trunk is a
+hybrid, and the file says so per layer: `attention.head_count_kv` is an
+*array*, and a `0` entry marks a recurrent Kimi Delta Attention layer while
+a nonzero one marks a full-attention layer. Three of the first for every one
+of the second, so on the 24-layer tiny model six layers carry a key/value
+cache and eighteen do not — a long conversation costs a quarter of the
+cache its context length suggests. Like every recurrent family here it has
+no per-position history to roll back, so the opt-in prompt-lookup
+speculative decoding is not available for this model.
+
+The delta-net layers are the same Kimi Delta Attention `unsloth/Kimi-K3-GGUF`
+uses, and they share one implementation with it: a short causal convolution
+`ssm.conv_kernel` taps wide over each of the query, key and value
+projections, then a delta rule whose state decays **per dimension** rather
+than by one scalar per head, then a gated per-head norm. What is specific
+here is the *safe gate* (`kda.safe_gate`): the log-decay is
+`kda.gate_lower_bound * sigmoid(..)` rather than an unbounded
+`-exp(A_log) * softplus(..)`, so the per-dimension decay lives strictly
+between `e^lower_bound` and 1 and cannot reach 0 and erase the state.
+
+The full-attention layers are multi-head latent attention in its absorbed
+form — one compressed vector per token stands in for both key and value,
+and each head's query is pushed through that head's key decompression up
+front, so the cache never has to be expanded. Two things separate them from
+Kimi-K3's: they **do** rotate (NORM-paired RoPE over
+`rope.dimension_count` of each query head's tail and of the shared key
+half), and their sigmoid output gate is one scalar per head rather than one
+per value dimension.
+
+Its experts are where the new shared machinery went. The routing is
+DeepSeek-V3's — sigmoid probabilities, an `exp_probs_b` bias that steers the
+selection but never the weights, renormalization, then
+`expert_weights_scale` — plus **group-limited selection**, which no
+architecture here had before: the experts are cut into
+`expert_group_count` contiguous groups (8 on both released models), each
+group is scored by the sum of its *two* best members, only the best
+`expert_group_used_count` groups (4) survive, and the top-k then runs over
+those alone. A strong expert in a weak group is therefore not selected —
+which is the point, and which a router that quietly ignored the grouping
+would get wrong while still producing fluent text.
+
+Tool calling works in the model's own format: it writes a call as
+`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
+which this server already parsed — with the wrinkle that this vocabulary
+spells all six of those delimiters as *tokens* rather than as text, so they
+have to be exempted from the suppression that hides every other structural
+token. Without that exemption the call reaches the parser as loose prose
+and quietly becomes chat rather than an invocation.
+
+Reasoning is inline, as it is for every `<think>`-tagged model here: the
+tags themselves are vocabulary tokens and are hidden, but the reasoning
+between them arrives as part of the answer rather than as a separate
+`reasoning_content` field. A reasoning-suppressing role (`--review`) does
+stop it at the source — the model's own template closes the block
+immediately when `enable_thinking` is false, so nothing is generated to
+hide.
+
+Not implemented for this model: embeddings requests, and the trailing
+multi-token-prediction head `Ling-3.0-flash` carries inside its
+`block_count`, which is trimmed exactly as every other draft head here is.
 
 A quantization label names the file's *dominant* type, not its only one. A
 K-quant block is 256 elements wide, so every tensor it covers needs a row

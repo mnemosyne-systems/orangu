@@ -224,6 +224,7 @@ impl NemotronModel {
         // the router width instead, where the number is checked).
         let n_expert = loaded.metadata_u64("expert_count").unwrap_or(0) as usize;
         let routing = ExpertRouting {
+            groups: super::ExpertGroups::from_gguf(loaded, n_expert)?,
             n_expert_used: loaded.metadata_u64("expert_used_count").unwrap_or(0) as usize,
             // Fixed by the architecture rather than read from the file,
             // which carries no `expert_gating_func` key for it.

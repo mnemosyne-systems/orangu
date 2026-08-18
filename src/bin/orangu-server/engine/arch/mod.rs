@@ -35,15 +35,21 @@
 //! ones), `nemotron` (Nemotron-H: blocks that are a *single* sub-layer each
 //! — a selective state-space mixer, an unrotated attention, or a squared-
 //! ReLU mixture-of-experts FFN — rather than the usual attention-plus-FFN
-//! pair), and `dflash`
+//! pair), `bailingmoe` (Ling 3.0: the same three-in-four delta-net /
+//! latent-attention trunk as `kimi3` — the two sharing one implementation
+//! in `kda`, which is not itself an architecture — but with a *rotated*
+//! latent attention, a per-head output gate, and group-limited routed
+//! experts), and `dflash`
 //! (DeepSeek draft sidecars, served through the target model they draft
 //! for).
 
+pub mod bailingmoe;
 pub mod deepseek4;
 pub mod dflash;
 pub mod gemma;
 pub mod glm;
 pub mod inkling;
+pub mod kda;
 pub mod kimi3;
 pub mod llama;
 pub mod mistral;
@@ -180,6 +186,85 @@ impl ExpertGating {
     }
 }
 
+/// Group-limited (node-limited) expert selection — DeepSeek-V3's, which
+/// `bailingmoe3` inherits: the experts are cut into
+/// `<arch>.expert_group_count` equal, *contiguous* groups, only the best
+/// `<arch>.expert_group_used_count` of them may contribute, and the top-k
+/// then runs over the survivors alone.
+///
+/// A group's score is the sum of its **two** highest member scores, not its
+/// best or its mean — upstream's `build_moe_ffn` takes
+/// `ggml_argsort_top_k(.., 2)` per group and sums. That detail decides
+/// which groups survive, and every plausible substitute for it produces
+/// fluent, subtly wrong output rather than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpertGroups {
+    /// How many groups the experts are cut into.
+    pub count: usize,
+    /// How many of them may contribute to one token.
+    pub used: usize,
+    /// `n_expert / count` — the size of each group.
+    pub size: usize,
+}
+
+impl ExpertGroups {
+    /// Reads `<arch>.expert_group_count` / `expert_group_used_count`,
+    /// returning `None` for the ordinary ungrouped case (the key absent, or
+    /// a single group, which is the same thing).
+    pub(crate) fn from_gguf(
+        loaded: &crate::engine::loader::LoadedModel,
+        n_expert: usize,
+    ) -> Result<Option<Self>> {
+        let count = loaded.metadata_u64("expert_group_count").unwrap_or(1) as usize;
+        if count <= 1 {
+            return Ok(None);
+        }
+        let used = loaded.metadata_u64("expert_group_used_count").unwrap_or(1) as usize;
+        anyhow::ensure!(
+            n_expert > 0 && n_expert.is_multiple_of(count),
+            "expert_group_count {count} does not divide expert_count {n_expert}"
+        );
+        anyhow::ensure!(
+            used >= 1 && used <= count,
+            "expert_group_used_count {used} is not between 1 and expert_group_count {count}"
+        );
+        Ok(Some(Self {
+            count,
+            used,
+            size: n_expert / count,
+        }))
+    }
+
+    /// The groups this token may draw from, best first — each group scored
+    /// by the sum of its two highest selection scores.
+    fn survivors(&self, selection: &[f32]) -> Vec<usize> {
+        let scores: Vec<f32> = (0..self.count)
+            .map(|g| {
+                let members = &selection[g * self.size..(g + 1) * self.size];
+                let mut best = f32::NEG_INFINITY;
+                let mut second = f32::NEG_INFINITY;
+                for &s in members {
+                    if s > best {
+                        second = best;
+                        best = s;
+                    } else if s > second {
+                        second = s;
+                    }
+                }
+                // A group of one has no second member to add; upstream's
+                // top-2 over a one-element row repeats nothing either, it
+                // simply has one row to sum.
+                if second.is_finite() {
+                    best + second
+                } else {
+                    best
+                }
+            })
+            .collect();
+        top_k_indices(&scores, self.used)
+    }
+}
+
 /// A MoE layer's routing rules, all read from the file's metadata.
 pub(crate) struct ExpertRouting {
     pub n_expert_used: usize,
@@ -189,6 +274,9 @@ pub(crate) struct ExpertRouting {
     pub weights_norm: bool,
     /// `<arch>.expert_weights_scale`, applied after any renormalization.
     pub weights_scale: f32,
+    /// Group-limited selection, for the architectures that declare it.
+    /// `None` is the ordinary "every expert is a candidate" case.
+    pub groups: Option<ExpertGroups>,
 }
 
 /// The smallest denominator `build_moe_ffn` will divide expert weights by
@@ -220,6 +308,19 @@ impl ExpertRouting {
                 let mut selection = probs.clone();
                 if let Some(bias) = bias {
                     tensor::add_inplace(&mut selection, bias);
+                }
+                // Group-limited selection masks the losing groups to
+                // `-inf` *before* the top-k, so a strong expert in a weak
+                // group cannot be picked. The mask is applied to the
+                // biased scores, which is what upstream sorts on.
+                if let Some(groups) = &self.groups {
+                    let survivors = groups.survivors(&selection);
+                    let mut masked = vec![f32::NEG_INFINITY; selection.len()];
+                    for g in survivors {
+                        let span = g * groups.size..(g + 1) * groups.size;
+                        masked[span.clone()].copy_from_slice(&selection[span]);
+                    }
+                    selection = masked;
                 }
                 top_k_indices(&selection, self.n_expert_used)
             }
@@ -874,6 +975,177 @@ pub(crate) fn swiglu_ffn(
     }
     tensor::mul_inplace(&mut gate, &up);
     backend.matmul(&gate, n_tokens, down_w)
+}
+
+/// One MoE layer's weights, for [`swiglu_moe_ffn`].
+///
+/// Borrowed rather than owned so each architecture keeps its own layer
+/// struct — what they share is the computation, not the layout.
+pub(crate) struct SwigluMoe<'a> {
+    /// `[n_embd, n_expert]` — the router.
+    pub gate_inp: &'a crate::engine::loader::QuantMatrix,
+    /// `exp_probs_b`, DeepSeek-V3's selection bias, when the file has one.
+    pub exp_probs_b: Option<&'a [f32]>,
+    pub gate_exps: &'a crate::engine::loader::ExpertQuantMatrix,
+    pub up_exps: &'a crate::engine::loader::ExpertQuantMatrix,
+    pub down_exps: &'a crate::engine::loader::ExpertQuantMatrix,
+    /// The always-on shared expert, which reads the same input as the
+    /// router and adds its whole output in. `None` for a model with none.
+    pub shared: Option<SwigluSharedExpert<'a>>,
+    /// `<arch>.swiglu_clamp_exp` for this layer — the routed experts'
+    /// SwiGLU limit. `0` (the usual case) leaves the activation alone.
+    pub clamp_exp: f32,
+    /// `<arch>.swiglu_clamp_shexp` for this layer — the same for the
+    /// shared expert.
+    pub clamp_shexp: f32,
+}
+
+/// SwiGLU with upstream's optional limit: the up branch is clamped to
+/// `[-limit, limit]` and the *activated* gate branch from above only, so
+/// the two halves are clamped differently and swapping them is silent. A
+/// `limit` at or below `1e-6` — which is what a file that declares no
+/// limit writes — means no clamp at all.
+fn swiglu_limited(gate: &[f32], up: &[f32], limit: f32) -> Vec<f32> {
+    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+    if limit > 1e-6 {
+        for (h, &u) in h.iter_mut().zip(up.iter()) {
+            *h = h.min(limit) * u.clamp(-limit, limit);
+        }
+    } else {
+        tensor::mul_inplace(&mut h, up);
+    }
+    h
+}
+
+/// The shared expert half of [`SwigluMoe`] — an ordinary SwiGLU FFN.
+pub(crate) struct SwigluSharedExpert<'a> {
+    pub gate: &'a crate::engine::loader::QuantMatrix,
+    pub up: &'a crate::engine::loader::QuantMatrix,
+    pub down: &'a crate::engine::loader::QuantMatrix,
+}
+
+/// The routed + shared-expert SwiGLU MoE FFN — upstream's `build_moe_ffn`
+/// with `LLM_FFN_SILU`, plus the shared expert its callers add alongside.
+///
+/// One computation, shared by every architecture here whose experts run at
+/// full width on the layer input: `engine::arch::glm` and
+/// `engine::arch::bailingmoe`. (`kimi3`'s experts run in a *latent* space
+/// and its activation is `situ`, not SwiGLU, so it keeps its own; the
+/// Qwen 3.5 hybrid trunk's `MoeFfn` differs in its shared-expert gate.)
+///
+/// The routing decision — which experts, with what weight, under whatever
+/// grouping the file declares — is entirely [`ExpertRouting::route`]'s, so
+/// an architecture that only differs there differs nowhere here.
+pub(crate) fn swiglu_moe_ffn(
+    backend: &dyn crate::engine::backend::Backend,
+    routing: &ExpertRouting,
+    normed: &[f32],
+    n_tokens: usize,
+    n_embd: usize,
+    moe: &SwigluMoe<'_>,
+) -> Vec<f32> {
+    let mut out = vec![0f32; n_tokens * n_embd];
+    let mut experts = crate::engine::moe_stats::LayerRecorder::for_tensors(&[
+        moe.gate_exps,
+        moe.up_exps,
+        moe.down_exps,
+    ]);
+    // Route the whole batch first, so the union can be taken before any
+    // expert's weights are read — see `evaluate_routed_experts`.
+    let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
+        .map(|t| {
+            let x_t = &normed[t * n_embd..(t + 1) * n_embd];
+            let logits = backend.matmul(x_t, 1, moe.gate_inp);
+            let (selected, weights) = routing.route(&logits, moe.exp_probs_b, None);
+            selected.into_iter().zip(weights).collect()
+        })
+        .collect();
+    // Trim to the expert budget *before* anything is recorded or read: the
+    // counters should describe the work actually done, and a dropped
+    // expert's weights must never be fetched.
+    apply_expert_budget(&mut selection, moe.gate_exps);
+    for picks in &selection {
+        picks.iter().for_each(|&(e, _)| experts.select(e));
+    }
+
+    // The GPU expert path batches the three projections across experts —
+    // see `evaluate_routed_experts_batched`.
+    let contribs = if gpu_experts() && backend.as_wgpu().is_some() {
+        evaluate_routed_experts_batched(
+            backend,
+            &selection,
+            normed,
+            n_embd,
+            moe.gate_exps,
+            moe.up_exps,
+            moe.down_exps,
+            |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
+        )
+    } else {
+        evaluate_routed_experts(&selection, |expert, members| {
+            let inputs: Vec<&[f32]> = members
+                .iter()
+                .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                .collect();
+            let gate = project_expert(
+                backend,
+                moe.gate_exps,
+                expert,
+                0,
+                moe.gate_exps.out_dim,
+                &inputs,
+            );
+            let up = project_expert(
+                backend,
+                moe.up_exps,
+                expert,
+                0,
+                moe.up_exps.out_dim,
+                &inputs,
+            );
+            let hidden: Vec<Vec<f32>> = gate
+                .into_iter()
+                .zip(up)
+                .map(|(gate, up)| swiglu_limited(&gate, &up, moe.clamp_exp))
+                .collect();
+            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+            project_expert(
+                backend,
+                moe.down_exps,
+                expert,
+                0,
+                moe.down_exps.out_dim,
+                &hidden_refs,
+            )
+            .into_iter()
+            .zip(members)
+            .map(|(mut contribution, &(_, weight))| {
+                contribution.iter_mut().for_each(|v| *v *= weight);
+                contribution
+            })
+            .collect()
+        })
+    };
+    experts.loaded_once_per_distinct_expert();
+
+    // The shared expert runs for every token at once. Its matrices are
+    // exempt from the backend's up-front type check (see
+    // `matmul_host_fallback`), so they must not go straight to the device.
+    if let Some(shared) = &moe.shared {
+        let gate = matmul_host_fallback(backend, normed, n_tokens, shared.gate);
+        let up = matmul_host_fallback(backend, normed, n_tokens, shared.up);
+        let h = swiglu_limited(&gate, &up, moe.clamp_shexp);
+        out = matmul_host_fallback(backend, &h, n_tokens, shared.down);
+    }
+
+    for t in 0..n_tokens {
+        let dst = &mut out[t * n_embd..(t + 1) * n_embd];
+        for contrib in &contribs[t] {
+            tensor::add_inplace(dst, contrib);
+        }
+    }
+    experts.commit(n_tokens);
+    out
 }
 
 /// `Backend::matmul`, falling back to the host when the selected backend has
@@ -2387,6 +2659,7 @@ mod tests {
             gating: ExpertGating::Sigmoid,
             weights_norm: false,
             weights_scale: 1.0,
+            groups: None,
         };
         let logits = vec![1.0, 0.0];
         let (unbiased, _) = routing.route(&logits, None, None);
@@ -2409,6 +2682,7 @@ mod tests {
             gating: ExpertGating::Sigmoid,
             weights_norm: true,
             weights_scale: 2.5,
+            groups: None,
         };
         let (_, weights) = routing.route(&[1.0, 0.5, -3.0], None, None);
         assert!(

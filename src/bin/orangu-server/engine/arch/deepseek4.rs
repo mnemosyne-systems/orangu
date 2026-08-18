@@ -682,6 +682,10 @@ impl Deepseek4Model {
                 gating: ExpertGating::from_gguf(gating_func)?,
                 weights_norm: expert_weights_norm,
                 weights_scale: expert_weights_scale,
+                groups: super::ExpertGroups::from_gguf(
+                    loaded,
+                    loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
+                )?,
             },
             q_lora_rank,
             o_group_count,
@@ -1441,6 +1445,7 @@ mod tests {
             gating: ExpertGating::SqrtSoftplus,
             weights_norm: false,
             weights_scale: 1.0,
+            groups: None,
         };
         let (_, weights) = routing.route(&[0.0], None, None);
         assert!((weights[0] - std::f32::consts::LN_2.sqrt()).abs() < 1e-6);
@@ -1493,6 +1498,7 @@ mod tests {
             gating: ExpertGating::SqrtSoftplus,
             weights_norm: true,
             weights_scale: 1.5,
+            groups: None,
         };
         let logits = vec![0.0, 1.0, 2.0];
         let (selected, weights) = routing.route(&logits, None, Some(&[2, 0]));

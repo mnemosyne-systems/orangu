@@ -30,11 +30,15 @@
 //!
 //! # Several bodies, one opener
 //!
-//! `<tool_call>` is not one format. Three supported architectures write three
+//! `<tool_call>` is not one format. Supported architectures write three
 //! different things inside that same span — JSON, `<arg_key>`/`<arg_value>`
 //! pairs, and a `<function=…>`/`<parameter=…>` nest — so the *body* is what
 //! distinguishes them, discriminated by its own leading structure once the
-//! span is already anchored. That is not a relaxation of the rule above: no
+//! span is already anchored. Whether the delimiters themselves arrive as
+//! text or as special tokens is a third, independent axis, and a property
+//! of the vocabulary rather than the format: Qwen writes `<tool_call>` as
+//! text, Ling 3.0 spells the same six delimiters as tokens. See
+//! [`marker_text`]. That is not a relaxation of the rule above: no
 //! text outside a delimited span is ever examined, and a body that matches
 //! none of the shapes stays in the answer as prose.
 //!
@@ -618,10 +622,28 @@ impl<'a> DslParser<'a> {
 /// `<|"|>` is gemma's string delimiter *inside* a call's arguments; mapping it
 /// to `"` is what lets [`split`] tell a string value from a bare one. It has
 /// no meaning outside a call and a model does not emit it elsewhere.
+///
+/// Whether a given format's delimiters need an entry here is a property of
+/// the *vocabulary*, not of the format. Qwen writes `<tool_call>` as ordinary
+/// text, so it arrives through `decode` and needs nothing; Ling 3.0
+/// (`bailingmoe3`) spells the same six delimiters as USER_DEFINED tokens, so
+/// without these entries the model's call reaches [`split`] as
+/// `get_weather\ncity\nParis` — prose with nothing left to say it was a call,
+/// which is not a parse failure the caller can see but a tool invocation that
+/// silently became chat.
+///
+/// `<tool_response>`/`</tool_response>` are deliberately absent: those frame a
+/// tool's *result* on the way in, and a model has no reason to write them.
 pub fn marker_text(token: &str) -> Option<&'static str> {
     match token {
         "<|tool_call>" => Some("<|tool_call>"),
         "<tool_call|>" => Some("<tool_call|>"),
+        "<tool_call>" => Some("<tool_call>"),
+        "</tool_call>" => Some("</tool_call>"),
+        "<arg_key>" => Some("<arg_key>"),
+        "</arg_key>" => Some("</arg_key>"),
+        "<arg_value>" => Some("<arg_value>"),
+        "</arg_value>" => Some("</arg_value>"),
         "<|\"|>" => Some("\""),
         _ => None,
     }
@@ -647,6 +669,50 @@ pub fn may_be_partial(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Ling 3.0's six tool-call delimiters are USER_DEFINED tokens in its
+    /// vocabulary, so `engine::generate` suppresses them like every other
+    /// special token unless [`marker_text`] claims them back.
+    ///
+    /// Without them the model's call arrives as `get_weather\ncity\nParis`
+    /// — which [`split`] correctly refuses to treat as a call, so the
+    /// caller silently gets chat where it asked for a tool invocation. The
+    /// second half of this test is the part that matters: reassembled
+    /// through `marker_text`, the same token stream parses.
+    #[test]
+    fn the_bailing_tool_call_delimiters_survive_special_token_suppression() {
+        let tokens = [
+            "<tool_call>",
+            "get_weather",
+            "<arg_key>",
+            "city",
+            "</arg_key>",
+            "\n",
+            "<arg_value>",
+            "Paris",
+            "</arg_value>",
+            "\n",
+            "</tool_call>",
+        ];
+
+        // What the stream would carry if every special token stayed hidden.
+        let suppressed: String = tokens
+            .iter()
+            .filter(|t| marker_text(t).is_none())
+            .copied()
+            .collect();
+        assert!(
+            split(&suppressed).calls.is_empty(),
+            "without the markers this is prose, and must not be mistaken for a call"
+        );
+
+        let rendered: String = tokens.iter().map(|t| marker_text(t).unwrap_or(t)).collect();
+        let parsed = split(&rendered);
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "get_weather");
+        assert_eq!(parsed.calls[0].arguments, r#"{"city":"Paris"}"#);
+    }
+
     use super::*;
 
     #[test]

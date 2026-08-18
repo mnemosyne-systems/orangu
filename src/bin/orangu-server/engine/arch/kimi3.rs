@@ -19,7 +19,12 @@
 //! A hybrid of two attention layers this engine already has pieces of —
 //! Kimi Delta Attention (a gated delta-net, three-in-four layers) and
 //! absorbed multi-head latent attention (every fourth layer, as in
-//! `engine::arch::glm`) — plus five things neither has:
+//! `engine::arch::glm`). Both halves live in
+//! [`engine::arch::kda`](super::kda), shared with
+//! `engine::arch::bailingmoe`, which alternates the same pair — and which
+//! is how this module's delta rule came to be checked against a real
+//! checkpoint at all, since no `kimi-k3` GGUF was on hand when it was
+//! written. What this module adds on top is five things neither half has:
 //!
 //! 1. **Cross-layer residual attention.** Every `attn_res.block_size`th
 //!    layer *banks* its raw input, and the residual stream then restarts
@@ -37,7 +42,8 @@
 //! 4. **A sigmoid output gate on the MLA layers**, read from the normed
 //!    layer input and applied before the output projection.
 //! 5. **A full-rank KDA gate** (one `ssm_g`) where Kimi-Linear factors the
-//!    same thing as `ssm_g_a`/`ssm_g_b`.
+//!    same thing as `ssm_g_a`/`ssm_g_b` — one of the load-time choices
+//!    [`kda::KdaNames`](super::kda::KdaNames) carries.
 //!
 //! Its MLA is also **nope-only**: `rope.dimension_count` still describes
 //! the width of the key's second half, but nothing is rotated — there is no
@@ -54,66 +60,15 @@
 //! multimodal input is for every architecture here.
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::{ExpertGating, ExpertRouting, ModelForward, attend, rms_norm_scale, row_mean_sq};
+use super::kda::{KIMI3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
+use super::{ExpertGating, ExpertRouting, ModelForward, rms_norm_scale, row_mean_sq};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
 use crate::engine::tensor;
-
-/// Kimi Delta Attention: the linear-attention layer, three in every four.
-struct KdaLayer {
-    wq: QuantMatrix,
-    wk: QuantMatrix,
-    wv: QuantMatrix,
-    /// The `ssm_conv1d_q`/`_k`/`_v` kernels concatenated into one
-    /// `[3 * d_inner, d_conv]` buffer, channel-major.
-    ///
-    /// The convolution is depthwise — every channel is independent — so
-    /// concatenating the three sets of channels and running one pass is
-    /// exactly the three separate passes upstream runs over its one
-    /// three-section conv state, and lets this share
-    /// `RecurrentLayerState::conv_step` with `engine::arch::qwen35moe`
-    /// unchanged.
-    conv_kernel: Vec<f32>,
-    /// The decay gate's low-rank projection: `[n_embd, kda_head_dim]` then
-    /// `[kda_head_dim, d_inner]`.
-    f_a: QuantMatrix,
-    f_b: QuantMatrix,
-    dt_bias: Vec<f32>,
-    /// `ssm_a`, `[n_head]`. Holds `-exp(A_log)`, folded at conversion time.
-    a: Vec<f32>,
-    /// `[n_embd, n_head]` — the per-head delta-rule write strength.
-    beta: QuantMatrix,
-    /// `[n_embd, d_inner]` — the full-rank output gate.
-    g: QuantMatrix,
-    /// RMSNorm weight applied per head to the scan output, `[head_dim]`.
-    o_norm: Vec<f32>,
-    wo: QuantMatrix,
-    /// Index into `KvCache::recurrent`.
-    cache_index: usize,
-}
-
-/// The full-attention layer, every fourth: MLA in its absorbed form, as in
-/// `engine::arch::glm`, but with no RoPE and with an output gate.
-struct MlaLayer {
-    wq_a: QuantMatrix,
-    q_a_norm: Vec<f32>,
-    wq_b: QuantMatrix,
-    wkv_a_mqa: QuantMatrix,
-    kv_a_norm: Vec<f32>,
-    wk_b: ExpertQuantMatrix,
-    wv_b: ExpertQuantMatrix,
-    /// `attn_gate`, `[n_embd, n_head * value_length_mla]` — sigmoid-gates
-    /// the attention output before the output projection.
-    gate: Option<QuantMatrix>,
-    wo: QuantMatrix,
-    /// Index into `KvCache::layers`.
-    cache_index: usize,
-}
 
 enum Attn {
     Kda(Box<KdaLayer>),
@@ -172,18 +127,9 @@ pub struct Kimi3Model {
     situ_beta: f32,
     situ_linear_beta: f32,
     routing: ExpertRouting,
-    /// `kda.head_dim`, and the KDA layers' `n_head * kda.head_dim`.
-    kda_head_dim: usize,
-    d_inner: usize,
-    /// `kda.gate_lower_bound`, when the file sets one.
-    kda_gate_lower_bound: Option<f32>,
-    kv_lora_rank: usize,
-    head_k_mla: usize,
-    head_v_mla: usize,
-    /// Width of one cached MLA key row: `kv_lora_rank + rope dims`. The
-    /// value is its leading `kv_lora_rank`.
-    kv_row: usize,
-    kq_scale: f32,
+    /// The shapes the shared half-layers need — see `engine::arch::kda`.
+    kda: KdaShape,
+    mla: MlaShape,
     kv_dims: Vec<usize>,
     recurrent_specs: Vec<RecurrentSpec>,
     layers: Vec<Kimi3Layer>,
@@ -229,8 +175,14 @@ impl Kimi3Model {
             .metadata_u64("ssm.conv_kernel")
             .context("missing ssm.conv_kernel")? as usize;
         anyhow::ensure!(d_conv > 0, "ssm.conv_kernel must be at least 1");
-        let d_inner = kda_head_dim * n_head;
-        let kda_gate_lower_bound = loaded.metadata_f32("kda.gate_lower_bound");
+        let kda = KdaShape {
+            n_head,
+            head_dim: kda_head_dim,
+            d_inner: kda_head_dim * n_head,
+            d_conv,
+            gate_lower_bound: loaded.metadata_f32("kda.gate_lower_bound"),
+            eps: loaded.config.rms_eps,
+        };
 
         let kv_lora_rank = loaded
             .metadata_u64("attention.kv_lora_rank")
@@ -246,10 +198,20 @@ impl Kimi3Model {
             head_k_mla > rope_dim,
             "attention.key_length_mla ({head_k_mla}) must exceed rope.dimension_count ({rope_dim})"
         );
-        // Not a RoPE parameter here: this model rotates nothing. It only
-        // names how the cached key splits into its two halves.
-        let kv_row = kv_lora_rank + rope_dim;
-        let kq_scale = 1.0 / (head_k_mla as f32).sqrt();
+        let mla = MlaShape {
+            n_head,
+            kv_lora_rank,
+            head_k_mla,
+            head_v_mla,
+            // Not a RoPE parameter here: this model rotates nothing, so
+            // `rope` is `None` and `rope_dim` only names how the cached key
+            // splits into its two halves.
+            kv_row: kv_lora_rank + rope_dim,
+            rope: None,
+            rope_dim,
+            kq_scale: 1.0 / (head_k_mla as f32).sqrt(),
+            eps: loaded.config.rms_eps,
+        };
 
         // `attention.head_count_kv` is a per-layer array: 0 marks a KDA
         // (recurrent) layer, non-zero a full-attention one.
@@ -278,12 +240,11 @@ impl Kimi3Model {
             "activation.situ_beta must be positive (got {situ_beta})"
         );
 
-        let n_expert_groups = loaded.metadata_u64("expert_group_count").unwrap_or(1) as usize;
-        anyhow::ensure!(
-            n_expert_groups <= 1,
-            "expert_group_count {n_expert_groups}: grouped expert selection is not implemented"
-        );
         let routing = ExpertRouting {
+            groups: super::ExpertGroups::from_gguf(
+                loaded,
+                loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
+            )?,
             n_expert_used: loaded
                 .metadata_u64("expert_used_count")
                 .context("missing expert_used_count")? as usize,
@@ -341,60 +302,22 @@ impl Kimi3Model {
             };
 
             let attn = if kv_heads == 0 {
-                // One conv kernel per channel, q's channels then k's then
-                // v's, matching the concatenated projection fed to it.
-                let mut conv_kernel = Vec::with_capacity(3 * d_inner * d_conv);
-                for part in ["q", "k", "v"] {
-                    let kernel = get(&format!("ssm_conv1d_{part}.weight"))?;
-                    anyhow::ensure!(
-                        kernel.len() == d_inner * d_conv,
-                        "layer {i}'s ssm_conv1d_{part} has {} values, not d_inner * conv_kernel ({})",
-                        kernel.len(),
-                        d_inner * d_conv
-                    );
-                    conv_kernel.extend_from_slice(&kernel);
-                }
-                recurrent_specs.push(RecurrentSpec::delta_net(
-                    3 * d_inner,
-                    d_conv,
-                    n_head,
-                    kda_head_dim,
-                ));
-                Attn::Kda(Box::new(KdaLayer {
-                    wq: get_matrix("attn_q.weight")?,
-                    wk: get_matrix("attn_k.weight")?,
-                    wv: get_matrix("attn_v.weight")?,
-                    conv_kernel,
-                    f_a: get_matrix("ssm_f_a.weight")?,
-                    f_b: get_matrix("ssm_f_b.weight")?,
-                    dt_bias: get("ssm_dt.bias")?,
-                    a: get("ssm_a")?,
-                    beta: get_matrix("ssm_beta.weight")?,
-                    g: get_matrix("ssm_g.weight")?,
-                    o_norm: get("ssm_norm.weight")?,
-                    wo: get_matrix("attn_output.weight")?,
-                    cache_index: recurrent_specs.len() - 1,
-                }))
+                recurrent_specs.push(kda.recurrent_spec());
+                Attn::Kda(Box::new(KdaLayer::load(
+                    loaded,
+                    i,
+                    &kda,
+                    &KIMI3_KDA_NAMES,
+                    recurrent_specs.len() - 1,
+                )?))
             } else {
-                kv_dims.push(kv_row);
-                let wkv_a_mqa = get_matrix("attn_kv_a_mqa.weight")?;
-                anyhow::ensure!(
-                    wkv_a_mqa.out_dim == kv_row,
-                    "layer {i}'s attn_kv_a_mqa projects to {} outputs, not kv_lora_rank + rope dims ({kv_row})",
-                    wkv_a_mqa.out_dim
-                );
-                Attn::Mla(Box::new(MlaLayer {
-                    wq_a: get_matrix("attn_q_a.weight")?,
-                    q_a_norm: get("attn_q_a_norm.weight")?,
-                    wq_b: get_matrix("attn_q_b.weight")?,
-                    wkv_a_mqa,
-                    kv_a_norm: get("attn_kv_a_norm.weight")?,
-                    wk_b: get_expert_matrix("attn_k_b.weight")?,
-                    wv_b: get_expert_matrix("attn_v_b.weight")?,
-                    gate: get_matrix("attn_gate.weight").ok(),
-                    wo: get_matrix("attn_output.weight")?,
-                    cache_index: kv_dims.len() - 1,
-                }))
+                kv_dims.push(mla.kv_row);
+                Attn::Mla(Box::new(MlaLayer::load(
+                    loaded,
+                    i,
+                    &mla,
+                    kv_dims.len() - 1,
+                )?))
             };
 
             let ffn = if i < n_layer_dense_lead {
@@ -455,14 +378,8 @@ impl Kimi3Model {
             situ_beta,
             situ_linear_beta,
             routing,
-            kda_head_dim,
-            d_inner,
-            kda_gate_lower_bound,
-            kv_lora_rank,
-            head_k_mla,
-            head_v_mla,
-            kv_row,
-            kq_scale,
+            kda,
+            mla,
             kv_dims,
             recurrent_specs,
             layers,
@@ -509,8 +426,17 @@ impl Kimi3Model {
                 self.config.rms_eps,
             );
             let attn = match &layer.attn {
-                Attn::Kda(kda) => self.kda_layer(kda, cache, &cur, n_tokens),
-                Attn::Mla(mla) => self.mla_layer(mla, cache, &cur, n_tokens, start_pos),
+                Attn::Kda(kda) => {
+                    kda.forward(self.backend.as_ref(), &self.kda, cache, &cur, n_tokens)
+                }
+                Attn::Mla(mla) => mla.forward(
+                    self.backend.as_ref(),
+                    &self.mla,
+                    cache,
+                    &cur,
+                    n_tokens,
+                    start_pos,
+                ),
             };
             if is_checkpoint {
                 x = attn;
@@ -587,226 +513,6 @@ impl Kimi3Model {
             tensor::axpy_inplace(dst, &cur[span.clone()], scores[banked.len()]);
         }
         out
-    }
-
-    /// One Kimi Delta Attention layer: a short causal convolution over each
-    /// of Q/K/V, then the delta rule with a per-dimension decay, then a
-    /// gated per-head norm.
-    fn kda_layer(
-        &self,
-        layer: &KdaLayer,
-        cache: &mut KvCache,
-        normed: &[f32],
-        n_tokens: usize,
-    ) -> Vec<f32> {
-        let n_head = self.config.n_head;
-        let head_dim = self.kda_head_dim;
-        let d_inner = self.d_inner;
-        let eps = self.config.rms_eps;
-        let q_scale = 1.0 / (head_dim as f32).sqrt();
-
-        // Token-independent projections, batched over the whole chunk. The
-        // three conv inputs are concatenated to match `conv_kernel`.
-        let q = self.backend.matmul(normed, n_tokens, &layer.wq);
-        let k = self.backend.matmul(normed, n_tokens, &layer.wk);
-        let v = self.backend.matmul(normed, n_tokens, &layer.wv);
-        let f = {
-            let low = self.backend.matmul(normed, n_tokens, &layer.f_a);
-            self.backend.matmul(&low, n_tokens, &layer.f_b)
-        };
-        let beta = self.backend.matmul(normed, n_tokens, &layer.beta);
-        let gate = self.backend.matmul(normed, n_tokens, &layer.g);
-
-        let mut out = vec![0f32; n_tokens * d_inner];
-        let state = &mut cache.recurrent[layer.cache_index];
-        for t in 0..n_tokens {
-            let mut qkv = Vec::with_capacity(3 * d_inner);
-            qkv.extend_from_slice(&q[t * d_inner..(t + 1) * d_inner]);
-            qkv.extend_from_slice(&k[t * d_inner..(t + 1) * d_inner]);
-            qkv.extend_from_slice(&v[t * d_inner..(t + 1) * d_inner]);
-            let mut conv = state.conv_step(&qkv, &layer.conv_kernel);
-            for value in conv.iter_mut() {
-                *value = tensor::silu(*value);
-            }
-            let (q_t, rest) = conv.split_at_mut(d_inner);
-            let (k_t, v_t) = rest.split_at_mut(d_inner);
-
-            // The decay: `lower_bound * sigmoid(exp(A_log) * (f + dt_bias))`
-            // when the file sets a lower bound, and `-exp(A_log) *
-            // softplus(f + dt_bias)` when it does not. `ssm_a` holds
-            // `-exp(A_log)` either way, so the first form negates it back.
-            // The scan exponentiates this, making the per-dimension decay
-            // `exp(lower_bound * sigmoid(..))`, which lives in
-            // `(e^lower_bound, 1)`.
-            let mut decay = vec![0f32; d_inner];
-            for h in 0..n_head {
-                for j in 0..head_dim {
-                    let idx = h * head_dim + j;
-                    let pre = f[t * d_inner + idx] + layer.dt_bias[idx];
-                    decay[idx] = match self.kda_gate_lower_bound {
-                        Some(bound) => bound * tensor::sigmoid(-(pre * layer.a[h])),
-                        None => layer.a[h] * tensor::softplus(pre),
-                    }
-                    .exp();
-                }
-            }
-
-            let dst = &mut out[t * d_inner..(t + 1) * d_inner];
-            for h in 0..n_head {
-                let q_h = &mut q_t[h * head_dim..(h + 1) * head_dim];
-                tensor::l2_norm_inplace(q_h, eps);
-                for value in q_h.iter_mut() {
-                    *value *= q_scale;
-                }
-                let k_h = &mut k_t[h * head_dim..(h + 1) * head_dim];
-                tensor::l2_norm_inplace(k_h, eps);
-                let q_h = &q_t[h * head_dim..(h + 1) * head_dim];
-                let k_h = &k_t[h * head_dim..(h + 1) * head_dim];
-                let v_h = &v_t[h * head_dim..(h + 1) * head_dim];
-                let beta_h = tensor::sigmoid(beta[t * n_head + h]);
-                let decay_h = &decay[h * head_dim..(h + 1) * head_dim];
-
-                // The delta rule, exactly `build_delta_net_autoregressive`:
-                // state[i][j] decays by `decay[j]` (per *dimension* here,
-                // where a plain gated delta-net decays a whole head by one
-                // scalar), absorbs `k[i] * beta*(v - k^T state)[j]`, and is
-                // read out with the query.
-                let state_h = state.delta_state_mut(h);
-                for i in 0..head_dim {
-                    let row = &mut state_h[i * head_dim..(i + 1) * head_dim];
-                    for (s, &d) in row.iter_mut().zip(decay_h.iter()) {
-                        *s *= d;
-                    }
-                }
-                let mut sk = vec![0f32; head_dim];
-                for i in 0..head_dim {
-                    tensor::axpy_inplace(
-                        &mut sk,
-                        &state_h[i * head_dim..(i + 1) * head_dim],
-                        k_h[i],
-                    );
-                }
-                let delta: Vec<f32> = (0..head_dim).map(|j| beta_h * (v_h[j] - sk[j])).collect();
-                for i in 0..head_dim {
-                    tensor::axpy_inplace(
-                        &mut state_h[i * head_dim..(i + 1) * head_dim],
-                        &delta,
-                        k_h[i],
-                    );
-                }
-                let mut o = vec![0f32; head_dim];
-                for i in 0..head_dim {
-                    tensor::axpy_inplace(
-                        &mut o,
-                        &state_h[i * head_dim..(i + 1) * head_dim],
-                        q_h[i],
-                    );
-                }
-
-                // Gated RMSNorm: norm the scan output, then scale it by a
-                // sigmoid gate read from the layer input (Kimi-Linear
-                // factors this gate into two matrices; K3 has one).
-                tensor::rmsnorm_inplace(&mut o, &layer.o_norm, 1, head_dim, eps);
-                let gate_h = &gate[t * d_inner + h * head_dim..t * d_inner + (h + 1) * head_dim];
-                for (value, &g) in o.iter_mut().zip(gate_h.iter()) {
-                    *value *= tensor::sigmoid(g);
-                }
-                dst[h * head_dim..(h + 1) * head_dim].copy_from_slice(&o);
-            }
-        }
-
-        self.backend.matmul(&out, n_tokens, &layer.wo)
-    }
-
-    /// One absorbed-MLA layer. Identical in shape to `engine::arch::glm`'s,
-    /// minus the RoPE (this model rotates nothing) and the lightning
-    /// indexer (it has none), plus a sigmoid gate on the output.
-    fn mla_layer(
-        &self,
-        layer: &MlaLayer,
-        cache: &mut KvCache,
-        normed: &[f32],
-        n_tokens: usize,
-        start_pos: usize,
-    ) -> Vec<f32> {
-        let n_head = self.config.n_head;
-        let eps = self.config.rms_eps;
-        let nope = self.head_k_mla - self.config.rope_dim;
-        let absorbed_dim = self.kv_lora_rank + self.config.rope_dim;
-
-        let mut qr = self.backend.matmul(normed, n_tokens, &layer.wq_a);
-        tensor::rmsnorm_inplace(&mut qr, &layer.q_a_norm, n_tokens, layer.wq_a.out_dim, eps);
-        let q = self.backend.matmul(&qr, n_tokens, &layer.wq_b);
-        let mut kv = self.backend.matmul(normed, n_tokens, &layer.wkv_a_mqa);
-        for t in 0..n_tokens {
-            tensor::rmsnorm_inplace(
-                &mut kv[t * self.kv_row..t * self.kv_row + self.kv_lora_rank],
-                &layer.kv_a_norm,
-                1,
-                self.kv_lora_rank,
-                eps,
-            );
-        }
-
-        let mut attn_out = vec![0f32; n_tokens * n_head * self.head_v_mla];
-        for t in 0..n_tokens {
-            let kv_t = &kv[t * self.kv_row..(t + 1) * self.kv_row];
-            cache.layers[layer.cache_index].push(kv_t, kv_t);
-
-            let n_keys = start_pos + t + 1;
-            let mut keys = vec![0f32; n_keys * self.kv_row];
-            {
-                let slot = &cache.layers[layer.cache_index];
-                for p in 0..n_keys {
-                    keys[p * self.kv_row..(p + 1) * self.kv_row].copy_from_slice(slot.key_at(
-                        p,
-                        0,
-                        self.kv_row,
-                    ));
-                }
-            }
-
-            let q_t = &q[t * n_head * self.head_k_mla..(t + 1) * n_head * self.head_k_mla];
-            let heads: Vec<Vec<f32>> = (0..n_head)
-                .into_par_iter()
-                .map(|h| {
-                    // Absorb the query through this head's key
-                    // decompression, then carry its second half unchanged.
-                    let q_nope = &q_t[h * self.head_k_mla..h * self.head_k_mla + nope];
-                    let mut q_h = vec![0f32; absorbed_dim];
-                    for (j, out) in q_h[..self.kv_lora_rank].iter_mut().enumerate() {
-                        *out = tensor::dot(q_nope, &layer.wk_b.row(h, j));
-                    }
-                    q_h[self.kv_lora_rank..].copy_from_slice(
-                        &q_t[h * self.head_k_mla + nope..(h + 1) * self.head_k_mla],
-                    );
-
-                    let compressed = attend(
-                        &q_h,
-                        &keys,
-                        self.kv_row,
-                        self.kv_lora_rank,
-                        self.kq_scale,
-                        None,
-                    );
-                    (0..self.head_v_mla)
-                        .map(|d| tensor::dot(&compressed, &layer.wv_b.row(h, d)))
-                        .collect()
-                })
-                .collect();
-            for (h, head) in heads.iter().enumerate() {
-                let at = (t * n_head + h) * self.head_v_mla;
-                attn_out[at..at + self.head_v_mla].copy_from_slice(head);
-            }
-        }
-
-        if let Some(gate) = &layer.gate {
-            let gate = self.backend.matmul(normed, n_tokens, gate);
-            for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
-                *o *= tensor::sigmoid(g);
-            }
-        }
-        self.backend.matmul(&attn_out, n_tokens, &layer.wo)
     }
 
     /// The latent MoE: route on the full-width input, run the selected

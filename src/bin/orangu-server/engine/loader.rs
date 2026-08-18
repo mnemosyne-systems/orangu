@@ -150,6 +150,13 @@ pub enum ArchFamily {
     /// temperature), and sigmoid-routed experts share their normalization
     /// with the always-on shared experts. See `engine::arch::inkling`.
     Inkling,
+    /// Ling 3.0 (`bailingmoe3`) — three-in-four Kimi Delta Attention
+    /// layers alternating with gated, **rotated** absorbed multi-head
+    /// latent attention (the pair `engine::arch::kda` shares with
+    /// [`ArchFamily::KimiK3`]), a leading dense block, and sigmoid-routed
+    /// experts under DeepSeek-V3 group-limited selection. See
+    /// `engine::arch::bailingmoe`.
+    BailingMoe3,
     /// Nemotron-H (`nemotron_h_moe`) — a hybrid whose blocks are a *single*
     /// sub-layer each rather than the usual attention-plus-FFN pair: a
     /// selective state-space mixer, an unrotated (position-free) attention,
@@ -237,6 +244,13 @@ const INKLING_ARCHITECTURES: &[&str] = &["inkling"];
 /// `bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF`. The unrelated,
 /// ordinary-transformer `nemotron` is *not* here.
 const NEMOTRON_ARCHITECTURES: &[&str] = &["nemotron_h_moe", "nemotron_h"];
+/// `bailingmoe3` (e.g. `bartowski/Ling-3.0-tiny-GGUF`,
+/// `bartowski/Ling-3.0-flash-GGUF`) — see [`ArchFamily::BailingMoe3`] and
+/// `engine::arch::bailingmoe`. Ling 1.0's `bailingmoe` and Ling 2.0's
+/// `bailingmoe2` are *not* here: despite the name they are ordinary
+/// GQA+RoPE transformers with routed experts, sharing none of this
+/// module's delta-net or latent-attention machinery.
+const BAILINGMOE3_ARCHITECTURES: &[&str] = &["bailingmoe3"];
 
 /// Architectures this engine recognises by name and deliberately does **not**
 /// serve, with the reason.
@@ -281,6 +295,16 @@ const KNOWN_UNSUPPORTED: &[(&str, &str)] = &[
         "nemotron",
         "an ordinary transformer, unrelated to the supported 'nemotron_h_moe' despite the \
          shared name",
+    ),
+    (
+        "bailingmoe",
+        "Ling 1.0: an ordinary GQA transformer with routed experts, sharing none of the \
+         supported 'bailingmoe3' delta-net trunk or latent attention",
+    ),
+    (
+        "bailingmoe2",
+        "Ling 2.0: an ordinary GQA transformer with routed experts; 'bailingmoe3' is a \
+         different graph, not a newer version of this one",
     ),
 ];
 
@@ -327,6 +351,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if NEMOTRON_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::NemotronHMoe);
     }
+    if BAILINGMOE3_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::BailingMoe3);
+    }
     // A recognised near miss gets its own reason. The alternative — dropping
     // the reader into a list of fourteen names that looks like it *should*
     // contain theirs — is what makes an out-of-tree alias mechanism sound
@@ -361,6 +388,7 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
             .chain(MUSE_ARCHITECTURES)
             .chain(INKLING_ARCHITECTURES)
             .chain(NEMOTRON_ARCHITECTURES)
+            .chain(BAILINGMOE3_ARCHITECTURES)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ")

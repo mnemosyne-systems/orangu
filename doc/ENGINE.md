@@ -197,7 +197,9 @@ Architectures, by what they are rather than by name:
 | `qwen35`, `qwen35moe`, `qwen3next` | thin modules over that trunk — dense, MoE, and a different MoE layout |
 | `deepseek4` | multi-head latent attention, block-compressed KV, routed experts |
 | `glm` | latent attention with a sparse-attention indexer |
-| `kimi3`, `inkling`, `muse` | their own attention or framing variants |
+| `kda` | shared half-layers: Kimi Delta Attention, and absorbed latent attention with an optional rotation and output gate |
+| `kimi3`, `bailingmoe` | thin modules over that pair — cross-layer residuals with latent experts, and Ling 3.0's rotated latent attention with group-limited experts |
+| `inkling`, `muse` | their own attention or framing variants |
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
 

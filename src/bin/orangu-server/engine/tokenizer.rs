@@ -126,6 +126,32 @@ const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\
 /// `"gpt2"`-shaped vocab already skips it.
 const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
 
+/// The Bailing/Ling pre-tokenizer (`tokenizer.ggml.pre` =
+/// `bailingmoe`/`bailingmoe2`/`llada-moe`), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` arm.
+///
+/// Two things set it apart from the generic [`SPLIT_PATTERN`], and both
+/// change the ids a prompt produces rather than merely how it looks:
+/// `\p{N}` splits digits **one at a time** (not `\p{N}{1,3}` as llama3
+/// does, and not the greedy ` ?\p{N}+` the generic pattern uses), and
+/// `\s*[\r\n]` takes a *single* line break rather than a run of them, so a
+/// blank line between paragraphs is two pre-tokens here and one elsewhere.
+/// The contraction set is the usual seven, case-insensitively.
+///
+/// As with the other patterns here, upstream's trailing-whitespace
+/// alternative `\s+(?!\S)` is dropped — the `regex` crate has no
+/// look-around — leaving the same minor difference in how a run of 2+
+/// spaces before a word splits. Upstream also sets `clean_spaces = false`,
+/// which needs no code here: that cleanup pass is `"gemma4"`-only in this
+/// module, so a `"gpt2"`-shaped vocab already skips it.
+const SPLIT_PATTERN_BAILINGMOE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` (its own list, verbatim) — Ling 1.0,
+/// Ling 2.0 and Ling 3.0 share one vocabulary family with LLaDA-MoE. None
+/// of them sets `ignore_merges`.
+const BAILINGMOE_PRE_TYPES: &[&str] = &["bailingmoe", "bailingmoe2", "llada-moe"];
+
 /// `tokenizer.ggml.pre` values upstream routes to
 /// `LLAMA_VOCAB_PRE_TYPE_CHATGLM4` — GLM-4 and GLM-5 family vocabs,
 /// including `glm-dsa` (GLM-5.2).
@@ -188,6 +214,9 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     }
     if GPT4O_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_GPT4O, false);
+    }
+    if BAILINGMOE_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_BAILINGMOE, false);
     }
     if pre == "tekken" {
         return (SPLIT_PATTERN_TEKKEN, true);
@@ -1405,6 +1434,32 @@ mod tests {
         assert_ne!(pattern, super::SPLIT_PATTERN);
     }
 
+    /// The Ling/Bailing vocabs (`bailingmoe`, `bailingmoe2`,
+    /// `llada-moe` — Ling 3.0 declares the middle one) split **one digit
+    /// at a time**, where both the generic GPT-2 fallback and the llama3
+    /// arm keep digits together. `Ling-3.0-tiny`'s own chat template
+    /// injects nothing numeric, but a prompt that mentions a year or a
+    /// version would be mis-tokenized in a way that still reads fluently,
+    /// which is exactly the failure this arm exists to prevent.
+    #[test]
+    fn the_bailing_pre_tokenizer_splits_digits_one_at_a_time() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("bailingmoe2");
+        assert_eq!(pattern, super::SPLIT_PATTERN_BAILINGMOE);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::SPLIT_PATTERN);
+        assert_eq!(super::split_pattern_for_pre("bailingmoe").0, pattern);
+        assert_eq!(super::split_pattern_for_pre("llada-moe").0, pattern);
+
+        let re = regex::Regex::new(pattern).expect("the pattern compiles");
+        let digits: Vec<&str> = re.find_iter("2026").map(|m| m.as_str()).collect();
+        assert_eq!(digits, vec!["2", "0", "2", "6"]);
+
+        // The generic fallback would take the whole run as one chunk.
+        let generic = regex::Regex::new(super::SPLIT_PATTERN).unwrap();
+        let generic_digits: Vec<&str> = generic.find_iter("2026").map(|m| m.as_str()).collect();
+        assert_eq!(generic_digits, vec!["2026"]);
+    }
+
     #[test]
     fn encode_falls_back_to_individual_bytes_without_merges() {
         let gguf = build_gguf(&["a", "b", "c"], &[], 0, 1);
@@ -1794,6 +1849,39 @@ mod tests {
         assert_eq!(
             ids,
             vec![818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799]
+        );
+    }
+
+    /// Cross-check against real `llama.cpp`'s `/tokenize` for
+    /// `bartowski/Ling-3.0-tiny-GGUF:Q4_K_M` (`tokenizer.ggml.model =
+    /// "gpt2"`, `.pre = "bailingmoe2"`), the model that needed the Bailing
+    /// pre-tokenizer arm.
+    ///
+    /// The second string is the one that matters: under the generic GPT-2
+    /// fallback `1` and `=` would still land on the same ids, but a
+    /// multi-digit run would not — real llama.cpp gives `2`, `0`, `2`, `6`
+    /// as four separate tokens where the fallback pattern hands BPE a
+    /// single `2026` chunk. Run with
+    /// `ORANGU_TEST_BAILINGMOE_MODEL=/path/to/Ling-3.0-tiny-Q4_K_M.gguf
+    /// cargo test --release --bin orangu-server tokenizer -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ling3_tokenization_matches_real_llama_cpp() {
+        let path = std::env::var("ORANGU_TEST_BAILINGMOE_MODEL")
+            .expect("set ORANGU_TEST_BAILINGMOE_MODEL");
+        let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open model");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        assert_eq!(tok.vocab_kind, VocabKind::Gpt2Byte);
+
+        assert_eq!(
+            tok.encode("The quick brown fox jumps over the lazy", false),
+            vec![678, 3901, 13187, 46998, 40977, 997, 268, 27028]
+        );
+        assert_eq!(
+            tok.encode("In 2026 the answer is 1 + 1 =", false),
+            vec![
+                846, 220, 17, 15, 17, 21, 268, 3766, 341, 220, 16, 781, 220, 16, 373
+            ]
         );
     }
 

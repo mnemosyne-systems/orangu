@@ -51,6 +51,7 @@ use config::{
     BackendPreference, ServerConfiguration, default_server_config_path, load_server_configuration,
 };
 use engine::arch::ModelForward;
+use engine::arch::bailingmoe::BailingMoeModel;
 use engine::arch::deepseek4::Deepseek4Model;
 use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
@@ -1501,6 +1502,10 @@ fn build_model(
         ),
         ArchFamily::NemotronHMoe => Arc::new(
             NemotronModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::BailingMoe3 => Arc::new(
+            BailingMoeModel::load_with_backend(loaded, backend.clone())
+                .context("building model")?,
         ),
     };
     Ok(model)

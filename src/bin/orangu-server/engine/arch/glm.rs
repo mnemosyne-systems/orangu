@@ -59,7 +59,6 @@ use super::{ExpertGating, ExpertRouting, ModelForward, attend, top_k_indices};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
-use crate::engine::moe_stats;
 use crate::engine::tensor::{self, RopeLayout, RopeParams};
 
 /// `attention.indexer.types` for GLM-5.2, whose GGUFs don't carry the key:
@@ -244,11 +243,10 @@ impl GlmModel {
                 .metadata_u64("expert_gating_func")
                 .context("missing expert_gating_func")?,
         )?;
-        let n_expert_groups = loaded.metadata_u64("expert_group_count").unwrap_or(1) as usize;
-        anyhow::ensure!(
-            n_expert_groups <= 1,
-            "expert_group_count {n_expert_groups}: grouped expert selection is not implemented"
-        );
+        let expert_groups = super::ExpertGroups::from_gguf(
+            loaded,
+            loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
+        )?;
 
         // YaRN, when a file uses it, scales the attention logits as well as
         // the frequencies: upstream folds `mscale^2` into the softmax
@@ -417,6 +415,7 @@ impl GlmModel {
                     .metadata_u64("expert_weights_norm")
                     .is_some_and(|v| v != 0),
                 weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
+                groups: expert_groups,
             },
             indexer_n_head,
             indexer_head_size,
@@ -740,116 +739,32 @@ impl GlmModel {
             .collect()
     }
 
-    /// Routed experts plus the always-on shared expert.
+    /// The routed + shared-expert SwiGLU MoE FFN — `super::swiglu_moe_ffn`,
+    /// shared with `engine::arch::bailingmoe`, which runs the same
+    /// computation over the same tensor names under whatever routing rules
+    /// its own file declares.
     fn moe_ffn(&self, moe: &Moe, normed: &[f32], n_tokens: usize) -> Vec<f32> {
-        let n_embd = self.config.n_embd;
-        let mut out = vec![0f32; n_tokens * n_embd];
-        let mut experts =
-            moe_stats::LayerRecorder::for_tensors(&[&moe.gate_exps, &moe.up_exps, &moe.down_exps]);
-        // Route the whole batch first, so the union can be taken before any
-        // expert's weights are read — see `super::evaluate_routed_experts`.
-        let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
-            .map(|t| {
-                let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-                let logits = self.backend.matmul(x_t, 1, &moe.gate_inp);
-                let (selected, weights) =
-                    self.routing
-                        .route(&logits, moe.exp_probs_b.as_deref(), None);
-                selected.into_iter().zip(weights).collect()
-            })
-            .collect();
-        // Trim to the expert budget *before* anything is recorded or
-        // read: the counters should describe the work actually done,
-        // and a dropped expert's weights must never be fetched.
-        super::apply_expert_budget(&mut selection, &moe.gate_exps);
-        for picks in &selection {
-            picks.iter().for_each(|&(e, _)| experts.select(e));
-        }
-
-        // The GPU expert path batches the three projections across experts —
-        // see `super::evaluate_routed_experts_batched`.
-        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
-            super::evaluate_routed_experts_batched(
-                self.backend.as_ref(),
-                &selection,
-                normed,
-                n_embd,
-                &moe.gate_exps,
-                &moe.up_exps,
-                &moe.down_exps,
-                |gate, up| {
-                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                    tensor::mul_inplace(&mut h, up);
-                    h
-                },
-            )
-        } else {
-            super::evaluate_routed_experts(&selection, |expert, members| {
-                let inputs: Vec<&[f32]> = members
-                    .iter()
-                    .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                    .collect();
-                let gate = super::project_expert(
-                    self.backend.as_ref(),
-                    &moe.gate_exps,
-                    expert,
-                    0,
-                    moe.gate_exps.out_dim,
-                    &inputs,
-                );
-                let up = super::project_expert(
-                    self.backend.as_ref(),
-                    &moe.up_exps,
-                    expert,
-                    0,
-                    moe.up_exps.out_dim,
-                    &inputs,
-                );
-                let hidden: Vec<Vec<f32>> = gate
-                    .into_iter()
-                    .zip(up)
-                    .map(|(gate, up)| {
-                        let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                        tensor::mul_inplace(&mut h, &up);
-                        h
-                    })
-                    .collect();
-                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-                super::project_expert(
-                    self.backend.as_ref(),
-                    &moe.down_exps,
-                    expert,
-                    0,
-                    moe.down_exps.out_dim,
-                    &hidden_refs,
-                )
-                .into_iter()
-                .zip(members)
-                .map(|(mut contribution, &(_, weight))| {
-                    contribution.iter_mut().for_each(|v| *v *= weight);
-                    contribution
-                })
-                .collect()
-            })
-        };
-        experts.loaded_once_per_distinct_expert();
-
-        for t in 0..n_tokens {
-            let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-            let gate = self.backend.matmul(x_t, 1, &moe.gate_shexp);
-            let up = self.backend.matmul(x_t, 1, &moe.up_shexp);
-            let mut shexp_h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-            tensor::mul_inplace(&mut shexp_h, &up);
-            let shexp = self.backend.matmul(&shexp_h, 1, &moe.down_shexp);
-
-            let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            dst.copy_from_slice(&shexp);
-            for contrib in &contribs[t] {
-                tensor::add_inplace(dst, contrib);
-            }
-        }
-        experts.commit(n_tokens);
-        out
+        super::swiglu_moe_ffn(
+            self.backend.as_ref(),
+            &self.routing,
+            normed,
+            n_tokens,
+            self.config.n_embd,
+            &super::SwigluMoe {
+                gate_inp: &moe.gate_inp,
+                exp_probs_b: moe.exp_probs_b.as_deref(),
+                gate_exps: &moe.gate_exps,
+                up_exps: &moe.up_exps,
+                down_exps: &moe.down_exps,
+                shared: Some(super::SwigluSharedExpert {
+                    gate: &moe.gate_shexp,
+                    up: &moe.up_shexp,
+                    down: &moe.down_shexp,
+                }),
+                clamp_exp: 0.0,
+                clamp_shexp: 0.0,
+            },
+        )
     }
 }
 
