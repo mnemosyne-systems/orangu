@@ -42,7 +42,6 @@ mod reexec;
 mod refresh;
 mod shell;
 mod suggest;
-mod tenant;
 mod tls;
 mod web;
 
@@ -610,9 +609,6 @@ struct Prepared {
     /// bearer token `http::require_api_key` checks. `None` leaves the server
     /// open.
     api_key: Option<String>,
-    /// The `[tenant:<name>]` sections, resolved once into the live meters the
-    /// middleware admits against. Empty unless the config declares tenants.
-    tenants: Arc<tenant::TenantRegistry>,
     /// `[orangu-server].tls_cert`/`tls_key`, resolved once. `None` serves
     /// plain HTTP.
     tls: Option<(PathBuf, PathBuf)>,
@@ -1246,7 +1242,6 @@ fn prepare(args: Args) -> Result<Prepared> {
 
     Ok(Prepared {
         api_key: conf.api_key.clone(),
-        tenants: Arc::new(tenant::TenantRegistry::new(&conf.tenants)),
         tls: conf.tls.clone(),
         engine,
         prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
@@ -1514,7 +1509,6 @@ fn build_model(
 async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
         api_key,
-        tenants,
         tls,
         engine,
         prefix_cache_snapshot,
@@ -1581,15 +1575,12 @@ async fn serve(prepared: Prepared) -> Result<()> {
     };
 
     // Captured before `api_key` moves into `AppState`, for the exposure note
-    // further down. A declared tenant counts: it is a key the server checks,
-    // so a deployment that uses only named keys is authenticated and must not
-    // be told otherwise.
-    let has_api_key = api_key.is_some() || !tenants.is_empty();
+    // further down.
+    let has_api_key = api_key.is_some();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
         api_key,
-        tenants: tenants.clone(),
         model_label: model_label.clone(),
         backend_label: backend_label.clone(),
         gpu_tuning,
@@ -1661,28 +1652,6 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // about where to point a client, `0.0.0.0:8100` does.
         println!("API        {scheme}://{}", listener.local_addr()?);
         println!("Workspace  {}", workspace.display());
-        // Who may call, and under what bound. Printed because a limit nobody
-        // can see is indistinguishable from a limit that is not applied — and
-        // this one is spelled in a section header, which is exactly the kind
-        // of key a typo turns into an MCP server nobody notices.
-        for meter in tenants.meters() {
-            let limits = meter.limits();
-            let bounds = if limits.any() {
-                [
-                    (limits.max_concurrent as u64, "concurrent"),
-                    (limits.requests_per_minute, "req/min"),
-                    (limits.tokens_per_minute, "tok/min"),
-                ]
-                .iter()
-                .filter(|(value, _)| *value > 0)
-                .map(|(value, unit)| format!("{value} {unit}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-            } else {
-                "no limits".to_string()
-            };
-            println!("Tenant     {} ({bounds})", meter.name());
-        }
         // The two deployment gates, said once, where someone will see it.
         //
         // Binding to a network is a deliberate act; serving an inference
@@ -1692,13 +1661,9 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // point the omission is worth naming rather than leaving for someone
         // to discover from the outside.
         if !listener.local_addr()?.ip().is_loopback() {
-            // The fix names only what is actually absent. Telling an operator
-            // to set `api_key` on a server that already authenticates — which
-            // is what a tenant-only deployment looks like — sends them to
-            // check a key that is working, and makes the half of the note that
-            // *is* true easier to dismiss.
-            let key_fix =
-                "[orangu-server].api_key (or ORANGU_API_KEY, or a [tenant:<name>] section)";
+            // The fix names only what is actually absent, so the half of the
+            // note that *is* true is not easier to dismiss.
+            let key_fix = "[orangu-server].api_key (or ORANGU_API_KEY)";
             let tls_fix = "tls_cert/tls_key, or terminate TLS in front of it";
             let missing = match (has_api_key, tls_config.is_some()) {
                 (true, true) => None,

@@ -18,7 +18,6 @@
 
 use crate::engine::backend::DeviceRequest;
 use crate::engine::placement::SplitMode;
-use crate::tenant::{TenantConfig, TenantLimits};
 use anyhow::{Context, Result, anyhow};
 use orangu::config::parse_ini_sections;
 use std::{
@@ -186,8 +185,6 @@ pub fn bundled_configuration(
         api_key: std::env::var("ORANGU_API_KEY")
             .ok()
             .filter(|k| !k.is_empty()),
-        // Tenants come from config sections, and a bundle has no config file.
-        tenants: Vec::new(),
         // A bundle is built for a machine nobody will configure, so it takes
         // the ranking policy rather than an index that would only be right
         // on the box the bundle was built on.
@@ -502,14 +499,6 @@ pub struct ServerConfiguration {
     /// wants: a secret in a config file is a secret on disk and in every
     /// backup of it.
     pub api_key: Option<String>,
-    /// `[tenant:<name>]` sections: named keys, each with its own limits.
-    ///
-    /// Empty by default, which is every deployment that has not asked for
-    /// this. A non-empty list turns authentication on by itself, with or
-    /// without [`api_key`](Self::api_key): declaring who may call is a
-    /// statement that not everyone may, and a server that accepted anonymous
-    /// requests alongside metered ones would meter nothing.
-    pub tenants: Vec<TenantConfig>,
     /// `[orangu-server].queue_limit`: how many requests may wait for a slot
     /// before the server starts refusing with `503`. `0` — the default —
     /// queues without bound, which is the behaviour before this key existed.
@@ -887,25 +876,6 @@ pub fn load_server_configuration(
         None => default_device_split(),
     };
 
-    // Taken out before the rest of the file is read as MCP servers, which is
-    // what every remaining section means. Without this a `[tenant:alice]`
-    // section would be reported as an MCP server missing an `endpoint` — an
-    // error about a key the operator never wrote.
-    let tenant_names: Vec<String> = sections
-        .keys()
-        .filter(|name| name.starts_with(TENANT_PREFIX))
-        .cloned()
-        .collect();
-    let mut tenants = Vec::new();
-    for section_name in tenant_names {
-        let values = sections
-            .remove(&section_name)
-            .expect("the name came from this map");
-        tenants.push(parse_tenant(&section_name, &values)?);
-    }
-    tenants.sort_by(|left: &TenantConfig, right: &TenantConfig| left.name.cmp(&right.name));
-    reject_ambiguous_keys(&tenants, api_key.as_deref())?;
-
     let mut mcp_servers = sections
         .into_iter()
         .map(|(name, values)| parse_mcp_configuration(name, values))
@@ -929,7 +899,6 @@ pub fn load_server_configuration(
         draft_model,
         draft_tokens,
         api_key,
-        tenants,
         tls,
         device,
         device_split,
@@ -938,146 +907,6 @@ pub fn load_server_configuration(
         delete,
         mcp_servers,
     })
-}
-
-/// What marks a section as a tenant rather than an MCP server.
-///
-/// A prefix rather than a `[tenants]` block with one key per name, because a
-/// tenant carries four values and an INI file has no nesting to express that
-/// in. It is the same shape the client config already uses for a named server.
-pub const TENANT_PREFIX: &str = "tenant:";
-
-fn parse_tenant(section: &str, values: &HashMap<String, String>) -> Result<TenantConfig> {
-    let name = section
-        .strip_prefix(TENANT_PREFIX)
-        .expect("caller filtered on the prefix")
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        return Err(anyhow!(
-            "[{section}] has no name — the section header is [{TENANT_PREFIX}<name>], \
-             and the name is what appears in /metrics and in refusals"
-        ));
-    }
-
-    // Either the key itself or the name of a variable holding it, never both:
-    // two spellings of one secret is a configuration whose effective value
-    // depends on a precedence rule nobody should have to know.
-    let literal = values
-        .get("api_key")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let from_env = values
-        .get("api_key_env")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let api_key = match (literal, from_env) {
-        (Some(_), Some(_)) => {
-            return Err(anyhow!(
-                "[{section}] sets both api_key and api_key_env — use one"
-            ));
-        }
-        (Some(key), None) => key,
-        // The variable must be set *now*. Falling back to "no key" would leave
-        // a tenant nobody can authenticate as, and falling back to open would
-        // publish the server; a typo in a variable name should stop the
-        // server, naming the variable.
-        (None, Some(variable)) => std::env::var(&variable)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow!("[{section}].api_key_env names {variable}, which is unset or empty")
-            })?,
-        (None, None) => {
-            return Err(anyhow!(
-                "[{section}] must set api_key (or api_key_env) — a tenant is identified by \
-                 the key it presents, so one without a key can never be recognised"
-            ));
-        }
-    };
-
-    let limits = TenantLimits {
-        max_concurrent: tenant_number::<usize>(section, values, "max_concurrent")?.unwrap_or(0),
-        requests_per_minute: tenant_number::<u64>(section, values, "requests_per_minute")?
-            .unwrap_or(0),
-        tokens_per_minute: tenant_number::<u64>(section, values, "tokens_per_minute")?.unwrap_or(0),
-    };
-
-    // Anything else is a typo in a key that silently does nothing — and a
-    // limit that silently does nothing is the failure this whole feature is
-    // supposed to prevent.
-    const KNOWN: [&str; 5] = [
-        "api_key",
-        "api_key_env",
-        "max_concurrent",
-        "requests_per_minute",
-        "tokens_per_minute",
-    ];
-    let mut unknown: Vec<&str> = values
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !KNOWN.contains(key))
-        .collect();
-    unknown.sort_unstable();
-    if let Some(key) = unknown.first() {
-        return Err(anyhow!(
-            "[{section}] has no key '{key}' (expected {})",
-            KNOWN.join(", ")
-        ));
-    }
-
-    Ok(TenantConfig {
-        name,
-        api_key,
-        limits,
-    })
-}
-
-fn tenant_number<T>(section: &str, values: &HashMap<String, String>, key: &str) -> Result<Option<T>>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    values
-        .get(key)
-        .map(|value| {
-            value
-                .trim()
-                .parse::<T>()
-                .map_err(|err| anyhow!("invalid value for [{section}].{key}: {err}"))
-        })
-        .transpose()
-}
-
-/// Two tenants sharing a key, or a tenant sharing the server's own key.
-///
-/// A startup error rather than a first-match win: the same token would
-/// authenticate as two identities, so every limit and every usage figure would
-/// be attributed to whichever one the lookup happened to reach — which is not
-/// a policy, it is a coin flip that looks like one.
-fn reject_ambiguous_keys(tenants: &[TenantConfig], api_key: Option<&str>) -> Result<()> {
-    for (index, tenant) in tenants.iter().enumerate() {
-        if Some(tenant.api_key.as_str()) == api_key {
-            return Err(anyhow!(
-                "[{TENANT_PREFIX}{}] uses the same key as [{SERVER_SECTION}].api_key — \
-                 a request presenting it could be either",
-                tenant.name
-            ));
-        }
-        if let Some(other) = tenants[..index]
-            .iter()
-            .find(|other| other.api_key == tenant.api_key)
-        {
-            return Err(anyhow!(
-                "[{TENANT_PREFIX}{}] and [{TENANT_PREFIX}{}] share an api_key — \
-                 a request presenting it could be either",
-                other.name,
-                tenant.name
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn parse_mcp_configuration(
@@ -1421,165 +1250,6 @@ mod tests {
                 .web,
             8200
         );
-    }
-
-    /// A config file, written and parsed, so the section-name handling is
-    /// exercised rather than the tenant parser in isolation.
-    fn load(contents: &str) -> Result<ServerConfiguration> {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "{contents}").unwrap();
-        load_server_configuration(file.path(), None, false)
-    }
-
-    #[test]
-    fn tenants_are_read_with_their_limits_and_sorted_by_name() {
-        let conf = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:web]\napi_key = web-key\nmax_concurrent = 2\n\
-             requests_per_minute = 60\ntokens_per_minute = 20000\n\n\
-             [tenant:ci]\napi_key = ci-key\n",
-        )
-        .unwrap();
-        assert_eq!(
-            conf.tenants
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["ci", "web"]
-        );
-        // A tenant declared with nothing but a key is authentication only.
-        assert_eq!(conf.tenants[0].api_key, "ci-key");
-        assert_eq!(conf.tenants[0].limits, TenantLimits::default());
-        assert_eq!(
-            conf.tenants[1].limits,
-            TenantLimits {
-                max_concurrent: 2,
-                requests_per_minute: 60,
-                tokens_per_minute: 20000,
-            }
-        );
-    }
-
-    /// Every section that is not `[orangu-server]` or `[web]` is read as an
-    /// MCP server, so a tenant section has to be taken out first. Without
-    /// that, declaring a tenant fails with "endpoint must be set for an MCP
-    /// server" — an error about a key the operator never wrote.
-    #[test]
-    fn a_tenant_section_is_not_mistaken_for_an_mcp_server() {
-        let conf = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key = alice-key\n\n\
-             [weather]\nendpoint = http://localhost:9000\n",
-        )
-        .unwrap();
-        assert_eq!(conf.tenants.len(), 1);
-        assert_eq!(conf.mcp_servers.len(), 1);
-        assert_eq!(conf.mcp_servers[0].name, "weather");
-    }
-
-    #[test]
-    fn a_tenant_without_a_key_is_a_startup_error() {
-        let err =
-            load("[orangu-server]\nmodels = /srv/models\n\n[tenant:alice]\nmax_concurrent = 1\n")
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("[tenant:alice]"), "{err}");
-        assert!(err.contains("api_key"), "{err}");
-    }
-
-    /// A typo in a limit is a limit that silently does nothing — which is the
-    /// failure the whole key exists to prevent.
-    #[test]
-    fn an_unknown_key_in_a_tenant_section_names_itself() {
-        let err = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key = k\nmax_concurent = 2\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("max_concurent"), "{err}");
-        assert!(err.contains("max_concurrent"), "{err}");
-    }
-
-    #[test]
-    fn a_limit_that_is_not_a_number_names_the_key() {
-        let err = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key = k\ntokens_per_minute = lots\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("[tenant:alice].tokens_per_minute"), "{err}");
-    }
-
-    /// Two identities behind one token is not a policy, it is a coin flip —
-    /// every limit and every usage figure would land on whichever tenant the
-    /// lookup happened to reach.
-    #[test]
-    fn two_tenants_may_not_share_a_key() {
-        let err = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key = same\n\n[tenant:bob]\napi_key = same\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("alice") && err.contains("bob"), "{err}");
-    }
-
-    #[test]
-    fn a_tenant_may_not_share_the_servers_own_key() {
-        let err = load(
-            "[orangu-server]\nmodels = /srv/models\napi_key = shared\n\n\
-             [tenant:alice]\napi_key = shared\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("[orangu-server].api_key"), "{err}");
-    }
-
-    /// Multi-tenancy must not force secrets onto disk — the property
-    /// `ORANGU_API_KEY` exists to preserve for the single-key case.
-    #[test]
-    fn a_tenant_key_can_come_from_the_environment() {
-        // Scoped to this test's own variable name so it cannot collide with
-        // another test's environment.
-        let variable = "ORANGU_TEST_TENANT_KEY_ALICE";
-        // SAFETY: single-threaded setup for this test's own variable.
-        unsafe { std::env::set_var(variable, "from-the-env") };
-        let conf = load(&format!(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key_env = {variable}\n"
-        ))
-        .unwrap();
-        assert_eq!(conf.tenants[0].api_key, "from-the-env");
-
-        unsafe { std::env::remove_var(variable) };
-        let err = load(&format!(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key_env = {variable}\n"
-        ))
-        .unwrap_err()
-        .to_string();
-        // An unset variable stops the server naming it, rather than leaving a
-        // tenant nobody can authenticate as or a server nobody has to.
-        assert!(err.contains(variable), "{err}");
-    }
-
-    #[test]
-    fn a_tenant_may_not_spell_its_key_twice() {
-        let err = load(
-            "[orangu-server]\nmodels = /srv/models\n\n\
-             [tenant:alice]\napi_key = k\napi_key_env = SOMEWHERE\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("api_key_env"), "{err}");
-    }
-
-    #[test]
-    fn a_config_with_no_tenant_section_declares_none() {
-        let conf = load("[orangu-server]\nmodels = /srv/models\n").unwrap();
-        assert!(conf.tenants.is_empty());
     }
 
     #[test]

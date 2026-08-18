@@ -28,7 +28,6 @@ into `~/.local/bin`. On Windows: `install.cmd`.
 | --- | --- |
 | `~/.orangu/` | `orangu.conf`, `orangu-server.conf`, `skills/`; a local `./orangu.conf` wins. |
 | `api_key` / `tls_cert` + `tls_key` | Bearer auth (`401` without it) and HTTPS, before exposing a server. `ORANGU_API_KEY` beats the file. |
-| `[tenant:<name>]` | A named key with its own `max_concurrent`, `requests_per_minute`, `tokens_per_minute`. Over one: `429`. |
 | `/metrics` `/ready` | Prometheus histograms and counters, no `api_key`. `/ready`: `503` on a full queue. |
 | `draft_model` | Speculative decoding: a small model guesses, the served one verifies. Greedy only, and measure it. |
 | `orangu -w /path/to/project` | Another tree. `-r` resumes, `-l` lists, `-a` reopens tabs, `-p` runs one prompt. |

@@ -401,119 +401,11 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         state.engine.slots.queue_limit(),
     );
     body.push_str(&state.engine.metrics.render());
-    body.push_str(&tenant_metrics(&state.tenants));
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
         body,
     )
-}
-
-/// Per-tenant series, or nothing at all when no tenant is declared.
-///
-/// Emitted even for a tenant with no limits set, because attribution is the
-/// half of this that is useful before anyone decides on a number: "who is
-/// using the machine, and for how many tokens" is the question an operator has
-/// to answer *first*, and a limit chosen without it is a guess.
-///
-/// `denied_total` matters more than it looks. A limit that is quietly refusing
-/// requests looks, from the server's side, exactly like a limit that is never
-/// reached — both are a tenant with nothing in flight — and the difference is
-/// the whole of whether the number was set right.
-fn tenant_metrics(tenants: &crate::tenant::TenantRegistry) -> String {
-    if tenants.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(
-        "# HELP orangu_server_tenant_requests_total Requests admitted for a tenant.\n\
-         # TYPE orangu_server_tenant_requests_total counter\n",
-    );
-    for meter in tenants.meters() {
-        out.push_str(&format!(
-            "orangu_server_tenant_requests_total{{tenant=\"{}\"}} {}\n",
-            meter.name(),
-            meter.total_requests()
-        ));
-    }
-    out.push_str(
-        "# HELP orangu_server_tenant_tokens_total Prompt and generated tokens charged to a tenant.\n\
-         # TYPE orangu_server_tenant_tokens_total counter\n",
-    );
-    for meter in tenants.meters() {
-        out.push_str(&format!(
-            "orangu_server_tenant_tokens_total{{tenant=\"{}\"}} {}\n",
-            meter.name(),
-            meter.total_tokens()
-        ));
-    }
-    out.push_str(
-        "# HELP orangu_server_tenant_in_flight Requests a tenant has in flight now.\n\
-         # TYPE orangu_server_tenant_in_flight gauge\n",
-    );
-    for meter in tenants.meters() {
-        out.push_str(&format!(
-            "orangu_server_tenant_in_flight{{tenant=\"{}\"}} {}\n",
-            meter.name(),
-            meter.in_flight()
-        ));
-    }
-    out.push_str(
-        "# HELP orangu_server_tenant_tokens_in_window Tokens a tenant spent in the last minute.\n\
-         # TYPE orangu_server_tenant_tokens_in_window gauge\n",
-    );
-    for meter in tenants.meters() {
-        out.push_str(&format!(
-            "orangu_server_tenant_tokens_in_window{{tenant=\"{}\"}} {}\n",
-            meter.name(),
-            meter.tokens_in_window()
-        ));
-    }
-    out.push_str(
-        "# HELP orangu_server_tenant_requests_in_window Requests a tenant made in the last minute.\n\
-         # TYPE orangu_server_tenant_requests_in_window gauge\n",
-    );
-    for meter in tenants.meters() {
-        out.push_str(&format!(
-            "orangu_server_tenant_requests_in_window{{tenant=\"{}\"}} {}\n",
-            meter.name(),
-            meter.requests_in_window()
-        ));
-    }
-    out.push_str(
-        "# HELP orangu_server_tenant_denied_total Requests refused by a tenant limit.\n\
-         # TYPE orangu_server_tenant_denied_total counter\n",
-    );
-    for meter in tenants.meters() {
-        for limit in crate::tenant::Limit::ALL {
-            out.push_str(&format!(
-                "orangu_server_tenant_denied_total{{tenant=\"{}\",limit=\"{}\"}} {}\n",
-                meter.name(),
-                limit.label(),
-                meter.denied(limit)
-            ));
-        }
-    }
-    // The configured bounds themselves, so a dashboard can draw usage against
-    // its limit without the limit having to be configured a second time in the
-    // dashboard — the copy that goes stale.
-    out.push_str(
-        "# HELP orangu_server_tenant_limit The configured bound; 0 is unlimited.\n\
-         # TYPE orangu_server_tenant_limit gauge\n",
-    );
-    for meter in tenants.meters() {
-        let limits = meter.limits();
-        for (label, value) in [
-            ("concurrency", limits.max_concurrent as u64),
-            ("requests", limits.requests_per_minute),
-            ("tokens", limits.tokens_per_minute),
-        ] {
-            out.push_str(&format!(
-                "orangu_server_tenant_limit{{tenant=\"{}\",limit=\"{label}\"}} {value}\n",
-                meter.name(),
-            ));
-        }
-    }
-    out
 }
 
 #[derive(Deserialize)]
@@ -589,7 +481,6 @@ fn default_n_predict() -> usize {
 
 pub async fn completion(
     State(state): State<Arc<AppState>>,
-    charge: super::Charge,
     Json(req): Json<CompletionRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -620,7 +511,6 @@ pub async fn completion(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
-            charge: charge.0,
         })
         .await;
 
@@ -728,24 +618,16 @@ pub struct EmbeddingResponse {
 
 pub async fn embedding(
     State(state): State<Arc<AppState>>,
-    charge: super::Charge,
     Json(req): Json<EmbeddingRequest>,
 ) -> axum::response::Response {
     match super::openai::pooled_embedding(&state, &req.content).await {
         // llama.cpp's native `/embedding` carries the vector and nothing else,
-        // so the token count `PooledEmbedding` also returns is dropped from
-        // the *response* on purpose; `/v1/embeddings` is where it surfaces, as
-        // `usage`. It is still charged — what the caller is shown and what the
-        // machine spent are different questions.
-        Ok(pooled) => {
-            if let Some(meter) = &charge.0 {
-                meter.charge(pooled.prompt_tokens as u64);
-            }
-            Json(EmbeddingResponse {
-                embedding: pooled.embedding,
-            })
-            .into_response()
-        }
+        // so the token count `PooledEmbedding` also returns is dropped on
+        // purpose; `/v1/embeddings` is where it surfaces, as `usage`.
+        Ok(pooled) => Json(EmbeddingResponse {
+            embedding: pooled.embedding,
+        })
+        .into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }

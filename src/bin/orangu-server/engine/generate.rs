@@ -125,15 +125,6 @@ pub struct GenerateRequest {
     /// channel message per token, which is nothing next to a forward pass but
     /// is pure waste for a caller that never reads it.
     pub timings_per_token: bool,
-    /// Who to charge this request's tokens to, or `None` for a request with no
-    /// tenant — an open server, the operator's own key, or the web console.
-    ///
-    /// Carried on the request rather than charged by each endpoint from the
-    /// `usage` it already computes, because there are seven places that
-    /// compute `usage` and exactly one place a generation ends. Charging at
-    /// the end means every generating endpoint — including any added later —
-    /// is accounted for without anyone remembering to account for it.
-    pub charge: Option<Arc<crate::tenant::TenantMeter>>,
 }
 
 impl Default for GenerateRequest {
@@ -147,7 +138,6 @@ impl Default for GenerateRequest {
             cache_prompt: true,
             id_slot: None,
             timings_per_token: false,
-            charge: None,
         }
     }
 }
@@ -947,13 +937,6 @@ fn run(
         guard.id(),
         stats.log_line()
     );
-    // Charged here, at the one point a generation is over, rather than at each
-    // endpoint's `usage` — and charged before the `Done` event, so a client
-    // that reads `usage` and immediately fires its next request cannot arrive
-    // ahead of its own bill.
-    if let Some(meter) = &req.charge {
-        meter.charge((stats.prompt_tokens + stats.generated_tokens) as u64);
-    }
     outcome.finish(
         match finish_reason {
             FinishReason::Stop => super::metrics::Outcome::Stop,
@@ -2134,7 +2117,6 @@ mod tests {
             cache_prompt: true,
             id_slot: None,
             timings_per_token: false,
-            charge: None,
         };
         let draft = DraftModel {
             model: draft,
@@ -2181,7 +2163,6 @@ mod tests {
             cache_prompt,
             id_slot: None,
             timings_per_token: false,
-            charge: None,
         };
         run(
             model,
@@ -2635,7 +2616,6 @@ mod tests {
                 cache_prompt: true,
                 id_slot: None,
                 timings_per_token: false,
-                charge: None,
             })
             .await;
 

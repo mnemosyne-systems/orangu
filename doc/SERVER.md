@@ -959,12 +959,6 @@ role = all
 [web]
 port = 8101
 reexec = yes
-
-[tenant:web]
-api_key = another-long-random-string
-max_concurrent = 2
-requests_per_minute = 120
-tokens_per_minute = 40000
 ```
 
 - `models` — the base directory a model spec resolves into: what `list`/
@@ -1031,15 +1025,6 @@ tokens_per_minute = 40000
   it also defaults to and does not suit a widened `host`. `ORANGU_API_KEY`
   overrides the file so the secret need not be written down. Only `/health` is
   exempt; everything else answers `401` with `WWW-Authenticate: Bearer`.
-- `[tenant:<name>]` sections — named keys, each with `max_concurrent`,
-  `requests_per_minute` and `tokens_per_minute` of its own (all `0`, meaning
-  unlimited, by default). `api_key_env` names an environment variable holding
-  the key instead of writing it here. Declaring a tenant turns authentication
-  on by itself; `api_key` above stays the operator's own key and is never
-  limited. Over a limit the five model-running endpoints answer `429` with
-  `Retry-After` and `X-Orangu-Rate-Limit`; metadata endpoints are never
-  metered. Per-tenant usage, refusals and bounds are on `/metrics`. See
-  **Tenants** in the manual.
 - `device` — *which* card when `backend` finds more than one: `auto` (the
   default), an index as printed at startup, or any part of the device's name.
 - `device_split` — spread one model's layers across several devices; `off` by
@@ -1574,12 +1559,10 @@ the API and (if enabled) the web UI listener stop together.
 
 ## Endpoint reference
 
-Four answers apply to every row rather than to any one of them: `401` when
-`api_key` or a `[tenant:…]` section is set and the request carries no valid
-bearer token (`GET /health` and `GET /ready` excepted); `503` with `Retry-After` when
-`queue_limit` is reached; `429` with `Retry-After` and `X-Orangu-Rate-Limit`
-when a tenant is over one of its own limits, on the five endpoints that run the
-model; and `https` on the same port when `tls_cert`/`tls_key` are set.
+Three answers apply to every row rather than to any one of them: `401` when
+`api_key` is set and the request carries no valid bearer token (`GET /health`
+and `GET /ready` excepted); `503` with `Retry-After` when `queue_limit` is
+reached; and `https` on the same port when `tls_cert`/`tls_key` are set.
 
 | Endpoint | |
 | :-- | :-- |
@@ -1591,7 +1574,7 @@ model; and `https` on the same port when `tls_cert`/`tls_key` are set.
 | `GET /ready` | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health` |
 | `GET /props` | model + server metadata |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens; plus per-tenant usage, refusals and bounds when `[tenant:…]` sections are declared |
+| `GET /metrics` | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens |
 | `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, the per-layer-call union, rows and bytes dequantized, plus the process's fault and RSS figures. Drain once before a workload and again after to measure exactly that window. Dense models report `layer_calls: 0` |
 | `orangu-server plan <model> [--deep]` | (a subcommand, not an endpoint) Reports what a model would need to run here **without loading it** — dense vs routed-expert bytes, experts streamed per token, and a verdict. Reads only the GGUF tensor tables, so a 434 GiB 11-shard model takes well under a second. `--deep` also checks every shard is present and the architecture supported |
 | `GET /gpu-timings` | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them |

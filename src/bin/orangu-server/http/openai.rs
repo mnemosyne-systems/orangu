@@ -22,8 +22,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::AppState;
 use super::native::finish_reason_str;
-use super::{AppState, Charge};
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::loader::PoolingType;
@@ -284,7 +284,6 @@ fn tool_calls_json(calls: &[tool_calls::ParsedToolCall], created: u64) -> serde_
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    charge: Charge,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -370,7 +369,6 @@ pub async fn chat_completions(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: req.stream && req.timings_per_token,
-            charge: charge.0,
         })
         .await;
 
@@ -642,7 +640,6 @@ pub struct CompletionsRequest {
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
-    charge: Charge,
     Json(req): Json<CompletionsRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -692,7 +689,6 @@ pub async fn completions(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
-            charge: charge.0,
         })
         .await;
 
@@ -797,7 +793,6 @@ struct EmbeddingDatum {
 
 pub async fn embeddings(
     State(state): State<Arc<AppState>>,
-    charge: Charge,
     Json(req): Json<EmbeddingsRequest>,
 ) -> axum::response::Response {
     let inputs = match req.input {
@@ -809,13 +804,6 @@ pub async fn embeddings(
     for (index, text) in inputs.into_iter().enumerate() {
         match pooled_embedding(&state, &text).await {
             Ok(pooled) => {
-                // Charged per input rather than once at the end, so a batch
-                // that fails half way through has still been paid for: the
-                // forward passes that ran are the machine's time whether or
-                // not the caller got a response.
-                if let Some(meter) = &charge.0 {
-                    meter.charge(pooled.prompt_tokens as u64);
-                }
                 prompt_tokens += pooled.prompt_tokens;
                 data.push(EmbeddingDatum {
                     object: "embedding",

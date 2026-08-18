@@ -716,11 +716,6 @@ async fn send_message(
             // notion of a slot; any free one is right.
             id_slot: None,
             timings_per_token: false,
-            // The console is served on its own listener, behind its own
-            // `[web].host`, and presents no bearer token — there is no tenant
-            // to charge, and inventing one would put the operator's own
-            // browsing against somebody's budget.
-            charge: None,
         })
         .await;
 

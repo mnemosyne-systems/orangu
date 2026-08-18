@@ -1011,9 +1011,6 @@ reexec = yes
   probe that fails before credentials are distributed. Everything else —
   `/v1/*`, `/metrics`, `/slots`, `/v1/shutdown` — answers `401` with
   `WWW-Authenticate: Bearer`.
-- `[tenant:<name>]` sections — more than one key, each with limits of its own.
-  See **Tenants** below. `api_key` above stays the operator's own key and is
-  never limited.
 - `queue_limit` — how many requests may **wait** for a slot before the server
   starts refusing (default `0`, unbounded). Beyond the limit a request is
   answered immediately with `503 Service Unavailable` and `Retry-After: 1`
@@ -1110,17 +1107,9 @@ shown.
 | `reexec` | `yes` | let the console switch the served model |
 | `delete` | `no` | let the console delete models from disk |
 
-| `[tenant:<name>]` | default | what it does |
-| :-- | :-- | :-- |
-| `api_key` | *one of these two* | the bearer token that identifies this tenant |
-| `api_key_env` | *one of these two* | name of an environment variable holding it instead |
-| `max_concurrent` | `0` | requests this tenant may have in flight at once; `0` is unlimited |
-| `requests_per_minute` | `0` | arrival rate over the last minute; `0` is unlimited |
-| `tokens_per_minute` | `0` | prompt + generated tokens over the last minute; `0` is unlimited |
-
-Every section that is none of the above — not `[orangu-server]`, not `[web]`,
-not `[tenant:<name>]` — is read as an **MCP server**, named after the section.
-These are an inventory for the web console's MCP panel, which lists them and
+Every section that is none of the above — not `[orangu-server]` and not
+`[web]` — is read as an **MCP server**, named after the section. These are an
+inventory for the web console's MCP panel, which lists them and
 shows one on request; the server itself neither connects to them nor calls
 them, so an entry here changes nothing about inference. A section with no
 `endpoint` is rejected at startup, which is also what a misspelled section
@@ -1256,95 +1245,6 @@ orangu-server: [speculative/draft model] 43 drafted tokens accepted over 20 step
 Prompt-lookup speculation needs no second model and stays behind
 `ORANGU_SPECULATIVE`; see the *Inference server internals* chapter. Setting
 `draft_model` takes precedence over it.
-
-### Tenants: named keys with their own limits
-
-`queue_limit` above keeps the server from collapsing. It does nothing about
-how the capacity is *divided*: one client opening thirty streams fills the
-queue, and everybody else gets `503` from a server that is perfectly healthy
-and completely useless to them. A `[tenant:<name>]` section is the other half —
-a limit on one caller, so that caller's excess is refused before it becomes
-everyone's outage.
-
-```ini
-[orangu-server]
-models = ~/models
-host = all
-api_key = the-operators-own-key
-
-[tenant:web]
-api_key = web-app-key
-max_concurrent = 2
-requests_per_minute = 120
-tokens_per_minute = 40000
-
-[tenant:ci]
-api_key_env = ORANGU_CI_KEY
-max_concurrent = 1
-```
-
-Declaring a tenant **turns authentication on**, with or without
-`[orangu-server].api_key`: saying who may call is a statement that not everyone
-may, and a server that still answered anonymous requests would be metering
-nobody. `api_key` itself stays the operator's own key and is never limited — a
-deployment that adds tenants around it should not discover that its own key
-acquired bounds it never set.
-
-Use `api_key_env` where you would have used `ORANGU_API_KEY`: it names an
-environment variable holding the key, so multi-tenancy does not force every
-secret onto disk. A variable that is unset at startup stops the server and says
-which one, rather than leaving a tenant nobody can authenticate as.
-
-**The three limits, and what each is for.**
-
-- `max_concurrent` bounds requests in flight. This is the direct bound on the
-  scarce thing: a generation holds a slot from admission to its last token,
-  and slots are what everyone is queueing for. It is also held for the whole
-  of a *streamed* response, not just until the response starts.
-- `requests_per_minute` bounds arrival rate. Concurrency alone does not stop a
-  loop firing thousands of one-token requests — each is over before the next
-  begins, so none is ever concurrent with any other.
-- `tokens_per_minute` bounds work done, counting prompt and generated tokens
-  together. It is the only one denominated in what a request actually costs:
-  two requests are not two units of anything when one is forty tokens and the
-  next four thousand.
-
-Every limit defaults to `0`, meaning unlimited, so a tenant declared with
-nothing but a key is authenticated and unmetered — which is a reasonable place
-to start, because `/metrics` reports per-tenant usage whether or not a limit is
-set, and the usage is what tells you which number to pick.
-
-**What a refusal looks like.** `429 Too Many Requests`, with `Retry-After` and
-an `X-Orangu-Rate-Limit` header naming which of the three was hit
-(`concurrency`, `requests` or `tokens`):
-
-```text
-HTTP/1.1 429 Too Many Requests
-retry-after: 56
-x-orangu-rate-limit: requests
-
-rate limit exceeded (requests): 3 requests per minute for tenant 'alice'. Retry in 56s.
-```
-
-`429`, not the `503` a full queue gets, because they mean different things:
-`503` says the server is saturated and every client is seeing it, `429` says
-this caller is over its own bound while the server may be idle. The refusal is
-immediate rather than a wait — making the request queue instead would put it in
-the very resource the limit exists to keep it out of.
-
-`Retry-After` is a real number rather than a constant: for a rate window it is
-when the oldest counted second rolls off, which is the earliest moment there
-is room.
-
-**Two things worth knowing before you pick numbers.** The limits apply to the
-endpoints that run the model — `/v1/chat/completions`, `/v1/completions`,
-`/v1/embeddings`, `/completion`, `/embedding` — and not to metadata like
-`/props`, `/slots`, `/metrics` or `/v1/models`. A monitoring scrape holding a
-tenant key would otherwise spend that tenant's generation budget on nothing.
-And a token budget is checked against tokens *already* spent, so the request in
-flight can overshoot it by its own length: what a generation will cost is not
-knowable until it stops, and the overshoot is bounded by `max_tokens` and
-repaid out of the next minute.
 
 ### The `[web]` section
 
@@ -2557,7 +2457,7 @@ pin — there is no later turn to keep a cache warm for.
 
 ## Endpoint reference
 
-Four things apply to every endpoint below rather than to any one of them, and
+Three things apply to every endpoint below rather than to any one of them, and
 are easy to miss looking down a table:
 
 - **`401`** — when `[orangu-server].api_key` is set, every endpoint except
@@ -2566,10 +2466,6 @@ are easy to miss looking down a table:
 - **`503`** — when `queue_limit` is set and that many requests are already
   waiting for a slot, a generating endpoint answers `503` with `Retry-After`
   instead of joining the queue.
-- **`429`** — when the key belongs to a `[tenant:<name>]` with a limit it has
-  reached, the five endpoints that run the model answer `429` with
-  `Retry-After` and `X-Orangu-Rate-Limit`. Metadata endpoints are never
-  metered. See **Tenants** above.
 - **`https`** — when `tls_cert`/`tls_key` are set, every endpoint is served
   over TLS on the same port; there is no plaintext listener alongside.
 
@@ -2584,7 +2480,7 @@ are easy to miss looking down a table:
 | `GET /ready` | readiness: would a request sent now be served. `503` with a reason when the admission queue is full or the GPU device was lost. Reachable without an `api_key`, like `/health` |
 | `GET /props` | model + server metadata: the `backend` and device the model is running on (plus every other device that backend saw, and under `gpu.footprint` what this model costs on it), and `version`/`commit` — which build is answering |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text: slots and queue depth as gauges; latency histograms (queue wait, time to first token, inter-token, request duration); counters for requests by outcome and for prompt/cached/generated tokens; and — when tenants are declared — per-tenant usage, refusals and bounds |
+| `GET /metrics` | Prometheus text: slots and queue depth as gauges; latency histograms (queue wait, time to first token, inter-token, request duration); counters for requests by outcome and for prompt/cached/generated tokens |
 | `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /tokenize` / `POST /detokenize` | |
 | `POST /embedding` | native embeddings |

@@ -22,7 +22,6 @@ pub mod openai;
 
 use crate::engine::backend::Backend;
 use crate::engine::generate::Engine;
-use crate::tenant::{Denied, InFlight, TenantMeter, TenantRegistry};
 use axum::{
     Router,
     extract::State,
@@ -44,10 +43,6 @@ pub struct AppState {
     /// The bearer token every request must carry, or `None` for an open
     /// server — see [`require_api_key`].
     pub api_key: Option<String>,
-    /// The named keys from `[tenant:<name>]`, each with its own limits and its
-    /// own live accounting. Empty for every deployment that has not declared
-    /// one, in which case nothing here costs anything.
-    pub tenants: Arc<TenantRegistry>,
     /// What `general.name`/the resolved model spec reports as the model's
     /// "id" in `/v1/models` and `/props` — not necessarily a real file path,
     /// so a client can display it directly.
@@ -101,57 +96,23 @@ pub struct AppState {
 /// been the wrong shape.
 const OPEN_PATHS: &[&str] = &["/health", "/ready"];
 
-/// The paths a tenant's limits apply to: everything that runs the model.
-///
-/// The rest of the API is metadata — `/props`, `/slots`, `/metrics`,
-/// `/v1/models` — and metering it would be worse than leaving it alone in both
-/// directions. A monitoring scrape holding a tenant key would spend a
-/// generation budget on nothing, and a `requests_per_minute` of 60 would then
-/// mean "sixty seconds of Prometheus, and no inference at all". These limits
-/// are denominated in the machine's time, so they are charged where the
-/// machine's time goes.
-///
-/// `/tokenize` and `/apply-template` are on the metadata side deliberately:
-/// they touch the tokenizer and the template, not the model, and their cost is
-/// already bounded by the size of the body the caller sent.
-const METERED_PATHS: &[&str] = &[
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/embeddings",
-    "/completion",
-    "/embedding",
-];
-
 /// Establishes who is asking, and whether they may.
 ///
-/// Two jobs, and they are one function because the second is meaningless
-/// without the first: a limit needs a subject, and the subject is whatever the
-/// presented key resolves to.
-///
-/// **Authentication.** No key configured and no tenant declared means no
-/// check, which is the behaviour before this existed and the right default for
-/// the loopback address the server also defaults to. The check matters exactly
-/// when `host` is widened, and the pairing is deliberate: nothing about
-/// binding to a network should silently also mean publishing an inference
-/// engine. `Authorization: Bearer <key>` because that is what the orangu
-/// client already sends (`orangu::llm`'s `bearer_auth`) and what every
-/// OpenAI-shaped client sends.
-///
-/// **Metering.** A request that authenticated *as a tenant* takes a place
-/// against that tenant's limits before the handler runs, and holds it until
-/// the response body is finished — see [`hold_until_finished`], which is where
-/// the interesting part is. `[orangu-server].api_key` is deliberately not a
-/// tenant: it is the operator's own key, it predates this, and a deployment
-/// that adds tenants around it should not discover that its own key acquired
-/// limits it never set.
+/// No key configured means no check, which is the behaviour before this
+/// existed and the right default for the loopback address the server also
+/// defaults to. The check matters exactly when `host` is widened, and the
+/// pairing is deliberate: nothing about binding to a network should silently
+/// also mean publishing an inference engine. `Authorization: Bearer <key>`
+/// because that is what the orangu client already sends (`orangu::llm`'s
+/// `bearer_auth`) and what every OpenAI-shaped client sends.
 async fn require_api_key(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    mut request: axum::extract::Request,
+    request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if state.api_key.is_none() && state.tenants.is_empty() {
+    let Some(expected) = state.api_key.as_deref() else {
         return next.run(request).await;
-    }
+    };
     if OPEN_PATHS.contains(&request.uri().path()) {
         return next.run(request).await;
     }
@@ -160,36 +121,24 @@ async fn require_api_key(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
-    let is_operator = state.api_key.as_deref().is_some_and(|expected| {
-        crate::tenant::constant_time_eq(presented.as_bytes(), expected.as_bytes())
-    });
-    let meter = if is_operator {
-        None
-    } else {
-        match state.tenants.resolve(&presented) {
-            Some(meter) => Some(meter),
-            None => return unauthorized(),
-        }
-    };
-
-    let Some(meter) = meter else {
-        return next.run(request).await;
-    };
-    // Available to the handlers, which is how a finished generation knows
-    // whose token budget to charge (`engine::generate::GenerateRequest`).
-    request.extensions_mut().insert(meter.clone());
-
-    if !METERED_PATHS.contains(&request.uri().path()) {
-        return next.run(request).await;
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return unauthorized();
     }
-    let guard = match meter.admit() {
-        Ok(guard) => guard,
-        Err(denied) => return denied_response(&denied),
-    };
-    hold_until_finished(next.run(request).await, guard)
+    next.run(request).await
+}
+
+/// Compares two byte strings without leaking where they first differ.
+///
+/// A `==` on secrets returns as soon as it finds a mismatch, so the time it
+/// takes reports how many leading bytes were right — enough, over many
+/// attempts, to recover a key one byte at a time.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn unauthorized() -> axum::response::Response {
@@ -199,110 +148,6 @@ fn unauthorized() -> axum::response::Response {
         "unauthorized: this server requires an Authorization: Bearer <key> header\n",
     )
         .into_response()
-}
-
-/// What a metered refusal looks like on the wire.
-///
-/// `429`, not the `503` a full queue gets: they are different conditions and a
-/// client should treat them differently. `503` means the *server* is saturated
-/// and any client would see it; `429` means this caller is over its own bound
-/// while the server may be idle. Backing off is right for both; reporting them
-/// as the same outage is not.
-/// Which of the three bounds was hit is carried in a header as well as in the
-/// prose, because they call for different responses and a client should not
-/// have to parse a sentence to tell them apart: concurrency clears as soon as
-/// the caller's own requests finish, a rate window only clears with time.
-fn denied_response(denied: &Denied) -> axum::response::Response {
-    (
-        axum::http::StatusCode::TOO_MANY_REQUESTS,
-        [
-            (
-                axum::http::header::RETRY_AFTER,
-                denied.retry_after.to_string(),
-            ),
-            (RATE_LIMIT_HEADER, denied.limit.label().to_string()),
-        ],
-        format!("{}\n", denied.message),
-    )
-        .into_response()
-}
-
-/// Names the bound a `429` came from: `concurrency`, `requests` or `tokens`.
-const RATE_LIMIT_HEADER: axum::http::HeaderName =
-    axum::http::HeaderName::from_static("x-orangu-rate-limit");
-
-/// Keeps a tenant's place until the response has actually been delivered.
-///
-/// **This is the part that would be wrong if it were simpler.** Dropping the
-/// guard when the handler returns looks equivalent and is not: a streaming
-/// generation returns its response as soon as the SSE stream *exists*, and
-/// then generates for however long the answer takes. A guard released there
-/// would count every streamed request as instantaneous — so a
-/// `max_concurrent` of 1 would admit a thousand of them, and the one shape of
-/// request the limit exists for would be the one shape it did not bound.
-///
-/// So the guard rides on the body and is dropped when the body is dropped:
-/// when the last frame is sent, or when the client disconnects and the
-/// connection tears its body down. Both are exactly when the work stops.
-///
-/// The wrapper forwards `size_hint` and `is_end_stream` rather than
-/// re-streaming the body, so an ordinary JSON response keeps its
-/// `Content-Length` and its framing. Re-wrapping it as a stream of unknown
-/// length would have quietly moved every response on the server to chunked
-/// transfer-encoding to add a `Drop`.
-fn hold_until_finished(
-    response: axum::response::Response,
-    guard: InFlight,
-) -> axum::response::Response {
-    response.map(|body| axum::body::Body::new(Guarded { body, guard }))
-}
-
-/// Whose token budget this request's work belongs to.
-///
-/// An extractor rather than an `Option<Extension<…>>` at five call sites,
-/// because the absence is the common case and has to read as ordinary: an open
-/// server, the operator's own key, and the web console all generate with
-/// nobody to charge, and none of those is a missing extension to be handled.
-pub struct Charge(pub Option<Arc<TenantMeter>>);
-
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Charge {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.extensions.get::<Arc<TenantMeter>>().cloned()))
-    }
-}
-
-/// A response body carrying one tenant's in-flight place.
-struct Guarded {
-    body: axum::body::Body,
-    #[allow(dead_code, reason = "held for its Drop, which releases the place")]
-    guard: InFlight,
-}
-
-impl http_body::Body for Guarded {
-    type Data = axum::body::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        // `axum::body::Body` is `Unpin` (it is a boxed, already-pinned body),
-        // so the projection needs no `unsafe` and no `pin_project`.
-        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.body.size_hint()
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
 }
 
 /// What a refused request is told, on every endpoint.
@@ -382,49 +227,6 @@ async fn shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every metered path is a real route, and every route that runs the
-    /// model is metered.
-    ///
-    /// The second half is the one that bites: a generating endpoint added
-    /// later and left off this list is unlimited, silently, and nothing about
-    /// the server would say so. Written against the router's own list rather
-    /// than a copy of it, so it fails when the routes change and not when
-    /// somebody remembers to update a fixture.
-    #[test]
-    fn every_endpoint_that_runs_the_model_is_metered() {
-        // The generating and embedding endpoints, from `build_router`.
-        let model_paths = [
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/embeddings",
-            "/completion",
-            "/embedding",
-        ];
-        for path in model_paths {
-            assert!(METERED_PATHS.contains(&path), "{path} must be metered");
-        }
-        for path in METERED_PATHS {
-            assert!(model_paths.contains(path), "{path} is not a model path");
-        }
-        // Metadata must not be: a scrape holding a tenant key would otherwise
-        // spend that tenant's generation budget on nothing.
-        for path in ["/metrics", "/props", "/slots", "/v1/models", "/tokenize"] {
-            assert!(!METERED_PATHS.contains(&path), "{path} must not be metered");
-        }
-    }
-
-    /// A metered path is a closed path. Metering an endpoint reachable
-    /// without a key would be a limit with no subject.
-    #[test]
-    fn nothing_metered_is_reachable_without_a_key() {
-        for path in METERED_PATHS {
-            assert!(
-                !OPEN_PATHS.contains(path),
-                "{path} is both open and metered"
-            );
-        }
-    }
 
     /// The probes stay reachable without a key, and nothing else does.
     ///
