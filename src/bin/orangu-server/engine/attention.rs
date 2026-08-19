@@ -284,7 +284,10 @@ pub fn attention(
     {
         let (window_start, window_end) = window(0);
         if window_end >= window_start && window_end + 1 - window_start >= min_gpu_decode_pos() {
-            out.clear();
+            // `resize` without a preceding `clear`: `copy_from_slice`
+            // overwrites every element, so zeroing them first is a wasted
+            // pass over the whole row. `clear` would force one, because
+            // every element then counts as new.
             out.resize(n_head * head_dim, 0.0);
             let got =
                 vulkan.gpu_attention_split(crate::engine::backend::vulkan::GpuAttentionInput {
@@ -321,7 +324,11 @@ pub fn attention(
         return Ran::OnGpu;
     }
 
-    out.clear();
+    // Deliberately no `clear` — see `multi_head_attention`'s contract: it
+    // fills every row it is given, empty windows included, so pre-zeroing
+    // here is a second full pass over a buffer the kernel is about to write.
+    // `resize` still zeroes whatever it *grows*, which is all the correctness
+    // this needs, and after the first layer it grows by nothing.
     out.resize(n_tokens * n_head * head_dim, 0.0);
     multi_head_attention(
         out,
@@ -450,7 +457,9 @@ fn attention_batched<const N: usize, W>(
 
             // Scores as `[n_head, n_pos]`, so each head's row is the
             // contiguous slice `softmax_inplace` needs.
-            scores.clear();
+            // Same reason, and this one is per token rather than per layer:
+            // both score loops below write every `[h, offset]` slot before
+            // anything reads one.
             scores.resize(n_head * n_pos, 0.0);
             // Positions in groups of `N`, so one query row is loaded per group
             // instead of per position. Nesting unchanged — still position-outer,
@@ -660,6 +669,53 @@ mod tests {
         let mut want = vec![0f32; 32];
         multi_head_attention(&mut want, &q, &cache.layers[0], 1, 1, 4, 0.5, |t| (0, t));
         assert_eq!(got, want);
+    }
+
+    /// `attention` reuses the caller's `out` across layers and no longer
+    /// `clear`s it before resizing, on the strength of
+    /// `multi_head_attention`'s "fills every row" contract. That makes a
+    /// stale buffer a real failure mode rather than a hypothetical one: a
+    /// wider previous layer leaves values behind, and a narrower one leaves
+    /// a longer buffer.
+    #[test]
+    fn attention_overwrites_a_dirty_reused_out_buffer() {
+        let backend = crate::engine::backend::cpu::CpuBackend;
+        let mut seed = 0x51ED_u32;
+        let mut cache = build(8, 1, 4, &mut seed);
+        let q: Vec<f32> = (0..32).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
+        let params = Params {
+            backend: &backend,
+            device: 0,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            scale: 0.5,
+            causal: true,
+            n_swa: 0,
+            start_pos: 0,
+            n_tokens: 8,
+        };
+
+        let mut fresh = Vec::new();
+        attention(&mut fresh, &q, &mut cache.layers[0], &params, |t| (0, t));
+
+        // Longer than this call needs and full of values no correct output
+        // could contain, so both truncation and overwrite are under test.
+        let mut dirty = vec![1234.5f32; 32 + 17];
+        attention(&mut dirty, &q, &mut cache.layers[0], &params, |t| (0, t));
+        assert_eq!(
+            dirty.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            fresh.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            "a reused output buffer leaked its previous contents"
+        );
+
+        // The empty-window half of the same contract — that the early return
+        // happens *after* the row is zeroed — is
+        // `shared_attention_handles_sliding_and_empty_windows`, which starts
+        // from a buffer of `7.0`. It cannot be exercised through `attention`
+        // itself: the dispatcher debug-asserts the window against the one it
+        // derives from `causal`/`n_swa`, so a hand-written empty window
+        // panics before reaching the kernel.
     }
 
     /// The head-outer, token-serial form every architecture carried before

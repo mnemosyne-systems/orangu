@@ -614,15 +614,30 @@ impl LlamaModel {
         }
 
         // Grown once and reused across layers rather than allocated per layer:
-        // at prefill widths this is megabytes a layer.
+        // at prefill widths this is megabytes a layer. The two norm scratch
+        // buffers are the same trick applied to what used to be `x.clone()`
+        // — see `tensor::rmsnorm_into`.
         let mut attn_out: Vec<f32> = Vec::new();
+        let mut normed: Vec<f32> = Vec::new();
+        let mut normed2: Vec<f32> = Vec::new();
+        // The projection outputs, on the same principle — see
+        // `Backend::matmul_into`. `ffn` is the big one: `n_tokens * n_ff`.
+        let mut attn_proj: Vec<f32> = Vec::new();
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // `Some` when attention left its output in a device buffer; the
             // post-attention chain then consumes it without a host bounce.
             let mut attn_on_device: Option<wgpu::Buffer> = None;
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
+            tensor::rmsnorm_into(
+                &mut normed,
+                &x,
+                &layer.attn_norm,
+                n_tokens,
+                n_embd,
+                cfg.rms_eps,
+            );
 
             // The whole pre-attention half — Q/K/V, RoPE, the KV-cache write
             // and attention itself — as one GPU submission, when this layer's
@@ -883,12 +898,13 @@ impl LlamaModel {
                 {
                     attn_out = vulkan.read_buffer_f32(buf, n_tokens * n_head * head_dim);
                 }
-                let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                self.backend
+                    .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
                 tensor::add_inplace(&mut x, &attn_proj);
 
-                let mut normed2 = x.clone();
-                tensor::rmsnorm_inplace(
+                tensor::rmsnorm_into(
                     &mut normed2,
+                    &x,
                     &layer.ffn_norm,
                     n_tokens,
                     n_embd,
@@ -898,15 +914,17 @@ impl LlamaModel {
                 // `LLM_FFN_SILU`/`LLM_FFN_PAR` is one computation and this
                 // family (Llama, Mistral, Qwen2, Qwen3) and that one run the
                 // same one.
-                let down = super::swiglu_ffn(
+                super::swiglu_ffn_into(
                     self.backend.as_ref(),
+                    &mut ffn_out,
+                    &mut ffn_scratch,
                     &normed2,
                     n_tokens,
                     &layer.w_gate,
                     &layer.w_up,
                     &layer.w_down,
                 );
-                tensor::add_inplace(&mut x, &down);
+                tensor::add_inplace(&mut x, &ffn_out);
             }
         }
 

@@ -51,461 +51,19 @@ use cudarc::driver::{
 };
 
 use crate::engine::loader::QuantMatrix;
-use crate::engine::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-};
 
 use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, MatmulOp};
 
-/// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
-/// `engine::quant` reads on the CPU path: the remaining `IQ*` types
-/// (`IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/
-/// `IQ3_XXS`/`IQ3_S`/`IQ4_XS`)
-/// index lattice codebooks that would each need their own uploaded buffer,
-/// which `VulkanBackend` has (`IQ_GRID_PRELUDE`) and this backend does not.
-/// `IQ4_NL` is here because it is the exception — a 16-entry level table
-/// small enough to inline into the kernel source. Anything absent is
-/// rejected by `Backend::supports_type` at startup rather than reaching
-/// `matmul`.
-const SUPPORTED_TYPES: &[u32] = &[
-    GGML_TYPE_F32,
-    GGML_TYPE_F16,
-    GGML_TYPE_BF16,
-    GGML_TYPE_Q4_0,
-    GGML_TYPE_Q5_0,
-    GGML_TYPE_Q8_0,
-    GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_K,
-    GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K,
-    GGML_TYPE_IQ4_NL,
-];
-
-const KERNEL_NAME: &str = "matmul_reduce";
-
-/// Shared by every type's kernel: a manual (no vendor-specific `__half`
-/// intrinsic) IEEE-754 binary16 -> float decoder, so the same source works
-/// unmodified across CUDA/HIP/OpenCL — see `engine::backend::opencl`/
-/// `engine::backend::rocm` for the (intentionally near-identical) sibling
-/// copies of this prelude in each backend's own kernel language.
-const PRELUDE: &str = r#"
-extern "C" __device__ float orangu_half_to_float(unsigned short h) {
-    unsigned int sign = ((unsigned int)(h & 0x8000u)) << 16;
-    unsigned int exp = (h >> 10) & 0x1Fu;
-    unsigned int mant = h & 0x3FFu;
-    unsigned int bits;
-    if (exp == 0u) {
-        if (mant == 0u) {
-            bits = sign;
-        } else {
-            int e = -1;
-            do {
-                mant <<= 1;
-                e++;
-            } while ((mant & 0x400u) == 0u);
-            mant &= 0x3FFu;
-            bits = sign | ((unsigned int)(127 - 15 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
-    }
-    return __int_as_float((int)bits);
-}
-
-// bfloat16 -> f32: the top 16 bits of an f32, left-shifted into place —
-// mirrors `quant::dequantize`'s `GGML_TYPE_BF16` arm exactly.
-extern "C" __device__ float orangu_bf16_to_float(unsigned short h) {
-    unsigned int bits = ((unsigned int)h) << 16;
-    return __int_as_float((int)bits);
-}
-
-// ggml's `get_scale_min_k4`: unpacks the 6-bit scale and 6-bit min for
-// sub-block `j` (0..8) of a Q4_K/Q5_K super-block's 12-byte `scales` region
-// starting at byte `base`. Mirrors `quant::get_scale_min_k4` exactly.
-extern "C" __device__ void orangu_get_scale_min_k4(
-    const unsigned char *w, unsigned int base, unsigned int j,
-    unsigned int *sc, unsigned int *m) {
-    if (j < 4u) {
-        *sc = w[base + j] & 63u;
-        *m = w[base + j + 4u] & 63u;
-    } else {
-        *sc = (w[base + j + 4u] & 0xFu) | ((w[base + j - 4u] >> 6) << 4);
-        *m = (w[base + j + 4u] >> 4) | ((w[base + j] >> 6) << 4);
-    }
-}
-"#;
-
-/// The compute entry point — a direct CUDA-C port of `vulkan_shaders`'s
-/// `MAIN_REDUCE_SUFFIX`: one block per (output-row group of 4, token) pair,
-/// all 64 threads splitting `in_dim` elements grid-stride style and
-/// reducing their partial dot products in shared memory. Correct for any
-/// `n_tokens` (unlike `VulkanBackend`'s separate cooperative/tiled paths,
-/// this is the only dispatch strategy this backend has — see the module
-/// doc comment for why those aren't ported here).
-const MAIN: &str = r#"
-extern "C" __global__ void matmul_reduce(
-    const unsigned char *weights,
-    const float *x,
-    float *y,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int n_tokens,
-    unsigned int row_bytes) {
-    __shared__ float partial_sums[256];
-
-    unsigned int n_row_groups = (out_dim + 3u) / 4u;
-    unsigned int flat = blockIdx.x;
-    if (flat >= n_row_groups * n_tokens) {
-        return;
-    }
-    unsigned int rg = flat / n_tokens;
-    unsigned int t = flat % n_tokens;
-    unsigned int o0 = rg * 4u;
-    unsigned int o1 = o0 + 1u;
-    unsigned int o2 = o0 + 2u;
-    unsigned int o3 = o0 + 3u;
-    unsigned int local = threadIdx.x;
-    unsigned int x_base = t * in_dim;
-
-    float partial0 = 0.0f;
-    float partial1 = 0.0f;
-    float partial2 = 0.0f;
-    float partial3 = 0.0f;
-    for (unsigned int k = local; k < in_dim; k += 64u) {
-        unsigned int block_idx = k / BLOCK_ELEMS;
-        unsigned int local_k = k % BLOCK_ELEMS;
-        unsigned int block_off = block_idx * BLOCK_BYTES;
-        float xv = x[x_base + k];
-        partial0 += dequant_element(weights, o0 * row_bytes + block_off, local_k) * xv;
-        if (o1 < out_dim) {
-            partial1 += dequant_element(weights, o1 * row_bytes + block_off, local_k) * xv;
-        }
-        if (o2 < out_dim) {
-            partial2 += dequant_element(weights, o2 * row_bytes + block_off, local_k) * xv;
-        }
-        if (o3 < out_dim) {
-            partial3 += dequant_element(weights, o3 * row_bytes + block_off, local_k) * xv;
-        }
-    }
-
-    partial_sums[local] = partial0;
-    partial_sums[64u + local] = partial1;
-    partial_sums[128u + local] = partial2;
-    partial_sums[192u + local] = partial3;
-    __syncthreads();
-    for (unsigned int stride = 32u; stride > 0u; stride /= 2u) {
-        if (local < stride) {
-            partial_sums[local] += partial_sums[local + stride];
-            partial_sums[64u + local] += partial_sums[64u + local + stride];
-            partial_sums[128u + local] += partial_sums[128u + local + stride];
-            partial_sums[192u + local] += partial_sums[192u + local + stride];
-        }
-        __syncthreads();
-    }
-    if (local == 0u) {
-        y[t * out_dim + o0] = partial_sums[0];
-        if (o1 < out_dim) {
-            y[t * out_dim + o1] = partial_sums[64u];
-        }
-        if (o2 < out_dim) {
-            y[t * out_dim + o2] = partial_sums[128u];
-        }
-        if (o3 < out_dim) {
-            y[t * out_dim + o3] = partial_sums[192u];
-        }
-    }
-}
-"#;
-
-/// Each type's `dequant_element(weights, byte_offset, k)` — a line-for-line
-/// restatement of its `engine::quant::dequantize_*` Rust counterpart (read
-/// them side by side when changing either), just addressed per output
-/// element `k` instead of sequentially over a whole block, the same
-/// transformation `vulkan_shaders`'s `*_COOP_MIDDLE` constants apply. Byte
-/// reads are direct (`weights[byte_offset]`) rather than WGSL's `read_u8`
-/// word-unpacking trick — CUDA/HIP/OpenCL C don't share WGSL's storage
-/// buffer 4-byte-alignment restriction.
-fn dequant_element_source(ggml_type: u32) -> Option<&'static str> {
-    Some(match ggml_type {
-        t if t == GGML_TYPE_F32 => {
-            r#"
-const unsigned int BLOCK_BYTES = 4u;
-const unsigned int BLOCK_ELEMS = 1u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned int bits = (unsigned int)w[byte_offset] | ((unsigned int)w[byte_offset + 1] << 8)
-        | ((unsigned int)w[byte_offset + 2] << 16) | ((unsigned int)w[byte_offset + 3] << 24);
-    return __int_as_float((int)bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_F16 => {
-            r#"
-const unsigned int BLOCK_BYTES = 2u;
-const unsigned int BLOCK_ELEMS = 1u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned short bits = (unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8);
-    return orangu_half_to_float(bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_BF16 => {
-            r#"
-const unsigned int BLOCK_BYTES = 2u;
-const unsigned int BLOCK_ELEMS = 1u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned short bits = (unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8);
-    return orangu_bf16_to_float(bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_Q4_0 => {
-            r#"
-const unsigned int BLOCK_BYTES = 18u;
-const unsigned int BLOCK_ELEMS = 32u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    if (k < 16u) {
-        unsigned char byte = w[byte_offset + 2u + k];
-        return ((float)((int)(byte & 0xFu) - 8)) * d;
-    }
-    unsigned char byte = w[byte_offset + 2u + (k - 16u)];
-    return ((float)((int)(byte >> 4) - 8)) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q5_0 => {
-            r#"
-const unsigned int BLOCK_BYTES = 22u;
-const unsigned int BLOCK_ELEMS = 32u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    unsigned int qh = (unsigned int)w[byte_offset + 2] | ((unsigned int)w[byte_offset + 3] << 8)
-        | ((unsigned int)w[byte_offset + 4] << 16) | ((unsigned int)w[byte_offset + 5] << 24);
-    if (k < 16u) {
-        unsigned char byte = w[byte_offset + 6u + k];
-        unsigned int xh0 = ((qh >> k) << 4) & 0x10u;
-        return ((float)((int)((byte & 0xFu) | xh0) - 16)) * d;
-    }
-    unsigned int j = k - 16u;
-    unsigned char byte = w[byte_offset + 6u + j];
-    unsigned int xh1 = (qh >> (j + 12u)) & 0x10u;
-    return ((float)((int)((byte >> 4) | xh1) - 16)) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q8_0 => {
-            r#"
-const unsigned int BLOCK_BYTES = 34u;
-const unsigned int BLOCK_ELEMS = 32u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    signed char q = (signed char)w[byte_offset + 2u + k];
-    return ((float)q) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q4_K => {
-            r#"
-const unsigned int BLOCK_BYTES = 144u;
-const unsigned int BLOCK_ELEMS = 256u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    float dmin = orangu_half_to_float((unsigned short)w[byte_offset + 2] | ((unsigned short)w[byte_offset + 3] << 8));
-    unsigned int scales_off = byte_offset + 4u;
-    unsigned int qs_off = byte_offset + 16u;
-    unsigned int q_offset = (k / 64u) * 64u;
-    unsigned int local_in_group = k % 64u;
-    unsigned int is_base = (q_offset / 64u) * 2u;
-    unsigned int q_base = qs_off + q_offset / 2u;
-    unsigned int sc, m;
-    if (local_in_group < 32u) {
-        unsigned char byte = w[q_base + local_in_group];
-        orangu_get_scale_min_k4(w, scales_off, is_base, &sc, &m);
-        float d1 = d * (float)sc;
-        float m1 = dmin * (float)m;
-        return d1 * (float)(byte & 0xFu) - m1;
-    }
-    unsigned int l = local_in_group - 32u;
-    unsigned char byte = w[q_base + l];
-    orangu_get_scale_min_k4(w, scales_off, is_base + 1u, &sc, &m);
-    float d2 = d * (float)sc;
-    float m2 = dmin * (float)m;
-    return d2 * (float)(byte >> 4) - m2;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q5_K => {
-            r#"
-const unsigned int BLOCK_BYTES = 176u;
-const unsigned int BLOCK_ELEMS = 256u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    float dmin = orangu_half_to_float((unsigned short)w[byte_offset + 2] | ((unsigned short)w[byte_offset + 3] << 8));
-    unsigned int scales_off = byte_offset + 4u;
-    unsigned int qh_off = byte_offset + 16u;
-    unsigned int qs_off = byte_offset + 48u;
-    unsigned int q_offset = (k / 64u) * 64u;
-    unsigned int idx = q_offset / 64u;
-    unsigned int local_in_group = k % 64u;
-    unsigned int is_base = idx * 2u;
-    unsigned int ql_offset = idx * 32u;
-    unsigned int u1 = 1u << (2u * idx);
-    unsigned int u2 = 2u << (2u * idx);
-    unsigned int sc, m;
-    if (local_in_group < 32u) {
-        unsigned int l = local_in_group;
-        unsigned char byte = w[qs_off + ql_offset + l];
-        unsigned char qhbyte = w[qh_off + l];
-        int hi_bit = (qhbyte & u1) != 0u ? 16 : 0;
-        orangu_get_scale_min_k4(w, scales_off, is_base, &sc, &m);
-        float d1 = d * (float)sc;
-        float m1 = dmin * (float)m;
-        return d1 * (float)((int)(byte & 0xFu) + hi_bit) - m1;
-    }
-    unsigned int l = local_in_group - 32u;
-    unsigned char byte = w[qs_off + ql_offset + l];
-    unsigned char qhbyte = w[qh_off + l];
-    int hi_bit = (qhbyte & u2) != 0u ? 16 : 0;
-    orangu_get_scale_min_k4(w, scales_off, is_base + 1u, &sc, &m);
-    float d2 = d * (float)sc;
-    float m2 = dmin * (float)m;
-    return d2 * (float)((int)(byte >> 4) + hi_bit) - m2;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q6_K => {
-            r#"
-const unsigned int BLOCK_BYTES = 210u;
-const unsigned int BLOCK_ELEMS = 256u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned int ql_off = byte_offset;
-    unsigned int qh_off = byte_offset + 128u;
-    unsigned int sc_off = byte_offset + 192u;
-    float d = orangu_half_to_float((unsigned short)w[byte_offset + 208] | ((unsigned short)w[byte_offset + 209] << 8));
-    unsigned int y_off = (k / 128u) * 128u;
-    unsigned int idx = y_off / 128u;
-    unsigned int local_in_group = k % 128u;
-    unsigned int which_q = local_in_group / 32u;
-    unsigned int l = local_in_group % 32u;
-    unsigned int ql_o = idx * 64u;
-    unsigned int qh_o = idx * 32u;
-    unsigned int sc_o = idx * 8u;
-    unsigned int is = l / 16u;
-    unsigned char ql_l = w[ql_off + ql_o + l];
-    unsigned char ql_l32 = w[ql_off + ql_o + l + 32u];
-    unsigned char qh_l = w[qh_off + qh_o + l];
-    int q;
-    unsigned int sc_idx;
-    if (which_q == 0u) {
-        q = (int)((ql_l & 0xFu) | ((qh_l & 3u) << 4)) - 32;
-        sc_idx = is;
-    } else if (which_q == 1u) {
-        q = (int)((ql_l32 & 0xFu) | (((qh_l >> 2) & 3u) << 4)) - 32;
-        sc_idx = is + 2u;
-    } else if (which_q == 2u) {
-        q = (int)((ql_l >> 4) | (((qh_l >> 4) & 3u) << 4)) - 32;
-        sc_idx = is + 4u;
-    } else {
-        q = (int)((ql_l32 >> 4) | (((qh_l >> 6) & 3u) << 4)) - 32;
-        sc_idx = is + 6u;
-    }
-    signed char sc = (signed char)w[sc_off + sc_o + sc_idx];
-    return d * (float)sc * (float)q;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q2_K => {
-            r#"
-const unsigned int BLOCK_BYTES = 84u;
-const unsigned int BLOCK_ELEMS = 256u;
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned int scales_off = byte_offset;
-    unsigned int qs_off = byte_offset + 16u;
-    float d = orangu_half_to_float((unsigned short)w[byte_offset + 80] | ((unsigned short)w[byte_offset + 81] << 8));
-    float dmin = orangu_half_to_float((unsigned short)w[byte_offset + 82] | ((unsigned short)w[byte_offset + 83] << 8));
-    unsigned int n = k / 128u;
-    unsigned int r = k % 128u;
-    unsigned int s = r / 32u;
-    unsigned int h = (r % 32u) / 16u;
-    unsigned int l = r % 16u;
-    unsigned char sc = w[scales_off + n * 8u + s * 2u + h];
-    float dl = d * (float)(sc & 0xFu);
-    float ml = dmin * (float)(sc >> 4);
-    unsigned char byte = w[qs_off + n * 32u + h * 16u + l];
-    return dl * (float)((byte >> (2u * s)) & 3u) - ml;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q3_K => {
-            r#"
-const unsigned int BLOCK_BYTES = 110u;
-const unsigned int BLOCK_ELEMS = 256u;
-// Q3_K's `i`th 6-bit sub-block scale (0..16), still biased by 32, out of the
-// 12 bytes at `base`. Mirrors `quant::unpack_q3_k_scales` for one index.
-extern "C" __device__ unsigned int orangu_q3k_scale(const unsigned char *w, unsigned int base, unsigned int i) {
-    unsigned int low;
-    if (i < 8u) {
-        low = w[base + i] & 0xFu;
-    } else {
-        low = w[base + i - 8u] >> 4;
-    }
-    unsigned int high = (w[base + 8u + (i % 4u)] >> (2u * (i / 4u))) & 3u;
-    return low | (high << 4);
-}
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    unsigned int hmask_off = byte_offset;
-    unsigned int qs_off = byte_offset + 32u;
-    unsigned int scales_off = byte_offset + 96u;
-    float d_all = orangu_half_to_float((unsigned short)w[byte_offset + 108] | ((unsigned short)w[byte_offset + 109] << 8));
-    unsigned int n = k / 128u;
-    unsigned int r = k % 128u;
-    unsigned int s = r / 32u;
-    unsigned int h = (r % 32u) / 16u;
-    unsigned int l = r % 16u;
-    unsigned int idx = h * 16u + l;
-    unsigned int m = 1u << (n * 4u + s);
-    float dl = d_all * (float)((int)orangu_q3k_scale(w, scales_off, n * 8u + s * 2u + h) - 32);
-    int hi = 4;
-    if ((w[hmask_off + idx] & m) != 0u) {
-        hi = 0;
-    }
-    unsigned int q = (w[qs_off + n * 32u + idx] >> (2u * s)) & 3u;
-    return dl * (float)((int)q - hi);
-}
-"#
-        }
-        t if t == GGML_TYPE_IQ4_NL => {
-            r#"
-const unsigned int BLOCK_BYTES = 18u;
-const unsigned int BLOCK_ELEMS = 32u;
-// The 16 non-uniformly spaced levels an IQ4_NL nibble selects between —
-// `engine::iq_grids::KVALUES_IQ4NL`, transcribed. Small enough to inline
-// per kernel, unlike the `IQ*` lattice codebooks (which is why this is the
-// one `IQ*` type here at all).
-__device__ const signed char ORANGU_KVALUES_IQ4NL[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-extern "C" __device__ float dequant_element(const unsigned char *w, unsigned int byte_offset, unsigned int k) {
-    float d = orangu_half_to_float((unsigned short)w[byte_offset] | ((unsigned short)w[byte_offset + 1] << 8));
-    unsigned char byte = w[byte_offset + 2u + (k % 16u)];
-    unsigned int nib = (k < 16u) ? (unsigned int)(byte & 0xFu) : (unsigned int)(byte >> 4);
-    return d * (float)ORANGU_KVALUES_IQ4NL[nib];
-}
-"#
-        }
-        _ => return None,
-    })
-}
+// The kernels, the type list and the entry-point name are all
+// `super::vendor_shaders`' - see that module for why they are shared
+// rather than written once per backend.
+use super::vendor_shaders::{KERNEL_NAME, SUPPORTED_TYPES};
 
 /// The complete, compile-ready CUDA-C source for `ggml_type`'s matmul
 /// kernel, or `None` if this backend has no kernel for it.
 fn kernel_source(ggml_type: u32) -> Option<String> {
-    let middle = dequant_element_source(ggml_type)?;
-    Some(format!("{PRELUDE}\n{middle}\n{MAIN}"))
+    super::vendor_shaders::kernel_source(super::vendor_shaders::Dialect::Cuda, ggml_type)
 }
 
 /// `QuantMatrix::cache_key()`'s return type — named, like `vulkan.rs`'s own
@@ -516,10 +74,10 @@ type WeightCacheKey = (usize, usize);
 pub struct CudaBackend {
     stream: Arc<CudaStream>,
     functions: HashMap<u32, CudaFunction>,
-    /// Same identity-keyed reuse discipline as `VulkanBackend::weight_
-    /// buffer`: a layer's weight tensor is uploaded to device memory once,
-    /// not re-uploaded on every decode step.
     weight_cache: Mutex<HashMap<WeightCacheKey, Arc<CudaSlice<u8>>>>,
+    /// The `IQ*` codebooks, uploaded once at init — see
+    /// `engine::iq_grids::packed`.
+    iq_grids: CudaSlice<u32>,
     /// The device's own name (e.g. `"NVIDIA GeForce RTX 4090"`) — for the
     /// startup banner.
     pub device_name: String,
@@ -638,10 +196,19 @@ impl CudaBackend {
             functions.insert(ggml_type, function);
         }
 
+        // The `IQ*` lattice codebooks, uploaded once and bound to every
+        // launch. ~33 KiB, read-only, shared by every kernel — see
+        // `vendor_shaders::iq_grid_prelude` for why every kernel takes the
+        // pointer whether or not it reads one.
+        let iq_grids = stream
+            .clone_htod(&crate::engine::iq_grids::packed::words())
+            .ok()?;
+
         Some(Self {
             stream,
             functions,
             weight_cache: Mutex::new(HashMap::new()),
+            iq_grids,
             device_name,
         })
     }
@@ -670,11 +237,92 @@ impl CudaBackend {
 }
 
 impl Backend for CudaBackend {
+    /// See [`Backend::reduced_surface`] — this backend implements
+    /// [`Backend::matmul`] and nothing else.
+    fn reduced_surface(&self) -> Option<&'static str> {
+        Some(super::MATMUL_ONLY_SURFACE)
+    }
+
     fn supports_type(&self, ggml_type: u32) -> bool {
         SUPPORTED_TYPES.contains(&ggml_type)
     }
 
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let launched = self.launch(x, n_tokens, w);
+        self.stream
+            .clone_dtoh(&launched.y)
+            .expect("cuda y readback failed")
+    }
+
+    /// Every op launched before any is read back, so the device runs one
+    /// kernel while the host is still enqueuing the next.
+    ///
+    /// The default implementation is one `matmul` per op, and `matmul` ends
+    /// in `clone_dtoh` — a device-to-*pageable*-host copy, which the CUDA
+    /// driver completes before returning. A batch of `n` ops therefore cost
+    /// `n` full round trips, with the device idle across each one, for a set
+    /// of ops [`MatmulOp`] already guarantees are independent.
+    ///
+    /// Here the readbacks all happen after the launches, so only the *first*
+    /// one waits on a kernel that is not already running. One synchronization
+    /// point per chunk instead of one per op — see
+    /// [`crate::engine::backend::plan_batch`] for what a chunk is and why
+    /// there is more than one.
+    fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        use crate::engine::backend::{BATCH_DEVICE_BUDGET_BYTES, plan_batch};
+
+        let (stripes, chunks) = plan_batch(ops, BATCH_DEVICE_BUDGET_BYTES);
+        let mut out: Vec<Vec<f32>> = ops
+            .iter()
+            .map(|op| Vec::with_capacity(op.n_tokens * op.w.out_dim))
+            .collect();
+        for chunk in chunks {
+            // Held as a whole until the chunk is drained. `x` is *not* the
+            // kernel's output but it is its input, and on a context without
+            // async allocation `CudaSlice::drop` synchronizes the stream
+            // before freeing — dropping each upload right after its launch
+            // would put back exactly the per-op wait this function exists to
+            // remove, and on a context *with* async allocation it would free
+            // in stream order and be merely wasteful. Keeping both buffers
+            // alive to the end of the chunk is the one shape that is right
+            // under either.
+            let launched: Vec<(usize, Launched)> = stripes[chunk]
+                .iter()
+                .map(|stripe| {
+                    let op = &ops[stripe.op];
+                    let in_dim = op.w.in_dim;
+                    let rows = stripe.start * in_dim..(stripe.start + stripe.n_tokens) * in_dim;
+                    (stripe.op, self.launch(&op.x[rows], stripe.n_tokens, op.w))
+                })
+                .collect();
+            for (op, launched) in &launched {
+                out[*op].extend(
+                    self.stream
+                        .clone_dtoh(&launched.y)
+                        .expect("cuda y readback failed"),
+                );
+            }
+        }
+        out
+    }
+}
+
+/// One in-flight `matmul`: the uploaded activations and the output buffer the
+/// kernel writes. Both are returned because both must outlive the launch —
+/// see [`CudaBackend::matmul_batch`].
+struct Launched {
+    #[allow(
+        dead_code,
+        reason = "kept alive until the kernel that reads it has run"
+    )]
+    x: CudaSlice<f32>,
+    y: CudaSlice<f32>,
+}
+
+impl CudaBackend {
+    /// Uploads `x`, allocates the output and launches the kernel — every step
+    /// of a `matmul` except the readback, which is what a batch defers.
+    fn launch(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Launched {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         let row_bytes = w.row_bytes() as u32;
@@ -707,6 +355,7 @@ impl Backend for CudaBackend {
         builder.arg(&out_dim_u32);
         builder.arg(&n_tokens_u32);
         builder.arg(&row_bytes);
+        builder.arg(&self.iq_grids);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (64, 1, 1),
@@ -714,19 +363,7 @@ impl Backend for CudaBackend {
         };
         unsafe { builder.launch(cfg) }.expect("cuda kernel launch failed");
 
-        self.stream
-            .clone_dtoh(&y_dev)
-            .expect("cuda y readback failed")
-    }
-
-    fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
-        ops.iter()
-            .map(|op| {
-                crate::engine::backend::guarded_matmul_op(op, |x, n_tokens, w| {
-                    self.matmul(x, n_tokens, w)
-                })
-            })
-            .collect()
+        Launched { x: x_dev, y: y_dev }
     }
 }
 
@@ -736,8 +373,10 @@ mod tests {
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
@@ -765,38 +404,21 @@ mod tests {
         (0..n).map(|_| next_byte(seed)).collect()
     }
 
+    /// Straight from `engine::quant`, which is where a block layout is
+    /// defined. This module used to keep its own copy of that table; so did
+    /// the other two vendor backends, and a type added to `quant` and to
+    /// `vendor_shaders` but not to all three copies would fail here as
+    /// `unreachable!()` rather than as a missing kernel.
     fn block_bytes_for(ggml_type: u32) -> usize {
-        match ggml_type {
-            t if t == GGML_TYPE_F32 => 4,
-            t if t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 2,
-            t if t == GGML_TYPE_Q4_0 => 18,
-            t if t == GGML_TYPE_Q5_0 => 22,
-            t if t == GGML_TYPE_Q8_0 => 34,
-            t if t == GGML_TYPE_Q2_K => 84,
-            t if t == GGML_TYPE_Q3_K => 110,
-            t if t == GGML_TYPE_Q4_K => 144,
-            t if t == GGML_TYPE_Q5_K => 176,
-            t if t == GGML_TYPE_Q6_K => 210,
-            t if t == GGML_TYPE_IQ4_NL => 18,
-            _ => unreachable!(),
-        }
+        crate::engine::quant::block_layout(ggml_type)
+            .expect("a type under cross-check has a block layout")
+            .0
     }
 
     fn block_elems_for(ggml_type: u32) -> usize {
-        match ggml_type {
-            t if t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 1,
-            // `IQ4_NL` belongs with the 32-element legacy quants, not the
-            // 256 default: it is the one `IQ*` type that does not block at
-            // `QK_K`.
-            t if t == GGML_TYPE_Q4_0
-                || t == GGML_TYPE_Q5_0
-                || t == GGML_TYPE_Q8_0
-                || t == GGML_TYPE_IQ4_NL =>
-            {
-                32
-            }
-            _ => 256,
-        }
+        crate::engine::quant::block_layout(ggml_type)
+            .expect("a type under cross-check has a block layout")
+            .1
     }
 
     /// Cross-checks `CudaBackend::matmul` against `CpuBackend::matmul` for
@@ -854,6 +476,17 @@ mod tests {
     fn matmul_matches_cpu_backend_for_q5_0() {
         cross_check(GGML_TYPE_Q5_0, 64, 6, 1);
     }
+    /// The two affine block quants this engine could always read on the CPU
+    /// and could not run on this device — no codebook, no extra binding,
+    /// simply never written. See `PARITY.md` C3.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_1() {
+        cross_check(GGML_TYPE_Q4_1, 64, 6, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_q5_1() {
+        cross_check(GGML_TYPE_Q5_1, 64, 6, 1);
+    }
     #[test]
     fn matmul_matches_cpu_backend_for_q8_0() {
         cross_check(GGML_TYPE_Q8_0, 64, 6, 1);
@@ -885,6 +518,42 @@ mod tests {
     /// in the first place: a K-quant needs 256 | `in_dim`, so upstream
     /// substitutes `IQ4_NL` on rows like this one. A 256-wide check would
     /// not distinguish a correct block stride from one that assumed `QK_K`.
+    /// The eight `IQ*` types this device could not take at all until the
+    /// lattice codebooks were uploaded — a capability gap, not a speed one:
+    /// `engine::backend::unsupported_tensor_types` refused the whole GPU for
+    /// a file carrying any of them. See `PARITY.md` C3.
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_s() {
+        cross_check(GGML_TYPE_IQ1_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_m() {
+        cross_check(GGML_TYPE_IQ1_M, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xxs() {
+        cross_check(GGML_TYPE_IQ2_XXS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xs() {
+        cross_check(GGML_TYPE_IQ2_XS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_s() {
+        cross_check(GGML_TYPE_IQ2_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_xxs() {
+        cross_check(GGML_TYPE_IQ3_XXS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_s() {
+        cross_check(GGML_TYPE_IQ3_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq4_xs() {
+        cross_check(GGML_TYPE_IQ4_XS, 256, 4, 1);
+    }
     #[test]
     fn matmul_matches_cpu_backend_for_iq4_nl() {
         cross_check(GGML_TYPE_IQ4_NL, 896, 6, 1);

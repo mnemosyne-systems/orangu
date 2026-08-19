@@ -32,6 +32,108 @@
 //! Generated from `ggml-common.h`; do not hand-edit. The test at the bottom
 //! pins the properties that would catch a truncated or reordered copy.
 
+/// The codebooks packed into one `u32` array for upload to a device, and the
+/// word offsets each table starts at.
+///
+/// Every GPU backend needs the same bytes in the same order — `vulkan`
+/// declares these offsets in `vulkan_shaders::IQ_GRID_PRELUDE`, and the
+/// CUDA/HIP/OpenCL backends in `vendor_shaders`. The packing used to live in
+/// `vulkan.rs`, where the other three could not reach it; it has no Vulkan
+/// dependency and never did, so it lives here now, beside the tables it
+/// packs.
+///
+/// The offsets are *asserted* against the running total rather than computed
+/// from it, so growing a table without updating the shader constants fails
+/// here, at startup, instead of silently shifting every later table.
+pub(crate) mod packed {
+    /// Word offset of each table in [`words`]'s output.
+    pub(crate) const IQ2XS_GRID_OFF: u32 = 0;
+    pub(crate) const IQ2S_GRID_OFF: u32 = 1024;
+    pub(crate) const IQ3XXS_GRID_OFF: u32 = 3072;
+    pub(crate) const IQ3S_GRID_OFF: u32 = 3328;
+    pub(crate) const KSIGNS_OFF: u32 = 3840;
+    pub(crate) const KVALUES_IQ4NL_OFF: u32 = 3872;
+    pub(crate) const IQ2XXS_GRID_OFF: u32 = 3876;
+    pub(crate) const IQ1S_GRID_OFF: u32 = 4388;
+    /// Total size of [`words`]'s output, in `u32`s — about 33 KiB.
+    pub(crate) const WORDS: usize = 8484;
+
+    /// The `IQ*` codebooks in one `u32` array, at the offsets above.
+    ///
+    /// The two `iq2*` grids hold `u64` lattice points and go in low word
+    /// first; the `iq3*` grids are already `u32`; `ksigns_iq2xs` and
+    /// `kvalues_iq4nl` are byte tables packed four to a word, little-end
+    /// first, so a shader's `>> ((i & 3) * 8)` reads them back in order.
+    pub(crate) fn words() -> Vec<u32> {
+        use super::{
+            IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+            KVALUES_IQ4NL,
+        };
+
+        let mut words = Vec::with_capacity(WORDS);
+        for &g in IQ2XS_GRID.iter().chain(IQ2S_GRID.iter()) {
+            words.push(g as u32);
+            words.push((g >> 32) as u32);
+        }
+        assert_eq!(
+            words.len() as u32,
+            IQ3XXS_GRID_OFF,
+            "iq2 grids must end at IQ3XXS_GRID_OFF"
+        );
+        words.extend_from_slice(&IQ3XXS_GRID);
+        words.extend_from_slice(&IQ3S_GRID);
+        assert_eq!(
+            words.len() as u32,
+            KSIGNS_OFF,
+            "iq3 grids must end at KSIGNS_OFF"
+        );
+        words.extend(
+            KSIGNS_IQ2XS
+                .chunks(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
+        assert_eq!(
+            words.len() as u32,
+            KVALUES_IQ4NL_OFF,
+            "ksigns must end at KVALUES_IQ4NL_OFF"
+        );
+        words.extend(
+            KVALUES_IQ4NL
+                .chunks(4)
+                .map(|c| u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])),
+        );
+        // The two grids appended last are the ones that make `IQ2_XXS`,
+        // `IQ1_S` and `IQ1_M` GPU types at all. `IQ1S_GRID` is 16 KiB by
+        // itself, which is why the whole buffer is ~33 KiB rather than ~15 —
+        // still a rounding error next to any weight tensor, and read-only
+        // storage cached like one.
+        assert_eq!(
+            words.len() as u32,
+            IQ2XXS_GRID_OFF,
+            "kvalues must end at IQ2XXS_GRID_OFF"
+        );
+        for &g in IQ2XXS_GRID.iter() {
+            words.push(g as u32);
+            words.push((g >> 32) as u32);
+        }
+        assert_eq!(
+            words.len() as u32,
+            IQ1S_GRID_OFF,
+            "iq2_xxs grid must end at IQ1S_GRID_OFF"
+        );
+        for &g in IQ1S_GRID.iter() {
+            words.push(g as u32);
+            words.push((g >> 32) as u32);
+        }
+        assert_eq!(words.len(), WORDS, "packed IQ grid size");
+        words
+    }
+
+    /// `IQ1S_DELTA`/`IQ1M_DELTA` — the `±` offset every `iq1*` weight
+    /// carries on top of its codebook value.
+    pub(crate) const IQ1_DELTA: f32 = 0.125;
+}
+
 /// Bit `j` of a packed sign byte: `1 << j`, spelled as a table so the
 /// dequantizers read the same way ggml's do.
 pub const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];

@@ -980,6 +980,17 @@ impl ExpertQuantMatrix {
     }
 
     /// Dequantizes row `index` of expert `expert` (`in_dim` values).
+    ///
+    /// **Test-only.** Production dequantizes through [`Self::row_from`] into
+    /// a caller-owned buffer instead: this signature allocates a fresh
+    /// `Vec<f32>` per row, and its only two callers — the MLA absorb paths in
+    /// `engine::arch::kda` and `engine::arch::glm` — were calling it from
+    /// inside a per-token loop, re-dequantizing every weight row once per
+    /// token. That measured 10.9% of a prefill profile. Both now hoist the
+    /// dequantization out of the loop, which left this with no production
+    /// caller at all; it survives as the reference the stride cross-check
+    /// below compares `expert_matrix(e).row(r)` against.
+    #[cfg(test)]
     pub fn row(&self, expert: usize, index: usize) -> Vec<f32> {
         debug_assert!(
             expert < self.n_expert,

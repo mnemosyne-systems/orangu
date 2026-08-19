@@ -1117,6 +1117,14 @@ impl GemmaModel {
         // submission is real overhead at high layer/token counts).
         let prefill_trace = submission_trace();
 
+        // Projection outputs, grown once and reused by every layer — see
+        // `Backend::matmul_into`.
+        let mut attn_proj: Vec<f32> = Vec::new();
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut gate_up_scratch: Vec<Vec<f32>> = Vec::new();
+        let mut pl_gate: Vec<f32> = Vec::new();
+        let mut pl_proj: Vec<f32> = Vec::new();
+
         for (il, layer) in self.layers.iter().enumerate() {
             let head_dim = layer.head_dim;
             let freq_factors = (!layer.is_swa)
@@ -1404,7 +1412,8 @@ impl GemmaModel {
                 }
                 x = fused;
             } else {
-                let mut attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                self.backend
+                    .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
                 tensor::rmsnorm_inplace(
                     &mut attn_proj,
                     &layer.attn_post_norm,
@@ -1493,18 +1502,21 @@ impl GemmaModel {
                         );
                         tensor::add_inplace(&mut x, &ffn_out);
                     } else {
-                        let mut gate_up = self.backend.matmul_batch(&[
-                            MatmulOp {
-                                x: &ffn_normed,
-                                n_tokens,
-                                w: &layer.ffn_gate,
-                            },
-                            MatmulOp {
-                                x: &ffn_normed,
-                                n_tokens,
-                                w: &layer.ffn_up,
-                            },
-                        ]);
+                        self.backend.matmul_batch_into(
+                            &mut gate_up_scratch,
+                            &[
+                                MatmulOp {
+                                    x: &ffn_normed,
+                                    n_tokens,
+                                    w: &layer.ffn_gate,
+                                },
+                                MatmulOp {
+                                    x: &ffn_normed,
+                                    n_tokens,
+                                    w: &layer.ffn_up,
+                                },
+                            ],
+                        );
                         if prefill_trace {
                             eprintln!(
                                 "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
@@ -1512,12 +1524,15 @@ impl GemmaModel {
                                 t0.elapsed().as_secs_f64() * 1000.0
                             );
                         }
-                        let up = gate_up.pop().unwrap();
-                        let mut gate = gate_up.pop().unwrap();
-                        tensor::gelu_inplace(&mut gate);
-                        tensor::mul_inplace(&mut gate, &up);
+                        // Borrowed in dispatch order rather than popped, so
+                        // the buffers stay in the scratch for the next layer.
+                        let (gate, up) = gate_up_scratch.split_at_mut(1);
+                        let gate = &mut gate[0];
+                        tensor::gelu_inplace(gate);
+                        tensor::mul_inplace(gate, &up[0]);
                         let t0 = Instant::now();
-                        let mut ffn_out = self.backend.matmul(&gate, n_tokens, &layer.ffn_down);
+                        self.backend
+                            .matmul_into(&mut ffn_out, gate, n_tokens, &layer.ffn_down);
                         if prefill_trace {
                             eprintln!(
                                 "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
@@ -1576,14 +1591,19 @@ impl GemmaModel {
                     }
                     proj
                 } else {
-                    let mut g = self.backend.matmul(&x, n_tokens, gate_w);
-                    tensor::gelu_inplace(&mut g);
+                    self.backend.matmul_into(&mut pl_gate, &x, n_tokens, gate_w);
+                    tensor::gelu_inplace(&mut pl_gate);
                     for t in 0..n_tokens {
                         let slice = &inp_per_layer[(t * self.layers.len() + il) * per_layer
                             ..(t * self.layers.len() + il + 1) * per_layer];
-                        tensor::mul_inplace(&mut g[t * per_layer..(t + 1) * per_layer], slice);
+                        tensor::mul_inplace(
+                            &mut pl_gate[t * per_layer..(t + 1) * per_layer],
+                            slice,
+                        );
                     }
-                    self.backend.matmul(&g, n_tokens, proj_w)
+                    self.backend
+                        .matmul_into(&mut pl_proj, &pl_gate, n_tokens, proj_w);
+                    std::mem::take(&mut pl_proj)
                 };
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n_tokens, n_embd, eps);
                 tensor::add_inplace(&mut x, &proj);
@@ -2432,6 +2452,11 @@ impl ModelForward for GemmaModel {
             Vec::new()
         };
 
+        // Grown once and reused by every layer rather than allocated per
+        // norm — see `tensor::rmsnorm_into`.
+        let mut normed: Vec<f32> = Vec::new();
+        let mut ffn_normed: Vec<f32> = Vec::new();
+
         for (il, layer) in self.layers.iter().enumerate() {
             let head_dim = layer.head_dim;
             let freq_factors = (!layer.is_swa)
@@ -2440,8 +2465,7 @@ impl ModelForward for GemmaModel {
             let cache_index = layer.kv_donor;
             let group_size = self.n_head / layer.n_head_kv;
 
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n, n_embd, eps);
+            tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n, n_embd, eps);
 
             let wk = layer.has_kv.then(|| {
                 layer
@@ -2583,9 +2607,12 @@ impl ModelForward for GemmaModel {
                 tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
                 tensor::add_inplace(&mut x, &ffn_out);
             } else {
-                let attn_out_residual = x.clone();
-                let mut ffn_normed = x.clone();
-                tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n, n_embd, eps);
+                // No `attn_out_residual = x.clone()` here, and no `x =
+                // attn_out_residual` below: nothing in this branch writes
+                // `x`, so the round trip restored a value that had not
+                // changed. The same redundancy was already removed from the
+                // fused path.
+                tensor::rmsnorm_into(&mut ffn_normed, &x, &layer.ffn_norm, n, n_embd, eps);
                 let mut gate_up = self.backend.matmul_batch_decode(&[
                     MatmulOp {
                         x: &ffn_normed,
@@ -2604,7 +2631,6 @@ impl ModelForward for GemmaModel {
                 tensor::mul_inplace(&mut gate, &up);
                 let mut ffn_out = self.backend.matmul_decode(&gate, n, &layer.ffn_down);
                 tensor::rmsnorm_inplace(&mut ffn_out, &layer.ffn_post_norm, n, n_embd, eps);
-                x = attn_out_residual;
                 tensor::add_inplace(&mut x, &ffn_out);
             }
 
@@ -2613,7 +2639,7 @@ impl ModelForward for GemmaModel {
                 &layer.per_layer_proj,
                 &layer.per_layer_post_norm,
             ) {
-                let pe_in = x.clone();
+                // Likewise no `pe_in` round trip — `x` is only read here.
                 let mut g = self.backend.matmul_decode(&x, n, gate_w);
                 tensor::gelu_inplace(&mut g);
                 for (i, per_layer_input) in inp_per_layer.iter().enumerate() {
@@ -2622,7 +2648,6 @@ impl ModelForward for GemmaModel {
                 }
                 let mut proj = self.backend.matmul_decode(&g, n, proj_w);
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n, n_embd, eps);
-                x = pe_in;
                 tensor::add_inplace(&mut x, &proj);
             }
 
@@ -2928,7 +2953,7 @@ impl GemmaModel {
         // this small is not worth believing on a cross-session comparison.
         let hoist = !crate::engine::env::flag_on("ORANGU_MOE_ROUTER_IN_JOIN");
         let hoisted = hoist.then(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
-        if n_tokens >= moe_overlap_min_tokens() {
+        if n_tokens >= super::moe_overlap_min_tokens() {
             let (mut result, moe_out) = rayon::join(
                 || self.moe_shared_mlp(il, layer, moe, attn_out, n_tokens, decode),
                 || {
@@ -3143,7 +3168,7 @@ impl GemmaModel {
                 &selection,
                 &expert_in,
                 n_embd,
-                &gate_proj,
+                Some(&gate_proj),
                 &up_proj,
                 &down_proj,
                 |gate, up| {
@@ -3290,41 +3315,6 @@ impl GemmaModel {
         tensor::rmsnorm_inplace(&mut moe_out, &moe.post_norm_2, n_tokens, n_embd, eps);
         moe_out
     }
-}
-
-/// Batch width at which a MoE layer's two FFN branches are evaluated
-/// concurrently rather than one after the other, from
-/// `ORANGU_MOE_OVERLAP_MIN_TOKENS`.
-///
-/// The branches use different processors — the shared MLP is device
-/// matmuls, the routed branch is host `vecdot` — and running them in
-/// sequence is why a MoE decode leaves both around 60% idle. Overlapping
-/// them costs one worker blocked in `device.poll`, which is why it is a
-/// width threshold and not a plain `true`.
-///
-/// **`1` — overlap at every width, including a single token.** An earlier
-/// version defaulted to 24 on the reading that a decode step's narrow
-/// fan-out could not spare a worker to a blocking `device.poll`. That
-/// reading came from comparing two runs taken an hour apart, and it was
-/// wrong: a *controlled* A/B through this variable, alternating the two
-/// settings against one another and repeated, gives **6.19 against 6.72
-/// tok/s — the overlap is +8.6% at decode** and reproduced to three
-/// significant figures on the repeat. Prefill is +9.2% at 1024 tokens. The
-/// two widths agree, so there is no crossover to place.
-///
-/// The threshold survives as the escape hatch and as the control for that
-/// A/B: a large value restores the sequential form. Decode throughput on
-/// this machine drifts several percent over a long session, which is what
-/// produced the wrong reading — compare settings with `orangu-bench
-/// --sweep`, never across sessions.
-fn moe_overlap_min_tokens() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ORANGU_MOE_OVERLAP_MIN_TOKENS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1)
-    })
 }
 
 /// Whether `ORANGU_PREFILL_TRACE=1` asked for a wall-clock line around each

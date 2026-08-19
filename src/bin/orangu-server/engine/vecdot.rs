@@ -82,6 +82,22 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
     let mut d = Vec::with_capacity(x.len() / ACT_BLOCK);
     let mut sums = Vec::with_capacity(x.len() / GROUP);
     for (b, chunk) in x.chunks_exact(ACT_BLOCK).enumerate() {
+        let out = &mut q[b * ACT_BLOCK..(b + 1) * ACT_BLOCK];
+        d.push(quantize_block::<true>(chunk, out, &mut sums));
+    }
+    ActQ8 { q, d, sums }
+}
+
+/// The portable reference for [`quantize_act`], and the definition of what
+/// its vector kernel must reproduce bit for bit. Also the live path on every
+/// target without the AVX2 floor.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn quantize_act_scalar(x: &[f32]) -> ActQ8 {
+    debug_assert_eq!(x.len() % ACT_BLOCK, 0);
+    let mut q = vec![0i8; x.len()];
+    let mut d = Vec::with_capacity(x.len() / ACT_BLOCK);
+    let mut sums = Vec::with_capacity(x.len() / GROUP);
+    for (b, chunk) in x.chunks_exact(ACT_BLOCK).enumerate() {
         let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
         // A block of exact zeros (real: a masked or unused tail) has no
         // scale; leave it 0 so `q * d` reproduces 0 rather than NaN.
@@ -107,6 +123,120 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
         d.push(scale);
     }
     ActQ8 { q, d, sums }
+}
+
+/// Quantizes one [`ACT_BLOCK`] of activations to `int8`, writing them into
+/// `out` and returning the block's scale — **the** activation-quantization
+/// kernel, shared by [`quantize_act`] and [`ActQ8Flat::quantize`], which
+/// differ only in where their outputs land.
+///
+/// Three details carry bit-identity with the scalar form, and each is a
+/// deliberate choice rather than the obvious one:
+///
+/// * **The `abs`-max fold** goes lane-parallel where the scalar is
+///   sequential. Sound because `max` is associative and commutative — but
+///   only away from `NaN`. `wide`'s `max` is `rhs.is_nan().select(self,
+///   max(self, rhs))`, and `max_m256` itself returns its right operand when
+///   either is unordered, so the pair ignores `NaN` on *either* side exactly
+///   as `f32::max` does. Operand order here is therefore not load-bearing;
+///   the `NaN`-blindness is. `fast_max` would not do: it lets a `NaN` reach
+///   the accumulator, and while the scalar horizontal reduce happens to
+///   discard it again, that is an accident of the reduce rather than a
+///   property of the fold.
+/// * **`round`.** `wide` 1.6.1's `f32x8::round` is ties-*away*-from-zero
+///   (`|x| + 0.5`, truncate, with the `0.5.next_down()` correction and a
+///   `8388608.0` bounds mask that passes large values, infinities and `NaN`
+///   through unchanged). That is precisely `f32::round`, not the
+///   `roundps`-native ties-to-even, so this is exact rather than merely
+///   close. `round_ties_even` here would silently change every logit.
+/// * **`NaN` to zero, before the clamp.** Scalar `f32::clamp` propagates
+///   `NaN` and the subsequent `as i8` saturating cast turns it into `0`. No
+///   vector min/max pair reproduces that, so the `NaN` lanes are zeroed
+///   explicitly and the clamp can then use the branch-free `fast_*` forms.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
+#[inline(always)]
+fn quantize_block<const SUMS: bool>(chunk: &[f32], out: &mut [i8], sums: &mut Vec<i32>) -> f32 {
+    use wide::{f32x8, i32x8};
+
+    const LANES: usize = 8;
+    const VECS: usize = ACT_BLOCK / LANES;
+    debug_assert_eq!(chunk.len(), ACT_BLOCK);
+    debug_assert_eq!(out.len(), ACT_BLOCK);
+
+    let load = |s: &[f32], i: usize| -> f32x8 {
+        let mut lane = [0f32; LANES];
+        lane.copy_from_slice(&s[i..i + LANES]);
+        f32x8::from(lane)
+    };
+    let v: [f32x8; VECS] = std::array::from_fn(|k| load(chunk, k * LANES));
+
+    let mut amax = f32x8::ZERO;
+    for vk in &v {
+        amax = amax.max(vk.abs());
+    }
+    let amax = amax.to_array().iter().fold(0f32, |m, &a| m.max(a));
+
+    let scale = amax / 127.0;
+    let inv = f32x8::from(if scale > 0.0 { 1.0 / scale } else { 0.0 });
+    let lo = f32x8::from(-127.0);
+    let hi = f32x8::from(127.0);
+
+    // `SUMS` is a const parameter rather than a second function: the two
+    // callers want the same arithmetic and differ only in whether they need
+    // the per-[`GROUP`] sums, and monomorphizing keeps the accumulation
+    // inside the vector loop for the caller that does — while leaving the
+    // other's code free of it entirely.
+    let mut sum = i32x8::ZERO;
+    for (k, vk) in v.iter().enumerate() {
+        let y = (*vk * inv).round();
+        let y = y.is_nan().select(f32x8::ZERO, y);
+        let qi = y.fast_max(lo).fast_min(hi).trunc_int();
+        if SUMS {
+            sum += qi;
+        }
+        for (slot, w) in out[k * LANES..(k + 1) * LANES]
+            .iter_mut()
+            .zip(qi.to_array())
+        {
+            *slot = w as i8;
+        }
+        // One [`GROUP`] is two lanes' worth, so a sum lands every other
+        // vector. Integers, so the reduction order is free.
+        if SUMS && (k * LANES + LANES).is_multiple_of(GROUP) {
+            sums.push(sum.to_array().iter().sum());
+            sum = i32x8::ZERO;
+        }
+    }
+    scale
+}
+
+/// [`quantize_block`] on every target without the AVX2 floor, and the
+/// definition the vector form reproduces bit for bit.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
+#[inline(always)]
+fn quantize_block<const SUMS: bool>(chunk: &[f32], out: &mut [i8], sums: &mut Vec<i32>) -> f32 {
+    debug_assert_eq!(chunk.len(), ACT_BLOCK);
+    debug_assert_eq!(out.len(), ACT_BLOCK);
+    let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let scale = amax / 127.0;
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    for (slot, &v) in out.iter_mut().zip(chunk) {
+        *slot = (v * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    if SUMS {
+        for group in out.chunks_exact(GROUP) {
+            sums.push(group.iter().map(|&v| v as i32).sum());
+        }
+    }
+    scale
 }
 
 /// Whether a fused kernel exists for `ggml_type` at this `in_dim`. The
@@ -266,6 +396,14 @@ fn dot_unpacked(w: &UnpackedRow, act: &ActQ8) -> f32 {
     dot_unpacked_impl::<ISA_BASELINE>(w, act)
 }
 
+/// `#[inline]` for the reason the `ISA_*` docs give: this is called from
+/// inside `#[target_feature]` wrappers, and Rust will not inline a
+/// `#[target_feature]` leaf into a caller that lacks the feature. Left
+/// out-of-line, the `ISA_VNNI` monomorphization could not fold its
+/// `dot16`/`dot32` calls in and carried **15 real `call`s** — one per block
+/// — where the AVX2 one had none, because AVX2 is a compile-time baseline
+/// here and needs no wrapper to cross.
+#[inline(always)]
 fn dot_unpacked_impl<const ISA: u8>(w: &UnpackedRow, act: &ActQ8) -> f32 {
     debug_assert_eq!(w.q.len(), act.q.len());
     let mut total = 0f32;
@@ -2353,6 +2491,10 @@ impl ActQ8Flat {
         // pins that down.
         let mut q = vec![0i8; n_tile * n_block * TOKEN_TILE * ACT_BLOCK];
         let mut d = vec![0f32; n_tile * n_block * TOKEN_TILE];
+        // This layout has no per-`GROUP` sums — `supports_flat` is exactly
+        // the symmetric types, whose kernels need none. The `SUMS = false`
+        // monomorphization never touches it.
+        let mut no_sums = Vec::new();
         for tl in 0..n_tile {
             for k in 0..TOKEN_TILE {
                 let t = tl * TOKEN_TILE + k;
@@ -2362,17 +2504,14 @@ impl ActQ8Flat {
                 let row = &x[t * in_dim..(t + 1) * in_dim];
                 for b in 0..n_block {
                     let chunk = &row[b * ACT_BLOCK..(b + 1) * ACT_BLOCK];
-                    let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
-                    let scale = amax / 127.0;
-                    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                    d[(tl * n_block + b) * TOKEN_TILE + k] = scale;
                     let dst =
                         &mut q[((tl * n_block + b) * TOKEN_TILE + k) * ACT_BLOCK..][..ACT_BLOCK];
-                    for (slot, &v) in dst.iter_mut().zip(chunk) {
-                        // `round` then clamp, as in `quantize_act`: the
-                        // extreme is exactly ±127, never -128.
-                        *slot = (v * inv).round().clamp(-127.0, 127.0) as i8;
-                    }
+                    // The same kernel `quantize_act` uses — this loop was an
+                    // open-coded copy of it, and the copy was the reason
+                    // LLVM widened this one to 128 bits while the other got
+                    // 256. See `quantize_block`.
+                    d[(tl * n_block + b) * TOKEN_TILE + k] =
+                        quantize_block::<false>(chunk, dst, &mut no_sums);
                 }
             }
         }
@@ -4119,6 +4258,150 @@ mod tests {
         assert!(a.d.iter().all(|d| *d == 0.0));
         assert!(a.q.iter().all(|q| *q == 0));
         assert!(a.sums.iter().all(|s| *s == 0));
+    }
+
+    /// Blocks chosen for the places [`quantize_act`]'s vector kernel and
+    /// [`quantize_act_scalar`] could legally disagree, rather than for
+    /// coverage: `round`'s tie direction, the `0.5.next_down()` case that
+    /// the `|x| + 0.5` formulation gets wrong without a correction, `NaN`
+    /// in the `abs`-max fold, `NaN` and infinity through the clamp, and the
+    /// saturating `as i8` cast. Every block's `amax` is `254.0` where the
+    /// tie behaviour is under test, which makes `inv` exactly `0.5` so the
+    /// scaled values land on representable halves.
+    fn quantize_act_adversarial_blocks() -> Vec<f32> {
+        let mut x = Vec::new();
+        let mut block = |v: &[f32]| {
+            assert_eq!(v.len(), ACT_BLOCK);
+            x.extend_from_slice(v);
+        };
+
+        block(&[0.0; ACT_BLOCK]);
+
+        // inv == 0.5 exactly. 1.0 -> 0.5 and -1.0 -> -0.5 are ties, and
+        // `f32::round` takes them away from zero, which `roundps`'s native
+        // ties-to-even would not.
+        let mut ties = [254.0f32; ACT_BLOCK];
+        for (i, slot) in ties.iter_mut().enumerate().skip(1) {
+            *slot = match i % 8 {
+                1 => 1.0,                       // 0.5  -> 1
+                2 => -1.0,                      // -0.5 -> -1
+                3 => 3.0,                       // 1.5  -> 2
+                4 => -3.0,                      // -1.5 -> -2
+                5 => 2.0 * 0.5f32.next_down(),  // just under 0.5 -> 0
+                6 => -2.0 * 0.5f32.next_down(), // just over -0.5 -> 0
+                _ => 5.0,                       // 2.5 -> 3
+            };
+        }
+        block(&ties);
+
+        // Denormals and the smallest normal, against a huge `amax`, so `inv`
+        // underflows the products to zero.
+        let mut tiny = [f32::MIN_POSITIVE; ACT_BLOCK];
+        tiny[0] = 1.0e30;
+        tiny[7] = -f32::from_bits(1); // smallest denormal
+        tiny[9] = f32::from_bits(1);
+        block(&tiny);
+
+        // `NaN` must be skipped by the `abs`-max fold, leaving `amax` at
+        // 4.0, and must itself quantize to 0 through the clamp and cast.
+        let mut nans = [4.0f32; ACT_BLOCK];
+        nans[0] = f32::NAN;
+        nans[3] = -f32::NAN;
+        nans[31] = f32::NAN;
+        block(&nans);
+
+        // An infinity makes `scale` infinite and `inv` zero, so every finite
+        // lane scales to 0 and the infinity itself becomes `inf * 0` = `NaN`.
+        let mut infs = [1.0f32; ACT_BLOCK];
+        infs[5] = f32::INFINITY;
+        infs[6] = f32::NEG_INFINITY;
+        block(&infs);
+
+        // The block maximum is negative, and is the *only* lane of that
+        // magnitude. Without this, dropping the `abs` from the max fold is
+        // undetectable: every other block here happens to carry its peak
+        // magnitude as a positive value too.
+        let mut neg = [0.25f32; ACT_BLOCK];
+        neg[13] = -100.0;
+        neg[20] = -60.0;
+        block(&neg);
+
+        // A plain spread, plus lanes that land on exactly +-127.
+        let mut lcg = 0x1234_5678u32;
+        let mut spread = [0f32; ACT_BLOCK];
+        for slot in spread.iter_mut() {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *slot = (lcg >> 8) as f32 / 8_388_608.0 - 0.5;
+        }
+        spread[0] = 1.0;
+        spread[1] = -1.0;
+        block(&spread);
+
+        x
+    }
+
+    #[test]
+    fn quantize_act_vector_kernel_is_bit_identical_to_its_scalar_reference() {
+        let x = quantize_act_adversarial_blocks();
+        let want = quantize_act_scalar(&x);
+        let got = quantize_act(&x);
+
+        assert_eq!(got.q, want.q, "int8 activations differ");
+        assert_eq!(got.sums, want.sums, "per-group sums differ");
+        // Bit patterns, not values: `d` carries infinities and the sign of
+        // zero, and `==` would call two different scales equal.
+        let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got.d), bits(&want.d), "block scales differ");
+    }
+
+    /// `quantize_block`'s `SUMS` parameter must change *only* whether the
+    /// per-[`GROUP`] sums are produced — never the scale and never a single
+    /// quantized byte. `ActQ8Flat::quantize` takes the `false`
+    /// monomorphization and `quantize_act` the `true` one, so a divergence
+    /// would silently give the two activation layouts different numbers from
+    /// the same input.
+    #[test]
+    fn quantize_block_is_the_same_quantization_with_and_without_sums() {
+        let x = quantize_act_adversarial_blocks();
+        for chunk in x.chunks_exact(ACT_BLOCK) {
+            let mut with = [0i8; ACT_BLOCK];
+            let mut without = [0i8; ACT_BLOCK];
+            let mut sums = Vec::new();
+            let mut unused = Vec::new();
+            let d_with = quantize_block::<true>(chunk, &mut with, &mut sums);
+            let d_without = quantize_block::<false>(chunk, &mut without, &mut unused);
+            assert_eq!(with, without, "SUMS changed the quantized bytes");
+            assert_eq!(
+                d_with.to_bits(),
+                d_without.to_bits(),
+                "SUMS changed the scale"
+            );
+            assert!(unused.is_empty(), "SUMS = false produced sums anyway");
+            // And the sums it does produce are the sums of what it wrote.
+            let want: Vec<i32> = with
+                .chunks_exact(GROUP)
+                .map(|g| g.iter().map(|&v| v as i32).sum())
+                .collect();
+            assert_eq!(sums, want, "the per-group sums do not match the bytes");
+        }
+    }
+
+    #[test]
+    fn quantize_act_rounds_ties_away_from_zero_like_f32_round() {
+        // Guards the kernel against `round_ties_even`, which is what a
+        // native `roundps` would give and which passes a random-input test
+        // roughly always. `inv` is exactly 0.5 here, so 1.0 and 3.0 scale to
+        // 0.5 and 1.5 — the two ties that split the modes apart.
+        let mut x = [254.0f32; ACT_BLOCK];
+        x[1] = 1.0;
+        x[2] = 3.0;
+        x[3] = -1.0;
+        x[4] = -3.0;
+        let a = quantize_act(&x);
+        assert_eq!(a.q[1], 1, "0.5 must round away from zero, not to even");
+        assert_eq!(a.q[2], 2, "1.5 must round away from zero");
+        assert_eq!(a.q[3], -1, "-0.5 must round away from zero");
+        assert_eq!(a.q[4], -2, "-1.5 must round away from zero");
     }
 
     // ------------------------------------------- K-quant prefill GEMM

@@ -67,7 +67,10 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::{ExpertGating, ExpertRouting, ModelForward, attend, rms_norm_rows, top_k_indices};
+use super::{
+    ExpertGating, ExpertRouting, ModelForward, attend, rms_norm_rows, rms_norm_rows_into,
+    top_k_indices,
+};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
@@ -386,6 +389,51 @@ fn rope_attn_factor(freq_scale: f32, ext_factor: f32) -> f32 {
         return 1.0;
     }
     1.0 / (1.0 + 0.1 * (1.0 / freq_scale).ln())
+}
+
+/// The buffers every layer of a forward pass reuses, so that the
+/// hyper-connection machinery allocates once per pass rather than four
+/// times per layer.
+///
+/// `residual` and `flat` are both the full four-stream state
+/// (`n_tokens * hc * n_embd`), which is what makes them worth hoisting:
+/// on a wide prefill each is several times the hidden state itself.
+#[derive(Default)]
+struct LayerScratch {
+    /// The streams as they were before this half-layer, which `hc_expand`
+    /// reads while writing `x`. A real copy — only its allocation is saved.
+    residual: Vec<f32>,
+    /// Per-token out-mix weights (`n_tokens * hc`).
+    post: Vec<f32>,
+    /// Per-token stream-combination weights (`n_tokens * hc * hc`).
+    comb: Vec<f32>,
+    /// The row-normalized streams `hc_collapse` predicts its mixes from.
+    flat: Vec<f32>,
+    /// `hc_collapse`'s mixing weights.
+    mixes: Vec<f32>,
+    /// `hc_collapse`'s collapsed output, one per half-layer so the
+    /// attention half's value is not overwritten while still in use.
+    collapsed_attn: Vec<f32>,
+    collapsed_ffn: Vec<f32>,
+    /// The attention half's always-run projections — see
+    /// `Backend::matmul_into`. The optional compressor and sparse-indexer
+    /// projections are **not** here: they are produced inside `Option::map`
+    /// closures that hand back owned tuples, and restructuring those to
+    /// write into a scratch is the one change in this file that a unit test
+    /// would not catch, on an architecture with no local reference model.
+    attn: AttnScratch,
+}
+
+/// [`LayerScratch`]'s attention half.
+#[derive(Default)]
+struct AttnScratch {
+    /// The query LoRA intermediate, shared with the indexer's query.
+    qr: Vec<f32>,
+    q: Vec<f32>,
+    kv: Vec<f32>,
+    /// One output group's low-rank projection.
+    projected: Vec<f32>,
+    out: Vec<f32>,
 }
 
 impl Deepseek4Model {
@@ -730,11 +778,24 @@ impl Deepseek4Model {
             }
         }
 
+        // Grown once and reused by every layer rather than allocated per
+        // half-layer. `flat` is the big one: `hc` times the hidden state.
+        let mut scratch = LayerScratch::default();
+
         for layer in &self.layers {
-            self.forward_layer(layer, cache, &mut x, tokens, start_pos)?;
+            self.forward_layer(layer, cache, &mut x, tokens, start_pos, &mut scratch)?;
         }
 
-        let mut out = self.hc_collapse(&self.hc_head, &x, n_tokens, None);
+        let mut out = Vec::new();
+        self.hc_collapse_into(
+            &mut out,
+            &self.hc_head,
+            &x,
+            n_tokens,
+            None,
+            &mut scratch.flat,
+            &mut scratch.mixes,
+        );
         tensor::rmsnorm_inplace(&mut out, &self.output_norm, n_tokens, n_embd, eps);
         Ok(out)
     }
@@ -746,24 +807,57 @@ impl Deepseek4Model {
         x: &mut [f32],
         tokens: &[u32],
         start_pos: usize,
+        scratch: &mut LayerScratch,
     ) -> Result<()> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
 
-        let residual = x.to_vec();
-        let mut post = Vec::new();
-        let mut comb = Vec::new();
-        let mut cur = self.hc_collapse(&layer.hc_attn, x, n_tokens, Some((&mut post, &mut comb)));
-        tensor::rmsnorm_inplace(&mut cur, &layer.attn_norm, n_tokens, n_embd, eps);
-        let attn = self.attention(layer, cache, &cur, n_tokens, start_pos)?;
-        self.hc_expand(x, &attn, &residual, &post, &comb, n_tokens);
+        let LayerScratch {
+            residual,
+            post,
+            comb,
+            flat,
+            mixes: mixes_buf,
+            collapsed_attn,
+            collapsed_ffn,
+            attn: attn_scratch,
+        } = scratch;
 
-        let residual = x.to_vec();
-        let mut cur = self.hc_collapse(&layer.hc_ffn, x, n_tokens, Some((&mut post, &mut comb)));
-        tensor::rmsnorm_inplace(&mut cur, &layer.ffn.norm, n_tokens, n_embd, eps);
-        let ffn = self.moe_ffn(&layer.ffn, &cur, tokens);
-        self.hc_expand(x, &ffn, &residual, &post, &comb, n_tokens);
+        // A genuine copy, unlike the norm inputs: `hc_expand` writes `x`
+        // while still reading the streams as they were before this
+        // half-layer. Only the *allocation* is hoisted here, not the copy.
+        residual.clear();
+        residual.extend_from_slice(x);
+        self.hc_collapse_into(
+            collapsed_attn,
+            &layer.hc_attn,
+            x,
+            n_tokens,
+            Some((post, comb)),
+            flat,
+            mixes_buf,
+        );
+        let cur = collapsed_attn;
+        tensor::rmsnorm_inplace(cur, &layer.attn_norm, n_tokens, n_embd, eps);
+        let attn = self.attention(layer, cache, attn_scratch, cur, n_tokens, start_pos)?;
+        self.hc_expand(x, &attn, residual, post, comb, n_tokens);
+
+        residual.clear();
+        residual.extend_from_slice(x);
+        self.hc_collapse_into(
+            collapsed_ffn,
+            &layer.hc_ffn,
+            x,
+            n_tokens,
+            Some((post, comb)),
+            flat,
+            mixes_buf,
+        );
+        let cur = collapsed_ffn;
+        tensor::rmsnorm_inplace(cur, &layer.ffn.norm, n_tokens, n_embd, eps);
+        let ffn = self.moe_ffn(&layer.ffn, cur, tokens);
+        self.hc_expand(x, &ffn, residual, post, comb, n_tokens);
         Ok(())
     }
 
@@ -773,23 +867,32 @@ impl Deepseek4Model {
     /// stream-combination (`comb`) weights [`Self::hc_expand`] needs; the
     /// final head passes `None`, which is upstream's separate
     /// `build_hc_head` (one scale, no `post`/`comb` at all).
-    fn hc_collapse(
+    #[allow(clippy::too_many_arguments)]
+    fn hc_collapse_into(
         &self,
+        cur: &mut Vec<f32>,
         mixer: &HyperConnection,
         x: &[f32],
         n_tokens: usize,
         out: Option<(&mut Vec<f32>, &mut Vec<f32>)>,
-    ) -> Vec<f32> {
+        flat: &mut Vec<f32>,
+        mixes_buf: &mut Vec<f32>,
+    ) {
         let n_embd = self.config.n_embd;
         let hc = self.hc;
         let flat_dim = hc * n_embd;
 
-        let mut flat = x.to_vec();
-        rms_norm_rows(&mut flat, flat_dim, self.config.rms_eps);
-        let mixes = self.backend.matmul(&flat, n_tokens, &mixer.weights);
+        // `hc` times the hidden state — the largest per-layer copy in this
+        // architecture, and it was being made only to be overwritten by the
+        // norm that follows.
+        rms_norm_rows_into(flat, x, flat_dim, self.config.rms_eps);
+        self.backend
+            .matmul_into(mixes_buf, flat, n_tokens, &mixer.weights);
+        let mixes = &*mixes_buf;
         let mix_dim = mixer.weights.out_dim;
 
-        let mut cur = vec![0f32; n_tokens * n_embd];
+        // Accumulated into, not overwritten — see `tensor::zeroed_to`.
+        let cur = tensor::zeroed_to(cur, n_tokens * n_embd);
         let (post_out, comb_out) = match out {
             Some((post, comb)) => {
                 post.clear();
@@ -832,7 +935,6 @@ impl Deepseek4Model {
                 tensor::axpy_inplace(dst, src, w);
             }
         }
-        cur
     }
 
     /// The hyper-connection out-mix: writes this half-layer's output back
@@ -870,10 +972,12 @@ impl Deepseek4Model {
     /// layer's compressed-block bookkeeping, the masked softmax over
     /// [sliding window + compressed blocks], and the grouped output
     /// projection.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         layer: &Deepseek4Layer,
         cache: &mut KvCache,
+        scratch: &mut AttnScratch,
         cur: &[f32],
         n_tokens: usize,
         start_pos: usize,
@@ -889,18 +993,20 @@ impl Deepseek4Model {
         // Every projection here is token-independent, so all of them run
         // once for the whole chunk — the per-token loop below is only the
         // parts that depend on position (RoPE, the cache, the softmax).
-        let mut qr = self.backend.matmul(cur, n_tokens, &layer.wq_a);
-        tensor::rmsnorm_inplace(
-            &mut qr,
-            &layer.attn_q_a_norm,
-            n_tokens,
-            self.q_lora_rank,
-            eps,
-        );
-        let mut q = self.backend.matmul(&qr, n_tokens, &layer.wq_b);
-        rms_norm_rows(&mut q, head_dim, eps);
-        let mut kv = self.backend.matmul(cur, n_tokens, &layer.wkv);
-        tensor::rmsnorm_inplace(&mut kv, &layer.attn_kv_norm, n_tokens, head_dim, eps);
+        let AttnScratch {
+            qr,
+            q,
+            kv,
+            projected,
+            out: out_buf,
+        } = scratch;
+        self.backend.matmul_into(qr, cur, n_tokens, &layer.wq_a);
+        tensor::rmsnorm_inplace(qr, &layer.attn_q_a_norm, n_tokens, self.q_lora_rank, eps);
+        let qr = &*qr;
+        self.backend.matmul_into(q, qr, n_tokens, &layer.wq_b);
+        rms_norm_rows(q, head_dim, eps);
+        self.backend.matmul_into(kv, cur, n_tokens, &layer.wkv);
+        tensor::rmsnorm_inplace(kv, &layer.attn_kv_norm, n_tokens, head_dim, eps);
 
         for t in 0..n_tokens {
             let pos = start_pos + t;
@@ -950,7 +1056,7 @@ impl Deepseek4Model {
             // The indexer's query shares the attention query's LoRA
             // intermediate, and ropes with the compressed-key parameters
             // whatever the layer's own are.
-            let mut iq = self.backend.matmul(&qr, n_tokens, &ix.q_b);
+            let mut iq = self.backend.matmul(qr, n_tokens, &ix.q_b);
             let inope = self.indexer_head_size - rope_dim;
             for t in 0..n_tokens {
                 let pos = start_pos + t;
@@ -1111,7 +1217,8 @@ impl Deepseek4Model {
                 group[t * o_group_dim..(t + 1) * o_group_dim]
                     .copy_from_slice(&attn_out[at..at + o_group_dim]);
             }
-            let projected = self.backend.matmul(
+            self.backend.matmul_into(
+                projected,
                 &group,
                 n_tokens,
                 &layer.wo_a.rows(g * self.o_lora_rank, self.o_lora_rank),
@@ -1122,9 +1229,10 @@ impl Deepseek4Model {
                     .copy_from_slice(&projected[t * self.o_lora_rank..(t + 1) * self.o_lora_rank]);
             }
         }
-        let out = self.backend.matmul(&oa, n_tokens, &layer.wo_b);
-        debug_assert_eq!(out.len(), n_tokens * n_embd);
-        Ok(out)
+        self.backend
+            .matmul_into(out_buf, &oa, n_tokens, &layer.wo_b);
+        debug_assert_eq!(out_buf.len(), n_tokens * n_embd);
+        Ok(std::mem::take(out_buf))
     }
 
     /// Pools the block that ends at `pos` out of its members' compressor
@@ -1218,19 +1326,25 @@ impl Deepseek4Model {
         // expert's weights are read — see `super::evaluate_routed_experts`.
         // The hash-routed layers route from the token id rather than the
         // logits, which changes nothing here: a selection is a selection.
+        //
+        // One matmul for the whole batch rather than one per token: see
+        // `super::moe_router_logits`. The hoist also keeps this device
+        // submission out of the parallel region below, where it would queue
+        // behind the shared expert's.
+        let n_tokens = tokens.len();
+        let logits = super::moe_router_logits(self.backend.as_ref(), cur, n_tokens, &ffn.gate_inp);
+        let n_expert = logits.len() / n_tokens;
         let mut selection: Vec<Vec<(usize, f32)>> = tokens
             .iter()
             .enumerate()
             .map(|(t, &token)| {
-                let x_t = &cur[t * n_embd..(t + 1) * n_embd];
-                let logits = self.backend.matmul(x_t, 1, &ffn.gate_inp);
+                let row = &logits[t * n_expert..(t + 1) * n_expert];
                 let hashed = ffn
                     .tid2eid
                     .as_ref()
                     .map(|route| selected_experts_for_token(route, token, self.n_expert_used));
                 let (selected, weights) =
-                    self.routing
-                        .route(&logits, ffn.exp_probs_b.as_deref(), hashed);
+                    self.routing.route(row, ffn.exp_probs_b.as_deref(), hashed);
                 selected.into_iter().zip(weights).collect()
             })
             .collect();
@@ -1244,80 +1358,98 @@ impl Deepseek4Model {
 
         // The GPU expert path batches the three projections across experts —
         // see `super::evaluate_routed_experts_batched`.
-        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
-            super::evaluate_routed_experts_batched(
-                self.backend.as_ref(),
-                &selection,
-                cur,
-                n_embd,
-                &ffn.gate_exps,
-                &ffn.up_exps,
-                &ffn.down_exps,
-                |gate, up| swiglu(gate, up, ffn.clamp_exp),
-            )
-        } else {
-            super::evaluate_routed_experts(&selection, |expert, members| {
-                let inputs: Vec<&[f32]> = members
-                    .iter()
-                    .map(|&(t, _)| &cur[t * n_embd..(t + 1) * n_embd])
-                    .collect();
-                let gate = super::project_expert(
+        let routed_branch = || {
+            if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+                super::evaluate_routed_experts_batched(
                     self.backend.as_ref(),
+                    &selection,
+                    cur,
+                    n_embd,
                     &ffn.gate_exps,
-                    expert,
-                    0,
-                    ffn.gate_exps.out_dim,
-                    &inputs,
-                );
-                let up = super::project_expert(
-                    self.backend.as_ref(),
                     &ffn.up_exps,
-                    expert,
-                    0,
-                    ffn.up_exps.out_dim,
-                    &inputs,
-                );
-                let hidden: Vec<Vec<f32>> = gate
-                    .into_iter()
-                    .zip(up)
-                    .map(|(gate, up)| swiglu(&gate, &up, ffn.clamp_exp))
-                    .collect();
-                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-                super::project_expert(
-                    self.backend.as_ref(),
                     &ffn.down_exps,
-                    expert,
-                    0,
-                    ffn.down_exps.out_dim,
-                    &hidden_refs,
+                    |gate, up| swiglu(gate, up, ffn.clamp_exp),
                 )
-                .into_iter()
-                .zip(members)
-                .map(|(mut contribution, &(_, weight))| {
-                    contribution.iter_mut().for_each(|v| *v *= weight);
-                    contribution
+            } else {
+                super::evaluate_routed_experts(&selection, |expert, members| {
+                    let inputs: Vec<&[f32]> = members
+                        .iter()
+                        .map(|&(t, _)| &cur[t * n_embd..(t + 1) * n_embd])
+                        .collect();
+                    let gate = super::project_expert(
+                        self.backend.as_ref(),
+                        &ffn.gate_exps,
+                        expert,
+                        0,
+                        ffn.gate_exps.out_dim,
+                        &inputs,
+                    );
+                    let up = super::project_expert(
+                        self.backend.as_ref(),
+                        &ffn.up_exps,
+                        expert,
+                        0,
+                        ffn.up_exps.out_dim,
+                        &inputs,
+                    );
+                    let hidden: Vec<Vec<f32>> = gate
+                        .into_iter()
+                        .zip(up)
+                        .map(|(gate, up)| swiglu(&gate, &up, ffn.clamp_exp))
+                        .collect();
+                    let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                    super::project_expert(
+                        self.backend.as_ref(),
+                        &ffn.down_exps,
+                        expert,
+                        0,
+                        ffn.down_exps.out_dim,
+                        &hidden_refs,
+                    )
+                    .into_iter()
+                    .zip(members)
+                    .map(|(mut contribution, &(_, weight))| {
+                        contribution.iter_mut().for_each(|v| *v *= weight);
+                        contribution
+                    })
+                    .collect()
                 })
-                .collect()
-            })
+            }
+        };
+
+        // The always-on shared expert, for every token at once rather than
+        // three device round-trips per token. Through
+        // `super::matmul_host_fallback`, not `matmul`: the `*_shexp`
+        // matrices are exempt from the backend's up-front type check (see
+        // `engine::backend::is_cpu_only_tensor`), so one of a type this
+        // device has no shader for would otherwise reach a backend that
+        // panics rather than declining.
+        let shared_branch = || {
+            let gate =
+                super::matmul_host_fallback(self.backend.as_ref(), cur, n_tokens, &ffn.gate_shexp);
+            let up =
+                super::matmul_host_fallback(self.backend.as_ref(), cur, n_tokens, &ffn.up_shexp);
+            let h = swiglu(&gate, &up, ffn.clamp_shexp);
+            super::matmul_host_fallback(self.backend.as_ref(), &h, n_tokens, &ffn.down_shexp)
+        };
+
+        // Different processors, no dependency between them, summed at the
+        // end — see `super::moe_overlap_min_tokens`.
+        let (shexp, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+            rayon::join(shared_branch, routed_branch)
+        } else {
+            (shared_branch(), routed_branch())
         };
         experts.loaded_once_per_distinct_expert();
 
-        for t in 0..tokens.len() {
-            let x_t = &cur[t * n_embd..(t + 1) * n_embd];
-            let shexp_h = swiglu(
-                &self.backend.matmul(x_t, 1, &ffn.gate_shexp),
-                &self.backend.matmul(x_t, 1, &ffn.up_shexp),
-                ffn.clamp_shexp,
-            );
-            let shexp = self.backend.matmul(&shexp_h, 1, &ffn.down_shexp);
-
+        for t in 0..n_tokens {
             let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            dst.copy_from_slice(&shexp);
+            dst.copy_from_slice(&shexp[t * n_embd..(t + 1) * n_embd]);
             for contrib in &contribs[t] {
                 tensor::add_inplace(dst, contrib);
             }
         }
-        experts.commit(tokens.len());
+        experts.commit(n_tokens);
         out
     }
 }
@@ -1344,6 +1476,15 @@ fn swiglu(gate: &[f32], up: &[f32], limit: f32) -> Vec<f32> {
 }
 
 impl ModelForward for Deepseek4Model {
+    /// The instrumentation hook `engine::generate` reads to count GPU
+    /// submissions per decode step. Only useful compared *between*
+    /// architectures, which is why an architecture that answers `None` is
+    /// invisible to exactly the measurement that would say whether a
+    /// cross-architecture change helped it.
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_wgpu()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

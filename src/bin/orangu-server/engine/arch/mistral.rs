@@ -577,9 +577,27 @@ impl MistralModel {
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
 
+        // Grown once and reused across layers rather than allocated per
+        // layer: at prefill widths each of these is megabytes. The norm
+        // buffers replace what used to be `x.clone()` — see
+        // `tensor::rmsnorm_into`.
+        let mut attn_out: Vec<f32> = Vec::new();
+        let mut normed: Vec<f32> = Vec::new();
+        let mut normed2: Vec<f32> = Vec::new();
+        // The projection outputs, on the same principle — see
+        // `Backend::matmul_into`. `ffn` is the big one: `n_tokens * n_ff`.
+        let mut attn_proj: Vec<f32> = Vec::new();
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
+            tensor::rmsnorm_into(
+                &mut normed,
+                &x,
+                &layer.attn_norm,
+                n_tokens,
+                n_embd,
+                cfg.rms_eps,
+            );
 
             // Q/K/V are independent given the same normed input — one batched
             // dispatch rather than three sequential round trips.
@@ -644,7 +662,6 @@ impl MistralModel {
             // Plain causal attention, on the GPU when the batch is wide
             // enough — `engine::attention` owns that choice for every
             // architecture.
-            let mut attn_out: Vec<f32> = Vec::new();
             crate::engine::attention::attention(
                 &mut attn_out,
                 &q,
@@ -694,37 +711,34 @@ impl MistralModel {
             if let Some(out) = fused {
                 x = out;
             } else {
-                let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+                self.backend
+                    .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
                 tensor::add_inplace(&mut x, &attn_proj);
 
-                let mut normed2 = x.clone();
-                tensor::rmsnorm_inplace(
+                tensor::rmsnorm_into(
                     &mut normed2,
+                    &x,
                     &layer.ffn_norm,
                     n_tokens,
                     n_embd,
                     cfg.rms_eps,
                 );
-                let mut gate_up = self.backend.matmul_batch(&[
-                    MatmulOp {
-                        x: &normed2,
-                        n_tokens,
-                        w: &layer.w_gate,
-                    },
-                    MatmulOp {
-                        x: &normed2,
-                        n_tokens,
-                        w: &layer.w_up,
-                    },
-                ]);
-                let up = gate_up.pop().unwrap();
-                let mut gate = gate_up.pop().unwrap();
-                for g in gate.iter_mut() {
-                    *g = tensor::silu(*g);
-                }
-                tensor::mul_inplace(&mut gate, &up);
-                let down = self.backend.matmul(&gate, n_tokens, &layer.w_down);
-                tensor::add_inplace(&mut x, &down);
+                // This block used to be an open-coded copy of
+                // `super::swiglu_ffn` — same batched gate/up, same in-place
+                // SiLU, same multiply, same down projection. Calling the
+                // shared one deletes the duplicate and picks up the buffer
+                // reuse in the same move.
+                super::swiglu_ffn_into(
+                    self.backend.as_ref(),
+                    &mut ffn_out,
+                    &mut ffn_scratch,
+                    &normed2,
+                    n_tokens,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                );
+                tensor::add_inplace(&mut x, &ffn_out);
             }
         }
 

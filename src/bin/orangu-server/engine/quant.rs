@@ -124,7 +124,12 @@ const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6,
 
 /// Bytes per block, and elements per block, for a supported `ggml_type`.
 /// `None` for a type this engine can't yet read.
-fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
+///
+/// `pub(crate)` for the vendor backends' cross-check tests, which each used
+/// to carry a hand-maintained copy of this table — three copies of one fact,
+/// none of which the compiler could tell had fallen behind. A block layout
+/// is `engine::quant`'s to know.
+pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
     match ggml_type {
         GGML_TYPE_F32 => Some((4, 1)),
         GGML_TYPE_F16 => Some((2, 1)),

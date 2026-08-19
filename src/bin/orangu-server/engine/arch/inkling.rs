@@ -661,38 +661,36 @@ impl InklingModel {
     }
 
     /// One layer's feed-forward half, `[n_tokens, n_embd]`, with
-    /// [`InklingLayer::ffn_scale`] already applied.
-    fn ffn(&self, layer: &InklingLayer, normed: &[f32], n_tokens: usize) -> Vec<f32> {
-        let mut out = match &layer.ffn {
-            Ffn::Dense { gate, up, down } => {
-                let mut gate_up = self.backend.matmul_batch(&[
-                    MatmulOp {
-                        x: normed,
-                        n_tokens,
-                        w: gate,
-                    },
-                    MatmulOp {
-                        x: normed,
-                        n_tokens,
-                        w: up,
-                    },
-                ]);
-                let up = gate_up.pop().unwrap();
-                let mut act = gate_up.pop().unwrap();
-                for g in act.iter_mut() {
-                    *g = tensor::silu(*g);
-                }
-                tensor::mul_inplace(&mut act, &up);
-                self.backend.matmul(&act, n_tokens, down)
-            }
-            Ffn::Moe(moe) => self.moe_ffn(moe, normed, n_tokens),
-        };
+    /// [`InklingLayer::ffn_scale`] already applied, into a caller-owned
+    /// buffer — see `Backend::matmul_into`.
+    fn ffn_into(
+        &self,
+        out: &mut Vec<f32>,
+        scratch: &mut super::FfnScratch,
+        layer: &InklingLayer,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        match &layer.ffn {
+            // Was an open-coded copy of `super::swiglu_ffn` — same batched
+            // gate/up, same in-place SiLU, same multiply, same down.
+            Ffn::Dense { gate, up, down } => super::swiglu_ffn_into(
+                self.backend.as_ref(),
+                out,
+                scratch,
+                normed,
+                n_tokens,
+                gate,
+                up,
+                down,
+            ),
+            Ffn::Moe(moe) => *out = self.moe_ffn(moe, normed, n_tokens),
+        }
         if layer.ffn_scale != 1.0 {
             for v in out.iter_mut() {
                 *v *= layer.ffn_scale;
             }
         }
-        out
     }
 
     /// Routed experts plus the always-on shared ones.
@@ -719,10 +717,16 @@ impl InklingModel {
         // at a time — so its weights are read the way they are used.
         let mut shared_weights: Vec<Vec<f32>> =
             vec![Vec::with_capacity(n_tokens); self.n_expert_shared];
+        // One router matmul for the whole batch, not one per token — see
+        // `super::moe_router_logits`.
+        let logits =
+            super::moe_router_logits(self.backend.as_ref(), normed, n_tokens, &moe.gate_inp);
+        let n_logit = logits.len() / n_tokens.max(1);
         for t in 0..n_tokens {
-            let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-            let logits = self.backend.matmul(x_t, 1, &moe.gate_inp);
-            let probs: Vec<f32> = logits.iter().map(|&l| self.gating.apply(l)).collect();
+            let probs: Vec<f32> = logits[t * n_logit..(t + 1) * n_logit]
+                .iter()
+                .map(|&l| self.gating.apply(l))
+                .collect();
             let mut choice = probs[..self.n_expert].to_vec();
             tensor::add_inplace(&mut choice, &moe.exp_probs_b);
             let selected = super::top_k_indices(&choice, self.n_expert_used);
@@ -894,9 +898,17 @@ impl InklingModel {
         }
         tensor::rmsnorm_inplace(&mut x, &self.tok_embd_norm, n_tokens, n_embd, eps);
 
+        // Same reuse as `attn_out`, replacing what used to be `x.clone()`
+        // per norm — see `tensor::rmsnorm_into`.
+        let mut normed: Vec<f32> = Vec::new();
+        let mut ffn_normed: Vec<f32> = Vec::new();
+        // Projection outputs, on the same principle — see
+        // `Backend::matmul_into`.
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
+
         for (il, layer) in self.layers.iter().enumerate() {
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
+            tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n_tokens, n_embd, eps);
             let mut attn = self.attention(cache, layer, il, &normed, n_tokens, start_pos);
             shortconv(
                 &mut cache.recurrent[il * CONV_PER_LAYER + CONV_ATTN],
@@ -907,9 +919,8 @@ impl InklingModel {
             );
             tensor::add_inplace(&mut x, &attn);
 
-            let mut ffn_normed = x.clone();
-            tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-            let mut ffn_out = self.ffn(layer, &ffn_normed, n_tokens);
+            tensor::rmsnorm_into(&mut ffn_normed, &x, &layer.ffn_norm, n_tokens, n_embd, eps);
+            self.ffn_into(&mut ffn_out, &mut ffn_scratch, layer, &ffn_normed, n_tokens);
             shortconv(
                 &mut cache.recurrent[il * CONV_PER_LAYER + CONV_MLP],
                 &mut ffn_out,

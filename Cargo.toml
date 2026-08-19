@@ -45,15 +45,7 @@ resvg = { version = "0.48.1", default-features = false, features = ["text"] }
 rmcp = { version = "3.1.2", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 rustc-hash = "2.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
-# Server-side TLS. `rustls` and `tokio-rustls` are already in the tree for
-# `reqwest`'s HTTPS, so this adds glue rather than a crypto stack: a
-# `TlsAcceptor` around the listener and a PEM reader for the key pair.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
-# The `Body` trait `axum`'s own body type implements. Declared so a response
-# body can be wrapped without changing it: a per-tenant concurrency guard has
-# to outlive the handler (a streamed generation is still running when the
-# handler returns), and forwarding `poll_frame`/`size_hint` keeps the response
-# framed exactly as it was. Already in the tree as an `axum` dependency.
 http-body = "1.1"
 rustyline = "18.0.1"
 rayon = "1.12.0"
@@ -105,6 +97,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system", 
 minijinja = "2.24"
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 half = "2.7"
+wide = "1.6.1"
 memmap2 = "0.9"
 rand = "0.10"
 async-stream = "0.3"

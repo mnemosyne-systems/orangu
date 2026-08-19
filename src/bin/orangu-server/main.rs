@@ -661,9 +661,13 @@ struct Prepared {
     mcp_servers: Vec<config::McpConfiguration>,
     /// The GPU kernel/tuning selection this device came up with, and its
     /// one-line form for the startup banner — see [`AppState::gpu_tuning`]
-    /// and `VulkanBackend::tuning_report`. Both `None` for a backend with no
-    /// such selection to report. Captured in [`prepare`], where the concrete
-    /// backend is still in hand rather than a `dyn Backend`.
+    /// and `VulkanBackend::tuning_report`. Both `None` only for
+    /// `CpuBackend`: a GPU backend with no kernel selection to report
+    /// carries `Backend::reduced_surface` here instead, so neither the
+    /// banner nor `/props` goes silent on a device that is running a
+    /// narrower path than the one every published number was taken on.
+    /// Captured in [`prepare`], where the concrete backend is still in hand
+    /// rather than a `dyn Backend`.
     gpu_tuning: Option<serde_json::Value>,
     gpu_tuning_summary: Option<String>,
     /// The backend, when it is the `wgpu` engine — see
@@ -954,11 +958,22 @@ fn prepare(args: Args) -> Result<Prepared> {
     // `wgpu` engine is the only thing that knows which of its kernels feature
     // negotiation and the `ORANGU_*` flags actually left live — and that
     // answer travels with every benchmark result through `/props`. `None` for
-    // the CPU/CUDA/OpenCL/ROCm backends, which have no such selection to
-    // report. See `VulkanBackend::tuning_report`.
+    // `CpuBackend`; on the CUDA/OpenCL/ROCm backends, which have no such
+    // selection to report, a `surface` naming what they run instead. See
+    // `VulkanBackend::tuning_report` and `Backend::reduced_surface`.
     let mut gpu_tuning = backend
         .as_wgpu()
-        .map(engine::backend::VulkanBackend::tuning_report);
+        .map(engine::backend::VulkanBackend::tuning_report)
+        .or_else(|| {
+            // Not a `tuning_report`: these backends have no flags, no
+            // geometry and no per-type kernel table to report. What they do
+            // have is a surface, and `/props.gpu` reading `null` for them
+            // makes a CUDA run indistinguishable from a CPU one to anything
+            // reading this endpoint — `orangu-bench`'s header included.
+            backend
+                .reduced_surface()
+                .map(|surface| serde_json::json!({ "surface": surface, "kernels": null }))
+        });
     // The banner reports the kernels *this* model's own weights decode
     // through, most-common type first. A file named for a K-quant is often
     // mostly something else — `unsloth/Qwen3.8-27B-GGUF:IQ2_XXS` has no
@@ -981,9 +996,15 @@ fn prepare(args: Args) -> Result<Prepared> {
         types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         types.into_iter().map(|(ty, _)| ty).collect::<Vec<_>>()
     };
+    // On a `wgpu` backend, the kernels this model's weights actually decode
+    // through. On `CudaBackend`/`RocmBackend`/`OpenClBackend`, which have no
+    // kernel *selection* to report, what they have instead of one — see
+    // `Backend::reduced_surface` for why an absent row was the wrong answer
+    // there.
     let gpu_tuning_summary = backend
         .as_wgpu()
-        .map(|v| v.tuning_summary_for(&dominant_types));
+        .map(|v| v.tuning_summary_for(&dominant_types))
+        .or_else(|| backend.reduced_surface().map(str::to_string));
     // The backend itself, when it is a `wgpu` one, so `/gpu-timings` can drain
     // its accumulated timestamp breakdown. Kept as the `dyn Backend` the state
     // already holds rather than a second concrete handle: `as_wgpu` is how
@@ -1648,6 +1669,12 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // tuned elsewhere that is not something to assume — see
         // `VulkanBackend::tuning_report` for the full picture `/props`
         // carries.
+        //
+        // On a backend with no kernel selection to make, the same row says
+        // what it runs instead of one (`Backend::reduced_surface`). The row
+        // is never silent on a GPU: an absent line is what let a `--device
+        // cuda:0` run look like a full-path run in every number taken from
+        // it.
         if let Some(summary) = &gpu_tuning_summary {
             println!("Kernels    {summary}");
         }

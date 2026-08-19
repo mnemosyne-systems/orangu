@@ -98,6 +98,24 @@ pub(crate) fn rms_norm_rows(x: &mut [f32], dim: usize, eps: f32) {
     }
 }
 
+/// [`rms_norm_rows`] from `src` into `dst` — the out-of-place form, for the
+/// callers that need the input preserved and were copying it first.
+///
+/// Same reasoning as `tensor::rmsnorm_into`, and same contract: the values
+/// are bit-identical to normalizing a copy, because the row kernel is the
+/// same expression in the same order. `dst` is a caller-owned buffer reused
+/// across layers.
+pub(crate) fn rms_norm_rows_into(dst: &mut Vec<f32>, src: &[f32], dim: usize, eps: f32) {
+    debug_assert_eq!(src.len() % dim, 0);
+    dst.resize(src.len(), 0.0);
+    for (out, row) in dst.chunks_mut(dim).zip(src.chunks(dim)) {
+        let scale = rms_norm_scale(row_mean_sq(row), eps);
+        for (o, v) in out.iter_mut().zip(row.iter()) {
+            *o = *v * scale;
+        }
+    }
+}
+
 /// `1/sqrt(mean(x^2) + eps)` — the scale [`rms_norm_rows`] multiplies by,
 /// exposed separately for callers that only need the *scaled dot product*
 /// of a row with a weight vector and would otherwise normalize a copy of
@@ -592,10 +610,38 @@ pub(crate) fn evaluate_routed_experts_batched(
         selection,
         hidden,
         n_embd,
-        &ExpertProjection::whole(gate_exps),
+        Some(&ExpertProjection::whole(gate_exps)),
         &ExpertProjection::whole(up_exps),
         &ExpertProjection::whole(down_exps),
         activate,
+    )
+}
+
+/// [`evaluate_routed_experts_batched`] for a **gate-less** expert — one
+/// projection into the hidden width, an activation on it alone, then the
+/// down projection.
+///
+/// `nemotron`'s squared-ReLU experts are the only ones here with this shape,
+/// and it was the last architecture on the unbatched per-expert path for no
+/// better reason than that the batched helper had `gate` in its signature.
+pub(crate) fn evaluate_routed_experts_batched_gateless(
+    backend: &dyn crate::engine::backend::Backend,
+    selection: &[Vec<(usize, f32)>],
+    hidden: &[f32],
+    n_embd: usize,
+    up_exps: &crate::engine::loader::ExpertQuantMatrix,
+    down_exps: &crate::engine::loader::ExpertQuantMatrix,
+    activate: impl Fn(&[f32]) -> Vec<f32> + Sync,
+) -> Vec<Vec<Vec<f32>>> {
+    evaluate_routed_experts_batched_views(
+        backend,
+        selection,
+        hidden,
+        n_embd,
+        None,
+        &ExpertProjection::whole(up_exps),
+        &ExpertProjection::whole(down_exps),
+        |_, up| activate(up),
     )
 }
 
@@ -617,12 +663,20 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     selection: &[Vec<(usize, f32)>],
     hidden: &[f32],
     n_embd: usize,
-    gate: &ExpertProjection<'_>,
+    gate: Option<&ExpertProjection<'_>>,
     up: &ExpertProjection<'_>,
     down: &ExpertProjection<'_>,
     activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
     use crate::engine::backend::MatmulOp;
+
+    // A gate-less expert — `nemotron`'s squared-ReLU FFN is `down(relu(up
+    // (x))^2)`, with no second projection to multiply against — is the same
+    // pipeline with one projection instead of two, so it is expressed as
+    // `None` rather than as a second copy of this function. `activate` is
+    // then called with an empty gate slice, and the up projection is what
+    // sets the hidden width.
+    let ops_per_group = if gate.is_some() { 2 } else { 1 };
 
     // Same first-seen grouping as `evaluate_routed_experts`, and for the
     // same reason: it keeps the evaluation order reproducible from the
@@ -681,7 +735,7 @@ pub(crate) fn evaluate_routed_experts_batched_views(
         .map(|&e| {
             !force_host
                 && (streamed
-                    || (gate.exps.is_device_resident(e)
+                    || (gate.is_none_or(|g| g.exps.is_device_resident(e))
                         && up.exps.is_device_resident(e)
                         && down.exps.is_device_resident(e)))
         })
@@ -718,10 +772,14 @@ pub(crate) fn evaluate_routed_experts_batched_views(
 
     // Views first, then ops: a `MatmulOp` borrows its weight. `rows` is what
     // makes a fused gate/up tensor two projections rather than one.
-    let gate_views: Vec<_> = experts
-        .iter()
-        .map(|&e| gate.exps.expert_matrix(e).rows(gate.first_row, gate.n_rows))
-        .collect();
+    let gate_views: Vec<_> = gate
+        .map(|gate| {
+            experts
+                .iter()
+                .map(|&e| gate.exps.expert_matrix(e).rows(gate.first_row, gate.n_rows))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let up_views: Vec<_> = experts
         .iter()
         .map(|&e| up.exps.expert_matrix(e).rows(up.first_row, up.n_rows))
@@ -732,11 +790,13 @@ pub(crate) fn evaluate_routed_experts_batched_views(
         if !on_device[group] {
             continue;
         }
-        ops.push(MatmulOp {
-            x: &xs[group],
-            n_tokens: members[group].len(),
-            w: &gate_views[group],
-        });
+        if gate.is_some() {
+            ops.push(MatmulOp {
+                x: &xs[group],
+                n_tokens: members[group].len(),
+                w: &gate_views[group],
+            });
+        }
         ops.push(MatmulOp {
             x: &xs[group],
             n_tokens: members[group].len(),
@@ -764,14 +824,19 @@ pub(crate) fn evaluate_routed_experts_batched_views(
                         .iter()
                         .map(|&(token, _)| &hidden[token * n_embd..(token + 1) * n_embd])
                         .collect();
-                    let gate_out = project_expert(
-                        backend,
-                        gate.exps,
-                        experts[group],
-                        gate.first_row,
-                        gate.n_rows,
-                        &inputs,
-                    );
+                    let gate_out = gate
+                        .map(|gate| {
+                            project_expert(
+                                backend,
+                                gate.exps,
+                                experts[group],
+                                gate.first_row,
+                                gate.n_rows,
+                                &inputs,
+                            )
+                            .concat()
+                        })
+                        .unwrap_or_default();
                     let up_out = project_expert(
                         backend,
                         up.exps,
@@ -780,7 +845,7 @@ pub(crate) fn evaluate_routed_experts_batched_views(
                         up.n_rows,
                         &inputs,
                     );
-                    (group, (gate_out.concat(), up_out.concat()))
+                    (group, (gate_out, up_out.concat()))
                 })
                 .collect()
         },
@@ -789,7 +854,13 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     // whichever path produced a group's projections.
     let mut slots: Vec<Option<(Vec<f32>, Vec<f32>)>> = (0..experts.len()).map(|_| None).collect();
     for (slot, group) in op_group.iter().enumerate() {
-        slots[*group] = Some((batched[slot * 2].clone(), batched[slot * 2 + 1].clone()));
+        let base = slot * ops_per_group;
+        let gate_out = if gate.is_some() {
+            batched[base].clone()
+        } else {
+            Vec::new()
+        };
+        slots[*group] = Some((gate_out, batched[base + ops_per_group - 1].clone()));
     }
     for (group, projections) in host_gate_up {
         slots[group] = Some(projections);
@@ -807,7 +878,7 @@ pub(crate) fn evaluate_routed_experts_batched_views(
         .par_iter_mut()
         .zip(experts.par_iter())
         .for_each(|(projected, &expert)| {
-            if let Some(scale) = gate.scale {
+            if let Some(scale) = gate.and_then(|g| g.scale) {
                 let s = scale[expert];
                 projected.0.iter_mut().for_each(|v| *v *= s);
             }
@@ -819,7 +890,7 @@ pub(crate) fn evaluate_routed_experts_batched_views(
 
     // Activation, per member, into one contiguous run per group — the down
     // projection's operand.
-    let ffn_dim = gate.n_rows;
+    let ffn_dim = gate.map_or(up.n_rows, |gate| gate.n_rows);
     // **Parallel across groups**, like every other stage here. These three
     // passes — the per-expert scales above, this activation, and the weighted
     // accumulation below — walk the same data volume the projections do, and
@@ -831,11 +902,16 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     let hs: Vec<Vec<f32>> = (0..experts.len())
         .into_par_iter()
         .map(|group| {
-            let (gate, up) = &projected[group];
+            let (gate_out, up_out) = &projected[group];
             let mut h = Vec::with_capacity(members[group].len() * ffn_dim);
             for m in 0..members[group].len() {
                 let range = m * ffn_dim..(m + 1) * ffn_dim;
-                h.extend_from_slice(&activate(&gate[range.clone()], &up[range]));
+                let gate_slice = if gate.is_some() {
+                    &gate_out[range.clone()]
+                } else {
+                    &[][..]
+                };
+                h.extend_from_slice(&activate(gate_slice, &up_out[range]));
             }
             h
         })
@@ -955,26 +1031,78 @@ pub(crate) fn swiglu_ffn(
     up_w: &crate::engine::loader::QuantMatrix,
     down_w: &crate::engine::loader::QuantMatrix,
 ) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut scratch = FfnScratch::default();
+    swiglu_ffn_into(
+        backend,
+        &mut out,
+        &mut scratch,
+        normed,
+        n_tokens,
+        gate_w,
+        up_w,
+        down_w,
+    );
+    out
+}
+
+/// The intermediates [`swiglu_ffn_into`] needs, owned by the caller so they
+/// are allocated once per forward pass rather than once per layer.
+///
+/// These are the **largest** buffers in a transformer layer: the gate and up
+/// projections are `n_tokens * n_ff`, where `n_ff` is several times `n_embd`.
+/// See `Backend::matmul_into` for what reusing them does and does not buy —
+/// allocator bookkeeping, not `mmap` traffic, at the default prefill-batch
+/// and stripe caps.
+#[derive(Default)]
+pub(crate) struct FfnScratch {
+    /// The gate and up projections, in that order — exactly the two ops
+    /// `matmul_batch_into` is handed, and reused in place.
+    gate_up: Vec<Vec<f32>>,
+}
+
+/// [`swiglu_ffn`] writing into caller-owned buffers.
+///
+/// Identical arithmetic — the same batched gate/up dispatch, the same
+/// in-place SiLU, the same multiply, the same down projection — so it is
+/// bit-identical by construction rather than by convention. What changes is
+/// only where the three intermediates live.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn swiglu_ffn_into(
+    backend: &dyn crate::engine::backend::Backend,
+    out: &mut Vec<f32>,
+    scratch: &mut FfnScratch,
+    normed: &[f32],
+    n_tokens: usize,
+    gate_w: &crate::engine::loader::QuantMatrix,
+    up_w: &crate::engine::loader::QuantMatrix,
+    down_w: &crate::engine::loader::QuantMatrix,
+) {
     use crate::engine::backend::MatmulOp;
-    let mut gate_up = backend.matmul_batch(&[
-        MatmulOp {
-            x: normed,
-            n_tokens,
-            w: gate_w,
-        },
-        MatmulOp {
-            x: normed,
-            n_tokens,
-            w: up_w,
-        },
-    ]);
-    let up = gate_up.pop().unwrap();
-    let mut gate = gate_up.pop().unwrap();
+    backend.matmul_batch_into(
+        &mut scratch.gate_up,
+        &[
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: gate_w,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: up_w,
+            },
+        ],
+    );
+    // `split_at_mut` rather than the old pair of `pop`s: the buffers stay in
+    // `scratch` so the next layer inherits their capacity.
+    let (gate, up) = scratch.gate_up.split_at_mut(1);
+    let gate = &mut gate[0];
     for g in gate.iter_mut() {
         *g = tensor::silu(*g);
     }
-    tensor::mul_inplace(&mut gate, &up);
-    backend.matmul(&gate, n_tokens, down_w)
+    tensor::mul_inplace(gate, &up[0]);
+    backend.matmul_into(out, gate, n_tokens, down_w);
 }
 
 /// One MoE layer's weights, for [`swiglu_moe_ffn`].
@@ -1017,6 +1145,109 @@ fn swiglu_limited(gate: &[f32], up: &[f32], limit: f32) -> Vec<f32> {
     h
 }
 
+/// Batch width at which a MoE layer's two FFN branches are evaluated
+/// concurrently rather than one after the other, from
+/// `ORANGU_MOE_OVERLAP_MIN_TOKENS`.
+///
+/// The branches use different processors — the shared MLP is device
+/// matmuls, the routed branch is host `vecdot` — and running them in
+/// sequence is why a MoE forward leaves both around 60% idle. Overlapping
+/// them costs one worker blocked in `device.poll`, which is why it is a
+/// width threshold and not a plain `true`.
+///
+/// **`1` — overlap at every width, including a single token.** An earlier
+/// version defaulted to 24 on the reading that a decode step's narrow
+/// fan-out could not spare a worker to a blocking `device.poll`. That
+/// reading came from comparing two runs taken an hour apart, and it was
+/// wrong: a *controlled* A/B through this variable, alternating the two
+/// settings against one another and repeated, gives **6.19 against 6.72
+/// tok/s — the overlap is +8.6% at decode** and reproduced to three
+/// significant figures on the repeat. Prefill is +9.2% at 1024 tokens. The
+/// two widths agree, so there is no crossover to place.
+///
+/// The threshold survives as the escape hatch and as the control for that
+/// A/B: a large value restores the sequential form. Throughput on this
+/// machine drifts several percent over a long session, which is what
+/// produced the wrong reading — compare settings with `orangu-bench
+/// --sweep`, never across sessions.
+///
+/// Lives here rather than in one architecture because the shape it exploits
+/// — a device-side shared branch summed with a host-side routed branch — is
+/// what *every* mixture-of-experts module in this directory builds.
+pub(crate) fn moe_overlap_min_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_MOE_OVERLAP_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+/// Whether `ORANGU_MOE_ROUTER_PER_TOKEN=1` asked for the router to run one
+/// matmul per token — the control arm for [`moe_router_logits`], and the
+/// form every module here except `gemma` used to carry unconditionally.
+fn router_per_token() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_MOE_ROUTER_PER_TOKEN"))
+}
+
+/// Every token's router scores for one MoE layer — `[n_tokens, n_expert]`,
+/// row-major — from **one** matmul over the whole batch.
+///
+/// `x` is `[n_tokens, gate_inp.in_dim]`, whatever normalization the
+/// architecture applies to the layer input having already been done.
+///
+/// The per-token form this replaces submitted a `[1, n_embd] × [n_embd,
+/// n_expert]` GEMV per token per MoE layer: at `pp 1024` that is a thousand
+/// device round-trips a layer, each on the shape a GPU is worst at, to
+/// produce a `[n_expert]` row that decides only *which experts run*. One
+/// GEMM produces the same rows.
+///
+/// Not bit-identical to the per-token form at `n_tokens > 1`, for the reason
+/// [`crate::engine::backend::Backend::matmul_decode`]'s doc comment gives —
+/// the multi-token kernels sum in a different order and quantize activations
+/// at a coarser granularity. That is the same trade every other prefill
+/// matmul in the engine already makes, and it is confined to prefill:
+/// a decode step is `n_tokens == 1` and takes the identical single-row path.
+pub(crate) fn moe_router_logits(
+    backend: &dyn crate::engine::backend::Backend,
+    x: &[f32],
+    n_tokens: usize,
+    gate_inp: &crate::engine::loader::QuantMatrix,
+) -> Vec<f32> {
+    if n_tokens > 1 && !router_per_token() {
+        return backend.matmul(x, n_tokens, gate_inp);
+    }
+    let in_dim = gate_inp.in_dim;
+    (0..n_tokens)
+        .flat_map(|t| backend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, gate_inp))
+        .collect()
+}
+
+/// Which experts each token selected, and with what weight, from the
+/// `[n_tokens, n_expert]` block [`moe_router_logits`] returns.
+///
+/// Split from the matmul so the two can sit on opposite sides of a
+/// `rayon::join`: the routing decides which experts run, so it is on the
+/// routed branch's critical path either way, but the *matmul* in front of it
+/// is a device submission that must not queue behind the shared branch's.
+pub(crate) fn route_batch(
+    routing: &ExpertRouting,
+    logits: &[f32],
+    n_tokens: usize,
+    exp_probs_b: Option<&[f32]>,
+) -> Vec<Vec<(usize, f32)>> {
+    let n_expert = logits.len() / n_tokens.max(1);
+    (0..n_tokens)
+        .map(|t| {
+            let row = &logits[t * n_expert..(t + 1) * n_expert];
+            let (selected, weights) = routing.route(row, exp_probs_b, None);
+            selected.into_iter().zip(weights).collect()
+        })
+        .collect()
+}
+
 /// The shared expert half of [`SwigluMoe`] — an ordinary SwiGLU FFN.
 pub(crate) struct SwigluSharedExpert<'a> {
     pub gate: &'a crate::engine::loader::QuantMatrix,
@@ -1051,15 +1282,13 @@ pub(crate) fn swiglu_moe_ffn(
         moe.down_exps,
     ]);
     // Route the whole batch first, so the union can be taken before any
-    // expert's weights are read — see `evaluate_routed_experts`.
-    let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
-        .map(|t| {
-            let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-            let logits = backend.matmul(x_t, 1, moe.gate_inp);
-            let (selected, weights) = routing.route(&logits, moe.exp_probs_b, None);
-            selected.into_iter().zip(weights).collect()
-        })
-        .collect();
+    // expert's weights are read — see `evaluate_routed_experts` — and so the
+    // router's own matmul is out of the way before the two branches below
+    // overlap: it is a device submission at the head of an otherwise
+    // host-side branch, and leaving it inside the parallel region puts it in
+    // a queue behind the shared MLP's submissions on the same device.
+    let logits = moe_router_logits(backend, normed, n_tokens, moe.gate_inp);
+    let mut selection = route_batch(routing, &logits, n_tokens, moe.exp_probs_b);
     // Trim to the expert budget *before* anything is recorded or read: the
     // counters should describe the work actually done, and a dropped
     // expert's weights must never be fetched.
@@ -1070,73 +1299,100 @@ pub(crate) fn swiglu_moe_ffn(
 
     // The GPU expert path batches the three projections across experts —
     // see `evaluate_routed_experts_batched`.
-    let contribs = if gpu_experts() && backend.as_wgpu().is_some() {
-        evaluate_routed_experts_batched(
-            backend,
-            &selection,
-            normed,
-            n_embd,
-            moe.gate_exps,
-            moe.up_exps,
-            moe.down_exps,
-            |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
-        )
-    } else {
-        evaluate_routed_experts(&selection, |expert, members| {
-            let inputs: Vec<&[f32]> = members
-                .iter()
-                .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                .collect();
-            let gate = project_expert(
+    let routed_branch = || {
+        if gpu_experts() && backend.as_wgpu().is_some() {
+            evaluate_routed_experts_batched(
                 backend,
+                &selection,
+                normed,
+                n_embd,
                 moe.gate_exps,
-                expert,
-                0,
-                moe.gate_exps.out_dim,
-                &inputs,
-            );
-            let up = project_expert(
-                backend,
                 moe.up_exps,
-                expert,
-                0,
-                moe.up_exps.out_dim,
-                &inputs,
-            );
-            let hidden: Vec<Vec<f32>> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(gate, up)| swiglu_limited(&gate, &up, moe.clamp_exp))
-                .collect();
-            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-            project_expert(
-                backend,
                 moe.down_exps,
-                expert,
-                0,
-                moe.down_exps.out_dim,
-                &hidden_refs,
+                |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
             )
-            .into_iter()
-            .zip(members)
-            .map(|(mut contribution, &(_, weight))| {
-                contribution.iter_mut().for_each(|v| *v *= weight);
-                contribution
+        } else {
+            evaluate_routed_experts(&selection, |expert, members| {
+                let inputs: Vec<&[f32]> = members
+                    .iter()
+                    .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                    .collect();
+                let gate = project_expert(
+                    backend,
+                    moe.gate_exps,
+                    expert,
+                    0,
+                    moe.gate_exps.out_dim,
+                    &inputs,
+                );
+                let up = project_expert(
+                    backend,
+                    moe.up_exps,
+                    expert,
+                    0,
+                    moe.up_exps.out_dim,
+                    &inputs,
+                );
+                let hidden: Vec<Vec<f32>> = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(gate, up)| swiglu_limited(&gate, &up, moe.clamp_exp))
+                    .collect();
+                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                project_expert(
+                    backend,
+                    moe.down_exps,
+                    expert,
+                    0,
+                    moe.down_exps.out_dim,
+                    &hidden_refs,
+                )
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    contribution.iter_mut().for_each(|v| *v *= weight);
+                    contribution
+                })
+                .collect()
             })
-            .collect()
-        })
+        }
     };
-    experts.loaded_once_per_distinct_expert();
 
     // The shared expert runs for every token at once. Its matrices are
     // exempt from the backend's up-front type check (see
     // `matmul_host_fallback`), so they must not go straight to the device.
-    if let Some(shared) = &moe.shared {
-        let gate = matmul_host_fallback(backend, normed, n_tokens, shared.gate);
-        let up = matmul_host_fallback(backend, normed, n_tokens, shared.up);
-        let h = swiglu_limited(&gate, &up, moe.clamp_shexp);
-        out = matmul_host_fallback(backend, &h, n_tokens, shared.down);
+    let shared_branch = || {
+        moe.shared.as_ref().map(|shared| {
+            let gate = matmul_host_fallback(backend, normed, n_tokens, shared.gate);
+            let up = matmul_host_fallback(backend, normed, n_tokens, shared.up);
+            let h = swiglu_limited(&gate, &up, moe.clamp_shexp);
+            matmul_host_fallback(backend, &h, n_tokens, shared.down)
+        })
+    };
+
+    // Nothing in one branch depends on the other — they read the same
+    // `normed` and are summed below — and they use *different processors*:
+    // the shared MLP is three device matmuls, the routed branch is host
+    // `vecdot` over a `par_iter`. Run in sequence each waits out the other,
+    // which is why a MoE forward leaves the GPU engine and the CPU both
+    // around 60% idle. See [`moe_overlap_min_tokens`] for the measurement
+    // and for the control that restores the sequential form.
+    //
+    // `rayon::join` rather than a thread: the routed branch is itself a
+    // `par_iter` over experts, so it has to run on the pool that owns those
+    // workers, and the shared branch's blocking device polls then occupy one
+    // worker while the rest keep evaluating experts. `join` returns a pair,
+    // not a race, and each branch is internally deterministic, so the sum
+    // below does not depend on which finishes first.
+    let (shared_out, contribs) = if moe.shared.is_some() && n_tokens >= moe_overlap_min_tokens() {
+        rayon::join(shared_branch, routed_branch)
+    } else {
+        (shared_branch(), routed_branch())
+    };
+    if let Some(shared_out) = shared_out {
+        out = shared_out;
     }
+    experts.loaded_once_per_distinct_expert();
 
     for t in 0..n_tokens {
         let dst = &mut out[t * n_embd..(t + 1) * n_embd];
@@ -1174,11 +1430,26 @@ pub(crate) fn matmul_host_fallback(
     n_tokens: usize,
     w: &crate::engine::loader::QuantMatrix,
 ) -> Vec<f32> {
+    let mut out = Vec::new();
+    matmul_host_fallback_into(&mut out, backend, x, n_tokens, w);
+    out
+}
+
+/// [`matmul_host_fallback`] into a caller-owned buffer — see
+/// `Backend::matmul_into`. The allocating form is a wrapper over this, so
+/// the routing decision lives in exactly one place.
+pub(crate) fn matmul_host_fallback_into(
+    out: &mut Vec<f32>,
+    backend: &dyn crate::engine::backend::Backend,
+    x: &[f32],
+    n_tokens: usize,
+    w: &crate::engine::loader::QuantMatrix,
+) {
     use crate::engine::backend::Backend as _;
     if backend.supports_type(w.ggml_type()) {
-        backend.matmul(x, n_tokens, w)
+        backend.matmul_into(out, x, n_tokens, w);
     } else {
-        crate::engine::backend::CpuBackend.matmul(x, n_tokens, w)
+        crate::engine::backend::CpuBackend.matmul_into(out, x, n_tokens, w);
     }
 }
 
@@ -2139,12 +2410,12 @@ mod tests {
             &selection,
             &hidden,
             N_EMBD,
-            &ExpertProjection {
+            Some(&ExpertProjection {
                 exps: &gate_up,
                 first_row: 0,
                 n_rows: N_FF,
                 scale: Some(&gate_up_scale),
-            },
+            }),
             &ExpertProjection {
                 exps: &gate_up,
                 first_row: N_FF,
@@ -2190,12 +2461,12 @@ mod tests {
             &selection,
             &hidden,
             N_EMBD,
-            &ExpertProjection {
+            Some(&ExpertProjection {
                 exps: &gate_up_res,
                 first_row: 0,
                 n_rows: N_FF,
                 scale: Some(&gate_up_scale),
-            },
+            }),
             &ExpertProjection {
                 exps: &gate_up_res,
                 first_row: N_FF,

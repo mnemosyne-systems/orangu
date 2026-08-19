@@ -233,15 +233,22 @@ impl KdaLayer {
         })
     }
 
-    /// The forward pass: convolve, decay, apply the delta rule, gate, norm.
-    pub(crate) fn forward(
+    /// The forward pass: convolve, decay, apply the delta rule, gate, norm,
+    /// into caller-owned buffers — see
+    /// `Backend::matmul_into`. Every projection here is the full
+    /// `[n_tokens, d_inner]`, once per layer, so they are the same class of
+    /// buffer the dense architectures hoist.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_into(
         &self,
         backend: &dyn Backend,
+        out: &mut Vec<f32>,
+        scratch: &mut KdaScratch,
         shape: &KdaShape,
         cache: &mut KvCache,
         normed: &[f32],
         n_tokens: usize,
-    ) -> Vec<f32> {
+    ) {
         let n_head = shape.n_head;
         let head_dim = shape.head_dim;
         let d_inner = shape.d_inner;
@@ -252,20 +259,32 @@ impl KdaLayer {
 
         // Token-independent projections, batched over the whole chunk. The
         // three conv inputs are concatenated to match `conv_kernel`.
-        let q = backend.matmul(normed, n_tokens, &self.wq);
-        let k = backend.matmul(normed, n_tokens, &self.wk);
-        let v = backend.matmul(normed, n_tokens, &self.wv);
-        let f = match &self.f_b {
+        let KdaScratch {
+            q,
+            k,
+            v,
+            f,
+            f_low,
+            beta,
+            gate,
+        } = scratch;
+        backend.matmul_into(q, normed, n_tokens, &self.wq);
+        backend.matmul_into(k, normed, n_tokens, &self.wk);
+        backend.matmul_into(v, normed, n_tokens, &self.wv);
+        match &self.f_b {
             Some(f_b) => {
-                let low = backend.matmul(normed, n_tokens, &self.f_a);
-                backend.matmul(&low, n_tokens, f_b)
+                backend.matmul_into(f_low, normed, n_tokens, &self.f_a);
+                backend.matmul_into(f, f_low, n_tokens, f_b);
             }
-            None => backend.matmul(normed, n_tokens, &self.f_a),
-        };
-        let beta = backend.matmul(normed, n_tokens, &self.beta);
-        let gate = backend.matmul(normed, n_tokens, &self.g);
+            None => backend.matmul_into(f, normed, n_tokens, &self.f_a),
+        }
+        backend.matmul_into(beta, normed, n_tokens, &self.beta);
+        backend.matmul_into(gate, normed, n_tokens, &self.g);
+        let (q, k, v, f, beta, gate) = (&*q, &*k, &*v, &*f, &*beta, &*gate);
 
-        let mut out = vec![0f32; n_tokens * d_inner];
+        // The scan output, before the output projection. Every element is
+        // written by the loop below, so `resize` without a `clear`.
+        let mut scan = vec![0f32; n_tokens * d_inner];
         let state = &mut cache.recurrent[self.cache_index];
         for t in 0..n_tokens {
             let mut qkv = Vec::with_capacity(3 * d_inner);
@@ -299,7 +318,7 @@ impl KdaLayer {
                 }
             }
 
-            let dst = &mut out[t * d_inner..(t + 1) * d_inner];
+            let dst = &mut scan[t * d_inner..(t + 1) * d_inner];
             for h in 0..n_head {
                 let q_h = &mut q_t[h * head_dim..(h + 1) * head_dim];
                 tensor::l2_norm_inplace(q_h, eps);
@@ -327,8 +346,24 @@ impl KdaLayer {
             }
         }
 
-        backend.matmul(&out, n_tokens, &self.wo)
+        backend.matmul_into(out, &scan, n_tokens, &self.wo);
     }
+}
+
+/// The per-layer projection buffers [`Kda::forward_into`] reuses — see
+/// `Backend::matmul_into`. Each is `[n_tokens, d_inner]` (or `[n_tokens,
+/// n_head]` for `beta`), allocated once per forward pass instead of seven
+/// times per layer.
+#[derive(Default)]
+pub(crate) struct KdaScratch {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    f: Vec<f32>,
+    /// The low-rank intermediate, only when `f_b` is present.
+    f_low: Vec<f32>,
+    beta: Vec<f32>,
+    gate: Vec<f32>,
 }
 
 /// One head's delta-rule step, exactly ggml's `gated_delta_net`: the state
@@ -433,6 +468,35 @@ pub(crate) struct MlaLayer {
     cache_index: usize,
 }
 
+/// One vector against every row of a head's absorbed projection.
+///
+/// `hoisted` is `Some` when the caller dequantized the whole projection up
+/// front — worth it once there is more than one token to reuse each row for —
+/// and `None` when it did not, in which case each row is dequantized into a
+/// reused buffer and dotted while it is still in cache. Both paths compute
+/// the same dot products in the same order, so which one runs cannot change
+/// an output; see the `hoist` guard in `MlaLayer::forward` for the
+/// measurement that decides it.
+pub(crate) fn project_rows(
+    weights: &ExpertQuantMatrix,
+    hoisted: Option<&[Vec<f32>]>,
+    head: usize,
+    x: &[f32],
+    row_len: usize,
+    out: &mut [f32],
+) {
+    if let Some(rows) = hoisted {
+        tensor::dot_rows(x, &rows[head], row_len, out);
+        return;
+    }
+    let span = weights.expert_span(head);
+    let mut row = Vec::new();
+    for (index, slot) in out.iter_mut().enumerate() {
+        weights.row_from(span, index, &mut row);
+        *slot = tensor::dot(x, &row);
+    }
+}
+
 impl MlaLayer {
     pub(crate) fn load(
         loaded: &LoadedModel,
@@ -501,33 +565,48 @@ impl MlaLayer {
         })
     }
 
-    pub(crate) fn forward(
+    /// The forward pass into caller-owned buffers — see
+    /// `Backend::matmul_into`. There is no allocating twin: both callers
+    /// own a scratch, so a second entry point would only be somewhere for
+    /// the two to drift apart.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_into(
         &self,
         backend: &dyn Backend,
+        out: &mut Vec<f32>,
+        scratch: &mut MlaScratch,
         shape: &MlaShape,
         cache: &mut KvCache,
         normed: &[f32],
         n_tokens: usize,
         start_pos: usize,
-    ) -> Vec<f32> {
+    ) {
         let n_head = shape.n_head;
         let eps = shape.eps;
         let nope = shape.head_k_mla - shape.rope_dim;
         let absorbed_dim = shape.kv_lora_rank + shape.rope_dim;
 
-        let mut q = match &self.q {
+        let MlaScratch {
+            q,
+            qr,
+            kv,
+            gate: gate_buf,
+        } = scratch;
+        match &self.q {
             Query::Lora {
                 wq_a,
                 q_a_norm,
                 wq_b,
             } => {
-                let mut qr = backend.matmul(normed, n_tokens, wq_a);
-                tensor::rmsnorm_inplace(&mut qr, q_a_norm, n_tokens, wq_a.out_dim, eps);
-                backend.matmul(&qr, n_tokens, wq_b)
+                backend.matmul_into(qr, normed, n_tokens, wq_a);
+                tensor::rmsnorm_inplace(qr, q_a_norm, n_tokens, wq_a.out_dim, eps);
+                backend.matmul_into(q, qr, n_tokens, wq_b);
             }
-            Query::Plain(wq) => backend.matmul(normed, n_tokens, wq),
-        };
-        let mut kv = backend.matmul(normed, n_tokens, &self.wkv_a_mqa);
+            Query::Plain(wq) => backend.matmul_into(q, normed, n_tokens, wq),
+        }
+        let q = &mut *q;
+        backend.matmul_into(kv, normed, n_tokens, &self.wkv_a_mqa);
+        let kv = &mut *kv;
 
         for t in 0..n_tokens {
             let pos = start_pos + t;
@@ -566,6 +645,48 @@ impl MlaLayer {
             }
         }
 
+        // `wk_b`/`wv_b` are weights: their rows do not depend on `t`. Read
+        // per token — which is what `ExpertQuantMatrix::row` inside the loop
+        // below amounted to — each row was dequantized `n_tokens` times over,
+        // into a freshly allocated `Vec<f32>` that was dotted once and
+        // dropped. On a 1122-token prefill that is 1121 redundant
+        // dequantizations of every row, and it measured **10.9% of the whole
+        // profile** in `quant::dequantize_into`.
+        //
+        // Hoisted here, once per call. Bit-exact: the same bytes through the
+        // same dequantizer produce the same `f32`s, and `tensor::dot` is
+        // handed the identical slice it was before — only *when* it is
+        // produced changes.
+        //
+        // Decode (`n_tokens == 1`) does the same amount of dequantizing as it
+        // always did and strictly fewer allocations: one buffer per head
+        // instead of one per row.
+        let absorb = |m: &crate::engine::loader::ExpertQuantMatrix, rows: usize| -> Vec<Vec<f32>> {
+            (0..n_head)
+                .into_par_iter()
+                .map(|h| {
+                    let span = m.expert_span(h);
+                    let mut flat = Vec::with_capacity(rows * m.in_dim);
+                    let mut row = Vec::new();
+                    for j in 0..rows {
+                        m.row_from(span, j, &mut row);
+                        flat.extend_from_slice(&row);
+                    }
+                    flat
+                })
+                .collect()
+        };
+        // **Only when there is more than one token to amortize it over.**
+        // At `n_tokens == 1` there is no reuse: the row is dotted once, and
+        // gathering it into a contiguous buffer first costs an extra copy and
+        // makes the dot read cold memory instead of the line just written.
+        // Measured **-6.8% on decode** before this guard, against +2.3% on
+        // prefill with it — the hoist is a prefill optimization and saying so
+        // in the type is cheaper than re-deriving it.
+        let hoist = n_tokens > 1;
+        let wk_b = hoist.then(|| absorb(&self.wk_b, shape.kv_lora_rank));
+        let wv_b = hoist.then(|| absorb(&self.wv_b, shape.head_v_mla));
+
         let mut attn_out = vec![0f32; n_tokens * n_head * shape.head_v_mla];
         for t in 0..n_tokens {
             let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
@@ -592,9 +713,14 @@ impl MlaLayer {
                     // decompression, then carry its second half unchanged.
                     let q_nope = &q_t[h * shape.head_k_mla..h * shape.head_k_mla + nope];
                     let mut q_h = vec![0f32; absorbed_dim];
-                    for (j, out) in q_h[..shape.kv_lora_rank].iter_mut().enumerate() {
-                        *out = tensor::dot(q_nope, &self.wk_b.row(h, j));
-                    }
+                    project_rows(
+                        &self.wk_b,
+                        wk_b.as_deref(),
+                        h,
+                        q_nope,
+                        nope,
+                        &mut q_h[..shape.kv_lora_rank],
+                    );
                     q_h[shape.kv_lora_rank..].copy_from_slice(
                         &q_t[h * shape.head_k_mla + nope..(h + 1) * shape.head_k_mla],
                     );
@@ -607,9 +733,16 @@ impl MlaLayer {
                         shape.kq_scale,
                         None,
                     );
-                    (0..shape.head_v_mla)
-                        .map(|d| tensor::dot(&compressed, &self.wv_b.row(h, d)))
-                        .collect()
+                    let mut head = vec![0f32; shape.head_v_mla];
+                    project_rows(
+                        &self.wv_b,
+                        wv_b.as_deref(),
+                        h,
+                        &compressed,
+                        shape.kv_lora_rank,
+                        &mut head,
+                    );
+                    head
                 })
                 .collect();
             for (h, head) in heads.iter().enumerate() {
@@ -619,7 +752,8 @@ impl MlaLayer {
         }
 
         if let Some(gate) = &self.gate {
-            let gate = backend.matmul(normed, n_tokens, gate);
+            backend.matmul_into(gate_buf, normed, n_tokens, gate);
+            let gate = &*gate_buf;
             if gate.len() == attn_out.len() {
                 for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
                     *o *= tensor::sigmoid(g);
@@ -638,8 +772,19 @@ impl MlaLayer {
                 }
             }
         }
-        backend.matmul(&attn_out, n_tokens, &self.wo)
+        backend.matmul_into(out, &attn_out, n_tokens, &self.wo);
     }
+}
+
+/// The per-layer projection buffers [`Mla::forward_into`] reuses — see
+/// `Backend::matmul_into`.
+#[derive(Default)]
+pub(crate) struct MlaScratch {
+    q: Vec<f32>,
+    /// The low-rank query intermediate, only on the `Query::Lora` path.
+    qr: Vec<f32>,
+    kv: Vec<f32>,
+    gate: Vec<f32>,
 }
 
 #[cfg(test)]

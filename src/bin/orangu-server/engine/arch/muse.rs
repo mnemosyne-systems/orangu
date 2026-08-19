@@ -304,10 +304,17 @@ impl MuseModel {
         // Grown once and reused across layers rather than allocated per
         // layer: at prefill widths this is megabytes a layer.
         let mut attn_out: Vec<f32> = Vec::new();
+        // Same reuse as `attn_out`, replacing what used to be `x.clone()`
+        // per norm — see `tensor::rmsnorm_into`.
+        let mut normed: Vec<f32> = Vec::new();
+        let mut ffn_normed: Vec<f32> = Vec::new();
+        // Projection outputs, on the same principle — see
+        // `Backend::matmul_into`.
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
 
         for (il, layer) in self.layers.iter().enumerate() {
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
+            tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n_tokens, n_embd, eps);
 
             // Q, K, V and the gate are four independent projections of the
             // same normed input — one batched dispatch instead of four
@@ -421,27 +428,19 @@ impl MuseModel {
             );
             tensor::add_inplace(&mut x, &attn_proj);
 
-            let mut ffn_normed = x.clone();
-            tensor::rmsnorm_inplace(&mut ffn_normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-            let mut gate_up = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens,
-                    w: &layer.ffn_gate,
-                },
-                MatmulOp {
-                    x: &ffn_normed,
-                    n_tokens,
-                    w: &layer.ffn_up,
-                },
-            ]);
-            let up = gate_up.pop().unwrap();
-            let mut act = gate_up.pop().unwrap();
-            for g in act.iter_mut() {
-                *g = tensor::silu(*g);
-            }
-            tensor::mul_inplace(&mut act, &up);
-            let mut ffn_out = self.backend.matmul(&act, n_tokens, &layer.ffn_down);
+            tensor::rmsnorm_into(&mut ffn_normed, &x, &layer.ffn_norm, n_tokens, n_embd, eps);
+            // Was an open-coded copy of `super::swiglu_ffn` — same batched
+            // gate/up, same in-place SiLU, same multiply, same down.
+            super::swiglu_ffn_into(
+                self.backend.as_ref(),
+                &mut ffn_out,
+                &mut ffn_scratch,
+                &ffn_normed,
+                n_tokens,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+            );
             tensor::rmsnorm_inplace(
                 &mut ffn_out,
                 &layer.ffn_post_norm,

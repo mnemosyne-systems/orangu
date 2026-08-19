@@ -9390,3 +9390,52 @@ mod coop_tiled_fill_tests {
         assert_eq!(forced_scalar_tiles("wx"), (true, true));
     }
 }
+
+#[cfg(test)]
+mod iq_grid_offset_tests {
+    use crate::engine::iq_grids::packed;
+
+    /// [`super::IQ_GRID_PRELUDE`]'s offsets must be the ones
+    /// `engine::iq_grids::packed` actually lays the buffer out at.
+    ///
+    /// The packing moved to `iq_grids` so the CUDA/HIP/OpenCL backends could
+    /// upload the identical bytes — `vendor_shaders::iq_grid_prelude`
+    /// *formats* its constants in from there and so cannot drift. This WGSL
+    /// still spells them as literals, which is the one place they can. A
+    /// table that grows would shift every later offset, and a shader reading
+    /// the old ones would return plausible, wrong weights rather than fail.
+    ///
+    /// Parsed out of the shader text rather than compared against a second
+    /// copy of the numbers, because a second copy would agree with a wrong
+    /// prelude by construction.
+    #[test]
+    fn iq_grid_prelude_offsets_match_the_packing() {
+        let src = super::IQ_GRID_PRELUDE;
+        let declared = |name: &str| -> u32 {
+            let needle = format!("const {name}: u32 = ");
+            let start = src
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{name} is not declared in IQ_GRID_PRELUDE"))
+                + needle.len();
+            let digits: String = src[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().expect("an offset literal")
+        };
+        for (name, expected) in [
+            ("IQ2XS_GRID_OFF", packed::IQ2XS_GRID_OFF),
+            ("IQ2S_GRID_OFF", packed::IQ2S_GRID_OFF),
+            ("IQ3XXS_GRID_OFF", packed::IQ3XXS_GRID_OFF),
+            ("IQ3S_GRID_OFF", packed::IQ3S_GRID_OFF),
+            ("KSIGNS_OFF", packed::KSIGNS_OFF),
+            ("KVALUES_IQ4NL_OFF", packed::KVALUES_IQ4NL_OFF),
+            ("IQ2XXS_GRID_OFF", packed::IQ2XXS_GRID_OFF),
+            ("IQ1S_GRID_OFF", packed::IQ1S_GRID_OFF),
+        ] {
+            assert_eq!(declared(name), expected, "IQ_GRID_PRELUDE's {name}");
+        }
+        // And the packing really is that long, so the last table is whole.
+        assert_eq!(packed::words().len(), packed::WORDS);
+    }
+}

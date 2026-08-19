@@ -649,9 +649,31 @@ impl PhiModel {
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
 
+        // Grown once and reused across layers rather than allocated per
+        // layer: at prefill widths each of these is megabytes. The norm
+        // buffers replace what used to be `x.clone()` — see
+        // `tensor::rmsnorm_into`.
+        let mut attn_out: Vec<f32> = Vec::new();
+        let mut normed: Vec<f32> = Vec::new();
+        let mut normed2: Vec<f32> = Vec::new();
+        // Projection outputs, on the same principle — see
+        // `Backend::matmul_into`. This family cannot use the shared
+        // `super::swiglu_ffn_into`: its gate and up live in **one**
+        // `[n_embd, 2 * n_ff]` matrix rather than two, so there is no
+        // batched pair to dispatch. The buffers are hoisted the same way.
+        let mut attn_proj: Vec<f32> = Vec::new();
+        let mut gate_up: Vec<f32> = Vec::new();
+        let mut activated: Vec<f32> = Vec::new();
+        let mut down: Vec<f32> = Vec::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let mut normed = x.clone();
-            tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, cfg.rms_eps);
+            tensor::rmsnorm_into(
+                &mut normed,
+                &x,
+                &layer.attn_norm,
+                n_tokens,
+                n_embd,
+                cfg.rms_eps,
+            );
 
             // Q/K/V as three matrices whichever way the checkpoint stored
             // them, then one batched dispatch — independent given the same
@@ -725,7 +747,6 @@ impl PhiModel {
 
             // Plain causal attention -- no sliding window, matching
             // upstream's own disabling of it for this architecture.
-            let mut attn_out: Vec<f32> = Vec::new();
             crate::engine::attention::attention(
                 &mut attn_out,
                 &q,
@@ -780,16 +801,27 @@ impl PhiModel {
                 continue;
             }
 
-            let attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
+            self.backend
+                .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
             tensor::add_inplace(&mut x, &attn_proj);
 
-            let mut normed2 = x.clone();
-            tensor::rmsnorm_inplace(&mut normed2, &layer.ffn_norm, n_tokens, n_embd, cfg.rms_eps);
+            tensor::rmsnorm_into(
+                &mut normed2,
+                &x,
+                &layer.ffn_norm,
+                n_tokens,
+                n_embd,
+                cfg.rms_eps,
+            );
             // One `[n_embd, 2*n_ff]` projection, then SwiGLU over the two
             // halves of each row: `silu(first) * second`.
-            let gate_up = self.backend.matmul(&normed2, n_tokens, &layer.w_up);
+            self.backend
+                .matmul_into(&mut gate_up, &normed2, n_tokens, &layer.w_up);
             let n_ff = layer.w_up.out_dim / 2;
-            let mut activated = vec![0f32; n_tokens * n_ff];
+            // Every element is written by the loop below, so `resize`
+            // without a preceding `clear` — the same reasoning as
+            // `tensor::rmsnorm_into`.
+            activated.resize(n_tokens * n_ff, 0.0);
             for t in 0..n_tokens {
                 let row = &gate_up[t * 2 * n_ff..(t + 1) * 2 * n_ff];
                 let (gate, up) = row.split_at(n_ff);
@@ -798,7 +830,8 @@ impl PhiModel {
                     *o = tensor::silu(*g) * u;
                 }
             }
-            let down = self.backend.matmul(&activated, n_tokens, &layer.w_down);
+            self.backend
+                .matmul_into(&mut down, &activated, n_tokens, &layer.w_down);
             tensor::add_inplace(&mut x, &down);
         }
 

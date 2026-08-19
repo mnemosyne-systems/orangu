@@ -178,12 +178,134 @@ pub fn dot_multi<const N: usize>(a: &[f32], b: [&[f32]; N]) -> [f32; N] {
     {
         dot_multi_neon(a, b)
     }
-    // Every other target defers to `dot`, the only way to stay consistent with
-    // it without duplicating `dot_avx2`'s four-accumulator structure here. x86-64
-    // loses the load sharing until someone writes `dot_multi_avx2`; it loses no
-    // accuracy and no correctness.
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86-64 with the crate's own `+avx2,+fma` floor in effect: `wide`'s
+    // `f32x8` *is* `__m256` there and its `mul_add` *is* `_mm256_fmadd_ps`
+    // (both selected by the same `target_feature` cfgs), so one body of safe
+    // code reproduces `dot_avx2`'s four-accumulator structure exactly. This
+    // is what the note that used to sit here asked for.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
+    {
+        dot_multi_wide(a, b)
+    }
+    // Anywhere else — a build without the AVX2 floor, or a non-x86 non-ARM
+    // target — defer to `dot`, which is exactly what this did everywhere
+    // before. The compile-time gate rather than a runtime one is deliberate:
+    // `wide` picks its lane width from `target_feature` at compile time, so a
+    // *runtime* check could pass on an AVX2 machine while `f32x8` had been
+    // compiled down to SSE, and the results would then not match `dot`'s
+    // own runtime-selected `dot_avx2`. Gating on the same cfgs `wide` gates
+    // on is the only way to promise they agree.
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        )
+    )))]
     std::array::from_fn(|j| dot(a, b[j]))
+}
+
+/// The x86-64 kernel behind [`dot_multi`], in `wide`'s portable `f32x8`.
+///
+/// **Bit-identical to `dot_avx2` per output**, which is the whole contract —
+/// `engine::attention` runs a bit-identity test against a head-outer
+/// reference that calls `dot` directly, and it holds only if every step here
+/// matches: four accumulators, the 32-element main loop, the 8-element loop
+/// into `acc0` alone, the `(acc0+acc1) + (acc2+acc3)` combine, the sequential
+/// eight-lane sum, then the scalar remainder. Each is a line-for-line mirror
+/// of `dot_avx2`; changing any of them changes attention's output.
+///
+/// `mul_add` rather than `*` and `+`: `wide` lowers it to `_mm256_fmadd_ps`
+/// under `+avx,+fma`, which is what `dot_avx2` issues. A separate multiply
+/// and add would round twice where the FMA rounds once and break the
+/// identity.
+///
+/// The point of the function is the shared load: `a` is read once per eight
+/// elements and used `N` times, where `N` separate `dot` calls read it `N`
+/// times. See [`dot_multi`] for the load-issue measurement that motivates it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
+#[inline(always)]
+fn dot_multi_wide<const N: usize>(a: &[f32], b: [&[f32]; N]) -> [f32; N] {
+    use wide::f32x8;
+
+    let n = b.iter().fold(a.len(), |m, s| m.min(s.len()));
+    let mut acc0 = [f32x8::ZERO; N];
+    let mut acc1 = [f32x8::ZERO; N];
+    let mut acc2 = [f32x8::ZERO; N];
+    let mut acc3 = [f32x8::ZERO; N];
+    let load = |s: &[f32], i: usize| -> f32x8 {
+        let mut lane = [0f32; 8];
+        lane.copy_from_slice(&s[i..i + 8]);
+        f32x8::from(lane)
+    };
+
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // Loaded once, used `N` times — the reason this function exists.
+        let a0 = load(a, i);
+        let a1 = load(a, i + 8);
+        let a2 = load(a, i + 16);
+        let a3 = load(a, i + 24);
+        for j in 0..N {
+            acc0[j] = a0.mul_add(load(b[j], i), acc0[j]);
+            acc1[j] = a1.mul_add(load(b[j], i + 8), acc1[j]);
+            acc2[j] = a2.mul_add(load(b[j], i + 16), acc2[j]);
+            acc3[j] = a3.mul_add(load(b[j], i + 24), acc3[j]);
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        let a0 = load(a, i);
+        for j in 0..N {
+            acc0[j] = a0.mul_add(load(b[j], i), acc0[j]);
+        }
+        i += 8;
+    }
+
+    std::array::from_fn(|j| {
+        let acc = (acc0[j] + acc1[j]) + (acc2[j] + acc3[j]);
+        let mut sum: f32 = acc.to_array().iter().sum();
+        for k in i..n {
+            sum += a[k] * b[j][k];
+        }
+        sum
+    })
+}
+
+/// `out[r] = dot(a, rows[r * row_len .. (r + 1) * row_len])` for every row of a
+/// flat row-major matrix — [`dot_multi`] applied across a whole projection.
+///
+/// This is the shape a "one vector against many rows" projection actually has,
+/// and writing it out at the call site invites writing it as a plain loop of
+/// [`dot`] — which is what `engine::arch::kda` and `engine::arch::glm`'s
+/// multi-head-latent-attention absorb steps both did. Each of those reloads
+/// `a` once per row; batching by [`DOT_MULTI`] loads it once per four, which
+/// is the whole point of `dot_multi`'s existence.
+///
+/// **Bit-identical to one [`dot`] per row**, because `dot_multi` is: the
+/// remainder rows past the last full batch go through `dot` itself.
+pub fn dot_rows(a: &[f32], rows: &[f32], row_len: usize, out: &mut [f32]) {
+    debug_assert_eq!(rows.len(), out.len() * row_len);
+    let row = |r: usize| &rows[r * row_len..(r + 1) * row_len];
+    let n = out.len();
+    let mut r = 0usize;
+    while r + DOT_MULTI <= n {
+        let batch: [&[f32]; DOT_MULTI] = std::array::from_fn(|k| row(r + k));
+        out[r..r + DOT_MULTI].copy_from_slice(&dot_multi(a, batch));
+        r += DOT_MULTI;
+    }
+    for (r, slot) in out.iter_mut().enumerate().skip(r) {
+        *slot = dot(a, row(r));
+    }
 }
 
 /// The aarch64 kernel behind [`dot_multi`]: `2N` accumulators, two per output,
@@ -425,10 +547,77 @@ pub fn axpy_multi<const N: usize>(out: &mut [f32], v: [&[f32]; N], scale: [f32; 
     {
         axpy_multi_neon(out, v, scale);
     }
-    // Elsewhere, literally the calls this batches — trivially bit-identical.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        axpy_multi_wide(out, v, scale);
+    }
+    // Anywhere else — a build without the AVX2 floor, or a target that is
+    // neither — literally the calls this batches, so trivially bit-identical
+    // and exactly what every target did before the kernels existed.
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    )))]
     for j in 0..N {
         axpy_inplace(out, v[j], scale[j]);
+    }
+}
+
+/// The x86-64 kernel behind [`axpy_multi`], in `wide`'s portable `f32x8` —
+/// the counterpart to [`dot_multi_wide`], closing the same aarch64-only
+/// asymmetry on the other half of attention.
+///
+/// **No `mul_add`, anywhere.** [`axpy_inplace`] documents at length that its
+/// reference is the scalar loop it replaced, which rounds the multiply and
+/// the add separately; an FMA rounds once and would change every attention
+/// output. `acc += s[j] * load(..)` is that pair — `wide`'s `AddAssign` is
+/// `*self = *self + rhs`, and Rust never contracts a separate multiply and
+/// add into an FMA on its own, so the two roundings survive. This
+/// is the one place in the file where `wide`'s `mul_add` would be a bug
+/// rather than an optimization, which is why it is called out here as well
+/// as there.
+///
+/// Bit-identity does not depend on the chunk width at all, unlike
+/// [`dot_multi_wide`]'s: each output element's value depends only on its own
+/// `out[i]`, `v[j][i]` and `scale[j]`, and the order over `j` is ascending in
+/// both forms. Vectorizing changes which elements are computed together, not
+/// the sequence any one of them goes through.
+///
+/// Gated on `avx2` alone, without `fma` — the same gate [`axpy_inplace`]'s
+/// own runtime check uses, and for the same reason: there is no FMA here to
+/// need it.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn axpy_multi_wide<const N: usize>(out: &mut [f32], v: [&[f32]; N], scale: [f32; N]) {
+    use wide::f32x8;
+
+    let n = v.iter().fold(out.len(), |m, s| m.min(s.len()));
+    let s: [f32x8; N] = std::array::from_fn(|j| f32x8::from(scale[j]));
+    let load = |slice: &[f32], i: usize| -> f32x8 {
+        let mut lane = [0f32; 8];
+        lane.copy_from_slice(&slice[i..i + 8]);
+        f32x8::from(lane)
+    };
+
+    let mut i = 0usize;
+    while i + 8 <= n {
+        // One load and one store of the output chunk for all `N` rows — the
+        // reason this function exists. `perf annotate` put 4.9% of the
+        // attention kernel in loading this row and 8.0% in storing it.
+        let mut acc = load(out, i);
+        for j in 0..N {
+            acc += s[j] * load(v[j], i);
+        }
+        out[i..i + 8].copy_from_slice(&acc.to_array());
+        i += 8;
+    }
+    while i < n {
+        let mut acc = out[i];
+        for j in 0..N {
+            acc += scale[j] * v[j][i];
+        }
+        out[i] = acc;
+        i += 1;
     }
 }
 
@@ -510,7 +699,107 @@ pub fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], n_tokens: usize, dim: usiz
     }
 }
 
+/// RMSNorm from `src` into `dst` — the out-of-place form of
+/// [`rmsnorm_inplace`], for the overwhelmingly common case where the caller
+/// needs *both* the normalized rows and the untouched input.
+///
+/// That case used to be written `let mut normed = x.clone();
+/// rmsnorm_inplace(&mut normed, ..)`, once or twice per transformer layer in
+/// every architecture, and the clone is pure waste: RMSNorm already writes
+/// every element of its output, so copying the input there first is a full
+/// pass over the hidden state whose result is immediately overwritten. At
+/// prefill widths that is megabytes per layer, allocated and freed again per
+/// layer.
+///
+/// `dst` is a caller-owned scratch buffer hoisted out of the layer loop, so
+/// the allocation happens once per forward pass rather than once per norm.
+/// It is resized rather than cleared: the values are all overwritten, and
+/// `clear` + `resize` would zero-fill a buffer that is about to be written
+/// anyway.
+///
+/// **Bit-identical to [`rmsnorm_inplace`]**, and deliberately so — this
+/// replaces it at every call site that was cloning, across every
+/// architecture, so any difference would move every model's output. The row
+/// kernel is the same expression in the same order: the sum of squares
+/// accumulates left to right over the row, and each element is
+/// `(v * scale) * w`, not `v * (scale * w)`.
+pub fn rmsnorm_into(
+    dst: &mut Vec<f32>,
+    src: &[f32],
+    weight: &[f32],
+    n_tokens: usize,
+    dim: usize,
+    eps: f32,
+) {
+    debug_assert_eq!(src.len(), n_tokens * dim);
+    debug_assert_eq!(weight.len(), dim);
+    dst.resize(n_tokens * dim, 0.0);
+    let norm_row = |(out, row): (&mut [f32], &[f32])| {
+        let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let scale = 1.0 / (mean_sq + eps).sqrt();
+        for ((o, v), w) in out.iter_mut().zip(row.iter()).zip(weight.iter()) {
+            *o = *v * scale * w;
+        }
+    };
+    if n_tokens >= PAR_ROWS_THRESHOLD {
+        dst.par_chunks_mut(dim)
+            .zip(src.par_chunks(dim))
+            .for_each(norm_row);
+    } else {
+        dst.chunks_mut(dim).zip(src.chunks(dim)).for_each(norm_row);
+    }
+}
+
+/// Resizes `buf` to `len` and returns it with **every element zero** — for
+/// a reused buffer that is *accumulated into* rather than overwritten.
+///
+/// The `clear` is the whole point, and it is the opposite of what
+/// [`rmsnorm_into`] does. There, every element is written by the kernel, so
+/// zeroing first is a wasted pass and a bare `resize` is right. Here the
+/// caller adds into what it finds, so a retained prefix would contribute
+/// last layer's values to this layer's sum — silently, and only for the
+/// layers after the first. `clear` drops the length to zero so `resize`
+/// treats every element as new and writes it.
+///
+/// One pass, not two: `resize` on an empty `Vec` fills from its own
+/// argument. `resize` followed by `fill(0.0)` would write the retained
+/// prefix twice.
+pub fn zeroed_to(buf: &mut Vec<f32>, len: usize) -> &mut [f32] {
+    buf.clear();
+    buf.resize(len, 0.0);
+    buf
+}
+
 /// In-place softmax over a single row.
+///
+/// **The summation order is part of the contract**, not an implementation
+/// detail: the exponentials accumulate left to right in one `f32`, and every
+/// element is then divided by that sum. Reassociating the sum — which is the
+/// first thing a vectorized rewrite would do — moves the denominator by an
+/// ulp or two and therefore moves every attention weight and every sampled
+/// probability that depends on it.
+///
+/// Nothing forced that order until now. `engine::attention`'s bit-identity
+/// tests compare a position-outer implementation against a head-outer
+/// *reference* that calls this same function, so a change here moves both
+/// sides equally and they cannot see it. The guard is
+/// `softmax_is_bit_exact_with_its_written_out_reference`, which spells the
+/// intended sequence out longhand rather than calling this, and
+/// `sampling::softmax_pairs` — a second copy of this computation over
+/// `(u32, f32)` pairs — is pinned to the same reference by
+/// `sampling_softmax_agrees_with_the_tensor_one`.
+///
+/// The `sum > 0.0` guard covers the **empty** row, where `sum` stays `0.0`
+/// and dividing would be a division by zero. It does *not* rescue a row that
+/// is entirely `-inf`: subtracting the maximum gives `-inf - -inf`, which is
+/// `NaN` before any division, so `sum` is `NaN`, the guard's comparison is
+/// false, and the row comes back `NaN`. That is left alone rather than
+/// special-cased because it is unreachable — after the max is subtracted the
+/// largest element is exactly `0.0` and contributes `exp(0) = 1`, so any
+/// non-empty finite row has `sum >= 1`; and the one place this engine writes
+/// `-inf` (`arch::inkling`'s padding-vocab mask) writes it beside finite
+/// logits. `engine::attention` never reaches here with an empty window
+/// either — it returns a zeroed row first.
 pub fn softmax_inplace(x: &mut [f32]) {
     let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
@@ -1026,13 +1315,19 @@ mod tests {
     /// accumulator with the wrong output would fail.
     fn check_dot_multi<const N: usize>() {
         for len in [1, 7, 8, 9, 64, 65, 71, 80, 128, 129, 256] {
+            // Non-dyadic on purpose. The original `* 0.0625` and
+            // `* 0.03125` made every product and every partial sum exactly
+            // representable, and an exact sum is the same however it is
+            // associated — so the test passed for any arrangement of
+            // accumulators, including a single running total, and for a
+            // kernel that had dropped the FMA. These scales do not.
             let a: Vec<f32> = (0..len)
-                .map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.0625)
+                .map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.1)
                 .collect();
             let b: Vec<Vec<f32>> = (0..N)
                 .map(|j| {
                     (0..len)
-                        .map(|i| ((i * (7 + j) % 31) as f32 - 15.0) * 0.03125)
+                        .map(|i| ((i * (7 + j) % 31) as f32 - 15.0) * 0.07)
                         .collect()
                 })
                 .collect();
@@ -1056,15 +1351,22 @@ mod tests {
     /// what this kernel restructures — would show.
     fn check_axpy_multi<const N: usize>() {
         for len in [1, 3, 4, 5, 63, 64, 65, 128] {
-            let scale: [f32; N] = std::array::from_fn(|j| 0.375 - 0.8125 * j as f32);
+            // Non-dyadic on purpose. With the old `0.375 - 0.8125 * j`
+            // scales against `* 0.125` rows and `* 0.5` starts, every
+            // product and every partial sum was exactly representable, so
+            // the accumulation could be reassociated — or fused into an FMA
+            // — without moving a single bit. The test passed for
+            // implementations it was written to reject. Same defect, same
+            // fix, as `check_dot_multi`.
+            let scale: [f32; N] = std::array::from_fn(|j| 0.3 - 0.7 * j as f32);
             let rows: Vec<Vec<f32>> = (0..N)
                 .map(|j| {
                     (0..len)
-                        .map(|i| ((i * (5 + j) % 23) as f32 - 11.0) * 0.125)
+                        .map(|i| ((i * (5 + j) % 23) as f32 - 11.0) * 0.1)
                         .collect()
                 })
                 .collect();
-            let start: Vec<f32> = (0..len).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
+            let start: Vec<f32> = (0..len).map(|i| ((i % 9) as f32 - 4.0) * 0.7).collect();
 
             let mut got = start.clone();
             let refs: [&[f32]; N] = std::array::from_fn(|j| rows[j].as_slice());
@@ -1154,6 +1456,150 @@ mod tests {
         // Row 1 is all zero: normalized stays exactly zero.
         assert_eq!(x[2], 0.0);
         assert_eq!(x[3], 0.0);
+    }
+
+    #[test]
+    fn rmsnorm_into_is_bit_identical_to_rmsnorm_inplace() {
+        // Both sides of `PAR_ROWS_THRESHOLD`, because the two functions pick
+        // their serial-versus-rayon split independently and a mismatch there
+        // would only show at one width. 31/32 are the exact boundary.
+        for n_tokens in [1usize, 2, PAR_ROWS_THRESHOLD - 1, PAR_ROWS_THRESHOLD, 77] {
+            let dim = 19; // not a multiple of any vector width
+            let mut lcg = 0x9E37_79B9u32;
+            let mut next = || {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (lcg >> 8) as f32 / 8_388_608.0 - 0.5
+            };
+            let src: Vec<f32> = (0..n_tokens * dim).map(|_| next()).collect();
+            let weight: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let eps = 1e-5f32;
+
+            let mut want = src.clone();
+            rmsnorm_inplace(&mut want, &weight, n_tokens, dim, eps);
+
+            // Deliberately pre-filled with garbage and the wrong length: the
+            // scratch buffer is reused across layers, so `rmsnorm_into` must
+            // resize it and overwrite every element rather than assume
+            // either.
+            let mut got = vec![f32::NAN; 3];
+            rmsnorm_into(&mut got, &src, &weight, n_tokens, dim, eps);
+
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "n_tokens={n_tokens}");
+            // The input must be left untouched — that is the whole reason
+            // the call sites used to clone.
+            assert_eq!(src.len(), n_tokens * dim);
+        }
+    }
+
+    #[test]
+    fn rmsnorm_into_shrinks_an_oversized_scratch_buffer() {
+        // The reused buffer can arrive longer than this call needs — a
+        // narrower batch after a wide one. Leaving the tail behind would
+        // hand the caller a slice with stale rows appended.
+        let weight = [1.0f32, 1.0];
+        let mut dst = vec![7.0f32; 100];
+        rmsnorm_into(&mut dst, &[3.0, 4.0], &weight, 1, 2, 1e-5);
+        assert_eq!(dst.len(), 2);
+    }
+
+    /// The intended sequence, written out longhand — **not** by calling
+    /// `softmax_inplace`, which would make this a comparison of a function
+    /// with itself and prove nothing (see `SIMD.md`'s P5).
+    fn softmax_reference(x: &[f32]) -> Vec<f32> {
+        let mut out = x.to_vec();
+        let mut max = f32::NEG_INFINITY;
+        for &v in x {
+            max = max.max(v);
+        }
+        let mut sum = 0.0f32;
+        for v in out.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        if sum > 0.0 {
+            for v in out.iter_mut() {
+                *v /= sum;
+            }
+        }
+        out
+    }
+
+    /// Rows chosen so the accumulation order is *visible*: magnitudes spread
+    /// far enough apart that summing them in a different order lands on a
+    /// different `f32`, plus the degenerate rows the guard exists for.
+    fn softmax_rows() -> Vec<Vec<f32>> {
+        let mut lcg = 0x1357_9BDFu32;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 8) as f32 / 8_388_608.0 - 0.5
+        };
+        let mut rows = vec![
+            vec![],
+            vec![0.3],
+            vec![1.7, 1.7, 1.7, 1.7],
+            // Entirely masked: every exponential underflows, the sum is zero
+            // and the guard has to stop the division.
+            vec![f32::NEG_INFINITY; 5],
+            // The maximum last, so subtracting it is not a no-op on the head.
+            vec![-9.0, -3.5, 0.25, 11.0],
+            // **The row that makes the accumulation order decisive.** One
+            // element at the maximum, so its exponential is exactly `1.0`,
+            // and three hundred at `exp(-18.4) ~ 1e-8` — an order of
+            // magnitude below the half-ulp of `1.0`. Summed left to right
+            // every one of them is swallowed and the total stays `1.0`;
+            // summed in any other order they accumulate into ~3e-6 first
+            // and survive the addition. Without this row a reassociated
+            // softmax passes, which is exactly how `check_dot_multi` went
+            // unnoticed (see `SIMD.md`'s P5).
+            std::iter::once(0.0f32)
+                .chain(std::iter::repeat_n(-18.4f32, 300))
+                .collect(),
+        ];
+        // Long, non-dyadic and wide-ranged: 257 is past any vector width and
+        // not a multiple of one, and the exponentials span many orders of
+        // magnitude, which is what makes the summation order observable.
+        for len in [8usize, 9, 17, 64, 257] {
+            rows.push((0..len).map(|i| next() * 20.0 - (i % 7) as f32).collect());
+        }
+        rows
+    }
+
+    /// The invariant both accumulating call sites rest on: whatever was in
+    /// the buffer, it comes back the requested length and entirely zero.
+    /// Growing, shrinking and staying the same size are separate cases —
+    /// a grow-only `resize` passes the first and fails the other two.
+    #[test]
+    fn zeroed_to_leaves_no_trace_of_the_previous_call() {
+        let mut buf = Vec::new();
+        for len in [0usize, 7, 64, 3, 64, 64, 1] {
+            // Fill with a value no correct accumulation could leave behind,
+            // so a retained element is unmistakable.
+            for v in buf.iter_mut() {
+                *v = f32::NAN;
+            }
+            let got = zeroed_to(&mut buf, len);
+            assert_eq!(got.len(), len, "len {len}: wrong length");
+            assert!(
+                got.iter().all(|v| *v == 0.0),
+                "len {len}: a previous call's values survived"
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_is_bit_exact_with_its_written_out_reference() {
+        for row in softmax_rows() {
+            let want = softmax_reference(&row);
+            let mut got = row.clone();
+            softmax_inplace(&mut got);
+            assert_eq!(
+                got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                "len {}: softmax is not bit-exact with its reference",
+                row.len()
+            );
+        }
     }
 
     #[test]

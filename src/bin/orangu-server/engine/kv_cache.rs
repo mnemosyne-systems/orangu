@@ -57,10 +57,17 @@ fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
         let d = amax / 127.0;
         let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
         out.extend_from_slice(&d.to_le_bytes());
-        for &v in block {
-            let q = (v * inv_d).round().clamp(-127.0, 127.0) as i8;
-            out.push(q as u8);
+        // Built into a fixed array and appended once, rather than a `push`
+        // per byte. The `push` is a capacity check and a length update per
+        // element, which is what kept LLVM from widening this loop past
+        // 128 bits — the block is 32 quantized values whether it is written
+        // one at a time or in one go. Bit-identical: same expression, same
+        // order, same bytes.
+        let mut q = [0u8; 32];
+        for (slot, &v) in q.iter_mut().zip(block) {
+            *slot = ((v * inv_d).round().clamp(-127.0, 127.0) as i8) as u8;
         }
+        out.extend_from_slice(&q);
     }
     out
 }
@@ -1551,6 +1558,56 @@ impl RecurrentLayerState {
 
 #[cfg(test)]
 mod tests {
+    /// The block-at-a-time rewrite of [`f32_to_q8_0_bytes`] must produce the
+    /// same bytes as the `push`-per-element form it replaced — this is a KV
+    /// cache the GPU then reads, so a one-byte difference is a silently
+    /// wrong attention output rather than a crash.
+    ///
+    /// The reference is written out here rather than kept in the module,
+    /// because the whole point of the change was to delete the `push` loop.
+    #[test]
+    fn q8_0_kv_bytes_match_the_push_per_element_form() {
+        fn reference(data: &[f32]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for block in data.chunks_exact(32) {
+                let amax = block.iter().fold(0f32, |a, &b| a.max(b.abs()));
+                let d = amax / 127.0;
+                let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&d.to_le_bytes());
+                for &v in block {
+                    out.push(((v * inv_d).round().clamp(-127.0, 127.0) as i8) as u8);
+                }
+            }
+            out
+        }
+
+        let mut data: Vec<f32> = Vec::new();
+        // An all-zero block, where `d` is zero and `inv_d` must not be a
+        // division by it.
+        data.extend(std::iter::repeat_n(0.0f32, 32));
+        // A block whose peak magnitude is negative and unique, so dropping
+        // the `abs` from the max fold would change `d`.
+        let mut neg = [0.25f32; 32];
+        neg[11] = -90.0;
+        data.extend_from_slice(&neg);
+        // Ties: `amax` 254 makes `inv_d` exactly 0.5, so 1.0 and 3.0 land on
+        // 0.5 and 1.5 — the two values that separate ties-away-from-zero
+        // from ties-to-even.
+        let mut ties = [254.0f32; 32];
+        ties[1] = 1.0;
+        ties[2] = -1.0;
+        ties[3] = 3.0;
+        ties[4] = -3.0;
+        data.extend_from_slice(&ties);
+        // A plain spread.
+        let mut lcg = 0x2545_F491u32;
+        data.extend((0..64).map(|_| {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 8) as f32 / 8_388_608.0 - 0.5
+        }));
+
+        assert_eq!(super::f32_to_q8_0_bytes(&data), reference(&data));
+    }
     use super::*;
     use crate::engine::backend::vulkan_shaders::KvStorage;
 

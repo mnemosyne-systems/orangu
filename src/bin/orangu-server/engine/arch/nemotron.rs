@@ -478,23 +478,42 @@ impl ModelForward for NemotronModel {
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
 
+        // Grown once and reused across layers rather than allocated per
+        // block — see `tensor::rmsnorm_into`.
+        let mut normed: Vec<f32> = Vec::new();
+        // Projection buffers, grown once and reused by every block — see
+        // `Backend::matmul_into`.
+        let mut sub_out: Vec<f32> = Vec::new();
+        let mut block = BlockScratch::default();
+
         // Every block is one sub-layer under one norm, so the residual is
         // added once per block rather than twice.
         for layer in &self.layers {
-            let mut normed = x.to_vec();
             let norm = match layer {
                 Layer::Ssm(l) => &l.norm,
                 Layer::Attn(l) => &l.norm,
                 Layer::Moe(l) => &l.norm,
                 Layer::Ffn(l) => &l.norm,
             };
-            tensor::rmsnorm_inplace(&mut normed, norm, n_tokens, n_embd, self.rms_eps);
-            let sub_out = match layer {
-                Layer::Ssm(l) => self.ssm_block(l, cache, &normed, n_tokens),
-                Layer::Attn(l) => self.attn_block(l, cache, &normed, n_tokens, start_pos),
-                Layer::Moe(l) => self.moe_block(l, &normed, n_tokens),
-                Layer::Ffn(l) => self.ffn_block(l, &normed, n_tokens),
-            };
+            tensor::rmsnorm_into(&mut normed, &x, norm, n_tokens, n_embd, self.rms_eps);
+            match layer {
+                Layer::Ssm(l) => {
+                    self.ssm_block_into(l, cache, &mut sub_out, &mut block, &normed, n_tokens)
+                }
+                Layer::Attn(l) => self.attn_block_into(
+                    l,
+                    cache,
+                    &normed,
+                    &mut sub_out,
+                    &mut block,
+                    n_tokens,
+                    start_pos,
+                ),
+                Layer::Moe(l) => sub_out = self.moe_block(l, &normed, n_tokens),
+                Layer::Ffn(l) => {
+                    self.ffn_block_into(&mut sub_out, &mut block, l, &normed, n_tokens)
+                }
+            }
             tensor::add_inplace(&mut x, &sub_out);
         }
 
@@ -515,19 +534,24 @@ impl NemotronModel {
     /// previous token's, so unlike attention there is nothing to batch
     /// across the prompt. The projection that feeds it *is* batched, which
     /// is where the width is.
-    fn ssm_block(
+    fn ssm_block_into(
         &self,
         layer: &SsmLayer,
         cache: &mut KvCache,
+        out: &mut Vec<f32>,
+        block: &mut BlockScratch,
         normed: &[f32],
         n_tokens: usize,
-    ) -> Vec<f32> {
+    ) {
         let head_dim = self.ssm_head_dim();
         let d_state = self.d_state;
         let group_width = self.d_inner / self.n_group;
         // How many heads share one `B`/`C` group vector.
         let heads_per_group = self.n_ssm_head / self.n_group;
-        let projected = self.backend.matmul(normed, n_tokens, &layer.in_proj);
+        let projected = &mut block.projected;
+        self.backend
+            .matmul_into(projected, normed, n_tokens, &layer.in_proj);
+        let projected = &*projected;
         let row = layer.in_proj.out_dim;
 
         // The recurrence is sequential, but the two projections around it
@@ -583,43 +607,50 @@ impl NemotronModel {
                 tensor::rmsnorm_inplace(chunk, weight, 1, group_width, self.rms_eps);
             }
         }
-        self.backend.matmul(&ys, n_tokens, &layer.out_proj)
+        self.backend
+            .matmul_into(out, &ys, n_tokens, &layer.out_proj);
     }
 
     /// Unrotated causal GQA — no RoPE, no QK-norm, no biases.
-    fn attn_block(
+    #[allow(clippy::too_many_arguments)]
+    fn attn_block_into(
         &self,
         layer: &AttnLayer,
         cache: &mut KvCache,
         normed: &[f32],
+        out: &mut Vec<f32>,
+        block: &mut BlockScratch,
         n_tokens: usize,
         start_pos: usize,
-    ) -> Vec<f32> {
+    ) {
         let head_dim = self.head_dim;
         let n_head = self.n_head;
         let n_head_kv = layer.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
 
-        let mut qkv = self.backend.matmul_batch(&[
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wq,
-            },
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wk,
-            },
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wv,
-            },
-        ]);
-        let v = qkv.pop().unwrap();
-        let k = qkv.pop().unwrap();
-        let q = qkv.pop().unwrap();
+        self.backend.matmul_batch_into(
+            &mut block.qkv,
+            &[
+                MatmulOp {
+                    x: normed,
+                    n_tokens,
+                    w: &layer.wq,
+                },
+                MatmulOp {
+                    x: normed,
+                    n_tokens,
+                    w: &layer.wk,
+                },
+                MatmulOp {
+                    x: normed,
+                    n_tokens,
+                    w: &layer.wv,
+                },
+            ],
+        );
+        // Borrowed in dispatch order rather than popped, so the buffers stay
+        // in the scratch and the next layer inherits their capacity.
+        let (q, k, v) = (&block.qkv[0], &block.qkv[1], &block.qkv[2]);
 
         let layer_cache = &mut cache.layers[layer.cache_index];
         for t in 0..n_tokens {
@@ -632,7 +663,7 @@ impl NemotronModel {
         let mut attn_out = Vec::new();
         crate::engine::attention::attention(
             &mut attn_out,
-            &q,
+            q,
             layer_cache,
             &crate::engine::attention::Params {
                 backend: self.backend.as_ref(),
@@ -649,7 +680,8 @@ impl NemotronModel {
             },
             |t| (0, start_pos + t),
         );
-        self.backend.matmul(&attn_out, n_tokens, &layer.wo)
+        self.backend
+            .matmul_into(out, &attn_out, n_tokens, &layer.wo);
     }
 
     /// The router's logits and the shared expert's up projection, from one
@@ -739,54 +771,83 @@ impl NemotronModel {
             picks.iter().for_each(|&(e, _)| experts.select(e));
         }
 
-        let contribs = super::evaluate_routed_experts(&selection, |expert, members| {
-            let inputs: Vec<&[f32]> = members
-                .iter()
-                .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                .collect();
-            let hidden: Vec<Vec<f32>> = super::project_expert(
-                self.backend.as_ref(),
-                &layer.up_exps,
-                expert,
-                0,
-                layer.up_exps.out_dim,
-                &inputs,
-            )
-            .into_iter()
-            .map(|mut up| {
-                relu_squared(&mut up);
-                up
-            })
-            .collect();
-            let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-            super::project_expert(
-                self.backend.as_ref(),
-                &layer.down_exps,
-                expert,
-                0,
-                layer.down_exps.out_dim,
-                &hidden_refs,
-            )
-            .into_iter()
-            .zip(members)
-            .map(|(mut contribution, &(_, weight))| {
-                contribution.iter_mut().for_each(|v| *v *= weight);
-                contribution
-            })
-            .collect()
-        });
-        experts.loaded_once_per_distinct_expert();
+        // The batched helper — one `MatmulOp` per expert group across the
+        // whole batch — where the per-expert path below is one call per
+        // expert per projection. `super::
+        // evaluate_routed_experts_batched_gateless` exists because these
+        // experts have no gate projection to pair with `up`; everything else
+        // about the two paths is the same, including the residency split and
+        // the host remainder running beside the device batch.
+        let routed_branch = || {
+            if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+                super::evaluate_routed_experts_batched_gateless(
+                    self.backend.as_ref(),
+                    &selection,
+                    normed,
+                    n_embd,
+                    &layer.up_exps,
+                    &layer.down_exps,
+                    |up| {
+                        let mut up = up.to_vec();
+                        relu_squared(&mut up);
+                        up
+                    },
+                )
+            } else {
+                super::evaluate_routed_experts(&selection, |expert, members| {
+                    let inputs: Vec<&[f32]> = members
+                        .iter()
+                        .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                        .collect();
+                    let hidden: Vec<Vec<f32>> = super::project_expert(
+                        self.backend.as_ref(),
+                        &layer.up_exps,
+                        expert,
+                        0,
+                        layer.up_exps.out_dim,
+                        &inputs,
+                    )
+                    .into_iter()
+                    .map(|mut up| {
+                        relu_squared(&mut up);
+                        up
+                    })
+                    .collect();
+                    let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                    super::project_expert(
+                        self.backend.as_ref(),
+                        &layer.down_exps,
+                        expert,
+                        0,
+                        layer.down_exps.out_dim,
+                        &hidden_refs,
+                    )
+                    .into_iter()
+                    .zip(members)
+                    .map(|(mut contribution, &(_, weight))| {
+                        contribution.iter_mut().for_each(|v| *v *= weight);
+                        contribution
+                    })
+                    .collect()
+                })
+            }
+        };
 
         // The shared expert's up projection was issued with the router above;
-        // only the activation and the down projection are left.
-        let mut shared = shared_up;
-        relu_squared(&mut shared);
-        let mut out = super::matmul_host_fallback(
-            self.backend.as_ref(),
-            &shared,
-            n_tokens,
-            &layer.down_shexp,
-        );
+        // only the activation and the down projection are left — a device
+        // matmul with nothing in common with the host-side routed branch, so
+        // the two overlap. See `super::moe_overlap_min_tokens`.
+        let shared_branch = || {
+            let mut shared = shared_up;
+            relu_squared(&mut shared);
+            super::matmul_host_fallback(self.backend.as_ref(), &shared, n_tokens, &layer.down_shexp)
+        };
+        let (mut out, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+            rayon::join(shared_branch, routed_branch)
+        } else {
+            (shared_branch(), routed_branch())
+        };
+        experts.loaded_once_per_distinct_expert();
 
         for (t, picks) in contribs.iter().enumerate() {
             let dst = &mut out[t * n_embd..(t + 1) * n_embd];
@@ -807,12 +868,31 @@ impl NemotronModel {
     /// these are ordinary per-layer weights rather than stacked experts, but
     /// a quantization the device has no kernel for still has to reach the
     /// host rather than panic inside the backend.
-    fn ffn_block(&self, layer: &FfnLayer, normed: &[f32], n_tokens: usize) -> Vec<f32> {
-        let mut up =
-            super::matmul_host_fallback(self.backend.as_ref(), normed, n_tokens, &layer.up);
-        relu_squared(&mut up);
-        super::matmul_host_fallback(self.backend.as_ref(), &up, n_tokens, &layer.down)
+    fn ffn_block_into(
+        &self,
+        out: &mut Vec<f32>,
+        block: &mut BlockScratch,
+        layer: &FfnLayer,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        let up = &mut block.up;
+        super::matmul_host_fallback_into(up, self.backend.as_ref(), normed, n_tokens, &layer.up);
+        relu_squared(up);
+        super::matmul_host_fallback_into(out, self.backend.as_ref(), up, n_tokens, &layer.down);
     }
+}
+
+/// The per-block projection buffers the `*_into` blocks reuse — see
+/// `Backend::matmul_into`. One per forward pass rather than one per block.
+#[derive(Default)]
+struct BlockScratch {
+    /// The SSM block's fused input projection.
+    projected: Vec<f32>,
+    /// The FFN block's up projection, squared-ReLU'd in place.
+    up: Vec<f32>,
+    /// The attention block's Q/K/V, in dispatch order.
+    qkv: Vec<Vec<f32>>,
 }
 
 /// This architecture's FFN activation, in place: `max(0, x)^2`.

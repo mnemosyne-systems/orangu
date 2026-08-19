@@ -43,7 +43,7 @@ use crate::engine::loader::QuantMatrix;
 use crate::engine::tensor;
 use crate::engine::vecdot;
 
-use super::{Backend, MatmulOp};
+use super::{Backend, MatmulOp, guarded_matmul_op_into};
 
 #[derive(Default)]
 pub struct CpuBackend;
@@ -52,12 +52,18 @@ impl CpuBackend {
     /// The fused path: quantize each token's activations to `int8` **once**,
     /// then dot them against the still-quantized weight rows. Returns `None`
     /// for any weight type without a fused kernel, so the caller falls back.
-    fn matmul_fused(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Option<Vec<f32>> {
+    fn matmul_fused_into(
+        &self,
+        out: &mut Vec<f32>,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+    ) -> bool {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         let ggml_type = w.ggml_type();
         if !vecdot::supports(ggml_type, in_dim) {
-            return None;
+            return false;
         }
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
@@ -68,9 +74,8 @@ impl CpuBackend {
         // over the generic path on a `Llama-3.2-1B-Instruct-Q4_K_M`, which is
         // 100% `Q4_K`/`Q6_K`. See `engine::vecdot`'s section comment.
         if n_tokens > 1 && vecdot::supports_k(ggml_type, in_dim) {
-            return Some(Self::matmul_k_gemm(
-                x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
-            ));
+            Self::matmul_k_gemm_into(out, x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim);
+            return true;
         }
 
         // The symmetric per-32 types take the same flat activation layout,
@@ -78,9 +83,10 @@ impl CpuBackend {
         // it because a `Q8_0` prefill profile is 74.9% *loads* — see
         // `engine::vecdot`'s section comment.
         if n_tokens > 1 && vecdot::supports_flat(ggml_type, in_dim) {
-            return Some(Self::matmul_flat_gemm(
-                x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
-            ));
+            Self::matmul_flat_gemm_into(
+                out, x, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
+            );
+            return true;
         }
 
         // The two-bit family decodes through a per-super-block activation
@@ -93,12 +99,15 @@ impl CpuBackend {
         // activation quantization, and doing both would pay for one twice.
         if n_tokens == 1 && vecdot::supports_k_row(ggml_type, in_dim) {
             let act = vecdot::quantize_act_k_row(&x[..in_dim]);
-            let mut y = vec![0f32; out_dim];
-            y.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
+            // One token, so the accumulation is already `[1, out_dim]` —
+            // write straight into the caller's buffer, no transpose and no
+            // allocation at all.
+            out.resize(out_dim, 0.0);
+            out.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
                 dst[0] =
                     vecdot::dot_k_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], &act);
             });
-            return Some(y);
+            return true;
         }
 
         // Once per call, not once per (row, token) — this is the whole point.
@@ -123,7 +132,8 @@ impl CpuBackend {
                 dst[0] = vecdot::dot_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], act);
             });
             // The transpose is the identity — hand the buffer straight back.
-            return Some(yt);
+            Self::finish_into(out, yt, n_tokens, out_dim);
+            return true;
         }
 
         // Two output rows per chunk: `dot_unpacked_pair` shares each token's
@@ -152,20 +162,16 @@ impl CpuBackend {
             },
         );
 
-        let mut y = vec![0f32; n_tokens * out_dim];
-        for o in 0..out_dim {
-            for t in 0..n_tokens {
-                y[t * out_dim + o] = yt[o * n_tokens + t];
-            }
-        }
-        Some(y)
+        Self::finish_into(out, yt, n_tokens, out_dim);
+        true
     }
 
     /// The K-quant prefill GEMM. Same shape as the generic path below it —
     /// accumulate transposed, two output rows per rayon chunk, one scratch
     /// row per worker — but over [`vecdot::ActQ8K`]/[`vecdot::KRow`].
     #[allow(clippy::too_many_arguments)]
-    fn matmul_k_gemm(
+    fn matmul_k_gemm_into(
+        out: &mut Vec<f32>,
         x: &[f32],
         n_tokens: usize,
         ggml_type: u32,
@@ -173,7 +179,7 @@ impl CpuBackend {
         row_bytes: usize,
         in_dim: usize,
         out_dim: usize,
-    ) -> Vec<f32> {
+    ) {
         let acts = vecdot::ActQ8K::quantize(x, in_dim, n_tokens);
         let mut yt = vec![0f32; out_dim * n_tokens];
         yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
@@ -193,20 +199,15 @@ impl CpuBackend {
             },
         );
 
-        let mut y = vec![0f32; n_tokens * out_dim];
-        for o in 0..out_dim {
-            for t in 0..n_tokens {
-                y[t * out_dim + o] = yt[o * n_tokens + t];
-            }
-        }
-        y
+        Self::finish_into(out, yt, n_tokens, out_dim);
     }
 
     /// The `Q8_0`/`Q5_0`/`IQ4_NL` prefill GEMM, over [`vecdot::ActQ8Flat`].
     /// Identical in shape to [`Self::matmul_k_gemm`]; they differ only in the
     /// activation type and the kernel called.
     #[allow(clippy::too_many_arguments)]
-    fn matmul_flat_gemm(
+    fn matmul_flat_gemm_into(
+        out: &mut Vec<f32>,
         x: &[f32],
         n_tokens: usize,
         ggml_type: u32,
@@ -214,7 +215,7 @@ impl CpuBackend {
         row_bytes: usize,
         in_dim: usize,
         out_dim: usize,
-    ) -> Vec<f32> {
+    ) {
         let acts = vecdot::ActQ8Flat::quantize(x, in_dim, n_tokens);
         let mut yt = vec![0f32; out_dim * n_tokens];
         yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
@@ -240,13 +241,7 @@ impl CpuBackend {
             },
         );
 
-        let mut y = vec![0f32; n_tokens * out_dim];
-        for o in 0..out_dim {
-            for t in 0..n_tokens {
-                y[t * out_dim + o] = yt[o * n_tokens + t];
-            }
-        }
-        y
+        Self::finish_into(out, yt, n_tokens, out_dim);
     }
 
     /// [`Self::matmul_fused`]'s decode form: the GEMV kernel that function
@@ -267,12 +262,18 @@ impl CpuBackend {
     /// cache. What it does not do is materialize the row as `int8` once and
     /// reuse it, which is what the GEMM paths buy and what costs the
     /// bit-exactness.
-    fn matmul_fused_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Option<Vec<f32>> {
+    fn matmul_fused_decode_into(
+        &self,
+        out: &mut Vec<f32>,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+    ) -> bool {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         let ggml_type = w.ggml_type();
         if !vecdot::supports(ggml_type, in_dim) {
-            return None;
+            return false;
         }
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
@@ -311,16 +312,8 @@ impl CpuBackend {
                 });
         }
 
-        if n_tokens == 1 {
-            return Some(yt);
-        }
-        let mut y = vec![0f32; n_tokens * out_dim];
-        for o in 0..out_dim {
-            for t in 0..n_tokens {
-                y[t * out_dim + o] = yt[o * n_tokens + t];
-            }
-        }
-        Some(y)
+        Self::finish_into(out, yt, n_tokens, out_dim);
+        true
     }
 
     /// The float path: `F32`/`F16`/`BF16` weights, widened a block at a time
@@ -336,12 +329,18 @@ impl CpuBackend {
     ///
     /// Reached in practice by `gemma-4`'s `per_layer_model_proj`, the last
     /// unfused matmul in the model set.
-    fn matmul_float(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Option<Vec<f32>> {
+    fn matmul_float_into(
+        &self,
+        out: &mut Vec<f32>,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+    ) -> bool {
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         let ggml_type = w.ggml_type();
         if !vecdot::supports_float(ggml_type) {
-            return None;
+            return false;
         }
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
@@ -360,17 +359,40 @@ impl CpuBackend {
                 }
             });
 
+        Self::finish_into(out, yt, n_tokens, out_dim);
+        true
+    }
+
+    /// Materializes a `[out_dim, n_tokens]` accumulation into the caller's
+    /// `[n_tokens, out_dim]` buffer — the one step every kernel above ends
+    /// with, and the allocation this whole `_into` family exists to remove.
+    ///
+    /// Two cases, and the split is the point:
+    ///
+    /// * `n_tokens == 1`, where the transpose is the identity: the
+    ///   accumulator *is* the answer, so it is swapped into place rather
+    ///   than copied. Decode therefore allocates exactly what it allocated
+    ///   before — no better, deliberately no worse.
+    /// * `n_tokens > 1`: transposed straight into `out`, which is a caller
+    ///   buffer reused across layers. This is where the saving is — one
+    ///   allocate/free pair per projection per layer. See
+    ///   [`Backend::matmul_into`] for why it is allocator bookkeeping rather
+    ///   than `mmap` traffic at the default batch and stripe caps.
+    ///
+    /// `resize` rather than `clear` + `resize`: every element is written by
+    /// the loop below, so zeroing them first is a wasted pass — the same
+    /// reasoning as `tensor::rmsnorm_into`.
+    fn finish_into(out: &mut Vec<f32>, mut yt: Vec<f32>, n_tokens: usize, out_dim: usize) {
         if n_tokens == 1 {
-            // The transpose is the identity.
-            return Some(yt);
+            std::mem::swap(out, &mut yt);
+            return;
         }
-        let mut y = vec![0f32; n_tokens * out_dim];
+        out.resize(n_tokens * out_dim, 0.0);
         for o in 0..out_dim {
             for t in 0..n_tokens {
-                y[t * out_dim + o] = yt[o * n_tokens + t];
+                out[t * out_dim + o] = yt[o * n_tokens + t];
             }
         }
-        Some(y)
     }
 
     /// The dequantize path, on its own: every weight row widened to `f32`
@@ -411,31 +433,68 @@ impl CpuBackend {
 }
 
 impl Backend for CpuBackend {
+    /// Both allocating entry points go through the `_into` forms, so there
+    /// is one implementation of each kernel rather than two that could
+    /// drift apart.
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.matmul_into(&mut out, x, n_tokens, w);
+        out
+    }
+
+    fn matmul_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
         debug_assert_eq!(x.len(), n_tokens * w.in_dim);
-        if let Some(y) = self.matmul_fused(x, n_tokens, w) {
-            return y;
+        if self.matmul_fused_into(out, x, n_tokens, w) {
+            return;
         }
-        if let Some(y) = self.matmul_float(x, n_tokens, w) {
-            return y;
+        if self.matmul_float_into(out, x, n_tokens, w) {
+            return;
         }
-        self.matmul_dequant(x, n_tokens, w)
+        // Left allocating: this is the cross-check *reference* path, taken
+        // only by types with no fused kernel at all, and it already
+        // allocates a `Vec<f32>` per output row inside. Converting it would
+        // save the smaller of its two allocations.
+        *out = self.matmul_dequant(x, n_tokens, w);
     }
 
     fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.matmul_decode_into(&mut out, x, n_tokens, w);
+        out
+    }
+
+    fn matmul_decode_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
         debug_assert_eq!(x.len(), n_tokens * w.in_dim);
-        if let Some(y) = self.matmul_fused_decode(x, n_tokens, w) {
-            return y;
+        if self.matmul_fused_decode_into(out, x, n_tokens, w) {
+            return;
         }
         // `matmul_float` needs no decode form of its own: it already dots one
         // `(row, token)` pair at a time and never materializes a row, so the
         // GEMV/GEMM split the quantized path makes has nothing to trade off.
-        if let Some(y) = self.matmul_float(x, n_tokens, w) {
-            return y;
+        if self.matmul_float_into(out, x, n_tokens, w) {
+            return;
         }
         // The dequantize path takes every `(row, token)` pair as its own
         // full-precision dot already, so it needs no decode form of its own.
-        self.matmul_dequant(x, n_tokens, w)
+        *out = self.matmul_dequant(x, n_tokens, w);
+    }
+
+    /// Per op and into the caller's buffers, which is the whole gain here:
+    /// `CpuBackend` has no submission batching to do — the same reason it
+    /// leaves [`Backend::matmul_batch`] at its default — so a batch is
+    /// exactly `n` independent matmuls, and each of them can write into a
+    /// buffer that outlives the layer.
+    ///
+    /// `resize_with` rather than rebuilding the outer `Vec`: the inner
+    /// buffers are the ones worth keeping, and a batch's shape does not
+    /// change from layer to layer.
+    fn matmul_batch_into(&self, outs: &mut Vec<Vec<f32>>, ops: &[MatmulOp<'_>]) {
+        outs.resize_with(ops.len(), Vec::new);
+        for (out, op) in outs.iter_mut().zip(ops) {
+            guarded_matmul_op_into(out, op, |dst, x, n_tokens, w| {
+                self.matmul_into(dst, x, n_tokens, w)
+            });
+        }
     }
 
     /// Per op, since `CpuBackend` has nothing to amortize across a batch —
@@ -467,6 +526,58 @@ mod tests {
             GGML_TYPE_Q8_0 => (2 + 32, 32),
             GGML_TYPE_Q4_K => (2 + 2 + 12 + 128, 256),
             other => panic!("no fixture for ggml_type {other}"),
+        }
+    }
+
+    /// `matmul_into` must produce exactly what `matmul` produces, from a
+    /// buffer that is reused rather than fresh. That is the invariant every
+    /// migrated call site depends on, and it has two halves worth testing
+    /// separately: the values, and that nothing of the previous call
+    /// survives.
+    ///
+    /// Both `n_tokens` cases matter and take different code paths —
+    /// `n_tokens == 1` swaps the accumulator into place while `n_tokens > 1`
+    /// transposes into the caller's buffer — and the K-quant GEMM at
+    /// `n_tokens > 1` is a third kernel again. `77` is deliberately not a
+    /// multiple of anything.
+    #[test]
+    fn matmul_into_matches_matmul_from_a_reused_buffer() {
+        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q4_K] {
+            let (_, block_elems) = block_layout(ggml_type);
+            let in_dim = block_elems * 3;
+            // Odd, so the two-rows-per-chunk kernels hit their trailing
+            // single-row branch.
+            let out_dim = 11;
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let bytes = weights(ggml_type, in_dim, out_dim, &mut seed);
+            let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+
+            // Reused across every shape below, exactly as a layer loop
+            // reuses it — so a later, narrower call has to shrink it.
+            let mut reused: Vec<f32> = vec![f32::NAN; 4096];
+
+            for n_tokens in [1usize, 2, 5, 77, 3, 1] {
+                let x: Vec<f32> = (0..n_tokens * in_dim)
+                    .map(|i| ((i % 29) as f32 - 14.0) * 0.037)
+                    .collect();
+
+                let want = CpuBackend.matmul(&x, n_tokens, &w);
+                CpuBackend.matmul_into(&mut reused, &x, n_tokens, &w);
+                assert_eq!(
+                    reused.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "type {ggml_type} n_tokens {n_tokens}: matmul_into differs from matmul"
+                );
+                assert_eq!(reused.len(), n_tokens * out_dim);
+
+                let want = CpuBackend.matmul_decode(&x, n_tokens, &w);
+                CpuBackend.matmul_decode_into(&mut reused, &x, n_tokens, &w);
+                assert_eq!(
+                    reused.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "type {ggml_type} n_tokens {n_tokens}: matmul_decode_into differs"
+                );
+            }
         }
     }
 

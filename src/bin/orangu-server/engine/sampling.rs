@@ -358,6 +358,14 @@ fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], params: &Samp
     }
 }
 
+/// `tensor::softmax_inplace`, over `(token, logit)` pairs.
+///
+/// A second copy of that computation rather than a call to it, because the
+/// values are interleaved with their token ids and extracting them would
+/// mean an allocation per sample. **The two must agree bit for bit** — the
+/// same max, the same left-to-right accumulation, the same `sum > 0.0`
+/// guard — and `sampling_softmax_agrees_with_the_tensor_one` is what holds
+/// them together.
 fn softmax_pairs(candidates: &mut [(u32, f32)]) {
     let max = candidates
         .iter()
@@ -411,6 +419,72 @@ fn apply_min_p(candidates: &mut Vec<(u32, f32)>, min_p: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two softmaxes in this engine — `tensor::softmax_inplace` over a
+    /// row and [`softmax_pairs`] over `(token, logit)` pairs — are separate
+    /// copies of one computation, so nothing but a test stops them drifting.
+    ///
+    /// Bit-for-bit, not approximately: this one decides sampled probabilities
+    /// and the other decides attention weights, and "close enough" between
+    /// two copies of the same formula is how a divergence hides.
+    #[test]
+    fn sampling_softmax_agrees_with_the_tensor_one() {
+        let mut lcg = 0x2468_ACE0u32;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 8) as f32 / 8_388_608.0 - 0.5
+        };
+        // The last row makes the accumulation order decisive: one element at
+        // the maximum (exponential exactly `1.0`) and three hundred an order
+        // of magnitude below its half-ulp. Left to right they are all
+        // swallowed; in any other order they accumulate first and survive.
+        // A random spread alone does *not* separate the two orders — that
+        // was checked by mutation, not assumed.
+        let mut rows: Vec<Vec<f32>> = [0usize, 1, 2, 7, 8, 33, 129]
+            .iter()
+            .map(|&len| (0..len).map(|i| next() * 25.0 - (i % 5) as f32).collect())
+            .collect();
+        rows.push(
+            std::iter::once(0.0f32)
+                .chain(std::iter::repeat_n(-18.4f32, 300))
+                .collect(),
+        );
+
+        for logits in rows {
+            let len = logits.len();
+
+            let mut pairs: Vec<(u32, f32)> = logits
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as u32, v))
+                .collect();
+            softmax_pairs(&mut pairs);
+
+            let mut row = logits.clone();
+            crate::engine::tensor::softmax_inplace(&mut row);
+
+            assert_eq!(
+                pairs.iter().map(|(_, v)| v.to_bits()).collect::<Vec<_>>(),
+                row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "len {len}: the sampler's softmax has drifted from the tensor one"
+            );
+        }
+        // An all `-inf` row. `-inf - -inf` is `NaN`, so both copies return
+        // `NaN` rather than zeros — see `tensor::softmax_inplace` for why
+        // that is unreachable in production and deliberately not
+        // special-cased. What this pins is that the two copies agree *there
+        // too*, which is where a divergence would be easiest to introduce by
+        // "fixing" one of them alone.
+        let mut pairs: Vec<(u32, f32)> = (0..4).map(|i| (i, f32::NEG_INFINITY)).collect();
+        softmax_pairs(&mut pairs);
+        let mut row = vec![f32::NEG_INFINITY; 4];
+        crate::engine::tensor::softmax_inplace(&mut row);
+        assert_eq!(
+            pairs.iter().map(|(_, v)| v.to_bits()).collect::<Vec<_>>(),
+            row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the two copies disagree on an all -inf row"
+        );
+    }
 
     #[test]
     fn greedy_sampling_is_deterministic_and_picks_the_max() {

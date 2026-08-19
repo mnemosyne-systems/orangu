@@ -50,40 +50,14 @@ use opencl3::program::Program;
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING};
 
 use crate::engine::loader::QuantMatrix;
-use crate::engine::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-};
 
 use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, MatmulOp};
 
-/// The `ggml_type`s a kernel exists for. Deliberately a *subset* of what
-/// `engine::quant` reads on the CPU path: the remaining `IQ*` types
-/// (`IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/
-/// `IQ3_XXS`/`IQ3_S`/`IQ4_XS`)
-/// index lattice codebooks that would each need their own uploaded buffer,
-/// which `VulkanBackend` has (`IQ_GRID_PRELUDE`) and this backend does not.
-/// `IQ4_NL` is here because it is the exception — a 16-entry level table
-/// small enough to inline into the kernel source. Anything absent is
-/// rejected by `Backend::supports_type` at startup rather than reaching
-/// `matmul`.
-const SUPPORTED_TYPES: &[u32] = &[
-    GGML_TYPE_F32,
-    GGML_TYPE_F16,
-    GGML_TYPE_BF16,
-    GGML_TYPE_Q4_0,
-    GGML_TYPE_Q5_0,
-    GGML_TYPE_Q8_0,
-    GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_K,
-    GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K,
-    GGML_TYPE_IQ4_NL,
-];
-
-const KERNEL_NAME: &str = "matmul_reduce";
+// The kernels, the type list and the entry-point name are all
+// `super::vendor_shaders`' - see that module for why they are shared
+// rather than written once per backend.
+use super::vendor_shaders::{KERNEL_NAME, SUPPORTED_TYPES};
 
 /// The reduction workgroup size — must match `LOCAL_WORK_SIZE` used at
 /// dispatch time and the hardcoded `64`/`partial_sums[256]` layout below,
@@ -91,421 +65,10 @@ const KERNEL_NAME: &str = "matmul_reduce";
 /// `@workgroup_size(64)`.
 const LOCAL_WORK_SIZE: usize = 64;
 
-/// Shared by every type's kernel: a manual IEEE-754 binary16 -> float
-/// decoder (OpenCL C's `half` type/`vload_half` requires the `cl_khr_fp16`
-/// extension, not guaranteed present, so this avoids depending on it) —
-/// see `engine::backend::cuda`'s near-identical sibling copy of this
-/// prelude for why the same logic is duplicated per backend rather than
-/// shared across files.
-const PRELUDE: &str = r#"
-inline float orangu_half_to_float(ushort h) {
-    uint sign = ((uint)(h & 0x8000u)) << 16;
-    uint exp = (h >> 10) & 0x1Fu;
-    uint mant = h & 0x3FFu;
-    uint bits;
-    if (exp == 0u) {
-        if (mant == 0u) {
-            bits = sign;
-        } else {
-            int e = -1;
-            do {
-                mant <<= 1;
-                e++;
-            } while ((mant & 0x400u) == 0u);
-            mant &= 0x3FFu;
-            bits = sign | ((uint)(127 - 15 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
-    }
-    return as_float(bits);
-}
-
-// bfloat16 -> f32: the top 16 bits of an f32, left-shifted into place —
-// mirrors `quant::dequantize`'s `GGML_TYPE_BF16` arm exactly.
-inline float orangu_bf16_to_float(ushort h) {
-    uint bits = ((uint)h) << 16;
-    return as_float(bits);
-}
-
-// ggml's `get_scale_min_k4`: unpacks the 6-bit scale and 6-bit min for
-// sub-block `j` (0..8) of a Q4_K/Q5_K super-block's 12-byte `scales` region
-// starting at byte `base`. Mirrors `quant::get_scale_min_k4` exactly.
-inline void orangu_get_scale_min_k4(
-    __global const uchar *w, uint base, uint j, uint *sc, uint *m) {
-    if (j < 4u) {
-        *sc = w[base + j] & 63u;
-        *m = w[base + j + 4u] & 63u;
-    } else {
-        *sc = (w[base + j + 4u] & 0xFu) | ((w[base + j - 4u] >> 6) << 4);
-        *m = (w[base + j + 4u] >> 4) | ((w[base + j] >> 6) << 4);
-    }
-}
-"#;
-
-/// The compute entry point — an OpenCL-C port of `vulkan_shaders`'s
-/// `MAIN_REDUCE_SUFFIX` (see `engine::backend::cuda`'s `MAIN` for the
-/// CUDA-C sibling this was translated alongside): one workgroup per
-/// (output-row group of 4, token) pair, all `LOCAL_WORK_SIZE` work-items
-/// splitting `in_dim` elements and reducing their partial dot products in
-/// local memory.
-const MAIN: &str = r#"
-__kernel void matmul_reduce(
-    __global const uchar *weights,
-    __global const float *x,
-    __global float *y,
-    uint in_dim,
-    uint out_dim,
-    uint n_tokens,
-    uint row_bytes) {
-    __local float partial_sums[256];
-
-    uint n_row_groups = (out_dim + 3u) / 4u;
-    uint flat = get_group_id(0);
-    if (flat >= n_row_groups * n_tokens) {
-        return;
-    }
-    uint rg = flat / n_tokens;
-    uint t = flat % n_tokens;
-    uint o0 = rg * 4u;
-    uint o1 = o0 + 1u;
-    uint o2 = o0 + 2u;
-    uint o3 = o0 + 3u;
-    uint local_id = get_local_id(0);
-    uint x_base = t * in_dim;
-
-    float partial0 = 0.0f;
-    float partial1 = 0.0f;
-    float partial2 = 0.0f;
-    float partial3 = 0.0f;
-    for (uint k = local_id; k < in_dim; k += 64u) {
-        uint block_idx = k / BLOCK_ELEMS;
-        uint local_k = k % BLOCK_ELEMS;
-        uint block_off = block_idx * BLOCK_BYTES;
-        float xv = x[x_base + k];
-        partial0 += dequant_element(weights, o0 * row_bytes + block_off, local_k) * xv;
-        if (o1 < out_dim) {
-            partial1 += dequant_element(weights, o1 * row_bytes + block_off, local_k) * xv;
-        }
-        if (o2 < out_dim) {
-            partial2 += dequant_element(weights, o2 * row_bytes + block_off, local_k) * xv;
-        }
-        if (o3 < out_dim) {
-            partial3 += dequant_element(weights, o3 * row_bytes + block_off, local_k) * xv;
-        }
-    }
-
-    partial_sums[local_id] = partial0;
-    partial_sums[64u + local_id] = partial1;
-    partial_sums[128u + local_id] = partial2;
-    partial_sums[192u + local_id] = partial3;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (uint stride = 32u; stride > 0u; stride /= 2u) {
-        if (local_id < stride) {
-            partial_sums[local_id] += partial_sums[local_id + stride];
-            partial_sums[64u + local_id] += partial_sums[64u + local_id + stride];
-            partial_sums[128u + local_id] += partial_sums[128u + local_id + stride];
-            partial_sums[192u + local_id] += partial_sums[192u + local_id + stride];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (local_id == 0u) {
-        y[t * out_dim + o0] = partial_sums[0];
-        if (o1 < out_dim) {
-            y[t * out_dim + o1] = partial_sums[64u];
-        }
-        if (o2 < out_dim) {
-            y[t * out_dim + o2] = partial_sums[128u];
-        }
-        if (o3 < out_dim) {
-            y[t * out_dim + o3] = partial_sums[192u];
-        }
-    }
-}
-"#;
-
-/// Each type's `dequant_element(weights, byte_offset, k)` — see
-/// `engine::backend::cuda::dequant_element_source`'s doc comment; this is
-/// the same line-for-line port of `engine::quant::dequantize_*`, restated
-/// in OpenCL C.
-fn dequant_element_source(ggml_type: u32) -> Option<&'static str> {
-    Some(match ggml_type {
-        t if t == GGML_TYPE_F32 => {
-            r#"
-constant uint BLOCK_BYTES = 4u;
-constant uint BLOCK_ELEMS = 1u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    uint bits = (uint)w[byte_offset] | ((uint)w[byte_offset + 1] << 8)
-        | ((uint)w[byte_offset + 2] << 16) | ((uint)w[byte_offset + 3] << 24);
-    return as_float(bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_F16 => {
-            r#"
-constant uint BLOCK_BYTES = 2u;
-constant uint BLOCK_ELEMS = 1u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    ushort bits = (ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8);
-    return orangu_half_to_float(bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_BF16 => {
-            r#"
-constant uint BLOCK_BYTES = 2u;
-constant uint BLOCK_ELEMS = 1u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    ushort bits = (ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8);
-    return orangu_bf16_to_float(bits);
-}
-"#
-        }
-        t if t == GGML_TYPE_Q4_0 => {
-            r#"
-constant uint BLOCK_BYTES = 18u;
-constant uint BLOCK_ELEMS = 32u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    if (k < 16u) {
-        uchar byte = w[byte_offset + 2u + k];
-        return ((float)((int)(byte & 0xFu) - 8)) * d;
-    }
-    uchar byte = w[byte_offset + 2u + (k - 16u)];
-    return ((float)((int)(byte >> 4) - 8)) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q5_0 => {
-            r#"
-constant uint BLOCK_BYTES = 22u;
-constant uint BLOCK_ELEMS = 32u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    uint qh = (uint)w[byte_offset + 2] | ((uint)w[byte_offset + 3] << 8)
-        | ((uint)w[byte_offset + 4] << 16) | ((uint)w[byte_offset + 5] << 24);
-    if (k < 16u) {
-        uchar byte = w[byte_offset + 6u + k];
-        uint xh0 = ((qh >> k) << 4) & 0x10u;
-        return ((float)((int)((byte & 0xFu) | xh0) - 16)) * d;
-    }
-    uint j = k - 16u;
-    uchar byte = w[byte_offset + 6u + j];
-    uint xh1 = (qh >> (j + 12u)) & 0x10u;
-    return ((float)((int)((byte >> 4) | xh1) - 16)) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q8_0 => {
-            r#"
-constant uint BLOCK_BYTES = 34u;
-constant uint BLOCK_ELEMS = 32u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    char q = (char)w[byte_offset + 2u + k];
-    return ((float)q) * d;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q4_K => {
-            r#"
-constant uint BLOCK_BYTES = 144u;
-constant uint BLOCK_ELEMS = 256u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    float dmin = orangu_half_to_float((ushort)w[byte_offset + 2] | ((ushort)w[byte_offset + 3] << 8));
-    uint scales_off = byte_offset + 4u;
-    uint qs_off = byte_offset + 16u;
-    uint q_offset = (k / 64u) * 64u;
-    uint local_in_group = k % 64u;
-    uint is_base = (q_offset / 64u) * 2u;
-    uint q_base = qs_off + q_offset / 2u;
-    uint sc, m;
-    if (local_in_group < 32u) {
-        uchar byte = w[q_base + local_in_group];
-        orangu_get_scale_min_k4(w, scales_off, is_base, &sc, &m);
-        float d1 = d * (float)sc;
-        float m1 = dmin * (float)m;
-        return d1 * (float)(byte & 0xFu) - m1;
-    }
-    uint l = local_in_group - 32u;
-    uchar byte = w[q_base + l];
-    orangu_get_scale_min_k4(w, scales_off, is_base + 1u, &sc, &m);
-    float d2 = d * (float)sc;
-    float m2 = dmin * (float)m;
-    return d2 * (float)(byte >> 4) - m2;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q5_K => {
-            r#"
-constant uint BLOCK_BYTES = 176u;
-constant uint BLOCK_ELEMS = 256u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    float dmin = orangu_half_to_float((ushort)w[byte_offset + 2] | ((ushort)w[byte_offset + 3] << 8));
-    uint scales_off = byte_offset + 4u;
-    uint qh_off = byte_offset + 16u;
-    uint qs_off = byte_offset + 48u;
-    uint q_offset = (k / 64u) * 64u;
-    uint idx = q_offset / 64u;
-    uint local_in_group = k % 64u;
-    uint is_base = idx * 2u;
-    uint ql_offset = idx * 32u;
-    uint u1 = 1u << (2u * idx);
-    uint u2 = 2u << (2u * idx);
-    uint sc, m;
-    if (local_in_group < 32u) {
-        uint l = local_in_group;
-        uchar byte = w[qs_off + ql_offset + l];
-        uchar qhbyte = w[qh_off + l];
-        int hi_bit = (qhbyte & u1) != 0u ? 16 : 0;
-        orangu_get_scale_min_k4(w, scales_off, is_base, &sc, &m);
-        float d1 = d * (float)sc;
-        float m1 = dmin * (float)m;
-        return d1 * (float)((int)(byte & 0xFu) + hi_bit) - m1;
-    }
-    uint l = local_in_group - 32u;
-    uchar byte = w[qs_off + ql_offset + l];
-    uchar qhbyte = w[qh_off + l];
-    int hi_bit = (qhbyte & u2) != 0u ? 16 : 0;
-    orangu_get_scale_min_k4(w, scales_off, is_base + 1u, &sc, &m);
-    float d2 = d * (float)sc;
-    float m2 = dmin * (float)m;
-    return d2 * (float)((int)(byte >> 4) + hi_bit) - m2;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q6_K => {
-            r#"
-constant uint BLOCK_BYTES = 210u;
-constant uint BLOCK_ELEMS = 256u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    uint ql_off = byte_offset;
-    uint qh_off = byte_offset + 128u;
-    uint sc_off = byte_offset + 192u;
-    float d = orangu_half_to_float((ushort)w[byte_offset + 208] | ((ushort)w[byte_offset + 209] << 8));
-    uint y_off = (k / 128u) * 128u;
-    uint idx = y_off / 128u;
-    uint local_in_group = k % 128u;
-    uint which_q = local_in_group / 32u;
-    uint l = local_in_group % 32u;
-    uint ql_o = idx * 64u;
-    uint qh_o = idx * 32u;
-    uint sc_o = idx * 8u;
-    uint is = l / 16u;
-    uchar ql_l = w[ql_off + ql_o + l];
-    uchar ql_l32 = w[ql_off + ql_o + l + 32u];
-    uchar qh_l = w[qh_off + qh_o + l];
-    int q;
-    uint sc_idx;
-    if (which_q == 0u) {
-        q = (int)((ql_l & 0xFu) | ((qh_l & 3u) << 4)) - 32;
-        sc_idx = is;
-    } else if (which_q == 1u) {
-        q = (int)((ql_l32 & 0xFu) | (((qh_l >> 2) & 3u) << 4)) - 32;
-        sc_idx = is + 2u;
-    } else if (which_q == 2u) {
-        q = (int)((ql_l >> 4) | (((qh_l >> 4) & 3u) << 4)) - 32;
-        sc_idx = is + 4u;
-    } else {
-        q = (int)((ql_l32 >> 4) | (((qh_l >> 6) & 3u) << 4)) - 32;
-        sc_idx = is + 6u;
-    }
-    char sc = (char)w[sc_off + sc_o + sc_idx];
-    return d * (float)sc * (float)q;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q2_K => {
-            r#"
-constant uint BLOCK_BYTES = 84u;
-constant uint BLOCK_ELEMS = 256u;
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    uint scales_off = byte_offset;
-    uint qs_off = byte_offset + 16u;
-    float d = orangu_half_to_float((ushort)w[byte_offset + 80] | ((ushort)w[byte_offset + 81] << 8));
-    float dmin = orangu_half_to_float((ushort)w[byte_offset + 82] | ((ushort)w[byte_offset + 83] << 8));
-    uint n = k / 128u;
-    uint r = k % 128u;
-    uint s = r / 32u;
-    uint h = (r % 32u) / 16u;
-    uint l = r % 16u;
-    uchar sc = w[scales_off + n * 8u + s * 2u + h];
-    float dl = d * (float)(sc & 0xFu);
-    float ml = dmin * (float)(sc >> 4);
-    uchar byte = w[qs_off + n * 32u + h * 16u + l];
-    return dl * (float)((byte >> (2u * s)) & 3u) - ml;
-}
-"#
-        }
-        t if t == GGML_TYPE_Q3_K => {
-            r#"
-constant uint BLOCK_BYTES = 110u;
-constant uint BLOCK_ELEMS = 256u;
-// Q3_K's `i`th 6-bit sub-block scale (0..16), still biased by 32, out of the
-// 12 bytes at `base`. Mirrors `quant::unpack_q3_k_scales` for one index.
-inline uint orangu_q3k_scale(__global const uchar *w, uint base, uint i) {
-    uint low;
-    if (i < 8u) {
-        low = w[base + i] & 0xFu;
-    } else {
-        low = w[base + i - 8u] >> 4;
-    }
-    uint high = (w[base + 8u + (i % 4u)] >> (2u * (i / 4u))) & 3u;
-    return low | (high << 4);
-}
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    uint hmask_off = byte_offset;
-    uint qs_off = byte_offset + 32u;
-    uint scales_off = byte_offset + 96u;
-    float d_all = orangu_half_to_float((ushort)w[byte_offset + 108] | ((ushort)w[byte_offset + 109] << 8));
-    uint n = k / 128u;
-    uint r = k % 128u;
-    uint s = r / 32u;
-    uint h = (r % 32u) / 16u;
-    uint l = r % 16u;
-    uint idx = h * 16u + l;
-    uint m = 1u << (n * 4u + s);
-    float dl = d_all * (float)((int)orangu_q3k_scale(w, scales_off, n * 8u + s * 2u + h) - 32);
-    int hi = 4;
-    if ((w[hmask_off + idx] & m) != 0u) {
-        hi = 0;
-    }
-    uint q = (w[qs_off + n * 32u + idx] >> (2u * s)) & 3u;
-    return dl * (float)((int)q - hi);
-}
-"#
-        }
-        t if t == GGML_TYPE_IQ4_NL => {
-            r#"
-constant uint BLOCK_BYTES = 18u;
-constant uint BLOCK_ELEMS = 32u;
-// The 16 non-uniformly spaced levels an IQ4_NL nibble selects between —
-// `engine::iq_grids::KVALUES_IQ4NL`, transcribed. Small enough to inline
-// per kernel, unlike the `IQ*` lattice codebooks (which is why this is the
-// one `IQ*` type here at all).
-constant char ORANGU_KVALUES_IQ4NL[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-inline float dequant_element(__global const uchar *w, uint byte_offset, uint k) {
-    float d = orangu_half_to_float((ushort)w[byte_offset] | ((ushort)w[byte_offset + 1] << 8));
-    uchar byte = w[byte_offset + 2u + (k % 16u)];
-    uint nib = (k < 16u) ? (uint)(byte & 0xFu) : (uint)(byte >> 4);
-    return d * (float)ORANGU_KVALUES_IQ4NL[nib];
-}
-"#
-        }
-        _ => return None,
-    })
-}
-
 /// The complete, compile-ready OpenCL-C source for `ggml_type`'s matmul
 /// kernel, or `None` if this backend has no kernel for it.
 fn kernel_source(ggml_type: u32) -> Option<String> {
-    let middle = dequant_element_source(ggml_type)?;
-    Some(format!("{PRELUDE}\n{middle}\n{MAIN}"))
+    super::vendor_shaders::kernel_source(super::vendor_shaders::Dialect::OpenCl, ggml_type)
 }
 
 /// `QuantMatrix::cache_key()`'s return type — named, like `vulkan.rs`'s own
@@ -515,30 +78,12 @@ type WeightCacheKey = (usize, usize);
 
 pub struct OpenClBackend {
     context: Context,
-    /// Guards both the command queue and (implicitly, since a launch is
-    /// entirely done while holding this) each kernel object's argument
-    /// state — `clSetKernelArg` mutates the `cl_kernel` object in place, so
-    /// two threads racing to set arguments on the *same* `Kernel` before
-    /// either enqueues would silently launch with a mixed-up argument set.
-    /// `engine::scheduler::SlotPool` runs multiple request slots' forward
-    /// passes concurrently, each potentially calling into the same
-    /// `OpenClBackend`, so this genuinely needs guarding — unlike
-    /// `VulkanBackend`, which instead gives each `(weight, n_tokens)` op
-    /// its own cached, independently-lockable resources.
     queue: Mutex<CommandQueue>,
-    /// One kernel per `ggml_type`, plus the `Program` each was built from
-    /// (kept alive — a `Kernel` internally holds a `cl_program` reference,
-    /// but keeping the owning `Program` here too avoids relying on that).
-    /// `Kernel` is `Send` but not `Sync` (its raw `cl_kernel` handle can't
-    /// safely be touched by two threads at once — the same
-    /// `clSetKernelArg` hazard `Self::queue`'s doc comment explains), so
-    /// the whole map lives behind one more `Mutex` rather than each
-    /// `Kernel` individually — simpler, and this backend never needs two
-    /// *different* types' kernels running concurrently anyway.
     kernels: Mutex<HashMap<u32, (Program, Kernel)>>,
-    /// Same identity-keyed reuse discipline as `VulkanBackend::weight_
-    /// buffer`/`CudaBackend::weight_buffer`.
     weight_cache: Mutex<HashMap<WeightCacheKey, Arc<Buffer<u8>>>>,
+    /// The `IQ*` codebooks, uploaded once at init — see
+    /// `engine::iq_grids::packed`.
+    iq_grids: Buffer<u32>,
     /// The device's own name — for the startup banner.
     pub device_name: String,
 }
@@ -626,11 +171,28 @@ impl OpenClBackend {
             kernels.insert(ggml_type, (program, kernel));
         }
 
+        // The `IQ*` lattice codebooks, uploaded once and bound to every
+        // launch — see `vendor_shaders::iq_grid_prelude` for why every
+        // kernel takes the pointer whether or not it reads one.
+        let grid_words = crate::engine::iq_grids::packed::words();
+        let mut iq_grids = unsafe {
+            Buffer::<u32>::create(
+                &context,
+                CL_MEM_READ_ONLY,
+                grid_words.len(),
+                ptr::null_mut(),
+            )
+        }
+        .ok()?;
+        unsafe { queue.enqueue_write_buffer(&mut iq_grids, CL_BLOCKING, 0, &grid_words, &[]) }
+            .ok()?;
+
         Some(Self {
             context,
             queue: Mutex::new(queue),
             kernels: Mutex::new(kernels),
             weight_cache: Mutex::new(HashMap::new()),
+            iq_grids,
             device_name,
         })
     }
@@ -669,6 +231,12 @@ impl OpenClBackend {
 }
 
 impl Backend for OpenClBackend {
+    /// See [`Backend::reduced_surface`] — this backend implements
+    /// [`Backend::matmul`] and nothing else.
+    fn reduced_surface(&self) -> Option<&'static str> {
+        Some(super::MATMUL_ONLY_SURFACE)
+    }
+
     fn supports_type(&self, ggml_type: u32) -> bool {
         SUPPORTED_TYPES.contains(&ggml_type)
     }
@@ -724,6 +292,7 @@ impl Backend for OpenClBackend {
                 .set_arg(&out_dim)
                 .set_arg(&n_tokens_u32)
                 .set_arg(&row_bytes)
+                .set_arg(&self.iq_grids)
                 .set_local_work_size(LOCAL_WORK_SIZE)
                 .set_global_work_size(global_work_size)
                 .enqueue_nd_range(&queue)
@@ -740,14 +309,136 @@ impl Backend for OpenClBackend {
         y
     }
 
+    /// Every op enqueued before any is read back — see
+    /// [`crate::engine::backend::CudaBackend::matmul_batch`] for the shape and
+    /// why it is the same one here. `matmul` ends in `read_event.wait()`, so
+    /// the default one-`matmul`-per-op implementation blocks the host once
+    /// per op with the device idle across each wait.
+    ///
+    /// Two OpenCL-specific notes. The command queue lock is taken **once per
+    /// chunk** rather than once per op, which is itself a serialization this
+    /// used to pay on every call. And every weight buffer is resolved
+    /// *before* that lock is taken: `weight_buffer` takes the same lock to
+    /// upload a weight it has not seen, and `Mutex` here is not reentrant, so
+    /// resolving one inside the chunk would deadlock on the first cache miss.
     fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
-        ops.iter()
-            .map(|op| {
-                crate::engine::backend::guarded_matmul_op(op, |x, n_tokens, w| {
-                    self.matmul(x, n_tokens, w)
-                })
-            })
-            .collect()
+        use crate::engine::backend::{BATCH_DEVICE_BUDGET_BYTES, plan_batch};
+
+        let (stripes, chunks) = plan_batch(ops, BATCH_DEVICE_BUDGET_BYTES);
+        let mut out: Vec<Vec<f32>> = ops
+            .iter()
+            .map(|op| Vec::with_capacity(op.n_tokens * op.w.out_dim))
+            .collect();
+        for chunk in chunks {
+            let chunk = &stripes[chunk];
+            // Before the queue lock. See this function's doc comment.
+            let weights: Vec<Arc<Buffer<u8>>> = chunk
+                .iter()
+                .map(|stripe| self.weight_buffer(ops[stripe.op].w))
+                .collect();
+
+            let queue = self.queue.lock().expect("opencl queue poisoned");
+            let kernels = self.kernels.lock().expect("opencl kernels poisoned");
+            // `x` and `y` both stay alive until every read below has
+            // completed: the kernel reads one and writes the other, and
+            // neither has run yet at the point the enqueue call returns.
+            let mut buffers: Vec<(Buffer<f32>, Buffer<f32>, opencl3::event::Event)> =
+                Vec::with_capacity(chunk.len());
+            for (stripe, weights) in chunk.iter().zip(&weights) {
+                let op = &ops[stripe.op];
+                let in_dim = op.w.in_dim as u32;
+                let out_dim = op.w.out_dim as u32;
+                let row_bytes = op.w.row_bytes() as u32;
+                let n_tokens_u32 = stripe.n_tokens as u32;
+                let rows =
+                    stripe.start * op.w.in_dim..(stripe.start + stripe.n_tokens) * op.w.in_dim;
+                let x = &op.x[rows];
+                let y_len = stripe.n_tokens * op.w.out_dim;
+
+                let n_row_groups = (out_dim as usize).div_ceil(4);
+                let num_groups = (n_row_groups * stripe.n_tokens).max(1);
+                let global_work_size = num_groups * LOCAL_WORK_SIZE;
+
+                let mut x_buf = unsafe {
+                    Buffer::<f32>::create(
+                        &self.context,
+                        CL_MEM_READ_ONLY,
+                        x.len().max(1),
+                        ptr::null_mut(),
+                    )
+                }
+                .expect("opencl x buffer allocation failed");
+                // Blocking, as in `matmul`: this waits for a host-to-device
+                // copy, not for a kernel, so it does not serialize the batch
+                // against the device.
+                unsafe { queue.enqueue_write_buffer(&mut x_buf, CL_BLOCKING, 0, x, &[]) }
+                    .expect("opencl x upload failed");
+                let y_buf = unsafe {
+                    Buffer::<f32>::create(
+                        &self.context,
+                        CL_MEM_WRITE_ONLY,
+                        y_len.max(1),
+                        ptr::null_mut(),
+                    )
+                }
+                .expect("opencl y buffer allocation failed");
+
+                let (_program, kernel) = kernels.get(&op.w.ggml_type()).unwrap_or_else(|| {
+                    panic!(
+                        "ggml_type {} reached OpenClBackend::matmul_batch without a \
+                         compiled kernel (QuantMatrix construction should have rejected \
+                         it earlier)",
+                        op.w.ggml_type()
+                    )
+                });
+                let kernel_event = unsafe {
+                    ExecuteKernel::new(kernel)
+                        .set_arg(&**weights)
+                        .set_arg(&x_buf)
+                        .set_arg(&y_buf)
+                        .set_arg(&in_dim)
+                        .set_arg(&out_dim)
+                        .set_arg(&n_tokens_u32)
+                        .set_arg(&row_bytes)
+                        .set_arg(&self.iq_grids)
+                        .set_local_work_size(LOCAL_WORK_SIZE)
+                        .set_global_work_size(global_work_size)
+                        .enqueue_nd_range(&queue)
+                }
+                .expect("opencl kernel launch failed");
+                buffers.push((x_buf, y_buf, kernel_event));
+            }
+            drop(kernels);
+
+            let mut hosts: Vec<Vec<f32>> = chunk
+                .iter()
+                .map(|stripe| vec![0f32; stripe.n_tokens * ops[stripe.op].w.out_dim])
+                .collect();
+            let mut reads = Vec::with_capacity(chunk.len());
+            for (host, (_x, y_buf, kernel_event)) in hosts.iter_mut().zip(&buffers) {
+                reads.push(
+                    unsafe {
+                        queue.enqueue_read_buffer(
+                            y_buf,
+                            CL_NON_BLOCKING,
+                            0,
+                            host,
+                            &[kernel_event.get()],
+                        )
+                    }
+                    .expect("opencl y readback enqueue failed"),
+                );
+            }
+            for read in &reads {
+                read.wait().expect("opencl y readback failed");
+            }
+            drop(queue);
+
+            for (stripe, host) in chunk.iter().zip(hosts) {
+                out[stripe.op].extend(host);
+            }
+        }
+        out
     }
 }
 
@@ -757,8 +448,10 @@ mod tests {
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
+        GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
     };
 
@@ -783,38 +476,21 @@ mod tests {
         (0..n).map(|_| next_byte(seed)).collect()
     }
 
+    /// Straight from `engine::quant`, which is where a block layout is
+    /// defined. This module used to keep its own copy of that table; so did
+    /// the other two vendor backends, and a type added to `quant` and to
+    /// `vendor_shaders` but not to all three copies would fail here as
+    /// `unreachable!()` rather than as a missing kernel.
     fn block_bytes_for(ggml_type: u32) -> usize {
-        match ggml_type {
-            t if t == GGML_TYPE_F32 => 4,
-            t if t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 2,
-            t if t == GGML_TYPE_Q4_0 => 18,
-            t if t == GGML_TYPE_Q5_0 => 22,
-            t if t == GGML_TYPE_Q8_0 => 34,
-            t if t == GGML_TYPE_Q2_K => 84,
-            t if t == GGML_TYPE_Q3_K => 110,
-            t if t == GGML_TYPE_Q4_K => 144,
-            t if t == GGML_TYPE_Q5_K => 176,
-            t if t == GGML_TYPE_Q6_K => 210,
-            t if t == GGML_TYPE_IQ4_NL => 18,
-            _ => unreachable!(),
-        }
+        crate::engine::quant::block_layout(ggml_type)
+            .expect("a type under cross-check has a block layout")
+            .0
     }
 
     fn block_elems_for(ggml_type: u32) -> usize {
-        match ggml_type {
-            t if t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 => 1,
-            // `IQ4_NL` belongs with the 32-element legacy quants, not the
-            // 256 default: it is the one `IQ*` type that does not block at
-            // `QK_K`.
-            t if t == GGML_TYPE_Q4_0
-                || t == GGML_TYPE_Q5_0
-                || t == GGML_TYPE_Q8_0
-                || t == GGML_TYPE_IQ4_NL =>
-            {
-                32
-            }
-            _ => 256,
-        }
+        crate::engine::quant::block_layout(ggml_type)
+            .expect("a type under cross-check has a block layout")
+            .1
     }
 
     /// Cross-checks `OpenClBackend::matmul` against `CpuBackend::matmul`
@@ -870,6 +546,17 @@ mod tests {
     fn matmul_matches_cpu_backend_for_q5_0() {
         cross_check(GGML_TYPE_Q5_0, 64, 6, 1);
     }
+    /// The two affine block quants this engine could always read on the CPU
+    /// and could not run on this device — no codebook, no extra binding,
+    /// simply never written. See `PARITY.md` C3.
+    #[test]
+    fn matmul_matches_cpu_backend_for_q4_1() {
+        cross_check(GGML_TYPE_Q4_1, 64, 6, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_q5_1() {
+        cross_check(GGML_TYPE_Q5_1, 64, 6, 1);
+    }
     #[test]
     fn matmul_matches_cpu_backend_for_q8_0() {
         cross_check(GGML_TYPE_Q8_0, 64, 6, 1);
@@ -901,6 +588,42 @@ mod tests {
     /// in the first place: a K-quant needs 256 | `in_dim`, so upstream
     /// substitutes `IQ4_NL` on rows like this one. A 256-wide check would
     /// not distinguish a correct block stride from one that assumed `QK_K`.
+    /// The eight `IQ*` types this device could not take at all until the
+    /// lattice codebooks were uploaded — a capability gap, not a speed one:
+    /// `engine::backend::unsupported_tensor_types` refused the whole GPU for
+    /// a file carrying any of them. See `PARITY.md` C3.
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_s() {
+        cross_check(GGML_TYPE_IQ1_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq1_m() {
+        cross_check(GGML_TYPE_IQ1_M, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xxs() {
+        cross_check(GGML_TYPE_IQ2_XXS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_xs() {
+        cross_check(GGML_TYPE_IQ2_XS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq2_s() {
+        cross_check(GGML_TYPE_IQ2_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_xxs() {
+        cross_check(GGML_TYPE_IQ3_XXS, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq3_s() {
+        cross_check(GGML_TYPE_IQ3_S, 256, 4, 1);
+    }
+    #[test]
+    fn matmul_matches_cpu_backend_for_iq4_xs() {
+        cross_check(GGML_TYPE_IQ4_XS, 256, 4, 1);
+    }
     #[test]
     fn matmul_matches_cpu_backend_for_iq4_nl() {
         cross_check(GGML_TYPE_IQ4_NL, 896, 6, 1);

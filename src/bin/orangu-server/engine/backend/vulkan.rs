@@ -124,60 +124,13 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// The `IQ*` codebooks packed into one `u32` array for upload, at the
-/// offsets `vulkan_shaders::IQ_GRID_PRELUDE` declares. The two `iq2*` grids
-/// hold `u64` lattice points and go in low word first; the `iq3*` grids are
-/// already `u32`; `ksigns_iq2xs` and `kvalues_iq4nl` are byte tables packed
-/// four to a word, little-end first, so the shader's
-/// `>> ((i & 3) * 8)` reads them back in order.
-///
-/// The offsets are asserted rather than computed from the slice lengths so
-/// that growing a table without updating the WGSL constants fails here, at
-/// startup, instead of silently shifting every later table.
+/// The `IQ*` codebooks packed for upload — `engine::iq_grids::packed`,
+/// which is where the packing lives now that three other backends need the
+/// identical bytes. The offsets `vulkan_shaders::IQ_GRID_PRELUDE` declares
+/// are the same module's constants; `iq_grid_prelude_offsets_match_the_
+/// packing` holds the WGSL to them.
 fn iq_grid_words() -> Vec<u32> {
-    use crate::engine::iq_grids::{
-        IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
-        KVALUES_IQ4NL,
-    };
-
-    let mut words = Vec::with_capacity(8484);
-    for &g in IQ2XS_GRID.iter().chain(IQ2S_GRID.iter()) {
-        words.push(g as u32);
-        words.push((g >> 32) as u32);
-    }
-    assert_eq!(words.len(), 3072, "iq2 grids must end at IQ3XXS_GRID_OFF");
-    words.extend_from_slice(&IQ3XXS_GRID);
-    words.extend_from_slice(&IQ3S_GRID);
-    assert_eq!(words.len(), 3840, "iq3 grids must end at KSIGNS_OFF");
-    words.extend(
-        KSIGNS_IQ2XS
-            .chunks(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-    );
-    assert_eq!(words.len(), 3872, "ksigns must end at KVALUES_IQ4NL_OFF");
-    words.extend(
-        KVALUES_IQ4NL
-            .chunks(4)
-            .map(|c| u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])),
-    );
-    // The two grids appended last are the ones that make `IQ2_XXS`, `IQ1_S`
-    // and `IQ1_M` GPU types at all: `IQ2XXS_GRID` is `IQ2_XXS`'s own
-    // 256-point lattice, and `IQ1S_GRID` is shared by both `iq1*` types.
-    // `IQ1S_GRID` is 16 KiB by itself, which is why the whole buffer is
-    // ~33 KiB rather than the ~15 KiB it was — still a rounding error next
-    // to any weight tensor, and read-only storage cached like one.
-    assert_eq!(words.len(), 3876, "kvalues must end at IQ2XXS_GRID_OFF");
-    for &g in IQ2XXS_GRID.iter() {
-        words.push(g as u32);
-        words.push((g >> 32) as u32);
-    }
-    assert_eq!(words.len(), 4388, "iq2_xxs grid must end at IQ1S_GRID_OFF");
-    for &g in IQ1S_GRID.iter() {
-        words.push(g as u32);
-        words.push((g >> 32) as u32);
-    }
-    assert_eq!(words.len(), 8484, "packed IQ grid size");
-    words
+    crate::engine::iq_grids::packed::words()
 }
 
 /// `Meta` in `vulkan_shaders::PRELUDE` — `#[repr(C)]` so its layout matches

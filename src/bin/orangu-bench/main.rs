@@ -3656,6 +3656,17 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
             let show = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
             println!("  server   pid {} up {}s", show(pid), show(uptime));
         }
+        // Beside the GPU clock, because it is the same class of evidence and
+        // the more consequential of the two for anything CPU-bound. A MoE
+        // decode measured under `schedutil` came out **2.6x** slower than the
+        // same build under `performance` on this project's own hardware,
+        // where a GPU-heavy dense model lost 11%. The server's own banner
+        // reports it, but a bench run is what a perf number is copied out of,
+        // and a header that shows the card's clock while staying silent about
+        // the CPU's invites the reading that only the card was checked.
+        if let Some(governor) = orangu::hardware::cpu_governor() {
+            println!("  cpu      governor {governor}");
+        }
         for gpu in &gpus {
             println!(
                 "  gpu      {} sclk {} ({})",
@@ -3720,6 +3731,15 @@ fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or(false)
     {
         return format_device_split(gpu);
+    }
+    // Likewise a backend with no kernel *selection* to report, which says
+    // what it runs instead — the CUDA/ROCm/OpenCL backends, which implement
+    // `matmul` and nothing else (`Backend::reduced_surface`). A third
+    // document under the same key, and reading it as a tuning report would
+    // print the same wall of `?` the split used to: "this server declined to
+    // say" where the truth is "there was nothing to choose".
+    if let Some(surface) = gpu.get("surface").and_then(serde_json::Value::as_str) {
+        return vec![format!("surface  {surface}")];
     }
     let get = |path: [&str; 2]| -> Option<&serde_json::Value> {
         gpu.get(path[0]).and_then(|v| v.get(path[1]))
@@ -4333,6 +4353,28 @@ mod tests {
                 ],
             },
         })
+    }
+
+    /// The same failure as the split one below, for the third document that
+    /// can arrive under `gpu`. A backend that implements `matmul` and nothing
+    /// else has no kernel table, no flags and no geometry, so every field a
+    /// tuning report asks for is absent — and a header full of `?` reads as a
+    /// device that lost its kernels rather than one that never had a choice
+    /// to report. The point of the row is that it is *never* silent on a GPU:
+    /// a run on one of these backends must not be mistaken for a full-path
+    /// run by anything reading the header.
+    #[test]
+    fn a_matmul_only_backend_reports_its_surface_instead_of_a_wall_of_question_marks() {
+        let gpu = serde_json::json!({
+            "surface": "matmul only - no fused layer chain, GPU attention or GPU sampling",
+            "kernels": serde_json::Value::Null,
+        });
+        let text = format_gpu_tuning(Some(&gpu)).join("\n");
+        assert!(!text.contains('?'), "{text}");
+        assert!(text.contains("matmul only"), "{text}");
+        assert!(text.contains("no fused layer chain"), "{text}");
+        // One line, not a tuning report with one field filled in.
+        assert_eq!(text.lines().count(), 1, "{text}");
     }
 
     /// The header used to read a split's placement plan as a tuning report

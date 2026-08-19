@@ -369,65 +369,95 @@ impl BailingMoeModel {
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
 
+        // Grown once and reused across layers rather than allocated per
+        // norm: at prefill widths this is megabytes a layer. See
+        // `tensor::rmsnorm_into`.
+        let mut cur: Vec<f32> = Vec::new();
+        // Projection outputs, on the same principle — see
+        // `Backend::matmul_into`.
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
+        // The attention half's projections, on the same principle.
+        let mut attn_out: Vec<f32> = Vec::new();
+        let mut kda_scratch = super::kda::KdaScratch::default();
+        let mut mla_scratch = super::kda::MlaScratch::default();
+
         for layer in &self.layers {
-            let mut cur = x.clone();
-            tensor::rmsnorm_inplace(
+            tensor::rmsnorm_into(
                 &mut cur,
+                &x,
                 &layer.attn_norm,
                 n_tokens,
                 n_embd,
                 self.config.rms_eps,
             );
-            let attn = match &layer.attn {
-                Attn::Kda(kda) => {
-                    kda.forward(self.backend.as_ref(), &self.kda, cache, &cur, n_tokens)
-                }
-                Attn::Mla(mla) => mla.forward(
+            match &layer.attn {
+                Attn::Kda(kda) => kda.forward_into(
                     self.backend.as_ref(),
+                    &mut attn_out,
+                    &mut kda_scratch,
+                    &self.kda,
+                    cache,
+                    &cur,
+                    n_tokens,
+                ),
+                Attn::Mla(mla) => mla.forward_into(
+                    self.backend.as_ref(),
+                    &mut attn_out,
+                    &mut mla_scratch,
                     &self.mla,
                     cache,
                     &cur,
                     n_tokens,
                     start_pos,
                 ),
-            };
-            tensor::add_inplace(&mut x, &attn);
+            }
+            tensor::add_inplace(&mut x, &attn_out);
 
-            let mut cur = x.clone();
-            tensor::rmsnorm_inplace(
+            tensor::rmsnorm_into(
                 &mut cur,
+                &x,
                 &layer.ffn_norm,
                 n_tokens,
                 n_embd,
                 self.config.rms_eps,
             );
-            let ffn = match &layer.ffn {
-                Ffn::Dense { gate, up, down } => {
-                    super::swiglu_ffn(self.backend.as_ref(), &cur, n_tokens, gate, up, down)
-                }
-                Ffn::Moe(moe) => super::swiglu_moe_ffn(
+            match &layer.ffn {
+                Ffn::Dense { gate, up, down } => super::swiglu_ffn_into(
                     self.backend.as_ref(),
-                    &self.routing,
+                    &mut ffn_out,
+                    &mut ffn_scratch,
                     &cur,
                     n_tokens,
-                    n_embd,
-                    &SwigluMoe {
-                        gate_inp: &moe.gate_inp,
-                        exp_probs_b: moe.exp_probs_b.as_deref(),
-                        gate_exps: &moe.gate_exps,
-                        up_exps: &moe.up_exps,
-                        down_exps: &moe.down_exps,
-                        shared: Some(SwigluSharedExpert {
-                            gate: &moe.gate_shexp,
-                            up: &moe.up_shexp,
-                            down: &moe.down_shexp,
-                        }),
-                        clamp_exp: moe.clamp_exp,
-                        clamp_shexp: moe.clamp_shexp,
-                    },
+                    gate,
+                    up,
+                    down,
                 ),
-            };
-            tensor::add_inplace(&mut x, &ffn);
+                Ffn::Moe(moe) => {
+                    ffn_out = super::swiglu_moe_ffn(
+                        self.backend.as_ref(),
+                        &self.routing,
+                        &cur,
+                        n_tokens,
+                        n_embd,
+                        &SwigluMoe {
+                            gate_inp: &moe.gate_inp,
+                            exp_probs_b: moe.exp_probs_b.as_deref(),
+                            gate_exps: &moe.gate_exps,
+                            up_exps: &moe.up_exps,
+                            down_exps: &moe.down_exps,
+                            shared: Some(SwigluSharedExpert {
+                                gate: &moe.gate_shexp,
+                                up: &moe.up_shexp,
+                                down: &moe.down_shexp,
+                            }),
+                            clamp_exp: moe.clamp_exp,
+                            clamp_shexp: moe.clamp_shexp,
+                        },
+                    )
+                }
+            }
+            tensor::add_inplace(&mut x, &ffn_out);
         }
 
         tensor::rmsnorm_inplace(

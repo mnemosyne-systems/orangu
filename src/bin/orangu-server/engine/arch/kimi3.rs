@@ -408,8 +408,22 @@ impl Kimi3Model {
         // The banked cross-layer residual checkpoints, each a full
         // `[n_tokens, n_embd]` slab.
         let mut banked: Vec<Vec<f32>> = Vec::new();
+        // Projection buffers, grown once and reused by every layer — see
+        // `Backend::matmul_into`.
+        let mut attn_out: Vec<f32> = Vec::new();
+        let mut kda_scratch = super::kda::KdaScratch::default();
+        let mut mla_scratch = super::kda::MlaScratch::default();
+        let mut ffn_out: Vec<f32> = Vec::new();
+        let mut ffn_gate: Vec<f32> = Vec::new();
+        let mut ffn_up: Vec<f32> = Vec::new();
+        // The residual mixes, one buffer per call site so none overwrites a
+        // value another still needs.
+        let mut attn_mix: Vec<f32> = Vec::new();
+        let mut ffn_mix: Vec<f32> = Vec::new();
+
         for (il, layer) in self.layers.iter().enumerate() {
-            let mut cur = self.res_mix(&banked, &x, &layer.attn_res_score, n_tokens);
+            self.res_mix_into(&mut attn_mix, &banked, &x, &layer.attn_res_score, n_tokens);
+            let cur = &mut attn_mix;
             // A checkpoint layer banks its *raw* input, and the residual
             // stream then restarts from this layer's attention output —
             // the bank is what carries the old stream forward.
@@ -418,53 +432,55 @@ impl Kimi3Model {
                 banked.push(x.clone());
             }
 
-            tensor::rmsnorm_inplace(
-                &mut cur,
-                &layer.attn_norm,
-                n_tokens,
-                n_embd,
-                self.config.rms_eps,
-            );
-            let attn = match &layer.attn {
-                Attn::Kda(kda) => {
-                    kda.forward(self.backend.as_ref(), &self.kda, cache, &cur, n_tokens)
-                }
-                Attn::Mla(mla) => mla.forward(
+            tensor::rmsnorm_inplace(cur, &layer.attn_norm, n_tokens, n_embd, self.config.rms_eps);
+            match &layer.attn {
+                Attn::Kda(kda) => kda.forward_into(
                     self.backend.as_ref(),
+                    &mut attn_out,
+                    &mut kda_scratch,
+                    &self.kda,
+                    cache,
+                    cur,
+                    n_tokens,
+                ),
+                Attn::Mla(mla) => mla.forward_into(
+                    self.backend.as_ref(),
+                    &mut attn_out,
+                    &mut mla_scratch,
                     &self.mla,
                     cache,
-                    &cur,
+                    cur,
                     n_tokens,
                     start_pos,
                 ),
-            };
+            }
             if is_checkpoint {
-                x = attn;
+                // The residual stream restarts from this layer's attention
+                // output. A swap rather than a move: `x`'s old buffer was
+                // already banked by value above, so handing it to `attn_out`
+                // costs nothing and gives the next layer its capacity back.
+                std::mem::swap(&mut x, &mut attn_out);
             } else {
-                tensor::add_inplace(&mut x, &attn);
+                tensor::add_inplace(&mut x, &attn_out);
             }
 
-            let mut cur = self.res_mix(&banked, &x, &layer.ffn_res_score, n_tokens);
-            tensor::rmsnorm_inplace(
-                &mut cur,
-                &layer.ffn_norm,
-                n_tokens,
-                n_embd,
-                self.config.rms_eps,
-            );
-            let ffn = match &layer.ffn {
+            self.res_mix_into(&mut ffn_mix, &banked, &x, &layer.ffn_res_score, n_tokens);
+            let cur = &mut ffn_mix;
+            tensor::rmsnorm_inplace(cur, &layer.ffn_norm, n_tokens, n_embd, self.config.rms_eps);
+            match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    let gate = self.backend.matmul(&cur, n_tokens, gate);
-                    let up = self.backend.matmul(&cur, n_tokens, up);
-                    let h = situ_vec(&gate, &up, self.situ_beta, self.situ_linear_beta);
-                    self.backend.matmul(&h, n_tokens, down)
+                    self.backend.matmul_into(&mut ffn_gate, cur, n_tokens, gate);
+                    self.backend.matmul_into(&mut ffn_up, cur, n_tokens, up);
+                    let h = situ_vec(&ffn_gate, &ffn_up, self.situ_beta, self.situ_linear_beta);
+                    self.backend.matmul_into(&mut ffn_out, &h, n_tokens, down);
                 }
-                Ffn::Moe(moe) => self.latent_moe(moe, &cur, n_tokens),
-            };
-            tensor::add_inplace(&mut x, &ffn);
+                Ffn::Moe(moe) => ffn_out = self.latent_moe(moe, cur, n_tokens),
+            }
+            tensor::add_inplace(&mut x, &ffn_out);
         }
 
-        let mut out = self.res_mix(&banked, &x, &self.output_res_score, n_tokens);
+        let mut out = Vec::new();
+        self.res_mix_into(&mut out, &banked, &x, &self.output_res_score, n_tokens);
         tensor::rmsnorm_inplace(
             &mut out,
             &self.output_norm,
@@ -483,15 +499,24 @@ impl Kimi3Model {
     /// `score_w`, but the *weighted sum is over the raw values* — the norm
     /// only decides the weights. A no-op until the first checkpoint has
     /// been banked, which is why layer 0 sees the plain embedding.
-    fn res_mix(
+    /// Into a caller-owned buffer — see `Backend::matmul_into`. Called
+    /// three times per layer, each time for a `[n_tokens, n_embd]` result.
+    fn res_mix_into(
         &self,
+        out: &mut Vec<f32>,
         banked: &[Vec<f32>],
         cur: &[f32],
         score_w: &[f32],
         n_tokens: usize,
-    ) -> Vec<f32> {
+    ) {
         if banked.is_empty() || self.res_block_size == 0 {
-            return cur.to_vec();
+            // Still a copy — the caller norms this in place and needs `cur`
+            // itself untouched — but not an allocation. Fusing the copy into
+            // that norm, the way `tensor::rmsnorm_into` does elsewhere,
+            // would mean splitting this branch out at the call site.
+            out.clear();
+            out.extend_from_slice(cur);
+            return;
         }
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
@@ -499,7 +524,8 @@ impl Kimi3Model {
         // the row is ever materialized just to be dotted and dropped.
         let score = |row: &[f32]| tensor::dot(row, score_w) * rms_norm_scale(row_mean_sq(row), eps);
 
-        let mut out = vec![0f32; n_tokens * n_embd];
+        // Accumulated into, not overwritten — see `tensor::zeroed_to`.
+        let out = tensor::zeroed_to(out, n_tokens * n_embd);
         for t in 0..n_tokens {
             let span = t * n_embd..(t + 1) * n_embd;
             let mut scores: Vec<f32> = banked.iter().map(|b| score(&b[span.clone()])).collect();
@@ -512,14 +538,12 @@ impl Kimi3Model {
             }
             tensor::axpy_inplace(dst, &cur[span.clone()], scores[banked.len()]);
         }
-        out
     }
 
     /// The latent MoE: route on the full-width input, run the selected
     /// experts in the latent space, norm and project back up, then add the
     /// shared experts — which read the full-width input directly.
     fn latent_moe(&self, moe: &LatentMoe, normed: &[f32], n_tokens: usize) -> Vec<f32> {
-        let n_embd = self.config.n_embd;
         let latent = moe.gate_exps.in_dim;
         let routed_in = self.backend.matmul(normed, n_tokens, &moe.routed_down);
 
@@ -529,16 +553,10 @@ impl Kimi3Model {
         // The router scores the full-width input, so routing the whole batch
         // up front costs nothing extra and lets the experts — which run in
         // the latent space — be grouped. See `super::evaluate_routed_experts`.
-        let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
-            .map(|t| {
-                let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-                let logits = self.backend.matmul(x_t, 1, &moe.gate_inp);
-                let (selected, weights) =
-                    self.routing
-                        .route(&logits, moe.exp_probs_b.as_deref(), None);
-                selected.into_iter().zip(weights).collect()
-            })
-            .collect();
+        let logits =
+            super::moe_router_logits(self.backend.as_ref(), normed, n_tokens, &moe.gate_inp);
+        let mut selection =
+            super::route_batch(&self.routing, &logits, n_tokens, moe.exp_probs_b.as_deref());
         // Trim to the expert budget *before* anything is recorded or
         // read: the counters should describe the work actually done,
         // and a dropped expert's weights must never be fetched.
@@ -630,6 +648,15 @@ impl Kimi3Model {
 }
 
 impl ModelForward for Kimi3Model {
+    /// The instrumentation hook `engine::generate` reads to count GPU
+    /// submissions per decode step. Only useful compared *between*
+    /// architectures, which is why an architecture that answers `None` is
+    /// invisible to exactly the measurement that would say whether a
+    /// cross-architecture change helped it.
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_wgpu()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

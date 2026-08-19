@@ -185,6 +185,39 @@ fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     }
 }
 
+/// The buffers every layer of a forward pass reuses, so the trunk allocates
+/// once per pass rather than three times per layer.
+#[derive(Default)]
+struct LayerScratch {
+    /// Per-token expert picks, reused by the MoE router.
+    selection: Vec<Vec<usize>>,
+    /// The normed residual stream — what used to be `x.to_vec()`, twice a
+    /// layer. See `tensor::rmsnorm_into`.
+    normed: Vec<f32>,
+    /// The feed-forward output, and the gate/up intermediates behind it —
+    /// see `Backend::matmul_into`.
+    ffn_out: Vec<f32>,
+    ffn: super::FfnScratch,
+    /// The attention half's per-layer projections.
+    attn: AttnScratch,
+}
+
+/// [`LayerScratch`]'s attention half — the MLA projections and the output
+/// projection, each `[n_tokens, ..]` and each run once per layer.
+///
+/// The lightning indexer's own three projections stay allocating:
+/// `indexer_inputs` hands back an owned triple that the caller destructures,
+/// and this architecture has no local reference model to check a
+/// restructuring against.
+#[derive(Default)]
+struct AttnScratch {
+    /// The query LoRA intermediate, shared with the indexer's query.
+    qr: Vec<f32>,
+    q: Vec<f32>,
+    kv: Vec<f32>,
+    out: Vec<f32>,
+}
+
 impl GlmModel {
     pub fn load_with_backend(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
         let n_head = loaded.config.n_head;
@@ -452,9 +485,9 @@ impl GlmModel {
         // A layer that doesn't score positions itself attends whatever the
         // last scoring layer chose, so the choice is carried down the stack
         // — per token, since each token scores its own history.
-        let mut selection: Vec<Vec<usize>> = Vec::new();
+        let mut scratch = LayerScratch::default();
         for layer in &self.layers {
-            self.forward_layer(layer, cache, &mut x, n_tokens, start_pos, &mut selection)?;
+            self.forward_layer(layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
         }
 
         tensor::rmsnorm_inplace(
@@ -474,39 +507,62 @@ impl GlmModel {
         x: &mut [f32],
         n_tokens: usize,
         start_pos: usize,
-        selection: &mut Vec<Vec<usize>>,
+        scratch: &mut LayerScratch,
     ) -> Result<()> {
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
+        let LayerScratch {
+            selection,
+            normed,
+            ffn_out,
+            ffn,
+            attn: attn_scratch,
+        } = scratch;
 
-        let mut normed = x.to_vec();
-        tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
-        let attn = self.attention(layer, cache, &normed, n_tokens, start_pos, selection)?;
+        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n_tokens, n_embd, eps);
+        let attn = self.attention(
+            layer,
+            cache,
+            attn_scratch,
+            normed,
+            n_tokens,
+            start_pos,
+            selection,
+        )?;
         tensor::add_inplace(x, &attn);
 
-        let mut normed = x.to_vec();
-        tensor::rmsnorm_inplace(&mut normed, &layer.ffn_norm, n_tokens, n_embd, eps);
-        let ffn = match &layer.ffn {
-            Ffn::Dense { gate, up, down } => {
-                let gate = self.backend.matmul(&normed, n_tokens, gate);
-                let up = self.backend.matmul(&normed, n_tokens, up);
-                let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                tensor::mul_inplace(&mut h, &up);
-                self.backend.matmul(&h, n_tokens, down)
-            }
-            Ffn::Moe(moe) => self.moe_ffn(moe, &normed, n_tokens),
-        };
-        tensor::add_inplace(x, &ffn);
+        tensor::rmsnorm_into(normed, x, &layer.ffn_norm, n_tokens, n_embd, eps);
+        match &layer.ffn {
+            // The shared one, rather than this module's own copy of it. The
+            // gate and up projections now go out as one `matmul_batch`
+            // instead of two sequential `matmul`s — numerically identical,
+            // since they are independent products of the same input, and one
+            // submission instead of two on any backend that batches.
+            Ffn::Dense { gate, up, down } => super::swiglu_ffn_into(
+                self.backend.as_ref(),
+                ffn_out,
+                ffn,
+                normed,
+                n_tokens,
+                gate,
+                up,
+                down,
+            ),
+            Ffn::Moe(moe) => *ffn_out = self.moe_ffn(moe, normed, n_tokens),
+        }
+        tensor::add_inplace(x, ffn_out);
         Ok(())
     }
 
     /// One layer's MLA attention, in the absorbed form: the query is pushed
     /// through `attn_k_b` so it can be dotted with the cached compressed KV
     /// directly, and the output is pushed back through `attn_v_b`.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         layer: &GlmLayer,
         cache: &mut KvCache,
+        scratch: &mut AttnScratch,
         normed: &[f32],
         n_tokens: usize,
         start_pos: usize,
@@ -518,11 +574,19 @@ impl GlmModel {
         let nope = self.head_k_mla - rope_dim;
         let q_lora_rank = layer.wq_a.out_dim;
 
+        let AttnScratch {
+            qr,
+            q,
+            kv,
+            out: out_buf,
+        } = scratch;
         // Token-independent projections run once for the whole chunk.
-        let mut qr = self.backend.matmul(normed, n_tokens, &layer.wq_a);
-        tensor::rmsnorm_inplace(&mut qr, &layer.q_a_norm, n_tokens, q_lora_rank, eps);
-        let mut q = self.backend.matmul(&qr, n_tokens, &layer.wq_b);
-        let mut kv = self.backend.matmul(normed, n_tokens, &layer.wkv_a_mqa);
+        self.backend.matmul_into(qr, normed, n_tokens, &layer.wq_a);
+        tensor::rmsnorm_inplace(qr, &layer.q_a_norm, n_tokens, q_lora_rank, eps);
+        let qr = &*qr;
+        self.backend.matmul_into(q, qr, n_tokens, &layer.wq_b);
+        self.backend
+            .matmul_into(kv, normed, n_tokens, &layer.wkv_a_mqa);
         for t in 0..n_tokens {
             let pos = start_pos + t;
             let q_t = &mut q[t * n_head * self.head_k_mla..(t + 1) * n_head * self.head_k_mla];
@@ -560,6 +624,41 @@ impl GlmModel {
         // non-rotary part into the compressed KV space, and the rotary part
         // rides along unchanged.
         let absorbed_dim = self.kv_lora_rank + rope_dim;
+
+        // `wk_b`/`wv_b` are weights and their rows do not depend on `t`, but
+        // `ExpertQuantMatrix::row` inside the token loops below dequantized
+        // each one afresh — into a newly allocated `Vec<f32>`, dotted once,
+        // dropped — `n_tokens` times over. See `engine::arch::kda`'s copy of
+        // this hoist for the measurement that found it.
+        //
+        // Bit-exact: same bytes, same dequantizer, same slice handed to
+        // `tensor::dot`.
+        let absorb = |m: &crate::engine::loader::ExpertQuantMatrix, rows: usize| -> Vec<Vec<f32>> {
+            (0..n_head)
+                .into_par_iter()
+                .map(|h| {
+                    let span = m.expert_span(h);
+                    let mut flat = Vec::with_capacity(rows * m.in_dim);
+                    let mut row = Vec::new();
+                    for j in 0..rows {
+                        m.row_from(span, j, &mut row);
+                        flat.extend_from_slice(&row);
+                    }
+                    flat
+                })
+                .collect()
+        };
+        // **Only when there is more than one token to amortize it over.**
+        // At `n_tokens == 1` there is no reuse: the row is dotted once, and
+        // gathering it into a contiguous buffer first costs an extra copy and
+        // makes the dot read cold memory instead of the line just written.
+        // Measured **-6.8% on decode** before this guard, against +2.3% on
+        // prefill with it — the hoist is a prefill optimization and saying so
+        // in the type is cheaper than re-deriving it.
+        let hoist = n_tokens > 1;
+        let wk_b = hoist.then(|| absorb(&layer.wk_b, self.kv_lora_rank));
+        let wv_b = hoist.then(|| absorb(&layer.wv_b, self.head_v_mla));
+
         let mut absorbed = vec![0f32; n_tokens * n_head * absorbed_dim];
         for t in 0..n_tokens {
             let q_t = &q[t * n_head * self.head_k_mla..(t + 1) * n_head * self.head_k_mla];
@@ -568,9 +667,14 @@ impl GlmModel {
                 .map(|h| {
                     let q_nope = &q_t[h * self.head_k_mla..h * self.head_k_mla + nope];
                     let mut head = vec![0f32; absorbed_dim];
-                    for (j, out) in head[..self.kv_lora_rank].iter_mut().enumerate() {
-                        *out = tensor::dot(q_nope, &layer.wk_b.row(h, j));
-                    }
+                    super::kda::project_rows(
+                        &layer.wk_b,
+                        wk_b.as_deref(),
+                        h,
+                        q_nope,
+                        nope,
+                        &mut head[..self.kv_lora_rank],
+                    );
                     head[self.kv_lora_rank..].copy_from_slice(
                         &q_t[h * self.head_k_mla + nope..(h + 1) * self.head_k_mla],
                     );
@@ -586,7 +690,7 @@ impl GlmModel {
         let indexer = layer
             .indexer
             .as_ref()
-            .map(|ix| self.indexer_inputs(ix, &qr, normed, n_tokens, start_pos));
+            .map(|ix| self.indexer_inputs(ix, qr, normed, n_tokens, start_pos));
 
         let mut attn_out = vec![0f32; n_tokens * n_head * self.head_v_mla];
         selection.resize(n_tokens, Vec::new());
@@ -655,9 +759,16 @@ impl GlmModel {
                         self.kq_scale,
                         None,
                     );
-                    (0..self.head_v_mla)
-                        .map(|d| tensor::dot(&compressed, &layer.wv_b.row(h, d)))
-                        .collect()
+                    let mut head = vec![0f32; self.head_v_mla];
+                    super::kda::project_rows(
+                        &layer.wv_b,
+                        wv_b.as_deref(),
+                        h,
+                        &compressed,
+                        self.kv_lora_rank,
+                        &mut head,
+                    );
+                    head
                 })
                 .collect();
             for (h, head) in heads.iter().enumerate() {
@@ -666,7 +777,9 @@ impl GlmModel {
             }
         }
 
-        Ok(self.backend.matmul(&attn_out, n_tokens, &layer.wo))
+        self.backend
+            .matmul_into(out_buf, &attn_out, n_tokens, &layer.wo);
+        Ok(std::mem::take(out_buf))
     }
 
     /// A scoring layer's per-token indexer inputs: the roped query, the
@@ -769,6 +882,15 @@ impl GlmModel {
 }
 
 impl ModelForward for GlmModel {
+    /// The instrumentation hook `engine::generate` reads to count GPU
+    /// submissions per decode step. Only useful compared *between*
+    /// architectures, which is why an architecture that answers `None` is
+    /// invisible to exactly the measurement that would say whether a
+    /// cross-architecture change helped it.
+    fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
+        self.backend.as_wgpu()
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

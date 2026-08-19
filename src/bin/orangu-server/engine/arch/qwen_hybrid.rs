@@ -418,6 +418,24 @@ pub(crate) trait HybridFfn: Send + Sync {
         normed: &[f32],
         n_tokens: usize,
     ) -> Vec<f32>;
+
+    /// [`Self::forward`] into caller-owned buffers — see
+    /// `Backend::matmul_into`. Defaults to the allocating form, so an
+    /// implementation only overrides it when it has something to reuse;
+    /// `MoeFfn` builds its output by summing per-expert contributions and
+    /// has no single projection to redirect.
+    fn forward_into(
+        &self,
+        backend: &dyn Backend,
+        out: &mut Vec<f32>,
+        scratch: &mut super::FfnScratch,
+        n_embd: usize,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        let _ = scratch;
+        *out = self.forward(backend, n_embd, normed, n_tokens);
+    }
 }
 
 /// Plain SwiGLU FFN (`gate`/`up`/`down`) — `LLM_FFN_SILU`/`LLM_FFN_PAR`
@@ -439,6 +457,20 @@ impl HybridFfn for DenseFfn {
         n_tokens: usize,
     ) -> Vec<f32> {
         super::swiglu_ffn(backend, normed, n_tokens, &self.gate, &self.up, &self.down)
+    }
+
+    fn forward_into(
+        &self,
+        backend: &dyn Backend,
+        out: &mut Vec<f32>,
+        scratch: &mut super::FfnScratch,
+        _n_embd: usize,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        super::swiglu_ffn_into(
+            backend, out, scratch, normed, n_tokens, &self.gate, &self.up, &self.down,
+        );
     }
 }
 
@@ -498,11 +530,16 @@ impl HybridFfn for MoeFfn {
             moe_stats::LayerRecorder::for_tensors(&[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps]);
         // Route every position before touching any expert's weights, so the
         // batch's whole selection is known and the union can be taken.
+        //
+        // One router matmul for the whole batch, not one per token — see
+        // `super::moe_router_logits`. Hoisted out of the parallel region
+        // below for the same reason: it is a device submission at the head
+        // of an otherwise host-side branch.
+        let logits = super::moe_router_logits(backend, normed, n_tokens, &ffn.gate_inp);
+        let n_expert = logits.len() / n_tokens.max(1);
         let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
             .map(|t| {
-                let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-                let logits = backend.matmul(x_t, 1, &ffn.gate_inp);
-                let mut probs = logits.clone();
+                let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
                 tensor::softmax_inplace(&mut probs);
 
                 let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
@@ -540,105 +577,102 @@ impl HybridFfn for MoeFfn {
         // instead of issuing them one expert at a time — see
         // `super::evaluate_routed_experts_batched` for why that is the
         // whole question, and why it is only for the GPU.
-        let contribs = if super::gpu_experts() && backend.as_wgpu().is_some() {
-            super::evaluate_routed_experts_batched(
-                backend,
-                &selection,
-                normed,
-                n_embd,
-                &ffn.gate_exps,
-                &ffn.up_exps,
-                &ffn.down_exps,
-                |gate, up| {
-                    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                    tensor::mul_inplace(&mut h, up);
-                    h
-                },
-            )
-        } else {
-            super::evaluate_routed_experts(&selection, |expert, members| {
-                let inputs: Vec<&[f32]> = members
-                    .iter()
-                    .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
-                    .collect();
-                let gate = super::project_expert(
+        let routed_branch = || {
+            if super::gpu_experts() && backend.as_wgpu().is_some() {
+                super::evaluate_routed_experts_batched(
                     backend,
+                    &selection,
+                    normed,
+                    n_embd,
                     &ffn.gate_exps,
-                    expert,
-                    0,
-                    ffn.gate_exps.out_dim,
-                    &inputs,
-                );
-                let up = super::project_expert(
-                    backend,
                     &ffn.up_exps,
-                    expert,
-                    0,
-                    ffn.up_exps.out_dim,
-                    &inputs,
-                );
-                let hidden: Vec<Vec<f32>> = gate
-                    .into_iter()
-                    .zip(up)
-                    .map(|(gate, up)| {
-                        let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-                        tensor::mul_inplace(&mut h, &up);
-                        h
-                    })
-                    .collect();
-                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-                super::project_expert(
-                    backend,
                     &ffn.down_exps,
-                    expert,
-                    0,
-                    ffn.down_exps.out_dim,
-                    &hidden_refs,
+                    |gate, up| {
+                        let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                        tensor::mul_inplace(&mut h, up);
+                        h
+                    },
                 )
-                .into_iter()
-                .zip(members)
-                .map(|(mut contribution, &(_, weight))| {
-                    contribution.iter_mut().for_each(|v| *v *= weight);
-                    contribution
+            } else {
+                super::evaluate_routed_experts(&selection, |expert, members| {
+                    let inputs: Vec<&[f32]> = members
+                        .iter()
+                        .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
+                        .collect();
+                    let gate = super::project_expert(
+                        backend,
+                        &ffn.gate_exps,
+                        expert,
+                        0,
+                        ffn.gate_exps.out_dim,
+                        &inputs,
+                    );
+                    let up = super::project_expert(
+                        backend,
+                        &ffn.up_exps,
+                        expert,
+                        0,
+                        ffn.up_exps.out_dim,
+                        &inputs,
+                    );
+                    let hidden: Vec<Vec<f32>> = gate
+                        .into_iter()
+                        .zip(up)
+                        .map(|(gate, up)| {
+                            let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
+                            tensor::mul_inplace(&mut h, &up);
+                            h
+                        })
+                        .collect();
+                    let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                    super::project_expert(
+                        backend,
+                        &ffn.down_exps,
+                        expert,
+                        0,
+                        ffn.down_exps.out_dim,
+                        &hidden_refs,
+                    )
+                    .into_iter()
+                    .zip(members)
+                    .map(|(mut contribution, &(_, weight))| {
+                        contribution.iter_mut().for_each(|v| *v *= weight);
+                        contribution
+                    })
+                    .collect()
                 })
-                .collect()
-            })
-        };
-        experts.loaded_once_per_distinct_expert();
-
-        for t in 0..n_tokens {
-            let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-            let mut moe_out = vec![0f32; n_embd];
-            for contrib in &contribs[t] {
-                for (o, d) in moe_out.iter_mut().zip(contrib.iter()) {
-                    *o += d;
-                }
             }
+        };
 
-            let shared_gate = tensor::sigmoid(tensor::dot(x_t, &ffn.gate_inp_shexp));
-            // A shared expert can be a type the device has no shader for —
-            // `engine::backend::is_cpu_only_tensor` exempts these from the
-            // startup check on purpose — and `VulkanBackend` panics on that
-            // rather than returning zeros. See `super::matmul_host_fallback`.
+        // The gated shared expert, for the whole batch in three matmuls
+        // rather than three per token.
+        //
+        // A shared expert can be a type the device has no shader for —
+        // `engine::backend::is_cpu_only_tensor` exempts these from the
+        // startup check on purpose — and `VulkanBackend` panics on that
+        // rather than returning zeros. See `super::matmul_host_fallback`,
+        // which this repeats inline because it also decides which backend
+        // the `down` projection goes to.
+        let shared_branch = || {
             let cpu = crate::engine::backend::CpuBackend;
             let use_cpu_shared = !backend.supports_type(ffn.gate_shexp.ggml_type())
                 || !backend.supports_type(ffn.up_shexp.ggml_type())
                 || !backend.supports_type(ffn.down_shexp.ggml_type());
             let (shexp_gate, shexp_up) = if use_cpu_shared {
                 (
-                    cpu.matmul(x_t, 1, &ffn.gate_shexp),
-                    cpu.matmul(x_t, 1, &ffn.up_shexp),
+                    cpu.matmul(normed, n_tokens, &ffn.gate_shexp),
+                    cpu.matmul(normed, n_tokens, &ffn.up_shexp),
                 )
             } else {
                 let mut gate_up = backend.matmul_batch(&[
                     MatmulOp {
-                        x: x_t,
-                        n_tokens: 1,
+                        x: normed,
+                        n_tokens,
                         w: &ffn.gate_shexp,
                     },
                     MatmulOp {
-                        x: x_t,
-                        n_tokens: 1,
+                        x: normed,
+                        n_tokens,
                         w: &ffn.up_shexp,
                     },
                 ]);
@@ -649,17 +683,37 @@ impl HybridFfn for MoeFfn {
             let mut shexp_h: Vec<f32> = shexp_gate.iter().map(|&g| tensor::silu(g)).collect();
             tensor::mul_inplace(&mut shexp_h, &shexp_up);
             let mut shexp_out = if use_cpu_shared {
-                cpu.matmul(&shexp_h, 1, &ffn.down_shexp)
+                cpu.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
             } else {
-                backend.matmul(&shexp_h, 1, &ffn.down_shexp)
+                backend.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
             };
-            for v in shexp_out.iter_mut() {
-                *v *= shared_gate;
+            // The per-token sigmoid gate on the shared branch.
+            for t in 0..n_tokens {
+                let x_t = &normed[t * n_embd..(t + 1) * n_embd];
+                let gate = tensor::sigmoid(tensor::dot(x_t, &ffn.gate_inp_shexp));
+                for v in shexp_out[t * n_embd..(t + 1) * n_embd].iter_mut() {
+                    *v *= gate;
+                }
             }
+            shexp_out
+        };
 
+        // Different processors, nothing shared but the input, summed at the
+        // end — see `super::moe_overlap_min_tokens`.
+        let (shexp_out, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+            rayon::join(shared_branch, routed_branch)
+        } else {
+            (shared_branch(), routed_branch())
+        };
+        experts.loaded_once_per_distinct_expert();
+
+        for t in 0..n_tokens {
             let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            for i in 0..n_embd {
-                dst[i] = moe_out[i] + shexp_out[i];
+            dst.copy_from_slice(&shexp_out[t * n_embd..(t + 1) * n_embd]);
+            for contrib in &contribs[t] {
+                for (o, d) in dst.iter_mut().zip(contrib.iter()) {
+                    *o += d;
+                }
             }
         }
         experts.commit(n_tokens);
@@ -681,6 +735,22 @@ pub(crate) struct Trunk<F> {
     output_weight: QuantMatrix,
     dims: Dims,
     layers: Vec<Layer<F>>,
+}
+
+/// The buffers every layer of a forward pass reuses, so the trunk allocates
+/// once per pass rather than twice per layer. Threaded through the per-layer
+/// helpers rather than held in `self`, because `forward` takes `&self`.
+#[derive(Default)]
+struct LayerScratch {
+    /// The normed residual stream feeding attention or the recurrent mixer —
+    /// what used to be `x.to_vec()`. See `tensor::rmsnorm_into`.
+    normed: Vec<f32>,
+    /// The same, for the post-attention FFN norm.
+    ffn: Vec<f32>,
+    /// The feed-forward output, and the gate/up intermediates behind it —
+    /// see `Backend::matmul_into`.
+    ffn_out: Vec<f32>,
+    ffn_work: super::FfnScratch,
 }
 
 impl<F: HybridFfn> Trunk<F> {
@@ -796,13 +866,34 @@ impl<F: HybridFfn> Trunk<F> {
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
 
+        // Grown once and reused by every layer rather than allocated per
+        // norm. Threaded through the per-layer helpers rather than held in
+        // `self`, because `forward` takes `&self` and two layers of the same
+        // model may run concurrently. See `tensor::rmsnorm_into`.
+        let mut scratch = LayerScratch::default();
+
         for layer in &self.layers {
             match layer {
                 Layer::FullAttn(weights, ffn) => {
-                    self.forward_full_attn_layer(weights, ffn, cache, &mut x, n_tokens, start_pos)?;
+                    self.forward_full_attn_layer(
+                        weights,
+                        ffn,
+                        cache,
+                        &mut x,
+                        n_tokens,
+                        start_pos,
+                        &mut scratch,
+                    )?;
                 }
                 Layer::Recurrent(weights, ffn) => {
-                    self.forward_recurrent_layer(weights, ffn, cache, &mut x, n_tokens)?;
+                    self.forward_recurrent_layer(
+                        weights,
+                        ffn,
+                        cache,
+                        &mut x,
+                        n_tokens,
+                        &mut scratch,
+                    )?;
                 }
             }
         }
@@ -812,6 +903,9 @@ impl<F: HybridFfn> Trunk<F> {
         Ok(self.backend.matmul(last, 1, &self.output_weight))
     }
 
+    // Eight because the scratch buffers are threaded rather than held in
+    // `self`; grouping them into `LayerScratch` already removed one.
+    #[allow(clippy::too_many_arguments)]
     fn forward_full_attn_layer(
         &self,
         layer: &FullAttnWeights,
@@ -820,7 +914,14 @@ impl<F: HybridFfn> Trunk<F> {
         x: &mut [f32],
         n_tokens: usize,
         start_pos: usize,
+        scratch: &mut LayerScratch,
     ) -> Result<()> {
+        let LayerScratch {
+            normed,
+            ffn: ffn_scratch,
+            ffn_out,
+            ffn_work,
+        } = scratch;
         let n_embd = self.dims.n_embd;
         let eps = self.dims.rms_eps;
         let head_dim = self.dims.head_dim;
@@ -828,8 +929,7 @@ impl<F: HybridFfn> Trunk<F> {
         let n_head_kv = self.dims.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
 
-        let mut normed = x.to_vec();
-        tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
+        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n_tokens, n_embd, eps);
 
         // Joint Q+gate projection, K, and V are all independent projections
         // of the same normed input — one batched dispatch instead of three
@@ -837,17 +937,17 @@ impl<F: HybridFfn> Trunk<F> {
         // the Q+gate projection is [Q(head_dim), gate(head_dim)].
         let mut qgkv = self.backend.matmul_batch(&[
             MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: &layer.wq,
             },
             MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: &layer.wk,
             },
             MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: &layer.wv,
             },
@@ -934,7 +1034,15 @@ impl<F: HybridFfn> Trunk<F> {
         let sub_out = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
 
         tensor::add_inplace(x, &sub_out);
-        self.apply_ffn(ffn, &layer.post_attention_norm, x, n_tokens);
+        self.apply_ffn(
+            ffn,
+            &layer.post_attention_norm,
+            x,
+            n_tokens,
+            ffn_scratch,
+            ffn_out,
+            ffn_work,
+        );
         Ok(())
     }
 
@@ -945,7 +1053,14 @@ impl<F: HybridFfn> Trunk<F> {
         cache: &mut KvCache,
         x: &mut [f32],
         n_tokens: usize,
+        scratch: &mut LayerScratch,
     ) -> Result<()> {
+        let LayerScratch {
+            normed,
+            ffn: ffn_scratch,
+            ffn_out,
+            ffn_work,
+        } = scratch;
         let n_embd = self.dims.n_embd;
         let eps = self.dims.rms_eps;
         let key_dim = self.dims.key_dim();
@@ -955,20 +1070,19 @@ impl<F: HybridFfn> Trunk<F> {
         let n_v_heads = self.dims.ssm_dt_rank;
         let q_scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut normed = x.to_vec();
-        tensor::rmsnorm_inplace(&mut normed, &layer.attn_norm, n_tokens, n_embd, eps);
+        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n_tokens, n_embd, eps);
 
         // Every projection here is of the same normed input — one batched
         // dispatch instead of three or four sequential round-trips (see
         // `Backend::matmul_batch`).
         let mut ops = vec![
             MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: &layer.wqkv,
             },
             MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: &layer.wqkv_gate,
             },
@@ -976,18 +1090,18 @@ impl<F: HybridFfn> Trunk<F> {
         match &layer.beta_alpha {
             BetaAlpha::Split { beta, alpha } => {
                 ops.push(MatmulOp {
-                    x: &normed,
+                    x: normed,
                     n_tokens,
                     w: beta,
                 });
                 ops.push(MatmulOp {
-                    x: &normed,
+                    x: normed,
                     n_tokens,
                     w: alpha,
                 });
             }
             BetaAlpha::Packed(packed) => ops.push(MatmulOp {
-                x: &normed,
+                x: normed,
                 n_tokens,
                 w: packed,
             }),
@@ -1101,24 +1215,45 @@ impl<F: HybridFfn> Trunk<F> {
         }
 
         tensor::add_inplace(x, &sub_out);
-        self.apply_ffn(ffn, &layer.post_attention_norm, x, n_tokens);
+        self.apply_ffn(
+            ffn,
+            &layer.post_attention_norm,
+            x,
+            n_tokens,
+            ffn_scratch,
+            ffn_out,
+            ffn_work,
+        );
         Ok(())
     }
 
     /// The second half of a pre-norm block, identical for both layer kinds:
     /// norm the residual stream, run the architecture's FFN, add it back.
-    fn apply_ffn(&self, ffn: &F, post_attention_norm: &[f32], x: &mut [f32], n_tokens: usize) {
+    // Eight because the scratch buffers are threaded rather than held in
+    // `self`, the same reason `forward_full_attn_layer` carries this allow:
+    // `forward` takes `&self` and two layers may be in flight at once.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_ffn(
+        &self,
+        ffn: &F,
+        post_attention_norm: &[f32],
+        x: &mut [f32],
+        n_tokens: usize,
+        normed: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        work: &mut super::FfnScratch,
+    ) {
         let n_embd = self.dims.n_embd;
-        let mut normed = x.to_vec();
-        tensor::rmsnorm_inplace(
-            &mut normed,
+        tensor::rmsnorm_into(
+            normed,
+            x,
             post_attention_norm,
             n_tokens,
             n_embd,
             self.dims.rms_eps,
         );
-        let ffn_out = ffn.forward(self.backend.as_ref(), n_embd, &normed, n_tokens);
-        tensor::add_inplace(x, &ffn_out);
+        ffn.forward_into(self.backend.as_ref(), out, work, n_embd, normed, n_tokens);
+        tensor::add_inplace(x, out);
     }
 }
 
