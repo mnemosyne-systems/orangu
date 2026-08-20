@@ -356,12 +356,49 @@
     URL.revokeObjectURL(url);
   }
 
+  // Saves one code block, named by the footer `render.rs` put under it —
+  // same Blob + object-URL mechanism as `downloadMarkdown`, a real file
+  // name instead of a timestamp.
+  //
+  // The text comes from the DOM rather than a copy carried alongside it:
+  // the transcript's HTML is replaced wholesale on every streamed token, so
+  // a second copy of every code block would ride along in each of those
+  // frames. `textContent` is the block exactly as rendered — licence header
+  // included, since `render.rs` puts that on the source it highlights, so
+  // the saved file is what the reader was looking at and nothing has to be
+  // fetched or reassembled here. The highlighter's <span>s contribute no
+  // text of their own, and the leading newline is the one syntect opens its
+  // <pre> with.
+  function downloadCodeBlock(text, fileName) {
+    const body = text.replace(/^\n/, "");
+    const blob = new Blob([body.endsWith("\n") ? body : `${body}\n`], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName || "orangu-snippet.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // Delegated from the transcript, once, rather than bound per button:
+  // every streamed token reassigns the message's `innerHTML`, which would
+  // throw away a listener attached to the button itself.
+  transcript.addEventListener("click", (event) => {
+    const button = event.target.closest?.(".code-dl");
+    if (!button) return;
+    const pre = button.closest(".code-block")?.querySelector("pre");
+    if (!pre) return;
+    downloadCodeBlock(pre.textContent ?? "", button.dataset.fileName);
+  });
+
   // Plain text is taken from the rendered answer rather than naively
   // stripping Markdown: that preserves readable tables, code, and links
   // while omitting the generation footer and its controls.
   function renderedAnswerText(assistantEl) {
     const answer = assistantEl.cloneNode(true);
-    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source").forEach((el) => el.remove());
+    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source, .code-footer").forEach((el) => el.remove());
     return (answer.innerText ?? answer.textContent ?? "").trim();
   }
 
@@ -393,7 +430,7 @@
 <style>
   body { padding: 24px; background: #fff; color: #000; }
   .pdf-answer { max-width: none; width: auto; padding: 0; border: none; background: none; color: #000; }
-  .pdf-answer .diagram-actions, .pdf-answer .diagram-source { display: none; }
+  .pdf-answer .diagram-actions, .pdf-answer .diagram-source, .pdf-answer .code-dl { display: none; }
   @media print { body { padding: 0; } }
 </style>
 </head>

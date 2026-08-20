@@ -47,7 +47,6 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
@@ -301,7 +300,7 @@ async fn index(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let html = INDEX_HTML
         .replace("{{VERSION}}", state.version)
         .replace("{{MODEL}}", &html_escape(&state.model_display))
-        .replace("{{YEAR}}", &current_year().to_string())
+        .replace("{{YEAR}}", &orangu::license::current_year().to_string())
         .replace("{{ASSET_VERSION}}", asset_version());
     Html(html)
 }
@@ -364,27 +363,6 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
         ],
         report,
     )
-}
-
-/// The current UTC calendar year, for the footer's copyright-style link —
-/// computed from the Unix clock rather than pulling in a full date/time
-/// crate for one integer.
-fn current_year() -> i64 {
-    let mut days = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        / 86400;
-    let mut year = 1970i64;
-    loop {
-        let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        let days_in_year = if is_leap { 366 } else { 365 };
-        if days < days_in_year {
-            return year;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
 }
 
 fn html_escape(text: &str) -> String {

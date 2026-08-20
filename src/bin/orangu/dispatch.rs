@@ -55,6 +55,10 @@ fn create_file_command(
             overwrite: orangu::files::overwrite_default(),
             parents: true,
             git: orangu::files::git_default(),
+            // No licence header. This command is a person spelling a file
+            // out by hand — writing it, not generating it — unlike the
+            // `create_file` tool and the endpoint, which default to one.
+            license: false,
         },
     )
 }
@@ -1511,6 +1515,8 @@ mod tests {
             }
             _ => panic!("expected an output line"),
         }
+        // Byte for byte what was typed — no licence header, unlike the
+        // tool and the endpoint. See `create_file_command`.
         assert_eq!(
             fs::read_to_string(workspace.path().join("notes.md")).unwrap(),
             "first\n"
@@ -1536,6 +1542,7 @@ mod tests {
                 overwrite: false,
                 parents: true,
                 git: orangu::files::git_default(),
+                license: false,
             },
         )
         .expect("call")

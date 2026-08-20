@@ -191,7 +191,11 @@ impl ToolExecutor {
                      its permissions (\"0644\"). An existing path is overwritten; pass \
                      `overwrite: false` for create-if-absent. A missing parent directory \
                      fails unless `parents` is set. In a Git repository the new file is \
-                     staged with `git add`; nothing is ever committed.",
+                     staged with `git add`; nothing is ever committed. A file that did not \
+                     exist before is written with a licence header on top of `content` \
+                     where its format allows a comment, so its line numbers are not the \
+                     ones in `content` — the response reports this as `licensed`, and \
+                     editing such a file by line number means reading it back first.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -653,6 +657,11 @@ impl ToolExecutor {
                 overwrite: true,
                 parents: true,
                 git: args.git.unwrap_or_else(crate::files::git_default),
+                // Generated, so a file this brings into existence is
+                // licensed. `files::create` is what decides that only a
+                // *new* file is — editing one that was already there must
+                // not stamp a licence onto it.
+                license: true,
             },
         )
         .map_err(|err| anyhow!("{err}"))?;

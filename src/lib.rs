@@ -30,6 +30,7 @@ pub mod gguf;
 pub mod git_index;
 pub mod graph;
 pub mod hardware;
+pub mod license;
 pub mod llm;
 pub mod mcp;
 pub mod model_download;

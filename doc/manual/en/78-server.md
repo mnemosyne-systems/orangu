@@ -3007,6 +3007,122 @@ draws ```` ```mermaid ```` blocks (below). `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
 `web::models` is the model manager (below).
 
+#### Downloading one code block
+
+`render::render_code_block` wraps every fenced block in
+`<div class="code-block">` with a `.code-footer` under it carrying the file
+name and a `.code-dl` button. The footer shares `.gen-time`'s dim/hover/
+icon-size rules rather than restating them: a download in this console is a
+small dimmed icon at the lower right of the thing it saves, and reusing the
+rules is what keeps that true as they change. It is deliberately not a bar
+welded onto the `<pre>` — the highlighter's theme is a fixed dark one that
+paints its own background inline while an unhighlighted block has none, so
+a strip with a background of its own would match one and clash with the
+other. Two more details are worth keeping:
+
+**The text is not sent twice.** The obvious shape — a `data:` URI on an
+anchor, which is what a diagram's download uses — is wrong here. A diagram
+is already a `data:` URI in the `<img>`, so its download reuses one that
+had to exist; a code block's source is plain text in the `<pre>`, and a
+`data:` URI would be a base64 second copy of it. The transcript is
+re-rendered and re-sent on **every streamed token**, so that copy would
+ride along in every frame of the reply. `app.js` reads `textContent` back
+out of the `<pre>` on click instead, and the click is delegated from the
+transcript rather than bound per button — `assistantEl.innerHTML =
+payload.html` on each token would throw away a listener attached to the
+button itself.
+
+**The name is derived, and refused when unsure.** `declared_file_name`
+reads the fence (mdast splits the info string into `lang` — the first
+word — and `meta`, so ```` ```rust src/main.rs ````, ```` ```rust:src/main.rs ````
+and ```` ```rust title="src/main.rs" ```` all land somewhere readable);
+`file_name_from_first_line` reads a first-line comment; otherwise
+`Renderer::code_blocks_seen` numbers it and `default_extension` extends it
+from the resolved `SyntaxReference::file_extensions`, which is why `rust`
+becomes `.rs` without a hand-written language table.
+
+Every candidate goes through `clean_file_name`, which keeps only the last
+path component and rejects anything that isn't plainly a file name. The
+strict version is the point: the first-line rule only fires on a comment
+holding a *single* token, so `# Install the dependencies` and
+`#include <stdio.h>` fall through to the generated name, and an extension
+has to start with a letter so `# roughly 3.14` doesn't save as `3.14`. A
+confidently wrong name on a saved file is worse than a numbered one. The
+name is also model output, so it is escaped into the attribute like
+everything else in a reply.
+
+A block routed to `web::mermaid` or `web::plantuml` never reaches
+`render_code_block`, so a diagram doesn't consume a snippet number — it
+isn't a code window, and it has a download of its own.
+
+#### The licence header (`orangu::license`)
+
+The module is `orangu::license`, in the **library** rather than in this
+binary, because the web console is not the only thing that generates code:
+`orangu`'s `create_file` tool writes a licence header onto a new file with
+the same call (see the Tools chapter). One module, so the two cannot
+disagree about the year, the licence, or where the header goes.
+
+The licence text is `TEMPLATE`, a raw string constant in that module. Not
+a data file, and not an `include_str!` of one: there is nothing to ship
+beside the binary and nothing an install can lose. `PLACEHOLDERS` is a
+table of the tokens in it that get filled in
+at request time — `<YEAR>` today, anything else by adding a line there and
+a token to the file. Request time, not build time, is the point: a server
+left running past midnight on 31 December would otherwise keep stamping
+last year onto everything it saves.
+
+`comment_style` maps the *saved file's extension* — not the fence's
+language tag — onto a `CommentStyle`, since the extension is what the file
+will be read as. `Line` markers get one per line, with a bare marker on a
+blank line rather than a marker plus a trailing space; `Block` styles
+(`<!-- -->`, `/* */`, `(* *)`) open and close around the text. A test
+asserts the licence text itself contains none of those closing
+delimiters — one `*/` inside it would end the comment early and spill the
+rest of the licence into the file as code.
+
+Two refusals are deliberate. An unknown extension gets **no** header rather
+than a guessed marker: `#` at the top of a JSON file, or `%` at the top of
+Objective-C, doesn't produce a differently-licensed file, it produces a
+broken one, and `.m` (Objective-C or MATLAB) and `.s` (assembler-dependent)
+are ambiguous enough to be left out on purpose. And `app.js` puts the
+header *below* a shebang or an XML declaration, which have to stay on line
+one or the file stops being executable/well-formed.
+
+`render_code_block` applies the licence to the source it hands the
+highlighter, so the header is in the block the reader sees — highlighted,
+selectable, and already in the `textContent` the download button reads back
+out. There is no endpoint and nothing for `app.js` to fetch or reassemble:
+what gets saved is what was on screen.
+
+Order matters in that function. The file name is derived **before** the
+licence goes on, because `file_name_from_first_line` reads line one and line
+one is about to become `// MIT License`.
+
+Only the rendering is licensed. The message stored in the session, replayed
+as context on the next turn, and written by **Save as Markdown** is the raw
+text the model produced — `render_markdown_to_html` is a pure render step,
+and that separation is what keeps the licence out of the model's own
+context.
+
+`license::apply` is the whole job — header, plus the shebang/XML-declaration
+placement — and is what both surfaces call: `web::render` on a block it is
+about to display, `files::create` on a file it is about to write. Each adds
+the one decision that is its own. For `files::create` that is *only a file
+that did not exist before the call*, since rewriting or editing an existing
+file must not stamp a licence onto somebody's project. For `web::render`
+there is no such qualifier — a code block in a reply is generated code by
+construction.
+
+`render::LANGUAGE_EXTENSIONS` and `license::comment_style` are two halves of
+one path — the first turns a fence tag into a file name, the second turns
+that name into a comment. A tag missing from the first (syntect ships
+Sublime's syntaxes, which cover neither TypeScript nor Kotlin nor
+PowerShell, so `typescript` would otherwise save as `.typescript`) silently
+costs the snippet its licence header too. `web::render`'s
+`every_name_render_generates_for_a_common_language_gets_a_header` walks
+both halves for 64 fence tags and is what caught that.
+
 ### Mermaid diagrams (`web::mermaid`)
 
 Diagrams are rendered by `merman`, a headless Rust implementation of

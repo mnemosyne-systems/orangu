@@ -1999,6 +1999,91 @@ API's own `port`.
 Each assistant reply is rendered from markdown to HTML server-side,
 including syntax-highlighted fenced code blocks.
 
+### Code blocks
+
+Every fenced code block carries a footer at its lower right — the file
+name and a **download** button, in the same place and the same dimmed
+style as the save control under a finished answer. Clicking it saves that
+block, and only that block, as a file, so a reply containing four files
+takes four clicks instead of four hand-made selections over a scrolling
+code window.
+
+The name is taken from the reply itself where the model gave one, in this
+order:
+
+1. The fence's info string, in any of the three forms models use:
+
+   ````
+   ```rust src/main.rs
+   ```rust:src/main.rs
+   ```rust title="src/main.rs"
+   ````
+
+   A fence that is *only* a file name (```` ```Makefile ````,
+   ```` ```main.rs ````) counts too.
+
+2. The block's first line, when it is a comment holding nothing but a
+   name — `// src/lib.rs`, `# File: app/models.py`,
+   `<!-- index.html -->`, `/* main.c */`.
+
+3. Failing both, a generated `orangu-snippet-<n>.<ext>`, numbered by the
+   block's position in the reply and extended from the fence's language
+   (`rust` saves as `.rs`, `python` as `.py`). A language the highlighter
+   doesn't know is used as its own extension where it reads like one, and
+   `.txt` otherwise.
+
+Only the file name is kept, never a directory — the browser saves into
+your download directory regardless — and a candidate that isn't plainly a
+file name is turned down in favour of the generated one, so an ordinary
+explanatory comment on line one costs nothing.
+
+#### The licence header
+
+Every code block is shown with the MIT licence at the top of it, written as
+a comment in that block's own language — in the block itself, highlighted
+and selectable like the rest of the code, so what the download button saves
+is exactly what is on screen:
+
+```rust
+// MIT License
+//
+// Copyright (c) 2026 orangu
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+...
+```
+
+The licence text is compiled into the binary as a string, not read from a
+file beside it — there is nothing to install, nothing to go missing, and
+nothing a running server can be pointed at. Changing the licence, or the
+copyright holder on it, means changing that string and rebuilding. `<YEAR>`
+in it is filled in when the message is rendered, not when the server was
+built, so a console left running over New Year's Eve keeps writing the
+right year.
+
+The comment syntax follows the file name — `//` for Rust and C-family
+languages, `#` for shells and configuration formats, `--` for SQL and Lua,
+`;;` for Lisps, `%` for TeX and Erlang, `REM` for batch files, and a
+delimited `<!-- -->`, `/* */` or `(* *)` block for languages with no line
+comment at all. A shebang or an XML declaration keeps the first line; the
+licence goes directly beneath it.
+
+This is the same header, from the same place, that `orangu`'s `create_file`
+tool puts on a file it generates — see **Licence headers** in the Tools
+chapter.
+
+The reply as the model wrote it is untouched: the licence is added when the
+message is rendered, so the text stored in the session, replayed as context
+on the next turn, and written by **Save as Markdown** stays exactly what
+came out of the model.
+
+A block whose comment syntax isn't known is shown with **no** header rather
+than a guessed one — `.json` and `.csv` have no comments to put it in, and
+an extension like `.m` (Objective-C or MATLAB, depending) has two
+incompatible answers. That is also what an untagged fence gets, since its
+generated `.txt` name says nothing about the language: tagging the fence is
+what earns the header.
+
 ### Diagrams
 
 A fenced code block tagged `mermaid` (or `mmd`) is drawn as a diagram

@@ -415,7 +415,9 @@ button:disabled {
 .gen-tps,
 .gen-duration,
 .save-md-btn,
-.save-menu-btn {
+.save-menu-btn,
+.code-name,
+.code-dl {
   opacity: 0.65;
 }
 
@@ -446,13 +448,16 @@ button:disabled {
 }
 
 .save-md-btn:hover,
-.save-menu-btn:hover {
+.save-menu-btn:hover,
+.code-dl:hover,
+.code-dl:focus-visible {
   color: var(--text);
   opacity: 1;
 }
 
 .save-md-btn svg,
-.save-menu-btn svg {
+.save-menu-btn svg,
+.code-dl svg {
   width: 12px;
   height: 12px;
 }
@@ -507,10 +512,57 @@ button:disabled {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-.message :not(pre) > code {
-  background: var(--bg-input);
-  padding: 0.1em 0.35em;
-  border-radius: 4px;
+/* A fenced code block as a *window*: the source with a footer under it
+   carrying the file name and the button that saves the block on its own.
+   `render.rs` emits the markup and derives the name; `app.js` does the
+   saving.
+
+   The footer is the console's standard download shape — under the thing it
+   saves, right-aligned, dimmed, full opacity on hover — so it shares
+   `.gen-time`'s dim/hover/icon-size rules above rather than restating them.
+   Deliberately not a bar welded onto the <pre>: the highlighter's theme is
+   a fixed dark one that paints its own background inline, while an
+   unhighlighted block has none, so a strip with a background of its own
+   would match one of those two and clash with the other. */
+.code-block {
+  margin: 1em 0;
+}
+
+.code-block > pre {
+  margin: 0;
+}
+
+.code-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 0.3em;
+  color: var(--text-dim);
+  font-size: 0.72em;
+}
+
+/* A long name shortens from its tail rather than pushing the button off
+   the right edge — `min-width: 0` is what lets a flex item shrink below
+   its content width and ellipsise at all. */
+.code-name {
+  min-width: 0;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Same rule as `.save-md-btn`, the answer footer's own save button. */
+.code-dl {
+  display: inline-flex;
+  flex: none;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  line-height: 0;
+  cursor: pointer;
 }
 
 /* Raw-TeX fallback text (`render.rs`'s `.katex-source` placeholders)

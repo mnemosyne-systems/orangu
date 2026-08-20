@@ -57,6 +57,33 @@ chapter). An existing path is overwritten on every
 surface — tool, typed command and HTTP endpoint alike; pass
 `"overwrite": false` for create-if-absent.
 
+**Licence headers.** A file that `create_file` brings into existence is
+generated code, and it is written with the MIT licence at the top of it, as
+a comment in that file's own language — `//` for Rust and the C family, `#`
+for shells and configuration formats, `--` for SQL and Lua, `;;` for Lisps,
+`%` for TeX and Erlang, `REM` for batch files, and a delimited `<!-- -->`,
+`/* */` or `(* *)` block for a language with no line comment. A shebang or
+an XML declaration keeps the first line; the licence goes directly beneath
+it.
+
+Three things never get one, and they are the point of the rule:
+
+- **A file that already existed.** Rewriting or editing it is a change to
+  somebody's project, and a project's licensing is not the agent's to
+  decide — an MIT header must never land on top of a GPL source file.
+- **A file you spelled out yourself** with the typed `/create_file`
+  command. That is you writing a file, not orangu generating one.
+- **A format with nowhere to put a comment** — `.json`, `.csv` — which
+  would be corrupted rather than licensed.
+
+Because the header is added on top of what was sent, the file on disk has
+more lines than the `content` argument did. The tool result reports this as
+`"licensed": true`, and a `modify_file` that names line numbers should read
+the file back first. The licence text is a string compiled into the
+binary rather than a file read from disk, and changing it changes the
+licence everywhere it is used — including the web console's code blocks,
+which share the same implementation.
+
 **Git.** In a Git repository these tools make their change *with* the Git
 command — `create_file`/`modify_file` stage with `git add`, `move_file`
 moves with `git mv`, `delete_file` deletes with `git rm` — so work is

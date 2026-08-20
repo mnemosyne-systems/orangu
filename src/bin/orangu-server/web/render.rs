@@ -43,6 +43,15 @@
 //! Mermaid and PlantUML blocks go the other way and are drawn here on the
 //! server by [`super::mermaid`] and [`super::plantuml`]. A block that doesn't
 //! parse falls back to the ordinary highlighted code block.
+//!
+//! Every code block that stays a code block is wrapped as a *code window*
+//! — the source under its licence header (`orangu::license`), highlighted,
+//! over a footer naming the file it saves as and a `.code-dl` button. The
+//! name is derived here (see [`Renderer::code_file_name`]); the saving is
+//! `app.js`'s, which reads the `<pre>`'s text back out on click rather than
+//! the server embedding a second, base64 copy of it in every streamed
+//! frame. Since the licence is in that text already, what is saved is
+//! exactly what the reader was looking at.
 
 use super::{mermaid, plantuml};
 use markdown::{
@@ -50,11 +59,11 @@ use markdown::{
     mdast::{Code, List, ListItem, Node},
     to_mdast,
 };
-use std::sync::OnceLock;
+use std::{cell::Cell, sync::OnceLock};
 use syntect::{
     highlighting::{Theme, ThemeSet},
     html::highlighted_html_for_string,
-    parsing::SyntaxSet,
+    parsing::{SyntaxReference, SyntaxSet},
 };
 
 struct HighlightAssets {
@@ -98,6 +107,7 @@ pub fn render_markdown_to_html(text: &str) -> String {
     }
     let renderer = Renderer {
         open_fence_start: unterminated_fence_start(text),
+        code_blocks_seen: Cell::new(0),
     };
     match to_mdast(text, &parse_options()) {
         Ok(tree) => renderer.render_node(&tree),
@@ -113,6 +123,12 @@ struct Renderer {
     /// which, mid-stream, is every code block the model is still typing.
     /// See [`unterminated_fence_start`].
     open_fence_start: Option<usize>,
+    /// How many code blocks have been rendered so far, which is what numbers
+    /// the ones with no name of their own (`orangu-snippet-2.py`). Counted
+    /// during the walk rather than passed down, because the walk is
+    /// recursive and a code block can sit at any depth (inside a list item,
+    /// a blockquote, ...) — a `Cell` keeps `render_node` taking `&self`.
+    code_blocks_seen: Cell<usize>,
 }
 
 /// Finds the opening fence of a trailing, still-unclosed code block.
@@ -322,7 +338,97 @@ impl Renderer {
             }
         }
 
-        render_code_block(language, &code.value)
+        self.render_code_block(code, language)
+    }
+
+    /// A fenced block rendered as a *code window*: the licensed source,
+    /// highlighted, over a footer naming the file it saves as and the button
+    /// that saves it.
+    ///
+    /// The licence header (`orangu::license`) is put on here, in the block
+    /// the reader sees, rather than added on the way out of the download
+    /// button. It is part of the code as far as the console is concerned:
+    /// visible, highlighted, selectable, and in the text the download reads
+    /// back out of the `<pre>` — so what gets saved is exactly what was on
+    /// screen. Only the rendering is affected; the message stored in the
+    /// session and replayed as context stays what the model actually wrote.
+    ///
+    /// The footer sits under the block on the right, dimmed, the same shape
+    /// and place the answer footer's own save control has — a download in
+    /// this console is a small icon at the lower right of the thing it
+    /// saves, and a code block is no exception.
+    ///
+    /// The text is already on screen, so this is purely about getting it
+    /// back out. Selecting it by hand is where that goes wrong — a code
+    /// block scrolls in both directions (`.message pre` in `app.css`), so a
+    /// drag over a long listing selects a window of it, silently. The button
+    /// hands over the block verbatim.
+    ///
+    /// The markup is a header plus the body; `app.js` reads the text back
+    /// out of the `<pre>` on click rather than the server embedding a second
+    /// copy of it as a `data:` URI. The transcript's HTML is re-rendered and
+    /// re-sent on *every streamed token*, and a `data:` URI would put a
+    /// base64 copy of every code block in the reply into each of those
+    /// frames.
+    fn render_code_block(&self, code: &Code, language: Option<&str>) -> String {
+        let assets = highlight_assets();
+        let syntax = language.and_then(|language| {
+            assets
+                .syntaxes
+                .find_syntax_by_token(language)
+                .or_else(|| assets.syntaxes.find_syntax_by_extension(language))
+        });
+
+        // The name has to be read from what the model wrote, before the
+        // licence goes on: `file_name_from_first_line` looks at line one,
+        // and line one is about to become `// MIT License`.
+        let name = self.code_file_name(code, language, syntax);
+        let source = orangu::license::apply(&code.value, &name);
+
+        let plain = || format!("<pre><code>{}</code></pre>", escape_html(&source));
+        let body = match syntax {
+            Some(syntax) => {
+                highlighted_html_for_string(&source, &assets.syntaxes, syntax, &assets.theme)
+                    .unwrap_or_else(|_| plain())
+            }
+            None => plain(),
+        };
+
+        let (text, attr) = (escape_html(&name), escape_attr(&name));
+        format!(
+            "<div class=\"code-block\">{body}\
+             <div class=\"code-footer\"><span class=\"code-name\">{text}</span>\
+             <button type=\"button\" class=\"code-dl\" data-file-name=\"{attr}\" \
+             title=\"Download {attr}\" aria-label=\"Download code as {attr}\">{SAVE_ICON}</button>\
+             </div></div>"
+        )
+    }
+
+    /// The name a code block downloads as.
+    ///
+    /// Preference order is how sure the name is: what the model wrote on the
+    /// fence, then what it wrote in the block's first-line comment, then a
+    /// generated `orangu-snippet-<n>.<ext>`. The counter advances for every
+    /// block, named or not, so the number is the block's position in the
+    /// reply — two blocks never race for the same generated name, and a
+    /// stable name means re-rendering mid-stream doesn't renumber the ones
+    /// already on screen.
+    fn code_file_name(
+        &self,
+        code: &Code,
+        language: Option<&str>,
+        syntax: Option<&SyntaxReference>,
+    ) -> String {
+        let index = self.code_blocks_seen.get() + 1;
+        self.code_blocks_seen.set(index);
+        declared_file_name(language, code.meta.as_deref())
+            .or_else(|| file_name_from_first_line(&code.value))
+            .unwrap_or_else(|| {
+                format!(
+                    "orangu-snippet-{index}.{}",
+                    default_extension(language, syntax)
+                )
+            })
     }
 
     /// True unless this block is the one the document ends inside of.
@@ -456,7 +562,8 @@ fn format_download_link(data_uri: &str, class: &str, format: &str) -> String {
 }
 
 /// The same glyph `app.js` uses for its own save buttons — kept identical so
-/// a diagram's download reads as the same action as an answer's.
+/// a diagram's download, a code block's, and an answer's all read as the
+/// same action.
 const SAVE_ICON: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" \
      stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">\
      <path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/>\
@@ -485,29 +592,216 @@ fn render_math(tex: &str, display: bool) -> String {
     )
 }
 
-fn render_code_block(language: Option<&str>, value: &str) -> String {
-    let language = language.and_then(|l| {
-        let trimmed = l.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    });
+/// Extension-less file names common enough to be worth recognising — the
+/// only names accepted without a `.ext`, so that a bare `rust` or `bash`
+/// info string stays a language rather than becoming a file.
+const BARE_FILE_NAMES: [&str; 8] = [
+    "Makefile",
+    "Dockerfile",
+    "Rakefile",
+    "Gemfile",
+    "Justfile",
+    "Vagrantfile",
+    "Jenkinsfile",
+    "Procfile",
+];
 
-    let assets = highlight_assets();
-    let syntax = language.and_then(|language| {
-        assets
-            .syntaxes
-            .find_syntax_by_token(language)
-            .or_else(|| assets.syntaxes.find_syntax_by_extension(language))
-    });
-
-    match syntax {
-        Some(syntax) => {
-            match highlighted_html_for_string(value, &assets.syntaxes, syntax, &assets.theme) {
-                Ok(html) => format!("<div class=\"code-block\">{html}</div>"),
-                Err(_) => format!("<pre><code>{}</code></pre>", escape_html(value)),
-            }
+/// A file name the model spelled out on the fence itself.
+///
+/// Three shapes are in circulation and all three are read here:
+/// ```` ```rust src/main.rs ````, ```` ```rust:src/main.rs ```` and
+/// ```` ```rust title="src/main.rs" ````. The info string's first word is
+/// what mdast calls `lang`; whatever follows it is `meta`.
+fn declared_file_name(language: Option<&str>, meta: Option<&str>) -> Option<String> {
+    if let Some(language) = language {
+        if let Some((_, rest)) = language.split_once(':')
+            && let Some(name) = clean_file_name(rest)
+        {
+            return Some(name);
         }
-        None => format!("<pre><code>{}</code></pre>", escape_html(value)),
+        // A fence tagged with the file name and nothing else — ```Makefile,
+        // ```main.rs. A plain ```rust has no dot and isn't a known bare
+        // name, so it falls through.
+        if let Some(name) = clean_file_name(language) {
+            return Some(name);
+        }
     }
+
+    meta?.split_whitespace().find_map(|token| {
+        let value = token
+            .split_once('=')
+            .filter(|(key, _)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "title" | "file" | "filename" | "name" | "path"
+                )
+            })
+            .map_or(token, |(_, value)| value);
+        clean_file_name(value)
+    })
+}
+
+/// A file name in the block's own first line, which is how a model labels a
+/// snippet when the fence carries only the language: `// src/main.rs`,
+/// `# app/models.py`, `<!-- index.html -->`.
+///
+/// Only a comment whose body is a *single* token is considered. That guard
+/// is what keeps `# Install the dependencies first` from naming a file, and
+/// it's why an ordinary explanatory comment on line one costs nothing —
+/// the block just falls back to a generated name.
+fn file_name_from_first_line(value: &str) -> Option<String> {
+    let line = value.lines().find(|line| !line.trim().is_empty())?.trim();
+    // Longest marker first, so `#!` isn't read as `#` and `;;` not as `;`.
+    let markers = [
+        "<!--", "\"\"\"", "/*", "//", "--", "#!", ";;", "#", ";", "%",
+    ];
+    let body = markers
+        .iter()
+        .find_map(|marker| line.strip_prefix(marker))?
+        .trim()
+        .trim_end_matches("-->")
+        .trim_end_matches("*/")
+        .trim();
+
+    // `// File: src/main.rs` is as common as the bare form.
+    let body = ["filename:", "file:", "path:", "name:"]
+        .iter()
+        .find_map(|label| {
+            body.get(..label.len())
+                .filter(|head| head.eq_ignore_ascii_case(label))
+                .map(|_| body[label.len()..].trim())
+        })
+        .unwrap_or(body);
+
+    let mut tokens = body.split_whitespace();
+    let token = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    clean_file_name(token.trim_end_matches([':', ',', ';', '.']))
+}
+
+/// Reduces a candidate to a bare, safe file name, or turns it down.
+///
+/// Only the last path component survives: the button saves one file, and a
+/// `download` attribute containing a separator is ignored by the browser
+/// anyway. Everything that isn't plainly a file name is rejected rather
+/// than guessed at — a confidently wrong name on a saved file is worse
+/// than a numbered one.
+fn clean_file_name(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_matches(['"', '\'', '`']);
+    // A URL's last component can look exactly like a file name.
+    if raw.is_empty() || raw.contains("://") {
+        return None;
+    }
+    let name = raw.rsplit(['/', '\\']).next()?.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+    {
+        return None;
+    }
+    if BARE_FILE_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+    {
+        return Some(name.to_string());
+    }
+
+    let (stem, extension) = name.rsplit_once('.')?;
+    // A dotfile (`.gitignore`) is the one shape with no stem. Requiring one
+    // otherwise, and requiring the extension to start with a letter, is what
+    // keeps a comment reading `# 3.14` from naming a file `3.14`.
+    let named = !stem.is_empty() || name.starts_with('.');
+    // Looser than [`is_plausible_extension`], which sizes a *generated*
+    // extension: `.gitignore` is a real name and nine characters long.
+    let plausible = (1..=12).contains(&extension.len())
+        && extension.starts_with(|c: char| c.is_ascii_alphabetic())
+        && extension.chars().all(|c| c.is_ascii_alphanumeric());
+    (named && plausible).then(|| name.to_string())
+}
+
+/// Fence tags that are not their own extension and that the highlighter
+/// can't resolve either — it ships Sublime's syntax definitions, which
+/// cover neither TypeScript nor Kotlin nor PowerShell, and a tag it can't
+/// resolve would otherwise be taken at its word (`.typescript`).
+///
+/// Only tags that are *wrong* without an entry belong here; anything the
+/// highlighter resolves (`rust`, `bash`, `haskell`) already comes out right
+/// and stays out of the table. `web::license` keys the comment syntax off
+/// the extension this produces, so a missing entry costs the snippet its
+/// licence header as well as its name — see that module's own consistency
+/// test.
+const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
+    ("batch", "bat"),
+    ("csharp", "cs"),
+    ("elisp", "el"),
+    ("elixir", "ex"),
+    ("emacs-lisp", "el"),
+    ("fortran", "f90"),
+    ("fsharp", "fs"),
+    ("golang", "go"),
+    ("julia", "jl"),
+    ("kotlin", "kt"),
+    ("matlab", "m"),
+    ("objc", "m"),
+    ("objective-c", "m"),
+    ("ocaml", "ml"),
+    ("pascal", "pas"),
+    ("plaintext", "txt"),
+    ("powershell", "ps1"),
+    ("protobuf", "proto"),
+    ("racket", "rkt"),
+    ("scheme", "scm"),
+    ("shell", "sh"),
+    ("terraform", "tf"),
+    ("text", "txt"),
+    ("typescript", "ts"),
+];
+
+/// The extension a generated name gets.
+///
+/// Taken from the resolved syntax definition, which already carries the
+/// real-world extensions for every language the highlighter knows, so
+/// `rust` becomes `.rs` without a hand-written table. [`LANGUAGE_EXTENSIONS`]
+/// covers the tags it can't resolve and that aren't their own extension;
+/// any other unresolved tag is used as its own extension where it reads
+/// like one, which is right far more often than `.txt` is.
+fn default_extension(language: Option<&str>, syntax: Option<&SyntaxReference>) -> String {
+    let language = language.map(|language| language.to_ascii_lowercase());
+    let language = language.as_deref();
+
+    // A linear scan, not a binary search: the table is small, and this way
+    // it cannot go silently wrong if the alphabetical order below slips.
+    if let Some(extension) = language.and_then(|language| {
+        LANGUAGE_EXTENSIONS
+            .iter()
+            .find(|(tag, _)| *tag == language)
+            .map(|(_, extension)| *extension)
+    }) {
+        return extension.to_string();
+    }
+
+    syntax
+        .and_then(|syntax| {
+            syntax
+                .file_extensions
+                .iter()
+                .map(String::as_str)
+                .find(|extension| is_plausible_extension(extension))
+        })
+        .or_else(|| language.filter(|language| is_plausible_extension(language)))
+        .unwrap_or("txt")
+        .to_ascii_lowercase()
+}
+
+fn is_plausible_extension(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 8
+        && candidate.starts_with(|c: char| c.is_ascii_alphabetic())
+        && candidate.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 fn escape_html(text: &str) -> String {
@@ -566,6 +860,271 @@ mod tests {
         let html = render_markdown_to_html("```notalanguage\nplain text\n```");
         assert!(html.contains("<pre><code>"));
         assert!(html.contains("plain text"));
+    }
+
+    /// Every code block, highlighted or not, is a downloadable window.
+    #[test]
+    fn every_code_block_carries_a_download_button() {
+        for source in [
+            "```rust\nfn main() {}\n```",
+            "```notalanguage\nplain text\n```",
+            "```\nno tag at all\n```",
+        ] {
+            let html = render_markdown_to_html(source);
+            assert!(html.contains("class=\"code-block\""), "{html}");
+            assert!(html.contains("class=\"code-dl\""), "{html}");
+            assert!(html.contains("data-file-name="), "{html}");
+        }
+    }
+
+    /// The licence is in the block the reader sees, not bolted on at save
+    /// time — so it is highlighted, selectable, and already in the text the
+    /// download button reads back out.
+    #[test]
+    fn a_code_block_is_rendered_with_its_licence_header() {
+        let html = render_markdown_to_html("```rust\nfn main() {}\n```");
+        assert!(html.contains("MIT License"), "{html}");
+        assert!(html.contains("Copyright (c)"), "{html}");
+        assert!(html.contains("fn"), "{html}");
+    }
+
+    /// A format with nowhere to put a comment is shown as written — a
+    /// displayed `.json` that doesn't parse would be worse than an
+    /// unlicensed one.
+    #[test]
+    fn a_block_that_cannot_carry_a_comment_is_rendered_untouched() {
+        let html = render_markdown_to_html("```json\n{\"a\": 1}\n```");
+        assert!(!html.contains("MIT License"), "{html}");
+
+        let untagged = render_markdown_to_html("```\nplain text\n```");
+        assert!(!untagged.contains("MIT License"), "{untagged}");
+    }
+
+    /// The name is read off line one, and line one is exactly what the
+    /// licence header displaces — so it has to be taken first.
+    #[test]
+    fn the_licence_does_not_hide_a_first_line_file_name() {
+        let html = render_markdown_to_html("```rust\n// src/lib.rs\nfn f() {}\n```");
+        assert!(html.contains("data-file-name=\"lib.rs\""), "{html}");
+        assert!(html.contains("MIT License"), "{html}");
+    }
+
+    /// A model that wrote its own header must not get a second one.
+    #[test]
+    fn a_block_that_already_carries_the_licence_gets_no_second_copy() {
+        let source = orangu::license::apply("fn main() {}\n", "main.rs");
+        let html = render_markdown_to_html(&format!("```rust\n{source}```"));
+        assert_eq!(html.matches("MIT License").count(), 1, "{html}");
+    }
+
+    /// A diagram is not a code window and never reaches the licensing path.
+    #[test]
+    fn a_diagram_is_not_licensed() {
+        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```");
+        assert!(html.contains("mermaid-diagram"), "{html}");
+        assert!(!html.contains("MIT License"), "{html}");
+    }
+
+    /// The three ways a model spells a file name onto the fence.
+    #[test]
+    fn takes_the_file_name_off_the_fence() {
+        for source in [
+            "```rust src/main.rs\nfn main() {}\n```",
+            "```rust:src/main.rs\nfn main() {}\n```",
+            "```rust title=\"src/main.rs\"\nfn main() {}\n```",
+        ] {
+            let html = render_markdown_to_html(source);
+            assert!(html.contains("data-file-name=\"main.rs\""), "{html}");
+            assert!(html.contains(">main.rs</span>"), "{html}");
+        }
+    }
+
+    /// A fence that is *only* a file name, with the language left implied.
+    #[test]
+    fn takes_a_bare_file_name_fence() {
+        let html = render_markdown_to_html("```Makefile\nall:\n\techo hi\n```");
+        assert!(html.contains("data-file-name=\"Makefile\""), "{html}");
+    }
+
+    /// Failing that, the block's own first-line comment.
+    #[test]
+    fn takes_the_file_name_off_a_first_line_comment() {
+        let cases = [
+            ("```rust\n// src/lib.rs\nfn f() {}\n```", "lib.rs"),
+            ("```python\n# File: app/models.py\nx = 1\n```", "models.py"),
+            ("```html\n<!-- index.html -->\n<p>hi</p>\n```", "index.html"),
+            (
+                "```c\n/* main.c */\nint main(void) { return 0; }\n```",
+                "main.c",
+            ),
+        ];
+        for (source, expected) in cases {
+            let html = render_markdown_to_html(source);
+            assert!(
+                html.contains(&format!("data-file-name=\"{expected}\"")),
+                "{source} -> {html}"
+            );
+        }
+    }
+
+    /// The guard that keeps the first-line rule from firing on prose. A
+    /// wrong name on a saved file is worse than a numbered one.
+    #[test]
+    fn a_prose_comment_does_not_name_the_file() {
+        for source in [
+            "```bash\n# Install the dependencies first\nnpm i\n```",
+            "```python\n# roughly 3.14\nx = 1\n```",
+            "```js\n// see https://example.com/docs.html\nlet x = 1;\n```",
+            "```c\n#include <stdio.h>\nint main(void) { return 0; }\n```",
+        ] {
+            let html = render_markdown_to_html(source);
+            assert!(
+                html.contains("data-file-name=\"orangu-snippet-1."),
+                "{html}"
+            );
+        }
+    }
+
+    /// With no name anywhere, the extension comes from the highlighter's own
+    /// syntax definitions and the number from the block's position.
+    #[test]
+    fn generated_names_number_and_extend_by_language() {
+        let html =
+            render_markdown_to_html("```rust\nfn main() {}\n```\n\ntext\n\n```python\nx = 1\n```");
+        assert!(
+            html.contains("data-file-name=\"orangu-snippet-1.rs\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-file-name=\"orangu-snippet-2.py\""),
+            "{html}"
+        );
+    }
+
+    /// A tag the highlighter has no definition for still beats `.txt` as an
+    /// extension when it reads like one; a tag that doesn't, doesn't.
+    #[test]
+    fn unknown_language_falls_back_to_the_tag_then_txt() {
+        let html = render_markdown_to_html("```zigzag\nconst x = 1;\n```");
+        assert!(
+            html.contains("data-file-name=\"orangu-snippet-1.zigzag\""),
+            "{html}"
+        );
+
+        let html = render_markdown_to_html("```++\nwhat\n```");
+        assert!(
+            html.contains("data-file-name=\"orangu-snippet-1.txt\""),
+            "{html}"
+        );
+    }
+
+    /// A name is attacker-supplied text like everything else in a reply.
+    #[test]
+    fn rejects_a_file_name_that_is_not_one() {
+        let html = render_markdown_to_html("```rust ../../etc/passwd\nfn main() {}\n```");
+        assert!(!html.contains("passwd"), "{html}");
+
+        let html = render_markdown_to_html("```rust \"><script>alert(1)</script>\nfn f() {}\n```");
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    /// A diagram block doesn't consume a snippet number — it isn't a code
+    /// window and has its own download.
+    #[test]
+    fn a_diagram_does_not_take_a_snippet_number() {
+        let html = render_markdown_to_html(
+            "```mermaid\nflowchart TD\n    A --> B\n```\n\n```rust\nfn main() {}\n```",
+        );
+        assert!(html.contains("mermaid-diagram"), "{html}");
+        assert!(
+            html.contains("data-file-name=\"orangu-snippet-1.rs\""),
+            "{html}"
+        );
+    }
+
+    /// The two halves have to agree. this module picks the file name from the
+    /// fence's language; `orangu::license` picks the comment from that name.
+    /// If they drift, a snippet in a mainstream language saves with no
+    /// licence header at all and nothing else notices.
+    #[test]
+    fn every_name_render_generates_for_a_common_language_gets_a_header() {
+        for language in [
+            "rust",
+            "python",
+            "javascript",
+            "typescript",
+            "tsx",
+            "jsx",
+            "go",
+            "golang",
+            "java",
+            "c",
+            "c++",
+            "cpp",
+            "csharp",
+            "c#",
+            "fsharp",
+            "bash",
+            "sh",
+            "shell",
+            "zsh",
+            "ruby",
+            "php",
+            "sql",
+            "yaml",
+            "yml",
+            "toml",
+            "ini",
+            "html",
+            "xml",
+            "css",
+            "scss",
+            "lua",
+            "kotlin",
+            "swift",
+            "scala",
+            "haskell",
+            "perl",
+            "r",
+            "erlang",
+            "elixir",
+            "clojure",
+            "racket",
+            "scheme",
+            "elisp",
+            "ocaml",
+            "pascal",
+            "fortran",
+            "julia",
+            "nim",
+            "zig",
+            "dart",
+            "vue",
+            "svelte",
+            "proto",
+            "protobuf",
+            "graphql",
+            "terraform",
+            "powershell",
+            "batch",
+            "latex",
+            "tex",
+            "markdown",
+            "make",
+            "makefile",
+            "dockerfile",
+        ] {
+            let html = render_markdown_to_html(&format!("```{language}\nplaceholder\n```"));
+            let name = html
+                .split("data-file-name=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("{language}: no file name in {html}"));
+            assert!(
+                orangu::license::header_for(name).is_some(),
+                "{language} saves as {name}, which has no licence header"
+            );
+        }
     }
 
     #[test]

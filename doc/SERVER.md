@@ -1377,6 +1377,29 @@ including syntax-highlighted fenced code blocks — reusing the same
 `markdown`/`syntect` crates `orangu`'s own terminal UI uses for its
 rendering, just pointed at HTML instead of ANSI.
 
+Every code block carries a file name and a **download** button at its
+lower right — the console's standard place for a download, the same as the
+save control under a finished answer — so a single block can be saved on
+its own rather than selected by hand out of a transcript. The name comes
+from the fence
+(```` ```rust src/main.rs ````, ```` ```rust:src/main.rs ````,
+```` ```rust title="src/main.rs" ````), or from a first line that is a
+comment holding nothing but a name (`// src/lib.rs`), or failing both from
+a generated `orangu-snippet-<n>.<ext>` numbered by position and extended
+from the fence's language.
+
+Every code block is shown with the MIT licence as a header, written as a
+comment in that block's own language (`//`, `#`, `--`, `;;`, `%`, `REM`, or a delimited
+`<!-- -->` / `/* */` block), below any shebang or XML declaration — so the
+download saves what is on screen. The reply as the model wrote it is
+untouched; the licence is added when the message is rendered. The text is a
+string compiled into the binary — not a file beside it — with `<YEAR>`
+filled in at render time. A file whose comment syntax isn't known (`.json`, `.csv`, an
+untagged fence's `.txt`) saves without a header rather than with a guessed
+one. The same header, from the same module (`orangu::license`), is what
+`orangu`'s `create_file` tool writes onto a file it generates. See the
+manual's **Web UI** chapter for the full rules.
+
 While a reply is streaming in, the **Send** button becomes a **Stop** (×)
 button; clicking it cancels the request. This closes the connection the
 reply was streaming over, which the engine notices the next time it goes

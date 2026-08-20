@@ -59,6 +59,16 @@ pub fn overwrite_default() -> bool {
 /// `git` defaults to on: inside a repository, a file's life cycle *is* a
 /// sequence of Git operations, and a caller that wants the plain filesystem
 /// has to say so.
+/// Generated code carries a licence header; a file a person spells out by
+/// hand does not. `true` here because the surfaces that deserialize a
+/// request — the `create_file` tool and the HTTP endpoint — are the
+/// generating ones; `orangu`'s typed `/create_file` command sets it to
+/// `false` explicitly. Either way it only ever applies to a file that did
+/// not exist before the call.
+pub fn license_default() -> bool {
+    true
+}
+
 pub fn git_default() -> bool {
     true
 }
@@ -209,6 +219,18 @@ pub struct CreateFileRequest {
     /// alone. Nothing is ever committed either way.
     #[serde(default = "git_default")]
     pub git: bool,
+    /// Write the file with a licence header (`crate::license`) when it is
+    /// new and its format has somewhere to put one — **the default**,
+    /// because a file created through the tool or the endpoint is generated
+    /// code. An *existing* file never gets one however this is set: its
+    /// licensing belongs to the project it is part of, not to the agent
+    /// rewriting it. Not
+    /// advertised in the tool schema, so it is the caller's decision and
+    /// not the model's: `orangu`'s typed `/create_file` command passes
+    /// `false`, since a person spelling a file out by hand is writing it,
+    /// not generating it.
+    #[serde(default = "license_default")]
+    pub license: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,6 +241,12 @@ pub struct CreateFileResponse {
     /// `true` when an existing file was replaced (only possible with
     /// `overwrite`), `false` when the file is new.
     pub overwritten: bool,
+    /// `true` when a licence header was added on top of the content that
+    /// was sent (`crate::license`). Reported because the file on disk then
+    /// has more lines than the request did, and a later `modify_file`
+    /// naming line numbers has to be working from the file, not the
+    /// request.
+    pub licensed: bool,
     /// What Git did, or `null` when the workspace isn't a repository (or
     /// the request passed `"git": false`).
     pub git: Option<GitOutcome>,
@@ -561,8 +589,27 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
     }
     let mode = request.mode.as_ref().map(Mode::bits).transpose()?;
 
+    // Generated code is written with a licence header (`crate::license`).
+    // `apply` itself covers the cases where it must not happen — a format
+    // with no comment syntax to put it in, and content that already carries
+    // the licence — so only "is this generated at all" is decided here.
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    // Only a file this call brings into existence. Rewriting one that was
+    // already there is a change to somebody's project, and a project's
+    // licensing is not this tool's to decide — the agent editing a GPL
+    // source file must not leave an MIT header on top of it.
+    let content = if request.license && !existed {
+        crate::license::apply(&request.content, file_name)
+    } else {
+        request.content.clone()
+    };
+    let licensed = content.len() != request.content.len();
+
     prepare_parent(workspace, &path, request.parents)?;
-    std::fs::write(&path, request.content.as_bytes())
+    std::fs::write(&path, content.as_bytes())
         .map_err(|err| FileError::Io(format!("{}: {err}", path.display())))?;
     if let Some(bits) = mode {
         set_mode(&path, bits)?;
@@ -574,9 +621,10 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
 
     Ok(CreateFileResponse {
         path: display_path(workspace, &path),
-        bytes_written: request.content.len(),
+        bytes_written: content.len(),
         mode: read_mode(&path),
         overwritten: existed,
+        licensed,
         git,
     })
 }
@@ -1048,6 +1096,104 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Code `orangu` writes is licensed code — the same header the web
+    /// console's download puts on a saved snippet, from the same module.
+    #[test]
+    fn create_writes_the_licence_header_onto_generated_code() {
+        let workspace = workspace_with(&[]);
+        let response = create(
+            workspace.path(),
+            create_request("main.rs", "fn main() {}\n"),
+        )
+        .expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("main.rs")).expect("read");
+        assert!(written.starts_with("// MIT License\n"), "{written}");
+        assert!(written.ends_with("\nfn main() {}\n"), "{written}");
+        assert!(response.licensed);
+        // Not the request's length — the file on disk is what was written.
+        assert_eq!(response.bytes_written, written.len());
+    }
+
+    /// A format with no comment syntax has to come out byte-for-byte, or a
+    /// generated `package.json` stops parsing.
+    #[test]
+    fn create_leaves_a_file_it_cannot_comment_untouched() {
+        let workspace = workspace_with(&[]);
+        let body = "{\"name\": \"x\"}\n";
+        let response =
+            create(workspace.path(), create_request("package.json", body)).expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("package.json")).expect("read");
+        assert_eq!(written, body);
+        assert!(!response.licensed);
+    }
+
+    /// A script the agent writes has to stay executable.
+    #[test]
+    fn create_keeps_a_shebang_first() {
+        let workspace = workspace_with(&[]);
+        create(
+            workspace.path(),
+            create_request("run.sh", "#!/bin/sh\necho hi\n"),
+        )
+        .expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("run.sh")).expect("read");
+        assert!(
+            written.starts_with("#!/bin/sh\n# MIT License\n"),
+            "{written}"
+        );
+    }
+
+    /// The rule the user's own project depends on: an existing file is the
+    /// project's, and its licensing is not the agent's to change. Only a
+    /// file this call brings into existence is generated code.
+    #[test]
+    fn create_never_licenses_a_file_that_already_existed() {
+        let workspace = workspace_with(&[("existing.rs", "// (C) somebody else\nfn a() {}\n")]);
+
+        let response = create(
+            workspace.path(),
+            create_request("existing.rs", "fn b() {}\n"),
+        )
+        .expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("existing.rs")).expect("read");
+        assert_eq!(written, "fn b() {}\n");
+        assert!(!response.licensed);
+        assert!(response.overwritten);
+    }
+
+    /// A file a person spells out with `/create_file` is written, not
+    /// generated — see `orangu`'s `create_file_command`.
+    #[test]
+    fn create_writes_exactly_what_was_asked_for_when_licensing_is_off() {
+        let workspace = workspace_with(&[]);
+        let mut request = create_request("hand.rs", "fn main() {}\n");
+        request.license = false;
+
+        let response = create(workspace.path(), request).expect("create");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("hand.rs")).expect("read"),
+            "fn main() {}\n"
+        );
+        assert!(!response.licensed);
+    }
+
+    /// Rewriting a file it already licensed must not stack a second copy.
+    #[test]
+    fn create_does_not_relicense_content_that_already_has_it() {
+        let workspace = workspace_with(&[]);
+        create(workspace.path(), create_request("a.rs", "fn a() {}\n")).expect("first");
+        let once = fs::read_to_string(workspace.path().join("a.rs")).expect("read");
+
+        let response = create(workspace.path(), create_request("a.rs", &once)).expect("second");
+        let twice = fs::read_to_string(workspace.path().join("a.rs")).expect("read");
+        assert_eq!(once, twice);
+        assert!(!response.licensed);
+    }
+
     fn workspace_with(files: &[(&str, &str)]) -> TempDir {
         let dir = tempfile::tempdir().expect("workspace");
         for (name, content) in files {
@@ -1121,6 +1267,7 @@ mod tests {
             overwrite: overwrite_default(),
             parents: false,
             git: false,
+            license: license_default(),
         }
     }
 
@@ -1210,12 +1357,15 @@ mod tests {
         let response = create(dir.path(), request).expect("create");
 
         assert_eq!(response.path, "src/main.rs");
-        assert_eq!(response.bytes_written, 13);
         assert!(!response.overwritten);
-        assert_eq!(
-            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
-            "fn main() {}\n"
-        );
+
+        // A `.rs` file is generated code, so it goes out licensed
+        // (`crate::license`) — `bytes_written` counts what landed on disk,
+        // not what the request carried.
+        let written = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+        assert_eq!(response.bytes_written, written.len());
+        assert!(response.licensed);
+        assert!(written.ends_with("fn main() {}\n"), "{written}");
     }
 
     /// Creating a file that is already there is an override — the same on
