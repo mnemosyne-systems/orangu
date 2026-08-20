@@ -242,7 +242,7 @@ remove directory build
 rmdir build
 ```
 
-These are the same operations the model's own `create_file`/`move_directory`/… tools call, and the same ones `orangu-server` serves over HTTP — one implementation behind all three (see the Tools chapter, and the Inference server internals chapter's **File-lifecycle API**).
+These are the same operations the model's own `create_file`/`move_directory`/… tools call, and the same ones `orangu-server` serves over HTTP — one implementation behind all three (see the Tools chapter, and the *HTTP endpoints* chapter's **File-lifecycle API**).
 
 \newpage
 

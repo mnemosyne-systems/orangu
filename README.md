@@ -391,6 +391,7 @@ Useful first commands:
 - [Serving models per role](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/73-openai.md)
 - [Shell completions](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/74-completions.md)
 - [Compression](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/75-compression.md)
+- [HTTP endpoints](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/80-http.md)
 - [Benchmarking](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/79-bench.md)
 - Internals: [coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md), [inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md), [developer information](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/70-dev.md)
 - [Engine contributor's map](https://github.com/mnemosyne-systems/orangu/blob/main/doc/ENGINE.md) — where the architecture and backend modules sit, what a new one has to implement, and the rules that are not visible from inside one

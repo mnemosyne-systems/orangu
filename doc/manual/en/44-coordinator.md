@@ -198,6 +198,7 @@ specialized model.
 `/v1/create_directory`, `/v1/move_directory`, `/v1/delete_directory`) work
 through the coordinator like everything else, because the coordinator is an
 HTTP proxy: it forwards the request untouched and streams the reply back.
+Their fields are documented in the *HTTP endpoints* chapter.
 
 The coordinator has no workspace of its own and no `-w`/`--workspace` flag —
 the file operation happens in the workspace of the `orangu-server` that

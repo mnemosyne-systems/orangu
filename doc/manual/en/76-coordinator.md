@@ -61,90 +61,35 @@ Deliberately not handled locally, even though the operations are available
 to the coordinator as a library: it has no workspace to act in. Giving it
 one would mean two workspaces in one deployment (the coordinator's and each
 backend's) and a client unable to tell which one a request reached. The
-proxy stays a proxy.
+proxy stays a proxy. The endpoints themselves are documented in the
+*HTTP endpoints* chapter.
 
-### `GET /v1/coordinator`
+### The coordinator's own endpoints
 
-A fixed, side-effect-free identity marker (`proxy::coordinator_info`),
-answered directly and never proxied — it must work even before any profile
-has been activated. Neither `orangu-server` nor a generic OpenAI-compatible
-server exposes this path, so a client can probe it to tell the three apart:
+`GET /v1/coordinator` (`proxy::coordinator_info`) and
+`POST /v1/coordinator/activate` (`proxy::activate`) are answered directly and
+never proxied — the identity marker must work before any profile has been
+activated, and the pre-warming hint never reaches a backend at all. Both are
+documented, request and response, in the *HTTP endpoints* chapter, along with
+`GET /v1/coordinator/shutdown` and how a client should pace its probes.
 
-```json
-{
-  "orangu_coordinator": true,
-  "version": "0.12.0",
-  "models": {
-    "all": "bartowski/gemma-4-12B-it-GGUF",
-    "code": "bartowski/gemma-4-12B-it-GGUF",
-    "review": "bartowski/gemma-4-12B-it-GGUF",
-    "explorer": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-    "embeddings": "bartowski/gemma-4-12B-it-GGUF"
-  }
-}
-```
+Two implementation notes that belong here rather than there. `activate`
+resolves the target entry, `tokio::spawn`s `ensure_active` on it and returns
+`202` without awaiting it: the swap has to survive the caller disconnecting
+early, and the handler must never block on a cold load. And it matches through
+`Coordinator::match_hint`, which does only the model-id/role match with none
+of `select_entry`'s further fallback steps — which is exactly why an unmatched
+`model` is a `404` here and a fallback everywhere else.
 
-`models` reports what `CoordinatorConfiguration::models_by_role` resolves
-each conventional role to — a role with no profile of its own falls back to
-the `all`-role default's model. `orangu`'s side of this lives in
-`src/llm/coordinator.rs`: `probe_coordinator` does the GET and parses the
-body, returning `Option<Vec<String>>` (`Some` only when
-`orangu_coordinator` is `true`). It's shared library code (not
-bin-specific) because both the `orangu` binary's per-cycle header-status
-probe and library code with no `HeaderStatus` of its own (the explorer
-subagent, which reloads its own config from disk) need it.
-
-**Asked once, not every cycle.** The client's status refresh runs on a timer —
-every 60 s idle, every 500 ms while the startup git sync is in flight — and
-this path exists on nothing but a coordinator, so probing it each cycle is a
-404 each cycle against a plain `orangu-server` (and against a hosted
-OpenAI-compatible endpoint). `models::probe_server_reachability` remembers what
-each endpoint answered: a known-plain one skips the probe entirely and lets
-`GET /v1/models` serve as both the model list and the health check, halving the
-requests a poll costs. Over one short session that is 4 coordinator probes down
-to 1, and the saving grows with session length.
-
-The memo is dropped the moment an endpoint stops answering, so a server
-restarted as a coordinator — or a coordinator that simply was not up yet when
-the client started — is identified afresh rather than assumed to be whatever
-was there before. A *confirmed* coordinator is still probed every cycle, since
-for it this endpoint is the health check and `/v1/models` is deliberately never
-called (see above).
-
-`/server` drops it too, in both its forms: listing the servers re-opens the
-question for the active endpoint, and `/server <name>` for the one it selects —
-including when that is the server already in use, matching the model
-re-detection that same command triggers. Listing or selecting a server is the
-moment a user is asking about the connection rather than working through it,
-and the moment the answer is most likely to have just changed. The memo is
-there to keep an unchanging answer from being re-asked on a timer, not to
-outlast a direct question about it; `/server` is how you say "look again".
-
-### `POST /v1/coordinator/activate`
-
-A pre-warming hint (`proxy::activate`) a caller can send *before* the
-request that actually needs a model. `model` is matched exactly like
-ordinary routing (see below). Critically, the swap is **spawned detached
-and not awaited** — the handler resolves the target entry, `tokio::spawn`s
-`ensure_active` on it, and returns `202 Accepted` immediately. This must
-work this way: the whole point is to start the swap ahead of the real
-request, so it has to survive the caller disconnecting early or never
-reading the response, and it must never itself block on a slow cold load.
-
-Unlike ordinary routing, an unmatched `model` here is a `404`, not a silent
-fallback to `all` or "currently active": those fallbacks exist so a request
-that must be answered *somehow* always is, but an explicit "activate X" call
-has no such obligation — silently activating the wrong thing would be worse
-than saying so (`Coordinator::match_hint`, which does only the model-id/role
-match, with none of `select_entry`'s further fallback steps).
-
-`orangu` fires this hint from `spawn_coordinator_activation_hint`
-(`src/bin/orangu/models.rs`) at the start of `/review`/`/auto_review`,
-naming the `review` role, so cold-load latency is hidden behind local work
-(diff collection, the auto-review prestart screen) instead of stalling the
-first real request. It's fire-and-forget from `orangu`'s side too: any
-failure is ignored, since the real request that follows triggers the same
-swap on its own if the hint didn't get there first.
+`orangu`'s side of the identity probe lives in `src/llm/coordinator.rs`:
+`probe_coordinator` does the GET and parses the body, returning
+`Option<Vec<String>>` (`Some` only when `orangu_coordinator` is `true`). It is
+shared library code rather than bin-specific because both the `orangu`
+binary's per-cycle header-status probe and library code with no `HeaderStatus`
+of its own — the explorer subagent, which reloads its own config from disk —
+need it. `models::probe_server_reachability` owns the memo that keeps it from
+being asked every cycle; `spawn_coordinator_activation_hint`
+(`src/bin/orangu/models.rs`) is what fires the pre-warming hint.
 
 ### Request routing: `select_entry`
 

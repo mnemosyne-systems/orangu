@@ -46,7 +46,7 @@ The eight file-lifecycle tools are the same operations `orangu-server`
 serves over HTTP as `/v1/create_file`, `/v1/modify_file` and so on — one
 shared implementation (`orangu::files`), so a tool call, a typed command and
 an API request behave identically. Their full field-by-field schemas are in
-the Inference server internals chapter, under **File-lifecycle API**.
+the *HTTP endpoints* chapter, under **File-lifecycle API**.
 
 They replace the earlier `read_file` and `edit_file`: `read_file` is now
 `show_file` with the same arguments, and `edit_file` is now `modify_file`,

@@ -6,7 +6,8 @@
 API — both the OpenAI-compatible endpoints (`/v1/chat/completions`,
 `/v1/completions`, `/v1/embeddings`, `/v1/models`) and its own
 native ones (`/health`, `/props`, `/slots`, `/metrics`, `/completion`,
-`/tokenize`, `/detokenize`, `/embedding`, `/apply-template`).
+`/tokenize`, `/detokenize`, `/embedding`, `/apply-template`). Every one of
+them is documented, field by field, in the *HTTP endpoints* chapter.
 
 `orangu-server` *is* the inference engine: GGUF loading, tokenization, the
 transformer forward pass, sampling, and request scheduling are implemented
@@ -1077,8 +1078,8 @@ reexec = yes
   `api_key`, and so does every OpenAI-shaped client. **`ORANGU_API_KEY`
   overrides the file**, which is the spelling a real deployment wants: a
   secret in a config file is a secret on disk and in every backup of it. Only
-  `/health` stays reachable without the key: it says the process is up and
-  nothing else, and a liveness probe that needs a credential is a liveness
+  `/health` and `/ready` stay reachable without the key: they say the process
+  is up and whether it can take work, and a probe that needs a credential is a
   probe that fails before credentials are distributed. Everything else —
   `/v1/*`, `/metrics`, `/slots`, `/v1/shutdown` — answers `401` with
   `WWW-Authenticate: Bearer`.
@@ -1199,66 +1200,11 @@ in the *Inference server internals* chapter for the rest.
 
 ### Monitoring: `/metrics` and `/ready`
 
-`/metrics` is Prometheus text. Beyond the slot and queue gauges it carries four
-latency **histograms**, which is what makes a latency question answerable at
-all: a mean is dominated by whichever requests happened to be long, and the
-useful questions are about the tail.
-
-| metric | what it measures |
-| :-- | :-- |
-| `orangu_server_queue_wait_seconds` | arrival to holding a slot |
-| `orangu_server_time_to_first_token_seconds` | arrival to the first generated token |
-| `orangu_server_inter_token_seconds` | the gap between consecutive tokens, one observation *per token* |
-| `orangu_server_request_seconds` | arrival to the last token |
-
-Each is a standard histogram (`_bucket{le="…"}`, `_sum`, `_count`), so a
-quantile is a query rather than a setting:
-
-```
-histogram_quantile(0.95, rate(orangu_server_time_to_first_token_seconds_bucket[5m]))
-```
-
-**Queue wait is the one to reach for first.** "Slow" and "overloaded" look
-identical from outside and have opposite fixes: if queue wait is near zero the
-requests themselves are expensive (bigger model than the device holds, longer
-prompts), and if it is not, the server is short of slots.
-
-Counters carry the totals a rate is taken from:
-
-| counter | notes |
-| :-- | :-- |
-| `orangu_server_requests_total{outcome="…"}` | `stop`, `length`, `cancelled`, `overloaded`, `error` — every label is exported from the start, at zero |
-| `orangu_server_prompt_tokens_total` | prompt tokens accepted, cached or not |
-| `orangu_server_cached_prompt_tokens_total` | the part served from a reused KV prefix; the two together are the cache-hit rate |
-| `orangu_server_generated_tokens_total` | tokens generated |
-
-`outcome="overloaded"` counts requests refused by `queue_limit` and is the one
-to alert on. `outcome="length"` is not an error — it counts answers truncated
-by `max_tokens` — but a rate that climbs usually means clients are asking for
-less room than the model wants.
-
-`outcome="cancelled"` counts clients that disconnected mid-generation. The
-server stops within a token of noticing and frees the slot, so a rate here is
-not a fault — but one that climbs usually means a client-side timeout set below
-what this server can deliver.
-
-**`/ready` is not `/health`.** `/health` answers "is this process alive" — what
-a supervisor uses to decide whether to restart it, and it stays `200` while the
-server is merely busy, because restarting a loaded server is the worst possible
-answer to load. `/ready` answers "would a request sent now be served" — what a
-load balancer uses to decide where to route:
-
-```json
-{"status": "queue full", "queue_depth": 2, "queue_limit": 2, "slots_busy": 1, "slots_total": 1}
-```
-
-`503` when the admission queue is full (so a balancer can route elsewhere
-rather than spend a round trip discovering the same `503` from the API), or
-when the GPU device has been lost and this process is on its way out. `200`
-otherwise. With no `queue_limit` set the queue never refuses, so it is never
-unready for that reason. Both probes stay reachable without an `api_key` — a
-readiness probe that needed a credential would fail closed exactly when a
-balancer most needs an answer.
+`/metrics` is Prometheus text — slot and queue gauges, four latency
+histograms, and counters for requests by outcome and for prompt, cached and
+generated tokens. `/ready` is the readiness probe a load balancer wants, and
+is a different question from `/health`'s liveness. Both are documented, metric
+by metric, in the *HTTP endpoints* chapter.
 
 ### Speculative decoding (`draft_model`)
 
@@ -1418,7 +1364,7 @@ The resolved path is printed on the startup banner, reported as
 `workspace` by `GET /props`, and included in the web UI's saved debug
 report. It is the root every workspace-scoped feature operates in: the
 file-lifecycle API (the five `*_file` and three `*_directory` endpoints —
-see **Endpoint reference** below) refuses any path that resolves outside it,
+see the *HTTP endpoints* chapter) refuses any path that resolves outside it,
 and the features built on top of it later will do the same.
 
 ## Roles
@@ -2410,298 +2356,21 @@ the API and (if enabled) the web UI listener stop together.
 
 ## What a request cost
 
-Every generation endpoint reports what the request cost, so a client never has
-to infer it from its own wall clock — which cannot separate prompt processing
-from generation, nor a cache hit from real work:
-
-- **`usage`** (OpenAI's shape) — `prompt_tokens`, `completion_tokens`,
-  `total_tokens`, and `prompt_tokens_details.cached_tokens` for the part of the
-  prompt served from the prefix cache.
-- **`timings`** (the ecosystem's shape, field for field) — `prompt_n`,
-  `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
-  `predicted_per_second` and their per-token equivalents. These are the same
-  figures the per-request console log prints.
-- **`prompt_progress`** (likewise) — `total`, `cache`, `processed`,
-  `time_ms`, reported once per prefill chunk while the prompt is still being
-  processed (see `return_progress` below).
-
-On a streaming response they ride on the final chunk (the one carrying
-`finish_reason`), immediately before `[DONE]`; on a non-streaming response they
-are top-level fields. `orangu-bench --pp` reads them to report prefill
-throughput, and the orangu client reads them for its status-line rates.
-
-### `timings_per_token` and `return_progress`
-
-Both are the ecosystem's field names, both apply to a **streaming**
-`/v1/chat/completions`, and both exist for the same reason: the longest part of
-a turn is the part a client otherwise knows nothing about.
-
-`return_progress: true` emits a `prompt_progress` chunk after every prefill
-chunk (`ORANGU_PREFILL_BATCH` tokens, 512 by default) rather than only at the
-end. `processed` counts cached tokens as already done, so a mostly-cached prompt
-does not appear to start from zero. On a 2712-token prompt that is six updates
-across a 12.8-second prefill:
-
-```
- 512/2712   2725 ms      2048/2712   9573 ms
-1024/2712   4996 ms      2560/2712  11904 ms
-1536/2712   7274 ms      2712/2712  12845 ms
-```
-
-`timings_per_token: true` attaches a `timings` object to every generated token,
-not just the last chunk, so a client can display a live decode rate measured by
-the server. The first token is deliberately skipped: it was sampled from the
-prefill's own logits, so a rate computed there is a division by a few
-microseconds and comes out in the tens of thousands of tokens per second.
-
-Each arrives as its own chunk with an empty `delta`, which is what lets them
-keep flowing while content is briefly held back by the tool-call splitter.
-
-The `orangu` client requests both. They are what its status line shows: a
-`n/total tok` prefill bar while the prompt is processing, then the server's
-`predicted_per_second` while the answer streams.
-
-### `cache_prompt`
-
-`/v1/chat/completions`, `/v1/completions`, and `/completion` accept
-`cache_prompt` (the ecosystem's field name, default `true`). It controls whether a
-request may **reuse** an already-computed KV cache for whatever prefix of its
-prompt one exists for — the cross-slot prefix pool, or a slot's own retained
-cache. Leaving it at the default is what makes a growing conversation cheap:
-only the new suffix is processed.
-
-Set it `false` to force the whole prompt through a real forward pass. That is
-what a prefill measurement needs, since a cached prompt is reported as
-processing thousands of tokens per second while doing almost nothing —
-`usage.prompt_tokens_details.cached_tokens` and `prompt_progress.cache` show
-exactly how much was skipped. The flag governs only what a request *reads*: the
-resulting cache is still stored for later requests either way.
-
-### Structured output (`response_format`)
-
-`POST /v1/chat/completions` and `/v1/completions` accept OpenAI's
-`response_format`. With `{"type": "json_object"}` the server does not ask the
-model for JSON — it makes anything else **unsampleable**:
-
-```sh
-curl -s localhost:8100/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": "Give me a person record with a name and an age."}],
-  "response_format": {"type": "json_object"},
-  "temperature": 0
-}'
-```
-
-Unconstrained, the same request returns `Here is a person record with a name
-and an age:` followed by prose. Constrained, it returns
-`{"Name": "John Doe", "Age": 32}`.
-
-At every step the sampler is offered only tokens that keep the output a prefix
-of some valid JSON object, and the end-of-sequence token is withheld until the
-document is **complete** — so a model cannot stop at `{"a":` and leave a caller
-parsing a fragment. Once the document is complete, stopping is the only move
-left, which is what keeps a model from trailing blank lines to `max_tokens`
-after it has finished.
-
-`json_object` means an **object**, matching the field's name: a bare string is
-technically valid JSON, and a caller asking for a record and receiving
-`"Name: Sophia, Age: 32"` gets something that parses and then fails at
-`result["name"]`, which is worse than failing outright. `json_schema` is
-accepted and treated the same way — output is constrained to valid JSON, but
-**not** to the schema's shape. Constraining to a schema is a larger job and is
-not implemented; the type is honoured rather than ignored so that a caller
-asking for it is not silently given free text.
-
-Two limits worth knowing. A constrained request cannot use the GPU's
-argmax fast path or prompt-lookup speculation, because both pick tokens without
-consulting the constraint — so constrained decoding is somewhat slower than
-unconstrained. And a constraint makes invalid output unreachable; it cannot
-make a model cooperate. Told *"reply with the single word hello, do not use
-JSON"*, the model spends its budget on whitespace and returns no document at
-all — the response is then not valid JSON, and `finish_reason` is `length`.
-Ask for JSON in the prompt as well as the parameter.
-
-### Tool calling
-
-`/v1/chat/completions` accepts OpenAI's `tools` array and answers with OpenAI's
-`tool_calls`. Nothing about the tools themselves is interpreted here: the array
-is handed to the model's own `tokenizer.chat_template` as the `tools` variable,
-which is what every tool-capable template gates its declaration block on
-(`{%- if tools -%}`). A model whose template has no tool support simply ignores
-it. An empty `tools: []` counts as no tools.
-
-Messages carry the other half of the conversation:
-
-| Field | On | Meaning |
-| :-- | :-- | :-- |
-| `tool_calls` | `assistant` | the calls that turn made, passed to the template verbatim |
-| `tool_call_id` | `tool` | which call this message answers |
-| `name` | `tool` | the function's name; some templates use it directly, others resolve it from `tool_call_id` |
-
-All three are required for a **multi-turn** tool conversation. Without them the
-transcript replayed on turn N+1 shows an assistant message with empty content
-and no record of any call, and the model calls the same tool again.
-
-**Reading the model's answer back.** There is no standard for how a model
-*writes* a call — its template teaches it one, and the forms differ far more
-than the OpenAI shape they all become. Six delimiter-anchored forms are
-recognised:
-
-| Family | Form |
-| :-- | :-- |
-| gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens) |
-| Qwen / Hermes | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
-| GLM, Ling 3.0 | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` (Ling spells all six delimiters as special tokens) |
-| Nemotron | `<tool_call><function=NAME><parameter=k>v</parameter>…</function></tool_call>` |
-| Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
-| Muse-Glimmer, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
-
-Note the three that share `<tool_call>`: the delimiters are the same and the
-bodies are not, so the body's own leading structure decides which it is. A
-value is read as JSON where it parses as JSON and as a plain string otherwise,
-so `3` stays a number and a sentence stays a sentence; where a format marks a
-parameter `string="true"`, that wins, and a version like `1.20` is not quietly
-turned into `1.2`.
-
-Only these delimiters count. A bare JSON object that merely *looks* like a call
-is left as ordinary content — an answer that explains an API must not be
-mistaken for a request to invoke one, and a model asked to *write* a tool call
-has to be able to. A span that opens and never closes, or whose body matches
-none of the forms, is also left as content rather than silently dropped.
-
-A turn that produced calls reports `finish_reason: "tool_calls"` and carries
-them in `choices[0].message.tool_calls` (non-streaming) or in a
-`delta.tool_calls` chunk (streaming). `function.arguments` is a JSON **string**,
-as OpenAI specifies. Streaming emits each call complete in one delta rather than
-character by character, since a call is only recognised once it is fully
-written.
-
-### `id_slot`
-
-`/v1/chat/completions`, `/v1/completions` and `/completion` accept `id_slot`
-(likewise a shared field name), pinning a request to one specific slot instead of
-letting it take whichever is free. An unknown slot number is a `400`, not a
-silent fallback.
-
-What it buys is **cache affinity**. A slot retains the `(tokens, KV cache)` of
-the last request that ran on it, so a conversation that returns to its own slot
-continues from a warm prefix and prefills only the new turn. Landing on a
-neighbour instead finds another conversation's cache there and reprefills the
-whole prompt — and since an idle server hands out the *lowest* free slot, two
-alternating conversations otherwise both land on slot 0 and evict each other
-every turn.
-
-Two conversations interleaved on a two-slot server, three turns each
-(`gemma-4-E2B-it:Q4_K_M`, ~430-token prompts):
-
-| | tokens actually prefilled | prefill time |
-| --- | ---: | ---: |
-| without `id_slot` | 2 567 | 13.4 s |
-| with `id_slot` | **889** | **5.0 s** |
-
-Steady-state per turn is where it shows: 2.0 s of prefill becomes 0.25 s, because
-the whole previous turn is served from the slot's own cache
-(`cached_tokens` 417 of 433, rather than 7).
-
-A pinned request **waits** for its slot rather than being bounced to a free one
-— that is the point, and it is a trade the caller has already chosen. Waiting
-costs no one else any concurrency: a queued request holds nothing.
-
-The `orangu` client does this automatically. Each workspace tab probes `/props`
-once per endpoint, takes a slot round-robin, and pins every request in that tab
-to it, so tabs stop evicting each other. One-shot requests (`orangu -p`) do not
-pin — there is no later turn to keep a cache warm for.
+Every generation endpoint reports what the request cost — `usage` in OpenAI's
+shape, `timings` and `prompt_progress` in the ecosystem's — so a client never
+has to infer it from its own wall clock, which cannot separate prompt
+processing from generation, nor a cache hit from real work. Those objects,
+and the request fields that shape a turn (`cache_prompt`, `id_slot`,
+`timings_per_token`, `return_progress`, `response_format`, `tools`), are
+documented in the *HTTP endpoints* chapter.
 
 ## Endpoint reference
 
-Three things apply to every endpoint below rather than to any one of them, and
-are easy to miss looking down a table:
-
-- **`401`** — when `[orangu-server].api_key` is set, every endpoint except
-  `GET /health` and `GET /ready` requires `Authorization: Bearer <key>` and answers `401` with
-  `WWW-Authenticate: Bearer` without it.
-- **`503`** — when `queue_limit` is set and that many requests are already
-  waiting for a slot, a generating endpoint answers `503` with `Retry-After`
-  instead of joining the queue.
-- **`https`** — when `tls_cert`/`tls_key` are set, every endpoint is served
-  over TLS on the same port; there is no plaintext listener alongside.
-
-
-| Endpoint | |
-| :-- | :-- |
-| `GET /v1/models` | |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; OpenAI `tools`/`tool_calls` and `response_format`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding` |
-| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`; disabled under `--embedding` |
-| `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized; carries OpenAI's `usage` (`prompt_tokens`/`total_tokens`, summed over a batched `input`) |
-| `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
-| `GET /ready` | readiness: would a request sent now be served. `503` with a reason when the admission queue is full or the GPU device was lost. Reachable without an `api_key`, like `/health` |
-| `GET /props` | model + server metadata: the `backend` and device the model is running on (plus every other device that backend saw, and under `gpu.footprint` what this model costs on it), and `version`/`commit` — which build is answering |
-| `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text: slots and queue depth as gauges; latency histograms (queue wait, time to first token, inter-token, request duration); counters for requests by outcome and for prompt/cached/generated tokens |
-| `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
-| `POST /tokenize` / `POST /detokenize` | |
-| `POST /embedding` | native embeddings |
-| `POST /apply-template` | renders the chat template without generating |
-| `POST /v1/create_file` | file lifecycle: write a new file, with optional permissions |
-| `POST /v1/modify_file` | file lifecycle: replace named line ranges, returning a diff |
-| `POST /v1/move_file` | file lifecycle: rename a file, optionally re-setting permissions |
-| `POST /v1/delete_file` | file lifecycle: delete a file |
-| `POST /v1/show_file` | file lifecycle: return a file's entire content |
-| `POST /v1/create_directory` | file lifecycle: create one directory, with optional permissions |
-| `POST /v1/move_directory` | file lifecycle: move an entire directory tree |
-| `POST /v1/delete_directory` | file lifecycle: delete an empty directory |
-| `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, bytes dequantized, the expert store's hit rate, and `batch.mean_batch` when fused decode batching is on. Drain once before a workload and again after to measure exactly that window |
-| `GET /gpu-timings` | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them |
-| `GET /model-cache` | how much of the model is in the page cache right now; `resident_bytes` is `null` where the platform cannot measure it, never `0` |
-| `POST /model-cache/drop` | evict the model from the page cache so the next request reads from disk; loopback-only. Reports residency before and after rather than a success flag |
-| `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache (see **Session management**) |
-| `POST /v1/shutdown` | not part of the standard API — orangu-server's own |
-
-Those eight are orangu-server's own JSON API for the whole life cycle of a
-file and the directories it lives in, and are confined to the workspace (see
-**Workspace** above): a path outside it is refused before anything is
-touched. `delete_directory` only removes an empty directory, and nothing in
-the API deletes a tree.
-
-When the workspace is a **Git repository**, they are Git operations: a file
-is created, modified, moved and deleted with `git add`, `git mv` and
-`git rm`, so the change is staged, and each reply reports what reached the
-index (including the forge, when `gh` or `glab` is installed). **Nothing is
-ever committed** — that stays the user's own decision. A request can pass
-`"git": false` for a plain filesystem change. They are documented field by field in the Inference
-server internals chapter, under **File-lifecycle API**.
-
-The built-in **Web UI** (above) is served on its own `web` port, separate
-from the API's `port`, and exposes a small `/api/...` surface of its own —
-used only by that page's own JavaScript, not part of the OpenAI-
-compatible API above, and only reachable at all when a `[web]` section is
-configured:
-
-| Endpoint | |
-| :-- | :-- |
-| `GET /api/asset-version` | the served page's own asset fingerprint — powers the Reload prompt shown when a newer build is running behind an already-open tab |
-| `GET /api/system-report` | plain-text hardware report (`system`'s own output) plus model/backend identity — what an error bubble's **Save** button bundles into its downloadable debug report, alongside the visible conversation |
-| `POST /api/sessions` | creates a new, empty chat session, returning its id |
-| `GET /api/sessions` | lists every non-empty session, newest-updated first |
-| `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
-| `POST /api/sessions/{id}/messages` | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses |
-| `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
-| `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
-| `GET /api/models` | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory |
-| `GET /api/models/updates` | which rows are behind their Hugging Face repo — `list`'s `(Refresh)` marker, one Hub request per distinct repo |
-| `GET /api/models/metadata?model=…` | a model's full GGUF metadata as plain text — `show`'s own output. `&tensors=true` and `&full=true` are `show --tensors`/`--full` |
-| `POST /api/models/select` | restarts the server on a different model, keeping both listening sockets and the pid; answers `202` before it acts, since `execve` leaves nothing to answer from |
-| `POST /api/models/download` | starts a Hugging Face download in the background, returning at once |
-| `DELETE /api/models` | deletes a model, refusing the one currently loaded |
-| `DELETE /api/models/job` | clears a finished download's result |
-
-The three that name a model take `{"model": "..."}` — an `NR`, a `MODEL`
-label, a bare filename, or a path, exactly as the matching subcommand's own
-argument does. The panel sends the `NR`, since that is the only spelling
-that names one row exactly (a repo with several quantizations on disk prints
-the same bare `MODEL` on each of their rows), and for a load or a delete it
-also sends the `path` that row showed. Given both, the server checks they
-still agree before acting: an `NR` is a *position*, and a download finishing
-while a confirmation dialog is open re-sorts the listing underneath it.
+Every endpoint this server exposes — the OpenAI-compatible ones, the native
+ones, the diagnostic ones, the eight file-lifecycle ones, and the web
+console's own `/api/…` surface — is documented in the *HTTP endpoints*
+chapter, field by field, alongside the rules (bearer token, queue `503`, TLS)
+that apply to all of them.
 
 ## Scope
 
