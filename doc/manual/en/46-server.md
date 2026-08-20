@@ -706,13 +706,33 @@ orangu-server refresh                                           # no argument: i
 ```
 
 ```
-Refresh 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)? The local copy is deleted first, then downloaded again. [y/N]: y
 Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (4 files, 17.28 GiB)
 Downloaded to /home/you/models/models--unsloth--Qwen3-Coder-Next-GGUF/snapshots/<newcommit>/...
 ```
 
-The local copy really does go first. A changed repo means a full second copy
-on disk, not a cheap blob-sharing snapshot, so deleting first means a 17 GiB
+Nothing is deleted until the Hub has been asked. `refresh` compares the
+repo's file hashes against the ones on disk — the same comparison `list`
+marks `(Refresh)` from, per file rather than per commit, so a commit that
+touched only another quantization doesn't count — and a model already at the
+latest revision is a no-op:
+
+```
+$ orangu-server refresh 3
+'unsloth/Qwen3-Coder-Next-GGUF' is already at its repo's latest revision; nothing to do.
+```
+
+Offline, or with the repo unreachable for any other reason, `refresh` does
+nothing at all rather than guessing. "Not known to be behind" is not the same
+as "current", and acting on the guess would delete a model that then could
+not be downloaded again:
+
+```
+$ orangu-server refresh 3
+Could not reach Hugging Face for 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M', so there is no way to tell whether 'unsloth/Qwen3-Coder-Next-GGUF' is behind its repo; nothing was changed.
+```
+
+When a refresh does go ahead, the local copy really does go first. A changed
+repo means a full second copy on disk, not a cheap blob-sharing snapshot, so deleting first means a 17 GiB
 model needs 17 GiB free to refresh rather than 34 — at the cost that an
 interrupted download leaves the model missing rather than stale. Re-running
 `refresh` (or `download`, which resumes from the `.part` file left behind)
@@ -731,11 +751,10 @@ error: 'bartowski/Llama-3.2-1B-Instruct-GGUF' names 2 models on disk (Q4_K_M, Q6
 With no argument, `refresh` prints `list`'s table with every row that is
 *already* current greyed out — the inverse of what `list` greys — so the only
 `NR`s standing out are the ones worth refreshing, and prompts for one. When
-nothing is behind (or the Hub couldn't be reached, so nothing is *known* to
-be behind and nothing is greyed) it says so before the prompt. A model that
-didn't come from Hugging Face has no repo to refresh from; naming one is an
-error, raised before anything is deleted. Confirmation and `-y`/`--yes` work
-exactly as in `delete`.
+nothing is behind, or the Hub couldn't be reached at all, it says so instead
+of opening a picker whose every choice would be a no-op. A model that didn't
+come from Hugging Face has no repo to refresh from; naming one is an error,
+raised before anything is deleted.
 
 ## Bundling: the server and a model as one file
 
