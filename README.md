@@ -43,6 +43,7 @@ orangu is the lean, private, Git-centric coding companion for the terminal — b
 - **Builds your project too** — `/build` detects the toolchain (Cargo, CMake, Autotools, Meson, Maven, Python, Go, plain `make`) and runs format, lint, build, and test as one reported pipeline, with `debug`/`release` profiles and per-target scoping.
 - **Scriptable and schedulable** — `-p` runs a single prompt or command and exits (`-q` silences it down to the exit code), and a built-in cron-style scheduler (`~/.orangu/schedule`) runs commands unattended while orangu is up.
 - **Themeable terminal UI** — six built-in themes (`classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`), `random`, or your own `~/.orangu/themes/*.theme`, applied per run (`-t`) or per session (`/theme`).
+- **Licenses what it generates** — a file the model creates carries *your project's* licence, read from its manifest or `LICENSE` file (used verbatim when it is one orangu has no header for) and defaulting to MIT. `/license <spdx> [<holder>]` overrides it per session, with Tab completion over the popular OSI licences; `/license none` turns headers off.
 - **Natural to drive** — dozens of slash commands, each with plain-English aliases (`review`, `auto review`, `commit "..."`, `merge feature/foo`, `pull 58`).
 
 ## A complete local AI coding stack
@@ -92,6 +93,7 @@ A fourth binary, `orangu-bench`, is a developer tool rather than part of the sta
 - Shell-style prompt editing, history with bash-style `Ctrl+R` reverse search (the match is ghosted inline, Tab completes it), scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches) and a slash-command dropdown
 - Mouse scroll and double-click, on by default and switchable off (hold **Shift** for the terminal's own text selection)
 - Natural-language aliases for nearly every command — e.g. `review`, `auto review`, `open README.md`, `list models`, `pull 58`, `commit "[#42] My feature"`, `rebase`, `merge feature/foo`, `get comments for issue 51`, `export review`
+- The licence generated files are written under, detected from the project and switchable per session with `/license` (the choice is stored with the session and restored on resume)
 - Streaming responses with live footer status such as `Thinking (...)` and native `Working @ X.Y t/s (...)`
 - Queued local commands while a response is in flight, plus double-`Esc` request cancellation
 - Markdown rendering in the console (bold, italic, headings, lists, links, code) with syntax highlighting for fenced code blocks

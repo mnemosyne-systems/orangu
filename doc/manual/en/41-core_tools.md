@@ -6,6 +6,8 @@ The core tools are the local slash commands that drive the client itself — dis
 
 Every command below also accepts the natural-language aliases listed in its **Examples**; the recognized phrases are matched only for these built-in commands, and any other input is sent to the model as an ordinary prompt.
 
+Some of those aliases are bare English verbs — `create `, `add `, `remove `, `delete `, `move `, `open `, `edit `, `show `, `restore `, `merge `, `checkout `, `switch to `, `rebase ` — which is also how a sentence meant for the model begins. Each of them takes **exactly one argument**: a single word, or a quoted string. So `create pacman.rs` creates that file, while `Create a Pacman like game` is a prompt and goes to the model, as does `remove the duplicated parsing code` or `open the file that defines the parser`. The forms that name their object — `create file …`, `delete branch …`, `git add …` — are not restricted this way, since there you have already said what you meant; and quoting reaches anything, so a path with a space in it is `open "docs/user guide.md"`.
+
 \newpage
 
 ## /help
@@ -268,6 +270,96 @@ Pressing `Tab` after `/theme ` completes the built-in themes, `random`, and any 
 /theme tokyonight
 /theme modern_light
 /theme random
+```
+
+\newpage
+
+## /license
+
+Chooses the licence **generated** code is written under — the header
+`create_file` puts on a file it brings into existence, and the one the web
+console's per-block download saves. It changes nothing in the workspace: this
+is a session's answer about a project, not a change to the project.
+
+With no argument it reports the licence in force and where it came from:
+
+```text
+Generated files are licensed GPL-3.0-or-later (GNU General Public License
+v3.0 or later), copyright Jesper Pedersen — detected from this workspace.
+```
+
+**It is detected before it is chosen.** In order: the `license` field of the
+workspace's `Cargo.toml`, `pyproject.toml` or `package.json`; then its
+`LICENSE`/`COPYING` file; then, if that file is a licence orangu has no header
+for, **that file's own text, used verbatim** — the project has said what its
+licence is, and that it is not one of the ones below is no reason to put a
+different one on its files. A project that says nothing at all gets **MIT**,
+so a new project still produces licensed files.
+
+The copyright holder is found the same way: the manifest's first author, then
+the `LICENSE` file's copyright line — but only for MIT and the BSDs, since a
+GPL or Apache `LICENSE` is boilerplate whose copyright line names the Free
+Software Foundation or the Apache Software Foundation rather than anyone who
+wrote the code — and finally `git config user.name`. Give one yourself as a
+second argument. If none can be found, no header is written and `/license`
+says so rather than leaving you to discover it in a generated file.
+
+The licences are the popular set from <https://opensource.org/license>, with
+the GNU family split the way SPDX splits it, because `-only` and `-or-later`
+are different grants and a header has to say which:
+
+```text
+MIT                 Apache-2.0          BSD-3-Clause        BSD-2-Clause
+GPL-3.0-or-later    GPL-3.0-only        GPL-2.0-or-later    GPL-2.0-only
+LGPL-3.0-or-later   LGPL-3.0-only       LGPL-2.1-or-later   LGPL-2.1-only
+AGPL-3.0-or-later   AGPL-3.0-only       MPL-2.0             EPL-2.0
+BSL-1.0             CDDL-1.0
+```
+
+`Tab` after `/license ` completes them, along with `auto` and `none`; the grey
+ghost previews the match as you type. Only the first argument is completed —
+what follows it is a copyright holder, which has nothing to offer a list.
+
+The choice is remembered **per session**, written to:
+
+```text
+~/.orangu/sessions/<UUID>/settings
+```
+
+as `license` and `license_holder`, so it is restored when the session is
+resumed or when you switch back to that workspace tab. Each workspace tab has
+its own session, so each can be writing under a different licence.
+
+`auto` clears the choice and goes back to following the workspace. `none`
+turns headers off for the session.
+
+A model cannot set this. The licensing fields are absent from the `create_file`
+tool schema deliberately — relicensing somebody's project is not a decision to
+leave to a language model — so a call that names them is overruled.
+
+`-p` refuses `/license <spdx>` for the same reason it refuses `/theme <name>`:
+the choice is kept per session and a one-shot keeps none. A bare `/license`
+reports, and works.
+
+**Examples**
+
+```text
+/license
+/license MIT
+/license Apache-2.0 Acme Ltd
+/license GPL-3.0-or-later
+/license none
+/license auto
+```
+
+Natural-language forms:
+
+```text
+license
+show license
+license MIT
+use license Apache-2.0
+set license to GPL-3.0-or-later
 ```
 
 \newpage

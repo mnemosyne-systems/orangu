@@ -370,6 +370,13 @@ fn session_only_reason(command: &LocalCommand<'_>) -> Option<&'static str> {
         LocalCommand::SetTheme(name) if !name.trim().is_empty() => {
             Some("only changes the running session's theme; -p renders no interface")
         }
+        // A bare `/license` reports the licence in force, which is a
+        // perfectly good thing to ask a one-shot; setting one is not, because
+        // the choice is remembered *per session* and `-p` keeps none.
+        LocalCommand::License(args) if !args.trim().is_empty() => Some(
+            "only changes the running session's licence, which -p does not keep; \
+             the workspace's own licence is what a one-shot writes",
+        ),
         LocalCommand::SetVerbosity(_) => {
             Some("only changes the running session's system prompt, which -p does not keep")
         }
@@ -504,6 +511,13 @@ fn report_timings(
         parts.push(format!("decode {rate:.1} t/s"));
     }
     console.note(&format!("[{}]", parts.join(" | ")));
+    // Its own line, above the rates rather than inside them: this is not a
+    // measurement of the turn, it is a warning that the answer above is not
+    // the whole answer — and if what was cut off was a tool call, the call
+    // never closed, so nothing ran and nothing was written.
+    if metrics.is_some_and(|m| m.truncated) {
+        console.note(&format!("[{}]", orangu::llm::TRUNCATED_NOTICE));
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +538,7 @@ mod tests {
             "/model gemma",
             "/server llama",
             "/theme dark",
+            "/license MIT",
             "/verbosity terse",
             "/verbosity",
         ] {
@@ -537,6 +552,7 @@ mod tests {
         // and `/model`/`/server` without an argument only report.
         for input in [
             "/theme",
+            "/license",
             "/model",
             "/server",
             "/status",

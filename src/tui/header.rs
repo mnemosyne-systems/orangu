@@ -174,9 +174,11 @@ pub fn help_text() -> &'static str {
 /reload                                         Restore the configured model and server
 /restart                                        Restart orangu, resuming the same workspace and session
 /tools                                          List tools
+/mcp [refresh|add <name> <command>…|remove <name>] Show MCP server status and discovered tools, or reconnect/add/remove a server
 /model [name]                                   List the server's models (active green), or switch to a specific one
 /information                                    Report which OpenAI/orangu-server capabilities are available and enabled
 /prune [<uuid>|-w <path>|-o <days>|all]         Remove sessions
+/search <query>                                 Semantic code search over the embedding index
 /session [uuid|workspace]                       List/switch sessions, or open a workspace directory (Tab completes UUIDs, workspaces, then filesystem paths)
 /workspace [number|path]                        Show the active workspace, switch to a tab by number, or open a directory (Tab completes workspaces, then filesystem paths)
 /create_workspace <dir>                         Open a new workspace tab on an existing directory (like Alt+Insert + /workspace)
@@ -188,19 +190,25 @@ pub fn help_text() -> &'static str {
 /shell <command>                                Run a shell command in the workspace, streaming its output (Tab completes workspace files one path segment at a time)
 /export [console|review|auto review|duplicates|pr|statistics] Export the output window (console), the last review report (review), the last auto-review report (auto review), a fresh duplicate-code report (duplicates), open pull requests (pr), or persistent activity history (statistics) to a PDF in the workspace root
 /duplicates [<threshold>]                       Scan source functions (Rust, C/C++, Go, Python, JS/TS, and ~20 more languages) for duplicates; on a non-default branch only the functions it adds/changes are compared against the project; optional threshold is a percentage (default 80%)
-/add_file <path>                                Stage a file or directory with git add
+/add_file <path>                                Obsolete spelling of /create_file, kept working
 /auto_review [<file>|all] [immediate] [deep]    LLM auto review in a split view: the whole branch, one Tab-completed file (the full file on main/master, its changes on a branch), or every Git-tracked project file with all; add immediate to start the run at once; add deep to start every file in Deep mode (no diff truncation, cross-file graph context, a verify pass on rejects)
+/create_directory <path> [with <mode>]          Create a directory in the workspace, optionally with octal permissions
 /amend <message>                                Rewrite the last commit message with git commit --amend
 /bisect [start|good|bad|skip|reset|log]         Binary-search history for the commit that introduced a bug (git bisect); bare /bisect shows the session status
 /branch [<name>|-a|-b|-m|-d <name>]             List, switch, create, rename or delete a branch
 /cherry_pick <commit>                           Cherry-pick a commit onto the current branch
 /comment <number> "<comment>"|<file>            Add a comment to a GitHub/GitLab issue; inline body, file from ~/.orangu/comments/, or `with [auto] review` to post the last /review or /auto_review report
+/create_file <path> [with <mode>] [containing <text>] Create a file (or stage an existing one), with optional permissions and content
 /close -i <number>|-p <number>                  Close a GitHub/GitLab issue or pull request with gh/glab
 /commit <message>                               Commit all tracked changes with git commit -a -m
+/delete_directory <path>                        Delete an empty directory from the workspace
+/delete_file <path>                             Delete a file from the workspace (git rm when it is tracked)
 /diff                                           Show a color unified diff against the current branch
 /fetch [remote]                                 Fetch from a remote with git fetch (Tab completes git remotes; defaults to the first remote)
 /get_comments -i <number>|-p <number>           List comments on a GitHub/GitLab issue or pull request with gh/glab
 /grep <pattern>                                 Search the workspace with git grep
+/graph                                          Write an HTML visualization of the codebase Knowledge Graph
+/issue <reviewer|assignee|label> <number> <value> Add a reviewer, assignee, or label to a GitHub/GitLab issue or pull request
 /init_repo                                      Initialize a Git repository in the workspace
 /log [number]                                   Show commit log (optionally the latest number of commits) plus a count of uncommitted/untracked changes
 /merge <branch>                                 Merge a branch into the current branch
@@ -208,6 +216,7 @@ pub fn help_text() -> &'static str {
 /pending [delete <n>]                           List queued commands, or delete one by number
 /pull <number>                                  Check out a GitHub/GitLab pull/merge request on a dedicated branch
 /pull_request                                   Create a pull request for the current branch
+/move_directory <from> <to>                     Move a directory and everything under it inside the workspace
 /push [--force]                                 Push the current branch to origin
 /rebase [target]                                Rebase the current branch onto master/main, or onto a given target (Tab completes local branches, then remotes, then remote branches)
 /remove_file <path>                             Remove a file or directory from Git tracking
@@ -225,10 +234,11 @@ pub fn help_text() -> &'static str {
 /developer                                      Developer mode (the default)
 /committer                                      Committer mode: the merge flow
 /theme <name>                                   Set this session's UI theme (naming the configured one drops the override)
+/license [<spdx> [<holder>]]                    Set the licence generated files carry (`auto` follows the project, `none` writes no header)
 /clear                                          Clear the current conversation
 /quit                                           Exit the client
 
-Natural-language forms such as `open README.md`, `list models`, `show information`, `list files`, `pull 58`, `log`, `git show abc1234`, `fetch`, `fetch upstream`, `status`, `rebase`, `rebase origin/main`, `squash`, `merge feature/foo`, `grep <pattern>`, `find <pattern>`, `branch`, `list branches`, `checkout main`, `switch to main`, `create branch feature/x`, `rename to new-name`, `delete feature/foo`, `restore README.md`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `comment on 48 with review`, `comment on 48 with auto review`, `get comments for issue 51`, `get comments for pull request 58`, `review`, `auto review`, `find duplicates`, `export console`, `export review`, `export auto review`, `export duplicates`, `export statistics`, `show statistics`, `show schedule`, `create pull request`, `stash`, `stash pop`, `stash list`, `stash drop`, `bisect start`, `mark good`, `mark bad`, `bisect reset`, `init repo`, `prune session <uuid>`, `prune all`, `prune sessions older than <days>`, `prune sessions in <path>`, `restart`, `pending`, `workspace`, `workspace 1`, `switch workspace ~/project`, `create workspace ~/project`, `delete workspace`, `show manual`, and `show help` are also handled locally.
+Natural-language forms such as `open README.md`, `list models`, `show information`, `list files`, `pull 58`, `log`, `git show abc1234`, `fetch`, `fetch upstream`, `status`, `rebase`, `rebase origin/main`, `squash`, `merge feature/foo`, `grep <pattern>`, `find <pattern>`, `branch`, `list branches`, `checkout main`, `switch to main`, `create branch feature/x`, `rename to new-name`, `delete feature/foo`, `restore README.md`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `comment on 48 with review`, `comment on 48 with auto review`, `get comments for issue 51`, `get comments for pull request 58`, `review`, `auto review`, `find duplicates`, `export console`, `export review`, `export auto review`, `export duplicates`, `export statistics`, `show statistics`, `show schedule`, `license`, `use license MIT`, `create pull request`, `stash`, `stash pop`, `stash list`, `stash drop`, `bisect start`, `mark good`, `mark bad`, `bisect reset`, `init repo`, `prune session <uuid>`, `prune all`, `prune sessions older than <days>`, `prune sessions in <path>`, `restart`, `pending`, `workspace`, `workspace 1`, `switch workspace ~/project`, `create workspace ~/project`, `delete workspace`, `show manual`, and `show help` are also handled locally.
 
 The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
 

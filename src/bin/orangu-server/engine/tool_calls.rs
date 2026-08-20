@@ -135,6 +135,13 @@ pub fn split(text: &str) -> Split {
     let mut calls = Vec::new();
     let mut rest = text;
 
+    // Whether the loop below gave up on a span rather than running out of
+    // them — an opener that never closed, or a body that would not parse.
+    // Both mean "stop reading calls and keep the rest as prose", and neither
+    // may fall through to the recovery pass afterwards, which exists for a
+    // different failure entirely.
+    let mut gave_up = false;
+
     while let Some((at, open, close, syntax)) = next_opener(rest) {
         let body_start = at + open.len();
         let (body, after) = if close.is_empty() {
@@ -146,7 +153,10 @@ pub fn split(text: &str) -> Split {
                     &rest[body_start + end + close.len()..],
                 ),
                 // Opened and never closed — not a call.
-                None => break,
+                None => {
+                    gave_up = true;
+                    break;
+                }
             }
         };
         let parsed = match syntax {
@@ -159,6 +169,7 @@ pub fn split(text: &str) -> Split {
             // A well-delimited span we could not read. Keeping the raw text is
             // the honest outcome: the user sees what the model produced rather
             // than a silently truncated answer.
+            gave_up = true;
             break;
         }
         content.push_str(&rest[..at]);
@@ -166,8 +177,50 @@ pub fn split(text: &str) -> Split {
         rest = after;
     }
 
+    // A call whose opener the model forgot, once it has already shown it can
+    // write one. See [`recover_unopened`].
+    if !gave_up {
+        while !calls.is_empty()
+            && let Some((at, parsed, after)) = recover_unopened(rest)
+        {
+            content.push_str(&rest[..at]);
+            calls.extend(parsed);
+            rest = after;
+        }
+    }
+
     content.push_str(rest);
     Split { content, calls }
+}
+
+/// A gemma call whose *opening* marker the model forgot.
+///
+/// Having written one well-formed `<|tool_call>call:…{…}<tool_call|>` span,
+/// gemma-4 will sometimes write the next call's body straight out and close
+/// it — `call:create_file{…}<tool_call|>` with nothing opening it. Measured on
+/// a three-file answer where only the first file was ever written: the model
+/// asked for `index.html`, `style.css` and `game.js`, and two of the three
+/// reached the caller as prose.
+///
+/// This is not a relaxation of the module's "only delimiter-anchored formats"
+/// rule. `<tool_call|>` is a special token the model writes to *end* a call
+/// and for nothing else, and `call:` is the format's own body opener; between
+/// the two the span is as anchored as one whose opener arrived. A body with
+/// neither is still nothing, and one that does not parse is still prose.
+///
+/// Only after a call has already been recovered from this message, so the
+/// format is established rather than guessed at.
+fn recover_unopened(text: &str) -> Option<(usize, Vec<ParsedToolCall>, &str)> {
+    const CLOSE: &str = "<tool_call|>";
+    let at = text.find(CLOSE)?;
+    // The last `call:` before the closer: anything earlier is the prose the
+    // model wrote between the two calls, and stays in the answer.
+    let body_start = text[..at].rfind("call:")?;
+    let parsed = parse_gemma_dsl(&text[body_start..at]);
+    if parsed.is_empty() {
+        return None;
+    }
+    Some((body_start, parsed, &text[at + CLOSE.len()..]))
 }
 
 fn next_opener(text: &str) -> Option<(usize, &'static str, &'static str, Syntax)> {
@@ -177,23 +230,47 @@ fn next_opener(text: &str) -> Option<(usize, &'static str, &'static str, Syntax)
         .min_by_key(|(at, open, _, _)| (*at, std::cmp::Reverse(open.len())))
 }
 
+/// gemma-4's string delimiter, as [`marker_text`] renders it — the literal
+/// spelling of the vocabulary's own `<|"|>` token.
+///
+/// Five characters rather than one so that a `"` occurring *inside* a string
+/// value cannot be mistaken for the end of it. The template writes the value
+/// between two of these and escapes nothing, so this is the only thing that
+/// says where the value stops.
+const DSL_QUOTE: &str = "<|\"|>";
+
 /// gemma-4's `call:NAME{key:value,...}`.
 ///
 /// The value grammar is the one the template's own `format_argument` macro
-/// writes: strings quoted (the `<|"|>` token having been rendered back to `"`
-/// upstream), `true`/`false`/`null` bare, numbers bare, nested objects with
-/// **unquoted** keys, and arrays. That last part is why this cannot simply be
-/// handed to `serde_json`.
+/// writes: strings delimited by [`DSL_QUOTE`], `true`/`false`/`null` bare,
+/// numbers bare, nested objects with **unquoted** keys, and arrays. That last
+/// part is why this cannot simply be handed to `serde_json`. A bare `"` is
+/// accepted as a delimiter too, for a model that spells one instead of
+/// emitting the token.
 fn parse_gemma_dsl(body: &str) -> Vec<ParsedToolCall> {
     let body = body.trim();
-    let Some(rest) = body.strip_prefix("call:") else {
-        return Vec::new();
+    // The `call:` prefix is what the template writes, and the model usually
+    // writes it back — but not always, and a span missing it was a file the
+    // model asked for and never got. Nothing is being guessed at by accepting
+    // the bare form: this text is already anchored between `<|tool_call>` and
+    // `<tool_call|>`, so it is a call or it is nothing. Without the prefix the
+    // name still has to look like one, which is the whole of the difference.
+    let (rest, prefixed) = match body.strip_prefix("call:") {
+        Some(rest) => (rest, true),
+        None => (body, false),
     };
     let Some(brace) = rest.find('{') else {
         return Vec::new();
     };
     let name = rest[..brace].trim();
     if name.is_empty() {
+        return Vec::new();
+    }
+    if !prefixed
+        && !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    {
         return Vec::new();
     }
     let args = rest[brace..].trim();
@@ -450,6 +527,12 @@ impl<'a> DslParser<'a> {
         }
     }
 
+    /// Whether a string starts here, in either of the two spellings the
+    /// delimiter arrives in — see [`Self::string`].
+    fn at_quote(&self) -> bool {
+        self.s[self.i..].starts_with(DSL_QUOTE) || self.peek() == Some('"')
+    }
+
     /// `key:value(,key:value)*` with no surrounding braces. Keys are bare.
     fn object_body(&mut self) -> Option<Map<String, Value>> {
         let mut out = Map::new();
@@ -480,7 +563,7 @@ impl<'a> DslParser<'a> {
 
     /// A bare key, or a quoted one — templates differ on `escape_keys`.
     fn key(&mut self) -> Option<String> {
-        if self.peek() == Some('"') {
+        if self.at_quote() {
             return self.string();
         }
         let start = self.i;
@@ -491,8 +574,10 @@ impl<'a> DslParser<'a> {
     }
 
     fn value(&mut self) -> Option<Value> {
+        if self.at_quote() {
+            return self.string().map(Value::String);
+        }
         match self.peek()? {
-            '"' => self.string().map(Value::String),
             '{' => {
                 self.bump();
                 let inner_start = self.i;
@@ -544,36 +629,70 @@ impl<'a> DslParser<'a> {
     /// Index of the `close` that matches an already-consumed `open`, honouring
     /// nesting and ignoring delimiters inside strings.
     fn matching(&self, from: usize, open: char, close: char) -> Option<usize> {
+        let hay = &self.s[from..];
         let mut depth = 1usize;
-        let mut in_string = false;
-        let mut escaped = false;
-        for (offset, c) in self.s[from..].char_indices() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_string = false;
+        let mut offset = 0usize;
+        while offset < hay.len() {
+            let rest = &hay[offset..];
+            // A `<|"|>` string is literal to its closing delimiter — braces,
+            // brackets and quotes inside it are content, not structure.
+            if let Some(after) = rest.strip_prefix(DSL_QUOTE) {
+                offset += DSL_QUOTE.len() + after.find(DSL_QUOTE)? + DSL_QUOTE.len();
+                continue;
+            }
+            let c = rest.chars().next()?;
+            if c == '"' {
+                offset += c.len_utf8();
+                let mut escaped = false;
+                loop {
+                    let inner = hay[offset..].chars().next()?;
+                    offset += inner.len_utf8();
+                    if escaped {
+                        escaped = false;
+                    } else if inner == '\\' {
+                        escaped = true;
+                    } else if inner == '"' {
+                        break;
+                    }
                 }
                 continue;
             }
-            match c {
-                '"' => in_string = true,
-                _ if c == open => depth += 1,
-                _ if c == close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(from + offset);
-                    }
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(from + offset);
                 }
-                _ => {}
             }
+            offset += c.len_utf8();
         }
         None
     }
 
+    /// A string value, in either spelling of its delimiter.
+    ///
+    /// [`DSL_QUOTE`] is what the template writes and what the model emits, and
+    /// it is the one that makes a value containing `"` — which is to say
+    /// almost any file this server is asked to write — readable at all. A bare
+    /// `"` is still accepted, for a model that spells the delimiter instead of
+    /// emitting the token, and only there can a quote inside the value end it
+    /// early; nothing can be done about that from here.
+    ///
+    /// The two also differ in what a backslash means. The template writes a
+    /// `<|"|>` value **verbatim** — `'<|"|>' + argument + '<|"|>'`, no escaping
+    /// on the way in — so nothing may be unescaped on the way out: a file
+    /// containing `print("\n")` was arriving with that `\n` turned into a real
+    /// newline, which is a syntax error in the file the model asked for. The
+    /// bare-`"` form keeps the JSON-style escapes it always had, since a model
+    /// spelling its own delimiter is following that convention rather than the
+    /// template's.
     fn string(&mut self) -> Option<String> {
+        if let Some(rest) = self.s[self.i..].strip_prefix(DSL_QUOTE) {
+            let end = rest.find(DSL_QUOTE)?;
+            self.i += DSL_QUOTE.len() + end + DSL_QUOTE.len();
+            return Some(rest[..end].to_string());
+        }
         if self.bump()? != '"' {
             return None;
         }
@@ -619,9 +738,16 @@ impl<'a> DslParser<'a> {
 /// tool-call structure, or `None` for every other special token (which stays
 /// suppressed, as all of them used to be).
 ///
-/// `<|"|>` is gemma's string delimiter *inside* a call's arguments; mapping it
-/// to `"` is what lets [`split`] tell a string value from a bare one. It has
-/// no meaning outside a call and a model does not emit it elsewhere.
+/// `<|"|>` is gemma's string delimiter *inside* a call's arguments, and it is
+/// rendered as its own literal spelling rather than as `"`. Flattening it to
+/// `"` is what [`split`] used to receive, and it made the delimiter
+/// indistinguishable from a `"` the model wrote *inside* the value: a
+/// `create_file` whose content contained `print("hi")` ended its string at
+/// that quote, failed to parse, and reached the caller as prose. Nearly every
+/// source file has a quote in it, so nearly every file the model tried to
+/// write was silently never written. Kept whole, the delimiter is
+/// unambiguous — see [`DslParser::string`]. It has no meaning outside a call
+/// and a model does not emit it elsewhere.
 ///
 /// Whether a given format's delimiters need an entry here is a property of
 /// the *vocabulary*, not of the format. Qwen writes `<tool_call>` as ordinary
@@ -644,7 +770,7 @@ pub fn marker_text(token: &str) -> Option<&'static str> {
         "</arg_key>" => Some("</arg_key>"),
         "<arg_value>" => Some("<arg_value>"),
         "</arg_value>" => Some("</arg_value>"),
-        "<|\"|>" => Some("\""),
+        "<|\"|>" => Some(DSL_QUOTE),
         _ => None,
     }
 }
@@ -750,6 +876,151 @@ mod tests {
         let split = split("<|tool_call>call:run{cmd:\"echo {hi}\"}<tool_call|>");
         let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
         assert_eq!(args["cmd"], "echo {hi}");
+    }
+
+    /// The file a coding agent is actually asked to write: source, with
+    /// quotes and braces in it, delimited by the vocabulary's own `<|"|>`.
+    /// Flattened to a bare `"` this ended its string at `print("`, failed to
+    /// parse, and reached the caller as prose with no file written.
+    #[test]
+    fn a_file_whose_content_contains_quotes_still_parses() {
+        let content = "def main():\n    print(\"hi {there}\")\n";
+        let span = format!(
+            "<|tool_call>call:create_file{{content:{q}{content}{q},path:{q}main.py{q}}}<tool_call|>",
+            q = DSL_QUOTE
+        );
+        let split = split(&span);
+        assert_eq!(split.content, "");
+        assert_eq!(split.calls.len(), 1, "call was not recovered: {split:?}");
+        assert_eq!(split.calls[0].name, "create_file");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(args["content"], content);
+        assert_eq!(args["path"], "main.py");
+    }
+
+    /// Three files asked for, one written: after the first well-formed span
+    /// gemma-4 stopped writing the opening marker, and the remaining two
+    /// calls reached the caller as prose. The closer and `call:` anchor them.
+    #[test]
+    fn a_call_whose_opener_the_model_forgot_is_still_recovered() {
+        let span = concat!(
+            "Here you go.",
+            "<|tool_call>call:create_file{path:\"index.html\",content:\"<html/>\"}<tool_call|>",
+            "Now the stylesheet.",
+            "call:create_file{path:\"style.css\",content:\"body{}\"}<tool_call|>",
+            "call:create_file{path:\"game.js\",content:\"let x=1\"}<tool_call|>",
+        );
+        let split = split(span);
+        assert_eq!(split.calls.len(), 3, "{split:?}");
+        let paths: Vec<String> = split
+            .calls
+            .iter()
+            .map(|call| {
+                serde_json::from_str::<Value>(&call.arguments).unwrap()["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(paths, ["index.html", "style.css", "game.js"]);
+        // The prose between the calls survives; the call bodies do not.
+        assert_eq!(split.content, "Here you go.Now the stylesheet.");
+    }
+
+    /// The recovery needs the format to have been established first, and it
+    /// needs a body that parses. Neither a stray closer in prose nor an
+    /// unopened body on its own is a call.
+    #[test]
+    fn an_unopened_body_is_not_a_call_on_its_own() {
+        // No call has been recovered yet, so nothing is established.
+        let first = "call:create_file{path:\"a.txt\"}<tool_call|>";
+        assert!(split(first).calls.is_empty(), "{:?}", split(first));
+
+        // Established, but the trailing text is prose rather than a body.
+        let prose = concat!(
+            "<|tool_call>call:create_file{path:\"a.txt\"}<tool_call|>",
+            "and that closes it out<tool_call|>",
+        );
+        let split = split(prose);
+        assert_eq!(split.calls.len(), 1, "{split:?}");
+        assert!(
+            split.content.contains("and that closes it out"),
+            "{split:?}"
+        );
+    }
+
+    /// A span that opened and never closed still stops the read dead: the
+    /// recovery pass must not pick over the remains of a truncated answer and
+    /// execute half a call.
+    #[test]
+    fn an_unterminated_span_is_not_salvaged_by_the_recovery_pass() {
+        let truncated = concat!(
+            "<|tool_call>call:create_file{path:\"a.txt\"}<tool_call|>",
+            "<|tool_call>call:create_file{path:\"b.txt\",content:\"half a fi",
+        );
+        let split = split(truncated);
+        assert_eq!(split.calls.len(), 1, "only the finished call: {split:?}");
+        assert!(split.content.contains("half a fi"), "{split:?}");
+    }
+
+    /// The model does not always write the template's `call:` prefix. The
+    /// span is anchored either way, so the bare form is read too — as a span
+    /// missing it was a `create_file` that reached the caller as prose.
+    #[test]
+    fn a_gemma_span_without_the_call_prefix_is_still_a_call() {
+        let split = split("<|tool_call>create_file{path:\"a.py\",content:\"x = 1\"}<tool_call|>");
+        assert_eq!(split.calls.len(), 1, "call was not recovered: {split:?}");
+        assert_eq!(split.calls[0].name, "create_file");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(args["path"], "a.py");
+    }
+
+    /// …but only when what precedes the brace actually looks like a name.
+    /// Prose that happens to contain a brace is left in the answer.
+    #[test]
+    fn prose_with_a_brace_in_a_gemma_span_is_not_a_call() {
+        let span = "<|tool_call>here is a set {a, b}<tool_call|>";
+        let split = split(span);
+        assert!(split.calls.is_empty(), "{split:?}");
+        assert_eq!(split.content, span);
+    }
+
+    /// A `<|"|>` value is verbatim: the template escapes nothing writing it,
+    /// so unescaping it here turned `print("\\n")` in the file the model asked
+    /// for into a real newline and a syntax error.
+    #[test]
+    fn a_backslash_in_a_quote_delimited_value_stays_a_backslash() {
+        let content = "print(\"\\n\")\nre.match(r\"\\d+\", s)";
+        let span = format!(
+            "<|tool_call>call:create_file{{content:{q}{content}{q}}}<tool_call|>",
+            q = DSL_QUOTE
+        );
+        let split = split(&span);
+        assert_eq!(split.calls.len(), 1, "call was not recovered: {split:?}");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(args["content"], content);
+    }
+
+    /// The same delimiter around a *nested* value: the object scan has to skip
+    /// the string whole, or a brace inside the source closes the call early.
+    #[test]
+    fn a_quote_delimited_string_inside_a_nested_object_is_skipped_whole() {
+        let span = format!(
+            "<|tool_call>call:write{{edits:{{body:{q}if (x) {{ y(\"z\"); }}{q}}},n:1}}<tool_call|>",
+            q = DSL_QUOTE
+        );
+        let split = split(&span);
+        assert_eq!(split.calls.len(), 1, "call was not recovered: {split:?}");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(args["edits"]["body"], "if (x) { y(\"z\"); }");
+        assert_eq!(args["n"], 1);
+    }
+
+    /// The vocabulary's delimiter token reaches [`split`] as its own literal
+    /// spelling, not as `"` — which is what keeps the two distinguishable.
+    #[test]
+    fn the_dsl_quote_token_renders_as_itself() {
+        assert_eq!(marker_text("<|\"|>"), Some(DSL_QUOTE));
     }
 
     #[test]

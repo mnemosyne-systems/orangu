@@ -49,6 +49,45 @@ pub(crate) fn load_session_settings(session_dir: &Path) -> (Option<String>, Opti
 /// they are restored when the session is resumed.  Either value may be omitted
 /// to leave it unset (which means the global default applies on next resume).
 pub(crate) fn save_session_settings(session_dir: &Path, server: Option<&str>, model: Option<&str>) {
+    // The licence is carried through rather than re-passed by every caller:
+    // this function rewrites the whole file, and the two settings are changed
+    // by different commands at different times, so reading it back is what
+    // keeps `/server` from clearing what `/license` set.
+    let (licence, holder) = load_session_licence(session_dir);
+    write_session_settings(
+        session_dir,
+        server,
+        model,
+        licence.as_deref(),
+        holder.as_deref(),
+    );
+}
+
+/// Persist this session's licence choice, leaving the server and model
+/// settings beside it alone. `None` clears it, so the session goes back to
+/// following the workspace.
+pub(crate) fn save_session_licence(
+    session_dir: &Path,
+    licence: Option<&str>,
+    holder: Option<&str>,
+) {
+    let (server, model) = load_session_settings(session_dir);
+    write_session_settings(
+        session_dir,
+        server.as_deref(),
+        model.as_deref(),
+        licence,
+        holder,
+    );
+}
+
+fn write_session_settings(
+    session_dir: &Path,
+    server: Option<&str>,
+    model: Option<&str>,
+    licence: Option<&str>,
+    holder: Option<&str>,
+) {
     let mut body = format!("[{}]\n", orangu::config::CLIENT_SECTION);
     if let Some(s) = server {
         body.push_str(&format!("server = {s}\n"));
@@ -56,7 +95,58 @@ pub(crate) fn save_session_settings(session_dir: &Path, server: Option<&str>, mo
     if let Some(m) = model {
         body.push_str(&format!("model = {m}\n"));
     }
+    if let Some(l) = licence {
+        body.push_str(&format!("license = {l}\n"));
+    }
+    if let Some(h) = holder {
+        body.push_str(&format!("license_holder = {h}\n"));
+    }
     let _ = std::fs::write(session_dir.join(SESSION_SETTINGS_FILE), body);
+}
+
+/// The licence `/license` pinned for this session, as it was written to the
+/// session's `settings` file — an SPDX identifier, `none`, or absent for
+/// "follow the workspace". The second value is the copyright holder, when one
+/// was given with it.
+pub(crate) fn load_session_licence(session_dir: &Path) -> (Option<String>, Option<String>) {
+    let path = session_dir.join(SESSION_SETTINGS_FILE);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(mut sections) = orangu::config::parse_ini_sections(&contents) else {
+        return (None, None);
+    };
+    let Some(client) = sections.remove(orangu::config::CLIENT_SECTION) else {
+        return (None, None);
+    };
+    let read = |key: &str| {
+        client
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    (read("license"), read("license_holder"))
+}
+
+/// This session's licence choice as the `ToolExecutor` wants it — the stored
+/// SPDX identifier resolved back into a [`orangu::license::Choice`].
+///
+/// An identifier that no longer parses (a licence dropped from the set, or a
+/// hand-edited `settings` file) falls back to `Auto` rather than failing the
+/// session: the worst case is a header the workspace would have chosen
+/// anyway.
+pub(crate) fn session_licence_choice(session_dir: &Path) -> orangu::license::Choice {
+    let (licence, holder) = load_session_licence(session_dir);
+    let Some(licence) = licence else {
+        return orangu::license::Choice::Auto;
+    };
+    if licence.eq_ignore_ascii_case("none") {
+        return orangu::license::Choice::None;
+    }
+    match orangu::license::from_spdx(&licence) {
+        Some(licence) => orangu::license::Choice::Use { licence, holder },
+        None => orangu::license::Choice::Auto,
+    }
 }
 
 /// Load the theme override pinned to this session, if any. Stored separately

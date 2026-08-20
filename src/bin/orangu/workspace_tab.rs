@@ -193,6 +193,10 @@ impl WorkspaceTab {
             Some(session_dir.clone()),
         )
         .with_mcp(mcp.clone());
+        // What `/license` pinned last time this session ran. Applied before
+        // the first request, so a resumed session writes files under the
+        // licence it was writing them under when it was left.
+        tools.set_licence_choice(session_licence_choice(&session_dir));
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");

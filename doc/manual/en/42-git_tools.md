@@ -6,7 +6,7 @@ The Git tools wrap common Git, GitHub, and GitLab operations as local slash comm
 
 Several commands surface a combined hint when the current branch is behind its base or carries more than one commit: `branch is N commits behind <base>; run /rebase` and/or `N commits ahead of <base>; run /squash`. The base branch is detected in the order `origin/main`, `origin/master`, `main`, then `master`.
 
-As with the core tools, every command below also accepts the natural-language aliases listed in its **Examples**.
+As with the core tools, every command below also accepts the natural-language aliases listed in its **Examples**. The bare-verb aliases — `create `, `add `, `remove `, `delete `, `move `, `restore `, `merge `, `checkout `, `switch to `, `rebase ` — take exactly one argument, a single word or a quoted string, so a sentence that merely starts with one of those verbs (`create a Pacman like game`, `merge these two functions`) is a prompt for the model rather than a command; the forms that name their object (`create file …`, `delete branch …`) are not restricted this way. The *Core tools* chapter's introduction has the full rule.
 
 \newpage
 

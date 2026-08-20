@@ -90,7 +90,15 @@ pub struct PendingResponse {
 }
 
 pub enum WaitResult {
-    Response(String),
+    Response {
+        answer: String,
+        /// The server stopped this turn at its response-length cap rather
+        /// than because the model was done — `llm::StreamMetrics::truncated`,
+        /// carried out of the wait loop so the caller can say so *after* it
+        /// has rendered the answer. Pushing it from inside the loop would put
+        /// the notice above the text it is about.
+        truncated: bool,
+    },
     Cancelled(String),
     Failed {
         partial: String,

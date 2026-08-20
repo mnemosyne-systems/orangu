@@ -992,6 +992,17 @@ const MAX_HEADER_LEN: usize = 128;
 ///   both, separated by a blank line (they are different messages, and
 ///   running them together produced `…Final.Three primes larger than…`).
 ///
+/// A third format frames the same distinction with a *channel*: gemma-4
+/// writes `<|channel>thought\n`, its chain of thought, then `<channel|>`,
+/// and may open a `tool_code` channel the same way. Both markers are already
+/// hidden, so what was reaching the reader was the channel name and its body
+/// run together with the answer — replies that began `"thought"` and ended
+/// `"tool_code\nprint(create_directory(path='x'))"`. The name is framing and
+/// is always dropped; the body is a reasoning message and follows the same
+/// rule as the other two formats' — hidden when the role suppresses
+/// reasoning, and otherwise separated from the answer rather than glued to
+/// it.
+///
 /// A second format asks the same question with tokens instead of text, and
 /// is answered here too: `inkling` opens each body with a marker naming its
 /// *kind* (`<|content_thinking|>` for reasoning, `<|content_text|>` for the
@@ -1000,9 +1011,11 @@ const MAX_HEADER_LEN: usize = 128;
 /// blank line — read off `Tokenizer::content_kinds` rather than off a
 /// recipient string.
 ///
-/// Inert (`framing` and `kinds` both `None`) for every vocabulary with
-/// neither, which is every other model this server serves — those keep
-/// byte-for-byte the behavior they had.
+/// Inert (`framing`, `kinds` and `channel` all `None`) for every vocabulary
+/// with none of them, which is every other model this server serves — those
+/// keep byte-for-byte the behavior they had. That is also what `Default`
+/// gives, which is how the tests build one framing at a time.
+#[derive(Default)]
 struct MessageHeader {
     /// `(<|start|>, <|message|>)`, or `None` when this vocabulary has no
     /// such framing and nothing here applies.
@@ -1010,12 +1023,29 @@ struct MessageHeader {
     /// The body-kind markers, for a vocabulary that types its bodies
     /// instead of naming a recipient. `None` for every other.
     kinds: Option<crate::engine::tokenizer::ContentKinds>,
+    /// `(<|channel>, <channel|>)`, for a vocabulary that frames the model's
+    /// side channels with them. `None` for every other.
+    channel: Option<(u32, u32)>,
+    /// Whether the stream is currently inside a channel *name* — between
+    /// `<|channel>` and the newline that ends it.
+    naming_channel: bool,
+    /// A separator owed to the next visible text because a message boundary
+    /// was crossed without a marker to hang it on. A channel closes with
+    /// `<channel|>` and the answer simply resumes, so unlike the other two
+    /// formats there is no opening marker later to emit it at; holding it
+    /// until there is text to put it in front of also keeps it off the end
+    /// of a reply that stops right after the channel.
+    owed_separator: bool,
     /// Whether the stream is currently inside a header.
     inside: bool,
     /// The current header's text so far, accumulated to be read once at
     /// `<|message|>` and then discarded. Bounded by the header's own length
     /// (a recipient name), not by the reply's.
     recipient: String,
+    /// The current channel's name so far, accumulated only so that a run of
+    /// text long past any name's length can be released as content instead
+    /// of swallowed. Bounded the same way [`Self::recipient`] is.
+    channel_name: String,
     /// Whether the message body now streaming is suppressed.
     hidden_body: bool,
     /// Whether any *visible* body has already been emitted this turn —
@@ -1029,8 +1059,12 @@ impl MessageHeader {
         Self {
             framing: tokenizer.message_framing(),
             kinds: tokenizer.content_kinds(),
+            channel: tokenizer.channel_framing(),
+            naming_channel: false,
+            owed_separator: false,
             inside: Self::prompt_ends_in_header(tokenizer, prompt_tokens),
             recipient: String::new(),
+            channel_name: String::new(),
             hidden_body: false,
             emitted_body: false,
             suppress_reasoning: role.suppresses_reasoning(),
@@ -1062,6 +1096,26 @@ impl MessageHeader {
     /// Returns text to emit in the marker's place — a separator between two
     /// visible messages, and otherwise nothing.
     fn observe_marker(&mut self, id: u32) -> Option<&'static str> {
+        // A channel opens and closes messages the way the other two formats'
+        // markers do, so it is settled here and returns rather than falling
+        // through to them — a vocabulary has at most one of the three.
+        if let Some((open, close)) = self.channel {
+            if id == open {
+                self.naming_channel = true;
+                self.channel_name.clear();
+                self.hidden_body = self.suppress_reasoning;
+                self.owed_separator |= !self.hidden_body && self.emitted_body;
+                return None;
+            }
+            if id == close {
+                // Whatever follows is the answer again: a new message, and
+                // one no marker will announce.
+                self.naming_channel = false;
+                self.hidden_body = false;
+                self.owed_separator |= self.emitted_body;
+                return None;
+            }
+        }
         // A body-kind marker settles the same question a header's recipient
         // does, and settles it on its own — a format that has these writes
         // no header, so this is checked first and returns rather than
@@ -1098,9 +1152,39 @@ impl MessageHeader {
     /// Feed every *ordinary* (non-special) token's text through this.
     /// Returns what to emit: nothing while inside a header, and nothing
     /// inside a body the role suppresses.
-    fn observe_text(&mut self, text: String) -> Option<String> {
+    fn observe_text(&mut self, mut text: String) -> Option<String> {
+        if self.naming_channel {
+            // The name runs to the first newline. One token can carry both
+            // it and the start of the body, so the tail is kept rather than
+            // dropped with the name.
+            match text.find('\n') {
+                Some(at) => {
+                    self.naming_channel = false;
+                    text = text.split_off(at + 1);
+                }
+                None => {
+                    self.channel_name.push_str(&text);
+                    // Same bound, and for the same reason, as a recipient's:
+                    // withholding is what has to stay bounded. A name this
+                    // long is not a name, so it is released as content.
+                    if self.channel_name.len() <= MAX_HEADER_LEN {
+                        return None;
+                    }
+                    self.naming_channel = false;
+                    self.hidden_body = false;
+                    text = std::mem::take(&mut self.channel_name);
+                }
+            }
+        }
         if !self.inside {
-            return (!self.hidden_body).then_some(text);
+            if self.hidden_body || text.is_empty() {
+                return None;
+            }
+            self.emitted_body = true;
+            if std::mem::take(&mut self.owed_separator) {
+                text.insert_str(0, "\n\n");
+            }
+            return Some(text);
         }
         self.recipient.push_str(&text);
         if self.recipient.len() <= MAX_HEADER_LEN {
@@ -1600,6 +1684,10 @@ mod message_header_tests {
     /// `<|content_thinking|>` and `<|content_text|>`).
     const THINKING: u32 = 4;
     const TEXT: u32 = 5;
+    /// The framing of the third format (gemma-4's `<|channel>` /
+    /// `<channel|>`).
+    const CHANNEL_OPEN: u32 = 6;
+    const CHANNEL_CLOSE: u32 = 7;
 
     /// One thing the model produced: a structural marker, or a run of
     /// ordinary text.
@@ -1615,12 +1703,9 @@ mod message_header_tests {
     fn shown(suppress_reasoning: bool, resumes_in_header: bool, stream: &[Out]) -> String {
         let mut header = MessageHeader {
             framing: Some((START, MESSAGE)),
-            kinds: None,
             inside: resumes_in_header,
-            recipient: String::new(),
-            hidden_body: false,
-            emitted_body: false,
             suppress_reasoning,
+            ..Default::default()
         };
         let mut out = String::new();
         for item in stream {
@@ -1713,13 +1798,8 @@ mod message_header_tests {
     #[test]
     fn a_vocabulary_without_the_markers_is_unaffected() {
         let mut header = MessageHeader {
-            framing: None,
-            kinds: None,
-            inside: false,
-            recipient: String::new(),
-            hidden_body: false,
-            emitted_body: false,
             suppress_reasoning: true,
+            ..Default::default()
         };
         assert_eq!(header.observe_marker(START), None);
         assert_eq!(header.observe_marker(MESSAGE), None);
@@ -1729,21 +1809,124 @@ mod message_header_tests {
         );
     }
 
+    /// Everything a client would see from a gemma-4 reply, where a side
+    /// channel is framed by `<|channel>` / `<channel|>` and names itself in
+    /// the text right after the opener.
+    fn shown_in_channels(suppress_reasoning: bool, stream: &[Out]) -> String {
+        let mut header = MessageHeader {
+            channel: Some((CHANNEL_OPEN, CHANNEL_CLOSE)),
+            suppress_reasoning,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        for item in stream {
+            match item {
+                Marker(id) => {
+                    if let Some(separator) = header.observe_marker(*id) {
+                        out.push_str(separator);
+                    }
+                }
+                Text(text) => {
+                    if let Some(text) = header.observe_text((*text).to_string()) {
+                        out.push_str(&text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The channel *name* is framing and never reaches the reader, whatever
+    /// the role. This is the bug that ended replies with a bare
+    /// `"tool_code\nprint(create_directory(path='pacman_game'))"`.
+    #[test]
+    fn a_channel_name_is_never_shown() {
+        let turn = [
+            Text("Here is the plan."),
+            Marker(CHANNEL_OPEN),
+            Text("tool_code\nprint(create_directory(path='x'))"),
+            Marker(CHANNEL_CLOSE),
+        ];
+        assert_eq!(
+            shown_in_channels(false, &turn),
+            "Here is the plan.\n\nprint(create_directory(path='x'))"
+        );
+        assert_eq!(shown_in_channels(true, &turn), "Here is the plan.");
+    }
+
+    /// A channel body is a reasoning message, so it follows the same rule as
+    /// the other two formats' — shown separated from the answer, or dropped
+    /// entirely when the role suppresses reasoning.
+    #[test]
+    fn a_channel_body_follows_the_reasoning_rule() {
+        let turn = [
+            Marker(CHANNEL_OPEN),
+            Text("thought\nLet me think."),
+            Marker(CHANNEL_CLOSE),
+            Text("23, 29, 31."),
+        ];
+        assert_eq!(
+            shown_in_channels(false, &turn),
+            "Let me think.\n\n23, 29, 31."
+        );
+        assert_eq!(shown_in_channels(true, &turn), "23, 29, 31.");
+    }
+
+    /// The name arrives one token at a time like everything else, and the
+    /// token that ends it can carry the first of the body with it.
+    #[test]
+    fn a_channel_name_split_across_tokens_is_still_dropped() {
+        let turn = [
+            Marker(CHANNEL_OPEN),
+            Text("tho"),
+            Text("ught"),
+            Text("\nLet me"),
+            Text(" think."),
+            Marker(CHANNEL_CLOSE),
+            Text("Done."),
+        ];
+        assert_eq!(shown_in_channels(false, &turn), "Let me think.\n\nDone.");
+    }
+
+    /// A channel whose name never ends must not swallow the rest of the
+    /// reply: past any name's length, what was withheld is content. Driven
+    /// directly rather than through the helper, because the text it needs is
+    /// longer than a literal worth writing out.
+    #[test]
+    fn an_unterminated_channel_name_releases_what_it_withheld() {
+        let mut header = MessageHeader {
+            channel: Some((CHANNEL_OPEN, CHANNEL_CLOSE)),
+            ..Default::default()
+        };
+        assert_eq!(header.observe_marker(CHANNEL_OPEN), None);
+        let long = "x".repeat(super::MAX_HEADER_LEN + 1);
+        assert_eq!(header.observe_text(long.clone()), Some(long));
+    }
+
+    /// A reply that stops right after a channel gets no separator hung off
+    /// the end of it.
+    #[test]
+    fn a_reply_ending_in_a_channel_has_no_trailing_separator() {
+        let turn = [
+            Text("Answer."),
+            Marker(CHANNEL_OPEN),
+            Text("thought\nafterthought"),
+            Marker(CHANNEL_CLOSE),
+        ];
+        assert_eq!(shown_in_channels(true, &turn), "Answer.");
+    }
+
     /// Everything a client would see from an `inkling`-style reply, where
     /// each body is opened by a marker naming its kind and there is no
     /// header at all.
     fn shown_by_kind(suppress_reasoning: bool, stream: &[Out]) -> String {
         let mut header = MessageHeader {
-            framing: None,
             kinds: Some(crate::engine::tokenizer::ContentKinds {
                 reasoning: THINKING,
                 other: vec![TEXT],
             }),
-            inside: false,
-            recipient: String::new(),
-            hidden_body: false,
-            emitted_body: false,
             suppress_reasoning,
+            ..Default::default()
         };
         let mut out = String::new();
         for item in stream {

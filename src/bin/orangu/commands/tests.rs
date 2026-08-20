@@ -1942,6 +1942,148 @@ fn parses_create_file_commands_with_an_optional_mode() {
     ));
 }
 
+/// `/license` and its natural-language forms, including the bare `license`
+/// that reports rather than sets.
+#[test]
+fn parses_the_license_command_in_every_form() {
+    for input in ["/license", "license", "show license"] {
+        assert!(
+            matches!(parse_local_command(input), Some(LocalCommand::License(""))),
+            "{input} should report"
+        );
+    }
+    for input in [
+        "/license MIT",
+        "license MIT",
+        "use license MIT",
+        "set license to MIT",
+    ] {
+        match parse_local_command(input) {
+            Some(LocalCommand::License(arg)) => assert_eq!(arg, "MIT", "{input}"),
+            other => panic!("{input}: {other:?}", other = other.is_some()),
+        }
+    }
+    // The slash form takes a holder after the identifier; the bare
+    // natural-language verb takes one token and nothing more.
+    match parse_local_command("/license Apache-2.0 Acme Ltd") {
+        Some(LocalCommand::License(arg)) => assert_eq!(arg, "Apache-2.0 Acme Ltd"),
+        _ => panic!("expected /license with a holder"),
+    }
+    assert!(
+        parse_local_command("license this code under something permissive").is_none(),
+        "a sentence starting with the verb is a prompt, not a command"
+    );
+}
+
+/// A bare verb followed by prose is a prompt for the model, not a local
+/// command. "Create a Pacman like game" used to become a file named
+/// "a Pacman like game" — the request never reached the model, and the only
+/// thing that ever appeared in the repository was that one empty file.
+#[test]
+fn bare_verbs_do_not_swallow_a_sentence() {
+    for input in [
+        "Create a Pacman like game",
+        "create a REST API in Rust",
+        "add a login form to the page",
+        "remove the duplicated parsing code",
+        "delete the dead branches in this function",
+        "open the file that defines the parser",
+        "edit the config so it points at port 9000",
+        "move the cursor to the end of the line",
+        "restore the behaviour we had last week",
+        "merge these two functions into one",
+        "checkout what the tests actually assert",
+        "switch to a smaller model",
+        "rebase this explanation on the earlier one",
+    ] {
+        assert!(
+            parse_local_command(input).is_none(),
+            "{input:?} was parsed as a local command instead of reaching the model"
+        );
+    }
+}
+
+/// The single-token rule only applies to the *bare* verbs: naming the object
+/// ("create file", "delete branch") says what was meant, and a quoted argument
+/// says it too, so both keep working with spaces in them.
+#[test]
+fn explicit_and_quoted_forms_still_take_an_argument_with_spaces() {
+    match parse_local_command("create file my notes.md") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "my notes.md");
+        }
+        _ => panic!("expected create_file"),
+    }
+    match parse_local_command("create \"my notes.md\"") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "\"my notes.md\"");
+        }
+        _ => panic!("expected quoted create_file"),
+    }
+    assert_eq!(
+        parse_open_command_target("open \"docs/user guide.md\""),
+        Some("docs/user guide.md")
+    );
+    assert!(matches!(
+        parse_local_command("delete branch feature/a b"),
+        Some(LocalCommand::Branch(BranchSubcommand::Delete(_)))
+    ));
+}
+
+/// The one-word forms the rule is there to protect must all still parse.
+#[test]
+fn bare_verbs_still_take_a_single_argument() {
+    match parse_local_command("create pacman.rs") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "pacman.rs")
+        }
+        _ => panic!("expected create_file"),
+    }
+    match parse_local_command("create notes.md with 0644 containing hello world") {
+        Some(LocalCommand::CreateFile(Some(args))) => {
+            assert_eq!(args.path.as_ref(), "notes.md");
+            assert_eq!(args.mode.as_deref(), Some("0644"));
+            assert_eq!(args.content.as_deref(), Some("hello world"));
+        }
+        _ => panic!("expected create_file with mode and content"),
+    }
+    assert!(matches!(
+        parse_local_command("remove README.md"),
+        Some(LocalCommand::DeleteFile(Some(_)))
+    ));
+    assert!(matches!(
+        parse_local_command("move old.rs new.rs"),
+        Some(LocalCommand::MoveFile(Some(_)))
+    ));
+    assert!(matches!(
+        parse_local_command("delete feature/x"),
+        Some(LocalCommand::Branch(BranchSubcommand::Delete(_)))
+    ));
+    assert!(matches!(
+        parse_local_command("merge feature/foo"),
+        Some(LocalCommand::Merge(Some(_)))
+    ));
+    assert!(matches!(
+        parse_local_command("checkout feature/foo"),
+        Some(LocalCommand::Branch(BranchSubcommand::Switch(_)))
+    ));
+    assert!(matches!(
+        parse_local_command("restore src/main.rs"),
+        Some(LocalCommand::Restore(Some(_)))
+    ));
+    assert_eq!(
+        parse_open_command_target("open src/main.rs"),
+        Some("src/main.rs")
+    );
+    // The optional " branch" tail is still dropped before the rule applies.
+    match parse_local_command("switch to main branch") {
+        Some(LocalCommand::Branch(BranchSubcommand::Switch(name))) => {
+            assert_eq!(name.as_ref(), "main")
+        }
+        _ => panic!("expected branch switch"),
+    }
+}
+
 /// The bare "create " form must not swallow the other things orangu
 /// creates — each keeps its own command.
 #[test]

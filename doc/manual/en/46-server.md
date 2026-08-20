@@ -2004,19 +2004,29 @@ explanatory comment on line one costs nothing.
 
 #### The licence header
 
-Every code block is shown with the MIT licence at the top of it, written as
-a comment in that block's own language — in the block itself, highlighted
-and selectable like the rest of the code, so what the download button saves
-is exactly what is on screen:
+Every code block is shown with **the workspace's own licence** at the top of
+it, written as a comment in that block's own language — in the block itself,
+highlighted and selectable like the rest of the code, so what the download
+button saves is exactly what is on screen:
 
 ```rust
-// MIT License
+// Copyright (C) 2026 Jane Roe
 //
-// Copyright (c) 2026 orangu
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
 ...
 ```
+
+The licence and the copyright holder are read from the tree this server was
+rooted at (`-w`/`--workspace`) when it started: its `Cargo.toml`,
+`pyproject.toml` or `package.json` `license` field, or failing that its
+`LICENSE`/`COPYING` file. A workspace whose licence cannot be established —
+none declared, one this server has no header for, or a dual licence such as
+`MIT OR Apache-2.0`, where which of the two a header should name is the
+project's choice and not this server's — gets **no header at all**, and the
+block is shown exactly as the model wrote it.
 
 The licence text is compiled into the binary as a string, not read from a
 file beside it — there is nothing to install, nothing to go missing, and

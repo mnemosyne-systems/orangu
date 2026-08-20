@@ -1768,8 +1768,14 @@ async fn serve(prepared: Prepared) -> Result<()> {
                 .ok()
             })
             .flatten();
+        // Resolved here, once, from the tree this server was rooted at: a
+        // code block downloaded out of a reply is a file for *that* project,
+        // so it carries that project's licence or none. See
+        // `WebState::project_licence` for why it is not read per render.
+        let project_licence = orangu::license::Project::detect(&workspace);
         let web_state = Arc::new(web::WebState {
             engine,
+            project_licence,
             model_display,
             architecture,
             backend_label,

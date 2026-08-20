@@ -101,13 +101,17 @@ fn parse_options() -> ParseOptions {
 /// Renders `text` (a chat message's raw content) to an HTML fragment safe
 /// to inject into the transcript. Falls back to escaped plain text wrapped
 /// in a `<p>` if the markdown fails to parse.
-pub fn render_markdown_to_html(text: &str) -> String {
+pub fn render_markdown_to_html(
+    text: &str,
+    project_licence: Option<&orangu::license::Project>,
+) -> String {
     if text.is_empty() {
         return String::new();
     }
     let renderer = Renderer {
         open_fence_start: unterminated_fence_start(text),
         code_blocks_seen: Cell::new(0),
+        project_licence,
     };
     match to_mdast(text, &parse_options()) {
         Ok(tree) => renderer.render_node(&tree),
@@ -118,7 +122,12 @@ pub fn render_markdown_to_html(text: &str) -> String {
 /// Carries the one piece of whole-document context the walk needs: where a
 /// still-unclosed fence begins, if the text ends inside one. Everything else
 /// a node needs to render is local to it.
-struct Renderer {
+struct Renderer<'a> {
+    /// The licence of the workspace this server is rooted at, or `None` when
+    /// it has none this program can write a header for. A downloaded code
+    /// block is a file for *that* project, so it carries that project's
+    /// licence or no licence at all — never a default one.
+    project_licence: Option<&'a orangu::license::Project>,
     /// Byte offset of the opening fence of a code block that never closes —
     /// which, mid-stream, is every code block the model is still typing.
     /// See [`unterminated_fence_start`].
@@ -181,7 +190,7 @@ fn unterminated_fence_start(text: &str) -> Option<usize> {
     open.map(|(start, _, _)| start)
 }
 
-impl Renderer {
+impl Renderer<'_> {
     fn render_node(&self, node: &Node) -> String {
         match node {
             Node::Root(root) => self.render_block_nodes(&root.children),
@@ -383,7 +392,7 @@ impl Renderer {
         // licence goes on: `file_name_from_first_line` looks at line one,
         // and line one is about to become `// MIT License`.
         let name = self.code_file_name(code, language, syntax);
-        let source = orangu::license::apply(&code.value, &name);
+        let source = orangu::license::apply(&code.value, &name, self.project_licence);
 
         let plain = || format!("<pre><code>{}</code></pre>", escape_html(&source));
         let body = match syntax {
@@ -816,12 +825,35 @@ fn escape_attr(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An MIT project to render against, built on disk because
+    /// `license::Project` is only ever constructed by detecting one — there
+    /// is deliberately no way to assert a licence a project does not have.
+    fn mit_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nlicense = \"MIT\"\nauthors = [\"Example Holder\"]\n",
+        )
+        .expect("manifest");
+        dir
+    }
+
+    fn mit_project() -> orangu::license::Project {
+        orangu::license::Project::detect(mit_workspace().path()).expect("detected")
+    }
+
+    /// The rendering tests are about markup, not licensing, so they all run
+    /// against the same MIT project.
+    fn render_markdown_to_html_t(text: &str) -> String {
+        render_markdown_to_html(text, Some(&mit_project()))
+    }
+
     use super::*;
     use base64::Engine as _;
 
     #[test]
     fn renders_emphasis_and_paragraphs() {
-        let html = render_markdown_to_html("Hello **bold** and *italic*.");
+        let html = render_markdown_to_html_t("Hello **bold** and *italic*.");
         assert!(html.contains("<strong>bold</strong>"));
         assert!(html.contains("<em>italic</em>"));
         assert!(html.starts_with("<p>"));
@@ -830,7 +862,7 @@ mod tests {
     #[test]
     fn renders_headings_lists_and_links() {
         let html =
-            render_markdown_to_html("# Title\n\n- one\n- two\n\n[docs](https://example.com)");
+            render_markdown_to_html_t("# Title\n\n- one\n- two\n\n[docs](https://example.com)");
         assert!(html.contains("<h1>Title</h1>"));
         assert!(html.contains("<li>one</li>"));
         assert!(html.contains("<li>two</li>"));
@@ -843,21 +875,21 @@ mod tests {
         // A list item with more than one block (two paragraphs, blank line
         // between them) keeps each paragraph's <p> wrapper — only a tight
         // item whose sole content is one paragraph gets unwrapped.
-        let html = render_markdown_to_html("- one\n\n  two");
+        let html = render_markdown_to_html_t("- one\n\n  two");
         assert!(html.contains("<p>one</p>"));
         assert!(html.contains("<p>two</p>"));
     }
 
     #[test]
     fn renders_fenced_code_with_syntax_highlighting() {
-        let html = render_markdown_to_html("```rust\nfn main() {}\n```");
+        let html = render_markdown_to_html_t("```rust\nfn main() {}\n```");
         assert!(html.contains("code-block"));
         assert!(html.contains("fn"));
     }
 
     #[test]
     fn renders_unknown_language_code_as_plain_pre() {
-        let html = render_markdown_to_html("```notalanguage\nplain text\n```");
+        let html = render_markdown_to_html_t("```notalanguage\nplain text\n```");
         assert!(html.contains("<pre><code>"));
         assert!(html.contains("plain text"));
     }
@@ -870,7 +902,7 @@ mod tests {
             "```notalanguage\nplain text\n```",
             "```\nno tag at all\n```",
         ] {
-            let html = render_markdown_to_html(source);
+            let html = render_markdown_to_html_t(source);
             assert!(html.contains("class=\"code-block\""), "{html}");
             assert!(html.contains("class=\"code-dl\""), "{html}");
             assert!(html.contains("data-file-name="), "{html}");
@@ -882,7 +914,7 @@ mod tests {
     /// download button reads back out.
     #[test]
     fn a_code_block_is_rendered_with_its_licence_header() {
-        let html = render_markdown_to_html("```rust\nfn main() {}\n```");
+        let html = render_markdown_to_html_t("```rust\nfn main() {}\n```");
         assert!(html.contains("MIT License"), "{html}");
         assert!(html.contains("Copyright (c)"), "{html}");
         assert!(html.contains("fn"), "{html}");
@@ -893,10 +925,10 @@ mod tests {
     /// unlicensed one.
     #[test]
     fn a_block_that_cannot_carry_a_comment_is_rendered_untouched() {
-        let html = render_markdown_to_html("```json\n{\"a\": 1}\n```");
+        let html = render_markdown_to_html_t("```json\n{\"a\": 1}\n```");
         assert!(!html.contains("MIT License"), "{html}");
 
-        let untagged = render_markdown_to_html("```\nplain text\n```");
+        let untagged = render_markdown_to_html_t("```\nplain text\n```");
         assert!(!untagged.contains("MIT License"), "{untagged}");
     }
 
@@ -904,7 +936,7 @@ mod tests {
     /// licence header displaces — so it has to be taken first.
     #[test]
     fn the_licence_does_not_hide_a_first_line_file_name() {
-        let html = render_markdown_to_html("```rust\n// src/lib.rs\nfn f() {}\n```");
+        let html = render_markdown_to_html_t("```rust\n// src/lib.rs\nfn f() {}\n```");
         assert!(html.contains("data-file-name=\"lib.rs\""), "{html}");
         assert!(html.contains("MIT License"), "{html}");
     }
@@ -912,15 +944,15 @@ mod tests {
     /// A model that wrote its own header must not get a second one.
     #[test]
     fn a_block_that_already_carries_the_licence_gets_no_second_copy() {
-        let source = orangu::license::apply("fn main() {}\n", "main.rs");
-        let html = render_markdown_to_html(&format!("```rust\n{source}```"));
+        let source = orangu::license::apply("fn main() {}\n", "main.rs", Some(&mit_project()));
+        let html = render_markdown_to_html_t(&format!("```rust\n{source}```"));
         assert_eq!(html.matches("MIT License").count(), 1, "{html}");
     }
 
     /// A diagram is not a code window and never reaches the licensing path.
     #[test]
     fn a_diagram_is_not_licensed() {
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B\n```");
         assert!(html.contains("mermaid-diagram"), "{html}");
         assert!(!html.contains("MIT License"), "{html}");
     }
@@ -933,7 +965,7 @@ mod tests {
             "```rust:src/main.rs\nfn main() {}\n```",
             "```rust title=\"src/main.rs\"\nfn main() {}\n```",
         ] {
-            let html = render_markdown_to_html(source);
+            let html = render_markdown_to_html_t(source);
             assert!(html.contains("data-file-name=\"main.rs\""), "{html}");
             assert!(html.contains(">main.rs</span>"), "{html}");
         }
@@ -942,7 +974,7 @@ mod tests {
     /// A fence that is *only* a file name, with the language left implied.
     #[test]
     fn takes_a_bare_file_name_fence() {
-        let html = render_markdown_to_html("```Makefile\nall:\n\techo hi\n```");
+        let html = render_markdown_to_html_t("```Makefile\nall:\n\techo hi\n```");
         assert!(html.contains("data-file-name=\"Makefile\""), "{html}");
     }
 
@@ -959,7 +991,7 @@ mod tests {
             ),
         ];
         for (source, expected) in cases {
-            let html = render_markdown_to_html(source);
+            let html = render_markdown_to_html_t(source);
             assert!(
                 html.contains(&format!("data-file-name=\"{expected}\"")),
                 "{source} -> {html}"
@@ -977,7 +1009,7 @@ mod tests {
             "```js\n// see https://example.com/docs.html\nlet x = 1;\n```",
             "```c\n#include <stdio.h>\nint main(void) { return 0; }\n```",
         ] {
-            let html = render_markdown_to_html(source);
+            let html = render_markdown_to_html_t(source);
             assert!(
                 html.contains("data-file-name=\"orangu-snippet-1."),
                 "{html}"
@@ -989,8 +1021,9 @@ mod tests {
     /// syntax definitions and the number from the block's position.
     #[test]
     fn generated_names_number_and_extend_by_language() {
-        let html =
-            render_markdown_to_html("```rust\nfn main() {}\n```\n\ntext\n\n```python\nx = 1\n```");
+        let html = render_markdown_to_html_t(
+            "```rust\nfn main() {}\n```\n\ntext\n\n```python\nx = 1\n```",
+        );
         assert!(
             html.contains("data-file-name=\"orangu-snippet-1.rs\""),
             "{html}"
@@ -1005,13 +1038,13 @@ mod tests {
     /// extension when it reads like one; a tag that doesn't, doesn't.
     #[test]
     fn unknown_language_falls_back_to_the_tag_then_txt() {
-        let html = render_markdown_to_html("```zigzag\nconst x = 1;\n```");
+        let html = render_markdown_to_html_t("```zigzag\nconst x = 1;\n```");
         assert!(
             html.contains("data-file-name=\"orangu-snippet-1.zigzag\""),
             "{html}"
         );
 
-        let html = render_markdown_to_html("```++\nwhat\n```");
+        let html = render_markdown_to_html_t("```++\nwhat\n```");
         assert!(
             html.contains("data-file-name=\"orangu-snippet-1.txt\""),
             "{html}"
@@ -1021,10 +1054,11 @@ mod tests {
     /// A name is attacker-supplied text like everything else in a reply.
     #[test]
     fn rejects_a_file_name_that_is_not_one() {
-        let html = render_markdown_to_html("```rust ../../etc/passwd\nfn main() {}\n```");
+        let html = render_markdown_to_html_t("```rust ../../etc/passwd\nfn main() {}\n```");
         assert!(!html.contains("passwd"), "{html}");
 
-        let html = render_markdown_to_html("```rust \"><script>alert(1)</script>\nfn f() {}\n```");
+        let html =
+            render_markdown_to_html_t("```rust \"><script>alert(1)</script>\nfn f() {}\n```");
         assert!(!html.contains("<script>"), "{html}");
     }
 
@@ -1032,7 +1066,7 @@ mod tests {
     /// window and has its own download.
     #[test]
     fn a_diagram_does_not_take_a_snippet_number() {
-        let html = render_markdown_to_html(
+        let html = render_markdown_to_html_t(
             "```mermaid\nflowchart TD\n    A --> B\n```\n\n```rust\nfn main() {}\n```",
         );
         assert!(html.contains("mermaid-diagram"), "{html}");
@@ -1114,14 +1148,14 @@ mod tests {
             "makefile",
             "dockerfile",
         ] {
-            let html = render_markdown_to_html(&format!("```{language}\nplaceholder\n```"));
+            let html = render_markdown_to_html_t(&format!("```{language}\nplaceholder\n```"));
             let name = html
                 .split("data-file-name=\"")
                 .nth(1)
                 .and_then(|rest| rest.split('"').next())
                 .unwrap_or_else(|| panic!("{language}: no file name in {html}"));
             assert!(
-                orangu::license::header_for(name).is_some(),
+                orangu::license::header_for(name, &mit_project()).is_some(),
                 "{language} saves as {name}, which has no licence header"
             );
         }
@@ -1129,28 +1163,28 @@ mod tests {
 
     #[test]
     fn escapes_html_in_plain_text_to_prevent_injection() {
-        let html = render_markdown_to_html("<script>alert(1)</script>");
+        let html = render_markdown_to_html_t("<script>alert(1)</script>");
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn escapes_html_inside_inline_and_block_code() {
-        let html = render_markdown_to_html("`<b>x</b>`");
+        let html = render_markdown_to_html_t("`<b>x</b>`");
         assert!(!html.contains("<code><b>"));
         assert!(html.contains("&lt;b&gt;"));
     }
 
     #[test]
     fn escapes_quotes_in_link_and_image_attributes() {
-        let html = render_markdown_to_html("![alt\"](http://x/\"y)");
+        let html = render_markdown_to_html_t("![alt\"](http://x/\"y)");
         assert!(!html.contains("\"y\""));
         assert!(html.contains("&quot;"));
     }
 
     #[test]
     fn renders_inline_math_as_a_katex_source_span() {
-        let html = render_markdown_to_html(r"The set $A \to B$ is finite.");
+        let html = render_markdown_to_html_t(r"The set $A \to B$ is finite.");
         assert!(html.contains(r#"<span class="katex-source" data-tex="A \to B">"#));
         // Escaped fallback content too, so the raw TeX is at least legible
         // if the client-side katex.render() pass never runs.
@@ -1160,14 +1194,14 @@ mod tests {
 
     #[test]
     fn renders_block_math_as_a_katex_block_div() {
-        let html = render_markdown_to_html("$$\n\\sum_{i=0}^n i\n$$");
+        let html = render_markdown_to_html_t("$$\n\\sum_{i=0}^n i\n$$");
         assert!(html.contains(r#"<div class="katex-source katex-block" data-tex="#));
         assert!(html.contains(r"\sum_{i=0}^n i"));
     }
 
     #[test]
     fn renders_a_closed_mermaid_block_as_a_diagram() {
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B\n```");
         assert!(html.contains("<figure class=\"mermaid-diagram\">"));
         assert!(html.contains("<img class=\"mermaid-light\" src=\"data:image/svg+xml;base64,"));
         assert!(html.contains("<img class=\"mermaid-dark\" src=\"data:image/svg+xml;base64,"));
@@ -1178,7 +1212,7 @@ mod tests {
     #[test]
     fn renders_plantuml_with_svg_and_png_downloads() {
         let html =
-            render_markdown_to_html("```plantuml\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
+            render_markdown_to_html_t("```plantuml\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
         assert!(
             html.contains("<figure class=\"plantuml-diagram\">"),
             "{html}"
@@ -1193,7 +1227,7 @@ mod tests {
     #[test]
     fn plantuml_fence_tags_are_case_insensitive() {
         let html =
-            render_markdown_to_html("```PlantUML\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
+            render_markdown_to_html_t("```PlantUML\n@startuml\nAlice -> Bob: hello\n@enduml\n```");
         assert!(
             html.contains("<figure class=\"plantuml-diagram\">"),
             "{html}"
@@ -1202,9 +1236,9 @@ mod tests {
 
     #[test]
     fn plantuml_streaming_and_fallback_match_mermaid_behaviour() {
-        let open = render_markdown_to_html("```plantuml\n@startuml\nAlice -> Bob: hi\n@enduml");
+        let open = render_markdown_to_html_t("```plantuml\n@startuml\nAlice -> Bob: hi\n@enduml");
         assert!(!open.contains("plantuml-diagram"), "{open}");
-        let unsupported = render_markdown_to_html(
+        let unsupported = render_markdown_to_html_t(
             "```plantuml\n@startuml\n!include https://example.com/theme.puml\nA -> B\n@enduml\n```",
         );
         assert!(!unsupported.contains("plantuml-diagram"), "{unsupported}");
@@ -1218,7 +1252,7 @@ mod tests {
         // point. Drawing it would show a diagram that reshapes on every
         // token, at a full layout each time, so the guard has to key on the
         // fence rather than on whether the source happens to parse.
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B");
         assert!(!html.contains("mermaid-diagram"), "{html}");
         assert!(html.contains("flowchart TD"));
     }
@@ -1227,7 +1261,7 @@ mod tests {
     fn renders_a_diagram_once_the_closing_fence_arrives() {
         // The same block one token later — the transition the test above
         // guards has to actually complete, or diagrams would never appear.
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```\n");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B\n```\n");
         assert!(html.contains("mermaid-diagram"), "{html}");
     }
 
@@ -1235,7 +1269,7 @@ mod tests {
     fn keeps_an_earlier_diagram_while_a_later_block_streams() {
         // Only the trailing unclosed fence is held back; a diagram the model
         // already finished must not blink out while it types the next block.
-        let html = render_markdown_to_html(
+        let html = render_markdown_to_html_t(
             "```mermaid\nflowchart TD\n    A --> B\n```\n\nthen\n\n```rust\nfn main() {",
         );
         assert!(html.contains("mermaid-diagram"), "{html}");
@@ -1245,21 +1279,21 @@ mod tests {
     fn falls_back_to_a_code_block_when_the_diagram_does_not_parse() {
         // Models emit near-miss Mermaid often enough that this is the
         // difference between a readable reply and a blank frame.
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A[[[--->>> ???\n```");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A[[[--->>> ???\n```");
         assert!(!html.contains("mermaid-diagram"), "{html}");
         assert!(html.contains("A[[["), "{html}");
     }
 
     #[test]
     fn leaves_non_mermaid_code_blocks_alone() {
-        let html = render_markdown_to_html("```rust\nfn main() {}\n```");
+        let html = render_markdown_to_html_t("```rust\nfn main() {}\n```");
         assert!(!html.contains("mermaid-diagram"));
         assert!(html.contains("code-block"));
     }
 
     #[test]
     fn every_diagram_carries_a_full_resolution_download() {
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B\n```");
         // One control per theme, so the saved file matches the visible
         // image rather than always being the light one.
         assert!(html.contains("diagram-dl diagram-dl-light"), "{html}");
@@ -1293,7 +1327,7 @@ mod tests {
         // right box before the image decodes; `app.css` scales it down from
         // there. Without them a large diagram reflows the transcript when
         // it lands.
-        let html = render_markdown_to_html("```mermaid\nflowchart TD\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```mermaid\nflowchart TD\n    A --> B\n```");
         assert!(
             html.contains(" width=\"") && html.contains(" height=\""),
             "{html}"
@@ -1304,7 +1338,7 @@ mod tests {
     fn renders_a_diagram_from_an_untagged_fence() {
         // Models don't always tag the fence; a diagram served as a wall of
         // code is the failure this avoids.
-        let html = render_markdown_to_html("```\nflowchart TD\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```\nflowchart TD\n    A --> B\n```");
         assert!(html.contains("mermaid-diagram"), "{html}");
     }
 
@@ -1316,7 +1350,7 @@ mod tests {
             "```\ngraph is a data structure of nodes and edges\n```",
             "```\ninfo: build succeeded\n```",
         ] {
-            let html = render_markdown_to_html(source);
+            let html = render_markdown_to_html_t(source);
             assert!(!html.contains("mermaid-diagram"), "{source} -> {html}");
         }
     }
@@ -1326,7 +1360,7 @@ mod tests {
         // Tagged `bash` but holding valid Mermaid: the tag is the model
         // saying what it wrote, and overriding it is how a shell transcript
         // ends up drawn as a flowchart.
-        let html = render_markdown_to_html("```bash\ngraph LR\n    A --> B\n```");
+        let html = render_markdown_to_html_t("```bash\ngraph LR\n    A --> B\n```");
         assert!(!html.contains("mermaid-diagram"), "{html}");
     }
 
@@ -1348,7 +1382,7 @@ mod tests {
 
     #[test]
     fn escapes_html_special_characters_inside_math_source() {
-        let html = render_markdown_to_html(r"$a < b \& c > d$");
+        let html = render_markdown_to_html_t(r"$a < b \& c > d$");
         assert!(html.contains("data-tex=\"a &lt; b \\&amp; c &gt; d\""));
         assert!(!html.contains("$a < b"));
     }

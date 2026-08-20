@@ -830,6 +830,26 @@ impl Tokenizer {
         (self.is_special(start) && self.is_special(message)).then_some((start, message))
     }
 
+    /// `(<|channel>, <channel|>)` for a vocabulary that wraps the model's
+    /// side channels in them, and `None` for every vocabulary that doesn't.
+    ///
+    /// The third spelling of the question [`Self::message_framing`] and
+    /// [`Self::content_kinds`] answer, and the one gemma-4 uses: an assistant
+    /// turn may contain `<|channel>thought\n…<channel|>` (or `tool_code`, or
+    /// any other channel name) alongside the answer. Both markers are
+    /// USER_DEFINED and so already hidden by [`Self::is_special`] — what this
+    /// exists for is the channel *name*, which is not. It is written for the
+    /// format's benefit and ends at the first newline, and left visible every
+    /// such reply reached the reader beginning `"thought"`.
+    ///
+    /// Matched on the vocabulary's own token names, like its two neighbours
+    /// here: the framing belongs to the chat format, not to an architecture.
+    pub fn channel_framing(&self) -> Option<(u32, u32)> {
+        let open = *self.token_to_id.get("<|channel>")?;
+        let close = *self.token_to_id.get("<channel|>")?;
+        (self.is_special(open) && self.is_special(close)).then_some((open, close))
+    }
+
     /// The marker a reasoning body opens with, and the markers every other
     /// kind of body opens with — for a vocabulary that types each message
     /// *body* with a control token instead of naming a recipient in text.

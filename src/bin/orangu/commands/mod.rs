@@ -439,6 +439,12 @@ pub enum LocalCommand<'a> {
     ServerInfo,
     SetServer(&'a str),
     SetTheme(&'a str),
+    /// `/license [<spdx> [<holder>]]`: which licence generated code is
+    /// written under for the rest of this session. Empty reports the licence
+    /// in force and where it came from; `none` turns headers off; anything
+    /// else is an SPDX identifier, optionally followed by the copyright
+    /// holder to name.
+    License(&'a str),
     /// `/information`: probe the active server for as much information as it
     /// will give up — advertised models over the OpenAI-compatible API, plus
     /// any native endpoints (`/health`, `/props`, `/slots`,
@@ -603,14 +609,33 @@ pub fn parse_local_command(input: &str) -> Option<LocalCommand<'_>> {
     parse_slash_command(input).or_else(|| parse_natural_language_command(input))
 }
 
+/// The instructions used when `[<server>].system_prompt` is not set.
+///
+/// Two things are spelled out that the previous wording left implicit, because
+/// a small model asked to "create a Pacman like game" reliably did neither:
+/// the deliverable is the files on disk (not code in a fenced block), and the
+/// open questions are the assistant's to settle (not to hand back). The tools
+/// are already declared in the request; what was missing was the instruction
+/// to reach for them and the licence to choose. "If you approve, I will
+/// proceed with creating the files" is a finished turn, and the workspace is
+/// still empty when it ends.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Orangu, a coding environment assistant connected to a local workspace. \
+     Carry the request out with the local tools rather than describing it: read files with the \
+     file tools, write every file you produce to disk with them, run shell commands when a \
+     command is what answers the question, and fetch external URLs for knowledge the workspace \
+     does not hold. Code that appears only in your answer has not been delivered.\n\n\
+     Do not ask for approval before starting, and do not ask which language, framework, or file \
+     layout to use — decide, say in one line what you decided, and create the files in the same \
+     reply. Ask a question back only when the work cannot proceed at all without an answer. When \
+     the work takes several steps, carry out every step, not only the first.\n\n\
+     Be precise, explain what you changed, and surface tool failures explicitly.";
+
 pub fn system_prompt<'a>(
     profile: &'a LlmConfiguration,
     verbosity_override: Option<&str>,
 ) -> Cow<'a, str> {
     let mut base = if profile.system_prompt.is_empty() {
-        Cow::Borrowed(
-            "You are Orangu, a coding environment assistant connected to a local workspace. Use the available local tools to inspect files, edit files on disk, fetch external URLs for knowledge, and run shell commands when needed. Be precise, explain what you changed, and surface tool failures explicitly.",
-        )
+        Cow::Borrowed(DEFAULT_SYSTEM_PROMPT)
     } else {
         Cow::Borrowed(profile.system_prompt.as_str())
     };

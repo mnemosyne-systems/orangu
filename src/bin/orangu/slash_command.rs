@@ -86,6 +86,7 @@ pub enum SlashCommand {
     Graph,
     Clear,
     Theme,
+    License,
     Quit,
 }
 
@@ -166,6 +167,7 @@ impl SlashCommand {
             }
             SlashCommand::Clear => "Clears the terminal screen",
             SlashCommand::Theme => "Switches the active TUI theme",
+            SlashCommand::License => "Chooses the licence generated code is written under",
             SlashCommand::Quit => "Exits the application",
         }
     }
@@ -174,5 +176,36 @@ impl SlashCommand {
     pub fn command(self) -> String {
         let name: &'static str = self.into();
         format!("/{}", name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strum::IntoEnumIterator;
+
+    /// `/help`'s text is hand-written while the dropdown, the ghost and the
+    /// completion all read this enum, so the two drift — `/license` was in
+    /// every generated surface and in none of `/help`. Every command has to
+    /// appear in the help text.
+    #[test]
+    fn every_command_appears_in_the_help_text() {
+        let help = orangu::tui::help_text();
+        let missing: Vec<String> = SlashCommand::iter()
+            .map(SlashCommand::command)
+            .filter(|command| !help.contains(command.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "not documented in /help: {missing:?}");
+    }
+
+    /// And a description, since that is what the dropdown shows.
+    #[test]
+    fn every_command_has_a_description() {
+        for command in SlashCommand::iter() {
+            assert!(
+                !command.description().trim().is_empty(),
+                "{command:?} has no description"
+            );
+        }
     }
 }

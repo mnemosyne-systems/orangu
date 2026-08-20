@@ -192,7 +192,7 @@ and points at `/v1/completions`.
 | :-- | :-- | :-- |
 | `messages` | `[]` | the conversation, in OpenAI's shape |
 | `stream` | `false` | SSE instead of one JSON body |
-| `max_tokens` | `512` | response-length cap, clamped to what is left of the context window |
+| `max_tokens` | `8192` | response-length cap, clamped to what is left of the context window; reaching it reports `finish_reason: "length"` |
 | `temperature`, `top_p` | role's own | OpenAI's sampler fields |
 | `top_k`, `min_p`, `repeat_penalty`, `seed` | role's own | the rest of the sampler |
 | `cache_prompt` | `true` | may this request reuse an already-computed KV prefix |
@@ -372,12 +372,19 @@ recognised:
 
 | Family | Form |
 | :-- | :-- |
-| gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens) |
+| gemma-4 | `<\|tool_call>call:NAME{key:value,…}<tool_call\|>` (the markers are special tokens; `call:` is optional) |
 | Qwen / Hermes | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
 | GLM, Ling 3.0 | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` (Ling spells all six delimiters as special tokens) |
 | Nemotron | `<tool_call><function=NAME><parameter=k>v</parameter>…</function></tool_call>` |
 | Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
 | Muse-Glimmer, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
+
+gemma-4's string values are delimited by its own `<|"|>` token, not by a
+plain `"`, and are taken **verbatim** between the two — the template escapes
+nothing writing them, so nothing is unescaped reading them. That is what lets
+a `create_file` carry a source file containing quotes, braces and backslashes;
+a value the model delimits with a plain `"` instead is still accepted, with
+JSON-style escapes, but there a quote inside the value ends it early.
 
 Note the three that share `<tool_call>`: the delimiters are the same and the
 bodies are not, so the body's own leading structure decides which it is. A

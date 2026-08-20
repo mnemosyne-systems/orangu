@@ -25,11 +25,33 @@ pub use coordinator::probe_coordinator;
 pub use openai::{OpenAiClient, normalized_openai_endpoint};
 pub use slots::{SaveRestoreOutcome, SlotRegistry};
 
+/// What every surface says when a turn ended with
+/// [`StreamMetrics::truncated`].
+///
+/// One wording in one place because two clients say it: `-p` prints it under
+/// the timings and the terminal interface pushes it into the transcript after
+/// the answer. A cut-off answer is the same event on both, and a user who
+/// learns to recognise the sentence on one should not meet a different one on
+/// the other.
+pub const TRUNCATED_NOTICE: &str = "answer cut off at the server's response-length cap \
+     — an unfinished tool call was not run; raise [orangu].code_max_tokens";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamMetrics {
     pub prompt_progress: Option<StreamPromptProgress>,
     pub prompt_per_second: Option<f64>,
     pub predicted_per_second: Option<f64>,
+    /// The server stopped because the answer reached its response-length cap
+    /// (`finish_reason: "length"`), not because the model was done.
+    ///
+    /// Not a rate, and here anyway: it is the one thing about how a response
+    /// ended that a caller cannot see from the response itself. A cut-off
+    /// answer looks exactly like a finished one, and when what it cut off was
+    /// a tool call, the call never closes, so it is not recognised as a call,
+    /// nothing runs, and the half-written file arrives as prose. That is a
+    /// silent wrong answer; every surface that reports a turn should be able
+    /// to say it happened.
+    pub truncated: bool,
 }
 
 impl StreamMetrics {
@@ -37,6 +59,7 @@ impl StreamMetrics {
         self.prompt_progress.is_none()
             && self.prompt_per_second.is_none()
             && self.predicted_per_second.is_none()
+            && !self.truncated
     }
 
     pub fn merge(&mut self, update: Self) {
@@ -49,6 +72,9 @@ impl StreamMetrics {
         if let Some(predicted_per_second) = update.predicted_per_second {
             self.predicted_per_second = Some(predicted_per_second);
         }
+        // Sticky: one truncated response stays truncated however many further
+        // updates arrive after it.
+        self.truncated |= update.truncated;
     }
 }
 

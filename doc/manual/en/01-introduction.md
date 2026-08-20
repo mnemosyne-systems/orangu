@@ -34,6 +34,7 @@ speaks the OpenAI-compatible API. See *A complete stack* below.
 * Persistent, resumable sessions (`/session`, `-r`, `-l`) and per-workspace activity statistics (`/statistics`)
 * One-shot, scriptable runs (`-p`, `-q`) and a cron-style scheduler for unattended commands (`/schedule`)
 * PDF export of the console, a review report, a pull-request summary, the statistics, or a duplicate-code report (`/export`)
+* Generated code carries the project's own licence, detected from it and chosen per session (`/license`)
 * Themeable terminal interface (`/theme`, `-t`), persistent history, shell-style editing, Tab completion, and a status banner
 * Built-in offline manual (`/manual`) with full-text search
 

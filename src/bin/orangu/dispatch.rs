@@ -59,8 +59,142 @@ fn create_file_command(
             // out by hand — writing it, not generating it — unlike the
             // `create_file` tool and the endpoint, which default to one.
             license: false,
+            license_id: None,
+            license_holder: None,
         },
     )
+}
+
+/// `/license [<spdx> [<holder>]]` — which licence generated code is written
+/// under for the rest of this session.
+///
+/// The choice lives on the [`ToolExecutor`], which every `create_file` reads,
+/// and in the session's `settings` file, which is what makes it survive a
+/// resume. Nothing is written to the *workspace*: this is a session's answer
+/// about a project, not a change to the project.
+fn license_command(
+    args: &str,
+    tools: &ToolExecutor,
+    workspace: &std::path::Path,
+    session_dir: &std::path::Path,
+) -> Result<CommandOutcome> {
+    use orangu::license::{Choice, Licence, Project};
+
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(CommandOutcome::Output(license_status(tools, workspace)));
+    }
+
+    // `none` is the one argument that is not a licence: write no header.
+    if args.eq_ignore_ascii_case("none") || args.eq_ignore_ascii_case("off") {
+        tools.set_licence_choice(Choice::None);
+        crate::session_store::save_session_licence(session_dir, Some("none"), None);
+        return Ok(CommandOutcome::Output(
+            "Generated files will carry no licence header.".to_string(),
+        ));
+    }
+    // `auto` hands the decision back to the workspace.
+    if args.eq_ignore_ascii_case("auto") {
+        tools.set_licence_choice(Choice::Auto);
+        crate::session_store::save_session_licence(session_dir, None, None);
+        return Ok(CommandOutcome::Output(license_status(tools, workspace)));
+    }
+
+    let (id, holder) = match args.split_once(char::is_whitespace) {
+        Some((id, holder)) => (id, Some(holder.trim()).filter(|h| !h.is_empty())),
+        None => (args, None),
+    };
+    let Some(licence) = orangu::license::from_spdx(id) else {
+        return Ok(CommandOutcome::OutputError(format!(
+            "Unknown licence {id:?}. Known: {}",
+            Licence::ALL
+                .iter()
+                .map(|l| l.spdx())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+
+    tools.set_licence_choice(Choice::Use {
+        licence,
+        holder: holder.map(str::to_string),
+    });
+    crate::session_store::save_session_licence(session_dir, Some(licence.spdx()), holder);
+
+    // Resolved once here so the reply can say who the header will name — and
+    // say so *now* rather than leaving it to be discovered when a generated
+    // file turns out to carry no header at all.
+    Ok(CommandOutcome::Output(
+        match Project::resolve(workspace, Some(licence), holder) {
+            Some(project) => format!("Generated files will be {}.", licence_phrase(&project)),
+            None => format!(
+                "Generated files will be licensed {} ({}) — but no copyright holder could be \
+                 found in this workspace, so no header will be written. Name one with \
+                 /license {} <holder>.",
+                licence.spdx(),
+                licence.title(),
+                licence.spdx()
+            ),
+        },
+    ))
+}
+
+/// "licensed MIT (MIT License), copyright Jane Roe" — or, for a project whose
+/// `LICENSE` file is being used verbatim, what that says instead.
+fn licence_phrase(project: &orangu::license::Project) -> String {
+    match project.holder() {
+        Some(holder) => format!("licensed {}, copyright {holder}", project.label()),
+        None => format!("licensed under {}, used verbatim", project.label()),
+    }
+}
+
+/// What `/license` reports when asked with no argument: the licence in force
+/// and, as much as it can, where it came from.
+fn license_status(tools: &ToolExecutor, workspace: &std::path::Path) -> String {
+    use orangu::license::{Choice, DEFAULT_LICENCE, Project};
+
+    match tools.licence_choice() {
+        Choice::None => {
+            "Generated files carry no licence header (set with /license none).".to_string()
+        }
+        Choice::Use { licence, holder } => {
+            match Project::resolve(workspace, Some(licence), holder.as_deref()) {
+                Some(project) => format!(
+                    "Generated files are {} — chosen with /license.",
+                    licence_phrase(&project)
+                ),
+                None => format!(
+                    "Generated files are licensed {} ({}) — chosen with /license, but no \
+                     copyright holder was found, so no header is written.",
+                    licence.spdx(),
+                    licence.title()
+                ),
+            }
+        }
+        Choice::Auto => {
+            let source = if Project::declared(workspace).is_some() {
+                "detected from this workspace"
+            } else if Project::has_unknown_licence_file(workspace) {
+                "this workspace's LICENSE file is not one orangu knows, so it is used as written"
+            } else {
+                "the default; this workspace declares none"
+            };
+            match Project::detect(workspace) {
+                Some(project) => format!(
+                    "Generated files are {} — {source}.",
+                    licence_phrase(&project)
+                ),
+                None => format!(
+                    "Generated files would be licensed {} ({}) — {source} — but no copyright \
+                     holder was found, so no header is written. Name one with /license {} \
+                     <holder>.",
+                    DEFAULT_LICENCE.spdx(),
+                    DEFAULT_LICENCE.title(),
+                    DEFAULT_LICENCE.spdx()
+                ),
+            }
+        }
+    }
 }
 
 /// Run one `orangu::files` operation for a typed command, reporting what it
@@ -682,6 +816,7 @@ pub(crate) fn handle_command(
             *detect_model = true;
             Ok(CommandOutcome::Quiet)
         }
+        LocalCommand::License(args) => license_command(args, tools, workspace, session_dir),
         LocalCommand::SetTheme(name) => {
             if name.is_empty() {
                 return Ok(CommandOutcome::OutputError(format!(
@@ -1543,6 +1678,8 @@ mod tests {
                 parents: true,
                 git: orangu::files::git_default(),
                 license: false,
+                license_id: None,
+                license_holder: None,
             },
         )
         .expect("call")

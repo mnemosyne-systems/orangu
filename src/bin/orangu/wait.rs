@@ -261,7 +261,10 @@ async fn drive_handle(
                             );
                             std::io::stdout().flush()?;
                         }
-                        return Ok(WaitResult::Response(response));
+                        return Ok(WaitResult::Response {
+                            answer: response,
+                            truncated: final_state.metrics.truncated,
+                        });
                     }
                 }
             }
@@ -869,6 +872,38 @@ pub(crate) fn request_cancelled_message() -> String {
     )
 }
 
+/// The transcript line that says this turn's answer stopped at the server's
+/// response-length cap.
+///
+/// The same sentence `-p` prints under its timings
+/// ([`orangu::llm::TRUNCATED_NOTICE`]), styled like the cancellation notice
+/// beside it: something the *server* did to the answer, not something the
+/// model said, so it must not read as part of the reply. Amber rather than
+/// red — nothing failed, the answer is simply not all of the answer.
+pub(crate) fn truncated_notice_line() -> String {
+    format!(
+        "{}{}{}",
+        render::ANSI_FG_CODE,
+        orangu::llm::TRUNCATED_NOTICE,
+        render::ANSI_RESET
+    )
+}
+
+/// Pushes a finished turn's answer into the transcript, followed by the
+/// truncation notice when the server cut it short.
+///
+/// The order is the whole point, and is why this cannot live inside the wait
+/// loop: the notice is *about* the answer, so it can only be pushed once the
+/// answer has been. Shared by both of the terminal interface's response paths
+/// — a turn awaited in place and one resumed from a parked tab — so a cut-off
+/// answer cannot be reported on one and silently accepted on the other.
+pub(crate) fn push_answer(output_state: &mut OutputState, answer: &str, truncated: bool) {
+    output_state.push_markdown(answer);
+    if truncated {
+        output_state.push_text(&truncated_notice_line());
+    }
+}
+
 pub(crate) fn preserve_cancelled_output(output_state: &mut OutputState, partial_output: &str) {
     if !partial_output.is_empty() {
         output_state.push_markdown(partial_output);
@@ -908,6 +943,28 @@ mod tests {
                 TranscriptLine::Plain("partial reply".to_string()),
                 TranscriptLine::Plain(request_cancelled_message()),
             ]
+        );
+    }
+
+    /// A cut-off answer says so, *under* the answer it is about — and an
+    /// ordinary one stays quiet, so the notice never becomes noise.
+    #[test]
+    fn a_truncated_answer_is_followed_by_the_notice() {
+        let mut output_state = OutputState::default();
+        push_answer(&mut output_state, "half an answer", true);
+        assert_eq!(
+            output_state.lines(),
+            &[
+                TranscriptLine::Plain("half an answer".to_string()),
+                TranscriptLine::Plain(truncated_notice_line()),
+            ]
+        );
+
+        let mut output_state = OutputState::default();
+        push_answer(&mut output_state, "a whole answer", false);
+        assert_eq!(
+            output_state.lines(),
+            &[TranscriptLine::Plain("a whole answer".to_string())]
         );
     }
 
@@ -1028,6 +1085,7 @@ mod tests {
                 }),
                 prompt_per_second: Some(15.0),
                 predicted_per_second: None,
+                truncated: false,
             },
             None,
             Duration::from_secs(2),
@@ -1046,6 +1104,7 @@ mod tests {
                 prompt_progress: None,
                 prompt_per_second: None,
                 predicted_per_second: None,
+                truncated: false,
             },
             None,
             Duration::from_secs(2),
@@ -1064,6 +1123,7 @@ mod tests {
                 prompt_progress: None,
                 prompt_per_second: Some(15.0),
                 predicted_per_second: Some(42.5),
+                truncated: false,
             },
             None,
             Duration::from_secs(2),

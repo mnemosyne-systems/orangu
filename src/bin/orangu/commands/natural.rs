@@ -28,6 +28,11 @@ use std::borrow::Cow;
 /// order the grey ghost hint cycles through. Add a new group only when you add
 /// a new command, keeping it in the same priority position the parser uses.
 ///
+/// Several of these are bare English verbs — `create `, `open `, `delete ` —
+/// which is also how a sentence meant for the model starts. Those forms take a
+/// single argument token only; see [`is_single_argument`], applied by the
+/// parser below wherever a phrase does not name its object.
+///
 /// This drives the grey inline "ghost" completion (see
 /// `completion::natural_language_ghost_candidates`), so it must stay in sync
 /// with the parser below. The `binding_phrases_all_parse` test guards against
@@ -129,6 +134,12 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "switch server to ",
     "set server to ",
     "select server ",
+    // --- license (select) ---
+    "license",
+    "show license",
+    "use license ",
+    "set license to ",
+    "license ",
     // --- theme (select) ---
     "use theme ",
     "switch theme to ",
@@ -571,6 +582,24 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             return Some(LocalCommand::SetServer(name.trim()));
         }
     }
+    // Checked before the file-lifecycle prefixes below, so `license` is the
+    // command rather than a file of that name. The bare `license ` form takes
+    // one token, like every other bare verb — see [`is_single_argument`] —
+    // while `/license` and the explicit forms may name a holder as well.
+    for prefix in ["use license ", "set license to "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            return Some(LocalCommand::License(rest.trim()));
+        }
+    }
+    if let Some(rest) = strip_ascii_prefix(input, "license ") {
+        let rest = rest.trim();
+        if is_single_argument(rest) {
+            return Some(LocalCommand::License(rest));
+        }
+    }
+    if matches_ci(input, &["license", "show license"]) {
+        return Some(LocalCommand::License(""));
+    }
     for prefix in ["use theme ", "switch theme to ", "set theme to ", "theme "] {
         if let Some(name) = strip_ascii_prefix(input, prefix) {
             return Some(LocalCommand::SetTheme(name.trim()));
@@ -589,11 +618,19 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             return Some(LocalCommand::SetModelId(name.trim()));
         }
     }
-    if let Some(path) = parse_open_file_target(input, "/open_file ") {
+    if let Some(path) = parse_open_file_target(input, "/open_file ", false) {
         return Some(LocalCommand::OpenFile(path));
     }
-    for prefix in ["open file ", "open ", "edit file ", "edit "] {
-        if let Some(path) = parse_open_file_target(input, prefix) {
+    // The bare `open `/`edit ` forms take a single token only — see
+    // [`is_single_argument`]. "open the config file" is a question for the
+    // model, not a request to edit a file called "the config file".
+    for (prefix, bare) in [
+        ("open file ", false),
+        ("open ", true),
+        ("edit file ", false),
+        ("edit ", true),
+    ] {
+        if let Some(path) = parse_open_file_target(input, prefix, bare) {
             return Some(LocalCommand::OpenFile(path));
         }
     }
@@ -748,10 +785,10 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["bisect status", "bisect", "git bisect"]) {
         return Some(LocalCommand::Bisect(BisectSubcommand::Status));
     }
-    for prefix in ["rebase ", "git rebase "] {
+    for (prefix, bare) in [("rebase ", true), ("git rebase ", false)] {
         if let Some(target) = strip_ascii_prefix(input, prefix) {
             let target = target.trim();
-            if !target.is_empty() {
+            if !target.is_empty() && (!bare || is_single_argument(target)) {
                 return Some(LocalCommand::Rebase(Some(Cow::Borrowed(target))));
             }
         }
@@ -759,10 +796,10 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["rebase", "git rebase"]) {
         return Some(LocalCommand::Rebase(None));
     }
-    for prefix in ["git merge ", "merge "] {
+    for (prefix, bare) in [("git merge ", false), ("merge ", true)] {
         if let Some(branch) = strip_ascii_prefix(input, prefix) {
             let branch = branch.trim();
-            if !branch.is_empty() {
+            if !branch.is_empty() && (!bare || is_single_argument(branch)) {
                 return Some(LocalCommand::Merge(Some(Cow::Borrowed(branch))));
             }
         }
@@ -770,17 +807,19 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["merge"]) {
         return Some(LocalCommand::Merge(None));
     }
-    for prefix in [
-        "git checkout ",
-        "checkout ",
-        "switch to branch ",
-        "switch to ",
+    for (prefix, bare) in [
+        ("git checkout ", false),
+        ("checkout ", true),
+        ("switch to branch ", false),
+        ("switch to ", true),
     ] {
         if let Some(target) = strip_ascii_prefix(input, prefix) {
+            // The optional " branch" tail is dropped before the single-token
+            // rule is applied, so `switch to main branch` still names `main`.
             let target = strip_ascii_suffix(target.trim(), " branch")
                 .map(str::trim)
                 .unwrap_or(target.trim());
-            if !target.is_empty() {
+            if !target.is_empty() && (!bare || is_single_argument(target)) {
                 return Some(LocalCommand::Branch(BranchSubcommand::Switch(
                     Cow::Borrowed(target),
                 )));
@@ -816,10 +855,10 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["list all branches", "branch -a", "branch --all"]) {
         return Some(LocalCommand::Branch(BranchSubcommand::ListAll));
     }
-    for prefix in ["restore ", "git restore "] {
+    for (prefix, bare) in [("restore ", true), ("git restore ", false)] {
         if let Some(path) = strip_ascii_prefix(input, prefix) {
             let path = path.trim();
-            if !path.is_empty() {
+            if !path.is_empty() && (!bare || is_single_argument(path)) {
                 return Some(LocalCommand::Restore(Some(Cow::Borrowed(path))));
             }
         }
@@ -853,13 +892,13 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     // "Create myfile.txt with 0644" — the mode is optional, and the bare
     // "create " form comes last so it never shadows "create branch"/"create
     // workspace"/"create pull request" above.
-    for prefix in [
-        "create file ",
-        "new file ",
-        "git add ",
-        "add file ",
-        "create ",
-        "add ",
+    for (prefix, bare) in [
+        ("create file ", false),
+        ("new file ", false),
+        ("git add ", false),
+        ("add file ", false),
+        ("create ", true),
+        ("add ", true),
     ] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
             // The bare "create " form must never swallow the other things
@@ -881,14 +920,26 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 break;
             }
             if let Some(parsed) = parse_create_file_args(rest) {
+                // Nor may it swallow a sentence. `create notes.md with 0644`
+                // has already been reduced to its path here, so the rule is
+                // applied to that and not to the whole argument — see
+                // [`is_single_argument`].
+                if bare && !is_single_argument(&parsed.path) {
+                    break;
+                }
                 return Some(LocalCommand::CreateFile(Some(parsed)));
             }
         }
     }
-    for prefix in ["git rm ", "delete file ", "remove file ", "remove "] {
+    for (prefix, bare) in [
+        ("git rm ", false),
+        ("delete file ", false),
+        ("remove file ", false),
+        ("remove ", true),
+    ] {
         if let Some(path) = strip_ascii_prefix(input, prefix) {
             let path = path.trim();
-            if !path.is_empty() {
+            if !path.is_empty() && (!bare || is_single_argument(path)) {
                 return Some(LocalCommand::DeleteFile(Some(Cow::Borrowed(path))));
             }
         }
@@ -896,11 +947,15 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["remove"]) {
         return Some(LocalCommand::DeleteFile(None));
     }
-    for prefix in ["git mv ", "move file ", "move "] {
+    for (prefix, bare) in [("git mv ", false), ("move file ", false), ("move ", true)] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
             let rest = rest.trim();
+            // A move takes exactly two paths. The explicit forms tolerate
+            // trailing words, but the bare `move ` does not: "move the cursor
+            // to the end" is a sentence, not `git mv the cursor`.
             if let Ok(words) = shell_words(rest)
                 && words.len() >= 2
+                && !(bare && words.len() > 2)
             {
                 return Some(LocalCommand::MoveFile(Some((
                     Cow::Owned(words[0].clone()),
@@ -987,10 +1042,14 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["delete", "delete branch"]) {
         return Some(LocalCommand::Branch(BranchSubcommand::List));
     }
-    for prefix in ["git branch -D ", "delete branch ", "delete "] {
+    for (prefix, bare) in [
+        ("git branch -D ", false),
+        ("delete branch ", false),
+        ("delete ", true),
+    ] {
         if let Some(branch) = strip_ascii_prefix(input, prefix) {
             let branch = branch.trim();
-            if !branch.is_empty() {
+            if !branch.is_empty() && (!bare || is_single_argument(branch)) {
                 return Some(LocalCommand::Branch(BranchSubcommand::Delete(
                     Cow::Borrowed(branch),
                 )));

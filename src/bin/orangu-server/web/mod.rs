@@ -181,6 +181,16 @@ pub struct WebState {
     /// `architecture`/`backend_label`, so a saved report says which tree the
     /// server was rooted at.
     pub workspace: PathBuf,
+    /// The licence [`workspace`](Self::workspace) is under, and who holds its
+    /// copyright — what a downloaded code block is stamped with.
+    ///
+    /// Resolved once, when this state is built, rather than per render:
+    /// `render_markdown_to_html` runs on *every streamed token*, and reading
+    /// three manifests per token to answer a question whose answer does not
+    /// change while the server is up is not a trade worth making. A server
+    /// started before its workspace acquired a `LICENSE` keeps saying "no
+    /// licence" until it is restarted, which is the honest failure of the two.
+    pub project_licence: Option<orangu::license::Project>,
     pub version: &'static str,
     /// The `.gguf` this server loaded, and the directory the model manager
     /// lists — see `web::models`, and `Prepared`'s own fields of the same
@@ -603,7 +613,10 @@ struct SessionView {
     messages: Vec<SessionMessageView>,
 }
 
-async fn get_session(Path(id): Path<String>) -> impl IntoResponse {
+async fn get_session(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     match sessions::load_session(&id) {
         Ok(session) => Json(SessionView {
             id: session.id,
@@ -614,8 +627,9 @@ async fn get_session(Path(id): Path<String>) -> impl IntoResponse {
                 .messages
                 .into_iter()
                 .map(|m| {
-                    let html = (m.role == "assistant")
-                        .then(|| render::render_markdown_to_html(&m.content));
+                    let html = (m.role == "assistant").then(|| {
+                        render::render_markdown_to_html(&m.content, state.project_licence.as_ref())
+                    });
                     SessionMessageView {
                         role: m.role,
                         content: m.content,
@@ -725,7 +739,7 @@ async fn send_message(
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Token(text) => {
                     full.push_str(&text);
-                    let html = render::render_markdown_to_html(&full);
+                    let html = render::render_markdown_to_html(&full, state.project_licence.as_ref());
                     yield Ok::<_, Infallible>(
                         axum::response::sse::Event::default()
                             .data(json!({"type": "token", "html": html}).to_string()),
@@ -733,7 +747,7 @@ async fn send_message(
                 }
                 StreamEvent::Done { finish_reason, stats } => {
                     let full = state.engine.tokenizer.clean_up_tokenization_spaces(&full);
-                    let html = render::render_markdown_to_html(&full);
+                    let html = render::render_markdown_to_html(&full, state.project_licence.as_ref());
                     let generation_ms = stats.generate_time.as_millis() as u64;
                     if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &full, Some(generation_ms)) {
                         yield Ok(axum::response::sse::Event::default()

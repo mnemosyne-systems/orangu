@@ -193,7 +193,12 @@ impl SlotStore {
             return Ok(0);
         };
         let bytes = encode_file(&self.fingerprint, entry);
-        let saved = entry.cache.committed_len();
+        // What the file actually carries, which is not `committed_len`: the
+        // fused GPU decode path leaves the cache's `len` ahead of its host
+        // buffers, and `KvCache::to_bytes` writes only the host-resident
+        // rows. Reporting the larger number told the client it had persisted
+        // a generated tail that is not in the file.
+        let saved = entry.cache.host_committed_len();
         drop(guard);
         write_atomic(&path, &bytes)?;
         Ok(saved)

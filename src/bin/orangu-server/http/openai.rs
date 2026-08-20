@@ -30,6 +30,32 @@ use crate::engine::loader::PoolingType;
 use crate::engine::sampling::SamplingParams;
 use crate::engine::tool_calls;
 
+/// How long an answer may get when the request does not say — the
+/// `max_tokens` default for `/v1/chat/completions`, clamped afterwards to
+/// what is left of the model's context window.
+///
+/// It has to be *this* large because the endpoint's real workload is an agent
+/// writing a file: the file's content travels inside a `<|tool_call>` span,
+/// and a span cut off by the cap never closes, so `engine::tool_calls`
+/// correctly refuses to read it as a call and it lands in the answer as prose
+/// instead. The tool is never run and nothing reaches disk. 512 — the default
+/// this replaces — is about forty lines of code, and a request that hit it
+/// wrote no file at all; 4096 was still short of a page of HTML with its game
+/// loop in it. This is a long source file with room for the model to think
+/// first.
+///
+/// A cap has to exist all the same, and the reason is **time**, not memory:
+/// `LayerCache::new_strided` only *reserves* its buffers, so an oversized
+/// capacity costs address space rather than RSS (see its own comment). What an
+/// unbounded default would cost is a runaway generation holding the slot every
+/// other request queues behind until the whole context window is full — on the
+/// order of an hour at a local decode rate, against a couple of minutes here.
+///
+/// Reaching this is no longer silent either way: the response carries
+/// `finish_reason: "length"`, and the client says so — see
+/// `llm::StreamMetrics::truncated`.
+const DEFAULT_MAX_TOKENS: usize = 8192;
+
 /// OpenAI's `usage` object.
 pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
     json!({
@@ -353,7 +379,7 @@ pub async fn chat_completions(
             seed: req.seed,
         },
     );
-    let max_tokens = req.max_tokens.unwrap_or(512);
+    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let created = unix_now();
     let model = state.model_label.clone();

@@ -195,6 +195,31 @@ fn theme_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
     Some((token_start, candidates))
 }
 
+/// Tab/ghost completion for `/license <spdx>` — and its natural-language
+/// `license <spdx>`, `use license <spdx>` and `set license to <spdx>` forms —
+/// as `(token_start, candidates)`: every licence orangu can write a header
+/// for, plus `auto` and `none`.
+///
+/// Only the *first* token is completed. Everything after it is the copyright
+/// holder, which is a name and has nothing to offer a completion list.
+fn license_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
+    let (token_start, value) = ["/license ", "use license ", "set license to ", "license "]
+        .into_iter()
+        .find_map(|form| prefix.strip_prefix(form).map(|value| (form.len(), value)))?;
+    // Past the first token the argument is a holder, not a licence.
+    if value.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let candidates = orangu::license::Licence::ALL
+        .iter()
+        .map(|licence| licence.spdx().to_string())
+        .chain(["auto".to_string(), "none".to_string()])
+        .filter(|spdx| spdx.to_ascii_lowercase().starts_with(&lower))
+        .collect();
+    Some((token_start, candidates))
+}
+
 /// Tab/ghost completion for the `/build [debug|release] [<target>]` argument
 /// as `(token_start, candidates)`: the profile keywords plus the workspace's
 /// discovered build targets (cargo binary names, Makefile rule names — see
@@ -314,6 +339,10 @@ fn structured_completion_candidates_unordered(
     }
 
     if let Some((start, candidates)) = theme_completion_candidates(prefix) {
+        return Some((start, cursor, candidates));
+    }
+
+    if let Some((start, candidates)) = license_completion_candidates(prefix) {
         return Some((start, cursor, candidates));
     }
 
@@ -598,6 +627,49 @@ mod tests {
             auto_review_completion_candidates("/auto_review de", workspace.path())
                 .expect("auto-review argument");
         assert!(candidates.iter().any(|c| c == "deep"), "{candidates:?}");
+    }
+
+    /// Every form of `/license` completes the licence set, and only the
+    /// first token — what follows it is a copyright holder, not a licence.
+    #[test]
+    fn license_completion_offers_the_licence_set() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+        for prefix in ["/license ", "license ", "use license ", "set license to "] {
+            let (start, _, candidates) =
+                completion_candidates(prefix, prefix.len(), workspace.path(), &[], &[], &skills)
+                    .expect("licence candidates");
+            assert_eq!(start, prefix.len());
+            for expected in ["MIT", "Apache-2.0", "GPL-3.0-or-later", "auto", "none"] {
+                assert!(
+                    candidates.iter().any(|candidate| candidate == expected),
+                    "missing {expected} for {prefix:?}: {candidates:?}"
+                );
+            }
+        }
+
+        // Narrowing by prefix, case-insensitively.
+        let narrowing = "/license gpl-3";
+        let (_, _, candidates) = completion_candidates(
+            narrowing,
+            narrowing.len(),
+            workspace.path(),
+            &[],
+            &[],
+            &skills,
+        )
+        .expect("narrowed");
+        assert!(
+            candidates.iter().all(|c| c.starts_with("GPL-3")),
+            "{candidates:?}"
+        );
+        assert_eq!(candidates.len(), 2, "only-and-or-later: {candidates:?}");
+
+        // Past the identifier the argument is a holder; nothing to offer.
+        assert!(
+            license_completion_candidates("/license MIT Acme ").is_none(),
+            "a holder is not a licence"
+        );
     }
 
     #[test]

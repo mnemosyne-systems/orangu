@@ -231,6 +231,17 @@ pub struct CreateFileRequest {
     /// not generating it.
     #[serde(default = "license_default")]
     pub license: bool,
+    /// The SPDX identifier to write the header under, overriding whatever the
+    /// workspace declares — `/license`'s answer, threaded through by
+    /// `tools::ToolExecutor`. Unset detects from the workspace. Like
+    /// [`license`](Self::license) it is not in the tool schema, so it is the
+    /// caller's decision and not the model's.
+    #[serde(default)]
+    pub license_id: Option<String>,
+    /// The copyright holder to name, overriding what the workspace says.
+    /// Unset detects one; see `license::Project`.
+    #[serde(default)]
+    pub license_holder: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -591,8 +602,9 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
 
     // Generated code is written with a licence header (`crate::license`).
     // `apply` itself covers the cases where it must not happen — a format
-    // with no comment syntax to put it in, and content that already carries
-    // the licence — so only "is this generated at all" is decided here.
+    // with no comment syntax to put it in, content that already carries a
+    // licence, and a project whose own licence could not be established —
+    // so only "is this generated at all" is decided here.
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -601,8 +613,20 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
     // already there is a change to somebody's project, and a project's
     // licensing is not this tool's to decide — the agent editing a GPL
     // source file must not leave an MIT header on top of it.
+    //
+    // Which licence is equally not this tool's to decide, so the header is
+    // the *workspace's* own — detected per call rather than cached, because
+    // the answer changes the moment somebody adds a `LICENSE`, and the cost
+    // is a couple of small reads against a file write that is about to
+    // happen anyway.
     let content = if request.license && !existed {
-        crate::license::apply(&request.content, file_name)
+        let chosen = request
+            .license_id
+            .as_deref()
+            .and_then(crate::license::from_spdx);
+        let project =
+            crate::license::Project::resolve(workspace, chosen, request.license_holder.as_deref());
+        crate::license::apply(&request.content, file_name, project.as_ref())
     } else {
         request.content.clone()
     };
@@ -1097,10 +1121,11 @@ mod tests {
     use tempfile::TempDir;
 
     /// Code `orangu` writes is licensed code — the same header the web
-    /// console's download puts on a saved snippet, from the same module.
+    /// console's download puts on a saved snippet, from the same module,
+    /// and under the licence the *workspace* uses.
     #[test]
     fn create_writes_the_licence_header_onto_generated_code() {
-        let workspace = workspace_with(&[]);
+        let workspace = licensed_workspace_with(&[]);
         let response = create(
             workspace.path(),
             create_request("main.rs", "fn main() {}\n"),
@@ -1113,6 +1138,68 @@ mod tests {
         assert!(response.licensed);
         // Not the request's length — the file on disk is what was written.
         assert_eq!(response.bytes_written, written.len());
+    }
+
+    /// The header is the *workspace's* licence. A file generated into a GPL
+    /// project used to arrive claiming MIT, attributed to "orangu", and
+    /// staged — false licensing metadata on somebody else's code.
+    #[test]
+    fn create_writes_the_workspace_s_own_licence() {
+        let workspace = workspace_with(&[(
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nlicense = \"GPL-3.0-or-later\"\nauthors = [\"Jane Roe <jane@example.com>\"]\n",
+        )]);
+        let response = create(
+            workspace.path(),
+            create_request("main.rs", "fn main() {}\n"),
+        )
+        .expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("main.rs")).expect("read");
+        assert!(response.licensed);
+        assert!(written.contains("GNU General Public License"), "{written}");
+        assert!(written.contains("Jane Roe"), "{written}");
+        assert!(!written.contains("MIT"), "{written}");
+        assert!(!written.contains("orangu"), "{written}");
+    }
+
+    /// A workspace that declares no licence gets the default, so a new
+    /// project still produces licensed files. `/license` is how to say
+    /// otherwise, including saying "no header".
+    #[test]
+    fn create_writes_the_default_licence_when_the_project_declares_none() {
+        let workspace = workspace_with(&[("Cargo.toml", "[package]\nauthors = [\"Jane Roe\"]\n")]);
+        let response = create(
+            workspace.path(),
+            create_request("main.rs", "fn main() {}\n"),
+        )
+        .expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("main.rs")).expect("read");
+        assert!(response.licensed);
+        assert!(written.starts_with("// MIT License\n"), "{written}");
+        assert!(written.contains("Jane Roe"), "{written}");
+    }
+
+    /// The `license_id`/`license_holder` fields are `/license`'s answer
+    /// arriving here. They are not in the tool schema — a model must not be
+    /// able to relicense somebody's project by writing a field.
+    #[test]
+    fn create_honours_an_explicitly_chosen_licence() {
+        let workspace = licensed_workspace_with(&[]);
+        let mut request = create_request("main.rs", "fn main() {}\n");
+        request.license = true;
+        request.license_id = Some("Apache-2.0".to_string());
+        request.license_holder = Some("Acme Ltd".to_string());
+        create(workspace.path(), request).expect("create");
+
+        let written = fs::read_to_string(workspace.path().join("main.rs")).expect("read");
+        assert!(
+            written.contains("Licensed under the Apache License"),
+            "{written}"
+        );
+        assert!(written.contains("Acme Ltd"), "{written}");
+        assert!(!written.contains("MIT"), "{written}");
     }
 
     /// A format with no comment syntax has to come out byte-for-byte, or a
@@ -1132,7 +1219,7 @@ mod tests {
     /// A script the agent writes has to stay executable.
     #[test]
     fn create_keeps_a_shebang_first() {
-        let workspace = workspace_with(&[]);
+        let workspace = licensed_workspace_with(&[]);
         create(
             workspace.path(),
             create_request("run.sh", "#!/bin/sh\necho hi\n"),
@@ -1192,6 +1279,19 @@ mod tests {
         let twice = fs::read_to_string(workspace.path().join("a.rs")).expect("read");
         assert_eq!(once, twice);
         assert!(!response.licensed);
+    }
+
+    /// The manifest that makes a test workspace a *licensed* project, which
+    /// is now what decides whether a generated file gets a header at all.
+    const MIT_MANIFEST: (&str, &str) = (
+        "Cargo.toml",
+        "[package]\nname = \"x\"\nlicense = \"MIT\"\nauthors = [\"Example Holder\"]\n",
+    );
+
+    fn licensed_workspace_with(files: &[(&str, &str)]) -> TempDir {
+        let mut all = vec![MIT_MANIFEST];
+        all.extend_from_slice(files);
+        workspace_with(&all)
     }
 
     fn workspace_with(files: &[(&str, &str)]) -> TempDir {
@@ -1268,6 +1368,8 @@ mod tests {
             parents: false,
             git: false,
             license: license_default(),
+            license_id: None,
+            license_holder: None,
         }
     }
 
@@ -1339,7 +1441,7 @@ mod tests {
 
     #[test]
     fn create_writes_the_file_and_reports_it_relative_to_the_workspace() {
-        let dir = workspace_with(&[]);
+        let dir = licensed_workspace_with(&[]);
 
         let err = create(dir.path(), create_request("src/main.rs", "fn main() {}\n"))
             .expect_err("missing parent");

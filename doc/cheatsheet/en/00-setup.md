@@ -34,6 +34,7 @@ into `~/.local/bin`. On Windows: `install.cmd`.
 | `orangu -s` | Print the shell completions. |
 | `/help` `/manual` `/model` | Every command, the full manual offline, and model switching. |
 | `/server` `/theme` `/tools` | The server and its capabilities, the colours, the model's tools. |
+| `/license` | The licence generated files carry. Detected from the project; `Tab` lists the rest. Per session. |
 | `/information` | What the connected server can do — check this first. |
 
 ## What the wizards write

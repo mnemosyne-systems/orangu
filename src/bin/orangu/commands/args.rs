@@ -47,9 +47,33 @@ pub fn parse_similarity_threshold(arg: &str) -> Option<f64> {
     Some(fraction.clamp(0.0, 1.0))
 }
 
-pub fn parse_open_file_target<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+/// Whether `argument` is the one token a *bare* verb prefix is allowed to take.
+///
+/// The natural-language bindings include bare English verbs — `create `,
+/// `open `, `delete `, `merge ` — that are also how a person opens a sentence
+/// meant for the model. `create pacman.rs` names a file; "Create a Pacman like
+/// game" is a request, and reading its remainder as a filename both creates
+/// nonsense on disk and stops the prompt ever reaching the model. One
+/// whitespace-free word is the shape of a path, a branch, or a remote; more
+/// than one is prose. Quoting overrides the rule, so a path that genuinely
+/// contains a space is still reachable as `open "docs/user guide.md"`.
+///
+/// The explicit forms (`create file `, `delete branch `, …) name their object
+/// and are never held to this — there the user has already said what they mean.
+pub fn is_single_argument(argument: &str) -> bool {
+    let argument = argument.trim();
+    !argument.is_empty()
+        && (matches!(argument.chars().next(), Some('"' | '\''))
+            || !argument.chars().any(char::is_whitespace))
+}
+
+pub fn parse_open_file_target<'a>(
+    input: &'a str,
+    prefix: &str,
+    single_token_only: bool,
+) -> Option<&'a str> {
     let path = strip_ascii_prefix(input, prefix)?.trim();
-    if path.is_empty() {
+    if path.is_empty() || (single_token_only && !is_single_argument(path)) {
         return None;
     }
     Some(strip_matching_quotes(path))
@@ -64,8 +88,14 @@ pub fn parse_open_file_target<'a>(input: &'a str, prefix: &str) -> Option<&'a st
 /// project file in `$EDITOR`, not just the changed files. `open file ` is tried
 /// before the bare `open `, so `open file x` yields `x` rather than `file x`.
 pub fn parse_open_command_target(input: &str) -> Option<&str> {
-    for prefix in ["/open_file ", "open file ", "open ", "edit file ", "edit "] {
-        if let Some(path) = parse_open_file_target(input, prefix) {
+    for (prefix, bare) in [
+        ("/open_file ", false),
+        ("open file ", false),
+        ("open ", true),
+        ("edit file ", false),
+        ("edit ", true),
+    ] {
+        if let Some(path) = parse_open_file_target(input, prefix, bare) {
             return Some(path);
         }
     }
@@ -143,11 +173,7 @@ pub fn parse_show_file_natural_language_target(
 }
 
 pub fn parse_show_file_target(path: &str, single_token_only: bool) -> Option<&str> {
-    if path.is_empty() {
-        return None;
-    }
-    let quoted = matches!(path.chars().next(), Some('"') | Some('\''));
-    if single_token_only && !quoted && path.chars().any(char::is_whitespace) {
+    if path.is_empty() || (single_token_only && !is_single_argument(path)) {
         return None;
     }
     Some(strip_matching_quotes(path))

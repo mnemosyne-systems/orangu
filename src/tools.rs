@@ -53,6 +53,14 @@ pub struct ToolExecutor {
     /// Optional workspace-scoped MCP services. Read-only executors never
     /// attach one, so external tools cannot bypass their safety boundary.
     mcp: Option<Arc<crate::mcp::McpManager>>,
+    /// The licence generated files are written under — `/license`'s answer
+    /// for this session, or [`crate::license::Choice::Auto`] to follow what
+    /// the workspace declares.
+    ///
+    /// Shared rather than owned so `/license` can change it *while* the
+    /// executor is in use: the next `create_file` reads it, and nothing has
+    /// to be rebuilt for a choice made mid-conversation to take effect.
+    pub licence: Arc<Mutex<crate::license::Choice>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -145,6 +153,7 @@ impl ToolExecutor {
             graph_store: Arc::new(Mutex::new(None)),
             graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
             mcp: None,
+            licence: Arc::new(Mutex::new(crate::license::Choice::default())),
         }
     }
 
@@ -152,6 +161,35 @@ impl ToolExecutor {
     pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    /// This session's licence choice, or `Auto` if the lock is poisoned —
+    /// a licence header is not worth failing a file write over.
+    pub fn licence_choice(&self) -> crate::license::Choice {
+        self.licence
+            .lock()
+            .map(|choice| choice.clone())
+            .unwrap_or_default()
+    }
+
+    /// Pin the licence generated files are written under.
+    pub fn set_licence_choice(&self, choice: crate::license::Choice) {
+        if let Ok(mut current) = self.licence.lock() {
+            *current = choice;
+        }
+    }
+
+    /// The three licensing fields of a `create_file` request, as this
+    /// session's choice sets them: whether to write a header at all, and —
+    /// when the user named them — which licence and whose copyright.
+    fn licence_fields(&self) -> (bool, Option<String>, Option<String>) {
+        match self.licence_choice() {
+            crate::license::Choice::Auto => (true, None, None),
+            crate::license::Choice::None => (false, None, None),
+            crate::license::Choice::Use { licence, holder } => {
+                (true, Some(licence.spdx().to_string()), holder)
+            }
+        }
     }
 
     pub fn total_tool_duration(&self) -> std::time::Duration {
@@ -192,10 +230,11 @@ impl ToolExecutor {
                      `overwrite: false` for create-if-absent. A missing parent directory \
                      fails unless `parents` is set. In a Git repository the new file is \
                      staged with `git add`; nothing is ever committed. A file that did not \
-                     exist before is written with a licence header on top of `content` \
-                     where its format allows a comment, so its line numbers are not the \
-                     ones in `content` — the response reports this as `licensed`, and \
-                     editing such a file by line number means reading it back first.",
+                     exist before may be written with the workspace's own licence header on \
+                     top of `content` — where its format allows a comment and the project's \
+                     licence is known — so its line numbers are then not the ones in \
+                     `content`. The response reports this as `licensed`, and editing such a \
+                     file by line number means reading it back first.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -442,7 +481,7 @@ impl ToolExecutor {
         let result = match name {
             "show_file" => self.show_file(arguments).await,
             "modify_file" => self.mutating(|| self.modify_file(arguments)),
-            "create_file" => self.mutating(|| self.file_operation(crate::files::create, arguments)),
+            "create_file" => self.mutating(|| self.create_file(arguments)),
             "move_file" => self.mutating(|| self.file_operation(crate::files::move_, arguments)),
             "delete_file" => self.mutating(|| self.file_operation(crate::files::delete, arguments)),
             "create_directory" => {
@@ -563,6 +602,26 @@ impl ToolExecutor {
         Ok(serde_json::to_string(&response)?)
     }
 
+    /// `create_file`, with this session's licence choice laid over what the
+    /// model sent.
+    ///
+    /// Its own arm rather than [`Self::file_operation`]'s generic one because
+    /// the licensing fields are the *caller's* to set and are deliberately
+    /// absent from the tool schema — a model must not be able to relicense
+    /// somebody's project by writing a field.
+    fn create_file(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let mut request: crate::files::CreateFileRequest =
+            serde_json::from_value(Value::Object(arguments.clone()))
+                .map_err(|err| anyhow!("{err}"))?;
+        let (license, license_id, license_holder) = self.licence_fields();
+        request.license = license;
+        request.license_id = license_id;
+        request.license_holder = license_holder;
+        let response =
+            crate::files::create(&self.workspace, request).map_err(|err| anyhow!("{err}"))?;
+        Ok(serde_json::to_string(&response)?)
+    }
+
     /// `modify_file` takes either shape: `edits` (the line ranges
     /// `orangu-server`'s own `/v1/modify_file` takes) or the
     /// `old_text`/`new_text` replacement this tool has always accepted,
@@ -642,6 +701,7 @@ impl ToolExecutor {
             created,
         )?;
 
+        let (license, license_id, license_holder) = self.licence_fields();
         let response = crate::files::create(
             &self.workspace,
             crate::files::CreateFileRequest {
@@ -661,7 +721,9 @@ impl ToolExecutor {
                 // licensed. `files::create` is what decides that only a
                 // *new* file is — editing one that was already there must
                 // not stamp a licence onto it.
-                license: true,
+                license,
+                license_id,
+                license_holder,
             },
         )
         .map_err(|err| anyhow!("{err}"))?;
@@ -1405,6 +1467,82 @@ mod file_lifecycle_tool_tests {
         // Migrated away from, not kept alongside.
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
+    }
+
+    /// `/license`'s answer reaches the file the model writes — the whole
+    /// point of the choice living on the executor. Set mid-session, without
+    /// rebuilding anything, and the *next* `create_file` uses it.
+    #[tokio::test]
+    async fn the_session_licence_choice_reaches_create_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nlicense = \"MIT\"\nauthors = [\"Jane Roe\"]\n",
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        let call = |name: &str| args(&[("path", json!(name)), ("content", json!("x = 1\n"))]);
+
+        // Auto: the workspace's own licence.
+        executor
+            .execute("create_file", &call("a.py"))
+            .await
+            .unwrap();
+        let a = std::fs::read_to_string(workspace.path().join("a.py")).unwrap();
+        assert!(a.starts_with("# MIT License"), "{a}");
+
+        // Chosen: that licence and that holder, over the workspace's.
+        executor.set_licence_choice(crate::license::Choice::Use {
+            licence: crate::license::Licence::Agpl3OrLater,
+            holder: Some("Acme Ltd".to_string()),
+        });
+        executor
+            .execute("create_file", &call("b.py"))
+            .await
+            .unwrap();
+        let b = std::fs::read_to_string(workspace.path().join("b.py")).unwrap();
+        assert!(b.contains("GNU Affero General Public License"), "{b}");
+        assert!(b.contains("Acme Ltd"), "{b}");
+
+        // Off: no header at all.
+        executor.set_licence_choice(crate::license::Choice::None);
+        executor
+            .execute("create_file", &call("c.py"))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("c.py")).unwrap(),
+            "x = 1\n"
+        );
+    }
+
+    /// The model must not be able to relicense somebody's project by writing
+    /// a field: the licensing fields are the caller's and are not in the
+    /// schema, so anything the model sends for them is overwritten.
+    #[tokio::test]
+    async fn a_model_cannot_choose_the_licence_itself() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nlicense = \"MIT\"\nauthors = [\"Jane Roe\"]\n",
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        executor
+            .execute(
+                "create_file",
+                &args(&[
+                    ("path", json!("a.py")),
+                    ("content", json!("x = 1\n")),
+                    ("license_id", json!("AGPL-3.0-or-later")),
+                    ("license_holder", json!("Someone Else")),
+                ]),
+            )
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(workspace.path().join("a.py")).unwrap();
+        assert!(written.starts_with("# MIT License"), "{written}");
+        assert!(!written.contains("Someone Else"), "{written}");
     }
 
     /// A read-only executor (`/review`, the explorer subagent) offers the

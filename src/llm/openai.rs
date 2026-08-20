@@ -308,6 +308,7 @@ where
     if !metrics.is_empty() {
         on_stream_metrics(metrics);
     }
+    let mut truncated = false;
     for choice in response.choices {
         if let Some(text) = choice.delta.content {
             content.push_str(&text);
@@ -316,7 +317,18 @@ where
         if let Some(deltas) = choice.delta.tool_calls {
             apply_tool_call_deltas(tool_calls, deltas);
         }
-        let _ = choice.finish_reason;
+        // `"length"` is the server saying it stopped at its response cap
+        // rather than because the model finished. Reported after the deltas,
+        // so the text this describes has already been handed on, and as a
+        // metrics update rather than as text, so nothing about it can end up
+        // in the conversation the next turn replays.
+        truncated |= choice.finish_reason.as_deref() == Some("length");
+    }
+    if truncated {
+        on_stream_metrics(StreamMetrics {
+            truncated: true,
+            ..StreamMetrics::default()
+        });
     }
 
     Ok(false)
@@ -547,6 +559,51 @@ mod tests {
         assert!(metrics.is_empty());
     }
 
+    /// A response the server cut off at its length cap has to say so. The
+    /// answer looks finished either way, and when what was cut off was a tool
+    /// call the span never closes, so nothing runs and a half-written file
+    /// arrives as prose — silently, before this.
+    #[test]
+    fn a_length_capped_response_reports_that_it_was_truncated() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut metrics: Vec<StreamMetrics> = Vec::new();
+        process_stream_event(
+            &[
+                r#"{"choices":[{"delta":{"content":"half an ans"},"finish_reason":"length"}]}"#
+                    .to_string(),
+            ],
+            &mut content,
+            &mut tool_calls,
+            &mut |_| {},
+            &mut |update| metrics.push(update),
+        )
+        .expect("event");
+        assert_eq!(content, "half an ans");
+        assert!(
+            metrics.iter().any(|m| m.truncated),
+            "a length finish must be reported: {metrics:?}"
+        );
+    }
+
+    /// An ordinary finish says nothing, so the notice only ever appears when
+    /// the answer really was cut short.
+    #[test]
+    fn a_normally_finished_response_reports_no_truncation() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut metrics: Vec<StreamMetrics> = Vec::new();
+        process_stream_event(
+            &[r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_string()],
+            &mut content,
+            &mut tool_calls,
+            &mut |_| {},
+            &mut |update| metrics.push(update),
+        )
+        .expect("event");
+        assert!(!metrics.iter().any(|m| m.truncated), "{metrics:?}");
+    }
+
     #[test]
     fn fenced_json_tool_call_text_remains_text() {
         let content =
@@ -583,6 +640,7 @@ mod tests {
                 }),
                 prompt_per_second: Some(32.3),
                 predicted_per_second: Some(52.9),
+                truncated: false,
             }]
         );
     }

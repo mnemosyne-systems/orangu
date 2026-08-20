@@ -58,13 +58,20 @@ surface — tool, typed command and HTTP endpoint alike; pass
 `"overwrite": false` for create-if-absent.
 
 **Licence headers.** A file that `create_file` brings into existence is
-generated code, and it is written with the MIT licence at the top of it, as
-a comment in that file's own language — `//` for Rust and the C family, `#`
+generated code, and it is written with **the workspace's own licence** at
+the top of it, as a comment in that file's own language — `//` for Rust and the C family, `#`
 for shells and configuration formats, `--` for SQL and Lua, `;;` for Lisps,
 `%` for TeX and Erlang, `REM` for batch files, and a delimited `<!-- -->`,
 `/* */` or `(* *)` block for a language with no line comment. A shebang or
 an XML declaration keeps the first line; the licence goes directly beneath
 it.
+
+The licence and the copyright holder are read from the workspace: the
+`license` field of its `Cargo.toml`, `pyproject.toml` or `package.json`, or
+failing that its `LICENSE`/`COPYING` file — used *verbatim* when it is a
+licence orangu has no header for. A project that says nothing gets MIT.
+**`/license` overrides all of it** for the session, including turning headers
+off; see the Core tools chapter.
 
 Three things never get one, and they are the point of the rule:
 
@@ -75,14 +82,21 @@ Three things never get one, and they are the point of the rule:
   command. That is you writing a file, not orangu generating one.
 - **A format with nowhere to put a comment** — `.json`, `.csv` — which
   would be corrupted rather than licensed.
+- **A workspace with no copyright holder to name.** It is taken from the
+  manifest's first author, the `LICENSE` file's own copyright line (for MIT
+  and the BSDs, whose licence files name the project rather than a
+  foundation), or `git config user.name`. With none to be found there is no
+  header, because inventing an attribution is worse than omitting one —
+  `/license <spdx> <holder>` supplies one.
 
 Because the header is added on top of what was sent, the file on disk has
 more lines than the `content` argument did. The tool result reports this as
 `"licensed": true`, and a `modify_file` that names line numbers should read
-the file back first. The licence text is a string compiled into the
-binary rather than a file read from disk, and changing it changes the
-licence everywhere it is used — including the web console's code blocks,
-which share the same implementation.
+the file back first. `"licensed": false` means no header was added — which,
+now that the licence is the project's, is the ordinary answer in a project
+that does not declare one. The licence texts are strings compiled into the
+binary rather than files read from disk, and they are shared with the web
+console's code blocks, which use the same implementation.
 
 **Git.** In a Git repository these tools make their change *with* the Git
 command — `create_file`/`modify_file` stage with `git add`, `move_file`

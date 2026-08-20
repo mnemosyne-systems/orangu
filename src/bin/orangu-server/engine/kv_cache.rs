@@ -1229,20 +1229,37 @@ impl KvCache {
         out
     }
 
-    /// Serializes every committed KV position (and all recurrent state) to a
-    /// self-describing little-endian byte blob — the payload
+    /// Serializes every **host-resident** KV position (and all recurrent
+    /// state) to a self-describing little-endian byte blob — the payload
     /// [`crate::engine::slot_store`] writes under
-    /// `~/.orangu/server/<fp>/slots/`. Only the `[0, len)` floats of each
+    /// `~/.orangu/server/<fp>/slots/`. Only the committed floats of each
     /// layer are written (never the unused tail of a larger `capacity`), so
     /// a saved file is sized to the conversation, not the context window.
+    ///
+    /// Host-resident, not `len`: the fused decode path commits a generated
+    /// token's key and value to the device mirror alone
+    /// ([`LayerCache::advance_gpu_only`]), which leaves `len` counting rows
+    /// that `k`/`v` do not hold. Writing `len` rows sliced off the end of
+    /// them and took the whole request down with
+    /// `range end index … out of range for slice of length …` — the same
+    /// crash [`Self::host_committed_len`] exists to prevent on the reuse
+    /// path, reached here through `slot_store::save` instead.
+    ///
+    /// What a save therefore leaves behind is the *generated tail*, which the
+    /// next turn re-prefills; the prompt prefix — the large part, and the
+    /// part worth persisting — is host-resident and is written in full. That
+    /// is the same trade [`crate::engine::prefix_cache::CachedPrefill::
+    /// reusable_prefix_len`] already makes for in-memory reuse, so a restored
+    /// slot and a pooled one now agree on what a cache is worth.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(KV_CACHE_MAGIC);
         push_u32(&mut out, self.layers.len() as u32);
         for l in &self.layers {
+            let rows = l.len.min(l.host_len());
             push_u32(&mut out, l.kv_dim as u32);
-            push_u32(&mut out, l.len as u32);
-            let n = l.len * l.kv_dim;
+            push_u32(&mut out, rows as u32);
+            let n = rows * l.kv_dim;
             push_f32s(&mut out, &l.k[..n]);
             push_f32s(&mut out, &l.v[..n]);
         }
@@ -1646,6 +1663,28 @@ mod tests {
             239,
             "but only 239 of them can be read back on the host"
         );
+    }
+
+    /// **The crash again, one path over.** Saving a slot serialized `len`
+    /// rows out of buffers that hold fewer, so a request that had generated
+    /// anything on the fused GPU path took the server down on
+    /// `POST /slots/{id}?action=save`: `range end index 1653504 out of range
+    /// for slice of length 1038848`.
+    #[test]
+    fn saving_a_cache_with_a_gpu_written_tail_writes_only_the_host_rows() {
+        let cache = cache_with_gpu_only_tail(239, 7);
+        let bytes = cache.to_bytes();
+        let restored = KvCache::from_bytes(&bytes).expect("round trip");
+        assert_eq!(
+            restored.committed_len(),
+            239,
+            "only the host-resident rows are persisted"
+        );
+        assert_eq!(restored.layers[0].k.len(), 239 * 4);
+        assert_eq!(restored.layers[0].v.len(), 239 * 4);
+        for i in 0..239 {
+            assert_eq!(restored.layers[0].key_at(i, 0, 4), [i as f32; 4]);
+        }
     }
 
     /// The reuse bound must be per-*layer*, and taken from the shortest

@@ -178,7 +178,18 @@ The two caps cover the two kinds of request the client makes:
   the input window, including tool-calling turns. It defaults to `0` (no cap)
   because coding answers are open-ended: explanations, diffs, and file
   contents can legitimately be long. Set it only when a model tends to ramble
-  or you want a hard latency bound per response.
+  or you want a hard latency bound per response. Note that `0` does not mean
+  *unbounded* — it means the **server** chooses, and `orangu-server` answers
+  with `8192` (see the HTTP chapter).
+
+**A cut-off answer says so.** Whichever cap is reached, the server reports
+`finish_reason: "length"` and `orangu` prints
+`[answer cut off at the server's response-length cap …]` under the timings.
+This matters most on a tool-calling turn: a file's contents travel *inside*
+the tool call, and a call cut off mid-argument never closes, so it is not
+recognised as a call at all — nothing runs, nothing is written, and the
+half-finished file arrives as ordinary text. If you see that notice where you
+expected a file, raise `code_max_tokens`.
 
 **Reasoning ("thinking") models need a larger review cap.** A model's hidden
 thinking tokens count against `max_tokens`, so with the default `512` a model
@@ -264,6 +275,22 @@ You can switch the current session with `/theme <name>`. That writes a session o
 ```
 
 Naming the theme `orangu.conf` already asks for drops the session override instead of pinning a copy of it, so the session goes back to following the global `[orangu].theme`. The command completes built-in themes and user theme files. The startup option `-t`/`--theme <name-or-path>` applies a theme only for that process and takes precedence over the global and session settings.
+
+### The session's licence
+
+The licence generated files are written under is a session setting too, but it
+is not configured here: it is read from the *workspace* — its manifest's
+`license` field, then its `LICENSE`/`COPYING` file, then MIT as the default —
+and overridden for the session with `/license <spdx> [<holder>]`. That writes:
+
+```text
+~/.orangu/sessions/<UUID>/settings
+```
+
+as `license` and `license_holder`, beside the session's `server` and `model`,
+and is restored on resume or when you switch back to that workspace tab.
+`/license auto` clears it and `/license none` turns headers off. See the
+*Core tools* chapter.
 
 ## Server sections
 

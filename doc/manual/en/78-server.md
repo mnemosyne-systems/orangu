@@ -3063,14 +3063,42 @@ binary, because the web console is not the only thing that generates code:
 the same call (see the Tools chapter). One module, so the two cannot
 disagree about the year, the licence, or where the header goes.
 
-The licence text is `TEMPLATE`, a raw string constant in that module. Not
-a data file, and not an `include_str!` of one: there is nothing to ship
-beside the binary and nothing an install can lose. `PLACEHOLDERS` is a
-table of the tokens in it that get filled in
-at request time — `<YEAR>` today, anything else by adding a line there and
-a token to the file. Request time, not build time, is the point: a server
-left running past midnight on 31 December would otherwise keep stamping
-last year onto everything it saves.
+**The licence is the project's, not this program's.** `Project::detect`
+reads it from the workspace root — the `license` field of `Cargo.toml`,
+`pyproject.toml` or `package.json`, or failing that the `LICENSE`/`COPYING`
+file — together with the copyright holder, and `Licence` is the small set of
+licences whose per-file header is well established enough to write:
+the popular set from <https://opensource.org/license>, with the GNU family
+split the way SPDX splits it. A `LICENSE` file that is none of them is used
+**verbatim** — the project has said what its licence is — and a project that
+says nothing gets [`DEFAULT_LICENCE`]. Only a project with no copyright holder
+to name produces no header, because inventing an attribution is worse than
+omitting one. `Choice` is `/license`'s answer laid over all of it, held by the
+client's `ToolExecutor` and read on every `create_file`.
+
+This used to be a single hard-coded MIT constant, which meant every file
+generated into a GPL project — orangu's own repository among them — arrived
+carrying an MIT header attributed to "orangu", and `git add`ed. `files::create`
+already refused to put a header on an *existing* file for exactly that reason;
+a file being created is no more this tool's to relicense.
+
+One trap is worth naming, because it is the reason the copyright holder is
+not simply read out of `LICENSE`: a GPL or Apache project ships the licence's
+own boilerplate, whose copyright line names the Free Software Foundation or
+the Apache Software Foundation. orangu's own `LICENSE` opens `Copyright (C)
+2007 Free Software Foundation, Inc.`. For those licences the manifest is the
+only source consulted; MIT and BSD put the project's real holder in that line,
+so for those it is used when the manifest has nothing.
+
+The licence texts are raw string constants in that module. Not data files,
+and not `include_str!` of any: there is nothing to ship beside the binary and
+nothing an install can lose. `PLACEHOLDERS` is a table of the process-wide
+tokens in them that get filled in at request time — `<YEAR>` today, anything
+else by adding a line there and a token to the file. Request time, not build
+time, is the point: a server left running past midnight on 31 December would
+otherwise keep stamping last year onto everything it saves. `<HOLDER>` is not
+in that table: it belongs to the project being written into, not to this
+process.
 
 `comment_style` maps the *saved file's extension* — not the fence's
 language tag — onto a `CommentStyle`, since the extension is what the file

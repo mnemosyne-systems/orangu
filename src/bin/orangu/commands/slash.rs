@@ -59,6 +59,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/model" => Some(LocalCommand::ModelInfo),
         "/server" => Some(LocalCommand::ServerInfo),
         "/theme" => Some(LocalCommand::SetTheme("")),
+        "/license" => Some(LocalCommand::License("")),
         "/information" => Some(LocalCommand::Information),
 
         "/verbosity" => Some(LocalCommand::SetVerbosity("")),
@@ -204,6 +205,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(name) = input.strip_prefix("/theme ") {
                 return Some(LocalCommand::SetTheme(name.trim()));
+            }
+            if let Some(args) = input.strip_prefix("/license ") {
+                return Some(LocalCommand::License(args.trim()));
             }
 
             if let Some(level) = input.strip_prefix("/verbosity ") {
@@ -466,7 +470,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     LocalCommand::PendingList
                 });
             }
-            parse_open_file_target(input, "/open_file ").map(LocalCommand::OpenFile)
+            parse_open_file_target(input, "/open_file ", false).map(LocalCommand::OpenFile)
         }
     }
 }

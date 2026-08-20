@@ -1089,12 +1089,12 @@ async fn run() -> Result<()> {
             )
             .await;
             match pr_result {
-                Ok(WaitResult::Response(answer)) => {
+                Ok(WaitResult::Response { answer, truncated }) => {
                     let tool_delta = tools
                         .total_tool_duration()
                         .saturating_sub(pr_tool_time_before);
                     usage_stats.record_response(pr_llm_start.elapsed(), &answer, tool_delta);
-                    output_state.push_markdown(&answer);
+                    push_answer(&mut output_state, &answer, truncated);
                     if config.feedback {
                         output_state.push_text(FEEDBACK_OK);
                     }
@@ -2417,10 +2417,10 @@ async fn run() -> Result<()> {
         )
         .await
         {
-            Ok(WaitResult::Response(answer)) => {
+            Ok(WaitResult::Response { answer, truncated }) => {
                 let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
                 usage_stats.record_response(llm_start.elapsed(), &answer, tool_delta);
-                output_state.push_markdown(&answer);
+                push_answer(&mut output_state, &answer, truncated);
                 if config.feedback {
                     output_state.push_text(FEEDBACK_OK);
                 }
