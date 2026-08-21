@@ -24,6 +24,7 @@ mod git;
 mod information;
 mod init;
 mod input;
+mod loop_runner;
 mod manual;
 mod mode;
 mod models;
@@ -45,7 +46,7 @@ mod workspace_tab;
 mod test_support;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -189,6 +190,14 @@ struct Args {
         hide = true
     )]
     build_manual: Option<Vec<PathBuf>>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Run a bounded code-and-review loop.
+    Loop(loop_runner::LoopArgs),
 }
 
 /// Pick the completion script for a `$SHELL` value. Separate from printing it
@@ -243,7 +252,7 @@ fn quiet_refusal(args: &Args) -> Option<&'static str> {
              is a dialogue, and its questions are the output",
         );
     }
-    if args.prompt.is_none() {
+    if args.prompt.is_none() && args.command.is_none() {
         return Some(
             "-q/--quiet applies to the modes that print and exit (-p, -l, -s); \
              the terminal interface has nothing to silence",
@@ -327,6 +336,17 @@ async fn run() -> Result<()> {
         }
     };
     let config = load_client_configuration(&config_path)?;
+    if let Some(CliCommand::Loop(loop_args)) = args.command.take() {
+        return loop_runner::run(
+            loop_args,
+            loop_runner::LoopRunContext {
+                workspace: resolve_workspace_root(args.workspace)?,
+                config,
+                quiet: args.quiet,
+            },
+        )
+        .await;
+    }
     // A one-shot prints a report and exits. Applying a theme here would emit the
     // OSC sequences that repaint the terminal's own background and foreground —
     // a lasting change to someone else's terminal, and output where `-q`
