@@ -19,6 +19,7 @@ use markdown::{
     mdast::{List, ListItem, Node},
     to_mdast,
 };
+use ratatui::style::Color;
 use std::{fs, path::Path, sync::OnceLock};
 use syntect::{
     easy::HighlightLines,
@@ -45,6 +46,51 @@ pub const ANSI_FG_LIGHT_RED: &str = "\x1b[38;2;255;170;170m";
 pub const ANSI_FG_SUBTLE: &str = "\x1b[38;2;180;190;205m";
 pub const ANSI_FG_RESET: &str = "\x1b[39m";
 pub const ANSI_RESET: &str = "\x1b[0m";
+
+struct MarkdownPalette {
+    heading_fg: String,
+    table_border_fg: String,
+}
+
+fn ansi_color(color: Color) -> String {
+    let code = match color {
+        Color::Reset => return "\x1b[39m".to_string(),
+        Color::Black => 30,
+        Color::Red => 31,
+        Color::Green => 32,
+        Color::Yellow => 33,
+        Color::Blue => 34,
+        Color::Magenta => 35,
+        Color::Cyan => 36,
+        Color::Gray => 37,
+        Color::DarkGray => 90,
+        Color::LightRed => 91,
+        Color::LightGreen => 92,
+        Color::LightYellow => 93,
+        Color::LightBlue => 94,
+        Color::LightMagenta => 95,
+        Color::LightCyan => 96,
+        Color::White => 97,
+        Color::Rgb(red, green, blue) => {
+            return format!("\x1b[38;2;{red};{green};{blue}m");
+        }
+        Color::Indexed(index) => {
+            return format!("\x1b[38;5;{index}m");
+        }
+    };
+    format!("\x1b[{code}m")
+}
+
+fn markdown_palette() -> MarkdownPalette {
+    let theme = orangu::tui::Theme::current();
+    let heading = theme.highlight.fg.unwrap_or(theme.text_primary);
+    let muted = theme.muted.fg.unwrap_or(theme.text_primary);
+
+    MarkdownPalette {
+        heading_fg: ansi_color(heading),
+        table_border_fg: ansi_color(muted),
+    }
+}
 
 pub struct SyntaxHighlightAssets {
     pub syntaxes: SyntaxSet,
@@ -352,7 +398,10 @@ pub fn git_blame_metadata_at_rev(
 }
 
 pub enum MarkdownChunk {
+    /// A deliberate empty transcript row between Markdown blocks.
+    Spacer,
     Text(String),
+    Table(String),
     Code {
         language: Option<String>,
         content: String,
@@ -364,25 +413,31 @@ pub fn parse_markdown_chunks(text: &str) -> Vec<MarkdownChunk> {
         return vec![];
     }
 
-    match to_mdast(text, &ParseOptions::default()) {
+    match to_mdast(text, &ParseOptions::gfm()) {
         Ok(mut tree) => {
             resolve_reference_links(&mut tree);
             let mut chunks = Vec::new();
             if let Node::Root(root) = tree {
                 for child in root.children {
-                    match child {
-                        Node::Code(code) => {
-                            chunks.push(MarkdownChunk::Code {
-                                language: code.lang.clone(),
-                                content: code.value.clone(),
-                            });
+                    let chunk = match child {
+                        Node::Code(code) => Some(MarkdownChunk::Code {
+                            language: code.lang.clone(),
+                            content: code.value.clone(),
+                        }),
+                        Node::Table(table) => {
+                            let rendered = render_table(&table.children);
+                            (!rendered.is_empty()).then_some(MarkdownChunk::Table(rendered))
                         }
                         _ => {
                             let rendered = render_markdown_node(&child);
-                            if !rendered.trim().is_empty() {
-                                chunks.push(MarkdownChunk::Text(rendered));
-                            }
+                            (!rendered.trim().is_empty()).then_some(MarkdownChunk::Text(rendered))
                         }
+                    };
+                    if let Some(chunk) = chunk {
+                        if !chunks.is_empty() {
+                            chunks.push(MarkdownChunk::Spacer);
+                        }
+                        chunks.push(chunk);
                     }
                 }
             } else {
@@ -399,7 +454,7 @@ pub fn render_markdown_for_console(text: &str) -> String {
         return String::new();
     }
 
-    match to_mdast(text, &ParseOptions::default()) {
+    match to_mdast(text, &ParseOptions::gfm()) {
         Ok(mut tree) => {
             resolve_reference_links(&mut tree);
             render_markdown_node(&tree)
@@ -412,16 +467,12 @@ pub fn render_markdown_node(node: &Node) -> String {
     match node {
         Node::Root(root) => render_block_nodes(&root.children, false),
         Node::Paragraph(paragraph) => render_inline_nodes(&paragraph.children),
-        Node::Heading(heading) => format!(
-            "{ANSI_BOLD_ON}{} {}{ANSI_BOLD_OFF}",
-            "#".repeat(heading.depth.into()),
-            render_inline_nodes(&heading.children)
-        ),
+        Node::Heading(heading) => render_heading(heading.depth, &heading.children),
         Node::Blockquote(blockquote) => {
-            prefix_lines(&render_block_nodes(&blockquote.children, false), "> ")
+            prefix_lines(&render_block_nodes(&blockquote.children, false), "│ ")
         }
         Node::List(list) => render_list(list),
-        Node::ListItem(item) => render_list_item(item, "-", 2),
+        Node::ListItem(item) => render_list_item(item, "-"),
         Node::Code(code) => render_code_block(code.lang.as_deref(), &code.value),
         Node::ThematicBreak(_) => "-".repeat(40),
         Node::Table(table) => render_table(&table.children),
@@ -461,10 +512,10 @@ pub fn render_inline_node(node: &Node) -> String {
             render_inline_nodes(&delete.children)
         ),
         Node::InlineCode(code) => {
-            format!("{ANSI_FG_CODE}`{}{ANSI_FG_RESET}`", code.value)
+            format!("{ANSI_FG_CODE}{}{ANSI_FG_RESET}", code.value)
         }
         Node::InlineMath(math) => {
-            format!("{ANSI_FG_CODE}${}{ANSI_FG_RESET}$", math.value)
+            format!("{ANSI_FG_CODE}{}{ANSI_FG_RESET}", math.value)
         }
         Node::Link(link) => render_link(&render_inline_nodes(&link.children), &link.url),
         Node::LinkReference(link) => render_inline_nodes(&link.children),
@@ -480,6 +531,30 @@ pub fn render_inline_node(node: &Node) -> String {
         Node::Toml(toml) => toml.value.clone(),
         Node::Yaml(yaml) => yaml.value.clone(),
         _ => render_markdown_node(node),
+    }
+}
+
+/// Terminals cannot change font size like GitHub, so headings use colour,
+/// weight, and a divider to establish the same visual hierarchy.
+pub fn render_heading(depth: u8, children: &[Node]) -> String {
+    let content = render_inline_nodes(children);
+    let palette = markdown_palette();
+    match depth {
+        1 => format!(
+            "{}{ANSI_BOLD_ON}{content}{ANSI_RESET}\n{}{}{ANSI_RESET}",
+            palette.heading_fg,
+            palette.heading_fg,
+            "━".repeat(orangu::tui::visible_line_width(&content).max(12))
+        ),
+        2 => format!(
+            "{}{ANSI_BOLD_ON}  ▌ {content}{ANSI_RESET}",
+            palette.heading_fg
+        ),
+        3 => format!(
+            "{}{ANSI_BOLD_ON}  ▪ {content}{ANSI_RESET}",
+            palette.heading_fg
+        ),
+        _ => format!("{ANSI_BOLD_ON}{content}{ANSI_BOLD_OFF}"),
     }
 }
 
@@ -505,7 +580,7 @@ pub fn render_list(list: &List) -> String {
                 } else {
                     "-".to_string()
                 };
-                Some(render_list_item(item, &marker, marker.len() + 1))
+                Some(render_list_item(item, &marker))
             }
             _ => None,
         })
@@ -513,9 +588,15 @@ pub fn render_list(list: &List) -> String {
         .join("\n")
 }
 
-pub fn render_list_item(item: &ListItem, marker: &str, indent: usize) -> String {
+pub fn render_list_item(item: &ListItem, marker: &str) -> String {
     let body = render_block_nodes(&item.children, !item.spread);
-    indent_lines(&body, &format!("{marker} "), &" ".repeat(indent))
+    let task_marker = match item.checked {
+        Some(true) => "[x] ",
+        Some(false) => "[ ] ",
+        None => "",
+    };
+    let first_prefix = format!("{marker} {task_marker}");
+    indent_lines(&body, &first_prefix, &" ".repeat(first_prefix.len()))
 }
 
 pub fn render_code_block(language: Option<&str>, value: &str) -> String {
@@ -590,6 +671,7 @@ pub fn render_plain_code_lines(value: &str) -> Vec<String> {
 }
 
 pub fn render_table(rows: &[Node]) -> String {
+    let palette = markdown_palette();
     let rendered_rows = rows
         .iter()
         .filter_map(|row| match row {
@@ -610,16 +692,84 @@ pub fn render_table(rows: &[Node]) -> String {
         return String::new();
     }
 
-    let mut lines = Vec::with_capacity(rendered_rows.len() + 1);
+    let column_count = rendered_rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths = (0..column_count)
+        .map(|column| {
+            rendered_rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .flat_map(|cell| cell.split('\n'))
+                .map(orangu::tui::visible_line_width)
+                .max()
+                .unwrap_or(0)
+                .max(3)
+        })
+        .collect::<Vec<_>>();
+
+    // Do not use a full SGR reset (`ESC[0m`) inside tables.  The ANSI parser
+    // treats it as a reset of the active terminal style, which can introduce a
+    // black cell background after conversion on light themes.  Tables only set
+    // a foreground colour and header weight, so reset exactly those attributes.
+    let vertical_border = format!("{}│{ANSI_FG_RESET}", palette.table_border_fg);
+    let format_row = |row: &[String], header: bool| {
+        let cells = (0..column_count)
+            .map(|column| {
+                row.get(column)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .split('\n')
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+
+        (0..height)
+            .map(|line| {
+                let row = cells
+                    .iter()
+                    .zip(&widths)
+                    .map(|(cell_lines, width)| {
+                        let cell = cell_lines.get(line).copied().unwrap_or("");
+                        let padding = width.saturating_sub(orangu::tui::visible_line_width(cell));
+                        if header {
+                            format!(
+                                "{}{ANSI_BOLD_ON} {cell}{} {ANSI_BOLD_OFF}{ANSI_FG_RESET}",
+                                palette.heading_fg,
+                                " ".repeat(padding)
+                            )
+                        } else {
+                            format!(" {cell}{} ", " ".repeat(padding))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "{vertical_border}{}{vertical_border}",
+                    row.join(&vertical_border)
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let border = |left: &str, join: &str, right: &str, fill: &str| {
+        format!(
+            "{}{left}{}{right}{ANSI_FG_RESET}",
+            palette.table_border_fg,
+            widths
+                .iter()
+                .map(|width| fill.to_string().repeat(width + 2))
+                .collect::<Vec<_>>()
+                .join(join)
+        )
+    };
+
+    let mut lines = Vec::with_capacity(rendered_rows.len() + 3);
+    lines.push(border("┌", "┬", "┐", "─"));
     for (index, row) in rendered_rows.iter().enumerate() {
-        lines.push(format!("| {} |", row.join(" | ")));
+        lines.extend(format_row(row, index == 0));
         if index == 0 {
-            lines.push(format!(
-                "| {} |",
-                row.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
-            ));
+            lines.push(border("├", "┼", "┤", "─"));
         }
     }
+    lines.push(border("└", "┴", "┘", "─"));
     lines.join("\n")
 }
 
@@ -698,12 +848,56 @@ mod tests {
             "# Title\n\n- one\n- two\n\n`code`\n\n[docs](https://example.com)",
         );
 
-        assert!(rendered.contains("\x1b[1m# Title\x1b[22m"));
+        assert!(rendered.contains("Title"));
         assert!(rendered.contains("- one"));
         assert!(rendered.contains("- two"));
-        assert!(rendered.contains("\x1b[38;2;255;215;120m`code\x1b[39m`"));
+        assert!(rendered.contains("\x1b[38;2;255;215;120mcode\x1b[39m"));
         assert!(rendered.contains("docs"));
         assert!(rendered.contains("https://example.com"));
+    }
+
+    #[test]
+    fn renders_github_flavored_tables_and_task_lists() {
+        let rendered = render_markdown_for_console(
+            "| Name | Status |\n| --- | --- |\n| `build` | **ready** |\n\n- [x] shipped\n- [ ] test",
+        );
+
+        assert!(rendered.contains("┌"));
+        assert!(rendered.contains("Name"));
+        assert!(!rendered.contains("\x1b[48;"));
+        assert!(!rendered.contains(ANSI_RESET));
+        assert!(rendered.contains("build"));
+        assert!(rendered.contains("- [x] shipped"));
+        assert!(rendered.contains("- [ ] test"));
+
+        let chunks = parse_markdown_chunks("| Name |\n| --- |\n| orangu |");
+        assert!(matches!(chunks.as_slice(), [MarkdownChunk::Table(_)]));
+    }
+
+    #[test]
+    fn preserves_visual_spacing_between_markdown_blocks() {
+        let chunks = parse_markdown_chunks("## First\n\n## Second");
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [
+                MarkdownChunk::Text(_),
+                MarkdownChunk::Spacer,
+                MarkdownChunk::Text(_)
+            ]
+        ));
+    }
+
+    #[test]
+    fn removes_markdown_delimiters_from_terminal_output() {
+        let rendered = render_markdown_for_console("## Heading\n\n`code`\n\n> note");
+
+        assert!(rendered.contains("Heading"));
+        assert!(rendered.contains("code"));
+        assert!(rendered.contains("│ note"));
+        assert!(!rendered.contains("## Heading"));
+        assert!(!rendered.contains("`code`"));
+        assert!(!rendered.contains("> note"));
     }
 
     #[test]

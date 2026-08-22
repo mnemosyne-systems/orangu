@@ -138,6 +138,9 @@ pub enum CommandOutcome {
     },
     /// Command failed — invalid usage, unknown command, or other error.
     OutputError(String),
+    /// Copy the active tab's latest assistant response in its original Markdown
+    /// form. The main loop owns that per-tab response state and the clipboard.
+    CopyLastResponse,
     Cleared,
     Quit,
     Restart,
@@ -537,6 +540,8 @@ pub enum LocalCommand<'a> {
     /// output. `None` is a usage error (the command line is required).
     Shell(Option<Cow<'a, str>>),
     Clear,
+    /// `/copy`: copy the latest assistant response as raw Markdown.
+    Copy,
     Quit,
     PendingList,
     PendingDelete(Option<usize>),

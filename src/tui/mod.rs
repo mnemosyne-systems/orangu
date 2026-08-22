@@ -38,6 +38,9 @@ pub enum TranscriptLine {
     Plain(String),
     UserInput(String),
     Wide(String),
+    /// A Markdown table. Tables deliberately inherit the terminal background
+    /// so their borders and text remain readable in every theme.
+    Table(String),
     CodeBlock {
         language: Option<String>,
         ansi_lines: Vec<String>,
@@ -57,7 +60,10 @@ pub enum TranscriptLine {
 impl TranscriptLine {
     pub fn as_str(&self) -> &str {
         match self {
-            TranscriptLine::Plain(s) | TranscriptLine::UserInput(s) | TranscriptLine::Wide(s) => s,
+            TranscriptLine::Plain(s)
+            | TranscriptLine::UserInput(s)
+            | TranscriptLine::Wide(s)
+            | TranscriptLine::Table(s) => s,
             TranscriptLine::CodeBlock { .. } => "",
             TranscriptLine::Collapsible { content, .. } => content,
             TranscriptLine::ToolCall { name, .. } => name,

@@ -216,6 +216,7 @@ Then start with:
 /status
 /usage
 /clear
+/copy
 /quit
 ```
 

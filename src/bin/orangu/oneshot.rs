@@ -437,6 +437,7 @@ async fn run_outcome(
         | CommandOutcome::AutoReview(_)
         | CommandOutcome::Manual
         | CommandOutcome::Cleared
+        | CommandOutcome::CopyLastResponse
         | CommandOutcome::Quit
         | CommandOutcome::Restart
         | CommandOutcome::SwitchSession(_)

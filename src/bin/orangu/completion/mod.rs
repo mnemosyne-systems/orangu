@@ -584,6 +584,7 @@ mod tests {
         // `/auto_review` is registered in the completion list...
         assert!(SlashCommand::iter().any(|c| c.command() == "/auto_review"));
         assert!(SlashCommand::iter().any(|c| c.command() == "/skills"));
+        assert!(SlashCommand::iter().any(|c| c.command() == "/copy"));
         // ...the inline ghost hint completes it once the prefix is unambiguous...
         assert_eq!(
             command_ghost_suffix(
@@ -594,6 +595,16 @@ mod tests {
         );
         // ...and the natural-language ghost knows the alias too.
         assert!(natural_language_ghost_candidates("auto re").contains(&"view"));
+    }
+
+    #[test]
+    fn copy_command_is_shown_in_the_slash_dropdown() {
+        let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+        let candidates = slash_command_dropdown_candidates("/cop", &skills);
+
+        assert!(candidates.iter().any(|(command, description)| {
+            command == "/copy" && description.contains("Markdown")
+        }));
     }
 
     #[test]

@@ -22,6 +22,14 @@ fn leaves_regular_prompts_unhandled() {
 }
 
 #[test]
+fn parses_copy_as_a_local_command() {
+    assert!(matches!(
+        parse_local_command("/copy"),
+        Some(LocalCommand::Copy)
+    ));
+}
+
+#[test]
 fn parses_the_prompt_modes() {
     use crate::mode::PromptMode;
 

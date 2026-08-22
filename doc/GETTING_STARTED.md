@@ -249,6 +249,7 @@ cargo run --bin orangu -- --config ./orangu.conf
 - `/status`
 - `/usage`
 - `/clear`
+- `/copy` — copy the latest assistant response as Markdown
 - `/quit`
 
 Then try a natural-language request such as:
