@@ -243,7 +243,7 @@ impl BatchCoordinator {
                 guard.pending.len() >= target || Instant::now() >= deadline
             });
             if become_leader {
-                let batch: Vec<_> = guard.pending.drain(..).collect();
+                let batch: Vec<_> = std::mem::take(&mut guard.pending);
                 record_batch_size(batch.len());
                 guard.deadline = None;
                 drop(guard);

@@ -743,7 +743,7 @@ fn split_message(line: &str) -> Option<(String, String, String, String)> {
 
 fn parse_sequence_note(line: &str) -> Option<(String, String)> {
     let rest = line.get(5..)?.trim();
-    let (head, label) = rest.split_once(':').map_or((rest, ""), |parts| parts);
+    let (head, label) = rest.split_once(':').unwrap_or((rest, ""));
     let lower = head.to_ascii_lowercase();
     let target = if let Some(at) = lower.find(" over ") {
         head[at + 6..]
@@ -1225,7 +1225,7 @@ fn split_relation(line: &str) -> Option<RawEdge> {
         };
         let left = relation_endpoint(&line[..at], true)?;
         let rest = line[at + arrow.len()..].trim();
-        let (right, label) = rest.split_once(':').map_or((rest, ""), |parts| parts);
+        let (right, label) = rest.split_once(':').unwrap_or((rest, ""));
         let right = relation_endpoint(right, false)?;
         let (from, to) = if arrow.starts_with('<') || arrow.ends_with('*') || arrow.ends_with('o') {
             (right, left)

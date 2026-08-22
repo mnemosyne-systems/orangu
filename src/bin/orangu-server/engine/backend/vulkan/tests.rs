@@ -2054,7 +2054,7 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
         let wdq = crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
         let q8 = quantize_activation_q8(&x);
         let mut qx = vec![0f32; x.len()];
-        for (blk, chunk) in q8.chunks_exact(10).enumerate() {
+        for (blk, chunk) in q8.as_chunks::<10>().0.iter().enumerate() {
             let d = f32::from_bits(chunk[0]);
             for i in 0..32 {
                 let byte = ((chunk[2 + i / 4] >> (8 * (i % 4))) & 0xFF) as u8 as i8;

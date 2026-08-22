@@ -1531,7 +1531,9 @@ impl LoadedModel {
         );
         let bytes = &loc.bytes[loc.start..loc.start + loc.len];
         let values = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         Ok((values, &loc.dims))

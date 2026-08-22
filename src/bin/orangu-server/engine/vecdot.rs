@@ -81,7 +81,7 @@ pub fn quantize_act(x: &[f32]) -> ActQ8 {
     let mut q = vec![0i8; x.len()];
     let mut d = Vec::with_capacity(x.len() / ACT_BLOCK);
     let mut sums = Vec::with_capacity(x.len() / GROUP);
-    for (b, chunk) in x.chunks_exact(ACT_BLOCK).enumerate() {
+    for (b, chunk) in x.as_chunks::<ACT_BLOCK>().0.iter().enumerate() {
         let out = &mut q[b * ACT_BLOCK..(b + 1) * ACT_BLOCK];
         d.push(quantize_block::<true>(chunk, out, &mut sums));
     }
@@ -97,7 +97,7 @@ pub fn quantize_act_scalar(x: &[f32]) -> ActQ8 {
     let mut q = vec![0i8; x.len()];
     let mut d = Vec::with_capacity(x.len() / ACT_BLOCK);
     let mut sums = Vec::with_capacity(x.len() / GROUP);
-    for (b, chunk) in x.chunks_exact(ACT_BLOCK).enumerate() {
+    for (b, chunk) in x.as_chunks::<ACT_BLOCK>().0.iter().enumerate() {
         let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
         // A block of exact zeros (real: a masked or unused tail) has no
         // scale; leave it 0 so `q * d` reproduces 0 rather than NaN.
@@ -108,7 +108,7 @@ pub fn quantize_act_scalar(x: &[f32]) -> ActQ8 {
         // one `push` per group. Indexing a `sums[i / GROUP]` slot per element
         // instead costs a read-modify-write on every activation and measurably
         // slowed decode (2.05 -> 1.98 tok/s on the reference Pi 4).
-        for (half, group) in out.chunks_exact_mut(GROUP).enumerate() {
+        for (half, group) in out.as_chunks_mut::<GROUP>().0.iter_mut().enumerate() {
             let src = &chunk[half * GROUP..(half + 1) * GROUP];
             let mut sum = 0i32;
             for (slot, &v) in group.iter_mut().zip(src) {
@@ -1143,7 +1143,7 @@ fn unpack_q3k_run(qs: &[u8], hmask: &[u8], shift: u32, bit: u8, w: &mut [i8; 32]
 /// [`supports_k`].
 fn unpack_q2_k(row: &[u8], out: &mut UnpackedRow) {
     out.has_min = true;
-    for (s, block) in row.chunks_exact(Q2K_BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<Q2K_BLOCK_BYTES>().0.iter().enumerate() {
         let scales = &block[0..16];
         let qs = &block[16..80];
         let d = read_f16(block, 80);
@@ -1168,7 +1168,7 @@ fn unpack_q2_k(row: &[u8], out: &mut UnpackedRow) {
 /// dot loop's correction term vanishes.
 fn unpack_q3_k(row: &[u8], out: &mut UnpackedRow) {
     out.has_min = false;
-    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<Q3K_BLOCK_BYTES>().0.iter().enumerate() {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let sc = unpack_q3_k_scales(&block[96..108]);
@@ -1246,7 +1246,7 @@ unsafe fn unpack_q6k_run_neon(ql: &[u8], qh: &[u8], hshift: i32, high_nib: bool,
 fn unpack_q8_0(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 32;
     out.has_min = false;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         out.q[b * 32..b * 32 + 32].copy_from_slice(bytemuck::cast_slice(&block[2..]));
         out.scale[b] = dw;
@@ -1264,7 +1264,7 @@ fn unpack_q8_0(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_q5_0(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 4 + 16;
     out.has_min = false;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
         let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
@@ -1282,7 +1282,7 @@ fn unpack_q5_0(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_q4_0(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 16;
     out.has_min = false;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
         unpack_block_q4_0(&block[2..], w);
@@ -1302,7 +1302,7 @@ fn unpack_q4_0(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_q5_1(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 2 + 4 + 16;
     out.has_min = true;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let m = read_f16(block, 2);
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
@@ -1330,7 +1330,7 @@ fn unpack_q5_1(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_iq4_xs(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
     out.has_min = false;
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let d = read_f16(block, 0);
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -1351,7 +1351,7 @@ fn unpack_iq4_xs(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_iq4_nl(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 16;
     out.has_min = false;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
         unpack_block_iq4_nl(&block[2..], w);
@@ -1375,7 +1375,7 @@ fn unpack_q4_k(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
     out.has_min = true;
     let mut sb = 0usize; // 32-element sub-block index across the whole row
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -1419,7 +1419,7 @@ fn unpack_q5_k(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
     out.has_min = true;
     let mut sb = 0usize; // 32-element sub-block index across the whole row
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -1455,7 +1455,7 @@ fn unpack_q5_k(row: &[u8], out: &mut UnpackedRow) {
 fn unpack_q6_k(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
     out.has_min = false;
-    for (sblk, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (sblk, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let ql = &block[0..128];
         let qh = &block[128..192];
         let sc = &block[192..208];
@@ -2036,7 +2036,7 @@ pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
 fn unpack_k_q4_k(row: &[u8], out: &mut KRow) {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
     let mut sb = 0usize;
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         out.d[s] = read_f16(block, 0);
         out.dmin[s] = read_f16(block, 2);
         let scales = &block[4..16];
@@ -2064,7 +2064,7 @@ fn unpack_k_q4_k(row: &[u8], out: &mut KRow) {
 fn unpack_k_q5_k(row: &[u8], out: &mut KRow) {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
     let mut sb = 0usize;
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         out.d[s] = read_f16(block, 0);
         out.dmin[s] = read_f16(block, 2);
         let scales = &block[4..16];
@@ -2098,7 +2098,7 @@ fn unpack_k_q5_k(row: &[u8], out: &mut KRow) {
 /// ~4.2e6 — two orders of magnitude inside `i32`, and looser than `Q6_K`'s
 /// own, which the same kernel already carries.
 fn unpack_k_q3_k(row: &[u8], out: &mut KRow) {
-    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<Q3K_BLOCK_BYTES>().0.iter().enumerate() {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let sc = unpack_q3_k_scales(&block[96..108]);
@@ -2118,7 +2118,7 @@ fn unpack_k_q3_k(row: &[u8], out: &mut KRow) {
 /// Same bit layout as [`unpack_q6_k`], with the `i8` scales kept as integers.
 fn unpack_k_q6_k(row: &[u8], out: &mut KRow) {
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let ql = &block[0..128];
         let qh = &block[128..192];
         let sc = &block[192..208];
@@ -2332,7 +2332,7 @@ fn gemm_k_iq4_xs<const ISA: u8>(
 /// dot accumulate in `i32` across a whole super-block.
 fn unpack_k_iq4_xs(row: &[u8], out: &mut KRow) {
     const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         out.d[s] = read_f16(block, 0);
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -2800,6 +2800,9 @@ fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
     let mut w = [0f32; FLOAT_BLOCK];
 
     let mut rows = row[..x.len() * stride].chunks_exact(FLOAT_BLOCK * stride);
+    // Paired with `rows` above through `by_ref`, and the tail is read from
+    // `ChunksExact::remainder` — neither exists on `as_chunks`.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let mut xs = x.chunks_exact(FLOAT_BLOCK);
     for (rb, xb) in rows.by_ref().zip(xs.by_ref()) {
         for (j, slot) in w.iter_mut().enumerate() {
@@ -2826,7 +2829,7 @@ fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
 fn dot_q8_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 32;
     let mut total = 0f32;
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let w: &[i8] = bytemuck::cast_slice(&block[2..]);
         total += dw * act.d[b] * dot32::<ISA>(w, &act.q[b * 32..]) as f32;
@@ -2840,7 +2843,7 @@ fn dot_iq4_nl<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 16;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         unpack_block_iq4_nl(&block[2..], &mut w);
         total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
@@ -2854,7 +2857,7 @@ fn dot_q5_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 4 + 16;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
         unpack_block_q5_0(qh, &block[6..], &mut w);
@@ -2869,7 +2872,7 @@ fn dot_q4_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 16;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         unpack_block_q4_0(&block[2..], &mut w);
         total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
@@ -2884,7 +2887,7 @@ fn dot_q5_1<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + 4 + 16;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let m = read_f16(block, 2);
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
@@ -2902,7 +2905,7 @@ fn dot_q4_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
     let mut total = 0f32;
     let mut sb = 0usize;
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -2934,7 +2937,7 @@ fn dot_q5_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
     let mut total = 0f32;
     let mut sb = 0usize;
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -2971,7 +2974,7 @@ fn dot_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     let mut total = 0f32;
     let mut blk = 0usize;
     let mut w = [0i8; 32];
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -3029,13 +3032,13 @@ pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
     let mut q = vec![0i8; x.len()];
     let mut d = Vec::with_capacity(x.len() / SUPER_BLOCK);
     let mut sums = Vec::with_capacity(x.len() / GROUP);
-    for (s, chunk) in x.chunks_exact(SUPER_BLOCK).enumerate() {
+    for (s, chunk) in x.as_chunks::<SUPER_BLOCK>().0.iter().enumerate() {
         let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
         // A super-block of exact zeros has no scale; leave it 0 so `q * d`
         // reproduces 0 rather than NaN. Same contract as `quantize_act`.
         let scale = amax / 127.0;
         let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-        for (g, group) in chunk.chunks_exact(GROUP).enumerate() {
+        for (g, group) in chunk.as_chunks::<GROUP>().0.iter().enumerate() {
             let mut sum = 0i32;
             for (i, &v) in group.iter().enumerate() {
                 let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
@@ -3150,7 +3153,7 @@ fn dot_k_row_q4_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -3179,7 +3182,7 @@ fn dot_k_row_q5_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
@@ -3213,7 +3216,7 @@ fn dot_k_row_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let ql = &block[0..128];
         let qh = &block[128..192];
         let sc = &block[192..208];
@@ -3243,7 +3246,7 @@ fn dot_k_row_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let d = read_f16(block, 0);
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..8];
@@ -3270,7 +3273,7 @@ fn dot_k_row_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
 fn dot_k_row_q3_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(Q3K_BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<Q3K_BLOCK_BYTES>().0.iter().enumerate() {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let sc = unpack_q3_k_scales(&block[96..108]);
@@ -3293,7 +3296,7 @@ fn dot_k_row_q3_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
 fn dot_k_row_q2_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     let mut total = 0f32;
     let mut w = [0i8; 32];
-    for (s, block) in row.chunks_exact(Q2K_BLOCK_BYTES).enumerate() {
+    for (s, block) in row.as_chunks::<Q2K_BLOCK_BYTES>().0.iter().enumerate() {
         let scales = &block[0..16];
         let qs = &block[16..80];
         let d = read_f16(block, 80);
@@ -3324,7 +3327,7 @@ fn dot_q2_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     let mut total = 0f32;
     let mut blk = 0usize;
     let mut w = [0i8; 32];
-    for block in row.chunks_exact(Q2K_BLOCK_BYTES) {
+    for block in row.as_chunks::<Q2K_BLOCK_BYTES>().0 {
         let scales = &block[0..16];
         let qs = &block[16..80];
         let d = read_f16(block, 80);
@@ -3353,7 +3356,7 @@ fn dot_q3_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     let mut total = 0f32;
     let mut blk = 0usize;
     let mut w = [0i8; 32];
-    for block in row.chunks_exact(Q3K_BLOCK_BYTES) {
+    for block in row.as_chunks::<Q3K_BLOCK_BYTES>().0 {
         let hmask = &block[0..32];
         let qs = &block[32..96];
         let sc = unpack_q3_k_scales(&block[96..108]);
@@ -3378,7 +3381,7 @@ fn dot_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     let mut total = 0f32;
     let mut blk = 0usize;
     let mut w = [0i8; 32];
-    for block in row.chunks_exact(BLOCK_BYTES) {
+    for block in row.as_chunks::<BLOCK_BYTES>().0 {
         let ql = &block[0..128];
         let qh = &block[128..192];
         let sc = &block[192..208];
@@ -4363,7 +4366,7 @@ mod tests {
     #[test]
     fn quantize_block_is_the_same_quantization_with_and_without_sums() {
         let x = quantize_act_adversarial_blocks();
-        for chunk in x.chunks_exact(ACT_BLOCK) {
+        for chunk in x.as_chunks::<ACT_BLOCK>().0 {
             let mut with = [0i8; ACT_BLOCK];
             let mut without = [0i8; ACT_BLOCK];
             let mut sums = Vec::new();
@@ -4379,7 +4382,9 @@ mod tests {
             assert!(unused.is_empty(), "SUMS = false produced sums anyway");
             // And the sums it does produce are the sums of what it wrote.
             let want: Vec<i32> = with
-                .chunks_exact(GROUP)
+                .as_chunks::<GROUP>()
+                .0
+                .iter()
                 .map(|g| g.iter().map(|&v| v as i32).sum())
                 .collect();
             assert_eq!(sums, want, "the per-group sums do not match the bytes");

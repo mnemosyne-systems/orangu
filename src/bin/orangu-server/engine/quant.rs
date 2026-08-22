@@ -384,19 +384,25 @@ pub fn dequantize_into(
     match ggml_type {
         GGML_TYPE_F32 => out.extend(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(element_count)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         ),
         GGML_TYPE_F16 => out.extend(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .take(element_count)
                 .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()),
         ),
         GGML_TYPE_I32 => out.extend(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(element_count)
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32),
         ),
@@ -404,7 +410,9 @@ pub fn dequantize_into(
         // mantissa) — reconstruct by left-shifting into the low bits' place.
         GGML_TYPE_BF16 => out.extend(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .take(element_count)
                 .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
         ),
@@ -469,7 +477,7 @@ fn dequantize_mxfp4(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 1 + QK_MXFP4 / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = e8m0_to_fp32_half(block[0]);
         let qs = &block[1..];
         for &q in qs.iter().take(QK_MXFP4 / 2) {
@@ -530,7 +538,7 @@ fn dequantize_q4_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK4_0 / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..];
         let mut lo = [0f32; QK4_0 / 2];
@@ -553,7 +561,7 @@ fn dequantize_q5_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 4 + QK5_0 / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
         let qs = &block[6..];
@@ -584,7 +592,7 @@ fn dequantize_q4_1(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 2 + QK4_1 / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let m = read_f16(block, 2);
         let qs = &block[4..];
@@ -608,7 +616,7 @@ fn dequantize_q5_1(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 2 + 4 + QK5_1 / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let m = read_f16(block, 2);
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
@@ -632,7 +640,7 @@ fn dequantize_q8_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK8_0;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..];
         out.extend(qs.iter().map(|&q| (q as i8) as f32 * d));
@@ -659,7 +667,7 @@ fn dequantize_q4_k(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..4 + K_SCALE_SIZE];
@@ -696,7 +704,7 @@ fn dequantize_q5_k(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..4 + K_SCALE_SIZE];
@@ -739,7 +747,7 @@ fn dequantize_q6_k(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let ql = &block[0..QK_K / 2];
         let qh = &block[QK_K / 2..QK_K / 2 + QK_K / 4];
         let sc = &block[QK_K / 2 + QK_K / 4..QK_K / 2 + QK_K / 4 + QK_K / 16];
@@ -791,7 +799,7 @@ fn dequantize_q2_k(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = QK_K / 16 + QK_K / 4 + 2 + 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let scales = &block[0..QK_K / 16];
         let qs = &block[QK_K / 16..QK_K / 16 + QK_K / 4];
         let d = read_f16(block, QK_K / 16 + QK_K / 4);
@@ -834,7 +842,7 @@ fn dequantize_q3_k(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = QK_K / 8 + QK_K / 4 + 12 + 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let hmask = &block[0..QK_K / 8];
         let qs = &block[QK_K / 8..QK_K / 8 + QK_K / 4];
         let scales = unpack_q3_k_scales(&block[QK_K / 8 + QK_K / 4..QK_K / 8 + QK_K / 4 + 12]);
@@ -919,7 +927,7 @@ fn dequantize_iq2_xxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + (QK_K / 8) * 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..];
         for ib32 in 0..QK_K / 32 {
@@ -966,7 +974,7 @@ fn dequantize_iq1_s(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 16;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 8];
         let qh_bytes = &block[2 + QK_K / 8..];
@@ -1000,7 +1008,7 @@ fn dequantize_iq1_m(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = QK_K / 8 + QK_K / 16 + QK_K / 32;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let qs = &block[..QK_K / 8];
         let qh = &block[QK_K / 8..QK_K / 8 + QK_K / 16];
         let scales = &block[QK_K / 8 + QK_K / 16..];
@@ -1087,7 +1095,7 @@ fn dequantize_iq1_xs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 32 + QK_K / 64;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 8];
         let qh = &block[2 + QK_K / 8..2 + QK_K / 8 + QK_K / 32];
@@ -1112,7 +1120,7 @@ fn dequantize_iq1_xxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 32;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 8];
         let qh = &block[2 + QK_K / 8..];
@@ -1140,7 +1148,7 @@ fn dequantize_iq1_xxxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 8 + QK_K / 64;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 8];
         let sc = &block[2 + QK_K / 8..];
@@ -1165,7 +1173,7 @@ fn dequantize_iq2_xs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + (QK_K / 8) * 2 + QK_K / 32;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + (QK_K / 8) * 2];
         let scales = &block[2 + (QK_K / 8) * 2..];
@@ -1198,7 +1206,7 @@ fn dequantize_iq2_s(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 4 + QK_K / 32 + QK_K / 32;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 4];
         let qh = &block[2 + QK_K / 4..2 + QK_K / 4 + QK_K / 32];
@@ -1232,7 +1240,7 @@ fn dequantize_iq3_xxs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 3 * (QK_K / 8);
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..];
         let scales_and_signs = &qs[QK_K / 4..];
@@ -1272,7 +1280,7 @@ fn dequantize_iq3_s(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..2 + QK_K / 4];
         let qh = &block[2 + QK_K / 4..2 + QK_K / 4 + QK_K / 32];
@@ -1313,7 +1321,7 @@ fn dequantize_iq4_nl(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + QK4_NL / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let qs = &block[2..];
         let mut lo = [0f32; QK4_NL / 2];
@@ -1343,7 +1351,7 @@ fn dequantize_iq4_xs(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
     const BLOCK_BYTES: usize = 2 + 2 + QK_K / 64 + QK_K / 2;
     out.clear();
     out.reserve(element_count);
-    for block in bytes.chunks_exact(BLOCK_BYTES) {
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
         let d = read_f16(block, 0);
         let scales_h = u16::from_le_bytes([block[2], block[3]]);
         let scales_l = &block[4..4 + QK_K / 64];
@@ -1560,8 +1568,10 @@ mod tests {
             let n_elems = u32_at(&fixture, &mut at) as usize;
             let raw = take(&fixture, &mut at, n_blocks * block_bytes).to_vec();
             let floats = take(&fixture, &mut at, n_elems * 4)
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             cases.push((ggml_type, n_elems / n_blocks, raw, floats));
         }

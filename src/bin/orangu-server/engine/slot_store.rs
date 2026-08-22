@@ -308,7 +308,12 @@ fn decode_file(expected_fingerprint: &str, bytes: &[u8]) -> Result<(Vec<u32>, Kv
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("token count overflows"))?,
     )?;
-    let tokens: Vec<u32> = token_bytes.chunks_exact(4).map(read_u32).collect();
+    let tokens: Vec<u32> = token_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| read_u32(word))
+        .collect();
     let cache = KvCache::from_bytes(&bytes[pos..])?;
     Ok((tokens, cache))
 }

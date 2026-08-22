@@ -4731,7 +4731,7 @@ fn quantize_activation_q8(x: &[f32]) -> Vec<u32> {
     debug_assert_eq!(x.len() % 32, 0);
     let nblocks = x.len() / 32;
     let mut out = Vec::with_capacity(nblocks * 10);
-    for blk in x.chunks_exact(32) {
+    for blk in x.as_chunks::<32>().0 {
         let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         let d = amax / 127.0;
         let id = if d > 0.0 { 1.0 / d } else { 0.0 };
@@ -4744,7 +4744,7 @@ fn quantize_activation_q8(x: &[f32]) -> Vec<u32> {
         }
         out.push(d.to_bits());
         out.push(sumq as u32);
-        for w in qs.chunks_exact(4) {
+        for w in qs.as_chunks::<4>().0 {
             out.push(
                 (w[0] as u8 as u32)
                     | ((w[1] as u8 as u32) << 8)

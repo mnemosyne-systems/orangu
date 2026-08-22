@@ -52,7 +52,7 @@ fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
         "q8_0 KV storage requires kv_dim to be a multiple of 32"
     );
     let mut out = Vec::with_capacity(data.len() / 32 * 36);
-    for block in data.chunks_exact(32) {
+    for block in data.as_chunks::<32>().0 {
         let amax = block.iter().fold(0f32, |a, &b| a.max(b.abs()));
         let d = amax / 127.0;
         let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
@@ -1375,7 +1375,9 @@ impl<'a> ByteReader<'a> {
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("KV-cache float count overflows"))?;
         let b = self.take(bytes)?;
-        Ok(b.chunks_exact(4)
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
@@ -1586,7 +1588,7 @@ mod tests {
     fn q8_0_kv_bytes_match_the_push_per_element_form() {
         fn reference(data: &[f32]) -> Vec<u8> {
             let mut out = Vec::new();
-            for block in data.chunks_exact(32) {
+            for block in data.as_chunks::<32>().0 {
                 let amax = block.iter().fold(0f32, |a, &b| a.max(b.abs()));
                 let d = amax / 127.0;
                 let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };

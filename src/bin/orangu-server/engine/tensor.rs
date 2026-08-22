@@ -403,7 +403,13 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc0 = [0f32; HALF];
     let mut acc1 = [0f32; HALF];
 
+    // `chunks_exact`, not `as_chunks`: the tail below is read through
+    // `ChunksExact::remainder`, and the two halves are advanced together with
+    // `by_ref`. `as_chunks` returns a slice pair with neither method, so the
+    // lint's suggestion does not apply to this shape.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let mut ca = a.chunks_exact(DOT_LANES);
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let mut cb = b.chunks_exact(DOT_LANES);
     for (x, y) in ca.by_ref().zip(cb.by_ref()) {
         for lane in 0..HALF {
