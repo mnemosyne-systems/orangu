@@ -430,6 +430,13 @@ impl OutputState {
         );
     }
 
+    pub fn push_table(&mut self, text: &str) {
+        self.push_lines(
+            text.lines()
+                .map(|line| TranscriptLine::Table(line.to_owned())),
+        );
+    }
+
     pub fn push_input(&mut self, text: &str) {
         self.push_lines(std::iter::once(TranscriptLine::UserInput(text.to_owned())));
     }
@@ -476,7 +483,11 @@ impl OutputState {
                     if !remaining.trim().is_empty() {
                         for chunk in crate::render::parse_markdown_chunks(remaining) {
                             match chunk {
+                                crate::render::MarkdownChunk::Spacer => self.push_lines(
+                                    std::iter::once(TranscriptLine::Plain(String::new())),
+                                ),
                                 crate::render::MarkdownChunk::Text(t) => self.push_text(&t),
+                                crate::render::MarkdownChunk::Table(t) => self.push_table(&t),
                                 crate::render::MarkdownChunk::Code { language, content } => {
                                     let ansi_lines = crate::render::render_syntax_highlighted_code(
                                         language.as_deref(),
@@ -500,7 +511,11 @@ impl OutputState {
             if !before.trim().is_empty() {
                 for chunk in crate::render::parse_markdown_chunks(before) {
                     match chunk {
+                        crate::render::MarkdownChunk::Spacer => {
+                            self.push_lines(std::iter::once(TranscriptLine::Plain(String::new())))
+                        }
                         crate::render::MarkdownChunk::Text(t) => self.push_text(&t),
+                        crate::render::MarkdownChunk::Table(t) => self.push_table(&t),
                         crate::render::MarkdownChunk::Code { language, content } => {
                             let ansi_lines = crate::render::render_syntax_highlighted_code(
                                 language.as_deref(),

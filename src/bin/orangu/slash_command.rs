@@ -85,6 +85,7 @@ pub enum SlashCommand {
     Committer,
     Graph,
     Clear,
+    Copy,
     Theme,
     License,
     Quit,
@@ -166,6 +167,7 @@ impl SlashCommand {
                 "Generates an HTML visualization of the codebase Knowledge Graph"
             }
             SlashCommand::Clear => "Clears the terminal screen",
+            SlashCommand::Copy => "Copies the latest assistant response as Markdown",
             SlashCommand::Theme => "Switches the active TUI theme",
             SlashCommand::License => "Chooses the licence generated code is written under",
             SlashCommand::Quit => "Exits the application",

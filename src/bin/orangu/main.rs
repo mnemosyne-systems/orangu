@@ -538,6 +538,7 @@ async fn run() -> Result<()> {
         mut current_branch,
         mut last_review_report,
         mut last_auto_review_report,
+        mut last_assistant_response,
         mut last_review_appendix,
         mut last_auto_review_appendix,
         mut last_review_was_auto,
@@ -661,6 +662,7 @@ async fn run() -> Result<()> {
                 current_branch,
                 last_review_report,
                 last_auto_review_report,
+                last_assistant_response,
                 last_review_appendix,
                 last_auto_review_appendix,
                 last_review_was_auto,
@@ -696,6 +698,7 @@ async fn run() -> Result<()> {
             current_branch = tab.current_branch;
             last_review_report = tab.last_review_report;
             last_auto_review_report = tab.last_auto_review_report;
+            last_assistant_response = tab.last_assistant_response;
             last_review_appendix = tab.last_review_appendix;
             last_auto_review_appendix = tab.last_auto_review_appendix;
             last_review_was_auto = tab.last_review_was_auto;
@@ -1094,6 +1097,7 @@ async fn run() -> Result<()> {
                         .total_tool_duration()
                         .saturating_sub(pr_tool_time_before);
                     usage_stats.record_response(pr_llm_start.elapsed(), &answer, tool_delta);
+                    last_assistant_response = Some(answer.clone());
                     push_answer(&mut output_state, &answer, truncated);
                     if config.feedback {
                         output_state.push_text(FEEDBACK_OK);
@@ -1609,6 +1613,28 @@ async fn run() -> Result<()> {
             }
             CommandOutcome::Cleared => {
                 output_state.clear();
+                last_assistant_response = None;
+                continue;
+            }
+            CommandOutcome::CopyLastResponse => {
+                let markdown = last_assistant_response.as_deref().or_else(|| {
+                    session
+                        .messages()
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == "assistant" && !message.content.is_empty())
+                        .map(|message| message.content.as_str())
+                });
+                match markdown {
+                    Some(markdown) => match copy_to_clipboard(markdown) {
+                        Ok(()) => output_state.push_text("Copied the last response as Markdown."),
+                        Err(err) => output_state.push_text(&format!(
+                            "Could not copy the last response to the clipboard: {err}"
+                        )),
+                    },
+                    None => output_state.push_text("No assistant response is available to copy."),
+                }
+                output_state.reset_scroll();
                 continue;
             }
             CommandOutcome::PendingList => {
@@ -2420,6 +2446,7 @@ async fn run() -> Result<()> {
             Ok(WaitResult::Response { answer, truncated }) => {
                 let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
                 usage_stats.record_response(llm_start.elapsed(), &answer, tool_delta);
+                last_assistant_response = Some(answer.clone());
                 push_answer(&mut output_state, &answer, truncated);
                 if config.feedback {
                     output_state.push_text(FEEDBACK_OK);

@@ -26,6 +26,7 @@ struct TranscriptRenderCache {
     transcript_epoch: usize,
     width: usize,
     word_wrap: bool,
+    theme: crate::tui::theme::Theme,
     lines: Vec<ratatui::text::Line<'static>>,
     is_user_input: Vec<bool>,
     user_input_ranges: Vec<(usize, usize)>,
@@ -121,15 +122,18 @@ fn build_transcript_render_cache(
     for line in transcript {
         let start_index = lines.len();
         let rendered = render_transcript_line_multi(line, width, theme);
-        let rendered =
-            if word_wrap && matches!(line, TranscriptLine::Plain(_) | TranscriptLine::Wide(_)) {
-                rendered
-                    .iter()
-                    .flat_map(|line| crate::tui::text::wrap_ratatui_line(line, width))
-                    .collect()
-            } else {
-                rendered
-            };
+        let rendered = if word_wrap
+            && matches!(
+                line,
+                TranscriptLine::Plain(_) | TranscriptLine::Wide(_) | TranscriptLine::Table(_)
+            ) {
+            rendered
+                .iter()
+                .flat_map(|line| crate::tui::text::wrap_ratatui_line(line, width))
+                .collect()
+        } else {
+            rendered
+        };
         let user_input = matches!(line, TranscriptLine::UserInput(_));
         for rendered_line in rendered {
             lines.push(rendered_line);
@@ -146,6 +150,7 @@ fn build_transcript_render_cache(
         transcript_epoch,
         width,
         word_wrap,
+        theme: theme.clone(),
         lines,
         is_user_input,
         user_input_ranges,
@@ -169,6 +174,7 @@ fn with_transcript_render_cache<R>(
                 || cached.transcript_epoch != transcript_epoch
                 || cached.width != width
                 || cached.word_wrap != word_wrap
+                || cached.theme != *theme
         });
         if cache_miss {
             *cache = Some(build_transcript_render_cache(
@@ -556,7 +562,7 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
             if args.word_wrap
                 && matches!(
                     transcript_line,
-                    TranscriptLine::Plain(_) | TranscriptLine::Wide(_)
+                    TranscriptLine::Plain(_) | TranscriptLine::Wide(_) | TranscriptLine::Table(_)
                 )
             {
                 rendered
@@ -997,6 +1003,24 @@ pub fn render_transcript_line_multi(
             } else {
                 vec![Line::from(content.clone())]
             }
+        }
+        TranscriptLine::Table(content) => {
+            let mut lines = content
+                .into_text()
+                .map(|text| text.lines)
+                .unwrap_or_else(|_| vec![Line::from(content.clone())]);
+
+            // A table is transparent by design. Remove, rather than reset, a
+            // background attribute from any ANSI sequence that slips through:
+            // `Color::Reset` means the terminal default (often black), while
+            // `None` inherits this screen's active light or dark canvas.
+            for line in &mut lines {
+                line.style.bg = None;
+                for span in &mut line.spans {
+                    span.style.bg = None;
+                }
+            }
+            lines
         }
         TranscriptLine::CodeBlock {
             language,
@@ -1453,6 +1477,17 @@ pub fn terminal_height() -> usize {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn markdown_tables_inherit_the_screen_background() {
+        let table = TranscriptLine::Table("\x1b[48;2;1;2;3m cell ".to_string());
+        let theme = crate::tui::Theme::current();
+        let lines = render_transcript_line_multi(&table, 80, &theme);
+
+        assert!(lines.iter().all(|line| {
+            line.style.bg.is_none() && line.spans.iter().all(|span| span.style.bg.is_none())
+        }));
+    }
 
     #[test]
     fn format_status_duration_uses_the_shortest_form() {

@@ -70,6 +70,9 @@ pub(crate) struct WorkspaceTab {
     /// review is of that tab's branch.
     pub(crate) last_review_report: Option<String>,
     pub(crate) last_auto_review_report: Option<String>,
+    /// The latest completed assistant response in its original Markdown form,
+    /// retained for `/copy` without trying to reconstruct it from the TUI.
+    pub(crate) last_assistant_response: Option<String>,
     /// The last `/review` and `/auto_review` source appendices (per-finding code
     /// windows), kept alongside their reports so `/export [auto] review` can add
     /// the appendix.
@@ -274,6 +277,7 @@ impl WorkspaceTab {
             current_branch,
             last_review_report: None,
             last_auto_review_report: None,
+            last_assistant_response: None,
             last_review_appendix: None,
             last_auto_review_appendix: None,
             last_review_was_auto: false,
@@ -614,6 +618,7 @@ mod tests {
             current_branch: None,
             last_review_report: None,
             last_auto_review_report: None,
+            last_assistant_response: None,
             last_review_appendix: None,
             last_auto_review_appendix: None,
             last_review_was_auto: false,

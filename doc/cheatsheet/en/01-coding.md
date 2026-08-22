@@ -41,7 +41,7 @@ form (`commit "..."`, `push`) works just as well.
 
 | Command | What it does |
 | --- | --- |
-| `/clear` `/usage` | Reset the conversation; see what the context window is being spent on. |
+| `/clear` `/copy` `/usage` | Reset the conversation; copy the latest response as Markdown; see what the context window is being spent on. |
 | `/session` `/session <uuid or path>` | List sessions; switch to one, or open another project as a new tab. |
 | `/schedule` | Run a command on a cron-style schedule, unattended. |
 | `#` `\` | A line starting with `#` stays local and is never sent; one starting with `\` is ignored entirely. |

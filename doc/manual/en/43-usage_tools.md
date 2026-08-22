@@ -83,6 +83,24 @@ reset conversation
 
 \newpage
 
+## /copy
+
+Copies the latest assistant response to the system clipboard as its original
+Markdown source. This is useful when you want to paste a response into a pull
+request, issue, or document while retaining headings, task lists, tables, and
+other Markdown formatting.
+
+`/copy` is available only in the interactive terminal UI. It reports an error
+when the current conversation has no assistant response yet.
+
+**Examples**
+
+```text
+/copy
+```
+
+\newpage
+
 ## /quit
 
 Exits the client.

@@ -43,7 +43,7 @@ A command is handled locally and never reaches the server, so it works while the
 Two groups of commands are refused rather than run, with a message saying which group they fall in:
 
 - Commands whose only effect is on the running session — `/model`, `/server`, `/theme <name>`, `/license <spdx>`, `/verbosity`, `/disconnect`, `/reload` — since a one-shot exits before the change could matter. (`/license` with no argument still reports; it is only *setting* one that a one-shot cannot keep.) Select the server and model in `orangu.conf`, or point `--config` at a different file.
-- Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
+- Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/copy`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
 
 `/export` covers the targets that are computed at export time: `pr`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
 

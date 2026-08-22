@@ -1554,6 +1554,7 @@ pub(crate) fn handle_command(
             session.clear(&prompt);
             Ok(CommandOutcome::Cleared)
         }
+        LocalCommand::Copy => Ok(CommandOutcome::CopyLastResponse),
         LocalCommand::Quit => Ok(CommandOutcome::Quit),
         LocalCommand::PendingList => Ok(CommandOutcome::PendingList),
         LocalCommand::PendingDelete(None) => Ok(CommandOutcome::Output(
