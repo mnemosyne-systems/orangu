@@ -101,7 +101,7 @@ wide = "1.6.1"
 memmap2 = "0.9"
 rand = "0.10"
 async-stream = "0.3"
-wgpu = { version = "30.0.0", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl", "std"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "metal", "dx12", "wgsl", "std"] }
 ash = "0.38"
 pollster = "1.0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }

@@ -78,6 +78,26 @@ const MAX_BATCH_WAIT_DEFAULT_MS: u64 = 4;
 /// size 1.6 to 2.2**. The comparison that concluded "fused batching is
 /// slower" was therefore not measuring fused batching; it was measuring
 /// unbatched decode plus a rendezvous.
+///
+/// **That re-run has now happened, and the verdict stands.** Widening the
+/// window until the batch actually fills, on `gemma-4-E2B-it-Q4_K_M`,
+/// aggregate tok/s with the achieved mean batch beside every point:
+///
+/// | slots / streams | control | best batched | mean batch reached |
+/// | :-- | --: | --: | --: |
+/// | 4 / 4 | **55.12 ± 0.35** | 43.26 ± 1.74 | 3.95 |
+/// | 8 / 8 | **50.21 ± 0.54** | 43.92 ± 1.68 | 7.87 |
+///
+/// **−22% and −17%**, both far outside the spread, and flat from batch 3 to
+/// batch 7.9. The window does its job — 250 ms catches 7.87 of 8 sequences —
+/// and throughput does not move with it. If fusing *M* sequences were
+/// amortising weight bandwidth, throughput would rise with the batch; it does
+/// not, which points at the per-step cost of chaining *M* sequences into one
+/// encoder rather than at the amortisation being absent.
+///
+/// So the earlier conclusion was reached from an invalid measurement and is
+/// nonetheless right. `DISK.md`'s D4 has the full tables. **Do not re-run the
+/// narrow-window version to check** — it measures the rendezvous, not this.
 /// Running mean batch size, reported at shutdown.
 ///
 /// A fused-batching measurement is only interpretable next to the batch sizes

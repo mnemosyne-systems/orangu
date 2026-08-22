@@ -239,6 +239,40 @@ impl DeviceFootprint {
         Some(total_bytes?.saturating_sub(self.weights_device_bytes))
     }
 
+    /// Whether this device has room for **no request at all** — the weights
+    /// leave less headroom than one KV step costs.
+    ///
+    /// This is the one capacity question that *is* answerable in advance, and
+    /// it is why the module's usual refusal to give a yes-or-no verdict does
+    /// not apply to it. That refusal is about margins: weights arrive lazily,
+    /// KV is allocated per request at that request's own size, so "fits" and
+    /// "does not fit" are both overclaims near the boundary. **Zero is not
+    /// near the boundary.** A device with room for zero tokens cannot serve a
+    /// one-token request, so no lazy arrival and no small request rescues it.
+    ///
+    /// `false` when the capacity is unknown, which is not zero — the same
+    /// rule [`headroom_in`](Self::headroom_in) applies.
+    ///
+    /// Exists because the alternative was measured: on a 3.98 GiB card asked
+    /// to hold 57.18 GiB of weights, startup printed "room for about 0 tokens"
+    /// and began serving anyway, and the first prompt took the device down
+    /// with `radv/amdgpu: Not enough memory for command submission`. The
+    /// server had already computed the answer and did not act on it.
+    pub fn serves_no_tokens_on(&self, device: &DeviceCandidate) -> bool {
+        self.serves_no_tokens_in(device.vram_total_bytes)
+    }
+
+    /// [`serves_no_tokens_on`](Self::serves_no_tokens_on) against a bare
+    /// capacity, for a device of a split.
+    pub fn serves_no_tokens_in(&self, total_bytes: Option<u64>) -> bool {
+        let Some(headroom) = self.headroom_in(total_bytes) else {
+            return false;
+        };
+        // `None` means the KV cost per step is unknown or zero — not a
+        // capacity finding, so not a refusal.
+        self.kv_tokens_in(headroom) == Some(0)
+    }
+
     /// `Some(shortfall)` when the weights alone exceed the device, `None`
     /// when they fit or the capacity is unknown.
     ///
@@ -315,12 +349,26 @@ impl DeviceFootprint {
         }
 
         if let Some(shortfall) = self.shortfall_on(device) {
-            lines.push(format!(
-                "orangu-server: [{api}] the weights are {} larger than this device — the \
-                 driver will page them in and out on every token, which is slow rather \
-                 than fatal. A smaller quantization, or `device`/`backend = cpu`, avoids it.",
-                format_bytes(shortfall)
-            ));
+            // "Slow rather than fatal" is true while there is still room for
+            // a request to run. Once the headroom will not cover one KV step
+            // it is simply false, and saying it anyway is what let a
+            // guaranteed device loss look like a performance warning.
+            if self.serves_no_tokens_on(device) {
+                lines.push(format!(
+                    "orangu-server: [{api}] the weights are {} larger than this device, \
+                     leaving no room for a KV cache — this device cannot serve a request \
+                     of any length. Use `device`/`backend = cpu`, a device with more \
+                     memory, or a smaller quantization.",
+                    format_bytes(shortfall)
+                ));
+            } else {
+                lines.push(format!(
+                    "orangu-server: [{api}] the weights are {} larger than this device — the \
+                     driver will page them in and out on every token, which is slow rather \
+                     than fatal. A smaller quantization, or `device`/`backend = cpu`, avoids it.",
+                    format_bytes(shortfall)
+                ));
+            }
         }
         lines
     }
@@ -378,6 +426,94 @@ mod tests {
             n_ctx_train: 1_000_000,
             kv_storage: Some(KvStorage::F16),
         }
+    }
+
+    /// The reported bug, as a test: a 3.98 GiB card asked to hold 57.18 GiB
+    /// of weights. Startup used to print "room for about 0 tokens" and serve
+    /// anyway; the first prompt took the device down with
+    /// `radv/amdgpu: Not enough memory for command submission` and exit 75.
+    #[test]
+    fn a_card_with_room_for_no_kv_at_all_is_refused() {
+        let f = footprint(57 * GIB, 2 * MIB, 1);
+        let tiny = card(Some(4 * GIB));
+        assert_eq!(f.headroom_on(&tiny), Some(0), "weights swamp the card");
+        assert_eq!(f.kv_tokens_in(0), Some(0));
+        assert!(
+            f.serves_no_tokens_on(&tiny),
+            "a device with no room for one KV step cannot serve any request"
+        );
+    }
+
+    /// The refusal is for zero, not for "tight". A card the weights still fit
+    /// inside keeps working — that is the case the module deliberately
+    /// declines to judge, and it must stay unjudged.
+    #[test]
+    fn a_tight_but_workable_card_is_not_refused() {
+        let f = footprint(3 * GIB, MIB, 1);
+        assert!(!f.serves_no_tokens_on(&card(Some(4 * GIB))));
+        // One step's worth of headroom is still not zero.
+        let exact = footprint(4 * GIB - CONTEXT_STEP as u64 * MIB, MIB, 1);
+        assert!(!exact.serves_no_tokens_on(&card(Some(4 * GIB))));
+    }
+
+    /// **The refusal is wider than the reported case, deliberately.** Because
+    /// headroom is `capacity - weights` clamped at zero, *any* shortfall
+    /// leaves zero headroom and therefore zero KV — a 1 GiB overshoot is
+    /// refused exactly like a 53 GiB one.
+    ///
+    /// That is the intended reading rather than an accident of the
+    /// arithmetic: `WeightArena` never evicts, so it goes on allocating
+    /// device buffers until the card is full whatever the margin, and the
+    /// only difference a small overshoot makes is how many tokens are served
+    /// before the allocation fails. A configuration that dies later is not a
+    /// configuration that works.
+    #[test]
+    fn any_shortfall_leaves_no_kv_and_is_refused() {
+        for weights in [4 * GIB + MIB, 5 * GIB, 57 * GIB] {
+            let f = footprint(weights, 2 * MIB, 1);
+            assert!(
+                f.serves_no_tokens_on(&card(Some(4 * GIB))),
+                "{weights} bytes of weights on a 4 GiB card"
+            );
+        }
+    }
+
+    /// Unknown capacity is not zero capacity — the same rule `headroom_in`
+    /// applies. Refusing a device that simply declined to report its size
+    /// would break every adapter that does not expose one.
+    #[test]
+    fn unknown_capacity_is_never_a_refusal() {
+        let f = footprint(57 * GIB, 2 * MIB, 1);
+        assert!(!f.serves_no_tokens_on(&card(None)));
+        assert!(!f.serves_no_tokens_in(None));
+    }
+
+    /// A model with no KV cost per step (nothing measured) is not a capacity
+    /// finding, so it must not refuse either.
+    #[test]
+    fn an_unmeasured_kv_cost_is_never_a_refusal() {
+        let f = footprint(57 * GIB, 0, 1);
+        assert!(!f.serves_no_tokens_on(&card(Some(4 * GIB))));
+    }
+
+    /// The wording follows the verdict: the "slow rather than fatal" line is
+    /// only printed where it is true.
+    #[test]
+    fn the_report_stops_calling_a_fatal_shortfall_slow() {
+        let doomed = footprint(57 * GIB, 2 * MIB, 1).report("vulkan", &card(Some(4 * GIB)));
+        let joined = doomed.join("\n");
+        assert!(
+            joined.contains("cannot serve a request of any length"),
+            "{joined}"
+        );
+        assert!(!joined.contains("slow rather than fatal"), "{joined}");
+
+        // A card the weights fit inside says neither thing — there is no
+        // shortfall line at all.
+        let fine = footprint(3 * GIB, MIB, 1).report("vulkan", &card(Some(4 * GIB)));
+        let joined = fine.join("\n");
+        assert!(!joined.contains("cannot serve a request"), "{joined}");
+        assert!(!joined.contains("slow rather than fatal"), "{joined}");
     }
 
     #[test]

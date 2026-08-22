@@ -16,8 +16,8 @@
 //! Interactive `--init` flow that writes `~/.orangu/orangu-server.conf`.
 
 use crate::config::{
-    HOST_ALL, HOST_ALL_ALIAS, Role, WEB_SECTION, default_delete, default_host, default_port,
-    default_reexec, default_web_port,
+    DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, Role, WEB_SECTION, default_delete, default_host,
+    default_port, default_reexec, default_web_port,
 };
 use anyhow::{Context, Result, anyhow};
 use rustyline::{
@@ -71,6 +71,13 @@ pub fn run_init() -> Result<()> {
     } else {
         String::new()
     };
+    // A storage knob rather than a deployment one, so it is asked after
+    // everything that decides *what* is served and *where*, and answered by
+    // pressing Enter unless the operator has measured their own drive. The
+    // unit is in the label because KiB against MiB is exactly the mistake
+    // this prompt would otherwise invite.
+    let read_size = prompt_line("read_size (KiB)", &DEFAULT_READ_SIZE.to_string())?;
+
     // The web console is a section of its own, so it is one yes/no question
     // rather than a port that has to be guessed at (and `0` remembered as
     // the way to decline). Declining writes no `[web]` section at all.
@@ -98,6 +105,12 @@ pub fn run_init() -> Result<()> {
     contents.push_str(&format!("host = {host}\nport = {port}\n"));
     if !api_key.trim().is_empty() {
         contents.push_str(&format!("api_key = {}\n", api_key.trim()));
+    }
+    // Written only when it differs from the default, the same rule `role`
+    // and the `[web]` booleans follow — a config file full of restated
+    // defaults hides the two lines that were actually chosen.
+    if read_size.trim() != DEFAULT_READ_SIZE.to_string() {
+        contents.push_str(&format!("read_size = {}\n", read_size.trim()));
     }
     if let Some((web_host, web_port, reexec, delete)) = &web {
         // `host` and `port` together, the same pair `[orangu-server]` writes

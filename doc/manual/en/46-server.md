@@ -995,6 +995,7 @@ queue_limit = 0
 backend = auto
 device = auto
 kv_cache = f16
+read_size = 8192
 role = all
 
 [web]
@@ -1110,6 +1111,47 @@ reexec = yes
   Vulkan-family backends (Vulkan, Metal, DX12) have a GPU-side mirror; on
   CPU, CUDA, OpenCL and ROCm the key has no effect. `ORANGU_KV_CACHE`
   overrides it for one run.
+- `read_size` — the smallest explicit read of a model file, **in KiB**.
+  Default `8192`, which is 8 MiB; `4` — one page — disables widening. Must be a
+  positive multiple of `4`, because a read has to be a whole number of pages;
+  anything else is refused rather than quietly rounded.
+
+  It exists because throughput on real storage is not proportional to how
+  much you ask for — it is closer to a step. Below some device-specific
+  request size every read costs a full round trip, and the device delivers a
+  small read and a large one in nearly the same time; above it the block
+  layer splits the request into several commands and issues them together,
+  and throughput jumps. On the storage this default was measured against the
+  step sits at 512 KiB: reads at or below it ran at 15–28 MB/s and reads from
+  1 MiB up ran at 206–214 MB/s, an eight-fold difference from request size
+  alone. Where that step falls depends on the controller, the bus, and any
+  bridge in front of it, which is why this is a key and not a constant.
+
+  A span smaller than `read_size` is widened outward to it and the wanted
+  bytes taken from the middle — so neighbouring weights arrive with the one
+  that was asked for, at no extra cost on a device that charges per request.
+  A span larger than `read_size` is read as itself rather than being split.
+
+  **The default widens, because widening was measured to win where it
+  matters.** On a mixture-of-experts model read cold — the case this key exists
+  for — 8 MiB gave **+36% decode tok/s** over not widening, and it made the
+  result far steadier: three runs spanning 7.89–8.44 tok/s against 2.25–8.65
+  without it. Large sequential reads hold the device in its fast regime;
+  scattered small ones let it drop out, and that variance costs more than the
+  wasted bytes. Warm, where nothing reaches the disk, the two are within noise.
+
+  It does read more than it uses — an expert slice may be a few hundred KiB
+  inside an 8 MiB window — so on storage that charges per byte rather than per
+  request, lower it. Measure rather than assume, and **interleave the arms**:
+  run sequentially, this same comparison reported the opposite result, because
+  drives degrade measurably across a session and whichever arm goes second
+  loses.
+
+  Only the **explicit** read routes use it (`ORANGU_EXPERT_READ=pread` or
+  `direct`). The default route is the memory mapping, where request size is
+  the kernel's readahead to decide, so on a default deployment this key
+  changes nothing.
+
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
   `cuda`, `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order
@@ -1163,6 +1205,7 @@ shown.
 | `api_key` | — | bearer token every request must carry; unset leaves the server open |
 | `tls_cert` / `tls_key` | — | PEM paths for serving HTTPS; both or neither |
 | `kv_cache` | `f16` | GPU KV mirror storage: `f16`, `q8_0`, or `f32` |
+| `read_size` | `8192` | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening |
 | `draft_model` | — | a second, smaller model whose guesses the served model verifies |
 | `draft_tokens` | `4` | tokens the draft proposes per verification |
 | `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm` |

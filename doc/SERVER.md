@@ -1003,6 +1003,7 @@ queue_limit = 0
 draft_model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 backend = auto
 kv_cache = f16
+read_size = 8192
 role = all
 
 [web]
@@ -1097,6 +1098,23 @@ reexec = yes
   growing with the cache), buying context and concurrent `slots` out of the
   same VRAM — and is the only **lossy** setting here, which is why it is
   opt-in. Vulkan-family backends only. `ORANGU_KV_CACHE` overrides it.
+- `read_size` — the smallest explicit read of a model file, **in KiB**;
+  default `8192` (8 MiB), `4` disables widening, and it must be a positive
+  multiple of `4` because a read has to be a whole number of pages. Widening
+  measured **+36% decode tok/s** on a cold mixture-of-experts model and cut the
+  run-to-run spread from 2.25–8.65 tok/s to 7.89–8.44: large sequential reads
+  hold the device in its fast regime. Warm, the setting is within noise. Storage throughput is closer to a step than a slope:
+  below a device-specific request size every read pays a full round trip and a
+  small read costs about what a large one does; above it the block layer
+  splits the request into several commands and issues them together. Measured
+  on one USB-bridged SSD the step sits at 512 KiB — 15–28 MB/s at or below it,
+  206–214 MB/s from 1 MiB up. Where it falls is a property of the controller,
+  the bus and any bridge in front of them, which is why this is configurable.
+  A span smaller than `read_size` is widened outward to it and the wanted
+  bytes taken from the middle; a larger span is read as itself. Only the
+  explicit read routes (`ORANGU_EXPERT_READ=pread|direct`) consult it — the
+  default memory mapping leaves request size to the kernel's readahead, so on
+  a default deployment this key changes nothing.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
   `opencl`, or
   `rocm`. `auto` tries every GPU backend compiled into this build, in order

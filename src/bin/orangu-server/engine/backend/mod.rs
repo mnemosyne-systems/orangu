@@ -128,7 +128,7 @@ pub struct MatmulOp<'a> {
 /// backend. `wgpu` backends may clamp it upward to their own kernel
 /// crossover where needed, but this is the one default policy the model
 /// code and the non-`wgpu` backends all share.
-pub(crate) const MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT: usize = 64;
+pub(crate) const MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT: usize = 256;
 
 /// `ORANGU_MAX_TOKENS_PER_SUBMISSION`, shared above every backend-specific
 /// implementation.

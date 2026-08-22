@@ -913,6 +913,9 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Before anything parallel runs — the loader itself reaches for rayon,
     // and `build_global` can only be called once.
     let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
+    // Before the model is opened, because the loader is the first thing that
+    // can read a weight through an explicit route.
+    engine::expert_read::set_read_size(conf.read_size);
     let mut loaded = source.load().context("loading model weights")?;
     // Before the first device comes up, because bringing one up compiles the
     // attention shaders against whichever storage this names — the choice
@@ -930,13 +933,134 @@ fn prepare(args: Args) -> Result<Prepared> {
         engine::backend::device_resident_split(loaded.resident_tensor_sizes());
     let per_layer_bytes =
         engine::footprint::DeviceFootprint::weights_per_layer(&loaded, loaded.config.n_layer);
+    // What device 0 is charged with no matter how the layers are placed:
+    // `LoadedModel::device_for_tensor` pins the embeddings, the output norm
+    // and `lm_head` there. On a large-vocabulary model at `BF16` that alone
+    // is gigabytes, and if it exceeds the head device nothing a placement can
+    // do will make the model fit a GPU.
+    let non_layer_bytes = weights_device_bytes.saturating_sub(per_layer_bytes.iter().sum::<u64>());
+    // **The last rung of the ladder: dGPU, then iGPU, then the CPU.** The
+    // embeddings, the output norm and `lm_head` are pinned to device 0 by
+    // `LoadedModel::device_for_tensor` whatever the placement, so if they
+    // alone exceed device 0 no split rescues the model — the GPU path will
+    // over-commit the card and run out of memory mid-request. Run it on the
+    // host instead, which is bounded by RAM and the page cache rather than by
+    // a card.
+    //
+    // Checked here, before the split, because afterwards the backend is a
+    // `MultiDeviceBackend` and `as_wgpu` is `None` by design — there is no
+    // head device left to ask.
+    //
+    // Loud rather than silent, and only where the device choice was
+    // automatic: an explicit `--device`/`device` is a decision to respect.
+    // A tensor larger than the device's maximum buffer size cannot be
+    // uploaded at all — not "slowly", not "paged", not at all: `wgpu` fails
+    // `create_buffer` validation and the request panics. Bigger than any
+    // capacity question, because no split and no eviction changes it.
+    let oversized_tensor = backend.as_wgpu().and_then(|wgpu| {
+        let limit = wgpu.max_buffer_size();
+        loaded
+            .resident_tensor_sizes()
+            .filter(|&(name, bytes)| {
+                let (device_bytes, _) =
+                    engine::backend::device_resident_split(std::iter::once((name, bytes)));
+                device_bytes > limit
+            })
+            .map(|(name, bytes)| (name.to_string(), bytes))
+            .max_by_key(|&(_, bytes)| bytes)
+            .map(|(name, bytes)| (name, bytes, limit))
+    });
+    if let Some((name, bytes, limit)) = &oversized_tensor {
+        eprintln!(
+            "orangu-server: tensor `{name}` is {} and this device will not create a buffer \
+             larger than {} — no placement changes that, so the model runs on the CPU.",
+            orangu::format::format_bytes(*bytes),
+            orangu::format::format_bytes(*limit),
+        );
+    }
+
+    let head_cannot_hold_pinned = backend
+        .as_wgpu()
+        .and_then(|wgpu| {
+            wgpu.device_in_use()
+                .vram_total_bytes
+                .map(|total| (wgpu.device_in_use().name.clone(), total))
+        })
+        .filter(|(_, total)| non_layer_bytes > *total)
+        .filter(|_| {
+            matches!(
+                requested_device(device_flag.as_deref(), &conf.device),
+                engine::backend::device::DeviceRequest::Auto
+            )
+        });
+    let (backend, backend_label) = match head_cannot_hold_pinned {
+        _ if oversized_tensor.is_some() => {
+            let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+            let label = if is_x86_feature_detected() {
+                "CPU/AVX2"
+            } else {
+                "CPU"
+            };
+            (cpu, label.to_string())
+        }
+        Some((name, total)) => {
+            eprintln!(
+                "orangu-server: {name} has {total_h} and this model pins {pinned} of embeddings \
+                 and output weights to it before a single layer is placed — no split can make \
+                 that fit, so the model runs on the CPU. Choose a device explicitly with \
+                 `--device` to override.",
+                total_h = orangu::format::format_bytes(total),
+                pinned = orangu::format::format_bytes(non_layer_bytes),
+            );
+            let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+            let label = if is_x86_feature_detected() {
+                "CPU/AVX2"
+            } else {
+                "CPU"
+            };
+            (cpu, label.to_string())
+        }
+        None => (backend, backend_label),
+    };
+
+    // **Every model has to run, even slowly.** When nothing was asked for and
+    // the weights will not fit the selected device, fill the devices in their
+    // ranked order — discrete first, then integrated — and run the remainder
+    // on the CPU, rather than loading a model this device cannot serve.
+    //
+    // Escalating here rather than refusing later is the difference between a
+    // slow server and no server. The alternative was measured: a 57.18 GiB
+    // model on a 4.00 GiB card uploaded weights into an arena that never
+    // evicts until `radv` could not allocate for a command submission, lost
+    // the device, and exited 75 — which a supervisor restarts into the same
+    // wall on the next request.
+    //
+    // Only when the caller expressed no preference. An explicit
+    // `device_split` — including `off` — is a decision, and this must not
+    // quietly overrule it.
+    let requested = requested_split(split_flag.as_deref(), &conf.device_split)?;
+    let split_mode = if requested.is_off()
+        && split_flag.is_none()
+        && conf.device_split.is_off()
+        && overflows_selected_device(backend.as_ref(), weights_device_bytes)
+    {
+        eprintln!(
+            "orangu-server: the weights are larger than the selected device — spreading \
+             them across every device in order and running the remainder on the CPU \
+             (`device_split = cpu`). Set `device_split` explicitly to choose differently."
+        );
+        SplitMode::Cpu
+    } else {
+        requested
+    };
     let (backend, backend_label, split) = apply_device_split(
         backend,
         backend_label,
-        &requested_split(split_flag.as_deref(), &conf.device_split)?,
+        &split_mode,
         &per_layer_bytes,
         weights_device_bytes,
     )?;
+
     eprintln!(
         "{}",
         cpu_inventory(
@@ -980,22 +1104,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // `Q4_K` tensor at all — so naming a fixed pair of types would answer a
     // question nobody asked. Floats are excluded: they carry the norms and
     // biases, never the weight bytes decode throughput is made of.
-    let dominant_types = {
-        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-        for (_, ty) in loaded.tensor_types() {
-            let is_float = ty == engine::quant::GGML_TYPE_F32
-                || ty == engine::quant::GGML_TYPE_F16
-                || ty == engine::quant::GGML_TYPE_BF16;
-            if !is_float {
-                *counts.entry(ty).or_default() += 1;
-            }
-        }
-        let mut types: Vec<(u32, usize)> = counts.into_iter().collect();
-        // Count first, then type id, so the line is the same on two runs of
-        // the same file rather than following `HashMap` iteration order.
-        types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        types.into_iter().map(|(ty, _)| ty).collect::<Vec<_>>()
-    };
+    let dominant_types = dominant_tensor_types(loaded.tensor_types());
     // On a `wgpu` backend, the kernels this model's weights actually decode
     // through. On `CudaBackend`/`RocmBackend`/`OpenClBackend`, which have no
     // kernel *selection* to report, what they have instead of one — see
@@ -1084,6 +1193,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         for line in expert_tier_projection(&loaded, footprint, wgpu) {
             eprintln!("{line}");
         }
+        // No refusal here, deliberately. A device with no headroom left is a
+        // reason to place layers somewhere else — which the overflow split
+        // above has already done — not a reason to decline the model. See
+        // `DeviceFootprint::serves_no_tokens_on`, which still exists so the
+        // report can say plainly what the numbers are.
     }
 
     let slots = SlotPool::with_queue_limit(conf.slots, conf.queue_limit);
@@ -2311,6 +2425,48 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
 /// `true` and lets the download proceed. The one thing this must not do is
 /// turn a working download into a failure because the advisory step ahead
 /// of it did not work.
+/// The `ggml_type`s the banner names as the kernels this model decodes
+/// through, most common first.
+///
+/// Floats are excluded **when the file has anything else**, because on a
+/// quantized model they carry the norms and biases and would otherwise
+/// outnumber the type the weight bytes are actually in.
+///
+/// They are counted when they are all there is. A `BF16` or `F16` file has no
+/// quantized tensors at all, so the unconditional exclusion left the set empty
+/// and the banner read `Kernels none` — which says "this build has no kernel
+/// for your model" to a reader, when the truth is the opposite. The rule was
+/// right about its own case and wrong about the case it did not consider.
+///
+/// Ordered by count and then by type id, so two runs of the same file print
+/// the same line rather than following `HashMap` iteration order.
+fn dominant_tensor_types<'a>(tensors: impl Iterator<Item = (&'a str, u32)>) -> Vec<u32> {
+    let is_float = |ty: u32| {
+        ty == engine::quant::GGML_TYPE_F32
+            || ty == engine::quant::GGML_TYPE_F16
+            || ty == engine::quant::GGML_TYPE_BF16
+    };
+    let mut quantized: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut floats: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (_, ty) in tensors {
+        *if is_float(ty) {
+            &mut floats
+        } else {
+            &mut quantized
+        }
+        .entry(ty)
+        .or_default() += 1;
+    }
+    let counts = if quantized.is_empty() {
+        floats
+    } else {
+        quantized
+    };
+    let mut types: Vec<(u32, usize)> = counts.into_iter().collect();
+    types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    types.into_iter().map(|(ty, _)| ty).collect()
+}
+
 fn plan_before_download(repo: &str, yes: bool) -> Result<bool> {
     // Resolution failures are silent on purpose. Everything that can go
     // wrong here — the repo missing, the token rejected, no file matching
@@ -2840,6 +2996,20 @@ fn expert_tier_projection(
 /// hardware has verified during development; giving them an untested
 /// multi-device path would be a worse answer than not offering one, so a
 /// split asked for on those is refused with that said out loud.
+/// Whether the weights will not fit the device the backend selected.
+///
+/// The trigger for the automatic overflow split above. `false` for a non-wgpu
+/// backend (nothing to overflow *from* — the CPU path already holds whatever
+/// RAM and the page cache can between them) and `false` for a device that does
+/// not report its size, which is the "unknown is not zero" rule the rest of
+/// the capacity code follows.
+fn overflows_selected_device(backend: &dyn Backend, weights_bytes: u64) -> bool {
+    backend
+        .as_wgpu()
+        .and_then(|wgpu| wgpu.device_in_use().vram_total_bytes)
+        .is_some_and(|total| weights_bytes > total)
+}
+
 fn apply_device_split(
     backend: Arc<dyn Backend>,
     label: String,
@@ -3645,6 +3815,67 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::dominant_tensor_types;
+    use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+
+    /// On a quantized file the floats are norms and biases and must not
+    /// outnumber the type the weight bytes are in.
+    #[test]
+    fn floats_are_excluded_while_the_file_has_quantized_tensors() {
+        let tensors = vec![
+            ("blk.0.attn_norm.weight", GGML_TYPE_F32),
+            ("blk.1.attn_norm.weight", GGML_TYPE_F32),
+            ("blk.2.attn_norm.weight", GGML_TYPE_F32),
+            ("blk.0.ffn_down.weight", GGML_TYPE_Q4_K),
+            ("blk.1.ffn_down.weight", GGML_TYPE_Q4_K),
+            ("output.weight", GGML_TYPE_Q6_K),
+        ];
+        assert_eq!(
+            dominant_tensor_types(tensors.into_iter()),
+            vec![GGML_TYPE_Q4_K, GGML_TYPE_Q6_K],
+            "the three F32 norms must not lead the line"
+        );
+    }
+
+    /// The reported bug: a `BF16` file has no quantized tensor at all, so
+    /// excluding floats unconditionally emptied the set and the banner read
+    /// `Kernels none` on a model the backend decodes perfectly well.
+    #[test]
+    fn a_float_only_model_reports_its_float_type_rather_than_nothing() {
+        let tensors = vec![
+            ("blk.0.attn_norm.weight", GGML_TYPE_F32),
+            ("blk.0.ffn_down.weight", GGML_TYPE_BF16),
+            ("blk.1.ffn_down.weight", GGML_TYPE_BF16),
+            ("token_embd.weight", GGML_TYPE_BF16),
+        ];
+        assert_eq!(
+            dominant_tensor_types(tensors.into_iter()),
+            vec![GGML_TYPE_BF16, GGML_TYPE_F32],
+            "a BF16 model decodes through BF16 kernels, not through none"
+        );
+    }
+
+    /// An empty file is still empty — the fallback adds a case, it does not
+    /// invent a type.
+    #[test]
+    fn no_tensors_means_no_types() {
+        assert!(dominant_tensor_types(std::iter::empty()).is_empty());
+    }
+
+    /// Ties break on type id so the banner is byte-identical across runs.
+    #[test]
+    fn equal_counts_order_by_type_id() {
+        let tensors = vec![("a", GGML_TYPE_Q6_K), ("b", GGML_TYPE_Q4_K)];
+        let out = dominant_tensor_types(tensors.into_iter());
+        assert_eq!(
+            out,
+            vec![
+                GGML_TYPE_Q4_K.min(GGML_TYPE_Q6_K),
+                GGML_TYPE_Q4_K.max(GGML_TYPE_Q6_K)
+            ]
+        );
+    }
+
     use super::{
         Args, Command, DeviceClass, SplitReport, gate, label_carries_tag, resolve_model_spec,
         resolve_workspace, terminal_title,

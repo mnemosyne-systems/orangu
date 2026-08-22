@@ -37,6 +37,27 @@ pub const SERVER_SECTION: &str = "orangu-server";
 /// everything else.
 pub const DEFAULT_DRAFT_TOKENS: usize = 4;
 
+/// `[orangu-server].read_size` when the key is absent, in KiB.
+///
+/// 8 MiB, and the number is measured rather than round. Storage throughput is
+/// closer to a step than a slope: on the drive this was sized against, reads
+/// at or below 512 KiB ran at 15-28 MB/s and reads from 1 MiB up ran at
+/// 206-214 MB/s, because the block layer splits a larger request into several
+/// commands and issues them together where a smaller one pays a full round
+/// trip. 8 MiB sits well inside that plateau.
+///
+/// End to end, on a mixture-of-experts model read cold, widening to 8 MiB
+/// measured **+36% decode tok/s** against not widening — and, just as usefully,
+/// it made the result *stable*: three repetitions at 8 MiB spread 7.89-8.44
+/// tok/s where three at one page spread 2.25-8.65. Large sequential reads keep
+/// the device in its fast regime; scattered small ones let it fall out. Warm,
+/// where nothing reaches the disk, the two are within noise of each other.
+///
+/// **The arms have to be interleaved to see any of this.** Run sequentially,
+/// this same comparison reported widening as 2.2x *slower* — the drive
+/// degrades measurably across a session, so whichever arm ran second lost.
+pub const DEFAULT_READ_SIZE: usize = 8192;
+
 /// The web console's own section. **Its presence is what enables the
 /// console** — a config with no `[web]` section binds no second listener at
 /// all, which is what `--init` writes when the web console is declined.
@@ -170,6 +191,7 @@ pub fn bundled_configuration(
         // A bundle runs on a machine nobody configured, so it takes the
         // default rather than a lossy format nobody chose.
         kv_cache: KvCache::default(),
+        read_size: DEFAULT_READ_SIZE,
         // A bundle serves whoever runs it; refusing on its owner's behalf is
         // not a decision it can make.
         queue_limit: 0,
@@ -483,6 +505,21 @@ pub struct ServerConfiguration {
     /// How the GPU-side KV mirror is stored — see [`KvCache`]. Overridden by
     /// `ORANGU_KV_CACHE`, so a sweep can vary it without editing the file.
     pub kv_cache: KvCache,
+    /// `[orangu-server].read_size`: the granule an explicit read of a
+    /// model file uses, in KiB.
+    ///
+    /// A span smaller than this is widened outward to it and the wanted bytes
+    /// taken from the middle; a larger one is read in chunks of it. Only the
+    /// explicit routes use it (`engine::expert_read`'s `pread`/`direct`) —
+    /// the default `mmap` route leaves request size to the kernel's
+    /// readahead.
+    ///
+    /// A key rather than a constant because the number that matters is the
+    /// device's, not the format's: the request size at which a drive stops
+    /// paying one round trip per read varies with the controller, the bus and
+    /// the bridge in front of it. See [`DEFAULT_READ_SIZE`] for the
+    /// measurement the default comes from.
+    pub read_size: usize,
     /// `[orangu-server].tls_cert` / `tls_key`: PEM paths for serving HTTPS.
     ///
     /// Both or neither — one alone is a configuration error rather than a
@@ -817,6 +854,31 @@ pub fn load_server_configuration(
         None => KvCache::default(),
     };
 
+    // Rejected rather than clamped, and page-aligned rather than rounded: a
+    // read granule that is not a multiple of the page size cannot satisfy
+    // `O_DIRECT`, and silently rounding a stated number would make a sweep's
+    // arms differ from the values it thinks it set.
+    let read_size = match section.get("read_size") {
+        Some(value) => {
+            let kib = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].read_size: {err}"))?;
+            if kib == 0 {
+                return Err(anyhow!(
+                    "[{SERVER_SECTION}].read_size must be at least 4 (one page)"
+                ));
+            }
+            if !kib.is_multiple_of(4) {
+                return Err(anyhow!(
+                    "[{SERVER_SECTION}].read_size must be a multiple of 4 (the page size),                      got {kib}"
+                ));
+            }
+            kib
+        }
+        None => DEFAULT_READ_SIZE,
+    };
+
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "auto" => BackendPreference::Auto,
@@ -895,6 +957,7 @@ pub fn load_server_configuration(
         web_host_explicit,
         backend,
         kv_cache,
+        read_size,
         queue_limit,
         draft_model,
         draft_tokens,
@@ -1494,6 +1557,41 @@ mod tests {
             err.to_string().contains("slots"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// The key exists, parses, defaults to 8 MiB, and rejects the two values
+    /// that would produce an unaligned read — a config that does not mention
+    /// it behaves exactly as it did before the key existed.
+    #[test]
+    fn the_read_size_key_parses_defaults_and_rejects_unaligned_values() {
+        let load = |line: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /tmp\n{line}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+
+        assert_eq!(load("").unwrap().read_size, DEFAULT_READ_SIZE);
+        assert_eq!(
+            load("").unwrap().read_size,
+            8192,
+            "the default is 8 MiB — measured +36% decode on a cold mixture-of-experts model"
+        );
+        assert_eq!(load("read_size = 4\n").unwrap().read_size, 4);
+        assert_eq!(load("read_size = 65536\n").unwrap().read_size, 65536);
+
+        // Zero is not "no widening", it is a read of nothing.
+        let err = load("read_size = 0\n").unwrap_err().to_string();
+        assert!(err.contains("read_size"), "unexpected error: {err}");
+
+        // `O_DIRECT` needs page alignment, so a granule that is not a whole
+        // number of pages is refused rather than quietly rounded — a swept
+        // value that does not survive to the read is an arm that secretly
+        // ran the control.
+        let err = load("read_size = 6\n").unwrap_err().to_string();
+        assert!(err.contains("multiple of 4"), "unexpected error: {err}");
+
+        let err = load("read_size = banana\n").unwrap_err().to_string();
+        assert!(err.contains("read_size"), "unexpected error: {err}");
     }
 
     /// The key exists, parses all three values, and defaults to `f16` — the

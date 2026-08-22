@@ -169,6 +169,26 @@ impl SplitPlan {
         self.per_device_layers.last().copied().unwrap_or(0) > 0
     }
 
+    /// Whether this plan puts anything anywhere other than device 0 — a
+    /// *relocation*, of which a split is one kind.
+    ///
+    /// [`is_split`](Self::is_split) asks whether the layers ended up on more
+    /// than one device, which is the wrong question for a fill: moving every
+    /// layer off device 0 onto device 1 is not a split by that test and is
+    /// emphatically a plan worth keeping. Discarding it hands the model back
+    /// to device 0 — the device the fill just decided could not hold it.
+    ///
+    /// Measured: a `BF16` model whose embeddings and `lm_head` alone exceed
+    /// the discrete card zeroed that card's budget, so the fill correctly put
+    /// all 35 layers on the 21 GiB integrated GPU — and `plan` threw the
+    /// answer away because only one device had layers.
+    pub fn relocates(&self) -> bool {
+        self.per_device_layers
+            .iter()
+            .skip(1)
+            .any(|&layers| layers > 0)
+    }
+
     /// `layers 0-23 -> device 0, 24-31 -> device 1`, for the banner.
     pub fn describe(&self, device_names: &[String]) -> String {
         let mut parts = Vec::new();
@@ -214,14 +234,16 @@ pub fn plan(
         // Not a share at all — see the variant's own doc.
         SplitMode::Cpu => {
             let plan = fill_in_order(per_layer_bytes, capacities);
-            // `runs_on_host`, not just `is_split`: a fill that put *every*
-            // layer on the host is still a plan worth returning, because
-            // the embeddings and `lm_head` stay on device 0 either way
+            // `relocates`, not just `is_split`: a fill that put *every*
+            // layer somewhere other than device 0 — the host, or a second
+            // card — is still a plan worth returning, because the
+            // embeddings and `lm_head` stay on device 0 either way
             // (`LoadedModel::device_for_tensor`). Discarding it as "not a
-            // split" would hand the whole model back to the GPU — which is
+            // split" would hand the whole model back to device 0 — which is
             // the paging this mode exists to avoid, arrived at by asking
-            // for the opposite.
-            return (plan.is_split() || plan.runs_on_host()).then_some(plan);
+            // for the opposite. `relocates` covers the host case
+            // `runs_on_host` used to and the second-card case it missed.
+            return (plan.is_split() || plan.relocates()).then_some(plan);
         }
         SplitMode::Auto => {
             // The whole of `Auto`: only spread a model that does not fit
@@ -367,6 +389,46 @@ mod tests {
     /// look only at the count.
     fn layers(n: usize) -> Vec<u64> {
         vec![0; n]
+    }
+
+    /// The reported crash, reduced: a fill whose head device has no budget
+    /// left puts every layer on the *second* device. That is one device, so
+    /// `is_split` is false — and returning `None` for it handed the model
+    /// back to the device the fill had just rejected.
+    #[test]
+    fn a_fill_that_moves_every_layer_off_device_zero_is_kept() {
+        let per_layer = vec![256 * 1024 * 1024u64; 35];
+        // Device 0's budget is zero: the embeddings and `lm_head` already
+        // exceeded it, which is exactly what `apply_device_split` computes
+        // for a large-vocabulary BF16 model on a small card.
+        let caps = vec![Some(0), Some(18 * 1024 * 1024 * 1024), None];
+        let plan = plan(&SplitMode::Cpu, &per_layer, &caps, 9 * 1024 * 1024 * 1024)
+            .expect("a fill that relocates every layer is a plan worth keeping");
+        assert!(!plan.is_split(), "all layers landed on one device");
+        assert!(plan.relocates(), "but not on device 0");
+        assert!(!plan.runs_on_host(), "and not on the host either");
+        assert!(plan.layer_device.iter().all(|&d| d == 1));
+    }
+
+    /// `relocates` is about device 0, not about the host, so it still covers
+    /// the case `runs_on_host` used to.
+    #[test]
+    fn a_fill_that_spills_to_the_host_still_relocates() {
+        let per_layer = vec![4 * 1024 * 1024 * 1024u64; 4];
+        let caps = vec![Some(0), None];
+        let plan = plan(&SplitMode::Cpu, &per_layer, &caps, 16 * 1024 * 1024 * 1024)
+            .expect("everything on the host is a plan");
+        assert!(plan.runs_on_host());
+        assert!(plan.relocates());
+    }
+
+    /// A fill that changes nothing is still nothing — device 0 holding every
+    /// layer is the placement that already happens without a split.
+    #[test]
+    fn a_fill_that_keeps_everything_on_device_zero_is_not_a_plan() {
+        let per_layer = vec![64 * 1024 * 1024u64; 4];
+        let caps = vec![Some(64 * 1024 * 1024 * 1024), None];
+        assert!(plan(&SplitMode::Cpu, &per_layer, &caps, 256 * 1024 * 1024).is_none());
     }
 
     #[test]
