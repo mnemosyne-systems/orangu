@@ -925,6 +925,10 @@ fn prepare(args: Args) -> Result<Prepared> {
         conf.backend,
         &requested_device(device_flag.as_deref(), &conf.device),
     )?;
+    // Before any prompt is prefilled: the chunker's sizer aims at a driver
+    // timeout, and on a backend that has none it reads the clock as a
+    // per-token rate that a streamed model does not have.
+    engine::generate::set_chunk_policy(backend.has_submission_timeout());
     // The split decision needs only the *weight* side of the footprint,
     // which is readable straight from the loaded tensor table — the KV side
     // needs a built model, and the model cannot be built until placement is
@@ -1077,7 +1081,24 @@ fn prepare(args: Args) -> Result<Prepared> {
     if let Some(split) = &split {
         loaded.set_layer_devices(split.plan.layer_device.clone());
     }
-    plan_expert_tier(&mut loaded, backend.as_ref(), weights_device_bytes);
+    // After the model is built — `LoadedModel::matrix` has stamped every
+    // tensor by then — and before the first token, so the sweep sees a
+    // complete table on its first pass.
+    engine::dense_residency::register(loaded.layer_weight_spans(loaded.config.n_layer));
+    // Two caveats belong in the message rather than in a doc nobody reads at
+    // 2am. The release hook lives in `CpuBackend::matmul_into` and nowhere
+    // else, so on layers a device executes this knob does exactly nothing —
+    // silence there would read as "it is working". And it was measured at
+    // three windows and never won: stating that here is cheaper than an
+    // operator re-deriving it.
+    if engine::dense_residency::enabled() {
+        eprintln!(
+            "orangu-server: dense residency: releasing each layer's weights once the sweep is \
+             past it (ORANGU_DENSE_WINDOW). Applies only to layers the CPU executes. \
+             Measured at windows 1, 4 and 32: none beat leaving residency to the kernel."
+        );
+    }
+    let expert_tier_active = plan_expert_tier(&mut loaded, backend.as_ref(), weights_device_bytes);
     // Captured here, while the concrete backend is still in hand, because the
     // `wgpu` engine is the only thing that knows which of its kernels feature
     // negotiation and the `ORANGU_*` flags actually left live — and that
@@ -1190,7 +1211,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // be worth. A projection, printed because the question otherwise
         // can only be answered by building the tier first — see
         // `engine::expert_tier`.
-        for line in expert_tier_projection(&loaded, footprint, wgpu) {
+        for line in expert_tier_projection(&loaded, footprint, wgpu, expert_tier_active) {
             eprintln!("{line}");
         }
         // No refusal here, deliberately. A device with no headroom left is a
@@ -1201,16 +1222,6 @@ fn prepare(args: Args) -> Result<Prepared> {
     }
 
     let slots = SlotPool::with_queue_limit(conf.slots, conf.queue_limit);
-    // Cross-sequence GEMM batching, off by default: a real, reproducible
-    // concurrent-load measurement (`ORANGU_BATCH_DECODE=1` vs. without,
-    // same `slots` count, 4 concurrent 100-token generations) showed it
-    // 25-55% *slower*, not faster, even with the batched path fully
-    // GPU-resident — see `engine::generate::Engine::batch_coordinator`'s
-    // own doc comment for the numbers and the likely cause. Only built at
-    // all when `slots > 1` (nothing to batch across otherwise) *and* the
-    // env var is set.
-    let batch_coordinator = (conf.slots > 1 && crate::engine::env::flag_on("ORANGU_BATCH_DECODE"))
-        .then(|| engine::batch::BatchCoordinator::new(slots.clone()));
     // Cross-request KV-cache prefix reuse (`engine::prefix_cache`),
     // **off by default; opt in with `ORANGU_PREFIX_CACHE=1`**. Unlike
     // every other opt-in-then-promoted flag in this codebase (`wide_load`,
@@ -1316,7 +1327,6 @@ fn prepare(args: Args) -> Result<Prepared> {
         tokenizer,
         chat_template_source,
         slots,
-        batch_coordinator,
         prefix_cache,
         slot_store,
         role,
@@ -2506,7 +2516,9 @@ fn plan_before_download(repo: &str, yes: bool) -> Result<bool> {
     if plan.dense_fits_in(cpu.available_memory_bytes) || yes {
         return Ok(true);
     }
-    confirm("\nThis model cannot run on this machine. Download anyway? [y/N]: ")
+    confirm(
+        "\nThis model is larger than this machine's RAM and will stream from disk, which is slow. Download anyway? [y/N]: ",
+    )
 }
 
 /// The GPU a plan should be judged against — the one the server would load
@@ -2829,13 +2841,18 @@ fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Resul
 /// here because a routing profile belongs to a session and this runs before
 /// the first token. That makes this the floor a tier achieves, which is
 /// what the startup projection has always reported.
+/// Returns whether a tier was actually stamped onto the model. Every early
+/// return here is a reason there is no tier, and the projection printed later
+/// has to agree with that — the two lines sit three screens apart in the
+/// startup output and a reader who believes the wrong one debugs the wrong
+/// half of the engine.
 fn plan_expert_tier(
     loaded: &mut engine::loader::LoadedModel,
     backend: &dyn Backend,
     weights_device_bytes: u64,
-) {
+) -> bool {
     if !engine::arch::gpu_experts() {
-        return;
+        return false;
     }
     // Streaming makes a resident tier redundant *and* harmful: it holds
     // whatever this call needs in a bounded region that rewinds, so a fixed
@@ -2847,19 +2864,19 @@ fn plan_expert_tier(
             "orangu-server: [{}] expert weights stream per batch; no resident tier is planned",
             backend.as_wgpu().map_or("cpu", |w| w.api_tag()),
         );
-        return;
+        return false;
     }
     let Some(wgpu) = backend.as_wgpu() else {
-        return;
+        return false;
     };
     let Some(total) = wgpu.device_in_use().vram_total_bytes else {
         // A device that will not say how big it is cannot be given a
         // budget, and guessing one is how an arena silently overruns.
-        return;
+        return false;
     };
     let tensors = loaded.expert_tensors();
     if tensors.is_empty() {
-        return;
+        return false;
     }
     // Half the headroom after the dense weights, leaving the rest for the
     // KV cache and the transient arenas — the same reservation the startup
@@ -2900,6 +2917,24 @@ fn plan_expert_tier(
         residency.insert(name.clone(), flags);
         at += n_expert;
     }
+    // Before anything is stamped onto the model: a tier that cannot pay is
+    // not merely useless, it is VRAM taken from the KV cache and the
+    // transient arenas, which on a small card is the ceiling everything else
+    // runs into. Declining is a decision worth printing with its number, not
+    // a silent no-op.
+    let floor = engine::expert_tier::coverage_floor();
+    if !engine::expert_tier::worth_building(plan.coverage(), floor) {
+        eprintln!(
+            "orangu-server: [{}] expert tier declined: the budget of {} would cover only \
+             {:.1}% of recorded routing, under the {:.0}% floor — that VRAM goes to the KV \
+             cache and the arenas instead. Set ORANGU_EXPERT_TIER_FLOOR=<percent> to override.",
+            wgpu.api_tag(),
+            orangu::format::format_bytes(plan.resident_bytes()),
+            plan.coverage().unwrap_or(0.0) * 100.0,
+            floor * 100.0,
+        );
+        return false;
+    }
     eprintln!(
         "orangu-server: [{}] expert tier: {} of {} experts on device ({}), filled by {}",
         wgpu.api_tag(),
@@ -2917,6 +2952,7 @@ fn plan_expert_tier(
         },
     );
     loaded.set_expert_residency(residency);
+    true
 }
 
 /// What a device-resident expert tier in this device's free VRAM would
@@ -2932,6 +2968,7 @@ fn expert_tier_projection(
     loaded: &engine::loader::LoadedModel,
     footprint: &engine::footprint::DeviceFootprint,
     wgpu: &VulkanBackend,
+    active: bool,
 ) -> Vec<String> {
     let expert_bytes = footprint.weights_host_bytes;
     if expert_bytes == 0 {
@@ -2975,9 +3012,12 @@ fn expert_tier_projection(
         / 2;
     let slots = heat.len();
     let plan = engine::expert_tier::plan(&heat, &[headroom]);
-    // Whether the tier this projects is the one actually running: the same
-    // knob `plan_expert_tier` gates on, so the two lines cannot disagree.
-    let active = engine::arch::gpu_experts();
+    // Whether the tier this projects is the one actually running — passed in
+    // from `plan_expert_tier`'s own outcome rather than re-derived from
+    // `gpu_experts()`. The knob being on is no longer sufficient: a tier
+    // under the coverage floor is declined with the knob set, and reading the
+    // knob here printed "the tier above is active" directly beneath "expert
+    // tier declined".
     engine::expert_tier::projection(wgpu.api_tag(), &plan, slots, true, active)
 }
 

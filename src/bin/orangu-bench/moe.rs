@@ -149,6 +149,84 @@ pub fn records(stats: &serde_json::Value, label: &str, n: u32, reps: u32) -> Vec
     out
 }
 
+/// The `io` records — bytes this run actually pulled off the disk, per token.
+///
+/// Separate from [`records`] because that one returns early on a model with
+/// no experts, and this is the figure that matters most on the models that
+/// have none: a dense model larger than RAM is *entirely* an I/O problem.
+///
+/// **A count, not a rate.** `DISK.md` records this rig's drive collapsing
+/// from 207 MB/s to 31 after forty seconds of continuous reading, and decode
+/// throughput drifting 14% across one afternoon — every timing there has to
+/// be interleaved and repeated to mean anything. Bytes moved does not drift:
+/// two runs of the same prompt against the same model read the same number,
+/// and the D1d sweep reproduced it to three significant figures while the
+/// wall-clock arms disagreed by 19%. That is why it is emitted as its own
+/// `mode` rather than folded into a throughput column.
+///
+/// `tokens` is what the window produced, so `io_bytes_per_token` is directly
+/// comparable across prompt lengths; `reps` divides the faults, which
+/// accumulate.
+pub fn io_records(
+    stats: &serde_json::Value,
+    label: &str,
+    n: u32,
+    tokens: f64,
+    reps: u32,
+) -> Vec<history::Record> {
+    let mut out = Vec::new();
+    let date = history::today();
+    let mut push = |mode: &str, value: f64| {
+        out.push(history::Record {
+            date: date.clone(),
+            label: label.to_string(),
+            mode: mode.to_string(),
+            n,
+            best: value,
+            mean: value,
+            sd: 0.0,
+            sd_sample: None,
+            device: None,
+        });
+    };
+    if let Some(read) = number(stats, &["process", "read_bytes_window"])
+        && tokens > 0.0
+    {
+        push("io_mb_per_token", read / tokens / (1024.0 * 1024.0));
+    }
+    if let Some(faults) = number(stats, &["process", "major_faults_window"]) {
+        push("io_majflt", faults / f64::from(reps.max(1)));
+    }
+    out
+}
+
+/// The `io` line under a table: what this run cost the disk.
+///
+/// `None` when the server reported nothing — which is every non-Linux host,
+/// and is reported as absence rather than as zero for the reason
+/// `resident_bytes` is: "read nothing" and "cannot tell you" are different
+/// claims and only one of them means the page cache did its job.
+pub fn io_line(stats: &serde_json::Value, tokens: f64) -> Option<String> {
+    let read = number(stats, &["process", "read_bytes_window"])?;
+    let gib = read / (1024.0 * 1024.0 * 1024.0);
+    let mut line = format!("  io       read {gib:.2} GiB from disk");
+    if tokens > 0.0 {
+        line.push_str(&format!(
+            "  ·  {:.1} MiB/token",
+            read / tokens / (1024.0 * 1024.0)
+        ));
+    }
+    if let Some(faults) = number(stats, &["process", "major_faults_window"]) {
+        line.push_str(&format!("  ·  {faults:.0} major faults"));
+    }
+    // A warm run reads nothing, and that is a result rather than a missing
+    // measurement — say so, so nobody reads the zero as a broken counter.
+    if read == 0.0 {
+        line.push_str("  (fully cached)");
+    }
+    Some(line)
+}
+
 /// The `moe` line under a table, or `None` when there is nothing to say.
 ///
 /// Deliberately reports `bytes_dequantized` against `bytes_unique` in the
@@ -196,6 +274,45 @@ pub fn residency_line(residency: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A warm run reads nothing, and the line has to say that rather than
+    /// look like a counter that failed — the two are indistinguishable from
+    /// a bare `0.00 GiB`, and only one of them means the page cache worked.
+    #[test]
+    fn a_fully_cached_run_says_so_instead_of_showing_a_bare_zero() {
+        let warm = serde_json::json!({
+            "process": {"read_bytes_window": 0u64, "major_faults_window": 0u64}
+        });
+        let line = io_line(&warm, 128.0).expect("a line");
+        assert!(line.contains("fully cached"), "{line}");
+    }
+
+    /// The whole point of the mode: per-token bytes, so two prompt lengths
+    /// are comparable.
+    #[test]
+    fn io_bytes_are_reported_per_token() {
+        let stats = serde_json::json!({
+            "process": {"read_bytes_window": 1024u64 * 1024 * 200, "major_faults_window": 40u64}
+        });
+        let records = io_records(&stats, "x", 512, 100.0, 2);
+        let per_token = records
+            .iter()
+            .find(|r| r.mode == "io_mb_per_token")
+            .expect("io_mb_per_token");
+        assert!((per_token.best - 2.0).abs() < 1e-9, "{}", per_token.best);
+        // Faults divide by repetitions; bytes-per-token already does not.
+        let faults = records.iter().find(|r| r.mode == "io_majflt").unwrap();
+        assert!((faults.best - 20.0).abs() < 1e-9, "{}", faults.best);
+    }
+
+    /// A host that cannot report `/proc` must produce no row at all, not a
+    /// zero row that a chart would draw as "this run read nothing".
+    #[test]
+    fn a_server_that_reports_no_io_produces_no_io_rows() {
+        let silent = serde_json::json!({"stats": {"layer_calls": 4}});
+        assert!(io_records(&silent, "x", 512, 100.0, 1).is_empty());
+        assert!(io_line(&silent, 100.0).is_none());
+    }
     use super::*;
 
     fn stats(

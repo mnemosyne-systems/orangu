@@ -795,7 +795,23 @@ pub const COOP_GEOM_DEFAULT: CoopGeom = CoopGeom {
     threads_x: 8,
     reg_rows: 4,
     reg_tokens: 8,
-    chunk: 16,
+    // **32, and the static metrics all say it should be 16.** Doubling the
+    // chunk doubles shared memory to 12 KiB, which takes occupancy from 10
+    // subgroups per SIMD to 6, raises the instruction count 12-28% and makes
+    // ACO's modelled inverse throughput two to three times worse. It is also
+    // measurably faster: `+3.4%` on `gemma-4-E2B Q4_K_M` and `+4.3%` on
+    // `Llama-3.2-3B Q4_K_M` at `pp512`, with all four of the second model's
+    // arms above all four of its `chunk 16` arms.
+    //
+    // An earlier sweep recorded `32` as 3.1% *slower*. That sweep ran its
+    // arms in a fixed order, and the later slot on this rig is worth about
+    // 3% on its own — every arm here holds every position exactly once
+    // instead. See `DISK.md`, D7.
+    //
+    // The honest summary is that this kernel's throughput is not predicted by
+    // occupancy, instruction count or the scheduler's own model, so a
+    // geometry can only be chosen by measuring it.
+    chunk: 32,
 };
 
 /// Whether the tiled GEMM stages its two shared tiles as `f16` instead of
@@ -1521,6 +1537,55 @@ fn coop_tiled_x_fill(g: CoopGeom) -> String {
 /// Each specialization must be read against its type's `dequant_element` in
 /// the corresponding `*_COOP_MIDDLE`; they are two statements of one format,
 /// and `matmul_matches_cpu_backend_*` is what holds them to it.
+/// Whether a run's weight bytes can be pulled as whole dwords instead of one
+/// `read_u8` each.
+///
+/// `read_u8` is a dword load plus `>>2`, `&3`, `*8`, a shift and a mask — so
+/// four consecutive elements load **the same dword four times** and pay the
+/// address arithmetic four times. An ISA census of this kernel put the tile
+/// fill at 520 integer operations and 84 VMEM loads per outer iteration,
+/// against 118 instructions of accumulation; this is what most of that is.
+///
+/// It is only sound when the stream is 4-byte aligned, and that is a fact
+/// about the *type*, not the geometry:
+///
+/// | type | block bytes | aligned |
+/// | :-- | --: | :-- |
+/// | `Q4_K` | 144 | yes |
+/// | `Q5_K` | 176 | yes |
+/// | `Q6_K` | **210** | **no** |
+///
+/// `Q6_K`'s block is 2-aligned, so `byte_offset` lands on an odd dword
+/// boundary for every odd block and the loads would straddle. It keeps the
+/// per-byte path. The run also has to be a multiple of four for the byte
+/// index within a dword to be a compile-time constant — with a dynamic index
+/// the extraction would go through scratch and lose more than it saves.
+fn tile_dword_fill_ok(ggml_type: u32, run: u32) -> bool {
+    let aligned_block = ggml_type == GGML_TYPE_Q4_K || ggml_type == GGML_TYPE_Q5_K;
+    aligned_block
+        && run.is_multiple_of(4)
+        && !crate::engine::env::flag_on("ORANGU_NO_TILE_DWORD_FILL")
+}
+
+/// `run` consecutive bytes of one stream, loaded as `run / 4` aligned dwords
+/// bound to `{name}_d0..`, for [`dword_byte`] to slice.
+fn dword_stream(name: &str, base: &str, run: u32) -> String {
+    let mut s = format!("    let {name}_w = ({base}) >> 2u;\n");
+    for d in 0..run / 4 {
+        s.push_str(&format!(
+            "    let {name}_d{d} = weights[{name}_w + {d}u];\n"
+        ));
+    }
+    s
+}
+
+/// Byte `i` of a [`dword_stream`], as an expression. Both indices are
+/// compile-time constants, so this is one shift and one mask on a value
+/// already in a register.
+fn dword_byte(name: &str, i: u32) -> String {
+    format!("(({name}_d{} >> {}u) & 0xFFu)", i / 4, (i % 4) * 8)
+}
+
 fn coop_tiled_run_fill(ggml_type: u32, run: u32) -> String {
     let body = match ggml_type {
         t if t == GGML_TYPE_Q4_K => {
@@ -1540,9 +1605,18 @@ fn coop_tiled_run_fill(ggml_type: u32, run: u32) -> String {
                  \x20   var shift: u32 = 0u;\n\
                  \x20   if ((local_k0 % 64u) >= 32u) {\n        shift = 4u;\n    }\n",
             );
+            let dwords = tile_dword_fill_ok(ggml_type, run);
+            if dwords {
+                s.push_str(&dword_stream("q", "q_base", run));
+            }
             for i in 0..run {
+                let byte = if dwords {
+                    dword_byte("q", i)
+                } else {
+                    format!("read_u8(q_base + {i}u)")
+                };
                 s.push_str(&format!(
-                    "    store_w(rr, kk0 + {i}u, ds * f32((read_u8(q_base + {i}u) >> shift) & 0xFu) - dm);\n"
+                    "    store_w(rr, kk0 + {i}u, ds * f32(({byte} >> shift) & 0xFu) - dm);\n"
                 ));
             }
             s
@@ -1568,11 +1642,24 @@ fn coop_tiled_run_fill(ggml_type: u32, run: u32) -> String {
                  \x20   let ql_base = byte_offset + 48u + idx * 32u + l0;\n\
                  \x20   let qh_base = byte_offset + 16u + l0;\n",
             );
+            let dwords = tile_dword_fill_ok(ggml_type, run);
+            if dwords {
+                s.push_str(&dword_stream("ql", "ql_base", run));
+                s.push_str(&dword_stream("qh", "qh_base", run));
+            }
             for i in 0..run {
+                let (ql, qh) = if dwords {
+                    (dword_byte("ql", i), dword_byte("qh", i))
+                } else {
+                    (
+                        format!("read_u8(ql_base + {i}u)"),
+                        format!("read_u8(qh_base + {i}u)"),
+                    )
+                };
                 s.push_str(&format!(
-                    "    let lo{i} = (read_u8(ql_base + {i}u) >> nib_shift) & 0xFu;\n\
+                    "    let lo{i} = ({ql} >> nib_shift) & 0xFu;\n\
                      \x20   var hi{i}: i32 = 0;\n\
-                     \x20   if ((read_u8(qh_base + {i}u) & umask) != 0u) {{\n        hi{i} = 16;\n    }}\n\
+                     \x20   if (({qh} & umask) != 0u) {{\n        hi{i} = 16;\n    }}\n\
                      \x20   store_w(rr, kk0 + {i}u, ds * f32(i32(lo{i}) + hi{i}) - dm);\n"
                 ));
             }
@@ -9147,8 +9234,24 @@ mod coop_geom_tests {
         assert_eq!(COOP_GEOM_DEFAULT.check(), Ok(()));
         assert_eq!(COOP_GEOM_DEFAULT.tile_rows(), 32);
         assert_eq!(COOP_GEOM_DEFAULT.tile_tokens(), 64);
-        assert_eq!(COOP_GEOM_DEFAULT.lds_bytes(), 6_144);
-        assert_eq!(COOP_GEOM_DEFAULT.run(), 8);
+        assert_eq!(COOP_GEOM_DEFAULT.lds_bytes(), 12_288);
+        assert_eq!(COOP_GEOM_DEFAULT.run(), 16);
+    }
+
+    /// The default's shared memory has to fit the *smallest* device this
+    /// engine runs on, not the one it was tuned on. `wgpu`'s default
+    /// `max_compute_workgroup_storage_size` is 16 KiB — half the 32 KiB
+    /// `check` allows — so a geometry can pass validation here and still fail
+    /// pipeline creation on a conforming device. The default must not be one
+    /// of those.
+    #[test]
+    fn the_default_fits_the_smallest_conforming_device() {
+        const WGPU_DEFAULT_WORKGROUP_STORAGE: u32 = 16 * 1024;
+        assert!(
+            COOP_GEOM_DEFAULT.lds_bytes() <= WGPU_DEFAULT_WORKGROUP_STORAGE,
+            "{} B of shared memory exceeds wgpu's default limit of {WGPU_DEFAULT_WORKGROUP_STORAGE} B",
+            COOP_GEOM_DEFAULT.lds_bytes(),
+        );
     }
 
     /// The rule that matters most, because breaking it is silent and
@@ -9270,6 +9373,68 @@ mod coop_geom_tests {
 #[cfg(test)]
 mod coop_tiled_fill_tests {
     use super::*;
+
+    /// The dword fill is a correctness cliff, not a tuning knob: `Q6_K`'s
+    /// 210-byte block puts every odd block on an odd dword boundary, and
+    /// enabling it there fails
+    /// `matmul_matches_cpu_backend_cooperative_path_q6_k` immediately —
+    /// verified by temporarily removing the exclusion, not merely reasoned
+    /// about. This pins the gate so a later type addition has to think about
+    /// alignment rather than inherit it.
+    #[test]
+    fn only_four_byte_aligned_blocks_take_the_dword_fill() {
+        assert!(
+            tile_dword_fill_ok(GGML_TYPE_Q4_K, 8),
+            "Q4_K blocks are 144B"
+        );
+        assert!(
+            tile_dword_fill_ok(GGML_TYPE_Q5_K, 8),
+            "Q5_K blocks are 176B"
+        );
+        assert!(
+            !tile_dword_fill_ok(GGML_TYPE_Q6_K, 8),
+            "Q6_K blocks are 210B — 2-aligned, so dword loads straddle"
+        );
+    }
+
+    /// A run that is not a multiple of four would need a *dynamic* byte index
+    /// into the loaded dwords, which goes through scratch and loses more than
+    /// the loads save.
+    #[test]
+    fn a_run_that_is_not_a_multiple_of_four_keeps_the_byte_fill() {
+        for run in [1u32, 2, 8, 16] {
+            assert_eq!(
+                tile_dword_fill_ok(GGML_TYPE_Q4_K, run),
+                run.is_multiple_of(4),
+                "run {run}"
+            );
+        }
+    }
+
+    /// What the two paths actually emit, read out of the generated text —
+    /// the same reason the fill tests above parse WGSL rather than
+    /// re-deriving it.
+    #[test]
+    fn the_dword_fill_replaces_four_byte_loads_with_one() {
+        let src = coop_tiled_run_fill(GGML_TYPE_Q4_K, 8);
+        assert_eq!(
+            src.matches("weights[q_w +").count(),
+            2,
+            "eight bytes must come from two dwords, not eight loads:\n{src}"
+        );
+        assert!(
+            !src.contains("read_u8(q_base"),
+            "no per-byte load may survive on the aligned path:\n{src}"
+        );
+
+        // And Q6_K keeps every one of them.
+        let q6 = coop_tiled_run_fill(GGML_TYPE_Q6_K, 8);
+        assert_eq!(
+            q6.matches("read_u8(ql_base").count(),
+            8,
+            "Q6_K stays per-byte"
+        );
+    }
 
     /// The straight-line activation fill, as the offsets it actually emits.
     ///

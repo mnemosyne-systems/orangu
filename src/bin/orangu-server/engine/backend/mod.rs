@@ -307,6 +307,30 @@ pub(crate) const MATMUL_ONLY_SURFACE: &str =
     "matmul only - no fused layer chain, GPU attention or GPU sampling";
 
 pub trait Backend: Send + Sync {
+    /// Whether one submission to this backend is subject to a driver
+    /// timeout — a limit on how long a *single* forward pass may run before
+    /// the device is reset out from under it.
+    ///
+    /// `engine::generate`'s prefill chunker exists to stay inside that limit,
+    /// and it sizes each chunk by dividing the last chunk's wall time by its
+    /// token count. That quotient is a per-token rate only when the model is
+    /// resident. When the weights are streamed from disk each pass pays a
+    /// largely *fixed* cost — the model is read once per pass whatever the
+    /// pass contains — so a narrow chunk reports a huge apparent rate, the
+    /// sizer narrows the next one, and the fixed cost is paid again over
+    /// fewer tokens. Measured, that spiral turned one pass and 6.4 GiB into
+    /// 39 passes and 134 GiB.
+    ///
+    /// **The default is `true`, and it has to be.** Neither
+    /// [`Backend::as_wgpu`] nor `ModelForward::vulkan_backend` can answer this
+    /// question: both are `None` for the CPU backend *and* for the CUDA,
+    /// OpenCL and ROCm ones, which very much do reset. A backend that says
+    /// nothing therefore keeps the chunker exactly as it is today; only one
+    /// that can prove it has no device to lose overrides this.
+    fn has_submission_timeout(&self) -> bool {
+        true
+    }
+
     /// `y[t, o] = sum_i x[t, i] * w.row(o)[i]` — `x` is `[n_tokens,
     /// w.in_dim]`, `y` is `[n_tokens, w.out_dim]`. `w`'s rows are
     /// dequantized on demand, not pre-materialized.

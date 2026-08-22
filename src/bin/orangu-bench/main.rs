@@ -57,6 +57,7 @@ mod moe;
 mod points;
 mod profile;
 mod report;
+mod storage;
 mod sweep;
 mod web;
 
@@ -185,6 +186,26 @@ struct Args {
     /// Only render the chart from an existing history file; measure nothing.
     #[arg(long, default_value_t = false)]
     chart_only: bool,
+
+    /// Storage mode: comma-separated read request sizes in KiB to sweep.
+    #[arg(long, value_name = "LIST")]
+    storage_probe: Option<String>,
+
+    /// File the storage probe reads. Defaults to the server's largest shard.
+    #[arg(long, value_name = "PATH")]
+    storage_file: Option<String>,
+
+    /// MiB to read at each request size, per pass.
+    #[arg(long, default_value_t = 256, value_name = "MIB")]
+    storage_span: u64,
+
+    /// MiB read and discarded before timing starts, at each size.
+    #[arg(long, default_value_t = 32, value_name = "MIB")]
+    storage_ramp: u64,
+
+    /// Run each `--sweep` server under this memory cap (e.g. `4G`).
+    #[arg(long, value_name = "SIZE")]
+    cap: Option<String>,
 
     /// Also render a PNG beside the chart SVG.
     #[arg(long, default_value_t = false)]
@@ -931,6 +952,14 @@ fn run(args: &Args) -> anyhow::Result<()> {
         return write_chart(args, &[]);
     }
 
+    // Before every server-touching mode: the probe measures the *device*, not
+    // the engine, so it neither needs a server nor should be charged for one
+    // being up. It does need a real file on the filesystem under test —
+    // `--storage-file`, or the largest shard the server reports.
+    if let Some(sizes) = &args.storage_probe {
+        return storage_probe(args, sizes);
+    }
+
     // Same shape as `--chart-only`: reads artifacts, touches no server.
     if !args.compare_profiles.is_empty() {
         return compare_profiles(args);
@@ -1580,6 +1609,34 @@ fn raster_twin(svg: &str) -> Option<std::path::PathBuf> {
 /// same artifacts a hand-run A/B would. The comparison table at the end is
 /// against the **first** value, so listing the current default first makes the
 /// percentages read as "what changing it would buy".
+/// `--cap`: run the swept server inside a memory-capped cgroup.
+///
+/// **The regime this document spends most of its length in is not reachable
+/// without one.** A model smaller than RAM is served from the page cache and
+/// measures the CPU; the interesting behaviour — streaming, `dense_pass_ratio`,
+/// the whole D1 family — only appears once the working set exceeds what the
+/// kernel will hold, and on a 62 GiB host that means either a 60 GiB model or
+/// a cap. The cap is repeatable and takes seconds.
+///
+/// `systemd-run --user --scope` rather than a `cgroup` written by hand: it
+/// needs no root, cleans the transient scope up when the process exits, and —
+/// the part that matters to [`sweep::start`] — **`exec`s into the command**,
+/// so the supervised pid is still the server's and not a wrapper's. That is
+/// load-bearing: the sweep identifies its server by pid and would otherwise
+/// kill a wrapper and leave the server running into the next point.
+///
+/// `MemorySwapMax=0` is not optional. Without it the kernel satisfies the cap
+/// by swapping instead of by evicting page cache, which measures the swap
+/// device rather than the model's read path and looks like a much slower disk.
+fn capped(cmd: &str, cap: Option<&str>) -> String {
+    match cap {
+        None => cmd.to_string(),
+        Some(cap) => {
+            format!("systemd-run --user --scope -q -p MemoryMax={cap} -p MemorySwapMax=0 -- {cmd}")
+        }
+    }
+}
+
 fn run_sweep(args: &Args) -> anyhow::Result<()> {
     let spec = sweep::Spec::parse(args.sweep.as_deref().expect("checked by the caller"))?;
     let cmd = args.sweep_cmd.as_deref().ok_or_else(|| {
@@ -1600,6 +1657,8 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
     let timeout = std::time::Duration::from_secs(args.sweep_start_timeout);
+    let cmd = capped(cmd, args.cap.as_deref());
+    let cmd = cmd.as_str();
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(args.timeout))
@@ -2551,10 +2610,24 @@ fn run_tg(
             device: None,
         });
         records.extend(moe::records(&moe_stats, label, depth, args.reps.max(1)));
-        if !args.json
-            && let Some(line) = moe::summary_line(&moe_stats)
-        {
-            println!("{line}");
+        // Every repetition in the window generated `--gen` tokens, and the
+        // window is bracketed by the two `take_stats` calls above, so this is
+        // what the disk was asked for per token of output.
+        let generated = f64::from(args.n_gen) * f64::from(args.reps.max(1));
+        records.extend(moe::io_records(
+            &moe_stats,
+            label,
+            depth,
+            generated,
+            args.reps.max(1),
+        ));
+        if !args.json {
+            if let Some(line) = moe::summary_line(&moe_stats) {
+                println!("{line}");
+            }
+            if let Some(line) = moe::io_line(&moe_stats, generated) {
+                println!("{line}");
+            }
         }
     }
 
@@ -2577,6 +2650,130 @@ fn record_and_chart(args: &Args, records: &[history::Record]) -> anyhow::Result<
         }
     }
     write_chart(args, records)
+}
+
+/// `--storage-probe`: the block-size curve `[orangu-server].read_size` is set
+/// from, as one command.
+///
+/// Touches no server for the measurement itself — the subject is the device.
+/// It will *ask* a server which file to read, because the interesting file is
+/// the one the engine actually streams and nobody wants to type a shard path;
+/// `--storage-file` skips that and works with nothing running.
+fn storage_probe(args: &Args, sizes: &str) -> anyhow::Result<()> {
+    let sizes: Vec<u32> = sizes
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| anyhow::anyhow!("--storage-probe wants KiB sizes, got {s:?}: {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if sizes.is_empty() {
+        anyhow::bail!("--storage-probe needs at least one request size in KiB");
+    }
+
+    let path = match &args.storage_file {
+        Some(p) => std::path::PathBuf::from(p),
+        None => largest_shard(args)?,
+    };
+    // Named before the probe runs, not after: the sweep takes minutes and the
+    // one thing that invalidates all of it is reading the wrong device.
+    if !args.json {
+        println!("  probe    {}", path.display());
+        println!(
+            "  sweep    {} sizes x 2 passes x {} MiB, {} MiB ramp",
+            sizes.len(),
+            args.storage_span,
+            args.storage_ramp
+        );
+    }
+
+    let points = storage::sweep(
+        &path,
+        &sizes,
+        args.storage_span * 1024 * 1024,
+        args.storage_ramp * 1024 * 1024,
+    )
+    .map_err(|e| anyhow::anyhow!("storage probe on {}: {e}", path.display()))?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "file": path.display().to_string(),
+                "points": points.iter().map(|p| serde_json::json!({
+                    "kib": p.kib, "mb_s": p.mean(), "up": p.up, "down": p.down,
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        print!("{}", storage::table(&points));
+    }
+
+    let label = args
+        .label
+        .clone()
+        .unwrap_or_else(|| device_label(&path).unwrap_or_else(|| "storage".to_string()));
+    record_and_chart(args, &storage::records(&points, &label))
+}
+
+/// The biggest file backing the running model, from `/model-cache`.
+///
+/// The largest shard rather than the first: a probe wants a file long enough
+/// to read hundreds of MiB out of without wrapping, and on a sharded model
+/// the small shards are not that.
+fn largest_shard(args: &Args) -> anyhow::Result<std::path::PathBuf> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let residency = moe::take_residency(&client, &args.url);
+    let best = residency
+        .get("shards")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some((
+                s.get("bytes")?.as_u64()?,
+                s.get("path")?.as_str()?.to_string(),
+            ))
+        })
+        .max_by_key(|(bytes, _)| *bytes);
+    match best {
+        Some((_, path)) => Ok(std::path::PathBuf::from(path)),
+        // The probe is useful with no server at all, so this is a nudge to the
+        // flag that makes it so rather than a hard failure about the server.
+        None => anyhow::bail!(
+            "no server at {} to name a model file — pass --storage-file <PATH> to probe a \
+             file directly",
+            args.url
+        ),
+    }
+}
+
+/// The block device a path lives on, for the history `label` — so two drives
+/// in one machine draw two lines instead of overwriting each other.
+///
+/// `None` when it cannot be worked out, which is not worth failing over: the
+/// caller falls back to a generic label and the curve is still recorded.
+fn device_label(path: &std::path::Path) -> Option<String> {
+    let mount = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let canonical = path.canonicalize().ok()?;
+    // The longest mount point that is a prefix of the file's path is the
+    // filesystem it is on — `/mnt/ai` beats `/` for a file under `/mnt/ai`.
+    mount
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let point = fields.nth(4)?;
+            let source = line.rsplit(' ').nth(1)?;
+            canonical
+                .starts_with(point)
+                .then(|| (point.len(), source.to_string()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, source)| source.rsplit('/').next().unwrap_or(&source).to_string())
 }
 
 /// Render `--chart` from `--history`. `extra` is folded in so a chart requested
@@ -3047,11 +3244,28 @@ fn run_pp(
                 s.prompt_tokens,
                 args.reps.max(1),
             ));
+            // Prefill's per-token I/O is the figure that separates a model
+            // that streams from one that fits: at one pass it is a fraction
+            // of the model, and at one pass per chunk it is the whole model
+            // over and over.
+            records.extend(moe::io_records(
+                &moe_stats,
+                label,
+                s.prompt_tokens,
+                f64::from(s.prompt_tokens) * f64::from(args.reps.max(1)),
+                args.reps.max(1),
+            ));
         }
-        if !args.json
-            && let Some(line) = moe::summary_line(&moe_stats)
-        {
-            println!("{line}");
+        if !args.json {
+            if let Some(line) = moe::summary_line(&moe_stats) {
+                println!("{line}");
+            }
+            if let Some(line) = moe::io_line(
+                &moe_stats,
+                f64::from(s.prompt_tokens) * f64::from(args.reps.max(1)),
+            ) {
+                println!("{line}");
+            }
         }
     }
     Ok(records)
@@ -4311,6 +4525,30 @@ fn run_curve(
 
 #[cfg(test)]
 mod tests {
+
+    /// `--cap` has to keep the server the *last* thing on the command line,
+    /// after `--`, or `systemd-run` swallows the server's own flags as its
+    /// own. It also has to pin swap off: a cap the kernel can satisfy by
+    /// swapping measures the swap device, not the model's read path.
+    #[test]
+    fn the_cap_wraps_the_command_without_eating_its_arguments() {
+        let wrapped = capped("orangu-server -c cfg.conf model:Q4_K_M", Some("4G"));
+        assert!(
+            wrapped.ends_with("-- orangu-server -c cfg.conf model:Q4_K_M"),
+            "{wrapped}"
+        );
+        assert!(wrapped.contains("MemoryMax=4G"), "{wrapped}");
+        assert!(wrapped.contains("MemorySwapMax=0"), "{wrapped}");
+    }
+
+    /// No cap must leave the command byte-identical: `--sweep` without
+    /// `--cap` is the control arm for every capped run, and a wrapper that
+    /// is "almost nothing" is still a difference between the arms.
+    #[test]
+    fn no_cap_leaves_the_command_untouched() {
+        let plain = "orangu-server -c cfg.conf model";
+        assert_eq!(capped(plain, None), plain);
+    }
     use super::*;
 
     /// The placement plan a split server reports under `props.gpu`, as

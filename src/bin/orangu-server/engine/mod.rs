@@ -16,9 +16,9 @@
 pub mod arch;
 pub mod attention;
 pub mod backend;
-pub mod batch;
 pub mod chat_template;
 pub mod constraint;
+pub mod dense_residency;
 pub mod env;
 pub mod expert_read;
 pub mod expert_store;

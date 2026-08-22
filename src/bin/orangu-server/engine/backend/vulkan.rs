@@ -57,8 +57,24 @@
 //! token these calls hit the cache and skip buffer/bind-group creation
 //! entirely, down to just an activation upload + dispatch + readback.
 
+mod layouts;
+mod meta;
+mod pipeline_cache;
+use layouts::{
+    argmax_bind_group_layout, argmax_split_bind_group_layout, attn_bind_group_layout,
+    bind_group_layout, elem2_bind_group_layout, elem3_bind_group_layout, elem4_bind_group_layout,
+    elem5_bind_group_layout,
+};
+use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
+// `RopeYarn` and `rope_layout_code` keep their `vulkan::` path: four
+// architectures name them, and a move must not rewrite call sites.
+use meta::{
+    ArgmaxSampleResources, ArgmaxSplitMeta, AttnMeta, AttnReduceMeta, AttnSplitMeta, ElemMeta,
+    FusedNormRopeMeta, Meta, PerHeadNormMeta, RopeMeta, SampleMeta,
+};
+pub use meta::{RopeYarn, rope_layout_code};
+
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::device::{self, DeviceCandidate, DeviceClass};
@@ -67,63 +83,6 @@ use super::vulkan_shaders;
 use super::{Backend, MatmulOp};
 use crate::engine::loader::QuantMatrix;
 
-/// Bind group layout shared by every type's pipeline: `weights` (storage,
-/// read-only, the raw quantized bytes), `x` (storage, read-only, the
-/// input activations), `y` (storage, read-write, the output), `meta`
-/// (uniform, the shapes — see `vulkan_shaders::PRELUDE`'s `Meta` struct).
-fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server matmul bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(false),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // The `IQ*` codebooks (`vulkan_shaders::IQ_GRID_PRELUDE`). Only
-            // the five `IQ*` types' shaders declare this binding; it is in
-            // the shared layout regardless because a bind group layout may
-            // carry entries a shader never reads — only the reverse is
-            // rejected — and one layout for every matmul pipeline is worth
-            // more than saving a ~15 KiB binding on the other eleven.
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-        ],
-    })
-}
-
 /// The `IQ*` codebooks packed for upload — `engine::iq_grids::packed`,
 /// which is where the packing lives now that three other backends need the
 /// identical bytes. The offsets `vulkan_shaders::IQ_GRID_PRELUDE` declares
@@ -131,584 +90,6 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// packing` holds the WGSL to them.
 fn iq_grid_words() -> Vec<u32> {
     crate::engine::iq_grids::packed::words()
-}
-
-/// `Meta` in `vulkan_shaders::PRELUDE` — `#[repr(C)]` so its layout matches
-/// WGSL's `struct Meta { in_dim: u32, out_dim: u32, n_tokens: u32,
-/// row_bytes: u32 }` field-for-field.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Meta {
-    in_dim: u32,
-    out_dim: u32,
-    n_tokens: u32,
-    row_bytes: u32,
-}
-
-/// `ElemMeta` in `vulkan_shaders::ELEM_META` — `#[repr(C)]` so its layout
-/// matches WGSL's `struct ElemMeta { len: u32, aux: u32, extra: f32,
-/// out_scale: f32 }` field-for-field. `extra` is `eps` for the RMSNorm
-/// pipeline, the multiplier for the scale pipeline, and unused (left `0.0`) for
-/// add/mul/gelu. `out_scale` is `layer_output_scale` for the
-/// `rmsnorm_add_scale` pipeline only (see
-/// `vulkan_shaders::shader_source_rmsnorm_add_scale`); left `0.0` and unread by
-/// every other shader.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ElemMeta {
-    len: u32,
-    /// A second integer whose meaning is the shader's: the KV-cast shader
-    /// reads it as a destination `offset`, the bias-add shader as the `row`
-    /// width to broadcast along. `0` and unread everywhere else. Shared rather
-    /// than grown into per-shader structs because the binding layout is what
-    /// costs, and these three agree on everything except this word.
-    aux: u32,
-    extra: f32,
-    out_scale: f32,
-}
-
-/// `AttnMeta` in `vulkan_shaders::ATTENTION_SHADER` — `#[repr(C)]` so its
-/// layout matches WGSL's `struct AttnMeta` field-for-field. The last four
-/// fields are read only by the multi-query (prefill) variant of the kernel,
-/// which derives each query's own window from them; the single-query variant
-/// takes `window_start`/`n_pos` as given and leaves them zero.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnMeta {
-    n_head: u32,
-    n_head_kv: u32,
-    head_dim: u32,
-    window_start: u32,
-    n_pos: u32,
-    capacity: u32,
-    scale: f32,
-    start_pos: u32,
-    n_query: u32,
-    n_swa: u32,
-    causal: u32,
-    _pad: u32,
-}
-
-/// `AttnSplitMeta` in `vulkan_shaders::ATTENTION_SPLIT_SHADER_TEMPLATE` —
-/// `#[repr(C)]` so its layout matches WGSL's `struct AttnSplitMeta {
-/// n_head: u32, n_head_kv: u32, head_dim: u32, window_start: u32, n_pos:
-/// u32, k_num: u32, scale: f32, _pad: u32 }` field-for-field. Almost
-/// `AttnMeta`'s own shape, `capacity` swapped for `k_num` — split-k phase
-/// 1 doesn't need `capacity` (it never reads past `n_pos`, unlike the
-/// un-split kernel which doesn't either — `capacity` is otherwise unused
-/// dead weight in `AttnMeta` too, kept there only for layout stability
-/// with `probs_scratch`-era code).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnSplitMeta {
-    n_head: u32,
-    n_head_kv: u32,
-    head_dim: u32,
-    window_start: u32,
-    n_pos: u32,
-    k_num: u32,
-    scale: f32,
-    _pad: u32,
-}
-
-/// `AttnReduceMeta` in `vulkan_shaders::ATTENTION_SPLIT_REDUCE_SHADER` —
-/// `#[repr(C)]` so its layout matches WGSL's `struct AttnReduceMeta {
-/// head_dim: u32, k_num: u32, _pad0: u32, _pad1: u32 }` field-for-field.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnReduceMeta {
-    head_dim: u32,
-    k_num: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-/// The YaRN tail both [`RopeMeta`] and [`FusedNormRopeMeta`] carry — five
-/// `f32`s plus padding to a 16-byte multiple, matching the fields
-/// `vulkan_shaders::ROPE_YARN_WGSL` documents in each WGSL struct.
-///
-/// Nested here rather than spelled out twice because a rope kernel that
-/// disagrees with its fused twin is silent: same shapes, same magnitudes,
-/// wrong angle.
-///
-/// `#[repr(C)]` with only 4-byte members, so nesting it costs no padding and
-/// the bytes land exactly where the inlined WGSL fields expect them.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RopeYarn {
-    freq_scale: f32,
-    ext_factor: f32,
-    /// ggml's `mscale`, already folded with `attn_factor`.
-    mscale: f32,
-    corr_lo: f32,
-    corr_hi: f32,
-    _pad: [u32; 3],
-}
-
-impl RopeYarn {
-    /// The unscaled rope every non-YaRN model uses: `freq_scale * theta` with
-    /// `freq_scale == 1.0` and `sin/cos * 1.0`, both exact in IEEE 754, so a
-    /// shader carrying this is bit-identical to one with no YaRN terms at all.
-    pub const IDENTITY: Self = Self {
-        freq_scale: 1.0,
-        ext_factor: 0.0,
-        mscale: 1.0,
-        corr_lo: 0.0,
-        corr_hi: 0.0,
-        _pad: [0; 3],
-    };
-
-    /// The GPU form of a CPU [`crate::engine::tensor::RopeParams`], taking the
-    /// derived constants from [`crate::engine::tensor::RopeParams::yarn_terms`]
-    /// rather than recomputing them.
-    pub fn from_params(params: &crate::engine::tensor::RopeParams) -> Self {
-        let (corr_lo, corr_hi, mscale) = params.yarn_terms();
-        Self {
-            freq_scale: params.freq_scale,
-            ext_factor: params.ext_factor,
-            mscale,
-            corr_lo,
-            corr_hi,
-            _pad: [0; 3],
-        }
-    }
-}
-
-/// `RopeMeta` in `vulkan_shaders::ROPE_SHADER` — `#[repr(C)]` so its
-/// layout matches WGSL's `struct RopeMeta { n_head: u32, head_dim: u32,
-/// rope_dim: u32, pos: u32, freq_base: f32, n_tokens: u32, pairing: u32,
-/// _pad2: u32, <RopeYarn> }` field-for-field. `n_head` is heads *per token*
-/// and `n_tokens` the rows in the batch; `pos` is the first row's position.
-/// `layout` is `0` for NEOX pairing and `1` for NORM — see
-/// [`rope_layout_code`].
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct RopeMeta {
-    n_head: u32,
-    head_dim: u32,
-    rope_dim: u32,
-    pos: u32,
-    freq_base: f32,
-    n_tokens: u32,
-    /// `0` = NEOX, `1` = NORM. Named `pairing` rather than `layout` because
-    /// WGSL reserves the latter.
-    pairing: u32,
-    _pad2: u32,
-    yarn: RopeYarn,
-}
-
-/// The `RopeMeta::layout` code for a CPU-side [`crate::engine::tensor::
-/// RopeLayout`], so the two descriptions of one convention live next to each
-/// other instead of as a bare `0`/`1` at each call site.
-pub fn rope_layout_code(layout: crate::engine::tensor::RopeLayout) -> u32 {
-    match layout {
-        crate::engine::tensor::RopeLayout::Neox => 0,
-        crate::engine::tensor::RopeLayout::Norm => 1,
-    }
-}
-
-/// `PerHeadNormMeta` in `vulkan_shaders::PERHEAD_RMSNORM_SHADER`/
-/// `PERHEAD_RMSNORM_WEIGHTLESS_SHADER` — `#[repr(C)]` so its layout
-/// matches WGSL's `struct PerHeadNormMeta { n_head: u32, head_dim: u32,
-/// eps: f32, _pad: u32 }` field-for-field.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PerHeadNormMeta {
-    n_head: u32,
-    head_dim: u32,
-    eps: f32,
-    _pad: u32,
-}
-
-/// `FusedNormRopeMeta` in `vulkan_shaders::FUSED_NORM_ROPE_SHADER` —
-/// `#[repr(C)]` so its layout matches WGSL's `struct FusedNormRopeMeta {
-/// n_head: u32, head_dim: u32, rope_dim: u32, pos: u32, freq_base: f32,
-/// eps: f32, _pad0: u32, _pad1: u32, <RopeYarn> }` field-for-field. The union
-/// of `RopeMeta`'s and `PerHeadNormMeta`'s own fields (`n_head` is common to
-/// both, so this has one copy, not two).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct FusedNormRopeMeta {
-    n_head: u32,
-    head_dim: u32,
-    rope_dim: u32,
-    pos: u32,
-    freq_base: f32,
-    eps: f32,
-    /// `0` = NEOX, `1` = NORM — see [`rope_layout_code`]. Named to match
-    /// `RopeMeta::pairing`; WGSL reserves `layout`.
-    pairing: u32,
-    _pad1: u32,
-    yarn: RopeYarn,
-}
-
-/// `SampleMeta` in `vulkan_shaders::ARGMAX_PENALTY_SHADER` —
-/// `#[repr(C)]` so its layout matches WGSL's `struct SampleMeta {
-/// n_vocab: u32, n_recent: u32, repeat_penalty: f32, logit_softcap: f32 }`
-/// field-for-field.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct SampleMeta {
-    n_vocab: u32,
-    n_recent: u32,
-    repeat_penalty: f32,
-    /// Gemma final-logit softcap `cap` (`cap * tanh(v / cap)`), applied to
-    /// every logit by the softcap phase *before* the repeat-penalty phase —
-    /// so the GPU sample path reproduces the CPU order softcap → penalty →
-    /// argmax exactly. `0.0` means "no softcap" (the softcap phase is not
-    /// dispatched, so the value is never read in that case).
-    logit_softcap: f32,
-}
-
-/// `ArgmaxSplitMeta` in `vulkan_shaders::ARGMAX_SPLIT_SHADER` —
-/// `#[repr(C)]` so its layout matches WGSL's `struct ArgmaxSplitMeta {
-/// n_vocab: u32, n_split: u32, _pad0: u32, _pad1: u32 }` field-for-field.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxSplitMeta {
-    n_vocab: u32,
-    n_split: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-/// Per-slot GPU-sample scratch, cached across decode steps so
-/// `VulkanBackend::record_argmax_sample` allocates **nothing** on the hot
-/// path — every decode token reuses the same buffers and bind groups,
-/// re-writing only the three per-token uniforms (logits, recent-token list,
-/// `SampleMeta`) via `queue.write_buffer`. Keyed by `batch_slot` (like
-/// `op_cache`) so concurrently-decoding sequences never share the same
-/// `out_buf`/`logits_buf`. Every field is `wgpu`'s `Arc`-backed handle, so a
-/// caller clones the few it needs out from under the cache lock and records
-/// without holding it. The `split_meta`/`reduce_meta`/`partial_*` buffers
-/// aren't stored explicitly — the `split_bind_group`/`reduce_bind_group`
-/// keep them alive, and their contents are constant for a given `n_vocab`
-/// (written once at build). Rebuilt when `n_vocab` changes or a call needs a
-/// larger recent-token window than the cached `recent_cap`.
-struct ArgmaxSampleResources {
-    n_vocab: usize,
-    recent_cap: usize,
-    logits_buf: wgpu::Buffer,
-    recent_buf: wgpu::Buffer,
-    out_buf: wgpu::Buffer,
-    sample_meta_buf: wgpu::Buffer,
-    penalty_bind_group: wgpu::BindGroup,
-    split_bind_group: wgpu::BindGroup,
-    reduce_bind_group: wgpu::BindGroup,
-}
-
-/// Bind group layout for the binary elementwise/norm shaders (`add`, `mul`,
-/// `rmsnorm`): two read-only storage buffers, one read-write storage
-/// buffer, one uniform — `rmsnorm`'s `(x, weight, y, meta)` happens to have
-/// the exact same binding shape as `add`/`mul`'s `(a, b, y, meta)`, so all
-/// three share one layout and one pipeline layout.
-fn elem4_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server elem4 bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(false),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    })
-}
-
-/// Bind group layout for `rmsnorm_add_pipeline` — RMSNorm fused with an
-/// immediately-following residual add, in one dispatch: `x`/`weight` (both
-/// read-only storage, RMSNorm's own inputs), `residual` (read-only
-/// storage, the value added after normalizing), `y` (read-write storage,
-/// the final post-add output), `meta` (uniform). See `shader_source_
-/// rmsnorm_add`'s own doc comment for why this exists as a fifth binding
-/// rather than reusing `elem4_bind_group_layout`.
-fn elem5_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server elem5 bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(false),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    })
-}
-
-/// Bind group layout for the unary elementwise shaders (`gelu`, `scale`):
-/// one read-only storage buffer, one read-write storage buffer, one
-/// uniform.
-fn elem3_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server elem3 bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(false),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    })
-}
-
-/// Bind group layout for `perhead_rmsnorm_weightless_pipeline` (V's
-/// weightless norm): one read-write storage buffer, one uniform — no
-/// weight vector, unlike [`elem3_bind_group_layout`]'s shape.
-fn elem2_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server elem2 bind group layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    })
-}
-
-/// Bind group layout for `attn_pipeline`: `aq` (storage, read-only, this
-/// token's query vectors), `k_cache`/`v_cache` (storage, read-only, the
-/// GPU-resident KV cache mirror — see `engine::kv_cache::GpuLayerCache`),
-/// `probs_scratch` (storage, read-write, softmax working memory),
-/// `aout` (storage, read-write, the attention output), `am` (uniform,
-/// shapes/position) — see `vulkan_shaders::shader_source_attention`.
-fn attn_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty,
-        count: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server attention bind group layout"),
-        entries: &[
-            entry(0, storage(true)),
-            entry(1, storage(true)),
-            entry(2, storage(true)),
-            entry(3, storage(false)),
-            entry(4, storage(false)),
-            entry(
-                5,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-        ],
-    })
-}
-
-/// Bind group layout for `vulkan_shaders::ARGMAX_PENALTY_SHADER` —
-/// `logits` (storage, read-write: mutated in place by the repeat-penalty
-/// step), `recent_tokens` (storage, read-only), `out_token` (storage,
-/// read-write, one `u32`, unused by this phase but still bound — same
-/// layout the whole `record_argmax_sample` chain shares this bind group
-/// for), `meta` (uniform).
-fn argmax_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty,
-        count: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server argmax sample bind group layout"),
-        entries: &[
-            entry(0, storage(false)),
-            entry(1, storage(true)),
-            entry(2, storage(false)),
-            entry(
-                3,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-        ],
-    })
-}
-
-/// Bind group layout for `vulkan_shaders::ARGMAX_SPLIT_SHADER` — `logits`
-/// (storage, read-only: the penalty phase already ran), `partial_val`/
-/// `partial_idx` (storage, read-write — each of `ARGMAX_SPLIT_N`
-/// workgroups writes its own slot), `meta` (uniform). Distinct from
-/// `argmax_bind_group_layout` above: binding 1 is read-write here
-/// (`partial_val`, an output), read-only there (`recent_tokens`, an
-/// input) — the two shapes don't coincide the way `elem4_bind_group_
-/// layout` happens to fit the merge phase (see `ARGMAX_REDUCE_SHADER_
-/// BODY`'s own doc comment).
-fn argmax_split_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |read_only: bool| wgpu::BindingType::Buffer {
-        ty: wgpu::BufferBindingType::Storage { read_only },
-        has_dynamic_offset: false,
-        min_binding_size: None,
-    };
-    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty,
-        count: None,
-    };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("orangu-server argmax split bind group layout"),
-        entries: &[
-            entry(0, storage(true)),
-            entry(1, storage(false)),
-            entry(2, storage(false)),
-            entry(
-                3,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-        ],
-    })
-}
-
-/// `~/.orangu/server/<key>/cache.bin` — a persistent, on-disk pipeline
-/// cache. `key` is `wgpu::util::pipeline_cache_key`'s output
-/// (vendor/device-derived, so a cache built
-/// for one GPU is never handed to a different one), one directory per
-/// adapter rather than a flat file, matching `web::sessions::sessions_dir`'s
-/// own "one identifier, one directory" shape rather than introducing a
-/// second, differently-shaped convention. `None` if the home directory
-/// can't be resolved — this cache is a startup-time optimization only,
-/// never required for correctness, so a missing `$HOME` just means "skip
-/// the cache," not "fail to start."
-fn pipeline_cache_file_path(key: &str) -> Option<PathBuf> {
-    Some(
-        home::home_dir()?
-            .join(".orangu/server")
-            .join(key)
-            .join("cache.bin"),
-    )
-}
-
-/// Writes `data` to `path` atomically (temp file, then rename over the
-/// real path) — `wgpu::PipelineCache`'s own doc comment recommends exactly
-/// this so a crash or concurrent write mid-save can never leave a
-/// truncated, half-written cache file for the next startup to try to load.
-fn save_pipeline_cache(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
 }
 
 /// `(weight cache_key.0, weight cache_key.1, in_dim, out_dim, row_bytes,
@@ -1516,9 +897,9 @@ pub struct VulkanBackend {
     /// kernels (this one, wide-load-alone, packed-alone) are chosen among.
     ///
     /// Correctness-verified; kept available as a selectable combination
-    /// rather than a default (same precedent as `gpu_sample`/
-    /// `ORANGU_BATCH_DECODE` — `kv_storage`'s `F16` mode moved off this
-    /// list once it became on-by-default itself).
+    /// rather than a default (same precedent as `gpu_sample` — and
+    /// `kv_storage`'s `F16` mode moved off this list once it became
+    /// on-by-default itself).
     wide_packed_pipeline: Option<wgpu::ComputePipeline>,
     /// Memory-level-parallelism decode kernel for `Q4_K`
     /// (`vulkan_shaders::shader_source_reduce_q4k_wide_unroll`).
@@ -3502,7 +2883,7 @@ impl VulkanBackend {
         // separate `subgroupAdd` calls per workgroup, one per row) was pure
         // overhead. **Off by default; opt in with `ORANGU_SUBGROUP=1`** —
         // kept available as an honest negative result, the same precedent
-        // as `gpu_sample`/`ORANGU_BATCH_DECODE`, not deleted, since
+        // as `gpu_sample`, not deleted, since
         // a different adapter/driver's `subgroupAdd` lowering could still
         // make this pay off.
         // Not stored as a field — every kernel it affects is a straight
@@ -3552,7 +2933,7 @@ impl VulkanBackend {
         // compute pass, which is what `TIMESTAMP_QUERY_INSIDE_ENCODERS`
         // (distinct from the stricter `TIMESTAMP_QUERY_INSIDE_PASSES`)
         // covers. **Off by default; opt in with `ORANGU_GPU_TIMESTAMPS=1`**
-        // — same precedent as `gpu_sample`/`ORANGU_BATCH_DECODE`: a
+        // — same precedent as `gpu_sample`: a
         // diagnostic for measuring where a decode step's time actually
         // goes, useful before prioritizing among further optimization
         // work, not something to run by default.
@@ -6308,8 +5689,9 @@ pub struct FusedPostAttentionInput<'a> {
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
     /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
-    /// (single-sequence) caller, `1..=batch_len` only from `GemmaModel::
-    /// record_batched_decode_forward`'s per-sequence chain.
+    /// (single-sequence) caller, and non-zero only where a caller threads
+    /// its own slot id in to keep concurrent requests off each other's
+    /// cached buffers.
     pub batch_slot: usize,
 }
 
@@ -6637,7 +6019,7 @@ pub struct FusedAttnInput<'a> {
     pub cache: &'a mut crate::engine::kv_cache::LayerCache,
     /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
     /// (single-sequence) caller, `1..=batch_len` only from `GemmaModel::
-    /// record_batched_decode_forward`'s per-sequence chain. Note this is
+    /// per-sequence chain. Note this is
     /// unrelated to `cache`'s own per-request isolation (`GpuAttnDispatch`
     /// is already keyed per `LayerCache`, batched or not) — `batch_slot`
     /// exists purely to keep the *model-scoped* caches
@@ -12992,68 +12374,6 @@ impl VulkanBackend {
         }
 
         result
-    }
-
-    /// Finishes and submits `encoder` **once**, then reads back every one
-    /// of `sources`' own `(buffer, element count)` pairs — the multi-
-    /// result counterpart to `submit_and_readback`/`submit_and_readback_
-    /// for`'s single-buffer versions, needed by `GemmaModel::record_
-    /// batched_decode_forward` to read back all `M` sequences' own
-    /// `[n_vocab]` logits from **one** shared submission (the entire point
-    /// of that method: one GPU round trip for the whole batch, not one per
-    /// sequence). Allocates a fresh readback buffer per source rather than
-    /// reusing any op-cache-owned one (`submit_and_readback_for`'s own
-    /// approach) — the sources here are `M` different `batch_slot`s' own
-    /// cached output buffers, and copying every one of them into a shared
-    /// pool of *fresh* destinations sidesteps needing this function to
-    /// know anything about which weight/slot each source came from. One
-    /// `map_async` per source, fired before the single shared `poll`
-    /// below — the same "one poll drains every callback" pattern
-    /// `matmul_batch_dispatch` already uses for its own multi-op readback.
-    pub fn submit_and_readback_batch(
-        &self,
-        mut encoder: wgpu::CommandEncoder,
-        sources: &[(&wgpu::Buffer, u64, usize)],
-    ) -> Vec<Vec<f32>> {
-        let readback_buffers: Vec<wgpu::Buffer> = sources
-            .iter()
-            .map(|&(src, src_offset, len_f32)| {
-                let byte_len = (len_f32 as u64) * 4;
-                let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("orangu-server batched decode readback"),
-                    size: byte_len,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                encoder.copy_buffer_to_buffer(src, src_offset, &readback, 0, byte_len);
-                readback
-            })
-            .collect();
-
-        self.queue.submit(Some(encoder.finish()));
-        self.submission_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        const CONTEXT: &str = "reading back a batched decode step";
-        let wait = MapWait::new();
-        for readback in &readback_buffers {
-            readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, wait.callback());
-        }
-        self.poll_blocking(CONTEXT);
-        wait.check(CONTEXT);
-
-        readback_buffers
-            .iter()
-            .map(|readback| {
-                let data = self.mapped_bytes(readback, CONTEXT);
-                let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-                drop(data);
-                readback.unmap();
-                result
-            })
-            .collect()
     }
 
     /// Whether `GemmaModel::record_decode_forward` should write per-layer

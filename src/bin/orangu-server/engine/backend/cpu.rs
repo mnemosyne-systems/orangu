@@ -433,6 +433,13 @@ impl CpuBackend {
 }
 
 impl Backend for CpuBackend {
+    /// There is no ring to reset and no driver to give up on a submission:
+    /// a long forward pass on the host is slow, not fatal. See the trait
+    /// method for what the chunker does with this.
+    fn has_submission_timeout(&self) -> bool {
+        false
+    }
+
     /// Both allocating entry points go through the `_into` forms, so there
     /// is one implementation of each kernel rather than two that could
     /// drift apart.
@@ -444,6 +451,17 @@ impl Backend for CpuBackend {
 
     fn matmul_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
         debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+        // The one place every CPU weight read funnels through, and the only
+        // point handed something that knows which layer it belongs to. That
+        // is what lets `engine::dense_residency` follow the sweep without any
+        // architecture's forward pass being aware of it — the same trick
+        // `engine::placement` uses to route a split model.
+        //
+        // Inert unless `ORANGU_DENSE_WINDOW` is set: one `OnceLock` read and
+        // one relaxed compare.
+        if let Some(layer) = w.layer() {
+            crate::engine::dense_residency::touch(layer);
+        }
         if self.matmul_fused_into(out, x, n_tokens, w) {
             return;
         }
@@ -604,48 +622,5 @@ mod tests {
             bytes.extend(block);
         }
         bytes
-    }
-
-    /// The invariant `engine::arch::gemma`'s `forward_batch_decode_matches_
-    /// independent_forward_calls_cpu` checks end to end on a real model, at
-    /// the one call this module is responsible for and without needing a
-    /// 4 GB GGUF: a decode batch's row `t` must be **bit-for-bit** what that
-    /// token would have produced decoding on its own.
-    ///
-    /// It is [`Backend::matmul_decode`] that owes this, not [`Backend::
-    /// matmul`] — the latter is free to pick the faster multi-token GEMM
-    /// kernels, which round differently (see `matmul_fused_decode`). Both
-    /// GEMV kernels a decode batch can land on are covered: `Q8_0` takes
-    /// `dot_row`'s per-32 activation scale and `Q4_K` `dot_k_row`'s
-    /// per-super-block one, so a decode path that picks the other one for
-    /// either family fails here.
-    #[test]
-    fn decode_batch_is_bit_identical_to_deciding_each_token_alone() {
-        for (ggml_type, in_dim) in [(GGML_TYPE_Q8_0, 128), (GGML_TYPE_Q4_K, 512)] {
-            // Odd, so the trailing lone-row chunk of the paired GEMM paths
-            // is exercised rather than only the even pairs.
-            let out_dim = 7;
-            let n_tokens = 5;
-            let mut seed = 0x0051_AB1E_5EED_u64;
-            let bytes = weights(ggml_type, in_dim, out_dim, &mut seed);
-            let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
-
-            let x: Vec<f32> = (0..n_tokens * in_dim)
-                .map(|_| (next_byte(&mut seed) as f32 / 255.0) * 2.0 - 1.0)
-                .collect();
-
-            let batched = CpuBackend.matmul_decode(&x, n_tokens, &w);
-            for t in 0..n_tokens {
-                let alone = CpuBackend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, &w);
-                for (o, want) in alone.iter().enumerate() {
-                    let got = batched[t * out_dim + o];
-                    assert_eq!(
-                        want.to_bits(),
-                        got.to_bits(),
-                        "ggml_type {ggml_type}, token {t}, row {o}: alone={want} batched={got}"
-                    );
-                }
-            }
-        }
     }
 }

@@ -1658,31 +1658,11 @@ its own blocking-pool thread against its own KV cache — real concurrency,
 bounded fairly by slot count, but not a single fused multi-sequence GEMM by
 default.
 
-`engine::batch::BatchCoordinator` is an opt-in alternative for that last
-part: when `slots > 1` and the `ORANGU_BATCH_DECODE` environment variable
-is set, concurrently-decoding requests within a short window are collected
-and handed to `ModelForward::forward_batch_decode` as one call, fusing
-every sequence's QKV/`wo`/FFN/PLE/`lm_head` matmuls into a single backend
-call each (attention, RoPE, and the KV-cache write stay per-sequence, since
-each sequence has its own cache and position). Correctness-verified
-against independent per-sequence `forward` calls, but **off by default**:
-under concurrent load (4 requests, 100 tokens each, `slots=4`) it measured
-around 60% *slower* than the unbatched path — the generic `Backend::matmul`/
-`matmul_batch` interface reads results back to the CPU between steps,
-reintroducing per-layer round trips the Vulkan backend's own fused decode
-path (below) was specifically built to eliminate, and that cost outweighs
-the weight-bandwidth savings batching provides at this scale on the
-hardware this was measured on. Left available behind the flag rather than
-removed, since a genuinely GPU-resident batched-and-fused pipeline could
-plausibly flip this positive on different hardware — but **not at higher
-concurrency**, which has now been measured and does not flip it. See below.
-
-
-**The fused path has been measured at real batch sizes, and it loses.**
-`ORANGU_BATCH_DECODE=1` routes concurrent decode steps through
-`engine::batch::BatchCoordinator`, which collects whatever arrives inside a
-window (`ORANGU_BATCH_WAIT_MS`, 4 ms by default) and runs them as one
-`forward_batch_decode`. At 32 concurrent streams:
+Cross-sequence decode batching used to be an opt-in alternative for that
+last part (`ORANGU_BATCH_DECODE`), collecting concurrently-decoding requests
+inside a short window and fusing every sequence's QKV/`wo`/FFN/PLE/`lm_head`
+matmuls into one backend call each. **It has been removed**, because it was
+measured and it lost at every size it was tried at.
 
 | window | mean batch | aggregate tok/s |
 | ---: | ---: | ---: |
@@ -1691,21 +1671,26 @@ window (`ORANGU_BATCH_WAIT_MS`, 4 ms by default) and runs them as one
 | 100 ms | 22.55 | 44.67 |
 | 400 ms | 26.98 | 42.75 |
 
-The first row is why `/moe-stats` reports `batch.mean_batch`: an earlier
-comparison at the default window concluded "batching is 3% slower" when the
-mean batch size was 2, so it had measured a rendezvous rather than a batch. At
-a mean of 27 the fused path is 34% *slower* than not batching.
+At 32 concurrent streams and a mean batch of 27 the fused path was 34%
+*slower* than not batching. Unbatched decode reads ~78 GiB/s of weights here,
+at the card's ceiling; batched at mean 27 it read ~1.9 GiB/s and still
+delivered fewer tokens. Fusing does remove the weight-bandwidth bottleneck —
+what remains costs more than it saves: the per-sequence attention, RoPE and
+KV write the fused path left per-sequence, plus the window every sequence
+paid on every token.
 
-Unbatched decode reads ~78 GiB/s of weights here, at the card's ceiling;
-batched at mean 27 reads ~1.9 GiB/s and still delivers fewer tokens. Fusing
-does remove the weight-bandwidth bottleneck, and what remains — the
-per-sequence attention, RoPE and KV write the fused path leaves per-sequence,
-plus the window every sequence pays on every token — costs more than it saves.
+The first row is why an earlier comparison was wrong, and the reason worth
+keeping: it concluded "batching is 3% slower" at the default window, when the
+mean batch size was 2 — it had measured a rendezvous rather than a batch. That
+is why the mean batch size, not the window setting, is the number a batching
+claim has to carry.
 
-A rendezvous can only build a batch by making sequences wait, and the waiting
-loses at every size tried, so there is no window setting that wins. Closing
-this gap means a scheduler that batches whatever is ready on each step without
-waiting for stragglers, not a larger constant.
+**A rendezvous can only build a batch by making sequences wait, and the
+waiting lost at every size tried, so no window setting wins.** Closing this
+gap needs a scheduler that batches whatever is ready on each step without
+waiting for stragglers — not a larger constant, and not the code that was
+here.
+
 
 ### Serving over TLS (`tls.rs`)
 
@@ -2720,8 +2705,10 @@ or parsed, and are noted as such where they appear.
 
 | Variable | Default | Effect |
 | :-- | :-- | :-- |
-| `ORANGU_PREFILL_BATCH` | `512` (integer, not a presence flag) | **Ceiling** on how many prompt tokens go into one forward pass; the actual width is chosen per chunk by `ORANGU_PREFILL_CHUNK_MS` below and never exceeds this. `0` disables chunking entirely — the whole prompt in one submission, which is what prefill did unconditionally before this existed and which loses the device on any long prompt. Measured on a 4 GiB RX 5500M holding 2.5 GiB of weights, with a 17.5k-token prompt — no chunking: device lost after 21s; `2048`: device lost after 3m54s; `512`: completed in 4m13s, with peak VRAM identical (3.67 GiB) in all three. Not a throughput tax: at 8k tokens on the same card `512` prefilled at 115.4 tok/s against 105.5 unchunked, since a smaller working set pages less. |
-| `ORANGU_PREFILL_CHUNK_MS` | `3000` (integer) | Wall-clock target for one prefill submission. A chunk is timed and the next is scaled by the rate just measured, because cost per token climbs with context: a fixed 512-token chunk measured 2.3 s at position 512 and **10.1 s at position 6 656**, past the ~10 s `amdgpu` allows before it resets the device (see *Losing the GPU device*). A token-count limit alone therefore stops protecting anything on a long prompt. With this, a 48 000-token prompt that used to reset the device at position 7 680 completes with a slowest submission of 3.3 s. Lower it if resets still happen; the default leaves room for the estimate to lag a rate that only rises. |
+| `ORANGU_PREFILL_BATCH` | unset (chosen per prefill; see below) (integer, not a presence flag) | How many prompt tokens go into one forward pass. Setting it fixes the width in every regime and overrides the choice described here; `0` means the whole prompt in one pass. **Left unset, the width depends on the backend and on how much of the model is in RAM.** On a backend with a driver submission timeout the value is a *ceiling* the adaptive sizer works below (see `ORANGU_PREFILL_CHUNK_MS`), and it is `512`: measured on a 4 GiB card holding 2.5 GiB of weights with a 17.5k-token prompt, no chunking lost the device after 21 s, `2048` after 3m54s, and `512` completed in 4m13s with peak VRAM identical (3.67 GiB) in all three. On a backend with no such timeout the width is flat — no probe, no shrink — and is `512` when the model is resident and the whole prompt when it is not. Resident, narrow is faster and smaller: at 8,001 tokens, three interleaved pairs, `512` prefilled **10.6% faster** than one pass and peaked at 1,988 MB against 2,967. Streamed from disk the ordering reverses, because every extra pass re-reads what is not cached: at ~1,030 tokens one pass ran at **45.7 tok/s reading 1.29 GiB**, against 35.4 tok/s and 4.97 GiB at width 256. |
+| `ORANGU_PREFILL_CHUNK_MS` | `3000` (integer) | Wall-clock target for one prefill submission, **on a backend that has a submission timeout only**. A chunk is timed and the next is scaled by the rate just measured, because cost per token climbs with context: a fixed 512-token chunk measured 2.3 s at position 512 and **10.1 s at position 6 656**, past the ~10 s `amdgpu` allows before it resets the device (see *Losing the GPU device*). **It is ignored where there is no device to lose**, and deliberately: the quotient it adapts on is a per-token rate only for a resident model. When weights stream from disk each pass costs about the same whatever it contains, so a narrow chunk reports a huge apparent rate, the next chunk shrinks, and the fixed cost is paid again over fewer tokens. Measured, that does not settle — it lands on the 16-token floor on the *first* chunk and stays: a 1,016-token prompt became **63.8 passes and 78.5 GiB of reads on a 1.23 GiB model, prefilling at 0.8 tok/s**, against one pass, 1.29 GiB and 45.7 tok/s once the adaptation is dropped. |
+| `ORANGU_CHUNK_POLICY` | unset (chosen from the backend) | `adaptive` or `flat`, forcing the prefill splitting strategy that the backend would otherwise pick — `adaptive` is the timed sizer above, `flat` keeps every chunk the configured width. Exists so both strategies can be measured on one machine, since otherwise the choice is a property of the hardware and an A/B would need two of them. An unrecognised value, empty included, is ignored rather than treated as one of the two: a typo in a harness must not silently select an arm. |
+| `ORANGU_EXPERT_TIER_FLOOR` | `25` (percent) | The share of recorded routing a device expert tier must cover before it is built. Below it the tier is declined and the startup line says so, naming the coverage, the floor and the VRAM not spent — that VRAM goes to the KV cache and the transient arenas instead, which on a small card are what a tier competes with. **Coverage is only known once a routing profile exists** (`ORANGU_EXPERT_USAGE`); with no profile there is no evidence either way and the tier is built, since the profile can only be recorded by running with it on. The default rejects the obviously futile case rather than marking a measured optimum: the only coverage measured end-to-end here was 44.4%, and it was 9.4% slower on decode, so clearing the floor is not a promise that the tier pays. `0` never declines. |
 | `ORANGU_NO_MLP_UNROLL` | unset (block-unroll **on**) | Set to **disable** the block-unroll reduce kernel for K-quant (`Q4_K`/`Q5_K`/`Q6_K`) decode and fall back to the scalar per-element reduce kernel. The block-unroll iterates whole super-blocks, loading each block header once and issuing several weight/activation loads before the dependent dot; it is the default decode path. |
 | `ORANGU_NO_BLOCK_HOISTED` | unset (block-hoisted **on**) | Set to **disable** the block-hoisted decode kernel and fall back to the scalar per-element `reduce` for every type that has one. The block-unroll above is fast and covers only `Q4_K`/`Q5_K`/`Q6_K` (it hardcodes their 256-element super-block as a fixed 4x64 geometry); the element-wise `reduce` covers everything and re-decodes each block's header once *per element*, which for a 32-element block is 32 times over. The block-hoisted kernel is the third algorithm: several adjacent lanes share one block and take contiguous byte slices of it, so the header is amortized while the coalesced access shape is kept. It covers every remaining quantized type — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` — and is the control for any A/B of it. Term-for-term identical arithmetic to the element-wise path but a different summation order, so output is not bit-identical and a greedy argmax can flip on a near-tie. Ask a running server which kernel a type resolves to: `/props` -> `gpu.kernels.decode`. |
 | `ORANGU_NO_DUAL_NIBBLE` | unset (dual **on** for `Q4_K` and `Q6_K` decode) | Set to **disable** the dual decode kernels for both `Q4_K` and `Q6_K` and fall back to the two-wave block-unroll. Each two-wave kernel splits a 64-thread workgroup into two halves that re-read shared weight bytes — `Q4_K` streams every qs byte twice (once per nibble half), `Q6_K` re-reads every `qh` byte (once per `w_lo` half). The dual kernels use a 32-thread (single-subgroup) workgroup that loads each such byte once, cutting decode GPU-execution time (~22% for `Q4_K`, a further ~4–8% for `Q6_K`) with identical greedy output. They reorder the per-lane float adds, so they cross-check against the CPU backend within a tolerance rather than bit-for-bit. No effect on `Q4_K` when `ORANGU_PACKED_DOT=1`, or on either when `ORANGU_NO_MLP_UNROLL=1`. |
@@ -2740,8 +2727,6 @@ or parsed, and are noted as such where they appear.
 | `ORANGU_COOP_MIN_TOKENS` | `64` (integer, `>= 1`) | The token count at or above which a matmul takes the weight-amortizing tiled-GEMM path instead of the reduce family. The reduce kernels dispatch `n_row_groups × n_tokens` workgroups, so **each token re-streams the whole weight matrix** (their cost grows with `n_tokens`); the tiled kernel loads a `16×in_dim` weight tile into shared memory once and reuses it across a `64`-wide token tile (cost ~flat in `n_tokens`). Below the threshold the per-token re-stream is cheaper because it keeps far more wavefronts in flight to hide this GPU's weight-load latency. Lowering it to route the "missing middle" (K ≈ 2…63, e.g. speculative or small-chunk prefill) onto the tiled path was measured **slower on `RX 5500M`** (this matmul is latency-bound, not bandwidth-bound — see `SERVER_ROADMAP.md` Step 13), so the default keeps that split at `64`; exposed as a knob for GPUs where the crossover sits lower and as the A/B harness for a future small-K kernel. `1` forces every matmul tiled; a value past the longest batch keeps everything on the reduce path. |
 | `ORANGU_NO_GPU_SAMPLE` | unset (GPU sampling **on**) | Set to **disable** running greedy (temperature-0) argmax sampling with repeat penalty on the GPU in the same submission as the forward pass (reading back one token id instead of the full `[n_vocab]` logits vector) and fall back to a CPU-side readback + sample. |
 | `ORANGU_DECODE_CHUNKS` | `7` (integer, not a presence flag) | How many `queue.submit()` calls one decode step's layer loop is split across. `1` records the whole token and submits once (the historical behaviour); `> 1` submits the first `chunks - 1` groups of layers as soon as they are recorded, so the GPU starts executing them while the CPU is still recording and validating the later ones — overlapping the CPU-side submission cost with GPU execution instead of serialising it. Clamped to `1..=n_layers`. On real `E2B`/`RX 5500M` this raised decode throughput from 14.4 tok/s (`1`) to 18.8 tok/s (`7`, the default), with byte-identical output; `35` (one submit per layer) reaches 19.4 tok/s but adds per-submission overhead for a marginal gain. |
-| `ORANGU_BATCH_DECODE` | unset (off) | Fuses the matmul steps of concurrent requests that submit a decode step within a short window into one batched call (attention/RoPE/KV-write stay per-sequence). Only takes effect when `slots > 1`. |
-| `ORANGU_BATCH_WAIT_MS` | `4` | How long a fused-decode collection window stays open. Only meaningful with `ORANGU_BATCH_DECODE`. Raising it is the only way batches actually form — at 32 concurrent streams the 4 ms default gives a mean batch of 2.2 and 400 ms gives 27 — but aggregate throughput falls monotonically as it rises (65 → 42.75 tok/s), because every sequence pays the wait on every token. The mean batch size achieved is reported as `batch.mean_batch` on `/moe-stats`; a batching measurement cannot be read without it. |
 | `ORANGU_PREFILL_FUSED_ATTN` | unset (**off**) | Set to **enable** running a prefill layer's whole pre-attention half as one submission — the Q/K/V projections, the per-head Q/K norms, RoPE, V's weightless norm, the KV-cache write for the whole batch, and attention itself — and fall back to the step-by-step path (projections read back to the CPU, norms and RoPE on the CPU, a per-token cache push, then a separate attention dispatch). The fused path keeps everything between the projections and attention in GPU memory, so nothing but attention's output and the K/V rows for the host mirror crosses the bus. Correctness-verified against the step-by-step path, but currently **slower**: re-measured against correct output it loses ~10% at a 158-token prompt and is a wash at 1120. Off until the transfers it removes pay for the work it adds. Automatically declined (with the same fallback) under `ORANGU_Q4K_MMVQ` and for a non-causal batch longer than one submission chunk. |
 | `ORANGU_PREFILL_ATTN` | unset (off) | Set to run the **standalone** prefill attention dispatch where the fused path above declines, instead of the CPU attention loop. Unlike the fused path this pays a Q upload and an attention-output readback per layer, which the CPU loop does not, so it wins only at long prompts. A measurement aid rather than a recommended setting. |
 | `ORANGU_NO_PREFILL_GQA` | unset (GQA sharing **on**) | Set to **disable** sharing each KV head's reads across the query heads that use it in the prefill attention kernel, falling back to one workgroup per `(head, query)`. Only affects models whose `n_head` exceeds `n_head_kv`. |
@@ -2831,10 +2816,9 @@ Correctness rests on the same tests as the Vulkan path, not on a separate
 suite: `vulkan::shared_test_backend` asks for whichever `wgpu` API the
 platform has, so the per-`ggml_type` cross-checks against `CpuBackend` —
 ordinary tests, not `#[ignore]`d ones — run against a real Metal device on
-CI's macOS runner. Two `#[ignore]`d real-model tests
-(`gemma4_predicts_paris_after_capital_of_france_metal`,
-`forward_batch_decode_matches_independent_forward_calls_metal`) add the
-whole-model claim on top, and CI fails rather than passes if either skips
+CI's macOS runner. An `#[ignore]`d real-model test
+(`gemma4_predicts_paris_after_capital_of_france_metal`) adds the
+whole-model claim on top, and CI fails rather than passes if it skips
 for want of an adapter.
 
 ### CUDA, OpenCL, and ROCm backends

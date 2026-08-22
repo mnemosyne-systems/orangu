@@ -1999,39 +1999,6 @@ pub enum ForwardOutcome {
     Logits(Vec<f32>),
 }
 
-/// One sequence's pending single-token decode step, as an element of a
-/// cross-sequence batch (see `engine::batch::BatchCoordinator`).
-/// Each sequence keeps its own `cache`/`start_pos`/`greedy_sample`
-/// (attention, RoPE, and the KV-cache write all stay per-sequence even
-/// when the *matmul* steps in between are fused across every item in the
-/// batch — see [`ModelForward::forward_batch_decode`]'s own doc comment).
-pub struct BatchDecodeItem<'a> {
-    pub cache: &'a mut KvCache,
-    pub token: u32,
-    pub start_pos: usize,
-    pub greedy_sample: Option<GreedySampleParams<'a>>,
-    /// The submitting request's own `engine::scheduler::SlotGuard::id()`
-    /// — **not** this item's position within `items`. `BatchCoordinator`
-    /// can run two *different* batches' own `forward_batch_decode` calls
-    /// genuinely concurrently (its own doc comment: the coordinator's
-    /// lock is released before processing a batch, specifically so a new
-    /// window can start collecting while an older one is still being
-    /// processed) — a GPU-resident implementation that caches per-
-    /// sequence resources by *array index within one call*
-    /// (`GemmaModel::record_batched_decode_forward`'s first, broken
-    /// attempt at this: `1..=items.len()`) would let two unrelated
-    /// sequences from two concurrently-running batches collide on the
-    /// exact same cached buffers — since the array index resets to `0`
-    /// every call, two overlapping batches' own "index 0" always
-    /// coincide, corrupting whichever one loses the race, silently. A
-    /// `SlotGuard`'s own `id()` is unique across every *concurrently
-    /// held* slot for that slot's entire lifetime (`SlotPool::acquire`'s
-    /// own guarantee — capped by the semaphore, one live guard per index
-    /// at a time), which is exactly the uniqueness overlapping batches
-    /// need and a per-call array index doesn't provide.
-    pub slot_id: usize,
-}
-
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
 
@@ -2071,11 +2038,10 @@ pub trait ModelForward: Send + Sync {
     /// prediction a caller doing either prefill (find where generation
     /// starts) or decode (one token at a time) actually needs.
     ///
-    /// `slot_id` is the caller's own `engine::scheduler::SlotGuard::id()` —
-    /// see [`BatchDecodeItem::slot_id`]'s doc comment for why a real,
-    /// per-request slot id (not a shared constant) is load-bearing here:
-    /// `GemmaModel`'s Vulkan decode path threads it into the same
-    /// per-sequence GPU resource cache the batched path uses, so two
+    /// `slot_id` is the caller's own `engine::scheduler::SlotGuard::id()`,
+    /// and a real per-request id rather than a shared constant is
+    /// load-bearing: `GemmaModel`'s Vulkan decode path threads it into the
+    /// per-sequence GPU resource cache, so two
     /// `slots > 1` requests decoding concurrently don't collide on the same
     /// cached buffers. Architectures/backends with no such per-caller cache
     /// (every non-Vulkan-decode path) simply ignore it.
@@ -2147,46 +2113,6 @@ pub trait ModelForward: Send + Sync {
     /// `n_embd -> 4*n_embd` before `dense_3` narrows it back).
     fn post_pool_projection(&self, pooled: Vec<f32>) -> Result<Vec<f32>> {
         Ok(pooled)
-    }
-
-    /// Runs a *cross-sequence batch* of independent single-token decode
-    /// steps, driven by `engine::batch::BatchCoordinator`.
-    /// Each `items[i]` is one sequence's own pending decode step (its own
-    /// KV cache, position, token); the *matmul* steps every layer needs
-    /// (QKV, `wo`, FFN, PLE, `lm_head` — the weight-bandwidth-heavy ones,
-    /// the actual thing "GEMM batching" amortizes) are fused into one call
-    /// across every item in the batch instead of one call per sequence,
-    /// while attention, RoPE, and the KV-cache write stay per-sequence
-    /// (each sequence has its own cache and its own position — there is
-    /// no shared state to fuse there, unlike the matmuls).
-    ///
-    /// The default implementation just loops over `items` calling
-    /// `forward_maybe_sampling` on each independently (correct, no fusion,
-    /// no batching win) — so `llama`/`qwen35moe` need no override to keep
-    /// working; only `GemmaModel` currently overrides this with the real
-    /// batched implementation. That override is correctness-verified but
-    /// **measured slower** under real concurrent load than not batching at
-    /// all — `engine::generate::Engine::batch_coordinator`'s own doc
-    /// comment has the numbers and the likely cause — so it's only ever
-    /// reached when a caller opts in (`ORANGU_BATCH_DECODE=1`); this
-    /// default implementation is what every other configuration actually
-    /// runs, including a `slots > 1` deployment that hasn't opted in.
-    fn forward_batch_decode(
-        &self,
-        items: &mut [BatchDecodeItem<'_>],
-    ) -> Result<Vec<ForwardOutcome>> {
-        items
-            .iter_mut()
-            .map(|item| {
-                self.forward_maybe_sampling(
-                    item.cache,
-                    &[item.token],
-                    item.start_pos,
-                    item.greedy_sample.take(),
-                    item.slot_id,
-                )
-            })
-            .collect()
     }
 }
 

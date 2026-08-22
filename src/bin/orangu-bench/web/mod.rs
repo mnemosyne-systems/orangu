@@ -274,7 +274,7 @@ struct Preset {
 /// - **concurrency `1 to 8 streams`** is the sweep behind "gemma pins the
 ///   engine at 99% with two streams where the generic path never passes 66%
 ///   with eight" (`PERF-GAP.md` item 7, re-measured through this tool), and
-///   the one `RESEARCH.md` names for re-testing `forward_batch_decode`.
+///   the one `RESEARCH.md` names for re-testing cross-sequence batching.
 /// - **decode CPU `0 to 1024`** is the depth set that separated a claimed
 ///   +58% growth in CPU per token from the real +8.8% — the 58% was the
 ///   prefill's, charged to the generated tokens.

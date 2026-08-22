@@ -234,6 +234,35 @@ pub fn render_labelled(
             "Experts — resident when asked (%)",
             axes.x.as_deref().unwrap_or("prompt length (tokens)"),
         ),
+        (
+            // The one figure on a streamed model that is a **count** rather
+            // than a rate: two runs of the same prompt read the same number
+            // of bytes, while this rig's drive rate wanders far enough to
+            // have reversed the sign of a real change. Lower is better, and
+            // a value near the model's own size means the whole model was
+            // read for every token.
+            "io_mb_per_token",
+            "Storage — MiB read from disk per token",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
+        (
+            // Distinct from `moe_majflt`, which only exists on a model with
+            // experts. This one is written for every model, which is the
+            // point: a dense model larger than RAM is entirely an I/O
+            // problem and has no expert rows at all.
+            "io_majflt",
+            "Storage — major faults per repetition (all models)",
+            axes.x.as_deref().unwrap_or("prompt length (tokens)"),
+        ),
+        (
+            // The only panel whose x-axis is not tokens: `n` is a read
+            // request size in KiB. Hence the explicit label rather than the
+            // shared fallback — an axis reading "prompt length" under a
+            // block-size curve would be worse than none.
+            "storage_mb_s",
+            "Storage — read throughput against request size",
+            "read request size (KiB)",
+        ),
     ] {
         // `(label, date) -> context -> best`.
         let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
@@ -649,6 +678,15 @@ mod tests {
             ("moe_mb", "dequantized per token"),
             ("moe_majflt", "major faults"),
             ("moe_hit", "resident when asked"),
+            // Written by `moe::io_records` for every model, not just MoE
+            // ones. Added here in the same edit that registered them above,
+            // which is the discipline this test exists to enforce — the
+            // first version of that edit wrote the rows and forgot the
+            // panel, and the chart cheerfully reported "3 of 3 rows" while
+            // drawing one.
+            ("io_mb_per_token", "MiB read from disk per token"),
+            ("io_majflt", "major faults per repetition (all models)"),
+            ("storage_mb_s", "read throughput against request size"),
         ] {
             let recs = [
                 rec("2026-08-08", "orangu", mode, 128, 1.4),

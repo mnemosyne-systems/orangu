@@ -364,6 +364,11 @@ pub fn format_plan(plan: &Plan, available_ram: u64, device: PlanDevice<'_>) -> S
         ));
         out.push_str(&draft_line(plan));
         out.push_str(&this_box(available_ram, device));
+        // Only worth saying when the model has to stream: for one that fits,
+        // the per-token figure is a number nothing reads from disk.
+        if !plan.dense_fits_in(available_ram) {
+            out.push_str(&per_token_dense(plan));
+        }
         out.push_str(&verdict_dense(plan, available_ram));
         out.push_str(&device_verdict(plan, device));
         return out;
@@ -434,9 +439,11 @@ fn device_verdict(plan: &Plan, device: PlanDevice<'_>) -> String {
         );
     };
     format!(
-        "Device     {} too large for this GPU ({}) — the driver will page weights\n           \
-         in and out on every token, which is slow rather than fatal. A smaller\n           \
-         quantization, or `backend = cpu`, avoids it.\n",
+        concat!(
+            "Device     {} too large for this GPU ({}) — the server will spread the model\n",
+            "           across every device in order and run the remainder on the CPU, which\n",
+            "           is slow rather than fatal. A smaller quantization avoids it.\n",
+        ),
         size(short),
         size(vram),
     )
@@ -457,6 +464,36 @@ fn draft_line(plan: &Plan) -> String {
     )
 }
 
+/// The per-token line for a dense model, which is the one figure a reader
+/// takes away and the one that used to be missing.
+///
+/// **Prefill and decode are stated separately because they differ by three
+/// orders of magnitude**, and quoting only the decode number — which is what
+/// "per token" naturally means — reads as "this model is unusable" for a
+/// workload where it is perfectly usable. Measured under a 4 GiB cap: 6,533
+/// MiB per token at decode against 6.33 MiB per prompt token at prefill,
+/// because decode walks the whole model to produce one token and prefill
+/// walks it once for the entire prompt.
+///
+/// **No seconds figure, deliberately.** It would need a read rate, and the
+/// only honest one is a measurement: the drive this was sized against runs at
+/// 210 MB/s in a short probe and 52 MB/s under the sustained reading that
+/// streaming actually does — a factor of four, decided by duty cycle rather
+/// than by the drive. Quoting either number alone misleads, probing at plan
+/// time costs the `ls`-speed this module's whole design rests on, and bytes
+/// are exact and free. So the bytes are stated and the arithmetic is left to
+/// a reader who knows their own storage.
+fn per_token_dense(plan: &Plan) -> String {
+    format!(
+        concat!(
+            "Per token  {} at decode — every byte, for every token. At prefill the same {}\n",
+            "           covers the whole prompt, so a long prompt costs a fraction of that.\n",
+        ),
+        size(plan.dense_bytes),
+        size(plan.dense_bytes),
+    )
+}
+
 fn verdict_dense(plan: &Plan, available_ram: u64) -> String {
     let total = plan.dense_bytes;
     if plan.dense_fits_in(available_ram) {
@@ -465,8 +502,15 @@ fn verdict_dense(plan: &Plan, available_ram: u64) -> String {
             size(available_ram - total)
         )
     } else {
+        // Not "nothing to stream": a dense model streams the whole of itself,
+        // which is slow rather than impossible. The old wording said the
+        // model would not run, and it does — measured at 992 s/token on a
+        // 57 GiB model against 35 GiB of RAM, with no cgroup involved.
         format!(
-            "Verdict    does NOT fit: {} short, and a dense model has nothing to stream\n",
+            concat!(
+                "Verdict    runnable by streaming: {} more than RAM holds, so that much comes\n",
+                "           off disk every token. The storage under the model sets the speed.\n",
+            ),
             size(total - available_ram)
         )
     }
@@ -475,8 +519,10 @@ fn verdict_dense(plan: &Plan, available_ram: u64) -> String {
 fn verdict_moe(plan: &Plan, available_ram: u64) -> String {
     if !plan.dense_fits_in(available_ram) {
         return format!(
-            "Verdict    will NOT work: the dense part alone is {} short of RAM, and it is \
-             touched by every token\n",
+            concat!(
+                "Verdict    runnable but slow: the dense part alone is {} short of RAM and is\n",
+                "           touched by every token, so it streams as well as the experts do.\n",
+            ),
             size(plan.dense_bytes - available_ram)
         );
     }
@@ -532,7 +578,7 @@ mod tests {
         let mut plan = moe_plan();
         plan.dense_bytes = 40 << 30;
         let report = format_plan(&plan, 20 << 30, None);
-        assert!(report.contains("will NOT work"), "{report}");
+        assert!(report.contains("runnable but slow"), "{report}");
         assert!(report.contains("20.00 GiB short"), "{report}");
     }
 
@@ -643,8 +689,11 @@ mod tests {
         };
         assert!(!plan.is_moe());
         let short = format_plan(&plan, 8 << 30, None);
-        assert!(short.contains("does NOT fit"), "{short}");
-        assert!(short.contains("nothing to stream"), "{short}");
+        assert!(short.contains("runnable by streaming"), "{short}");
+        assert!(
+            short.contains("comes\n           off disk every token"),
+            "{short}"
+        );
         assert!(format_plan(&plan, 60 << 30, None).contains("fits in RAM"));
     }
 
@@ -810,7 +859,11 @@ mod tests {
             (&dense, 8 << 30),           // short
         ] {
             let report = format_plan(plan, ram, None);
-            let says_no = report.contains("does NOT fit") || report.contains("will NOT work");
+            // Both over-RAM verdicts now say "runnable" — the model streams
+            // rather than failing — so the marker is what the verdict warns
+            // about, not a claim that it cannot run.
+            let says_no = report.contains("comes\n           off disk every token")
+                || report.contains("runnable but slow");
             assert_eq!(
                 plan.dense_fits_in(ram),
                 !says_no,
@@ -852,8 +905,11 @@ mod tests {
         assert!(report.contains("AMD Radeon RX 5500M"), "{report}");
         assert!(report.contains("Device"), "{report}");
         assert!(report.contains("too large for this GPU"), "{report}");
-        assert!(report.contains("page weights"), "{report}");
-        assert!(report.contains("`backend = cpu`"), "{report}");
+        // The wording changed when the server learned to spread a too-large
+        // model across devices instead of paging it: it now says what will
+        // happen rather than naming a knob the operator has to reach for.
+        assert!(report.contains("spread the model"), "{report}");
+        assert!(report.contains("run the remainder on the CPU"), "{report}");
         assert_eq!(plan.device_shortfall(3980 << 20), Some(17020 << 20));
     }
 

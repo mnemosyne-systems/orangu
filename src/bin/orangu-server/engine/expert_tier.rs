@@ -43,21 +43,44 @@
 //!
 //! # What this is for right now
 //!
-//! Nothing executes on a device expert tier yet — see the module doc of
-//! `engine::backend::multi` for the shape a split model runs in, and the
-//! manual's developer chapter for what the execution path would still
-//! need. What this *does* today is answer the question that decides whether
-//! that work is worth doing on a given machine, in that machine's own
-//! terms:
-//! [`coverage`] is the share of real routing traffic a tier of a given size
-//! would serve. A tier that covers 4% of selections cannot pay for itself
-//! whatever the kernels look like; one that covers 60% might.
+//! **The tier executes.** `main::plan_expert_tier` fills it from real routing
+//! heat (`ORANGU_EXPERT_USAGE`) or by size, records it through
+//! `LoadedModel::set_expert_residency`, and every `ExpertQuantMatrix` built
+//! afterwards carries the per-expert flags that `arch::device_expert_admissible`
+//! gates the device dispatch on. It runs behind `ORANGU_GPU_EXPERTS`, and the
+//! startup line names how many experts it placed and which of heat or size
+//! filled it.
 //!
-//! Deliberately measured rather than assumed, because the honest prior is
-//! not favourable: colibri's own conclusion is that a GPU expert tier
-//! "earns its VRAM only when the CPU is the weak link", and orangu's expert
-//! matmul is a tuned AVX2/rayon path over host memory that a small card has
-//! to beat while also paying a round trip per dispatch.
+//! This paragraph used to say the opposite — that nothing executed on a device
+//! expert tier yet. That stopped being true when `LLAMA.md` L1 added the
+//! residency check to `gpu_project_expert`, and it stayed wrong long enough
+//! that an outside reader of the source drew the wrong conclusion from it.
+//! **A doc comment is part of the source, and this one was lying.**
+//!
+//! [`coverage`] is still the number the decision turns on: the share of real
+//! routing traffic a tier of a given size would serve. A tier that covers 4%
+//! of selections cannot pay for itself whatever the kernels look like; one
+//! that covers 60% might.
+//!
+//! # And the measurement came back negative
+//!
+//! The honest prior was already unfavourable — colibri's own conclusion is
+//! that a GPU expert tier "earns its VRAM only when the CPU is the weak
+//! link", and orangu's expert matmul is a tuned AVX2/rayon path over host
+//! memory that a small card has to beat while also paying a round trip per
+//! dispatch.
+//!
+//! It is no longer a prior. `LLAMA.md` L1 measured the device expert path
+//! losing at 11.8% and at 82.8% residency, per-expert and batched, at decode
+//! and at prefill. `DISK.md`'s D2b then reached **44.4% coverage** — three and
+//! a half times the ceiling L1 was stuck at — on a model chosen to make the
+//! tier large relative to the card, and measured decode **9.4% slower with the
+//! tier than without it**, prefill inside the noise.
+//!
+//! So residency was never the limiter, and this module's value is now the
+//! projection rather than the placement: [`coverage`] is what tells an
+//! operator, before the first token, that a tier on their card would serve a
+//! share too small to pay for the VRAM it takes from the KV cache.
 
 /// One expert a tier could hold: what it costs, and how much traffic it
 /// would serve.
@@ -102,6 +125,58 @@ impl ExpertTierPlan {
 
     pub fn resident_bytes(&self) -> u64 {
         self.per_device_bytes.iter().sum()
+    }
+}
+
+/// The coverage below which a resident tier is not built.
+///
+/// **On a small card one subsystem's allocator is another's ceiling.** VRAM
+/// the tier takes is VRAM the KV cache and the transient arenas do not get,
+/// so a tier serving a small share of routing is not merely useless — it is
+/// paid for by the things that are working.
+///
+/// A quarter is a guard against the futile case, not a tuned optimum, and
+/// saying so matters: the *only* coverage this project has measured
+/// end-to-end is **44.4%, and it was 9.4% slower on decode** (see `DISK.md`
+/// D2b). So a tier passing this floor is not thereby known to pay — it is
+/// merely not known to be pointless. The floor exists to stop the case where
+/// the budget bought 12% of the traffic, which needs no measurement to reject.
+const COVERAGE_FLOOR_DEFAULT: f64 = 0.25;
+
+/// `ORANGU_EXPERT_TIER_FLOOR`, as a percentage — the same units the startup
+/// line prints, so an operator reading "12.7%" can type `13` and get the
+/// behaviour they expected. Out-of-range and unparseable values are ignored
+/// rather than clamped: a typo must not silently pick a different policy.
+pub fn coverage_floor() -> f64 {
+    static FLOOR: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("ORANGU_EXPERT_TIER_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|percent| (0.0..=100.0).contains(percent))
+            .map(|percent| percent / 100.0)
+            .unwrap_or(COVERAGE_FLOOR_DEFAULT)
+    })
+}
+
+/// Whether a planned tier is worth the VRAM, given what is known about it.
+///
+/// Three cases, and the middle one is the whole design:
+///
+/// - **Coverage measured and below the floor** — decline. The budget would
+///   buy a share of routing too small to pay for the VRAM it costs.
+/// - **Coverage unknown** — build it. `None` means nothing was routed yet, so
+///   the tier was filled by size and there is *no evidence either way*; that
+///   is the state every first run is in, and refusing there would make the
+///   feature unreachable without a profiling session the operator cannot run
+///   until the feature works. An operator who set `ORANGU_GPU_EXPERTS` asked
+///   for this; absence of evidence must not read as evidence of absence.
+/// - **Coverage at or above the floor** — build it, and let the operator's
+///   own measurement decide from there.
+pub fn worth_building(coverage: Option<f64>, floor: f64) -> bool {
+    match coverage {
+        Some(coverage) => coverage >= floor,
+        None => true,
     }
 }
 
@@ -206,6 +281,49 @@ pub fn projection(
 
 #[cfg(test)]
 mod tests {
+
+    /// D2c's acceptance test: the threshold, from both sides, with no gap
+    /// between them. `>=` rather than `>` is deliberate — a tier that exactly
+    /// meets the floor meets it.
+    #[test]
+    fn the_coverage_floor_is_tested_from_both_sides() {
+        let floor = 0.25;
+        assert!(
+            !worth_building(Some(0.249), floor),
+            "just under must decline"
+        );
+        assert!(
+            worth_building(Some(0.25), floor),
+            "exactly at the floor is in"
+        );
+        assert!(worth_building(Some(0.251), floor), "just over must build");
+        // The case the floor exists for.
+        assert!(!worth_building(Some(0.127), floor));
+        // And the case it must not catch.
+        assert!(worth_building(Some(1.0), floor));
+    }
+
+    /// Unknown coverage is not low coverage. `None` means nothing has been
+    /// routed yet, which is the state of every first run — refusing there
+    /// would make the tier unreachable, because the routing profile that
+    /// would raise coverage above the floor can only be recorded by running
+    /// with the tier on.
+    #[test]
+    fn unknown_coverage_builds_the_tier_rather_than_declining_it() {
+        for floor in [0.0, 0.25, 0.99, 1.0] {
+            assert!(
+                worth_building(None, floor),
+                "no routing evidence must not read as evidence of no routing (floor {floor})"
+            );
+        }
+    }
+
+    /// A floor of zero has to mean "never decline", or an operator disabling
+    /// the guard would still hit it on a tier covering exactly nothing.
+    #[test]
+    fn a_zero_floor_never_declines() {
+        assert!(worth_building(Some(0.0), 0.0));
+    }
     use super::*;
 
     const MIB: u64 = 1024 * 1024;

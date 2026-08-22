@@ -276,7 +276,8 @@ Both apply to a **streaming** request, and both exist for the same reason: the
 longest part of a turn is the part a client otherwise knows nothing about.
 
 `return_progress: true` emits a `prompt_progress` chunk after every prefill
-chunk (`ORANGU_PREFILL_BATCH` tokens, 512 by default) rather than only at the
+chunk (`ORANGU_PREFILL_BATCH` tokens, or the width the backend and the model's
+residency choose when that is unset) rather than only at the
 end. `processed` counts cached tokens as already done, so a mostly-cached
 prompt does not appear to start from zero. On a 2712-token prompt that is six
 updates across a 12.8-second prefill:
@@ -723,8 +724,7 @@ GPU stages cost nothing.
 Mixture-of-experts counters since the previous call, and reset: expert visits,
 bytes dequantized, `stats.union_ratio` for the redundancy in the per-token
 expert loop, the expert store's `hit_rate`, `route_ahead.accuracy`,
-`process.major_faults_window`, and `batch.mean_batch` when fused decode
-batching is on.
+and `process.major_faults_window`.
 
 This is what makes work on models too large for RAM scoreable: throughput
 alone cannot separate a change that moves fewer bytes from one that moves the

@@ -19,7 +19,7 @@
 //! its own blocking-pool thread (`engine::generate`) — real concurrency,
 //! bounded fairly by slot count, but not llama.cpp's fused single-GEMM
 //! cross-sequence batching (a distinct performance optimization —
-//! see `engine::batch::BatchCoordinator`).
+//! ).
 
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -172,9 +172,7 @@ impl SlotPool {
         self.slots.len()
     }
 
-    /// How many slots are currently busy (prefilling or decoding) —
-    /// `engine::batch::BatchCoordinator`'s hint for how many concurrent
-    /// decode steps to expect in the *current* cross-sequence batch.
+    /// How many slots are currently busy (prefilling or decoding).
     /// A live count, not a request-time snapshot — it can
     /// briefly overestimate during a mixed prefill/decode moment (a
     /// prefilling slot is "busy" but not yet submitting decode steps),

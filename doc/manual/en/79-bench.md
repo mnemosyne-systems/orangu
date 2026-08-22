@@ -485,6 +485,117 @@ What to do about it:
   drift (thermals, clocks, a cold first run), interleave the arms rather than
   running all of one and then all of the other.
 
+### Position inside a `--sweep` is a confound, and a large one
+
+`--sweep` runs its values in the order you give them, and each value's
+repetitions run together. The **later slot is systematically worse** on
+hardware that warms or a drive that tires — measured here at **2.96% slower
+with three to six times the variance**, pooled over seven `pp512` sweeps.
+
+That is bigger than most changes worth measuring, so a two-value sweep written
+`VAR=a,b` charges the whole positional penalty to `b`:
+
+| what the sweep said | what it was |
+| :-- | :-- |
+| +4.8%, −9.8%, +4.0%, −8.8% across four same-order runs | a **+0.11%** change |
+| −3.1% | a **+3.9%** change |
+
+**Write each value more than once, in both orders** — `VAR=a,b,b,a` and
+`VAR=b,a,a,b` — so every value holds every position, and pool the runs.
+And score on **mean ± sd, not best-of**: the extra variance in the late slot
+inflates a best-of statistic, which is how the +0.11% change above also
+produced a confident-looking +4.9% "win".
+
+### Storage mode (`--storage-probe`) — what request size is worth
+
+`[orangu-server].read_size` exists because read throughput is a function of
+request size, and the shape of that function is a property of the drive, the
+bus and the bridge rather than something derivable from `sysfs`. This measures
+it:
+
+```sh
+orangu-bench --storage-probe 4,64,128,256,512,1024,2048,4096,8192 \
+  --storage-file <a model shard> --storage-span 384 --storage-ramp 16 \
+  --history storage-history.tsv --chart storage-curve.svg \
+  --chart-y-label "MB/s (log)"
+```
+
+Sizes are KiB. `--storage-file` names the file to read; without it the probe
+asks the server at `--url` for its largest shard, which is usually what you
+want and needs a server running. `--storage-span` is how much to read at each
+size, per pass, and `--storage-ramp` how much to read and discard first.
+
+Reads are `O_DIRECT`, so the page cache is neither consulted nor populated:
+the probe measures the device rather than memcpy, and it does not evict a
+model a later benchmark is about to want.
+
+**Every size is measured twice, ascending then descending**, and the table
+reports both passes with their spread. This is not redundancy. A drive that
+degrades under load gives its later sizes a worse reading, so a
+one-directional sweep can invent a threshold that is not there — which is
+exactly what happened to this project's own storage table, where an apparent
+8× cliff at 512 KiB turned out to be the drive changing state partway through
+the measurement. When the two passes disagree by more than a quarter the
+probe says so and names the size:
+
+```text
+  request |     MB/s |       up |     down |  spread
+      4 K |     27.4 |     46.6 |      8.2 |  140.0%
+   8192 K |    305.9 |    305.6 |    306.2 |    0.2%
+  the 4 K point differs by 140% between the ascending and descending passes —
+  this drive changed state during the probe, so read the two columns, not the mean
+```
+
+Read that as: 8 MiB reads hold ~306 MB/s whether measured first or last, while
+4 KiB reads collapse from 46.6 to 8.2 — **small requests put this drive into a
+slow state and large ones never do.** That is the argument for a large
+`read_size`, and it is a stronger one than "clear a threshold".
+
+### Capped runs (`--cap`) — the regime a large model actually meets
+
+A model smaller than RAM is served from the page cache, so a benchmark of it
+measures the CPU. Streaming behaviour only appears once the working set
+exceeds what the kernel will hold, and reproducing that on a large host
+otherwise means finding a large enough model.
+
+`--cap` runs each `--sweep` server inside a memory-capped transient cgroup:
+
+```sh
+orangu-bench --cap 4G --drop-model-cache \
+  --sweep 'ORANGU_CHUNK_POLICY=flat,adaptive' \
+  --sweep-cmd "orangu-server -c bench.conf <model>"
+```
+
+It uses `systemd-run --user --scope`, so it needs no root and the scope is
+cleaned up when the server exits. Swap is pinned off — a cap the kernel can
+satisfy by swapping measures the swap device instead of the model's read path.
+
+Combined with the `io` line (below) this reports what a streamed model costs
+per token:
+
+```text
+  io       read 19.74 GiB from disk  ·  1263.6 MiB/token  ·  20688 major faults
+```
+
+1,263.6 MiB per token against a 1.23 GiB model is the whole model, every
+token — the signature of a working set that does not fit.
+
+### The `io` line — bytes, which do not drift
+
+Every run reports what it pulled through the block layer, from the server's
+own `/proc/self/io` over the measured window, and records it as
+`io_mb_per_token` and `io_majflt` in `--history`.
+
+This is the most trustworthy number a run produces on storage-bound work.
+Rates on real hardware drift — thermals, clocks, a drive tiring — and this
+manual's own sections say so repeatedly. **Bytes moved do not.** Two runs of
+the same prompt against the same model read the same number, so a change that
+moves bytes has moved something real, whatever the stopwatch says that
+afternoon.
+
+A warm run reads nothing and says `(fully cached)` rather than showing a bare
+zero, because "read nothing" and "could not measure" must not look alike.
+
 ### Measuring across cards, and across models
 
 `orangu-bench` is an HTTP client, so it never chooses a device: the server
@@ -753,6 +864,11 @@ Options:
       --label <NAME>                   Series name recorded in the history file (defaults to the server's model); prefixes each `--sweep` point
       --chart <PATH>                   Render the history file to this SVG after measuring
       --chart-only                     Only render the chart from an existing history file; measure nothing
+      --storage-probe <LIST>           Storage mode: comma-separated read request sizes in KiB to sweep
+      --storage-file <PATH>            File the storage probe reads. Defaults to the server's largest shard
+      --storage-span <MIB>             MiB to read at each request size, per pass [default: 256]
+      --storage-ramp <MIB>             MiB read and discarded before timing starts, at each size [default: 32]
+      --cap <SIZE>                     Run each `--sweep` server under this memory cap (e.g. `4G`)
       --chart-png                      Also render a PNG beside the chart SVG
       --chart-scale <MIN:MAX>          Pin the chart's tok/s axis to `MIN:MAX` so a pair of charts compare
       --chart-y-label <TEXT>           Label for the chart's y-axis [default: "tok/s (log)"]

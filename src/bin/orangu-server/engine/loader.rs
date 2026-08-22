@@ -508,6 +508,10 @@ fn release_mapped_range(range: &[u8]) {
     let _ = range;
 }
 
+/// `QuantMatrix::layer`'s "belongs to no transformer block" sentinel — see
+/// that field for why it is not an `Option`.
+const NO_LAYER: u32 = u32::MAX;
+
 /// A tensor's resolved location and shape, ready for [`quant::dequantize`].
 #[derive(Clone)]
 struct TensorLocation {
@@ -577,6 +581,21 @@ pub struct QuantMatrix {
     /// — which is what lets a split model need no change to any
     /// architecture's forward pass.
     device: usize,
+    /// Which transformer block this tensor belongs to, or `None` for one that
+    /// belongs to none (`token_embd`, `output_norm`, `output`).
+    ///
+    /// Rides the same path `device` does and for the same reason: a residency
+    /// policy has to know which layer a weight is in, and the *only* thing
+    /// handed to `Backend::matmul` that can identify it is the matrix. Adding
+    /// it here is what lets `engine::dense_residency` work without touching a
+    /// single architecture's forward pass — the trick `engine::placement`
+    /// already proved.
+    ///
+    /// A sentinel rather than an `Option<u32>`, which would be eight bytes:
+    /// `QuantMatrix` is held inside several architectures' layer enums and the
+    /// extra word pushed four of them past clippy's `large_enum_variant`
+    /// threshold. `u32::MAX` is not a layer index any model reaches.
+    layer: u32,
 }
 
 impl QuantMatrix {
@@ -642,6 +661,7 @@ impl QuantMatrix {
             // inheriting this would send half a layer's rows to device 0
             // and produce a result that is wrong only on a split model.
             device: self.device,
+            layer: NO_LAYER,
         }
     }
 
@@ -662,6 +682,12 @@ impl QuantMatrix {
     /// own doc. `0` unless a split plan said otherwise.
     pub fn device(&self) -> usize {
         self.device
+    }
+
+    /// Which transformer block this tensor belongs to, or `None` for one that
+    /// belongs to none — see the field for why it is stored as a sentinel.
+    pub fn layer(&self) -> Option<u32> {
+        (self.layer != NO_LAYER).then_some(self.layer)
     }
 
     /// Overrides the device tag, for tests that need a matrix on a
@@ -744,6 +770,7 @@ pub(crate) fn test_quant_matrix(
         in_dim,
         out_dim,
         device: 0,
+        layer: NO_LAYER,
     }
 }
 
@@ -953,6 +980,7 @@ impl ExpertQuantMatrix {
             // placement, exactly as `LoadedModel::matrix` does from the
             // layer plan.
             device: 0,
+            layer: NO_LAYER,
         }
     }
 
@@ -1237,6 +1265,27 @@ impl LoadedModel {
     /// Counting them made `orangu-server` report `weights 21.30 GiB on
     /// device` for a model whose plan said 21.0 GiB, the 0.3 GiB difference
     /// being a block the forward pass never reaches.
+    /// Each transformer block's mapped weight spans, as `(address, length)`
+    /// — the table `engine::dense_residency` releases from.
+    ///
+    /// Addresses rather than names because the release is an `madvise` on
+    /// this process's own mapping, and looking a name up per layer on the hot
+    /// path would cost more than the release saves. Tensors outside a
+    /// numbered block (`token_embd`, `output_norm`, `output`) are excluded:
+    /// they are touched by every layer, so releasing them would guarantee the
+    /// refault the policy exists to avoid.
+    pub fn layer_weight_spans(&self, n_layer: usize) -> Vec<Vec<(usize, usize)>> {
+        let mut spans = vec![Vec::new(); n_layer];
+        for (name, loc) in &self.tensors {
+            let Some(layer) = block_index(name).filter(|l| *l < n_layer) else {
+                continue;
+            };
+            let base = loc.bytes.as_ptr() as usize + loc.start;
+            spans[layer].push((base, loc.len));
+        }
+        spans
+    }
+
     pub fn resident_tensor_sizes(&self) -> impl Iterator<Item = (&str, u64)> {
         let draft_start = self.draft_block_start();
         self.tensor_sizes().filter(move |(name, _)| {
@@ -1576,6 +1625,9 @@ impl LoadedModel {
             in_dim,
             out_dim,
             device: self.device_for_tensor(name),
+            layer: block_index(name)
+                .and_then(|l| u32::try_from(l).ok())
+                .unwrap_or(NO_LAYER),
         })
     }
 

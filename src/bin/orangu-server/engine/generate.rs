@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use super::arch::{ForwardOutcome, GreedySampleParams, ModelForward};
-use super::batch::{BatchCoordinator, BatchDecodeRequest, OwnedGreedySample};
 use super::kv_cache::KvCache;
 use super::prefix_cache::PrefixCache;
 use super::sampling::{Sampler, SamplingParams};
@@ -211,61 +210,6 @@ pub struct Engine {
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template_source: Option<String>,
     pub slots: Arc<SlotPool>,
-    /// The cross-sequence GEMM batching coordinator — `Some` only when
-    /// `slots.total() > 1` *and*
-    /// `ORANGU_BATCH_DECODE=1` is set; a single-slot deployment, or
-    /// `slots > 1` without the env var (the default), keeps calling
-    /// `ModelForward::forward_maybe_sampling` directly, unchanged.
-    ///
-    /// **Off by default**, unlike every other GPU-fused change in this
-    /// project. `GemmaModel::record_batched_decode_forward` *is*
-    /// GPU-resident (every item in a batch chained into one shared
-    /// encoder/submission — the one-round-trip design every single-
-    /// sequence decode step already uses, not the old CPU-orchestrated
-    /// per-layer-round-trip path an earlier version of this comment
-    /// described), and is correctness-verified bit-for-bit against
-    /// independent per-sequence `forward` calls
-    /// (`engine::arch::gemma`'s own `forward_batch_decode_matches_
-    /// independent_forward_calls_*` tests) as well as against itself
-    /// across many autoregressive steps
-    /// (`forward_batch_decode_identical_prompts_stay_identical_over_
-    /// many_steps_vulkan`). It still measures **slower** than not
-    /// batching under real concurrent load, though: a reproducible
-    /// concurrent-load A/B (4 concurrent 100-token generations, `slots =
-    /// 4` either way) measured it consistently slower batched than not.
-    /// Likely cause: fusing *M* sequences' matmuls into shared dispatches
-    /// amortizes weight bandwidth, but the GPU is fast enough per
-    /// single-sequence step that the extra
-    /// synchronization needed to chain *M* independent sequences into one
-    /// encoder — and the coordinator's own up-to-`MAX_BATCH_WAIT`
-    /// rendezvous wait before a batch can even start — costs more than
-    /// the amortization saves. Left available behind the flag,
-    /// correctness-verified, for hardware or batch sizes where that
-    /// balance tips the other way, rather than deleted.
-    ///
-    /// Getting a trustworthy measurement here required fixing a real bug
-    /// first: both this batched path *and* the pre-existing single-
-    /// sequence GPU-resident decode path (`GemmaModel::record_decode_
-    /// forward`) used to key their cached per-layer GPU
-    /// buffers by weight shape alone, with no per-caller distinction.
-    /// `BatchCoordinator` deliberately allows two of its own `process_
-    /// batch` calls to run concurrently (see its own doc comment), and
-    /// ordinary `slots > 1` decode is concurrent by construction — so two
-    /// requests decoding at the same time could end up sharing the same
-    /// cached buffer. Because that cache's mutex guard is only held
-    /// during the cheap *recording* step, not across the deferred GPU
-    /// *submission* (`queue.write_buffer` takes effect immediately, not
-    /// in encoder-submission order), one request's write could silently
-    /// corrupt another's not-yet-executed dispatch — no crash, just wrong
-    /// tokens, on *any* `slots > 1` deployment regardless of whether
-    /// `ORANGU_BATCH_DECODE` was ever set. Fixed by threading each
-    /// request's own `SlotGuard::id()` through as `BatchDecodeItem::
-    /// slot_id` (see its own doc comment) into every cache key, so
-    /// concurrent callers never share a buffer. Verified fixed with a
-    /// live reproduction: 4 concurrent identical greedy prompts, which
-    /// diverged after a few tokens before the fix (in *both* the batched
-    /// and non-batched configurations) and are byte-identical after it.
-    pub batch_coordinator: Option<Arc<BatchCoordinator>>,
     /// Cross-request KV-cache prefix reuse (`engine::prefix_cache`) —
     /// `None` disables it entirely (same as `Some(PrefixCache::new(0))`,
     /// just without even the pool's own mutex/lookup cost). See that
@@ -332,7 +276,6 @@ impl Engine {
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
         let draft = self.draft.clone();
-        let batch_coordinator = self.batch_coordinator.clone();
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
         // Whether a reasoning message reaches the client is this server's
@@ -390,7 +333,6 @@ impl Engine {
                         model.as_ref(),
                         tokenizer.as_ref(),
                         draft.as_deref(),
-                        batch_coordinator.as_deref(),
                         prefix_cache.as_deref(),
                         slot_store.as_deref(),
                         &guard,
@@ -474,7 +416,6 @@ fn run(
     model: &dyn ModelForward,
     tokenizer: &Tokenizer,
     draft: Option<&DraftModel>,
-    batch_coordinator: Option<&BatchCoordinator>,
     prefix_cache: Option<&PrefixCache>,
     slot_store: Option<&super::slot_store::SlotStore>,
     guard: &super::scheduler::SlotGuard,
@@ -543,7 +484,6 @@ fn run(
         reused_len = store.reuse_into(guard.id(), &req.prompt_tokens, &mut new_cache);
     }
     // `Option` (not a plain `KvCache`) so the decode loop can *move* it
-    // into a `BatchDecodeRequest` when a `batch_coordinator` is in use —
     // that call crosses to a different thread (whichever one ends up
     // leading this batch), which needs ownership, not a borrow. `.take()`/
     // reassignment stands in for a borrow everywhere else, at zero real
@@ -615,8 +555,7 @@ fn run(
     // them where they match what greedy decoding *would* have produced, and
     // greedy decoding knows nothing about the grammar. A drafted token the
     // constraint forbids would be accepted on that comparison alone.
-    let may_speculate =
-        sampler.is_greedy() && !sampler.is_constrained() && batch_coordinator.is_none();
+    let may_speculate = sampler.is_greedy() && !sampler.is_constrained();
     // A configured draft model wins over prompt-lookup rather than being
     // combined with it. Both are guesses at the same tokens, and running the
     // free one first would only turn its misses into a second, wasted
@@ -801,35 +740,6 @@ fn run(
                 Ok(t) => t,
                 Err(err) => {
                     let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
-                    return Ok(());
-                }
-            }
-        } else if let Some(coordinator) = batch_coordinator {
-            // Submit this decode step to the shared coordinator instead of
-            // calling `forward_maybe_sampling` directly, so it can be fused
-            // with whatever other sequences submit their own next step
-            // within the same short window.
-            let request = BatchDecodeRequest {
-                cache: cache
-                    .take()
-                    .expect("cache is always Some between iterations"),
-                token: next,
-                start_pos,
-                greedy_sample: (sampler.is_greedy() && !sampler.is_constrained()).then(|| {
-                    OwnedGreedySample {
-                        recent_tokens: history[recent_start..].to_vec(),
-                        repeat_penalty: sampler.repeat_penalty(),
-                    }
-                }),
-                slot_id: guard.id(),
-            };
-            let response = coordinator.submit(model, request);
-            cache = Some(response.cache);
-            match response.outcome {
-                Ok(ForwardOutcome::Token(t)) => t,
-                Ok(ForwardOutcome::Logits(l)) => sampler.sample(&l, &history),
-                Err(err) => {
-                    let _ = tx.send(StreamEvent::Error(err));
                     return Ok(());
                 }
             }
@@ -1212,13 +1122,89 @@ impl MessageHeader {
 /// default [`PREFILL_BATCH_DEFAULT`]. `0` means no limit: the whole prompt in
 /// one pass, which is what this code did unconditionally before.
 fn prefill_batch() -> usize {
-    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    prefill_batch_override().unwrap_or(PREFILL_BATCH_DEFAULT)
+}
+
+/// `ORANGU_PREFILL_BATCH` if it was set, `None` if it was not — the
+/// distinction [`flat_width`] needs and [`prefill_batch`] throws away. An
+/// operator who wrote `512` gets 512 everywhere; one who wrote nothing gets a
+/// width chosen for the regime.
+fn prefill_batch_override() -> Option<usize> {
+    static BATCH: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *BATCH.get_or_init(|| {
         std::env::var("ORANGU_PREFILL_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(PREFILL_BATCH_DEFAULT)
     })
+}
+
+/// How much of the model must be in RAM before an extra prefill pass is
+/// cheap.
+///
+/// Not a tuning knob so much as a statement about which of two measured
+/// regimes a run is in. Above it an extra pass costs locality; below it an
+/// extra pass costs a re-read of everything missing, which is the whole model
+/// when residency is poor.
+const RESIDENT_ENOUGH: f64 = 0.95;
+
+/// The width one flat-policy prefill should use.
+///
+/// **The two regimes disagree, and both were measured.** With the model
+/// resident, a narrow chunk is faster *and* smaller — a smaller working set
+/// pages less — and the ordering is monotone in width. With the model
+/// streamed from disk, every extra pass re-reads what is not resident, so the
+/// ordering reverses and one pass wins by a factor rather than a percentage.
+/// No single constant is right for both, so this asks which regime it is in.
+///
+/// Two things keep the question cheap. A prompt that fits the narrow default
+/// is one pass at any width, so the answer cannot matter and is not asked
+/// for — and that is every short prompt, while the probe is `mincore` over
+/// the whole model. And residency that cannot be established keeps **today's**
+/// width, on the same principle as [`Backend::has_submission_timeout`]'s
+/// default: a component that cannot answer must not be read as having
+/// answered.
+///
+/// [`Backend::has_submission_timeout`]: crate::engine::backend::Backend::has_submission_timeout
+fn flat_width(prompt_tokens: usize) -> usize {
+    let configured = prefill_batch_override();
+    // Short-circuited before the probe, not inside it: `resident_fraction` is
+    // `mincore` over every shard, and a prompt this size does not care.
+    let resident = (configured.is_none() && prompt_tokens > PREFILL_BATCH_DEFAULT)
+        .then(resident_fraction)
+        .flatten();
+    flat_width_for(configured, prompt_tokens, resident)
+}
+
+/// The mapping alone, so each direction can be tested without a process-wide
+/// `OnceLock` a test cannot then undo — the same shape as [`policy_for`], and
+/// for the same reason: getting this backwards is a factor, not a percentage.
+fn flat_width_for(
+    configured: Option<usize>,
+    prompt_tokens: usize,
+    resident_fraction: Option<f64>,
+) -> usize {
+    match (configured, resident_fraction) {
+        // An operator who named a width gets it, in either regime.
+        (Some(width), _) => width,
+        // One pass at any width: the regime cannot change the pass count.
+        _ if prompt_tokens <= PREFILL_BATCH_DEFAULT => PREFILL_BATCH_DEFAULT,
+        // Streamed: every extra pass re-reads what is not resident.
+        (None, Some(fraction)) if fraction < RESIDENT_ENOUGH => 0,
+        // Resident, or residency unknowable — keep today's width.
+        (None, _) => PREFILL_BATCH_DEFAULT,
+    }
+}
+
+/// What fraction of the model's bytes are in RAM, or `None` if that cannot be
+/// established for every shard — a partial answer would understate residency
+/// and read as a colder run than happened.
+fn resident_fraction() -> Option<f64> {
+    let shards = crate::engine::page_cache::residency();
+    let (bytes, resident) = crate::engine::page_cache::residency_totals(&shards);
+    if bytes == 0 {
+        return None;
+    }
+    resident.map(|r| r as f64 / bytes as f64)
 }
 
 /// The default prompt-chunk size.
@@ -1273,6 +1259,112 @@ const PREFILL_BATCH_DEFAULT: usize = 512;
 /// prompt: this is the same `(cache, tokens, start_pos)` shape the prefix
 /// cache already uses to resume a prompt it has partly seen, not a new
 /// contract with the architectures.
+/// How a prefill splits a prompt across forward passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkPolicy {
+    /// Size each chunk from the last one's measured rate, aiming at
+    /// [`prefill_chunk_budget`]. For a backend whose driver resets a device
+    /// that takes too long over one submission — see
+    /// [`Backend::has_submission_timeout`].
+    ///
+    /// [`Backend::has_submission_timeout`]: crate::engine::backend::Backend::has_submission_timeout
+    Adaptive,
+    /// Every chunk the configured width. For a backend with no submission
+    /// timeout, where the wall clock carries no information the sizer can
+    /// use: a streamed model's per-pass cost is fixed rather than per-token,
+    /// so adapting to it shrinks the chunk and multiplies the reads. The
+    /// width still bounds a pass's scratch; nothing infers a rate.
+    Flat,
+}
+
+/// How one prefill splits: how wide a chunk may be, and whether that width is
+/// a starting point or the whole rule.
+///
+/// The two travel together because neither means anything alone — a width with
+/// no policy does not say whether it is a ceiling or a probe, and a policy with
+/// no width has nothing to bound a pass's scratch by.
+#[derive(Clone, Copy, Debug)]
+struct Chunking {
+    /// Tokens per forward pass. `0` opts out of chunking entirely — see
+    /// [`prefill_batch`].
+    width: usize,
+    policy: ChunkPolicy,
+}
+
+impl Chunking {
+    /// How this process should split a prompt of `prompt_tokens`.
+    ///
+    /// The width is regime-chosen only under [`ChunkPolicy::Flat`]. Under
+    /// `Adaptive` it stays a ceiling the sizer works below, and widening it
+    /// would hand the driver exactly the long submission the chunker exists
+    /// to prevent.
+    fn for_prompt(prompt_tokens: usize) -> Self {
+        let policy = chunk_policy();
+        let width = match policy {
+            ChunkPolicy::Adaptive => prefill_batch(),
+            ChunkPolicy::Flat => flat_width(prompt_tokens),
+        };
+        Self { width, policy }
+    }
+}
+
+/// Whether the backend this process selected can lose its device to a
+/// submission timeout, recorded once at startup by [`set_chunk_policy`].
+///
+/// A process-wide fact rather than a parameter because the prefill call site
+/// holds a `&dyn ModelForward` and no backend handle, and threading one down
+/// would touch every architecture — the thing this whole design is trying not
+/// to do. Unset means [`ChunkPolicy::Adaptive`]: a test, a benchmark harness
+/// or any caller that never registered gets today's behaviour.
+static CHUNK_POLICY: std::sync::OnceLock<ChunkPolicy> = std::sync::OnceLock::new();
+
+/// Records what the selected backend answered for
+/// [`Backend::has_submission_timeout`]. Called once, from `main`, right after
+/// the backend is chosen.
+///
+/// [`Backend::has_submission_timeout`]: crate::engine::backend::Backend::has_submission_timeout
+pub fn set_chunk_policy(has_submission_timeout: bool) {
+    let _ =
+        CHUNK_POLICY.set(env_chunk_policy().unwrap_or_else(|| policy_for(has_submission_timeout)));
+}
+
+/// `ORANGU_CHUNK_POLICY=adaptive|flat`, the override that lets a sweep put
+/// both policies on one backend and compare them.
+///
+/// Without it the policy is a function of the hardware, so the two arms of the
+/// A/B would have to be two machines — and a cross-machine A/B is not a
+/// measurement. Anything unrecognised, including an empty value, is ignored
+/// rather than treated as one of the two: a typo in a harness must not
+/// silently select an arm.
+fn env_chunk_policy() -> Option<ChunkPolicy> {
+    match std::env::var("ORANGU_CHUNK_POLICY")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "adaptive" => Some(ChunkPolicy::Adaptive),
+        "flat" => Some(ChunkPolicy::Flat),
+        _ => None,
+    }
+}
+
+/// The mapping alone, so the direction can be tested without writing the
+/// process-wide `OnceLock` a test cannot then undo. Getting it backwards
+/// costs a device.
+fn policy_for(has_submission_timeout: bool) -> ChunkPolicy {
+    if has_submission_timeout {
+        ChunkPolicy::Adaptive
+    } else {
+        ChunkPolicy::Flat
+    }
+}
+
+/// The registered policy, defaulting to the safe one.
+fn chunk_policy() -> ChunkPolicy {
+    *CHUNK_POLICY.get().unwrap_or(&ChunkPolicy::Adaptive)
+}
+
 fn prefill(
     model: &dyn ModelForward,
     cache: &mut KvCache,
@@ -1287,7 +1379,7 @@ fn prefill(
         tokens,
         start_pos,
         slot_id,
-        prefill_batch(),
+        Chunking::for_prompt(tokens.len()),
         on_chunk,
     )
 }
@@ -1302,9 +1394,13 @@ fn prefill_in_chunks(
     tokens: &[u32],
     start_pos: usize,
     slot_id: usize,
-    batch: usize,
+    chunking: Chunking,
     on_chunk: &mut dyn FnMut(usize),
 ) -> Result<Vec<f32>> {
+    let Chunking {
+        width: batch,
+        policy,
+    } = chunking;
     // The one shape that needs no bounding: a prompt that fits in a single
     // chunk *and* starts at position zero is the least work a prefill can be.
     // `batch == 0` is an explicit opt-out — see [`prefill_batch`].
@@ -1322,7 +1418,15 @@ fn prefill_in_chunks(
     // this machine's cost curve, and a full-width chunk at a deep position is
     // exactly the submission that hangs the GPU; a probe is cheap at any
     // depth and turns the next choice into arithmetic instead of a guess.
-    let mut width = PREFILL_PROBE_TOKENS.min(batch);
+    //
+    // Under `ChunkPolicy::Flat` there is nothing to probe for: the probe
+    // exists to price a submission against a driver limit this backend does
+    // not have, and pricing a streamed model by the clock is what shrinks the
+    // chunk into a read spiral. Start at the full width and stay there.
+    let mut width = match policy {
+        ChunkPolicy::Adaptive => PREFILL_PROBE_TOKENS.min(batch),
+        ChunkPolicy::Flat => batch,
+    };
     while done < tokens.len() {
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
@@ -1332,7 +1436,9 @@ fn prefill_in_chunks(
         done += n;
         // After the forward, not before: progress means work finished.
         on_chunk(done);
-        width = next_chunk_width(n, elapsed, budget, batch);
+        if policy == ChunkPolicy::Adaptive {
+            width = next_chunk_width(n, elapsed, budget, batch);
+        }
     }
     Ok(logits)
 }
@@ -1568,7 +1674,9 @@ fn draft_forward(
     start_pos: usize,
     slot_id: usize,
 ) -> Result<Vec<f32>> {
-    let batch = prefill_batch();
+    // The draft model runs the same forward passes over the same prompt, so it
+    // wants the same width for the same reasons — it just never adapted.
+    let batch = Chunking::for_prompt(tokens.len()).width;
     let chunk = if batch == 0 { tokens.len() } else { batch };
     let mut last = Vec::new();
     for (i, part) in tokens.chunks(chunk.max(1)).enumerate() {
@@ -2312,7 +2420,6 @@ mod tests {
             Some(&draft),
             None,
             None,
-            None,
             &guard,
             req,
             crate::config::Role::default(),
@@ -2350,7 +2457,6 @@ mod tests {
         run(
             model,
             tokenizer,
-            None,
             None,
             prefix_cache,
             None,
@@ -2614,7 +2720,19 @@ mod tests {
         let mut cache = model.new_kv_cache(64);
         let tokens: Vec<u32> = (0..25).collect();
 
-        let logits = prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 10, &mut |_| {}).unwrap();
+        let logits = prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            0,
+            Chunking {
+                width: 10,
+                policy: ChunkPolicy::Adaptive,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
 
         let calls = model.calls.lock().unwrap().clone();
         assert_eq!(
@@ -2630,6 +2748,142 @@ mod tests {
         assert_eq!(logits[0], 25.0);
     }
 
+    /// `Flat` does not probe. The probe exists to price one submission
+    /// against a driver limit, and on a backend with no such limit it costs
+    /// an extra pass over the whole model for nothing — which on a streamed
+    /// model is the entire expense of a prefill.
+    ///
+    /// Asserted against `Adaptive` on the same input rather than in
+    /// isolation, because the property is a *difference*: if both policies
+    /// ever produce the same call sequence, this change did nothing.
+    #[test]
+    fn the_flat_policy_does_not_open_with_a_probe() {
+        let widths = |policy| {
+            let model = RecordingModel::new();
+            let mut cache = model.new_kv_cache(128);
+            let tokens: Vec<u32> = (0..40).collect();
+            prefill_in_chunks(
+                &model,
+                &mut cache,
+                &tokens,
+                0,
+                0,
+                Chunking { width: 32, policy },
+                &mut |_| {},
+            )
+            .unwrap();
+            let calls = model.calls.lock().unwrap().clone();
+            calls.into_iter().map(|(t, _)| t.len()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(widths(ChunkPolicy::Flat), vec![32, 8]);
+        assert_eq!(
+            widths(ChunkPolicy::Adaptive)[0],
+            PREFILL_PROBE_TOKENS,
+            "the adaptive path must still probe — this test is only \
+             meaningful while the two policies differ"
+        );
+    }
+
+    /// Dropping the adaptation must not drop the contract every prefill has:
+    /// each token fed exactly once, in order, at its absolute position. This
+    /// is the property whose violation corrupts a KV cache silently instead
+    /// of failing, so it is asserted separately for each policy.
+    #[test]
+    fn the_flat_policy_still_feeds_every_token_once_in_order() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(128);
+        let tokens: Vec<u32> = (0..25).collect();
+
+        prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            100,
+            0,
+            Chunking {
+                width: 10,
+                policy: ChunkPolicy::Flat,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let calls = model.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ((0..10).collect::<Vec<u32>>(), 100),
+                ((10..20).collect::<Vec<u32>>(), 110),
+                ((20..25).collect::<Vec<u32>>(), 120),
+            ]
+        );
+    }
+
+    /// The direction of the mapping, which is the one thing here that is
+    /// dangerous to get wrong: a backend that *has* a timeout must keep the
+    /// chunker adapting, and an unregistered process must behave as though it
+    /// does. Everything that is not the CPU backend — including CUDA, OpenCL
+    /// and ROCm, none of which `as_wgpu` can distinguish from it — reaches
+    /// this with `true`.
+    /// The width choice is the one place D9 can still be catastrophically
+    /// wrong, and in opposite directions in the two regimes: a narrow width on
+    /// a streamed model re-reads the model per chunk (measured: 61x the
+    /// bytes), while dropping the bound on a resident model costs tok/s and a
+    /// third more peak memory. Both directions are asserted.
+    #[test]
+    fn a_streamed_model_prefills_in_one_pass() {
+        assert_eq!(flat_width_for(None, 100_000, Some(0.5)), 0);
+        assert_eq!(flat_width_for(None, 100_000, Some(0.0)), 0);
+    }
+
+    #[test]
+    fn a_resident_model_keeps_the_narrow_width() {
+        assert_eq!(
+            flat_width_for(None, 100_000, Some(1.0)),
+            PREFILL_BATCH_DEFAULT
+        );
+        assert_eq!(
+            flat_width_for(None, 100_000, Some(RESIDENT_ENOUGH)),
+            PREFILL_BATCH_DEFAULT
+        );
+    }
+
+    /// The fail-safe: a platform where `mincore` is absent or refused must not
+    /// be read as having said "streamed".
+    #[test]
+    fn unknowable_residency_keeps_todays_width() {
+        assert_eq!(flat_width_for(None, 100_000, None), PREFILL_BATCH_DEFAULT);
+    }
+
+    #[test]
+    fn an_explicit_batch_setting_outranks_the_regime() {
+        // Including `0`, which is how an operator asks for one pass outright.
+        assert_eq!(flat_width_for(Some(2048), 100_000, Some(0.1)), 2048);
+        assert_eq!(flat_width_for(Some(2048), 100_000, Some(1.0)), 2048);
+        assert_eq!(flat_width_for(Some(0), 100_000, Some(1.0)), 0);
+    }
+
+    /// A prompt that fits one pass at the narrow width must not be able to
+    /// reach the streamed branch — it is the guard that keeps `mincore` off
+    /// the path of every short prompt.
+    #[test]
+    fn a_short_prompt_ignores_the_regime_entirely() {
+        for resident in [None, Some(0.0), Some(1.0)] {
+            assert_eq!(
+                flat_width_for(None, PREFILL_BATCH_DEFAULT, resident),
+                PREFILL_BATCH_DEFAULT,
+                "resident={resident:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backend_with_a_submission_timeout_keeps_adapting() {
+        assert_eq!(policy_for(true), ChunkPolicy::Adaptive);
+        assert_eq!(policy_for(false), ChunkPolicy::Flat);
+    }
+
     /// A prompt that starts partway in (the prefix cache reused its head)
     /// keeps counting positions from there — the chunk boundaries are
     /// relative to the prompt, the positions are absolute.
@@ -2639,7 +2893,19 @@ mod tests {
         let mut cache = model.new_kv_cache(64);
         let tokens: Vec<u32> = (0..7).collect();
 
-        prefill_in_chunks(&model, &mut cache, &tokens, 100, 0, 3, &mut |_| {}).unwrap();
+        prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            100,
+            0,
+            Chunking {
+                width: 3,
+                policy: ChunkPolicy::Adaptive,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
 
         let starts: Vec<usize> = model
             .calls
@@ -2697,7 +2963,19 @@ mod tests {
         let mut cache = model.new_kv_cache(200_000);
         let tokens: Vec<u32> = (0..600).collect();
 
-        prefill_in_chunks(&model, &mut cache, &tokens, 100_000, 0, 512, &mut |_| {}).unwrap();
+        prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            100_000,
+            0,
+            Chunking {
+                width: 512,
+                policy: ChunkPolicy::Adaptive,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
 
         let first = model.calls.lock().unwrap()[0].0.len();
         assert_eq!(first, PREFILL_PROBE_TOKENS, "opened {first} tokens wide");
@@ -2713,9 +2991,18 @@ mod tests {
         let tokens: Vec<u32> = (0..25).collect();
         let mut seen = Vec::new();
 
-        prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 10, &mut |done| {
-            seen.push((done, model.calls.lock().unwrap().len()))
-        })
+        prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            0,
+            Chunking {
+                width: 10,
+                policy: ChunkPolicy::Adaptive,
+            },
+            &mut |done| seen.push((done, model.calls.lock().unwrap().len())),
+        )
         .unwrap();
 
         // (tokens done, forwards completed) — the second element proves the
@@ -2732,9 +3019,18 @@ mod tests {
         let tokens: Vec<u32> = (0..5).collect();
         let mut seen = Vec::new();
 
-        prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, 512, &mut |done| {
-            seen.push(done)
-        })
+        prefill_in_chunks(
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            0,
+            Chunking {
+                width: 512,
+                policy: ChunkPolicy::Adaptive,
+            },
+            &mut |done| seen.push(done),
+        )
         .unwrap();
 
         assert_eq!(seen, vec![5]);
@@ -2750,7 +3046,19 @@ mod tests {
             let mut cache = model.new_kv_cache(8192);
             let tokens: Vec<u32> = (0..len as u32).collect();
 
-            prefill_in_chunks(&model, &mut cache, &tokens, 0, 0, batch, &mut |_| {}).unwrap();
+            prefill_in_chunks(
+                &model,
+                &mut cache,
+                &tokens,
+                0,
+                0,
+                Chunking {
+                    width: batch,
+                    policy: ChunkPolicy::Adaptive,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
 
             let calls = model.calls.lock().unwrap();
             assert_eq!(calls.len(), 1, "len {len}, batch {batch}");
@@ -2783,7 +3091,6 @@ mod tests {
             tokenizer: Arc::new(letter_tokenizer(8)),
             chat_template_source: None,
             slots: SlotPool::new(1),
-            batch_coordinator: None,
             prefix_cache: None,
             slot_store: None,
             role: crate::config::Role::default(),
@@ -2867,7 +3174,6 @@ mod tests {
         run(
             &model,
             &tokenizer,
-            None,
             None,
             None,
             None,

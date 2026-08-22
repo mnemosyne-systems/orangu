@@ -102,6 +102,7 @@ pub fn record_budget(dropped: u64, rescued: u64) {
 /// each drain can report the faults taken *in its own window* as well as the
 /// process total. Zero until the first drain.
 static LAST_MAJOR_FAULTS: AtomicU64 = AtomicU64::new(0);
+static LAST_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// One MoE layer call's routing, accumulated as the caller routes and flushed
 /// to the process counters once.
@@ -341,6 +342,29 @@ pub struct ProcessMemory {
     pub minor_faults: u64,
     pub rss_kb: u64,
     pub peak_rss_kb: u64,
+    /// Bytes this process pulled through the block layer, from
+    /// `/proc/self/io`. A page-cache hit does not count and a major fault
+    /// does, so this is what a run actually cost the disk.
+    ///
+    /// **It is the numerator of every I/O claim in `DISK.md`, and until now
+    /// it lived outside the engine.** Every one of those measurements came
+    /// from an ad-hoc script reading `/proc/<pid>/io` beside the server,
+    /// which meant finding the pid and keeping exactly one server alive —
+    /// three contaminated runs are recorded there as the price of getting
+    /// that wrong. Served from inside the process, a benchmark can bracket
+    /// its own window without a pid, a second process, or root.
+    ///
+    /// `0` where `/proc/self/io` is unreadable. That is a weaker convention
+    /// than `resident_bytes`'s `None`, and deliberate: this whole struct is
+    /// already `None` on a platform without `/proc`, so the only way to get
+    /// here with no value is a permission failure on Linux, where zero and
+    /// unknown are equally uninformative.
+    pub read_bytes: u64,
+    /// Bytes read since the previous [`take_process_memory`] call. The same
+    /// window as `major_faults_window`, and the one figure on a streamed
+    /// model that is a **count** rather than a rate — which is why it
+    /// survives the drive drift that invalidates timings on this hardware.
+    pub read_bytes_window: u64,
 }
 
 impl ProcessMemory {
@@ -351,6 +375,8 @@ impl ProcessMemory {
             "minor_faults": self.minor_faults,
             "rss_kb": self.rss_kb,
             "peak_rss_kb": self.peak_rss_kb,
+            "read_bytes": self.read_bytes,
+            "read_bytes_window": self.read_bytes_window,
         })
     }
 }
@@ -364,13 +390,33 @@ pub fn take_process_memory() -> Option<ProcessMemory> {
     let (minor_faults, major_faults) = parse_faults(&stat)?;
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let previous = LAST_MAJOR_FAULTS.swap(major_faults, Ordering::Relaxed);
+    let read_bytes = std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|io| parse_read_bytes(&io))
+        .unwrap_or(0);
+    let previous_read = LAST_READ_BYTES.swap(read_bytes, Ordering::Relaxed);
     Some(ProcessMemory {
         major_faults,
         major_faults_window: major_faults.saturating_sub(previous),
         minor_faults,
         rss_kb: parse_status_kb(&status, "VmRSS:").unwrap_or(0),
         peak_rss_kb: parse_status_kb(&status, "VmHWM:").unwrap_or(0),
+        read_bytes,
+        read_bytes_window: read_bytes.saturating_sub(previous_read),
     })
+}
+
+/// `read_bytes` from a `/proc/<pid>/io` block.
+///
+/// Named-key lookup rather than a field index, because this file has no fixed
+/// ordering guarantee and carries a `rchar` line whose name is a prefix of
+/// nothing but whose *value* is wildly different — `rchar` counts every byte
+/// read through a syscall including page-cache hits, which is the number this
+/// is specifically not.
+fn parse_read_bytes(io: &str) -> Option<u64> {
+    io.lines()
+        .find_map(|line| line.strip_prefix("read_bytes:"))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// `(minflt, majflt)` from a `/proc/<pid>/stat` line.
@@ -401,6 +447,30 @@ fn parse_status_kb(status: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `rchar` is the trap: it sits in the same file, counts every byte read
+    /// through a syscall *including page-cache hits*, and is typically an
+    /// order of magnitude larger. A field-index parse or a sloppy prefix
+    /// match picks it up and every I/O claim built on it is wrong in the
+    /// direction that looks like a discovery.
+    #[test]
+    fn read_bytes_is_not_rchar() {
+        let io = "rchar: 1627049701\n\
+                  wchar: 4096\n\
+                  syscr: 199034\n\
+                  syscw: 12\n\
+                  read_bytes: 20725362688\n\
+                  write_bytes: 0\n\
+                  cancelled_write_bytes: 0\n";
+        assert_eq!(parse_read_bytes(io), Some(20_725_362_688));
+    }
+
+    #[test]
+    fn an_io_block_without_read_bytes_reports_nothing() {
+        assert_eq!(parse_read_bytes("rchar: 5\nwchar: 6\n"), None);
+        assert_eq!(parse_read_bytes(""), None);
+        assert_eq!(parse_read_bytes("read_bytes: not-a-number\n"), None);
+    }
     use super::*;
 
     /// The counters are process-wide, so tests that drain them cannot run

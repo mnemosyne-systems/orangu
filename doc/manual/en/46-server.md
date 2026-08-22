@@ -1274,7 +1274,7 @@ forward (`gemma4`, `deepseek4`, `glm-dsa`, `muse-glimmer` today). Either
 failure stops the server with a message naming what is wrong.
 
 **Speculation only runs for greedy requests** (`temperature: 0`), unconstrained
-by `response_format`, and not while `ORANGU_BATCH_DECODE` is fusing decode
+by `response_format`.
 steps. A drafted token is accepted only when it equals what the sampler would
 itself have chosen, which is what makes the output identical — and that
 comparison has no meaning for a sampled or grammar-constrained request.
@@ -1967,10 +1967,30 @@ RX 5500M, a fixed 512-token chunk took
 so a token-count limit alone stops protecting anything past a few thousand
 tokens. Each chunk is now timed, and the next one is scaled by the rate just
 measured to hold roughly `ORANGU_PREFILL_CHUNK_MS` (default 3000) per
-submission; `ORANGU_PREFILL_BATCH` (default 512) remains the ceiling. A prompt
+submission; `ORANGU_PREFILL_BATCH` (512 here) remains the ceiling. A prompt
 opens with a small probe chunk rather than a full-width one, since nothing
 knows the machine's cost curve in advance and a full-width chunk at a deep
 position is exactly the submission that hangs.
+
+All of that is about a device that can be reset out from under a submission,
+and it applies only where there is one. **Where there is not — the CPU
+backend — the timing is dropped and the width is flat**, because the quotient
+the sizer adapts on is a per-token rate only while the model is in RAM. When
+weights stream from disk, a pass costs about the same whatever it contains, so
+a narrow chunk reports a huge apparent rate and the next chunk shrinks to
+match; the fixed cost is then paid again over fewer tokens. That does not
+converge to something slow, it collapses: a 1,016-token prompt reached the
+16-token floor on the first chunk and read a 1.23 GiB model **63.8 times**,
+prefilling at 0.8 tok/s where one pass manages 45.7.
+
+The flat width itself is then chosen from residency, because the two regimes
+disagree. Resident, a narrow chunk is both faster and smaller — 10.6% faster
+at 8,001 tokens across three interleaved pairs, and 1,988 MB peak against
+2,967 — since a smaller working set pages less. Streamed, every extra pass
+re-reads what is not cached, and one pass wins by a factor: 1.29 GiB against
+4.97. So a resident model keeps the narrow width and a streamed one takes the
+whole prompt in a single pass. Setting `ORANGU_PREFILL_BATCH` fixes the width
+in either case.
 
 On the same card, a 48 000-token prompt that previously reset the device at
 position 7 680 now completes in 163 chunks with a slowest submission of 3.3 s,

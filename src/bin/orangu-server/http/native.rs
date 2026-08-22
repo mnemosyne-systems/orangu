@@ -218,10 +218,11 @@ pub async fn moe_stats() -> impl IntoResponse {
         // `engine::route_ahead`, which measures this before anything is built
         // on it.
         "route_ahead": route_ahead.to_json(),
-        // Mean fused-batch size, or null when `ORANGU_BATCH_DECODE` is off.
-        // A batching measurement is uninterpretable without it.
-        "batch": crate::engine::batch::batch_stats().map(|(batches, seqs, mean)| {
-            serde_json::json!({"batches": batches, "sequences": seqs, "mean_batch": mean})
+        // Layers released behind the sweep, or null when no dense residency
+        // window is configured. Null and zero are different claims: one says
+        // the policy is off, the other that it ran and freed nothing.
+        "dense_residency": crate::engine::dense_residency::stats().map(|(layers, bytes)| {
+            serde_json::json!({"released_layers": layers, "released_bytes": bytes})
         }),
     }))
 }

@@ -91,7 +91,6 @@ fill. Skipping one costs a feature, never correctness:
 | `forward_maybe_sampling` | device-side argmax, so a greedy decode step never reads back a whole vocabulary | `llama`, `gemma`, `mistral`, `phi` |
 | `forward_all_logits` | **multi-position decode** — speculative decoding needs it on *both* halves of a pair | `gemma`, `deepseek4`, `glm`, `muse` |
 | `post_pool_projection` | extra adapter layers after embedding pooling | `gemma` |
-| `forward_batch_decode` | cross-sequence fused decode | `gemma` |
 
 Start with the four required methods and nothing else. A correct architecture
 that gives up every fast path is a finished contribution; the optional methods
