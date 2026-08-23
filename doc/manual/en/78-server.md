@@ -141,7 +141,9 @@ of the workspace rather than binary-local ones: `orangu::gguf` (the GGUF
 binary-format reader), `orangu::model_spec` (directory scan, shard
 grouping, and the Hugging Face repo-id/quant-tag reconstruction behind
 `list`'s `MODEL` column), `orangu::model_download` (`download`'s fetch
-logic), `orangu::os` (OS detection) and `orangu::hardware` (CPU/GPU
+logic), `orangu::model_registry` (the locked, versioned
+`~/.orangu/models` inventory behind `list`'s `LAST_USED` column),
+`orangu::os` (OS detection) and `orangu::hardware` (CPU/GPU
 detection). Living in `src/`
 alongside `orangu`'s and `orangu-coordinator`'s own shared code, rather
 than nested under `src/bin/orangu-server/`, is what let `orangu-server`

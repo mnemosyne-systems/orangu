@@ -34,6 +34,7 @@ pub mod license;
 pub mod llm;
 pub mod mcp;
 pub mod model_download;
+pub mod model_registry;
 pub mod model_spec;
 pub mod os;
 

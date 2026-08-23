@@ -519,11 +519,11 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                        QUANT   SIZE        SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   Yes (qwen3)
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Yes (qwen3)
- 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    Yes (gemma4)
- 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  No (glm-dsa)
+NR  MODEL                                        QUANT   SIZE        LAST_USED        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   2026-08-24 15:42  Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Never             Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    2026-08-21 09:16  Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order, starting from 1 — a shorthand for
@@ -549,15 +549,23 @@ so the column tells you that up front. The greying is only emitted to a
 terminal — piped or redirected output stays plain text, so the shell
 completion scripts that read `list` by column keep working.
 
+`LAST_USED` is the local date and time at which that model last completed
+server startup. `show`, `plan`, shell completion, and failed startup attempts
+do not change it. `Never` means the model has not been successfully served
+since tracking was introduced. The versioned JSON file `~/.orangu/models`
+stores the model name, canonical path, download time, and last-use time.
+Downloads create records, manually installed models acquire one when first
+served, and deleting a model removes its record.
+
 For every row that names a Hugging Face repo, `list` also checks that repo's
 current `main` commit against the one the local copy was downloaded at, in
 parallel across every distinct repo on the list. A row that's behind gets a
 trailing `(Refresh)` marker after its last column:
 
 ```
-NR  MODEL                                      QUANT   SIZE       SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3) (Refresh)
- 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)
+NR  MODEL                                      QUANT   SIZE       LAST_USED        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  2026-08-24 15:42  Yes (qwen3) (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Never             Yes (gemma4)
 ```
 
 `refresh` (below) is the command that acts on it. The check needs the Hub to
@@ -2270,8 +2278,8 @@ stays open, so several can be cleared in a row.
 
 ## Model management
 
-The topbar's **Models** button opens a panel showing the models directory as
-`orangu-server list` prints it — the same numbered table, column for column:
+The topbar's **Models** button opens a panel showing the models directory from
+the same scan as `orangu-server list`, with its core numbered inventory fields:
 
 | | |
 | :-- | :-- |

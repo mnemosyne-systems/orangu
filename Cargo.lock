@@ -3532,6 +3532,7 @@ dependencies = [
  "base64 0.23.1",
  "bytemuck",
  "calamine",
+ "chrono",
  "clap",
  "crossterm",
  "cubecl-hip-sys",
