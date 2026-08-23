@@ -2129,7 +2129,15 @@ fn run_command(
             Ok(())
         }
         Command::Suggest => {
-            let os = orangu::os::detect();
+            let mut os = orangu::os::detect();
+            // Same best-effort load as `system`, and for the same reason:
+            // a machine with no config file still gets a suggestion, and
+            // one with a config gets the models directory measured. Without
+            // this the report claimed the machine had no models directory
+            // while `list` was printing the models sitting in it.
+            os.models = load_config(config_arg, None, false)
+                .ok()
+                .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
             print!("{}", suggest::format_suggestion(&os, &cpu, &gpus));

@@ -350,26 +350,8 @@ pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String
         ),
     );
 
-    out.push_str(NEXT_STEP);
     out
 }
-
-/// Where the estimate ends and a real answer begins.
-///
-/// Every figure above it is derived from a parameter count and the standard
-/// transformer approximation, because at this point no model has been chosen
-/// and there is no file to read. `download` does not have that problem: it
-/// reads the repo's actual tensor tables before fetching anything and reports
-/// what *that* model needs. Saying so here is what turns a size class into a
-/// next step, and it is the difference between a suggestion the user has to
-/// act on blind and one that gets checked against reality before any
-/// bandwidth is spent.
-const NEXT_STEP: &str = "\n\
-    Every figure above is estimated from a parameter count — no model has been\n\
-    chosen yet, so there is no file to read. Once you have picked one,\n\
-    `orangu-server download <user>/<model>[:quant]` reads its real tensor tables\n\
-    before fetching it and reports what that model actually needs here;\n\
-    `orangu-server plan` does the same for a model already downloaded.\n";
 
 #[cfg(test)]
 mod tests {

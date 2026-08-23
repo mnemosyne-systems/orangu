@@ -535,11 +535,11 @@ pub fn format_section(os: &OsInfo) -> String {
             &format!("{} (max {})", format_limit(soft), format_limit(hard)),
         );
     }
-    // Only where a models directory is known — `suggest` and the report a
-    // machine with no config prints have no directory to measure, and say
-    // nothing about disk rather than measuring some default that isn't in
-    // use. The free-space line is the filesystem's, not the directory's:
-    // it's what the *next* download has to fit into.
+    // Only where a models directory is known — the report a machine with no
+    // config prints has no directory to measure, and says nothing about disk
+    // rather than measuring some default that isn't in use. The free-space
+    // line is the filesystem's, not the directory's: it's what the *next*
+    // download has to fit into.
     if let Some(models) = &os.models {
         field("Models", &models.path.display().to_string());
         field("Models used", &format_bytes(models.used_bytes));
