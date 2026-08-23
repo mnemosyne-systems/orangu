@@ -410,6 +410,14 @@ pub fn resolve_refresh_target(models_dir: &Path, requested: &str) -> Result<Mode
 /// too, walking up from each deleted path but never past `models_dir`
 /// itself, which is left alone regardless of what remains inside it.
 pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
+    // Resolve symlinks while they still exist: registry records use the
+    // canonical blob path, which cannot be recovered after the snapshot
+    // link and its final blob have both been removed.
+    let registry_paths: Vec<PathBuf> = group
+        .paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect();
     for path in &group.paths {
         let blob_target = std::fs::symlink_metadata(path)
             .ok()
@@ -447,6 +455,9 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
         }
 
         remove_empty_ancestors(path, models_dir);
+    }
+    if let Err(err) = crate::model_registry::forget(&registry_paths) {
+        eprintln!("warning: could not update ~/.orangu/models: {err:#}");
     }
     Ok(())
 }
@@ -1089,11 +1100,26 @@ pub fn format_groups(
     support: &[ModelSupport],
     dim: Dimming,
 ) -> String {
+    format_groups_with_last_used(groups, base, latest_updates, support, dim, None)
+}
+
+/// [`format_groups`] with the persistent `LAST_USED` column requested by
+/// `orangu-server list`. Other model pickers keep their compact table by
+/// passing through [`format_groups`] instead.
+pub fn format_groups_with_last_used(
+    groups: &[ModelGroup],
+    base: &Path,
+    latest_updates: &HashMap<String, crate::model_download::RepoUpdateInfo>,
+    support: &[ModelSupport],
+    dim: Dimming,
+    last_used: Option<&[Option<u64>]>,
+) -> String {
     if groups.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
 
     let show_support = !support.is_empty();
+    let show_last_used = last_used.is_some();
 
     let nr_width = groups.len().to_string().len().max("NR".len());
     let model_width = groups
@@ -1108,10 +1134,9 @@ pub fn format_groups(
         .max()
         .unwrap_or(0)
         .max("QUANT".len());
-    // SIZE is the last column unless a SUPPORTED column follows it, in which
-    // case it needs a fixed width so SUPPORTED lines up. Error rows carry no
-    // size, so they don't factor into the width.
-    let size_width = if show_support {
+    // SIZE needs a fixed width whenever another column follows it. Error
+    // rows carry no size, so they don't factor into the width.
+    let size_width = if show_support || show_last_used {
         groups
             .iter()
             .filter(|g| g.errors.is_empty())
@@ -1124,9 +1149,19 @@ pub fn format_groups(
     };
 
     let mut out = String::new();
-    if show_support {
+    if show_support && show_last_used {
+        out.push_str(&format!(
+            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {:<16}  SUPPORTED\n",
+            "NR", "MODEL", "QUANT", "SIZE", "LAST_USED"
+        ));
+    } else if show_support {
         out.push_str(&format!(
             "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  SUPPORTED\n",
+            "NR", "MODEL", "QUANT", "SIZE"
+        ));
+    } else if show_last_used {
+        out.push_str(&format!(
+            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  LAST_USED\n",
             "NR", "MODEL", "QUANT", "SIZE"
         ));
     } else {
@@ -1158,13 +1193,32 @@ pub fn format_groups(
             continue;
         }
         let refresh_suffix = if refresh { " (Refresh)" } else { "" };
-        let row = if show_support {
+        let used = last_used
+            .and_then(|values| values.get(index).copied().flatten())
+            .map(format_last_used)
+            .unwrap_or_else(|| "Never".to_string());
+        let row = if show_support && show_last_used {
+            format!(
+                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {used:<16}  {}{refresh_suffix}",
+                group.label,
+                group.quantization.as_deref().unwrap_or("-"),
+                format_bytes(group.size_bytes),
+                support[index].cell(),
+            )
+        } else if show_support {
             format!(
                 "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {}{refresh_suffix}",
                 group.label,
                 group.quantization.as_deref().unwrap_or("-"),
                 format_bytes(group.size_bytes),
                 support[index].cell(),
+            )
+        } else if show_last_used {
+            format!(
+                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {used}{refresh_suffix}",
+                group.label,
+                group.quantization.as_deref().unwrap_or("-"),
+                format_bytes(group.size_bytes),
             )
         } else {
             format!(
@@ -1187,6 +1241,18 @@ pub fn format_groups(
         }
     }
     out
+}
+
+fn format_last_used(timestamp: u64) -> String {
+    use chrono::{DateTime, Local};
+
+    DateTime::from_timestamp(timestamp as i64, 0)
+        .map(|time| {
+            time.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "Never".to_string())
 }
 
 #[cfg(test)]
@@ -1830,6 +1896,44 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].hf_repo, None);
         assert_eq!(groups[0].local_commit, None);
+    }
+
+    #[test]
+    fn last_used_column_shows_never_until_a_model_has_been_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("plain.gguf"), "llama", None);
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+
+        let output = format_groups_with_last_used(
+            &groups,
+            dir.path(),
+            &HashMap::new(),
+            &[],
+            Dimming::Off,
+            Some(&[None]),
+        );
+
+        assert!(output.lines().next().unwrap().contains("LAST_USED"));
+        assert!(output.lines().nth(1).unwrap().ends_with("Never"));
+
+        let support = [ModelSupport {
+            architecture: Some("llama".to_string()),
+            supported: true,
+            unsupported_quant: None,
+        }];
+        let output = format_groups_with_last_used(
+            &groups,
+            dir.path(),
+            &HashMap::new(),
+            &support,
+            Dimming::Off,
+            Some(&[None]),
+        );
+        let header = output.lines().next().unwrap();
+        assert!(header.find("LAST_USED") < header.find("SUPPORTED"));
+        let row = output.lines().nth(1).unwrap();
+        assert!(row.contains("Never"));
+        assert!(row.ends_with("Yes (llama)"));
     }
 
     #[cfg(unix)]
