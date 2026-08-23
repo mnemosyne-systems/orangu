@@ -2232,6 +2232,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             kv_storage,
             subgroup,
             head_dim as u32,
+            super::super::vulkan_shaders::KvPaging::Contiguous,
         );
         let reduce_wgsl = super::super::vulkan_shaders::shader_source_attention_split_reduce();
 

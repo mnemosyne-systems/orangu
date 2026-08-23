@@ -76,13 +76,21 @@ pub(super) struct AttnMeta {
     pub(super) n_query: u32,
     pub(super) n_swa: u32,
     pub(super) causal: u32,
-    pub(super) _pad: u32,
+    /// Where this sequence's block table starts, and how many positions one
+    /// page covers — see `vulkan_shaders::KvPaging`. Both `0` on the
+    /// contiguous path, where `kv_slot` is the identity and reads neither.
+    pub(super) kv_page_base: u32,
+    pub(super) kv_page_tokens: u32,
+    pub(super) _pad0: u32,
+    pub(super) _pad1: u32,
+    pub(super) _pad2: u32,
 }
 
 /// `AttnSplitMeta` in `vulkan_shaders::ATTENTION_SPLIT_SHADER_TEMPLATE` —
 /// `#[repr(C)]` so its layout matches WGSL's `struct AttnSplitMeta {
 /// n_head: u32, n_head_kv: u32, head_dim: u32, window_start: u32, n_pos:
-/// u32, k_num: u32, scale: f32, _pad: u32 }` field-for-field. Almost
+/// u32, k_num: u32, scale: f32, kv_page_base: u32, kv_page_tokens: u32,
+/// _pad0..2: u32 }` field-for-field. Almost
 /// `AttnMeta`'s own shape, `capacity` swapped for `k_num` — split-k phase
 /// 1 doesn't need `capacity` (it never reads past `n_pos`, unlike the
 /// un-split kernel which doesn't either — `capacity` is otherwise unused
@@ -98,7 +106,15 @@ pub(super) struct AttnSplitMeta {
     pub(super) n_pos: u32,
     pub(super) k_num: u32,
     pub(super) scale: f32,
-    pub(super) _pad: u32,
+    /// Where this sequence's block table starts, and how many positions one
+    /// page covers. Both `0` on the contiguous path, where the shader's
+    /// `kv_slot` is the identity and reads neither — see
+    /// `vulkan_shaders::KvPaging`.
+    pub(super) kv_page_base: u32,
+    pub(super) kv_page_tokens: u32,
+    pub(super) _pad0: u32,
+    pub(super) _pad1: u32,
+    pub(super) _pad2: u32,
 }
 
 /// `AttnReduceMeta` in `vulkan_shaders::ATTENTION_SPLIT_REDUCE_SHADER` —

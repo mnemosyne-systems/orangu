@@ -19,11 +19,13 @@
 //! there is no cross-sequence sharing (no prompt-prefix reuse) in this
 //! build.
 
+use std::sync::Mutex;
+
 /// Converts a slice of `f32` KV values into little-endian `f16` bytes, for
 /// `LayerCache::sync_gpu`'s `f16` KV-mirror upload path. A plain
 /// per-element loop, not `bytemuck::cast_slice` — unlike the `f32` path,
 /// this genuinely *converts* values, not just reinterprets bytes.
-fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 2);
     for &v in data {
         out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
@@ -45,7 +47,7 @@ fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
 /// and GPU storage buffers are little-endian on every platform this
 /// backend targets), so a cross-check test can compare either path's
 /// output directly.
-fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
     debug_assert_eq!(
         data.len() % 32,
         0,
@@ -91,10 +93,315 @@ pub struct LayerCache {
     /// Nothing else changes: [`Self::push`] appends one row per completed
     /// block exactly as a per-token slot appends one row per token.
     stride: usize,
+    /// Sealed pages in a shared [`crate::engine::kv_pool::KvPool`], when this
+    /// layer is paged — `None` for the ordinary contiguous layout.
+    ///
+    /// When it is `Some`, `k`/`v` above stop being the whole layer and become
+    /// only its **tail**: the rows of the page currently being written. Every
+    /// row before that lives in the pool. The split is what lets a page be
+    /// immutable the moment it is shareable — a sequence writes into its own
+    /// buffer and hands the page over only when it is full, so the pool never
+    /// holds anything that is still changing.
+    paged: Option<PagedRows>,
     /// GPU-resident mirror of `k`/`v`, built lazily on the first call that
     /// needs it (a Vulkan-backed decode step) — `None` for every other
     /// backend/request. See [`Self::sync_gpu`].
     gpu: Option<GpuLayerCache>,
+    /// Whether this layer's device-side keys and values are the pool's.
+    ///
+    /// Once true, `gpu` is a one-row stub that holds only softmax scratch and
+    /// the cached dispatch — it has no rows and will never be uploaded to. So
+    /// a reader that silently fell back to it would read zeros and produce a
+    /// plausible answer, which is the failure this flag exists to make loud.
+    pool_backed: bool,
+}
+
+/// The pages of **one sequence**, shared by every layer of it.
+///
+/// A page index addresses the same token positions in every layer — that is
+/// what makes a block table per sequence rather than per layer — so a page has
+/// to be taken from the pool exactly once, no matter how many layers then write
+/// their own region of it. Getting this wrong is not subtle in its
+/// consequences but is entirely invisible with one layer: the second layer to
+/// seal finds the first layer's page already published, and either shares a
+/// page it is about to overwrite or is refused by `fill`.
+///
+/// So acquisition, fill-counting and release live here, once, and the layers
+/// coordinate through it.
+struct SequencePages {
+    pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+    /// Where this sequence's block table lives in the pool's shared table
+    /// buffer, and how many entries were reserved — `None` when the pool has no
+    /// device, or when the table buffer was full, in which case this sequence
+    /// uses the per-request mirror and is correct but not shared on the device.
+    table: Option<(usize, usize)>,
+    inner: Mutex<SeqPages>,
+}
+
+#[derive(Default)]
+struct SeqPages {
+    /// Physical page per logical page, in order — the block table.
+    pages: Vec<u32>,
+    /// How many layers have written their region of each page. A page is
+    /// sealed, and so becomes shareable, only when every layer has.
+    filled: Vec<usize>,
+    /// Content identity per logical page, from `engine::prefix_index`.
+    tags: Vec<u64>,
+    /// How many entries of this sequence's block table are on the device.
+    table_synced: usize,
+    /// Layers that have ever written a row.
+    ///
+    /// **Not every layer of the model writes.** A cross-layer KV donor has its
+    /// own slot in the cache that is never pushed to — its writes redirect to
+    /// the layer it donates from — so a page that waited for *all* layers
+    /// would wait for a write that never arrives. It would never seal, never
+    /// publish, and never be shareable, and nothing would report a fault: the
+    /// index would go on advertising prefixes, every adoption would fail, and
+    /// the feature would look switched off.
+    ///
+    /// Discovered rather than declared, because which layers write is a
+    /// property of the architecture and not of the cache's geometry. Every
+    /// token touches every participating layer, so the set is complete well
+    /// before the first page fills.
+    participants: std::collections::BTreeSet<usize>,
+}
+
+impl SequencePages {
+    fn new(pool: std::sync::Arc<crate::engine::kv_pool::KvPool>, max_pages: usize) -> Self {
+        // Reserved up front, for the whole sequence's possible length: growing
+        // it later would move the region, and the base is baked into every
+        // dispatch's meta uniform.
+        let table = pool
+            .device_pages()
+            .and_then(|_| pool.alloc_table(max_pages))
+            .map(|base| (base, max_pages));
+        Self {
+            pool,
+            table,
+            inner: Mutex::new(SeqPages::default()),
+        }
+    }
+
+    /// Pushes the block table to the device if it has changed since the last
+    /// upload, and reports where the kernel should read it.
+    ///
+    /// The table is per *sequence*, not per layer — a page index means the same
+    /// token positions in every layer — so this uploads once however many
+    /// layers ask.
+    fn sync_table(&self, queue: &wgpu::Queue) -> Option<(usize, usize)> {
+        let (base, cap) = self.table?;
+        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        if inner.table_synced != inner.pages.len() {
+            if inner.pages.len() > cap {
+                // More pages than were reserved: this sequence outgrew its
+                // table. Correct to decline — the caller falls back to the
+                // mirror — and silent growth would overwrite a neighbour's.
+                return None;
+            }
+            self.pool.write_table(queue, base, &inner.pages);
+            inner.table_synced = inner.pages.len();
+        }
+        Some((base, inner.pages.len()))
+    }
+
+    /// Notes that `layer` writes rows, the first time it does.
+    fn joins(&self, layer: usize) {
+        self.inner
+            .lock()
+            .expect("sequence pages poisoned")
+            .participants
+            .insert(layer);
+    }
+
+    /// The page for logical index `i`, and whether it already holds this
+    /// content.
+    ///
+    /// A hit means some other sequence has already built and published exactly
+    /// these positions — same tag, and the index confirmed the token run behind
+    /// it, so the keys and values are the ones this sequence just computed.
+    /// It takes that page and throws its own copy away.
+    ///
+    /// This is not an edge case to be avoided. It is the ordinary outcome
+    /// whenever a request rebuilds a page it was deliberately not given: the
+    /// prefix match leaves the last matched page unshared so the forward pass
+    /// has something to produce logits from, and that page is still resident.
+    /// It also covers two requests racing to build the same page, where
+    /// whichever seals second finds the first one's work waiting.
+    ///
+    /// A hit is always a *sealed* page — the tag lookup contains nothing else —
+    /// so it is complete and immutable, and adopting it cannot pick up
+    /// half-written rows.
+    fn page_for(&self, i: usize) -> (u32, bool) {
+        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        if let Some(&page) = inner.pages.get(i) {
+            // Another layer of this sequence got here first.
+            return (page, self.pool.is_sealed(page));
+        }
+        debug_assert_eq!(i, inner.pages.len(), "pages are sealed in order");
+        let tag = inner.tags.get(i).copied().unwrap_or(0);
+        let got = self
+            .pool
+            .acquire(&[tag])
+            .expect("the scheduler admits a request only against pool room")[0];
+        inner.pages.push(got.page);
+        // A page adopted whole is already complete; counting it as filled by
+        // every participant keeps `seal_complete` from trying to publish it a
+        // second time.
+        let complete = inner.participants.len();
+        inner.filled.push(if got.hit { complete } else { 0 });
+        (got.page, got.hit)
+    }
+
+    /// Records that one more layer has written `i`, sealing it once all have.
+    fn layer_filled(&self, i: usize) {
+        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        inner.filled[i] += 1;
+        // **Deliberately no seal here.** Sealing publishes a page for sharing,
+        // and a page is only publishable once every layer that will write it
+        // has. This tried to detect that by counting fills against the set of
+        // layers that write — and that assumes the layers reach a page
+        // boundary together, which they do not.
+        //
+        // `arch::gemma` is the counter-example: its cross-layer KV donors send
+        // several model layers' writes into one `LayerCache`, so that cache
+        // advances through pages at a different rate from its neighbours. The
+        // count reached the participant total while other layers were still
+        // several tokens behind, the page was published, and the next layer to
+        // write it hit `fill`'s "already sealed" assertion — which is the
+        // assertion doing its job, catching a page about to be handed out
+        // half-written rather than letting it be shared.
+        //
+        // The fix is not a cleverer count. Whether token positions are
+        // complete is a fact the *forward pass* knows and the cache cannot
+        // infer, so it has to be told — a commit point per prefill chunk and
+        // per decode step. Until that exists, pages stay unsealed: paging
+        // works and is private, `KvPool::holds` reports nothing, and the index
+        // advertises nothing it cannot deliver.
+        let _ = i;
+    }
+
+    /// Drops every page past `keep`, once — idempotent, because every layer
+    /// rolls back to the same token count and each of them asks.
+    fn truncate_to(&self, keep: usize) {
+        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        if inner.pages.len() <= keep {
+            return;
+        }
+        let released: Vec<u32> = inner.pages.drain(keep..).collect();
+        inner.filled.truncate(keep);
+        // The device copy of the table now names pages this sequence has given
+        // back. Marking it stale is not an optimisation: leaving it would have
+        // the kernel read whoever takes those pages next.
+        inner.table_synced = inner.table_synced.min(inner.pages.len());
+        self.pool.release(&released);
+    }
+
+    /// Seals every page every participating layer has finished writing.
+    ///
+    /// The commit point. Whether a page is complete is a fact about the forward
+    /// pass — it knows when it has run every layer over a span of positions —
+    /// and the cache cannot infer it, which is what the removed auto-seal was
+    /// wrongly trying to do. So the caller says when, and this seals whatever
+    /// has genuinely been finished by then.
+    ///
+    /// Idempotent: a page already sealed is skipped, so calling this after
+    /// every chunk costs a scan of the fill counts and nothing else.
+    fn seal_complete(&self) {
+        let inner = self.inner.lock().expect("sequence pages poisoned");
+        let participants = inner.participants.len();
+        if participants == 0 {
+            return;
+        }
+        for (i, &page) in inner.pages.iter().enumerate() {
+            if inner.filled[i] == participants && !self.pool.is_sealed(page) {
+                self.pool.seal(page);
+            }
+        }
+    }
+
+    fn adopt(&self, pages: &[u32]) {
+        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        inner.pages = pages.to_vec();
+        inner.table_synced = 0;
+        // Adopted pages are already sealed by whoever built them; counting them
+        // as fully filled keeps `layer_filled` from sealing them a second time.
+        let participants = inner.participants.len().max(1);
+        inner.filled = vec![participants; pages.len()];
+    }
+
+    fn set_tags(&self, tags: &[u64]) {
+        self.inner.lock().expect("sequence pages poisoned").tags = tags.to_vec();
+    }
+
+    fn pages(&self) -> Vec<u32> {
+        self.inner
+            .lock()
+            .expect("sequence pages poisoned")
+            .pages
+            .clone()
+    }
+}
+
+impl Drop for SequencePages {
+    /// A sequence's pages go back when the sequence does. Without this a
+    /// finished request's pages stay held for the life of the process, and the
+    /// pool runs out while every page in it is reclaimable.
+    fn drop(&mut self) {
+        let inner = self.inner.lock().expect("sequence pages poisoned");
+        self.pool.release(&inner.pages);
+        if let Some((base, entries)) = self.table {
+            self.pool.free_table(base, entries);
+        }
+    }
+}
+
+/// One layer's view of its sequence's pages.
+struct PagedRows {
+    seq: std::sync::Arc<SequencePages>,
+    /// Which layer of the pool's geometry this is — pages are shared across
+    /// layers, so a page index means "these token positions", and the layer
+    /// selects which of its regions to read.
+    layer: usize,
+    /// Rows one page holds for *this* layer — `page_tokens / stride`, rounded
+    /// up, so a block-compressed layer stores fewer rows per page than a
+    /// per-token one.
+    rows_per_page: usize,
+    /// A local copy of the block table, so a read never takes the sequence
+    /// lock. `key_at` is in the CPU attention inner loop; the shared list is
+    /// consulted only when a page is sealed or released.
+    pages: Vec<u32>,
+    /// How many of `pages` are *complete* — every position they cover has been
+    /// written.
+    ///
+    /// Not the same as `pages.len()`, and the difference is the tail. A page is
+    /// allocated as soon as the sequence starts writing into it, because the
+    /// attention kernels address positions through the block table and a
+    /// position with no entry there reads whatever the table happens to hold.
+    /// But it is not *complete* until its last row is written, and host reads
+    /// must keep taking those rows from the local tail buffer, which is the
+    /// only place they are authoritative.
+    full_pages: usize,
+    /// Rows of the *tail* page already on the device.
+    ///
+    /// The tail grows a row per decode step, and without this every step
+    /// re-sent the whole page — `page_tokens` times the traffic the step
+    /// actually produced, per layer.
+    tail_uploaded: usize,
+    /// How many of `pages` have been written to the pool's **device** pages.
+    ///
+    /// The device copy lags the host one: a page is filled on the host as its
+    /// tail completes, and pushed to the device when something asks for the
+    /// mirror. Tracked per layer because each layer writes its own region of a
+    /// page and they do not finish together.
+    device_synced: usize,
+}
+
+impl PagedRows {
+    /// The row range of `pool_page` inside the pool's per-layer buffer.
+    fn row(&self, pool_page: u32, row_in_page: usize) -> std::ops::Range<usize> {
+        let start = self.seq.pool.row_offset(self.layer, pool_page, row_in_page);
+        start..start + self.seq.pool.layers()[self.layer].kv_dim
+    }
 }
 
 /// One layer's GPU-resident KV cache mirror, plus the softmax scratch
@@ -152,6 +459,84 @@ struct GpuLayerCache {
     /// more than one entry here.
     #[allow(dead_code)]
     attn_dispatch: std::collections::HashMap<(usize, usize), GpuAttnDispatch>,
+}
+
+/// Everything the fused decode dispatch needs to serve one position out of
+/// the pool's device pages instead of out of a per-request mirror.
+///
+/// The write and the read have to move together. A decode step writes this
+/// token's key and value on the device and then, in the same submission,
+/// reads the whole attention window back — so the destination of the write and
+/// the addressing the kernel reads through must name the same storage. That is
+/// why this carries both the region layout (`layer_buffer`, `half`) and the
+/// one physical row this step writes (`write_slot`), rather than the caller
+/// deriving either.
+pub struct PagedFusedRefs {
+    /// The pool's buffer for this layer: keys from zero, values from `half`.
+    pub layer_buffer: wgpu::Buffer,
+    /// The block table, read by the kernel to turn a position into a row.
+    pub table: wgpu::Buffer,
+    /// Byte offset of the value region, and equally the size of each region.
+    pub half: u64,
+    /// This sequence's first entry in the shared table.
+    pub table_base: u32,
+    /// Positions per page — the divisor in the kernel's address computation.
+    pub page_tokens: u32,
+    /// The physical row `write_pos` maps to, in rows from each region's base.
+    pub write_slot: u32,
+}
+
+/// One contiguous stretch of a write that stays inside a single page.
+///
+/// A range of positions is contiguous on the host and contiguous inside each
+/// page, but not across a page boundary — so a write of `n` positions becomes
+/// one of these per page it touches, and each is a straight copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRun {
+    /// Rows into the source, from the start of the range being written.
+    pub src_row: u32,
+    /// Rows into each of the layer buffer's regions.
+    pub dst_row: u32,
+    /// How many rows this run covers.
+    pub rows: u32,
+}
+
+/// Splits `[write_pos, write_pos + n_tokens)` into runs that each stay inside
+/// one page.
+///
+/// `pages` is the block table — logical page index to physical page — and must
+/// already cover the last position in the range.
+fn page_runs(
+    pages: &[u32],
+    write_pos: usize,
+    n_tokens: usize,
+    rows_per_page: usize,
+) -> Vec<PageRun> {
+    let mut runs = Vec::new();
+    let mut done = 0usize;
+    while done < n_tokens {
+        let p = write_pos + done;
+        let in_page = p % rows_per_page;
+        let rows = (rows_per_page - in_page).min(n_tokens - done);
+        runs.push(PageRun {
+            src_row: done as u32,
+            dst_row: pages[p / rows_per_page] * rows_per_page as u32 + in_page as u32,
+            rows: rows as u32,
+        });
+        done += rows;
+    }
+    runs
+}
+
+/// [`PagedFusedRefs`] for a range of positions rather than one.
+pub struct PagedRangeRefs {
+    pub layer_buffer: wgpu::Buffer,
+    pub table: wgpu::Buffer,
+    pub half: u64,
+    pub table_base: u32,
+    pub page_tokens: u32,
+    /// The range split at page boundaries, in order.
+    pub runs: Vec<PageRun>,
 }
 
 /// Sub-range handles into a [`GpuLayerCache::buffer`] returned by
@@ -300,6 +685,27 @@ impl GpuLayerCache {
         n_head: usize,
         kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> Self {
+        Self::new_sized(device, rows, rows, kv_dim, n_head, kv_storage)
+    }
+
+    /// A mirror whose key/value region and whose softmax scratch are sized
+    /// independently.
+    ///
+    /// The paged decode path needs the second without the first. Its keys and
+    /// values live in the pool's pages, so the per-request mirror holds
+    /// nothing — but the attention dispatch it caches, and the scratch that
+    /// dispatch writes its per-position softmax terms into, are still
+    /// per-request. Sizing the mirror to one row rather than to the context
+    /// window is what stops a paged sequence from paying for a copy of a cache
+    /// it reads through the block table instead.
+    fn new_sized(
+        device: &wgpu::Device,
+        rows: usize,
+        probs_rows: usize,
+        kv_dim: usize,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    ) -> Self {
         let capacity = rows;
         // `Q8_0`'s 9-word (36-byte), 32-element blocks aren't expressible
         // as a fixed per-element byte count the way `f32`/`f16` are — size
@@ -343,7 +749,7 @@ impl GpuLayerCache {
         });
         let probs_scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server kv cache attention scratch"),
-            size: ((capacity * n_head).max(1) * 4) as u64,
+            size: ((probs_rows * n_head).max(1) * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -434,6 +840,8 @@ impl LayerCache {
             len: 0,
             gpu: None,
             stride,
+            paged: None,
+            pool_backed: false,
         }
     }
 
@@ -453,10 +861,12 @@ impl LayerCache {
             capacity: len,
             len,
             gpu: None,
+            paged: None,
             // A restored layer is only ever a `copy_prefix_from` *source*,
             // and only the destination's stride governs how many rows a
             // token count means, so this never needs the original's.
             stride: 1,
+            pool_backed: false,
         }
     }
 
@@ -466,18 +876,42 @@ impl LayerCache {
     /// single completed cache is needed in two places at once.
     fn duplicate(&self) -> Self {
         Self {
-            k: self.k.clone(),
-            v: self.v.clone(),
+            // Flattened, not cloned: under paging `k`/`v` hold only the tail,
+            // and a snapshot of the tail is not a snapshot of the layer.
+            k: self.flatten(self.host_len()).0,
+            v: self.flatten(self.host_len()).1,
             kv_dim: self.kv_dim,
             capacity: self.capacity,
             len: self.len,
             gpu: None,
             stride: self.stride,
+            // A duplicate is a plain host snapshot: it is taken so a completed
+            // cache can be in two places at once, and sharing pages between
+            // those two would defeat the point of taking it.
+            paged: None,
+            pool_backed: false,
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Floats in one stored row — this layer's `n_head_kv * head_dim`.
+    ///
+    /// Exposed so a pool can be sized from a model's own probe cache
+    /// (`ModelForward::new_kv_cache(1)`) rather than from a second description
+    /// of the same geometry. A second description is a second thing to keep in
+    /// step, and this one varies along a model's depth in ways
+    /// (`head_count_kv` per layer, a block-compressed layer, a layer with no
+    /// positional state at all) that a summary would flatten.
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    /// Token positions one stored row stands for — see [`Self::stride`].
+    pub fn row_stride(&self) -> usize {
+        self.stride
     }
 
     /// Drops every position from `new_len` onward, rolling this layer back to
@@ -499,12 +933,16 @@ impl LayerCache {
             return;
         }
         self.len = new_len;
-        // The buffers carry the committed rows and nothing else now, so
-        // rolling back the length has to roll them back too. `Vec::truncate`
-        // keeps the allocation, which is right: the rows are about to be
-        // written again by whatever replaces them.
-        self.k.truncate(new_len * self.kv_dim);
-        self.v.truncate(new_len * self.kv_dim);
+        if self.paged.is_some() {
+            self.truncate_paged(new_len);
+        } else {
+            // The buffers carry the committed rows and nothing else now, so
+            // rolling back the length has to roll them back too.
+            // `Vec::truncate` keeps the allocation, which is right: the rows
+            // are about to be written again by whatever replaces them.
+            self.k.truncate(new_len * self.kv_dim);
+            self.v.truncate(new_len * self.kv_dim);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.synced_len = gpu.synced_len.min(new_len);
         }
@@ -525,6 +963,13 @@ impl LayerCache {
     /// still copies.
     fn adopt(&mut self, src: &mut LayerCache) {
         debug_assert_eq!(self.kv_dim, src.kv_dim);
+        assert!(
+            self.paged.is_none() && src.paged.is_none(),
+            "adopting moves whole buffers between two layers, which only \
+             describes the contiguous layout; a paged layer hands over page \
+             indices instead, and mixing the two would leave one of them \
+             reading the other's tail as if it were a whole layer"
+        );
         self.k = std::mem::take(&mut src.k);
         self.v = std::mem::take(&mut src.v);
         self.len = src.len;
@@ -534,6 +979,8 @@ impl LayerCache {
         self.k.reserve(want.saturating_sub(self.k.len()));
         self.v.reserve(want.saturating_sub(self.v.len()));
         self.gpu = None;
+        // The stub goes with the mirror it stood in for.
+        self.pool_backed = false;
     }
 
     /// A CPU-only snapshot (no GPU mirror) for building an independent
@@ -562,6 +1009,10 @@ impl LayerCache {
         n_head: usize,
         kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> GpuKvRefs {
+        assert!(
+            !self.pool_backed,
+            "sync_gpu on a layer served from the pool: its mirror holds no rows"
+        );
         let capacity = self.capacity;
         let kv_dim = self.kv_dim;
         // `len + 1`, not `len`: the fused decode path binds these buffers and
@@ -572,6 +1023,12 @@ impl LayerCache {
         // driver never objects and the damage is silent: it lands on row 0 of
         // v. Sizing to `capacity` used to hide this, because capacity always
         // exceeds `len`.
+        // A paged layer's rows are spread across pages, so the incremental
+        // upload below cannot slice `k` directly and materializes the range
+        // instead (see `rows_between`). That path is now only reached by a
+        // sequence that could get no pages at all — every dispatch that can
+        // read through the block table does, and the assertion above is what
+        // holds the two apart.
         let want = mirror_rows_for(self.len + 1, capacity);
         // Grow before syncing, never shrink. A mirror that is already big
         // enough is left exactly as it is, so the steady state — every decode
@@ -623,54 +1080,43 @@ impl LayerCache {
             }
             Some(_) => {}
         }
+        // The bytes to upload are built **before** the mirror is borrowed
+        // mutably, because on the paged path assembling them reads back
+        // through `self`. Owned either way, which the two quantizing arms
+        // already were; only the `f32` arm previously handed the queue a
+        // borrow of `k`, and that is one `memcpy` of the range being uploaded
+        // — a row per decode step.
+        let storage = self.gpu.as_ref().map(|g| g.kv_storage);
+        let (row_from, row_to) = (self.gpu.as_ref().map_or(0, |g| g.synced_len), self.len);
+        let payload = (row_from < row_to).then(|| {
+            let k_rows = self.rows_between(row_from, row_to);
+            let v_rows = self.values_between(row_from, row_to);
+            match storage.expect("mirror present when rows are pending") {
+                crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
+                    (f32_to_f16_bytes(&k_rows), f32_to_f16_bytes(&v_rows))
+                }
+                crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
+                    (f32_to_q8_0_bytes(&k_rows), f32_to_q8_0_bytes(&v_rows))
+                }
+                crate::engine::backend::vulkan_shaders::KvStorage::F32 => (
+                    bytemuck::cast_slice(&k_rows).to_vec(),
+                    bytemuck::cast_slice(&v_rows).to_vec(),
+                ),
+            }
+        });
         let gpu = self.gpu.as_mut().expect("mirror present after growth");
-        if gpu.synced_len < self.len {
-            let start = gpu.synced_len * kv_dim;
-            let end = self.len * kv_dim;
+        if let Some((k_bytes, v_bytes)) = payload {
+            let start = row_from * kv_dim;
             // Local byte offset of `start` within each region, by storage
             // format; `k_off`/`v_off` shift it to the region's base in the
             // shared buffer.
-            match gpu.kv_storage {
-                crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
-                    let local = (start * 2) as u64;
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.k_off + local,
-                        &f32_to_f16_bytes(&self.k[start..end]),
-                    );
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.v_off + local,
-                        &f32_to_f16_bytes(&self.v[start..end]),
-                    );
-                }
-                crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
-                    let local = (start / 32 * 36) as u64;
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.k_off + local,
-                        &f32_to_q8_0_bytes(&self.k[start..end]),
-                    );
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.v_off + local,
-                        &f32_to_q8_0_bytes(&self.v[start..end]),
-                    );
-                }
-                crate::engine::backend::vulkan_shaders::KvStorage::F32 => {
-                    let local = (start * 4) as u64;
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.k_off + local,
-                        bytemuck::cast_slice(&self.k[start..end]),
-                    );
-                    queue.write_buffer(
-                        &gpu.kv_buffer,
-                        gpu.v_off + local,
-                        bytemuck::cast_slice(&self.v[start..end]),
-                    );
-                }
-            }
+            let local = match gpu.kv_storage {
+                crate::engine::backend::vulkan_shaders::KvStorage::F16 => (start * 2) as u64,
+                crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => (start / 32 * 36) as u64,
+                crate::engine::backend::vulkan_shaders::KvStorage::F32 => (start * 4) as u64,
+            };
+            queue.write_buffer(&gpu.kv_buffer, gpu.k_off + local, &k_bytes);
+            queue.write_buffer(&gpu.kv_buffer, gpu.v_off + local, &v_bytes);
             gpu.synced_len = self.len;
         }
         GpuKvRefs {
@@ -761,10 +1207,26 @@ impl LayerCache {
         );
         debug_assert_eq!(k.len(), self.kv_dim);
         debug_assert_eq!(v.len(), self.kv_dim);
-        debug_assert_eq!(self.k.len(), self.len * self.kv_dim);
+        debug_assert_eq!(self.k.len(), (self.len - self.sealed_rows()) * self.kv_dim);
+        if let Some(paged) = self.paged.as_ref()
+            && self.k.is_empty()
+            && paged.pages.is_empty()
+        {
+            // First write from this layer: it is a participant, and a page is
+            // sealed once every participant has written it.
+            paged.seq.joins(paged.layer);
+        }
         self.k.extend_from_slice(k);
         self.v.extend_from_slice(v);
         self.len += 1;
+        // A full tail becomes a page. Done here rather than lazily on the next
+        // read so that a page is sealed at the moment it stops changing, which
+        // is the property everything else about the pool is built on.
+        if let Some(paged) = self.paged.as_ref()
+            && self.k.len() / self.kv_dim == paged.rows_per_page
+        {
+            self.seal_tail();
+        }
     }
 
     /// Commits `n = k_rows.len() / kv_dim` positions whose K/V a GPU-resident
@@ -826,6 +1288,533 @@ impl LayerCache {
         self.len * self.stride
     }
 
+    /// A layer backed by pages from `pool`, with its tail held locally.
+    ///
+    /// `capacity` is still a token count, and still this sequence's own — the
+    /// pool bounds how much can be resident across every sequence at once, and
+    /// this bounds how far *this* one may run. Two different limits; a pool
+    /// with room does not entitle one request to the whole context.
+    #[allow(dead_code)]
+    fn new_paged(
+        capacity: usize,
+        kv_dim: usize,
+        stride: usize,
+        seq: std::sync::Arc<SequencePages>,
+        layer: usize,
+    ) -> Self {
+        let mut me = Self::new_strided(capacity, kv_dim, stride);
+        let rows_per_page = seq.pool.page_tokens().div_ceil(stride);
+        me.paged = Some(PagedRows {
+            seq,
+            layer,
+            rows_per_page,
+            pages: Vec::new(),
+            full_pages: 0,
+            tail_uploaded: 0,
+            device_synced: 0,
+        });
+        me
+    }
+
+    /// Pushes any pages this layer has sealed but not yet mirrored into the
+    /// pool's device pages.
+    ///
+    /// Kept apart from [`sync_gpu`](Self::sync_gpu) rather than folded into it,
+    /// deliberately. That one maintains the **per-request** mirror the
+    /// contiguous kernels read; this one maintains the **shared** pages the
+    /// paged kernels read. Both are correct, they are read by different
+    /// pipelines, and a single method that decided between them would make the
+    /// choice of pipeline and the choice of storage two things that could
+    /// disagree — with the failure being a kernel reading the wrong buffer and
+    /// answering from another sequence's tokens.
+    ///
+    /// Only whole sealed pages are pushed. The tail is still being written and
+    /// is not part of any block table yet.
+    pub fn sync_pool_device(&mut self, queue: &wgpu::Queue) {
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        if paged.seq.pool.device_pages().is_none() {
+            return;
+        }
+        let rows = paged.rows_per_page;
+        let kv_dim = self.kv_dim;
+        // The tail needs a page too. The kernels resolve *every* position they
+        // read through the block table, including the ones in a page that is
+        // not finished, so a tail with no entry there sends them to whatever
+        // the table happens to hold. Allocated here rather than at seal time,
+        // and left unsealed — unsealed is what keeps it private, so a partial
+        // page can be on the device without being shareable.
+        let tail_rows = self.k.len() / kv_dim.max(1);
+        if tail_rows > 0 && paged.pages.len() == paged.full_pages {
+            let (page, _) = paged.seq.page_for(paged.full_pages);
+            paged.pages.push(page);
+        }
+        // Only the rows added since the last call. The tail grows one row per
+        // decode step; sending the whole page each time was the same bytes as
+        // sixteen steps' worth, per layer, per token.
+        if tail_rows > paged.tail_uploaded {
+            let page = paged.pages[paged.full_pages];
+            let from = paged.tail_uploaded * kv_dim;
+            let to = tail_rows * kv_dim;
+            paged.seq.pool.fill_device_rows(
+                queue,
+                paged.layer,
+                page,
+                paged.tail_uploaded,
+                &self.k[from..to],
+                &self.v[from..to],
+            );
+            paged.tail_uploaded = tail_rows;
+        }
+        // Sealed pages, uploaded in **runs of consecutive physical pages**.
+        //
+        // Two things make the naive form expensive, and a prefill pays both
+        // once per page per layer. A page's rows are already contiguous in the
+        // pool's host buffer, so copying them row by row into a temporary was
+        // building a copy of something that could be sliced; and pages come out
+        // of the free list in ascending order most of the time, so a whole
+        // prefill is usually one run rather than sixty-four separate transfers.
+        //
+        // Measured on a model whose layers are all full-attention: time to
+        // first token at depth 1024 was three times the contiguous path's, and
+        // did not move when the page size changed — which is what said the cost
+        // was per *transfer* rather than per lookup.
+        let mut i = paged.device_synced;
+        while i < paged.full_pages {
+            let first = paged.pages[i];
+            let mut n = 1;
+            while i + n < paged.full_pages && paged.pages[i + n] == first + n as u32 {
+                n += 1;
+            }
+            let per = rows * kv_dim;
+            let base = first as usize * per;
+            let span = n * per;
+            paged.seq.pool.fill_device_rows(
+                queue,
+                paged.layer,
+                first,
+                0,
+                &paged.seq.pool.page_k_all(paged.layer)[base..base + span],
+                &paged.seq.pool.page_v_all(paged.layer)[base..base + span],
+            );
+            i += n;
+        }
+        paged.device_synced = paged.full_pages;
+    }
+
+    /// Everything a paged attention dispatch needs, or `None` when this layer
+    /// is not served that way.
+    ///
+    /// `None` covers three separate cases, and all three are correct rather
+    /// than degraded: the layer is contiguous, the pool has no device, or the
+    /// sequence could not reserve a block table. In each the caller uses the
+    /// per-request mirror, which is the path that has always run.
+    ///
+    /// Pushes any newly sealed pages and the table to the device as a side
+    /// effect, because a dispatch is exactly the moment they have to be there
+    /// and nothing else knows when that is.
+    pub fn paged_device_refs(
+        &mut self,
+        queue: &wgpu::Queue,
+    ) -> Option<(wgpu::Buffer, wgpu::Buffer, u64, u32, u32)> {
+        self.sync_pool_device(queue);
+        let paged = self.paged.as_ref()?;
+        let pool = &paged.seq.pool;
+        let pages = pool.device_pages()?;
+        let (base, len) = paged.seq.sync_table(queue)?;
+        // The table must already cover every page this layer will read.
+        if len < paged.pages.len() {
+            return None;
+        }
+        let (k_off, v_off, _) = pool.device_page_offsets(paged.layer, 0)?;
+        Some((
+            pages.layers[paged.layer].clone(),
+            pages.table.clone(),
+            v_off - k_off,
+            base as u32,
+            pool.page_tokens() as u32,
+        ))
+    }
+
+    /// Reserves this position's row in the pool's device pages and hands back
+    /// everything a fused decode step needs to write it and read it.
+    ///
+    /// `None` where [`Self::paged_device_refs`] is `None`, and for one case of
+    /// its own: a layer whose rows and the pool's positions are not one to one
+    /// (a block-compressed slot) addresses pages differently from what the
+    /// kernel's `position / page_tokens` computes, so it keeps the mirror.
+    ///
+    /// The reservation is the part that has no counterpart on the host path.
+    /// Every other writer pushes a row to the host first and the page is
+    /// allocated because there is a tail to upload; this one writes on the
+    /// device and there may be no tail at all — at a page boundary the
+    /// previous page has just been sealed and the next does not exist yet. So
+    /// the page is taken here.
+    ///
+    /// Those pages are never sealed, and that is deliberate rather than a gap.
+    /// A sealed page is offered to every other sequence, and these rows exist
+    /// only on the device — the host copy the pool would publish is still
+    /// zeroed. Leaving them unsealed keeps them private to this sequence,
+    /// which is the same bound `PrefixCache` already applies when it reuses
+    /// only up to `host_committed_len`.
+    pub fn paged_fused_refs(
+        &mut self,
+        queue: &wgpu::Queue,
+        write_pos: usize,
+    ) -> Option<PagedFusedRefs> {
+        let refs = self.paged_fused_refs_inner(queue, write_pos);
+        assert!(
+            refs.is_some() || !self.pool_backed,
+            "a layer already served from the pool cannot fall back to its mirror: \
+             the mirror was deliberately left at one row and never uploaded to, \
+             so reading it would silently answer from zeros"
+        );
+        refs
+    }
+
+    fn paged_fused_refs_inner(
+        &mut self,
+        queue: &wgpu::Queue,
+        write_pos: usize,
+    ) -> Option<PagedFusedRefs> {
+        let r = self.paged_range_refs(queue, write_pos, 1)?;
+        let run = *r.runs.first()?;
+        Some(PagedFusedRefs {
+            layer_buffer: r.layer_buffer,
+            table: r.table,
+            half: r.half,
+            table_base: r.table_base,
+            page_tokens: r.page_tokens,
+            write_slot: run.dst_row,
+        })
+    }
+
+    /// [`Self::paged_fused_refs`] for a whole range of positions.
+    ///
+    /// The prefill path writes `n_tokens` positions at once. On the host and
+    /// inside any one page those rows are contiguous, but a range that crosses
+    /// a page boundary is not contiguous in the pool — so it comes back split
+    /// into runs, each of which the caller can write as a straight copy.
+    ///
+    /// Same reservation and same never-sealed rule as the one-position form:
+    /// the pages are taken here because the device write precedes any host
+    /// row, and they stay private until a host-side writer fills and seals
+    /// them.
+    pub fn paged_range_refs(
+        &mut self,
+        queue: &wgpu::Queue,
+        write_pos: usize,
+        n_tokens: usize,
+    ) -> Option<PagedRangeRefs> {
+        self.sync_pool_device(queue);
+        let rows_per_page = self.paged.as_ref()?.rows_per_page;
+        let page_tokens = self.paged.as_ref()?.seq.pool.page_tokens();
+        if rows_per_page == 0 || rows_per_page != page_tokens || n_tokens == 0 {
+            return None;
+        }
+        let last = (write_pos + n_tokens - 1) / rows_per_page;
+        {
+            let paged = self.paged.as_mut()?;
+            while paged.pages.len() <= last {
+                let (page, _) = paged.seq.page_for(paged.pages.len());
+                paged.pages.push(page);
+            }
+        }
+        let paged = self.paged.as_ref()?;
+        let pool = &paged.seq.pool;
+        let pages = pool.device_pages()?;
+        let (base, len) = paged.seq.sync_table(queue)?;
+        if len < paged.pages.len() {
+            return None;
+        }
+        let (k_off, v_off, _) = pool.device_page_offsets(paged.layer, 0)?;
+
+        let runs = page_runs(&paged.pages, write_pos, n_tokens, rows_per_page);
+        Some(PagedRangeRefs {
+            layer_buffer: pages.layers[paged.layer].clone(),
+            table: pages.table.clone(),
+            half: v_off - k_off,
+            table_base: base as u32,
+            page_tokens: page_tokens as u32,
+            runs,
+        })
+    }
+
+    /// The per-request scratch a paged decode step still needs: the softmax
+    /// partials buffer, and the home for its cached attention dispatch.
+    ///
+    /// This is [`Self::sync_gpu`] with the mirror taken out. Nothing uploads,
+    /// and the key/value region is one row rather than the context window,
+    /// because on this path the keys and values are the pool's.
+    pub fn pool_scratch(
+        &mut self,
+        device: &wgpu::Device,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    ) {
+        let probs_rows = self.capacity;
+        let kv_dim = self.kv_dim;
+        self.pool_backed = true;
+        if self.gpu.is_none() {
+            self.gpu = Some(GpuLayerCache::new_sized(
+                device, 1, probs_rows, kv_dim, n_head, kv_storage,
+            ));
+        }
+        // Nothing here will ever upload, so the watermark is simply the truth:
+        // there are no host rows this mirror is behind on.
+        if let Some(gpu) = &mut self.gpu {
+            gpu.synced_len = self.len;
+        }
+    }
+
+    /// Whether this layer's device keys and values are the pool's.
+    ///
+    /// A white-box assertion, for the same reason `device_synced_pages` is one:
+    /// a test that only compares outputs cannot tell the paged path from the
+    /// mirrored fallback, because the fallback is materialized from the very
+    /// pages the paged path reads and is therefore correct either way.
+    #[cfg(test)]
+    pub fn is_pool_backed(&self) -> bool {
+        self.pool_backed
+    }
+
+    /// The mirror's softmax scratch, once one exists.
+    pub fn probs_scratch(&self) -> Option<wgpu::Buffer> {
+        self.gpu.as_ref().map(|g| g.probs_scratch.clone())
+    }
+
+    /// This layer's block table — the physical page per logical page.
+    #[allow(dead_code)]
+    pub fn block_table(&self) -> &[u32] {
+        self.paged.as_ref().map_or(&[], |p| &p.pages)
+    }
+
+    /// How many pages have been mirrored to the device.
+    ///
+    /// Exposed for a test that would otherwise be unable to see the thing it
+    /// claims to check: the watermark's only observable effect is which pages
+    /// a later `sync_pool_device` uploads, and reading the device back to
+    /// discover that needs a `f16` readback path this module does not have. A
+    /// white-box assertion that names the invariant beats an end-to-end one
+    /// that cannot fail.
+    #[cfg(test)]
+    pub fn device_synced_pages(&self) -> usize {
+        self.paged.as_ref().map_or(0, |p| p.device_synced)
+    }
+
+    /// Rows `[from, to)` as a contiguous run, borrowed when they already are.
+    ///
+    /// The upload path wants one slice per range; a paged layer has one slice
+    /// per page. Rather than teach every caller about pages, this materializes
+    /// the range — which is a copy the contiguous path does not pay, bounded by
+    /// the range being uploaded (one row per decode step, one prefill's worth
+    /// on the first sync).
+    fn rows_between(&self, from: usize, to: usize) -> std::borrow::Cow<'_, [f32]> {
+        self.rows_between_side(from, to, true)
+    }
+
+    fn values_between(&self, from: usize, to: usize) -> std::borrow::Cow<'_, [f32]> {
+        self.rows_between_side(from, to, false)
+    }
+
+    fn rows_between_side(&self, from: usize, to: usize, keys: bool) -> std::borrow::Cow<'_, [f32]> {
+        if self.paged.is_none() {
+            let buf = if keys { &self.k } else { &self.v };
+            return std::borrow::Cow::Borrowed(&buf[from * self.kv_dim..to * self.kv_dim]);
+        }
+        let mut out = Vec::with_capacity((to - from) * self.kv_dim);
+        for r in from..to {
+            out.extend_from_slice(if keys { self.row_k(r) } else { self.row_v(r) });
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// The first `rows` rows as one contiguous buffer, whichever layout they
+    /// are in — for the paths that genuinely need a flat copy (a snapshot, a
+    /// serialization, a prefix hand-over) rather than a row at a time.
+    ///
+    /// Under the contiguous layout this is the buffer itself and the clone is
+    /// the same one those paths already made. Under paging it walks rows, which
+    /// costs a copy those paths were already paying.
+    fn flatten(&self, rows: usize) -> (Vec<f32>, Vec<f32>) {
+        if self.paged.is_none() {
+            let n = rows * self.kv_dim;
+            return (self.k[..n].to_vec(), self.v[..n].to_vec());
+        }
+        let mut k = Vec::with_capacity(rows * self.kv_dim);
+        let mut v = Vec::with_capacity(rows * self.kv_dim);
+        for r in 0..rows {
+            k.extend_from_slice(self.row_k(r));
+            v.extend_from_slice(self.row_v(r));
+        }
+        (k, v)
+    }
+
+    /// Rows held in sealed pages — everything before the tail.
+    fn sealed_rows(&self) -> usize {
+        self.paged
+            .as_ref()
+            .map_or(0, |p| p.full_pages * p.rows_per_page)
+    }
+
+    /// The tail buffer's row count, which for a contiguous layer is the whole
+    /// layer.
+    fn tail_rows(&self) -> usize {
+        if self.kv_dim == 0 {
+            return 0;
+        }
+        self.k.len() / self.kv_dim
+    }
+
+    /// Seals the tail into a pool page once it is full, and starts a new one.
+    ///
+    /// Only ever called with a *full* tail. A partial tail is never handed to
+    /// the pool: a page becomes shareable when it is sealed, and a page that is
+    /// still being appended to is precisely what must not be shared.
+    fn seal_tail(&mut self) {
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        debug_assert_eq!(
+            self.k.len() / self.kv_dim,
+            paged.rows_per_page,
+            "only a full tail is sealed"
+        );
+        // The page for this logical index, taken from the pool by whichever
+        // layer reaches it first. Every layer writes its own region of the same
+        // page, and the last one to do so seals it.
+        let index = paged.full_pages;
+        let (page, already) = paged.seq.page_for(index);
+        if paged.pages.len() == index {
+            paged.pages.push(page);
+        }
+        if !already {
+            paged.seq.pool.fill(paged.layer, page, &self.k, &self.v);
+            paged.seq.layer_filled(index);
+        }
+        // Complete now: the rows it covers are all written, so host reads move
+        // to the page and the tail starts empty again.
+        paged.full_pages += 1;
+        paged.tail_uploaded = 0;
+        self.k.clear();
+        self.v.clear();
+    }
+
+    /// Takes `tags`' pages as this layer's leading pages, without computing
+    /// them.
+    ///
+    /// This is the whole point of the pool. The pages already hold the keys and
+    /// values for these token positions — computed by whichever request got
+    /// here first — so this request takes a reference to them and starts its
+    /// forward pass after them. Nothing is copied: the two sequences read the
+    /// same bytes.
+    ///
+    /// Returns how many rows were adopted, or `None` if any tag is not resident
+    /// — all or nothing, because page `i` is meaningless without `0..i`.
+    fn adopt_pages(&mut self, tags: &[u64]) -> Option<usize> {
+        let paged = self.paged.as_mut()?;
+        debug_assert!(
+            paged.pages.is_empty() && self.k.is_empty(),
+            "pages are adopted into a fresh layer, before anything is pushed"
+        );
+        // Taken once for the sequence, by layer 0; later layers read the list
+        // it recorded. Acquiring per layer would take one reference per layer
+        // for a page that is one page.
+        if paged.layer == 0 {
+            let got = paged.seq.pool.acquire(tags).ok()?;
+            if !got.iter().all(|a| a.hit) {
+                // Something was reclaimed between the index promising it and
+                // this call. Give back what was taken rather than filling the
+                // gaps: a half-adopted prefix is not a prefix.
+                let pages: Vec<u32> = got.iter().map(|a| a.page).collect();
+                paged.seq.pool.release(&pages);
+                return None;
+            }
+            paged
+                .seq
+                .adopt(&got.iter().map(|a| a.page).collect::<Vec<_>>());
+        }
+        paged.pages = paged.seq.pages();
+        if paged.pages.len() != tags.len() {
+            return None;
+        }
+        // Adopted pages are finished by construction — they were sealed by
+        // whoever built them — so host reads must take their rows from the
+        // pool, not from an empty tail.
+        paged.full_pages = paged.pages.len();
+        let rows = paged.pages.len() * paged.rows_per_page;
+        self.len = rows;
+        Some(rows)
+    }
+
+    /// Rolls a paged layer back to `new_len` rows.
+    ///
+    /// Whole pages past the cut go back to the pool. The interesting case is a
+    /// cut that lands *inside* a sealed page: that page cannot simply be kept
+    /// and appended to, because sealing is what made it shareable and another
+    /// sequence may be reading it right now. So its retained rows are copied
+    /// into the tail buffer and the page is released — after which writing
+    /// continues into the tail exactly as it would have.
+    ///
+    /// That copy is bounded by one page and happens once per rollback, against
+    /// a rollback that discards at least one token. Speculative decoding is
+    /// what does this, and it rolls back a draft's rejected tail, not a
+    /// conversation.
+    fn truncate_paged(&mut self, new_len: usize) {
+        let kv_dim = self.kv_dim;
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        let rows_per_page = paged.rows_per_page;
+        let whole = new_len / rows_per_page;
+        let partial = new_len % rows_per_page;
+
+        if whole >= paged.full_pages {
+            // The cut lands inside the page currently being written, whose rows
+            // live in the tail buffer and not in the pool. Nothing to release
+            // and nothing to carry back — drop the tail's later rows and stop.
+            self.k.truncate(partial * kv_dim);
+            self.v.truncate(partial * kv_dim);
+            // Rows past the cut are gone; whatever the device still holds for
+            // them will be overwritten before it is read again, but the
+            // watermark must not claim they are current.
+            paged.tail_uploaded = paged.tail_uploaded.min(partial);
+            return;
+        }
+
+        // The cut lands in a completed page. Everything from there on leaves
+        // this sequence — including any page allocated for the tail, which is
+        // why this drains to `whole` and not to `full_pages`.
+        let released: Vec<u32> = paged.pages.drain(whole..).collect();
+        if partial > 0 {
+            // A completed page cannot be appended to: sealing is what made it
+            // shareable and another sequence may be reading it. So its retained
+            // rows are copied into the tail and the page is let go.
+            let straddling = released[0];
+            let mut k = Vec::with_capacity(partial * kv_dim);
+            let mut v = Vec::with_capacity(partial * kv_dim);
+            for row in 0..partial {
+                let range = paged.row(straddling, row);
+                k.extend_from_slice(&paged.seq.pool.page_k_all(paged.layer)[range.clone()]);
+                v.extend_from_slice(&paged.seq.pool.page_v_all(paged.layer)[range]);
+            }
+            self.k = k;
+            self.v = v;
+        } else {
+            self.k.clear();
+            self.v.clear();
+        }
+        paged.full_pages = whole;
+        paged.tail_uploaded = 0;
+        // The device copy cannot be ahead of the pages that still exist.
+        paged.device_synced = paged.device_synced.min(whole);
+        // The release is the sequence's, not this layer's: every layer rolls
+        // back to the same token count and would otherwise release the same
+        // pages once each. `truncate_to` is idempotent for exactly that reason.
+        paged.seq.truncate_to(whole);
+    }
+
     /// How many rows are actually **in the host buffers**.
     ///
     /// Not the same as [`len`](Self::len), and the gap is the whole reason
@@ -843,7 +1832,9 @@ impl LayerCache {
         if self.kv_dim == 0 {
             return 0;
         }
-        self.k.len() / self.kv_dim
+        // Sealed pages are as host-resident as the tail is; the split between
+        // them is where the bytes live, not whether they exist.
+        self.sealed_rows() + self.tail_rows()
     }
 
     /// [`host_len`](Self::host_len) in tokens rather than rows.
@@ -854,13 +1845,53 @@ impl LayerCache {
     /// The key vector at cached position `pos` for KV head `kv_head`
     /// (`[head_dim]`).
     pub fn key_at(&self, pos: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let row = &self.k[pos * self.kv_dim..(pos + 1) * self.kv_dim];
+        let row = self.row_k(pos);
         &row[kv_head * head_dim..(kv_head + 1) * head_dim]
     }
 
     pub fn value_at(&self, pos: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let row = &self.v[pos * self.kv_dim..(pos + 1) * self.kv_dim];
+        let row = self.row_v(pos);
         &row[kv_head * head_dim..(kv_head + 1) * head_dim]
+    }
+
+    /// Row `pos`'s keys, from whichever side of the seal it is on.
+    ///
+    /// The one place the paged indirection lives on the read path. A page's
+    /// rows are contiguous, so a row is still a plain slice either way and the
+    /// attention loops above are unchanged — this is a lookup and an offset,
+    /// not a gather.
+    fn row_k(&self, pos: usize) -> &[f32] {
+        match self.paged.as_ref() {
+            None => &self.k[pos * self.kv_dim..(pos + 1) * self.kv_dim],
+            Some(paged) => {
+                let complete = paged.full_pages * paged.rows_per_page;
+                if pos < complete {
+                    let (page, row) = (pos / paged.rows_per_page, pos % paged.rows_per_page);
+                    let range = paged.row(paged.pages[page], row);
+                    &paged.seq.pool.page_k_all(paged.layer)[range]
+                } else {
+                    let local = pos - complete;
+                    &self.k[local * self.kv_dim..(local + 1) * self.kv_dim]
+                }
+            }
+        }
+    }
+
+    fn row_v(&self, pos: usize) -> &[f32] {
+        match self.paged.as_ref() {
+            None => &self.v[pos * self.kv_dim..(pos + 1) * self.kv_dim],
+            Some(paged) => {
+                let complete = paged.full_pages * paged.rows_per_page;
+                if pos < complete {
+                    let (page, row) = (pos / paged.rows_per_page, pos % paged.rows_per_page);
+                    let range = paged.row(paged.pages[page], row);
+                    &paged.seq.pool.page_v_all(paged.layer)[range]
+                } else {
+                    let local = pos - complete;
+                    &self.v[local * self.kv_dim..(local + 1) * self.kv_dim]
+                }
+            }
+        }
     }
 
     /// Overwrites this (freshly allocated, empty) layer's first `len`
@@ -917,13 +1948,20 @@ impl LayerCache {
             src.host_len(),
             src.len
         );
-        let n = len * self.kv_dim;
+        assert!(
+            self.paged.is_none(),
+            "a paged layer is filled by pushing rows into it, not by copying a \
+             flat prefix over its buffers; the reuse path for paged caches is \
+             sharing the source's pages, not duplicating its bytes"
+        );
         self.k.clear();
         self.v.clear();
-        self.k.extend_from_slice(&src.k[..n]);
-        self.v.extend_from_slice(&src.v[..n]);
+        let (k, v) = src.flatten(len);
+        self.k = k;
+        self.v = v;
         self.len = len;
         self.gpu = None;
+        self.pool_backed = false;
     }
 }
 
@@ -986,6 +2024,122 @@ impl KvCache {
     /// prefix reuse, and slot persistence apply to all of it unchanged.
     pub fn new_with_strided_dims(capacity: usize, kv_dims: &[(usize, usize)]) -> Self {
         Self::build(capacity, kv_dims, &[])
+    }
+
+    /// A cache whose layers draw their rows from `pool`.
+    ///
+    /// The pool's geometry must be this model's: it is built from a probe cache
+    /// of the same architecture (`kv_pool::LayerGeometry::of`), so a mismatch
+    /// means a pool built for one model is being handed to another — the same
+    /// class of error the slot fingerprint refuses, and it is checked here for
+    /// the same reason. A cache that silently ran on another model's geometry
+    /// would not crash; it would answer from the wrong rows.
+    /// Converts this cache's positional layers to draw their rows from `pool`,
+    /// keeping everything else about it.
+    ///
+    /// **Built from the architecture's own cache, not from the pool's
+    /// geometry.** A `KvCache` is not only its attention layers: the mixed
+    /// attention/linear-attention architectures — `qwen35moe`, `qwen3next`,
+    /// `nemotron_h_moe`, `kda`, `inkling` and the rest — carry per-layer
+    /// recurrent state alongside, and index it directly. A paged cache
+    /// assembled from the pool's layer list alone would have none of it, and
+    /// the first recurrent layer of such a model would index an empty vector.
+    ///
+    /// Recurrent state is not paged and could not be: it is one evolving value
+    /// per layer with no per-position history, which is why
+    /// `prefix_cache::CachedPrefill::reusable_prefix_len` already forces
+    /// all-or-nothing reuse on it. So it is carried across untouched, and only
+    /// the positional layers change where their rows live.
+    pub fn into_paged(mut self, pool: std::sync::Arc<crate::engine::kv_pool::KvPool>) -> Self {
+        assert_eq!(
+            self.layers.len(),
+            pool.layers().len(),
+            "the pool was built for a different model's layer count"
+        );
+        let max_pages = pool.pages_for(self.layers.first().map_or(0, |l| l.capacity * l.stride));
+        let seq = std::sync::Arc::new(SequencePages::new(pool.clone(), max_pages));
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let geom = pool.layers()[i];
+            assert_eq!(
+                (layer.kv_dim, layer.stride),
+                (geom.kv_dim, geom.stride),
+                "layer {i}'s geometry does not match the pool's"
+            );
+            layer.k.clear();
+            layer.v.clear();
+            layer.len = 0;
+            layer.gpu = None;
+            layer.paged = Some(PagedRows {
+                seq: seq.clone(),
+                layer: i,
+                rows_per_page: pool.page_tokens().div_ceil(geom.stride.max(1)),
+                pages: Vec::new(),
+                full_pages: 0,
+                tail_uploaded: 0,
+                device_synced: 0,
+            });
+        }
+        self
+    }
+
+    /// Publishes every page whose positions are complete, making them
+    /// shareable.
+    ///
+    /// Called by the forward pass at a point where it knows a span of
+    /// positions has been through every layer — after a prefill chunk, after a
+    /// decode step. Nothing else can know that: a page is written layer by
+    /// layer, and a cache watching its own fill counts cannot distinguish "all
+    /// layers are done" from "the layers that happen to have arrived so far".
+    pub fn commit_pages(&self) {
+        if let Some(paged) = self.layers.first().and_then(|l| l.paged.as_ref()) {
+            paged.seq.seal_complete();
+        }
+    }
+
+    /// Gives every layer the page identities this sequence's tokens imply, so
+    /// the pages it seals become findable by the next request that shares them.
+    ///
+    /// Set before the forward pass, from `engine::prefix_index::page_tags` over
+    /// the prompt. A cache without them still pages — it just keeps everything
+    /// to itself.
+    pub fn set_page_tags(&mut self, tags: &[u64]) {
+        if let Some(paged) = self.layers.first().and_then(|l| l.paged.as_ref()) {
+            paged.seq.set_tags(tags);
+        }
+    }
+
+    /// Adopts the pages behind `tags` into every layer, sharing them rather
+    /// than recomputing them.
+    ///
+    /// Returns the number of **token** positions adopted, or `None` if the
+    /// pages were not all resident — in which case nothing is taken and the
+    /// caller prefills as it would have.
+    ///
+    /// All layers or none. A cache whose layer 3 adopted a prefix and whose
+    /// layer 4 did not is not in a state any forward pass can describe, so the
+    /// failure is handled here rather than left to be discovered mid-pass.
+    pub fn adopt_shared_pages(&mut self, tags: &[u64], page_tokens: usize) -> Option<usize> {
+        if tags.is_empty() {
+            return Some(0);
+        }
+        let mut adopted = None;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            match layer.adopt_pages(tags) {
+                Some(rows) => {
+                    debug_assert!(
+                        adopted.is_none_or(|r| r == rows) || layer.stride != 1,
+                        "layers disagreed on how many rows one prefix is"
+                    );
+                    adopted = Some(rows);
+                }
+                None if i == 0 => return None,
+                None => unreachable!(
+                    "layer {i} refused a prefix layer 0 accepted; every layer \
+                     draws on the same pool and the same page list"
+                ),
+            }
+        }
+        Some(tags.len() * page_tokens)
     }
 
     /// Device bytes this cache's *shape* would need at `token_capacity`
@@ -1259,9 +2413,12 @@ impl KvCache {
             let rows = l.len.min(l.host_len());
             push_u32(&mut out, l.kv_dim as u32);
             push_u32(&mut out, rows as u32);
-            let n = rows * l.kv_dim;
-            push_f32s(&mut out, &l.k[..n]);
-            push_f32s(&mut out, &l.v[..n]);
+            // Through `flatten`, because a paged layer's `k` is only its tail
+            // and a snapshot written from that would restore a fraction of the
+            // conversation while claiming the whole of it.
+            let (k, v) = l.flatten(rows);
+            push_f32s(&mut out, &k);
+            push_f32s(&mut out, &v);
         }
         push_u32(&mut out, self.recurrent.len() as u32);
         for r in &self.recurrent {
@@ -1575,8 +2732,93 @@ impl RecurrentLayerState {
     }
 }
 
+/// The `(kv_dim, stride)` list a pool describes — for tests that build a cache
+/// matching a pool without a model to ask.
+#[cfg(test)]
+pub(crate) fn strided_dims(
+    pool: &std::sync::Arc<crate::engine::kv_pool::KvPool>,
+) -> Vec<(usize, usize)> {
+    pool.layers().iter().map(|g| (g.kv_dim, g.stride)).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// The run split is the whole of the paged prefill write: a range that
+    /// crosses a page boundary is contiguous on the host and in each page, but
+    /// not across them, so getting the boundary wrong writes a chunk of a
+    /// prefill into the middle of somebody else's page.
+    ///
+    /// The table here is deliberately *not* ascending, because an ascending one
+    /// makes `dst_row` land where a plain `write_pos + i` would and the test
+    /// stops being able to fail.
+    #[test]
+    fn page_runs_split_at_page_boundaries() {
+        let pages = [7u32, 3, 9, 1];
+        // Wholly inside one page.
+        assert_eq!(
+            super::page_runs(&pages, 1, 2, 4),
+            vec![super::PageRun {
+                src_row: 0,
+                dst_row: 7 * 4 + 1,
+                rows: 2
+            }]
+        );
+        // Exactly one whole page.
+        assert_eq!(
+            super::page_runs(&pages, 4, 4, 4),
+            vec![super::PageRun {
+                src_row: 0,
+                dst_row: 3 * 4,
+                rows: 4
+            }]
+        );
+        // Straddling a boundary: the tail of page 0, then the head of page 1.
+        assert_eq!(
+            super::page_runs(&pages, 2, 4, 4),
+            vec![
+                super::PageRun {
+                    src_row: 0,
+                    dst_row: 7 * 4 + 2,
+                    rows: 2
+                },
+                super::PageRun {
+                    src_row: 2,
+                    dst_row: 3 * 4,
+                    rows: 2
+                },
+            ]
+        );
+        // Spanning three pages, starting and ending part way in.
+        assert_eq!(
+            super::page_runs(&pages, 3, 8, 4),
+            vec![
+                super::PageRun {
+                    src_row: 0,
+                    dst_row: 7 * 4 + 3,
+                    rows: 1
+                },
+                super::PageRun {
+                    src_row: 1,
+                    dst_row: 3 * 4,
+                    rows: 4
+                },
+                super::PageRun {
+                    src_row: 5,
+                    dst_row: 9 * 4,
+                    rows: 3
+                },
+            ]
+        );
+        // Every run together covers the range exactly once, in order.
+        let runs = super::page_runs(&pages, 3, 8, 4);
+        let mut next = 0;
+        for r in &runs {
+            assert_eq!(r.src_row, next, "runs must tile the source without gaps");
+            next += r.rows;
+        }
+        assert_eq!(next, 8);
+    }
+
     /// The block-at-a-time rewrite of [`f32_to_q8_0_bytes`] must produce the
     /// same bytes as the `push`-per-element form it replaced — this is a KV
     /// cache the GPU then reads, so a one-byte difference is a silently
@@ -1839,6 +3081,519 @@ mod tests {
             mixed.gpu_mirror_bytes(512, 8, KvStorage::F16),
             attention_only.gpu_mirror_bytes(512, 8, KvStorage::F16)
         );
+    }
+
+    /// **The differential test the paged backing has to pass.** Same pushes
+    /// into both layouts, then every row compared — paging changes where a row
+    /// lives and must not change what it is.
+    ///
+    /// Compared for **equality**, not a tolerance: nothing here is arithmetic.
+    /// A row is copied into a page and read back out, so anything but the same
+    /// bits is a addressing bug, and a tolerance would hide exactly the
+    /// off-by-one-page error this is written to catch.
+    fn paged_and_contiguous_agree(kv_dim: usize, stride: usize, page_tokens: usize, rows: usize) {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+
+        let geom = vec![LayerGeometry { kv_dim, stride }];
+        // Room for far more pages than the sequence needs, so this measures
+        // addressing rather than reclaim.
+        let pool = Arc::new(KvPool::with_policy(64, page_tokens, geom, Policy::Lru));
+        let capacity = rows * stride + stride;
+        let mut paged =
+            KvCache::new_with_strided_dims(capacity, &strided_dims(&pool)).into_paged(pool);
+        let mut plain = KvCache::new_with_strided_dims(capacity, &[(kv_dim, stride)]);
+
+        for r in 0..rows {
+            let k: Vec<f32> = (0..kv_dim).map(|d| (r * kv_dim + d) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            paged.layers[0].push(&k, &v);
+            plain.layers[0].push(&k, &v);
+        }
+
+        assert_eq!(paged.layers[0].len, plain.layers[0].len, "row count");
+        assert_eq!(
+            paged.host_committed_len(),
+            plain.host_committed_len(),
+            "host-resident token count"
+        );
+        for r in 0..rows {
+            assert_eq!(
+                paged.layers[0].key_at(r, 0, kv_dim),
+                plain.layers[0].key_at(r, 0, kv_dim),
+                "key row {r} (kv_dim {kv_dim}, stride {stride}, page {page_tokens})"
+            );
+            assert_eq!(
+                paged.layers[0].value_at(r, 0, kv_dim),
+                plain.layers[0].value_at(r, 0, kv_dim),
+                "value row {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn paged_rows_read_back_exactly_as_contiguous_ones() {
+        // Sequence lengths either side of a page boundary, and a page size that
+        // does not divide them, so a partial tail is always in play.
+        for rows in [1usize, 3, 4, 5, 8, 9, 17, 33] {
+            paged_and_contiguous_agree(8, 1, 4, rows);
+        }
+    }
+
+    /// The same across page sizes, including one page per token — the
+    /// degenerate setting that turns the block table into an identity map and
+    /// would hide a page-arithmetic error.
+    #[test]
+    fn paged_rows_agree_at_every_page_size() {
+        for page_tokens in [1usize, 2, 4, 8, 16] {
+            paged_and_contiguous_agree(8, 1, page_tokens, 20);
+        }
+    }
+
+    /// And for a block-compressed layer, whose rows stand for several tokens —
+    /// the case where rows-per-page is not page-tokens.
+    #[test]
+    fn paged_rows_agree_for_a_strided_layer() {
+        for stride in [2usize, 4, 128] {
+            paged_and_contiguous_agree(4, stride, 8, 10);
+        }
+    }
+
+    /// Rollback must land in the same place under both layouts, including the
+    /// hard case: a cut *inside* a sealed page, which cannot be rewritten and
+    /// so has to be carried back into the tail.
+    #[test]
+    fn paged_truncate_matches_contiguous_including_mid_page_cuts() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        const PAGE: usize = 4;
+
+        for cut in [0usize, 1, 3, 4, 5, 7, 8, 11] {
+            let geom = vec![LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            }];
+            let pool = Arc::new(KvPool::with_policy(64, PAGE, geom, Policy::Lru));
+            let mut paged =
+                KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+            let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
+            for r in 0..12usize {
+                let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
+                let v: Vec<f32> = k.iter().map(|x| -x).collect();
+                paged.layers[0].push(&k, &v);
+                plain.layers[0].push(&k, &v);
+            }
+            paged.truncate(cut);
+            plain.truncate(cut);
+            assert_eq!(paged.layers[0].len, plain.layers[0].len, "cut {cut}");
+
+            // And writing continues correctly afterwards, which is what a
+            // rejected speculative draft does next.
+            for r in 0..5usize {
+                let k: Vec<f32> = (0..KV).map(|d| (1000 + r * KV + d) as f32).collect();
+                let v: Vec<f32> = k.iter().map(|x| -x).collect();
+                paged.layers[0].push(&k, &v);
+                plain.layers[0].push(&k, &v);
+            }
+            for r in 0..(cut + 5) {
+                assert_eq!(
+                    paged.layers[0].key_at(r, 0, KV),
+                    plain.layers[0].key_at(r, 0, KV),
+                    "after cut {cut}, row {r}"
+                );
+            }
+        }
+    }
+
+    /// A finished sequence's pages go back, or the pool leaks until it is full
+    /// of content nobody holds and nobody can reclaim.
+    #[test]
+    fn dropping_a_paged_cache_returns_its_pages() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        let geom = vec![LayerGeometry {
+            kv_dim: 4,
+            stride: 1,
+        }];
+        let pool = Arc::new(KvPool::with_policy(16, 4, geom, Policy::Lru));
+        {
+            let mut cache =
+                KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+            for r in 0..9usize {
+                cache.layers[0].push(&[r as f32; 4], &[r as f32; 4]);
+            }
+            assert_eq!(pool.stats().live_pages, 2, "two sealed pages while live");
+        }
+        assert_eq!(
+            pool.stats().live_pages,
+            0,
+            "a dropped sequence left its pages held"
+        );
+    }
+
+    /// A paged cache must serialize the whole conversation, not the tail page
+    /// it happens to be holding — a snapshot that restored a fraction while
+    /// claiming the whole is the quiet failure this guards.
+    #[test]
+    fn a_paged_cache_round_trips_through_bytes() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        let geom = vec![LayerGeometry {
+            kv_dim: KV,
+            stride: 1,
+        }];
+        let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
+        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
+        for r in 0..11usize {
+            let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            paged.layers[0].push(&k, &v);
+            plain.layers[0].push(&k, &v);
+        }
+        assert_eq!(
+            paged.to_bytes(),
+            plain.to_bytes(),
+            "a paged cache serialized to different bytes than the same rows \
+             stored contiguously"
+        );
+        let restored = KvCache::from_bytes(&paged.to_bytes()).expect("round trip");
+        for r in 0..11usize {
+            assert_eq!(
+                restored.layers[0].key_at(r, 0, KV),
+                plain.layers[0].key_at(r, 0, KV),
+                "row {r}"
+            );
+        }
+    }
+
+    /// The same for a duplicate, which slot persistence takes.
+    #[test]
+    fn duplicating_a_paged_cache_snapshots_every_row() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 4;
+        let geom = vec![LayerGeometry {
+            kv_dim: KV,
+            stride: 1,
+        }];
+        let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
+        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        for r in 0..9usize {
+            paged.layers[0].push(&[r as f32; KV], &[-(r as f32); KV]);
+        }
+        let copy = paged.duplicate();
+        assert_eq!(copy.layers[0].len, 9);
+        for r in 0..9usize {
+            assert_eq!(
+                copy.layers[0].key_at(r, 0, KV),
+                &vec![r as f32; KV][..],
+                "row {r}"
+            );
+        }
+    }
+
+    /// **End to end: two sequences share a prefix, and the sharer reads exactly
+    /// what the builder computed.**
+    ///
+    /// This is the thing the whole pool exists for, and the thing the engine
+    /// as it stands cannot do — measured on the running server, a second
+    /// concurrent request on a shared prefix re-prefills the whole of it.
+    ///
+    /// The check that matters is not that sharing *happened* (page counts would
+    /// show that) but that the shared rows are bit-identical to what a private
+    /// recompute produces. A pool that shares the wrong page is worse than one
+    /// that shares nothing.
+    #[test]
+    fn a_second_sequence_shares_a_prefix_instead_of_rebuilding_it() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use crate::engine::prefix_index::{PrefixIndex, page_tags};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        const PAGE: usize = 4;
+
+        let geom = vec![
+            LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            },
+            LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            },
+        ];
+        let pool = Arc::new(KvPool::with_policy(32, PAGE, geom, Policy::Lru));
+        let index = PrefixIndex::new(PAGE);
+
+        // A shared 12-token prompt, then two different continuations.
+        let shared: Vec<u32> = (0..12).collect();
+        let row = |r: usize, d: usize| (r * KV + d) as f32;
+
+        // First sequence: builds the shared prefix itself.
+        let tags = page_tags(&shared, PAGE);
+        let mut first =
+            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        first.set_page_tags(&tags);
+        for r in 0..shared.len() {
+            let k: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            for layer in &mut first.layers {
+                layer.push(&k, &v);
+            }
+        }
+        // The commit point the forward pass owns: these positions have been
+        // through every layer, so the pages covering them may be published.
+        first.commit_pages();
+        for (i, &t) in tags.iter().enumerate() {
+            index.remember(t, &shared[i * PAGE..(i + 1) * PAGE]);
+        }
+        let pages_after_first = pool.stats().live_pages;
+        assert_eq!(pages_after_first, 3, "12 tokens at 4 per page");
+
+        // Second sequence: resolves the same prompt and adopts it.
+        let resolved = index.resolve(&shared, false);
+        assert_eq!(resolved.shared.len(), 3, "the whole prompt is known");
+        let mut second =
+            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        let adopted = second
+            .adopt_shared_pages(&resolved.shared, PAGE)
+            .expect("the pages are resident");
+        assert_eq!(adopted, 12);
+
+        // **No new pages.** The prefix is one copy with two holders, which is
+        // the difference between sharing and the pool merely holding two
+        // copies of the same thing.
+        assert_eq!(
+            pool.stats().live_pages,
+            pages_after_first,
+            "adopting a prefix allocated fresh pages instead of sharing"
+        );
+        for &t in &resolved.shared {
+            // Both sequences hold every shared page.
+            let page = pool.acquire(&[t]).expect("resident");
+            assert_eq!(pool.refs(page[0].page), 3, "two holders plus this probe");
+            pool.release(&[page[0].page]);
+        }
+
+        // And it reads what the first sequence computed, in every layer.
+        for layer in 0..2 {
+            for r in 0..12 {
+                let expect: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+                assert_eq!(
+                    second.layers[layer].key_at(r, 0, KV),
+                    &expect[..],
+                    "layer {layer} row {r} keys"
+                );
+                let expect_v: Vec<f32> = expect.iter().map(|x| -x).collect();
+                assert_eq!(
+                    second.layers[layer].value_at(r, 0, KV),
+                    &expect_v[..],
+                    "layer {layer} row {r} values"
+                );
+            }
+        }
+
+        // The second sequence then continues past the shared part, privately.
+        for r in 12..16usize {
+            let k: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            for layer in &mut second.layers {
+                layer.push(&k, &v);
+            }
+        }
+        assert_eq!(second.layers[0].len, 16);
+        for r in 12..16 {
+            let expect: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            assert_eq!(second.layers[0].key_at(r, 0, KV), &expect[..], "row {r}");
+        }
+        // The first sequence is untouched by any of it.
+        for r in 0..12 {
+            let expect: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            assert_eq!(first.layers[0].key_at(r, 0, KV), &expect[..], "row {r}");
+        }
+    }
+
+    /// A prefix the pool has since reclaimed must be declined, not
+    /// half-adopted — the caller prefills instead, which is correct and slow
+    /// rather than fast and wrong.
+    #[test]
+    fn adopting_a_reclaimed_prefix_takes_nothing() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        let geom = vec![LayerGeometry {
+            kv_dim: 4,
+            stride: 1,
+        }];
+        let pool = Arc::new(KvPool::with_policy(4, 4, geom, Policy::Lru));
+        let mut cache =
+            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        // Tags nothing ever sealed.
+        assert!(cache.adopt_shared_pages(&[11, 22], 4).is_none());
+        assert_eq!(
+            pool.stats().live_pages,
+            0,
+            "a refused adoption left pages held"
+        );
+    }
+
+    /// The block table is what the paged kernel reads to turn a position into
+    /// a row, so it has to name this sequence's pages in logical order.
+    #[test]
+    fn the_block_table_names_the_pages_in_order() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 4;
+        let pool = Arc::new(KvPool::with_policy(
+            8,
+            4,
+            vec![LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            }],
+            Policy::Lru,
+        ));
+        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        assert!(cache.layers[0].block_table().is_empty());
+        for r in 0..9usize {
+            cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
+        }
+        // Two whole pages sealed; the ninth row is a tail with no page yet.
+        assert_eq!(cache.layers[0].block_table().len(), 2);
+        let table: Vec<u32> = cache.layers[0].block_table().to_vec();
+        assert_ne!(
+            table[0], table[1],
+            "two logical pages share one physical page"
+        );
+    }
+
+    /// Rolling back must not leave the device believing it has mirrored pages
+    /// the sequence no longer holds — the next pages to take those indices
+    /// would then never be uploaded, and the kernel would read whatever the
+    /// previous occupant left.
+    #[test]
+    fn a_rollback_pulls_the_device_watermark_back() {
+        use crate::engine::backend::vulkan_shaders::KvStorage;
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        let Some(vulkan) = crate::engine::backend::vulkan::shared_test_backend() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        const KV: usize = 32;
+        let mut pool = KvPool::with_policy(
+            16,
+            4,
+            vec![LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            }],
+            Policy::Lru,
+        );
+        let (device, queue) = vulkan.device_and_queue();
+        pool.attach_device(device, KvStorage::F16, 64);
+        let pool = Arc::new(pool);
+
+        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        for r in 0..12usize {
+            cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
+        }
+        cache.layers[0].sync_pool_device(queue);
+        assert_eq!(cache.layers[0].block_table().len(), 3);
+
+        assert_eq!(cache.layers[0].device_synced_pages(), 3);
+
+        // Roll back into the first page and write again.
+        cache.truncate(2);
+        assert!(cache.layers[0].block_table().is_empty());
+        assert_eq!(
+            cache.layers[0].device_synced_pages(),
+            0,
+            "the device watermark outlived the pages it counted; the next pages \
+             to take those indices would never be uploaded"
+        );
+        for r in 100..108usize {
+            cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
+        }
+        // Two fresh pages, and the sync must upload both rather than believing
+        // three were already done.
+        assert_eq!(cache.layers[0].block_table().len(), 2);
+        cache.layers[0].sync_pool_device(queue);
+        assert_eq!(cache.layers[0].device_synced_pages(), 2);
+        for r in 0..2usize {
+            assert_eq!(cache.layers[0].key_at(r, 0, KV), &[r as f32; KV][..]);
+        }
+        for r in 2..10usize {
+            assert_eq!(
+                cache.layers[0].key_at(r, 0, KV),
+                &[(98 + r) as f32; KV][..],
+                "row {r}"
+            );
+        }
+    }
+
+    /// **A mixed architecture keeps its recurrent state when it goes paged.**
+    ///
+    /// This is the bug that shipped for one commit and that nothing caught: the
+    /// paged cache used to be built from the pool's layer list, which knows only
+    /// about positional layers, so `recurrent` came out empty. Eight
+    /// architectures index `cache.recurrent[..]` directly — `qwen35moe`,
+    /// `qwen3next`, `nemotron_h_moe`, `kda`, `inkling` among them — and every
+    /// one of them would have panicked on its first linear-attention layer the
+    /// moment paging became the default.
+    ///
+    /// It survived because every paged test until now used a purely positional
+    /// cache, which cannot express the difference.
+    #[test]
+    fn going_paged_keeps_a_mixed_architecture_s_recurrent_state() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        let pool = Arc::new(KvPool::with_policy(
+            16,
+            4,
+            vec![LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+            }],
+            Policy::Lru,
+        ));
+        // What a mixed architecture hands back: one attention layer and one
+        // recurrent state beside it.
+        let built = KvCache::new_mixed(64, &[KV], &[RecurrentSpec::delta_net(2, 3, 1, 2)]);
+        assert_eq!(built.recurrent.len(), 1);
+
+        let paged = built.into_paged(pool);
+        assert_eq!(
+            paged.recurrent.len(),
+            1,
+            "the recurrent state was dropped on the way into the pool; every \
+             linear-attention layer of this model would index an empty vector"
+        );
+        assert!(
+            paged.layers[0].paged.is_some(),
+            "the attention layer is paged"
+        );
+    }
+
+    /// And the geometry has to match, or the pool belongs to another model —
+    /// the same class of error the slot fingerprint refuses.
+    #[test]
+    #[should_panic(expected = "does not match the pool")]
+    fn going_paged_refuses_a_pool_built_for_a_different_shape() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        let pool = Arc::new(KvPool::with_policy(
+            8,
+            4,
+            vec![LayerGeometry {
+                kv_dim: 8,
+                stride: 1,
+            }],
+            Policy::Lru,
+        ));
+        let _ = KvCache::new_with_strided_dims(64, &[(16, 1)]).into_paged(pool);
     }
 
     #[test]

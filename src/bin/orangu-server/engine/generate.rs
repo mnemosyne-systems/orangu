@@ -222,6 +222,16 @@ pub struct Engine {
     /// reuse source for the next request on that slot (independent of the
     /// cross-slot `prefix_cache` pool). See that module's own doc comment.
     pub slot_store: Option<Arc<super::slot_store::SlotStore>>,
+    /// The paged KV pool and its prefix index (`ORANGU_PAGED_KV=1`), or `None`
+    /// for the per-request contiguous caches this engine has always used.
+    ///
+    /// Both together or neither. A pool without an index pages without
+    /// sharing, which pays paging's indirection for none of its benefit; an
+    /// index without a pool has nothing to point at.
+    pub paged_kv: Option<(
+        Arc<super::kv_pool::KvPool>,
+        Arc<super::prefix_index::PrefixIndex>,
+    )>,
     /// Which of `--all`/`--code`/`--review`/`--explorer`/`--embedding` this
     /// deployment was started with — read by the HTTP layer for default
     /// sampling parameters, generation-endpoint gating, and (`Review`
@@ -278,6 +288,7 @@ impl Engine {
         let draft = self.draft.clone();
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
+        let paged_kv = self.paged_kv.clone();
         // Whether a reasoning message reaches the client is this server's
         // role's call, not the request's — the same place every other
         // reasoning decision is made (`Role::enable_thinking`, which the
@@ -335,6 +346,7 @@ impl Engine {
                         draft.as_deref(),
                         prefix_cache.as_deref(),
                         slot_store.as_deref(),
+                        paged_kv.as_ref(),
                         &guard,
                         req,
                         role,
@@ -418,6 +430,10 @@ fn run(
     draft: Option<&DraftModel>,
     prefix_cache: Option<&PrefixCache>,
     slot_store: Option<&super::slot_store::SlotStore>,
+    paged_kv: Option<&(
+        Arc<super::kv_pool::KvPool>,
+        Arc<super::prefix_index::PrefixIndex>,
+    )>,
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
     role: crate::config::Role,
@@ -457,9 +473,41 @@ fn run(
     // `cache_prompt: false` skips both reuse paths below, so the prompt is
     // prefilled in full. Storing this request's own cache afterwards is
     // unaffected — the flag governs what this request may *read*.
-    let mut new_cache = model.new_kv_cache(capacity);
+    // The paged path, when a pool exists. It replaces both reuse mechanisms
+    // below rather than layering on them: those hand a whole cache to one
+    // request at a time, and the point of the pool is that a prefix has as many
+    // holders as want it.
+    let mut page_tags: Vec<u64> = Vec::new();
+    let mut new_cache;
     let mut reused_len = 0usize;
-    if req.cache_prompt
+    if let Some((pool, index)) = paged_kv {
+        // The architecture builds its own cache — recurrent state included —
+        // and only its positional layers move into the pool.
+        new_cache = model.new_kv_cache(capacity).into_paged(pool.clone());
+        if req.cache_prompt {
+            // `keep_last`: a fully matched prompt still needs one page of real
+            // work to produce fresh logits from — the same reason the
+            // contiguous path clamps a full match by one token.
+            let resolved = index.resolve(&req.prompt_tokens, true);
+            if !resolved.shared.is_empty()
+                && let Some(tokens) =
+                    new_cache.adopt_shared_pages(&resolved.shared, pool.page_tokens())
+            {
+                reused_len = tokens;
+            }
+            page_tags = super::prefix_index::page_tags(&req.prompt_tokens, pool.page_tokens());
+        } else {
+            page_tags = super::prefix_index::page_tags(&req.prompt_tokens, pool.page_tokens());
+        }
+        // Pages this request seals become findable under these identities. Set
+        // even when nothing was adopted: this request is the one that makes the
+        // prefix available to the next.
+        new_cache.set_page_tags(&page_tags);
+    } else {
+        new_cache = model.new_kv_cache(capacity);
+    }
+    if paged_kv.is_none()
+        && req.cache_prompt
         && let Some(pool) = prefix_cache
         && let Some((matched, entry)) = pool.take_best_match(&req.prompt_tokens)
     {
@@ -477,7 +525,8 @@ fn run(
     // does this slot's own durably-retained cache (`engine::slot_store`, the
     // source a `restore` populated) get consulted — it applies the same
     // leave-one-token and recurrent-state rules internally.
-    if req.cache_prompt
+    if paged_kv.is_none()
+        && req.cache_prompt
         && reused_len == 0
         && let Some(store) = slot_store
     {
@@ -515,6 +564,12 @@ fn run(
             elapsed: prompt_start.elapsed(),
         });
     };
+    // Committed after the whole prefill, not inside it. Prefill is
+    // **layer-major** — `arch::gemma` pushes every token of layer 0, then every
+    // token of layer 1 — so during it a page can be complete for one layer and
+    // untouched by the rest. The only moment a span of positions is known to
+    // have been through every layer is when the pass returns, which is why this
+    // is the caller's call to make and not something the cache can infer.
     let logits = match prefill(
         model,
         cache.as_mut().expect("cache is always Some here"),
@@ -535,6 +590,11 @@ fn run(
             return Ok(());
         }
     };
+    if paged_kv.is_some()
+        && let Some(cache) = cache.as_mut()
+    {
+        cache.commit_pages();
+    }
     let prompt_time = prompt_start.elapsed();
     // Prefill is never decode-shaped (`n_tokens > 1`), so it never takes a
     // GPU-fused sampling fast path either way — this first sample always
@@ -783,6 +843,15 @@ fn run(
                     v.submission_count() - before
                 );
             }
+            // Every layer has run over this position now, so whichever page it
+            // completed may be published. A no-op on all but one step in
+            // `page_tokens`, and a lock plus a scan of the fill counts when it
+            // is not.
+            if paged_kv.is_some()
+                && let Some(cache) = cache.as_mut()
+            {
+                cache.commit_pages();
+            }
             match outcome {
                 Ok(ForwardOutcome::Token(t)) => t,
                 Ok(ForwardOutcome::Logits(l)) => sampler.sample(&l, &history),
@@ -821,14 +890,42 @@ fn run(
     // to own its copy.
     if let Some(final_cache) = cache.take() {
         let history = std::mem::take(&mut history);
-        match (prefix_cache, slot_store) {
-            (Some(pool), Some(store)) => {
-                store.retain(guard.id(), history.clone(), final_cache.duplicate());
-                pool.store(history, final_cache);
+        if let Some((pool, index)) = paged_kv {
+            // Publish what this request sealed, so the next one with the same
+            // prompt shares it instead of recomputing it. Only whole pages of
+            // the *prompt* are recorded: the generated tail is still being
+            // produced page by page and the last one is partial, and a page is
+            // shareable exactly when it is complete.
+            //
+            // Recorded here rather than as each page seals, because a page is
+            // only worth advertising once the request that built it is known to
+            // have finished with it — an aborted request leaves pages the pool
+            // reclaims, and an index entry for one of those promises content
+            // that is gone.
+            let page_tokens = pool.page_tokens();
+            for (i, &tag) in page_tags.iter().enumerate() {
+                // Only what the pool actually holds. The index and the pool are
+                // separate structures, and an index entry for a page the pool
+                // never sealed is worse than no entry: `resolve` promises it,
+                // the adoption then fails, and the request pays a full prefill
+                // having been told it would not have to.
+                if !pool.holds(tag) {
+                    continue;
+                }
+                let run = &history[i * page_tokens..(i + 1) * page_tokens];
+                index.remember(tag, run);
             }
-            (Some(pool), None) => pool.store(history, final_cache),
-            (None, Some(store)) => store.retain(guard.id(), history, final_cache),
-            (None, None) => {}
+            drop(final_cache);
+        } else {
+            match (prefix_cache, slot_store) {
+                (Some(pool), Some(store)) => {
+                    store.retain(guard.id(), history.clone(), final_cache.duplicate());
+                    pool.store(history, final_cache);
+                }
+                (Some(pool), None) => pool.store(history, final_cache),
+                (None, Some(store)) => store.retain(guard.id(), history, final_cache),
+                (None, None) => {}
+            }
         }
     }
 
@@ -2420,6 +2517,7 @@ mod tests {
             Some(&draft),
             None,
             None,
+            None,
             &guard,
             req,
             crate::config::Role::default(),
@@ -2459,6 +2557,7 @@ mod tests {
             tokenizer,
             None,
             prefix_cache,
+            None,
             None,
             &guard,
             req,
@@ -3085,6 +3184,7 @@ mod tests {
         crate::panic_capture::install();
 
         let engine = Engine {
+            paged_kv: None,
             metrics: Arc::new(crate::engine::metrics::ServerMetrics::new()),
             draft: None,
             model: Arc::new(PanickingModel::new()),
@@ -3174,6 +3274,7 @@ mod tests {
         run(
             &model,
             &tokenizer,
+            None,
             None,
             None,
             None,

@@ -1241,6 +1241,135 @@ fn prepare(args: Args) -> Result<Prepared> {
     let prefix_cache = crate::engine::env::flag_on("ORANGU_PREFIX_CACHE")
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
 
+    // The paged KV pool (`ORANGU_PAGED_KV=1`), and the index that gives its
+    // pages a content identity. Both or neither: a pool without an index pages
+    // without sharing, which is the cost of paging for none of the benefit.
+    //
+    // Sized from the same headroom figure the startup report already prints,
+    // but **not divided by the slot count** — that division is what a shared
+    // pool exists to remove. See `KvPool::sized_for`.
+    /// Host memory the paged KV pool may take, unless `ORANGU_KV_POOL_BYTES`
+    /// says otherwise.
+    ///
+    /// A flat ceiling rather than a fraction of free RAM. What is free at
+    /// startup is not this process's to spend — the page cache holding the
+    /// model is counted as free and is doing real work — and a pool sized from
+    /// it would grow on an idle machine and shrink on a busy one, which makes
+    /// two runs of the same benchmark incomparable for reasons nothing reports.
+    const DEFAULT_HOST_KV_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    // On unless disabled — and not built at all where the selected attention
+    // kernels have no paged form, because a paged cache under those would keep
+    // the shared pages *and* the per-request mirror.
+    let paged_supported = backend
+        .as_wgpu()
+        .is_none_or(engine::backend::vulkan::VulkanBackend::supports_paged_kv);
+    let paged_kv = (engine::kv_pool::paged_kv_enabled() && paged_supported)
+        .then(|| {
+            let page_tokens = engine::kv_pool::page_tokens();
+            let probe = model.new_kv_cache(1);
+            let layers = engine::kv_pool::LayerGeometry::of(&probe);
+            // **Host** bytes, and only host bytes. This used to read the
+            // device headroom, on the reasoning that VRAM is what a KV cache
+            // competes for — which is true of the device *mirror* and false of
+            // this pool. The pool holds `f32` rows in system memory; the mirror
+            // is a separate, per-request allocation the pool does not replace.
+            // Sizing one from the other's budget gave a plausible number for
+            // the wrong reason, and would have been wrong in either direction
+            // on a machine whose card and RAM are differently proportioned.
+            let budget = engine::backend::env_tuning_value(
+                "ORANGU_KV_POOL_BYTES",
+                DEFAULT_HOST_KV_POOL_BYTES,
+                "a positive byte count",
+                |v: u64| v > 0,
+            );
+            // Bounded by *both* budgets. The pool holds `f32` on the host and
+            // the backend's KV width on the device, and it allocates the device
+            // side up front where the per-request mirror grew on demand — so a
+            // page count derived from host bytes alone will happily claim
+            // headroom the weights need.
+            //
+            // A **quarter** of the headroom, and the fraction is measured
+            // rather than chosen. The startup report's "room for N tokens of
+            // KV" describes memory the mirror would have taken *as it grew*;
+            // the pool takes its share at once and keeps it, so the same figure
+            // is not available to it. On a 4 GiB card with a 1.9 GiB model
+            // (2.13 GiB headroom), device pages of 1.06 GiB cost 47% of decode
+            // with a spread fourteen times the contiguous path's, while 0.54
+            // GiB and below ran at parity — so the usable share is under half
+            // and a quarter clears it with margin.
+            let device_budget = backend.as_wgpu().and_then(|wgpu| {
+                footprint
+                    .as_ref()?
+                    .headroom_on(wgpu.device_in_use())
+                    .map(|h| h / 4)
+            });
+            // `F32` when there is no device: the width only matters for the
+            // device bound, which is `None` in that case and never consulted.
+            let storage = backend.as_wgpu().map_or(
+                engine::backend::vulkan_shaders::KvStorage::F32,
+                |w| w.kv_storage(),
+            );
+            let pages = engine::kv_pool::KvPool::pages_within(
+                budget,
+                device_budget,
+                &layers,
+                page_tokens,
+                storage,
+            );
+            if pages == 0 {
+                return None;
+            }
+            let mut pool = engine::kv_pool::KvPool::with_policy(
+                pages,
+                page_tokens,
+                layers,
+                engine::kv_pool::policy_from_env(),
+            );
+            // Device pages, once for the process. This is what makes a shared
+            // prefix cost one mirror instead of one per request — the per-slot
+            // mirrors it replaces were the reason a four-slot server advertised
+            // a quarter of the context.
+            //
+            // The block table is sized for every slot holding a full pool's
+            // worth of pages at once, which cannot happen (they draw on one
+            // pool) but is the bound that cannot be exceeded, and it is four
+            // bytes an entry.
+            if let Some(wgpu) = backend.as_wgpu() {
+                let (device, _) = wgpu.device_and_queue();
+                let entries = pool.num_pages() * conf.slots;
+                if pool.attach_device(device, wgpu.kv_storage(), entries) {
+                    println!(
+                        "orangu-server: [kv] device pages — {:.2} GiB across {} layers",
+                        pool.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                        pool.layers().len(),
+                    );
+                }
+            }
+            println!(
+                "orangu-server: [kv] paged cache — {} pages of {page_tokens} tokens                  ({} tokens total, {:.2} GiB host), policy {:?}",
+                pool.num_pages(),
+                pool.token_capacity(),
+                pool.host_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                pool.policy(),
+            );
+            let index = engine::prefix_index::PrefixIndex::new(page_tokens);
+            Some((Arc::new(pool), Arc::new(index)))
+        })
+        .flatten();
+    if engine::kv_pool::paged_kv_enabled() && !paged_supported {
+        println!(
+            "orangu-server: [kv] paged cache off — this device's attention \
+             kernels (GQA or flash split) have no paged form yet"
+        );
+    } else if engine::kv_pool::paged_kv_enabled() && paged_kv.is_none() {
+        // Said out loud rather than silently falling back: an operator who
+        // asked for the pool and did not get one should learn it here, not
+        // from a hit rate that never moves.
+        eprintln!(
+            "orangu-server: [kv] ORANGU_PAGED_KV is set but the memory budget              does not hold one page; running with per-request caches"
+        );
+    }
+
     // Durable version of that pool (`ORANGU_PREFIX_CACHE_DIR=<dir>`), so a
     // conversation survives a restart instead of re-prefilling. On a model
     // whose experts stream, a re-prefill is not just recomputed attention: it
@@ -1321,6 +1450,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     };
 
     let engine = Arc::new(Engine {
+        paged_kv: paged_kv.clone(),
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
         model,
         draft,

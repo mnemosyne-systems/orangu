@@ -123,6 +123,27 @@ struct Args {
     #[arg(skip)]
     streams: Vec<u32>,
 
+    /// Shared-prefix mode: stream counts that all send the SAME long prefix.
+    #[arg(long = "shared-prefix", value_delimiter = ',', value_name = "LIST")]
+    shared_prefix_spec: Vec<String>,
+
+    /// [`Args::shared_prefix_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
+    shared_prefix: Vec<u32>,
+
+    /// Length in tokens of the prefix `--shared-prefix` streams have in common.
+    #[arg(long, default_value_t = 2048, value_name = "N")]
+    shared_prefix_tokens: u32,
+
+    /// Scan-resistance mode: unique prompts to push through between two uses
+    /// of one hot prefix.
+    #[arg(long = "prefix-scan", value_delimiter = ',', value_name = "LIST")]
+    prefix_scan_spec: Vec<String>,
+
+    /// [`Args::prefix_scan_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
+    prefix_scan: Vec<u32>,
+
     /// Prompt length (tokens) to prime the prefix cache with for `--pp-continue`.
     #[arg(long, default_value_t = 512, value_name = "N")]
     pp_continue_base: u32,
@@ -317,6 +338,16 @@ impl Args {
             ),
             ("--embed", &self.embed_spec, &mut self.embed),
             ("--streams", &self.streams_spec, &mut self.streams),
+            (
+                "--shared-prefix",
+                &self.shared_prefix_spec,
+                &mut self.shared_prefix,
+            ),
+            (
+                "--prefix-scan",
+                &self.prefix_scan_spec,
+                &mut self.prefix_scan,
+            ),
         ] {
             *out = points::expand_list(spec).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
         }
@@ -1558,6 +1589,18 @@ fn workload_detail(args: &Args) -> String {
         format!("prompt lengths {}", list(&args.embed))
     } else if !args.streams.is_empty() {
         format!("streams {}", list(&args.streams))
+    } else if !args.shared_prefix.is_empty() {
+        format!(
+            "streams {} sharing a {}-token prefix",
+            list(&args.shared_prefix),
+            args.shared_prefix_tokens
+        )
+    } else if !args.prefix_scan.is_empty() {
+        format!(
+            "{} unique prompts between two uses of a {}-token prefix",
+            list(&args.prefix_scan),
+            args.shared_prefix_tokens
+        )
     } else if args.curve > 0 {
         format!("{} tokens in {}-token buckets", args.curve, args.bucket)
     } else {
@@ -2313,6 +2356,14 @@ fn measure(
 
     if !args.streams.is_empty() {
         return run_streams(client, args, label);
+    }
+
+    if !args.shared_prefix.is_empty() {
+        return run_shared_prefix(client, args, label);
+    }
+
+    if !args.prefix_scan.is_empty() {
+        return run_prefix_scan(client, args, label);
     }
 
     if args.curve > 0 {
@@ -3377,6 +3428,233 @@ fn run_streams(
             mean: stats.mean,
             sd: stats.sd,
             sd_sample: stats.sd_sample,
+            device: None,
+        });
+    }
+    Ok(records)
+}
+
+/// Shared-prefix mode: `n` concurrent requests that all carry the **same**
+/// long prefix, reporting the spread in time to first token.
+///
+/// [`run_streams`] deliberately gives every stream a distinct prompt, so that
+/// none of them gets "a free ride" off the prefix cache. This mode is the
+/// opposite experiment, and it measures something that number cannot show: what
+/// a *shared* prefix costs when more than one request wants it at once.
+///
+/// The prefix cache pools finished requests' caches and hands the best match to
+/// a new one — but the entry is **removed** when it is taken, so exactly one
+/// in-flight request can hold it. The others find an empty pool and prefill the
+/// shared prefix again from position zero. That is invisible to aggregate
+/// throughput (the tokens still get generated) and invisible to a single-stream
+/// TTFT (there is nobody to contend with). It shows up here, as a spread:
+/// the stream that got the entry answers immediately, and every other stream
+/// pays the whole prefill.
+///
+/// So the number to read is `slowest / fastest`. At 1 it is shared; well above
+/// 1 the prefix is being recomputed per concurrent peer, and the absolute
+/// `slowest` is roughly what a cold prefill of `--shared-prefix-tokens` costs.
+///
+/// One priming request runs first and is not timed — without it the first
+/// measured round has nothing in the pool and every stream is cold, which
+/// measures cold prefill rather than contention for a warm entry.
+///
+/// Sends `cache_prompt: true`, unlike every other mode here. That is the whole
+/// experiment: with the cache off, all streams prefill and the mode measures
+/// nothing but contention for the device.
+fn run_shared_prefix(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    // The shared part. Built by the same padding helper the depth sweep uses,
+    // so its token count is the one `--shared-prefix-tokens` asked for rather
+    // than a character count that happens to tokenize near it.
+    let prefix = build_prompt(args.shared_prefix_tokens);
+
+    if !args.json {
+        println!(
+            "{:>8} | {:>11} | {:>11} | {:>7} | {:>8}",
+            "streams", "ttft_fast", "ttft_slow", "ratio", "tokens"
+        );
+        println!("{}", "-".repeat(56));
+    }
+
+    // Prime the pool: one request establishes the prefix so the measured
+    // rounds are contending for a warm entry rather than all arriving cold.
+    let _ = run_once_cached(client, &args.url, &prefix, 1, &args.model);
+
+    for (point, &n) in args.shared_prefix.iter().enumerate() {
+        if point > 0 {
+            args.settle();
+        }
+        let n = n.max(1);
+        let mut fastest = f64::MAX;
+        let mut slowest: f64 = 0.0;
+        let mut total_tokens = 0u32;
+        for _ in 0..args.reps.max(1) {
+            let results: Vec<Sample> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..n)
+                    .map(|i| {
+                        let prefix = prefix.as_str();
+                        scope.spawn(move || {
+                            // Identical prefix, distinct suffix: every stream
+                            // can reuse everything but its own last few tokens,
+                            // which is the shape a shared system prompt has.
+                            let prompt = format!("{prefix}\nRequest {i}, continue:");
+                            run_once_cached(client, &args.url, &prompt, args.n_gen, &args.model)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().and_then(Result::ok))
+                    .collect()
+            });
+            if results.is_empty() {
+                anyhow::bail!("no streams completed at {n} sharing a prefix");
+            }
+            for s in &results {
+                fastest = fastest.min(s.ttft_ms);
+                slowest = slowest.max(s.ttft_ms);
+                total_tokens += s.gen_tokens;
+            }
+        }
+        let ratio = if fastest > 0.0 {
+            slowest / fastest
+        } else {
+            0.0
+        };
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "streams": n,
+                    "shared_prefix_tokens": args.shared_prefix_tokens,
+                    "ttft_ms_fastest": fastest,
+                    "ttft_ms_slowest": slowest,
+                    "ttft_ratio": ratio,
+                    "tokens": total_tokens,
+                })
+            );
+        } else {
+            println!(
+                "{:>8} | {:>9.0}ms | {:>9.0}ms | {:>6.1}x | {:>8}",
+                n, fastest, slowest, ratio, total_tokens
+            );
+        }
+
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            // The recorded value is the *slowest* stream's TTFT: it is the one
+            // a user actually waits for, and the one sharing would remove.
+            mode: "ttft".to_string(),
+            n,
+            best: slowest,
+            mean: slowest,
+            sd: 0.0,
+            sd_sample: None,
+            device: None,
+        });
+    }
+    Ok(records)
+}
+
+/// Scan-resistance mode: does a hot prefix survive a burst of unrelated
+/// traffic?
+///
+/// A cache's replacement policy is invisible until something competes for it.
+/// [`run_shared_prefix`] measures contention between requests that all want the
+/// *same* prefix; this measures the opposite pressure — one prefix worth
+/// keeping, and a stream of one-shot prompts that will never be asked for
+/// again. That is what a served deployment actually looks like: a system prompt
+/// reused by everyone, and everybody's own conversation behind it.
+///
+/// Under a purely recency-ordered policy the one-shot prompts are the most
+/// recently used thing in the cache, so they evict the prefix that is about to
+/// be needed again — the classic scan. A policy that also weighs how *often*
+/// something is used should keep it.
+///
+/// Each point: use the hot prefix and time it, push `n` unique prompts through,
+/// use the hot prefix again and time that. The number to read is the ratio. At
+/// 1 the prefix survived; at the cost of a full cold prefill it was evicted,
+/// and `n` is the depth at which that happens.
+///
+/// The unique prompts differ in their **first** tokens, not their last, so they
+/// share no prefix with the hot one or with each other — otherwise they would
+/// be partial hits and the pressure would be softer than intended.
+fn run_prefix_scan(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    label: &str,
+) -> anyhow::Result<Vec<history::Record>> {
+    let mut records = Vec::new();
+    let hot = format!("HOT PREFIX. {}", build_prompt(args.shared_prefix_tokens));
+
+    if !args.json {
+        println!(
+            "{:>8} | {:>11} | {:>11} | {:>8}",
+            "scan", "ttft_warm", "ttft_after", "ratio"
+        );
+        println!("{}", "-".repeat(46));
+    }
+
+    for (point, &n) in args.prefix_scan.iter().enumerate() {
+        if point > 0 {
+            args.settle();
+        }
+        // Establish the hot prefix, then time it warm. Two calls, because the
+        // first one is what puts it in the cache and the second is the reading.
+        let _ = run_once_cached(client, &args.url, &hot, 1, &args.model);
+        let warm = run_once_cached(client, &args.url, &hot, args.n_gen, &args.model)?;
+
+        for i in 0..n {
+            // Distinct leading text: a unique prompt must not be a partial hit
+            // on the hot one, or it refreshes what it is supposed to displace.
+            let junk = format!(
+                "UNIQUE {point}-{i}. {}",
+                build_prompt(args.shared_prefix_tokens)
+            );
+            let _ = run_once_cached(client, &args.url, &junk, 1, &args.model);
+        }
+
+        let after = run_once_cached(client, &args.url, &hot, args.n_gen, &args.model)?;
+        let ratio = if warm.ttft_ms > 0.0 {
+            after.ttft_ms / warm.ttft_ms
+        } else {
+            0.0
+        };
+
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "scan": n,
+                    "prefix_tokens": args.shared_prefix_tokens,
+                    "ttft_ms_warm": warm.ttft_ms,
+                    "ttft_ms_after_scan": after.ttft_ms,
+                    "ttft_ratio": ratio,
+                })
+            );
+        } else {
+            println!(
+                "{:>8} | {:>9.0}ms | {:>9.0}ms | {:>7.1}x",
+                n, warm.ttft_ms, after.ttft_ms, ratio
+            );
+        }
+
+        records.push(history::Record {
+            date: history::today(),
+            label: label.to_string(),
+            mode: "ttft".to_string(),
+            n,
+            best: after.ttft_ms,
+            mean: after.ttft_ms,
+            sd: 0.0,
+            sd_sample: None,
             device: None,
         });
     }

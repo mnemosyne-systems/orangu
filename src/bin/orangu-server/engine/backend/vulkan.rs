@@ -62,8 +62,8 @@ mod meta;
 mod pipeline_cache;
 use layouts::{
     argmax_bind_group_layout, argmax_split_bind_group_layout, attn_bind_group_layout,
-    bind_group_layout, elem2_bind_group_layout, elem3_bind_group_layout, elem4_bind_group_layout,
-    elem5_bind_group_layout,
+    attn_paged_bind_group_layout, bind_group_layout, elem2_bind_group_layout,
+    elem3_bind_group_layout, elem4_bind_group_layout, elem5_bind_group_layout,
 };
 use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
 // `RopeYarn` and `rope_layout_code` keep their `vulkan::` path: four
@@ -697,6 +697,12 @@ pub struct VulkanBackend {
     /// the correctness reference the split path's own tests check
     /// against.
     attn_pipeline: wgpu::ComputePipeline,
+    /// The paged twin of `attn_pipeline`, built on first use.
+    ///
+    /// Lazy rather than eager because the un-split kernel only runs when
+    /// split-k is off, which is not the default — compiling its paged form for
+    /// every server that will never dispatch it is a startup cost for nothing.
+    attn_paged_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
     /// Whether the **standalone** prefill attention dispatch
     /// ([`Self::gpu_attention_prefill`]) is used where the fused layer below
     /// declines. **On by default**; opt out with `ORANGU_NO_PREFILL_ATTN=1`.
@@ -762,6 +768,16 @@ pub struct VulkanBackend {
     /// with mixed head_dims (e.g. SWA vs full-attention) gets one entry
     /// each. Reuses `attn_bind_group_layout`/`attn_pipeline_layout`.
     attn_split_pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    /// Bind group layout and pipeline layout for the paged kernels — six
+    /// bindings plus the block table.
+    // Read only by the paged dispatch, which is `#[cfg(test)]` until the
+    // decode path selects it — the scheduler side of paged attention is the
+    // next step. Held on the backend rather than built per call because a bind
+    // group layout is part of a pipeline's identity and both must come from
+    // the same one.
+    #[allow(dead_code)]
+    attn_paged_bind_group_layout: wgpu::BindGroupLayout,
+    attn_paged_pipeline_layout: wgpu::PipelineLayout,
     /// Pipeline layout shared by `attn_pipeline` and every lazily-built
     /// `attn_split_pipelines` entry (same binding shape).
     attn_pipeline_layout: wgpu::PipelineLayout,
@@ -2052,11 +2068,20 @@ fn dump_shaders_if_requested(
         ),
         (
             "attention_split_headdim256.wgsl".into(),
-            vulkan_shaders::shader_source_attention_split(kv_storage, subgroup, 256),
+            vulkan_shaders::shader_source_attention_split(
+                kv_storage,
+                subgroup,
+                256,
+                vulkan_shaders::KvPaging::Contiguous,
+            ),
         ),
         (
             "attention_prefill_coop_headdim256.wgsl".into(),
-            vulkan_shaders::shader_source_attention_prefill_coop(kv_storage, 256),
+            vulkan_shaders::shader_source_attention_prefill_coop(
+                kv_storage,
+                256,
+                vulkan_shaders::KvPaging::Contiguous,
+            ),
         ),
     ];
     let mut shaders = shaders;
@@ -2098,7 +2123,13 @@ fn dump_shaders_if_requested(
         let heads = vulkan_shaders::gqa_prefill_heads_per_workgroup(head_dim, group);
         shaders.push((
             format!("attention_prefill_gqa_headdim{head_dim}_heads{heads}.wgsl"),
-            vulkan_shaders::shader_source_attention_prefill_gqa(kv_storage, head_dim, group, heads),
+            vulkan_shaders::shader_source_attention_prefill_gqa(
+                kv_storage,
+                head_dim,
+                group,
+                heads,
+                vulkan_shaders::KvPaging::Contiguous,
+            ),
         ));
     }
     for (name, src) in shaders {
@@ -2124,7 +2155,7 @@ const ARGMAX_SPLIT_N: u32 = 256;
 /// The `ggml_type`s a shader exists for — kept in one place so
 /// construction (build every pipeline up front) and the `matmul` dispatch
 /// (look one up) can't drift apart.
-const SUPPORTED_TYPES: &[u32] = &[
+pub(crate) const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_F32,
     crate::engine::quant::GGML_TYPE_F16,
     crate::engine::quant::GGML_TYPE_BF16,
@@ -2147,6 +2178,7 @@ const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ3_S,
     crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
+    crate::engine::quant::GGML_TYPE_MXFP4,
 ];
 
 /// The KV storage the configuration asked for, for backends built after
@@ -2399,6 +2431,87 @@ impl VulkanBackend {
     /// 262k vocabulary has a 2.62 GiB `token_embd` — which panicked inside
     /// `Device::create_buffer` on the first prompt, because `WeightArena`
     /// sizes an oversized chunk to the tensor and never asked.
+    /// The `wgpu` device and queue behind this backend.
+    ///
+    /// For the one caller that owns device memory of its own rather than
+    /// borrowing this backend's: `engine::kv_pool` allocates the shared KV
+    /// pages once for the process, which is the whole reason they can be shared
+    /// between requests, and it needs the device that everything else here was
+    /// built on rather than one of its own.
+    /// The pipeline layout for a kernel that does or does not read a block
+    /// table — six bindings against seven.
+    fn attn_layout_for(&self, paged: bool) -> &wgpu::PipelineLayout {
+        if paged {
+            &self.attn_paged_pipeline_layout
+        } else {
+            &self.attn_pipeline_layout
+        }
+    }
+
+    /// The un-split attention pipeline, contiguous or paged.
+    fn attn_pipeline_for(&self, paged: bool) -> &wgpu::ComputePipeline {
+        if !paged {
+            return &self.attn_pipeline;
+        }
+        self.attn_paged_pipeline.get_or_init(|| {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("orangu-server paged attention shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        vulkan_shaders::shader_source_attention(
+                            self.kv_storage,
+                            self.subgroup_reduce,
+                            2048,
+                            vulkan_shaders::KvPaging::Paged,
+                        )
+                        .into(),
+                    ),
+                });
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("orangu-server paged attention pipeline"),
+                    layout: Some(&self.attn_paged_pipeline_layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+        })
+    }
+
+    /// The bind group layout matching [`Self::attn_layout_for`].
+    fn attn_bind_layout_for(&self, paged: bool) -> &wgpu::BindGroupLayout {
+        if paged {
+            &self.attn_paged_bind_group_layout
+        } else {
+            &self.attn_bind_group_layout
+        }
+    }
+
+    /// Whether this backend's selected attention kernels can read a paged KV
+    /// cache.
+    ///
+    /// Every attention kernel now has a paged form, so this is `true`
+    /// unconditionally. It is still asked, because the question it answers is a
+    /// real one: a kernel without a paged form leaves its cache on the
+    /// per-request mirror, and a pool built anyway would cost the shared pages
+    /// **and** that mirror — twice the device memory for none of the benefit.
+    /// A deployment in that position is better served by not building a pool,
+    /// which is what `main` uses this for.
+    pub fn supports_paged_kv(&self) -> bool {
+        // Every split-k variant now has a paged form — plain, cooperative,
+        // flash and GQA — so there is no configuration left that would have to
+        // keep a per-request mirror beside the pool. Kept as a method rather
+        // than deleted: the next kernel added here has to answer this question
+        // again, and a call site is where it will be asked.
+        true
+    }
+
+    pub fn device_and_queue(&self) -> (&wgpu::Device, &wgpu::Queue) {
+        (&self.device, &self.queue)
+    }
+
     pub fn max_buffer_size(&self) -> u64 {
         self.device.limits().max_buffer_size
     }
@@ -3217,6 +3330,13 @@ impl VulkanBackend {
         );
 
         let attn_bind_group_layout = attn_bind_group_layout(&device);
+        let attn_paged_bind_group_layout = attn_paged_bind_group_layout(&device);
+        let attn_paged_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server paged attention pipeline layout"),
+                bind_group_layouts: &[Some(&attn_paged_bind_group_layout)],
+                immediate_size: 0,
+            });
         let attn_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("orangu-server attention pipeline layout"),
             bind_group_layouts: &[Some(&attn_bind_group_layout)],
@@ -3234,7 +3354,13 @@ impl VulkanBackend {
         let attn_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("orangu-server attention shader"),
             source: wgpu::ShaderSource::Wgsl(
-                vulkan_shaders::shader_source_attention(kv_storage, subgroup_reduce, 2048).into(),
+                vulkan_shaders::shader_source_attention(
+                    kv_storage,
+                    subgroup_reduce,
+                    2048,
+                    vulkan_shaders::KvPaging::Contiguous,
+                )
+                .into(),
             ),
         });
         let attn_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -3693,7 +3819,10 @@ impl VulkanBackend {
             rmsnorm_add_scale_pipeline,
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
+            attn_paged_bind_group_layout,
+            attn_paged_pipeline_layout,
             attn_pipeline,
+            attn_paged_pipeline: std::sync::OnceLock::new(),
             prefill_attn: (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_ATTN")),
             prefill_fused_attn: crate::engine::env::flag_on("ORANGU_PREFILL_FUSED_ATTN"),
             prefill_gqa: attn_coop && (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_GQA")),
@@ -6239,12 +6368,18 @@ impl VulkanBackend {
     /// for why this reuses `ElemMeta`'s Rust struct too, just naming its
     /// second field `offset` here instead of `_pad0`).
     fn cast_meta_buffer(&self, len: u32, offset: u32) -> wgpu::Buffer {
-        let meta = ElemMeta {
-            len,
-            aux: offset,
-            extra: 0.0,
-            out_scale: 0.0,
-        };
+        self.cast_meta_buffer_from(len, offset, 0)
+    }
+
+    /// [`Self::cast_meta_buffer`] with a source offset.
+    ///
+    /// The KV write shaders read a `u32` in the fourth word where the shared
+    /// `ElemMeta` declares an `f32`, so the words are written directly rather
+    /// than through that struct — `ElemMeta`'s zeroed `out_scale` has the same
+    /// bytes as a zero source offset, which is why every other caller can go
+    /// on using the two-argument form unchanged.
+    fn cast_meta_buffer_from(&self, len: u32, dst_offset: u32, src_offset: u32) -> wgpu::Buffer {
+        let words: [u32; 4] = [len, dst_offset, 0, src_offset];
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server kv cast meta"),
             size: std::mem::size_of::<ElemMeta>() as u64,
@@ -6252,7 +6387,7 @@ impl VulkanBackend {
             mapped_at_creation: false,
         });
         self.queue
-            .write_buffer(&buffer, 0, bytemuck::bytes_of(&meta));
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&words));
         buffer
     }
 
@@ -8768,7 +8903,16 @@ impl VulkanBackend {
     ) -> Vec<f32> {
         debug_assert_eq!(q.len(), n_tokens * n_head * head_dim);
         let capacity = cache.capacity();
-        let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+        // Ask for pages first. If the cache can supply them, `sync_gpu` is
+        // never reached — which is the point: a paged cache that still built
+        // the per-request mirror would pay for both storages, and measured, it
+        // did (prefill at depth 1024 went 6.1 s to 11.7 s).
+        let paged = cache.paged_device_refs(&self.queue);
+        let kv_refs = if paged.is_some() {
+            None
+        } else {
+            Some(cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage))
+        };
 
         let out_len = n_tokens * n_head * head_dim;
         // Grown on demand and held across layers — see `PrefillAttnScratch`.
@@ -8807,42 +8951,75 @@ impl VulkanBackend {
             n_query: n_tokens as u32,
             n_swa: n_swa as u32,
             causal: u32::from(causal),
-            _pad: 0,
+            kv_page_base: paged.as_ref().map_or(0, |p| p.3),
+            kv_page_tokens: paged.as_ref().map_or(0, |p| p.4),
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(meta_buf, 0, bytemuck::bytes_of(&meta));
 
+        // Softmax scratch. The mirror carries one sized to the request; a paged
+        // cache has no mirror, so it takes one from the shared scratch pool at
+        // the same shape the kernel indexes it by.
+        let paged_probs = paged
+            .is_some()
+            .then(|| self.scratch_buffer(n_head * capacity.max(1)));
+        let (kv_k, kv_v, probs) = match (&paged, &kv_refs, &paged_probs) {
+            (Some((buffer, _table, half, _base, _tokens)), _, Some(probs)) => (
+                BindSrc::Slice(buffer, 0, *half),
+                BindSrc::Slice(buffer, *half, *half),
+                probs,
+            ),
+            (None, Some(refs), _) => (
+                BindSrc::Slice(&refs.buffer, refs.k_off, refs.k_size),
+                BindSrc::Slice(&refs.buffer, refs.v_off, refs.v_size),
+                &refs.probs,
+            ),
+            _ => unreachable!("exactly one of the paged and mirrored paths is taken"),
+        };
+
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: q_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: kv_k.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: kv_v.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: probs.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: meta_buf.as_entire_binding(),
+            },
+        ];
+        if let Some((_, table, _, _, _)) = &paged {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: table.as_entire_binding(),
+            });
+        }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server prefill attention bind group"),
-            layout: &self.attn_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.k_off, kv_refs.k_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.v_off, kv_refs.v_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: kv_refs.probs.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: meta_buf.as_entire_binding(),
-                },
-            ],
+            layout: if paged.is_some() {
+                &self.attn_paged_bind_group_layout
+            } else {
+                &self.attn_bind_group_layout
+            },
+            entries: &entries,
         });
 
         // The GQA kernel's workgroup covers `heads` query heads at once, so its
@@ -8855,7 +9032,16 @@ impl VulkanBackend {
         } else {
             n_head as u32
         };
-        let prefill_pipeline = self.attn_prefill_pipeline_for(head_dim, group, heads);
+        let prefill_pipeline = self.attn_prefill_pipeline_for(
+            head_dim,
+            group,
+            heads,
+            if paged.is_some() {
+                vulkan_shaders::KvPaging::Paged
+            } else {
+                vulkan_shaders::KvPaging::Contiguous
+            },
+        );
         let mut encoder = self.new_encoder("orangu-server prefill attention encoder");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -9115,6 +9301,25 @@ impl VulkanBackend {
             }
         };
 
+        // Resolved before the meta because the meta carries the page geometry.
+        // This call appends exactly `n_tokens` positions starting here, and a
+        // range that long generally crosses page boundaries — so unlike the
+        // decode step it gets back a list of runs rather than one row.
+        let write_pos = cache.len;
+        let paged = cache.paged_range_refs(&self.queue, write_pos, n_tokens);
+        // The write, as runs. A contiguous cache is the one-run case, so the
+        // cast dispatches and the `f32` copies below are written once and both
+        // paths take the same code — the mirror is simply a pool of one very
+        // large page.
+        let write_runs: Vec<crate::engine::kv_cache::PageRun> = match &paged {
+            Some(p) => p.runs.clone(),
+            None => vec![crate::engine::kv_cache::PageRun {
+                src_row: 0,
+                dst_row: write_pos as u32,
+                rows: n_tokens as u32,
+            }],
+        };
+
         // Attention writes into this stripe's slice of the caller's buffer.
         let out_byte_off = (out_row * n_head * head_dim) as u64 * 4;
         let out_slice = BindSrc::Slice(out_buf, out_byte_off, (q_elems as u64) * 4);
@@ -9130,7 +9335,11 @@ impl VulkanBackend {
             n_query: n_tokens as u32,
             n_swa: n_swa as u32,
             causal: u32::from(causal),
-            _pad: 0,
+            kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
+            kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let attn_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server fused prefill attention meta"),
@@ -9141,44 +9350,64 @@ impl VulkanBackend {
         self.queue
             .write_buffer(&attn_meta_buf, 0, bytemuck::bytes_of(&attn_meta));
 
-        // Captured before the cache write: this call appends exactly
-        // `n_tokens` positions starting here.
-        let write_pos = cache.len;
-        let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
-        let kv_buf = kv_refs.buffer.clone();
-        let probs_buf = kv_refs.probs.clone();
-        let (k_off, k_size, v_off, v_size) =
-            (kv_refs.k_off, kv_refs.k_size, kv_refs.v_off, kv_refs.v_size);
+        // The pool's pages, or the per-request mirror when there are none.
+        let (kv_buf, probs_buf, k_off, k_size, v_off, v_size) = match &paged {
+            Some(p) => {
+                cache.pool_scratch(&self.device, n_head, self.kv_storage);
+                let probs = cache
+                    .probs_scratch()
+                    .expect("pool_scratch built the mirror above");
+                (p.layer_buffer.clone(), probs, 0u64, p.half, p.half, p.half)
+            }
+            None => {
+                let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+                (
+                    kv_refs.buffer.clone(),
+                    kv_refs.probs.clone(),
+                    kv_refs.k_off,
+                    kv_refs.k_size,
+                    kv_refs.v_off,
+                    kv_refs.v_size,
+                )
+            }
+        };
 
+        let mut attn_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: q_g.output_src().resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: BindSrc::Slice(&kv_buf, k_off, k_size).resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: BindSrc::Slice(&kv_buf, v_off, v_size).resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: probs_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_slice.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: attn_meta_buf.as_entire_binding(),
+            },
+        ];
+        if let Some(p) = &paged {
+            attn_entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: p.table.as_entire_binding(),
+            });
+        }
         let attn_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server fused prefill attention bind group"),
-            layout: &self.attn_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_g.output_src().resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: BindSrc::Slice(&kv_buf, k_off, k_size).resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: BindSrc::Slice(&kv_buf, v_off, v_size).resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: probs_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: out_slice.resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: attn_meta_buf.as_entire_binding(),
-                },
-            ],
+            layout: self.attn_bind_layout_for(paged.is_some()),
+            entries: &attn_entries,
         });
 
         // K/V-side resources, when this layer owns a KV projection.
@@ -9270,33 +9499,47 @@ impl VulkanBackend {
                         _rope_meta: rope_meta,
                     }
                 };
-                let cast =
-                    (!matches!(self.kv_storage, vulkan_shaders::KvStorage::F32)).then(|| {
-                        let (len, off) = match self.kv_storage {
-                            vulkan_shaders::KvStorage::Q8_0 => (
-                                (n_tokens * kv_dim / 32) as u32,
-                                (write_pos * kv_dim / 32) as u32,
-                            ),
-                            _ => ((n_tokens * kv_dim) as u32, (write_pos * kv_dim) as u32),
-                        };
-                        let k_meta = self.cast_meta_buffer(len, off);
-                        let v_meta = self.cast_meta_buffer(len, off);
-                        let k_bg = self.elem3_bind_group(
-                            k_g.output_src(),
-                            BindSrc::Slice(&kv_buf, k_off, k_size),
-                            &k_meta,
-                        );
-                        let v_src: BindSrc<'_> = match v_g {
-                            Some(g) => g.output_src(),
-                            None => v_scratch.as_ref().unwrap().into(),
-                        };
-                        let v_bg = self.elem3_bind_group(
-                            v_src,
-                            BindSrc::Slice(&kv_buf, v_off, v_size),
-                            &v_meta,
-                        );
-                        (k_bg, v_bg, len, k_meta, v_meta)
-                    });
+                // One dispatch per run. Each is a straight copy — the run is
+                // contiguous at both ends — so the only thing that varies is
+                // where in the source it starts and where in the pages it
+                // lands. Each needs its own meta buffer: they are all recorded
+                // into one encoder, and a shared buffer would give every
+                // dispatch whichever offset was written last.
+                let cast: Vec<_> = if matches!(self.kv_storage, vulkan_shaders::KvStorage::F32) {
+                    Vec::new()
+                } else {
+                    let per_row = match self.kv_storage {
+                        vulkan_shaders::KvStorage::Q8_0 => kv_dim / 32,
+                        _ => kv_dim,
+                    };
+                    write_runs
+                        .iter()
+                        .map(|run| {
+                            let len = run.rows as usize * per_row;
+                            let dst = run.dst_row as usize * per_row;
+                            let src = run.src_row as usize * per_row;
+                            let k_meta =
+                                self.cast_meta_buffer_from(len as u32, dst as u32, src as u32);
+                            let v_meta =
+                                self.cast_meta_buffer_from(len as u32, dst as u32, src as u32);
+                            let k_bg = self.elem3_bind_group(
+                                k_g.output_src(),
+                                BindSrc::Slice(&kv_buf, k_off, k_size),
+                                &k_meta,
+                            );
+                            let v_src: BindSrc<'_> = match v_g {
+                                Some(g) => g.output_src(),
+                                None => v_scratch.as_ref().unwrap().into(),
+                            };
+                            let v_bg = self.elem3_bind_group(
+                                v_src,
+                                BindSrc::Slice(&kv_buf, v_off, v_size),
+                                &v_meta,
+                            );
+                            (k_bg, v_bg, len as u32, k_meta, v_meta)
+                        })
+                        .collect()
+                };
                 (
                     proj,
                     k_g,
@@ -9329,8 +9572,15 @@ impl VulkanBackend {
         } else {
             n_head as u32
         };
-        let attn_pipeline =
-            self.attn_prefill_pipeline_for(head_dim, (n_head / n_head_kv).max(1), heads);
+        let attn_pipeline = self.attn_prefill_pipeline_for(
+            head_dim,
+            (n_head / n_head_kv).max(1),
+            heads,
+            match paged {
+                Some(_) => vulkan_shaders::KvPaging::Paged,
+                None => vulkan_shaders::KvPaging::Contiguous,
+            },
+        );
 
         let mut encoder = self.new_encoder("orangu-server fused prefill attention encoder");
         // Fan the single staged upload out into each projection's own input
@@ -9468,7 +9718,7 @@ impl VulkanBackend {
                     pass.dispatch_workgroups(self.flat_workgroups(total).max(1), 1, 1);
                 }
 
-                if let Some((k_bg, v_bg, len, ..)) = cast {
+                if !cast.is_empty() {
                     let pipeline = match self.kv_storage {
                         vulkan_shaders::KvStorage::Q8_0 => self
                             .kv_quantize_q8_0_pipeline
@@ -9480,10 +9730,12 @@ impl VulkanBackend {
                             .expect("kv_storage F16 but no kv_cast_pipeline"),
                     };
                     pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, k_bg, &[]);
-                    pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
-                    pass.set_bind_group(0, v_bg, &[]);
-                    pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
+                    for (k_bg, v_bg, len, ..) in cast {
+                        pass.set_bind_group(0, k_bg, &[]);
+                        pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
+                        pass.set_bind_group(0, v_bg, &[]);
+                        pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
+                    }
                 }
             }
         }
@@ -9492,21 +9744,24 @@ impl VulkanBackend {
         if let Some((_, k_g, v_g, v_scratch, ..)) = &kv_side
             && matches!(self.kv_storage, vulkan_shaders::KvStorage::F32)
         {
-            let bytes = (n_tokens * kv_dim) as u64 * 4;
-            let dst = (write_pos * kv_dim) as u64 * 4;
-            encoder.copy_buffer_to_buffer(
-                &k_g.output_buffer,
-                k_g.output_offset,
-                &kv_buf,
-                k_off + dst,
-                bytes,
-            );
             let (v_src, v_src_off) = match (v_g, v_scratch) {
                 (Some(g), _) => (&g.output_buffer, g.output_offset),
                 (None, Some(s)) => (s, 0),
                 _ => unreachable!("a KV layer has either its own V projection or a V scratch"),
             };
-            encoder.copy_buffer_to_buffer(v_src, v_src_off, &kv_buf, v_off + dst, bytes);
+            for run in &write_runs {
+                let bytes = run.rows as u64 * kv_dim as u64 * 4;
+                let dst = run.dst_row as u64 * kv_dim as u64 * 4;
+                let src = run.src_row as u64 * kv_dim as u64 * 4;
+                encoder.copy_buffer_to_buffer(
+                    &k_g.output_buffer,
+                    k_g.output_offset + src,
+                    &kv_buf,
+                    k_off + dst,
+                    bytes,
+                );
+                encoder.copy_buffer_to_buffer(v_src, v_src_off + src, &kv_buf, v_off + dst, bytes);
+            }
         }
 
         {
@@ -10043,7 +10298,28 @@ impl VulkanBackend {
         debug_assert_eq!(q.len(), n_head * head_dim);
         debug_assert!(window_start <= pos);
         let capacity = cache.capacity();
-        let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+        // Pages where the sequence has them; the mirror otherwise.
+        let paged = cache.paged_device_refs(&self.queue);
+        let (kv_buf, probs_buf, k_off, k_size, v_off, v_size) = match &paged {
+            Some((buffer, _, half, _, _)) => {
+                cache.pool_scratch(&self.device, n_head, self.kv_storage);
+                let probs = cache
+                    .probs_scratch()
+                    .expect("pool_scratch built the mirror above");
+                (buffer.clone(), probs, 0u64, *half, *half, *half)
+            }
+            None => {
+                let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+                (
+                    kv_refs.buffer.clone(),
+                    kv_refs.probs.clone(),
+                    kv_refs.k_off,
+                    kv_refs.k_size,
+                    kv_refs.v_off,
+                    kv_refs.v_size,
+                )
+            }
+        };
 
         let q_buf = self.upload_new(q);
         let out_buf = self.scratch_buffer(n_head * head_dim);
@@ -10059,7 +10335,11 @@ impl VulkanBackend {
             n_query: 0,
             n_swa: 0,
             causal: 0,
-            _pad: 0,
+            kv_page_base: paged.as_ref().map_or(0, |(_, _, _, base, _)| *base),
+            kv_page_tokens: paged.as_ref().map_or(0, |(_, _, _, _, t)| *t),
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server attention meta"),
@@ -10070,37 +10350,42 @@ impl VulkanBackend {
         self.queue
             .write_buffer(&meta_buf, 0, bytemuck::bytes_of(&meta));
 
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: q_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: BindSrc::Slice(&kv_buf, k_off, k_size).resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: BindSrc::Slice(&kv_buf, v_off, v_size).resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: probs_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: meta_buf.as_entire_binding(),
+            },
+        ];
+        if let Some((_, table, _, _, _)) = &paged {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: table.as_entire_binding(),
+            });
+        }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server attention bind group"),
-            layout: &self.attn_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.k_off, kv_refs.k_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.v_off, kv_refs.v_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: kv_refs.probs.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: meta_buf.as_entire_binding(),
-                },
-            ],
+            layout: self.attn_bind_layout_for(paged.is_some()),
+            entries: &entries,
         });
 
         let mut encoder = self
@@ -10113,7 +10398,7 @@ impl VulkanBackend {
                 label: Some("orangu-server attention pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.attn_pipeline);
+            pass.set_pipeline(self.attn_pipeline_for(paged.is_some()));
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
@@ -10168,6 +10453,43 @@ impl VulkanBackend {
     /// measures that submission count as what decides whether concurrent
     /// requests can fill the device at all.
     pub fn gpu_attention_split(&self, input: GpuAttentionInput<'_>) -> Vec<f32> {
+        // A paged cache with device pages goes to the paged kernel, which reads
+        // the pool directly — so two sequences sharing a prefix read one copy
+        // of it instead of each mirroring their own.
+        //
+        // Only where every part is available: `paged_device_refs` returns
+        // `None` for a contiguous layer, a pool with no device, or a sequence
+        // that could not reserve a block table. Each of those falls through to
+        // the per-request mirror below, which is the fallback for a sequence
+        // that could not get pages at all.
+        //
+        // No kernel-variant guard any more: `dispatch_attention_split_paged`
+        // selects through `attn_split_pipeline_for`, and every split-k variant
+        // — plain, coop, GQA, flash — now has a paged form.
+        {
+            let n_head_kv = input.n_head_kv;
+            let head_dim = input.head_dim;
+            let (n_head, pos, window_start, scale) =
+                (input.n_head, input.pos, input.window_start, input.scale);
+            if let Some((buffer, table, half, table_base, page_tokens)) =
+                input.cache.paged_device_refs(&self.queue)
+            {
+                return self.dispatch_attention_split_paged(
+                    input.q,
+                    &buffer,
+                    &table,
+                    half,
+                    table_base,
+                    page_tokens,
+                    pos,
+                    window_start,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    scale,
+                );
+            }
+        }
         let n_out = input.n_head * input.head_dim;
         let mut encoder = self
             .device
@@ -10283,7 +10605,12 @@ impl VulkanBackend {
             n_pos: (pos - window_start + 1) as u32,
             k_num,
             scale,
-            _pad: 0,
+            // Contiguous: `kv_slot` is the identity and reads neither of these.
+            kv_page_base: 0,
+            kv_page_tokens: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let split_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server attention split meta"),
@@ -10345,7 +10672,8 @@ impl VulkanBackend {
             self.elem4_bind_group(&partial_ml, &partial_acc, &out_buf, &reduce_meta_buf);
 
         let group = (n_head / n_head_kv).max(1);
-        let split_pipeline = self.attn_split_pipeline_for(head_dim, group);
+        let split_pipeline =
+            self.attn_split_pipeline_for(head_dim, group, vulkan_shaders::KvPaging::Contiguous);
         let phase1_x = if self.attn_gqa && group > 1 {
             n_head_kv as u32
         } else {
@@ -10678,9 +11006,17 @@ impl VulkanBackend {
         head_dim: usize,
         group: usize,
         heads: u32,
+        paging: vulkan_shaders::KvPaging,
     ) -> wgpu::ComputePipeline {
         let hd = head_dim as u32;
-        let key = (hd, if heads > 0 { group as u32 } else { 0 });
+        // Paging is part of the key, not a second cache: unlike the split
+        // pipelines this one is already keyed by a pair, so there is a spare
+        // dimension to spend and no ambiguity to create.
+        let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
+        let key = (
+            hd,
+            if heads > 0 { group as u32 } else { 0 } | u32::from(paged) << 16,
+        );
         let mut cache = self
             .attn_prefill_pipelines
             .lock()
@@ -10701,14 +11037,16 @@ impl VulkanBackend {
                 hd,
                 group as u32,
                 heads,
+                paging,
             )
         } else if self.attn_coop && head_dim.is_multiple_of(32) {
-            vulkan_shaders::shader_source_attention_prefill_coop(self.kv_storage, hd)
+            vulkan_shaders::shader_source_attention_prefill_coop(self.kv_storage, hd, paging)
         } else {
             vulkan_shaders::shader_source_attention_prefill(
                 self.kv_storage,
                 self.subgroup_reduce,
                 hd,
+                paging,
             )
         };
         let module = self
@@ -10721,7 +11059,11 @@ impl VulkanBackend {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("orangu-server prefill attention pipeline layout"),
-                bind_group_layouts: &[Some(&self.attn_bind_group_layout)],
+                bind_group_layouts: &[Some(if paged {
+                    &self.attn_paged_bind_group_layout
+                } else {
+                    &self.attn_bind_group_layout
+                })],
                 immediate_size: 0,
             });
         let pipeline = self
@@ -10741,13 +11083,25 @@ impl VulkanBackend {
         pipeline
     }
 
-    fn attn_split_pipeline_for(&self, head_dim: usize, group: usize) -> wgpu::ComputePipeline {
+    fn attn_split_pipeline_for(
+        &self,
+        head_dim: usize,
+        group: usize,
+        paging: vulkan_shaders::KvPaging,
+    ) -> wgpu::ComputePipeline {
         let hd = head_dim as u32;
+        let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
+        // One selector for both layouts rather than two that have to agree:
+        // which kernel a shape gets is a property of the shape, and paging only
+        // changes how that kernel addresses the cache. Two functions meant two
+        // places to remember a new variant in, and the paged one was already a
+        // shorter list than the contiguous one.
+        let key = hd | u32::from(paged) << 16;
         let mut cache = self
             .attn_split_pipelines
             .lock()
             .expect("attn split pipelines poisoned");
-        if let Some(p) = cache.get(&hd) {
+        if let Some(p) = cache.get(&key) {
             return p.clone();
         }
         // GQA-grouped phase-1 (`ORANGU_ATTN_GQA`): one workgroup per KV head
@@ -10765,6 +11119,7 @@ impl VulkanBackend {
                             self.kv_storage,
                             hd,
                             group as u32,
+                            paging,
                         )
                         .into(),
                     ),
@@ -10773,13 +11128,13 @@ impl VulkanBackend {
                 .device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("orangu-server attention split gqa pipeline"),
-                    layout: Some(&self.attn_pipeline_layout),
+                    layout: Some(self.attn_layout_for(paged)),
                     module: &module,
                     entry_point: Some("main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
-            cache.insert(hd, pipeline.clone());
+            cache.insert(key, pipeline.clone());
             return pipeline;
         }
         // The flash variant (coalesced-LDS-staged K) is only well-defined for
@@ -10795,7 +11150,7 @@ impl VulkanBackend {
         // 512/256 qualify). It supersedes flash when both are requested.
         let use_coop = self.attn_coop && hd.is_multiple_of(32);
         let source = if use_coop {
-            vulkan_shaders::shader_source_attention_split_coop(self.kv_storage, hd)
+            vulkan_shaders::shader_source_attention_split_coop(self.kv_storage, hd, paging)
         } else if use_flash {
             vulkan_shaders::shader_source_attention_split_flash(
                 self.kv_storage,
@@ -10806,9 +11161,15 @@ impl VulkanBackend {
                 // and the limit it has to fit under differs by a factor of two
                 // across the APIs this same code runs on.
                 self.device.limits().max_compute_workgroup_storage_size,
+                paging,
             )
         } else {
-            vulkan_shaders::shader_source_attention_split(self.kv_storage, self.subgroup_reduce, hd)
+            vulkan_shaders::shader_source_attention_split(
+                self.kv_storage,
+                self.subgroup_reduce,
+                hd,
+                paging,
+            )
         };
         let module = self
             .device
@@ -10820,14 +11181,201 @@ impl VulkanBackend {
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("orangu-server attention split pipeline"),
-                layout: Some(&self.attn_pipeline_layout),
+                layout: Some(self.attn_layout_for(paged)),
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
-        cache.insert(hd, pipeline.clone());
+        cache.insert(key, pipeline.clone());
         pipeline
+    }
+
+    /// One split-k phase-1 dispatch reading a **paged** KV cache, for the
+    /// cross-check that the paged kernel and the contiguous one agree.
+    ///
+    /// The pool buffer bound whole, the block table at binding 6, and the two
+    /// new meta fields. Selected by [`Self::gpu_attention_split`] when the
+    /// cache can supply all of them, and reached directly by the cross-check
+    /// that holds it to the contiguous kernel's answers.
+    // The pool-taking spelling is what the cross-check uses; the decode path
+    // resolves the buffers itself and calls the core below directly.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gpu_attention_split_paged(
+        &self,
+        q: &[f32],
+        pool: &crate::engine::kv_pool::KvPool,
+        layer: usize,
+        table_base: usize,
+        pos: usize,
+        window_start: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let pages = pool
+            .device_pages()
+            .expect("a paged dispatch needs the pool's device pages");
+        let (k_off, v_off, _) = pool
+            .device_page_offsets(layer, 0)
+            .expect("attached pool has offsets");
+        self.dispatch_attention_split_paged(
+            q,
+            &pages.layers[layer],
+            &pages.table,
+            v_off - k_off,
+            table_base as u32,
+            pool.page_tokens() as u32,
+            pos,
+            window_start,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+        )
+    }
+
+    /// The paged split-k dispatch proper, over a buffer rather than a pool —
+    /// so the decode path, which has already resolved everything it needs, does
+    /// not have to hand the backend a pool handle just to have it look the same
+    /// things up again.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_attention_split_paged(
+        &self,
+        q: &[f32],
+        layer_buffer: &wgpu::Buffer,
+        table_buffer: &wgpu::Buffer,
+        half: u64,
+        table_base: u32,
+        page_tokens: u32,
+        pos: usize,
+        window_start: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let n_out = n_head * head_dim;
+        let k_num = self.attn_split_k;
+
+        let q_buf = self.upload_new(q);
+        let partial_ml = self.scratch_buffer(n_head * k_num as usize * 2);
+        let partial_acc = self.scratch_buffer(n_head * k_num as usize * head_dim);
+
+        let meta = AttnSplitMeta {
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            window_start: window_start as u32,
+            n_pos: (pos - window_start + 1) as u32,
+            k_num,
+            scale,
+            kv_page_base: table_base,
+            kv_page_tokens: page_tokens,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server paged attention meta"),
+            size: std::mem::size_of::<AttnSplitMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&meta_buf, 0, bytemuck::bytes_of(&meta));
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server paged attention bind group"),
+            layout: &self.attn_paged_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                // The pool's layer buffer, keys then values — bound whole,
+                // because the shader now addresses inside it through the table
+                // rather than through a sub-range base.
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: layer_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(half),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: layer_buffer,
+                        offset: half,
+                        size: std::num::NonZeroU64::new(half),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: partial_ml.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: partial_acc.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: meta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: table_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.new_encoder("orangu-server paged attention encoder");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server paged attention pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.attn_split_pipeline_for(
+                head_dim,
+                (n_head / n_head_kv).max(1),
+                vulkan_shaders::KvPaging::Paged,
+            ));
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_head as u32, k_num, 1);
+        }
+
+        let out_buf = self.scratch_buffer(n_out);
+        let reduce_meta = AttnReduceMeta {
+            head_dim: head_dim as u32,
+            k_num,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let reduce_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server paged attention reduce meta"),
+            size: std::mem::size_of::<AttnReduceMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&reduce_meta_buf, 0, bytemuck::bytes_of(&reduce_meta));
+        let reduce_bind_group =
+            self.elem4_bind_group(&partial_ml, &partial_acc, &out_buf, &reduce_meta_buf);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server paged attention reduce pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.attn_split_reduce_pipeline);
+            pass.set_bind_group(0, &reduce_bind_group, &[]);
+            pass.dispatch_workgroups(n_head as u32, 1, 1);
+        }
+        let (result, _) = self.submit_and_readback_split(encoder, &out_buf, 0, n_out);
+        result
     }
 
     /// Records the QKV-projection→Q-norm→Q-RoPE→K-norm→V-norm→K-RoPE→
@@ -11070,16 +11618,56 @@ impl VulkanBackend {
         // present) will append exactly one position, at this index.
         let write_pos = cache.len;
         let capacity = cache.capacity();
-        let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+        // Served from the pool's device pages where that is possible: the keys
+        // and values are then the pool's, this token's write lands in a page,
+        // and the kernel turns positions into rows through the block table.
+        // Split-k only. The un-split kernel has a paged form too, but it takes
+        // the cache through `gpu_attention` rather than this recorder, so there
+        // is nothing for this branch to hand it.
+        //
+        // Everything below is written against one pair of key/value regions
+        // and one destination row, so the two paths differ only in what those
+        // are. That is the whole port: a paged step is the same step with a
+        // different address.
+        let paged = self
+            .attn_split
+            .then(|| cache.paged_fused_refs(&self.queue, write_pos))
+            .flatten();
         // All three are aligned sub-ranges of one buffer now; the `Arc`-backed
         // clone turns it into a value `cache` is no longer borrowed by, so
         // `cache.attn_dispatch()`/`set_attn_dispatch` below (which need their
         // own access to `cache`) don't fight this borrow.
-        let k_buf = kv_refs.buffer.clone();
-        let v_buf = kv_refs.buffer.clone();
-        let probs_buf = kv_refs.probs.clone();
-        let (k_off, k_size, v_off, v_size) =
-            (kv_refs.k_off, kv_refs.k_size, kv_refs.v_off, kv_refs.v_size);
+        let (k_buf, v_buf, probs_buf, k_off, k_size, v_off, v_size, kv_row) = match &paged {
+            Some(p) => {
+                cache.pool_scratch(&self.device, n_head, self.kv_storage);
+                let probs = cache
+                    .probs_scratch()
+                    .expect("pool_scratch built the mirror above");
+                (
+                    p.layer_buffer.clone(),
+                    p.layer_buffer.clone(),
+                    probs,
+                    0u64,
+                    p.half,
+                    p.half,
+                    p.half,
+                    p.write_slot as usize,
+                )
+            }
+            None => {
+                let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+                (
+                    kv_refs.buffer.clone(),
+                    kv_refs.buffer.clone(),
+                    kv_refs.probs.clone(),
+                    kv_refs.k_off,
+                    kv_refs.k_size,
+                    kv_refs.v_off,
+                    kv_refs.v_size,
+                    write_pos,
+                )
+            }
+        };
 
         // The calling layer's own `wq` identity — see `GpuAttnDispatch`'s
         // doc comment for why a cross-layer KV-donor layer must not reuse
@@ -11198,35 +11786,46 @@ impl VulkanBackend {
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
+                // The paged layout's seventh binding is the block table. The
+                // first six are the same resources in the same order, so the
+                // entry list is built once and extended rather than written
+                // twice.
+                let mut entries = vec![
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wq_g.output_src().resource(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: BindSrc::Slice(&k_buf, k_off, k_size).resource(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: BindSrc::Slice(&v_buf, v_off, v_size).resource(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: partial_ml.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: partial_acc.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: split_meta_buf.as_entire_binding(),
+                    },
+                ];
+                if let Some(p) = &paged {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: p.table.as_entire_binding(),
+                    });
+                }
                 let split_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("orangu-server attention split bind group"),
-                    layout: &self.attn_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wq_g.output_src().resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: BindSrc::Slice(&k_buf, k_off, k_size).resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: BindSrc::Slice(&v_buf, v_off, v_size).resource(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: partial_ml.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: partial_acc.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: split_meta_buf.as_entire_binding(),
-                        },
-                    ],
+                    layout: self.attn_bind_layout_for(paged.is_some()),
+                    entries: &entries,
                 });
                 let reduce_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention reduce meta"),
@@ -11276,7 +11875,11 @@ impl VulkanBackend {
                 n_query: 0,
                 n_swa: 0,
                 causal: 0,
-                _pad: 0,
+                kv_page_base: 0,
+                kv_page_tokens: 0,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             }),
         );
         if let Some(split) = &dispatch.split {
@@ -11293,7 +11896,11 @@ impl VulkanBackend {
                     n_pos,
                     k_num: split_k,
                     scale,
-                    _pad: 0,
+                    kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
+                    kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 }),
             );
             self.queue.write_buffer(
@@ -11566,7 +12173,7 @@ impl VulkanBackend {
         if let (Some(wk_guard), Some(kv_res)) = (&wk_g, &layer.kv) {
             match self.kv_storage {
                 vulkan_shaders::KvStorage::F16 => {
-                    let offset = (write_pos * kv_dim) as u32;
+                    let offset = (kv_row * kv_dim) as u32;
                     let cast_meta = ElemMeta {
                         len: kv_dim as u32,
                         aux: offset,
@@ -11607,7 +12214,7 @@ impl VulkanBackend {
                             k_off,
                             k_size,
                             kv_dim,
-                            write_pos,
+                            kv_row,
                             wg,
                         )
                     });
@@ -11617,13 +12224,13 @@ impl VulkanBackend {
                     };
                     self.capture_push(|| {
                         kv_cast_capture_step(
-                            &v_src, v_src_off, &v_buf, v_off, v_size, kv_dim, write_pos, wg,
+                            &v_src, v_src_off, &v_buf, v_off, v_size, kv_dim, kv_row, wg,
                         )
                     });
                 }
                 vulkan_shaders::KvStorage::Q8_0 => {
                     let n_blocks = (kv_dim as u32) / 32;
-                    let dst_block_offset = (write_pos as u32) * n_blocks;
+                    let dst_block_offset = (kv_row as u32) * n_blocks;
                     let quant_meta = ElemMeta {
                         len: n_blocks,
                         aux: dst_block_offset,
@@ -11658,7 +12265,7 @@ impl VulkanBackend {
                     pass.dispatch_workgroups(wg, 1, 1);
                 }
                 vulkan_shaders::KvStorage::F32 => {
-                    let byte_offset = (write_pos * kv_dim * 4) as u64;
+                    let byte_offset = (kv_row * kv_dim * 4) as u64;
                     let byte_len = (kv_dim as u64) * 4;
                     // Copy destinations are absolute buffer offsets, so add the
                     // region base (unlike the bound sub-ranges above, whose
@@ -11703,7 +12310,14 @@ impl VulkanBackend {
         // written directly.
         if let Some(split) = &dispatch.split {
             let group = (n_head / n_head_kv).max(1);
-            let split_pipeline = self.attn_split_pipeline_for(head_dim, group);
+            let split_pipeline = self.attn_split_pipeline_for(
+                head_dim,
+                group,
+                match paged {
+                    Some(_) => vulkan_shaders::KvPaging::Paged,
+                    None => vulkan_shaders::KvPaging::Contiguous,
+                },
+            );
             // GQA groups the query heads of each KV head into one workgroup, so
             // phase-1 covers `n_head_kv` (not `n_head`); phase-2 still merges per
             // query head, so its grid is unchanged.
@@ -13283,9 +13897,18 @@ fn attn_split_capture_step(
     };
     CaptureStep::Dispatch {
         wgsl: if coop {
-            vulkan_shaders::shader_source_attention_split_coop(kv_storage, head_dim as u32)
+            vulkan_shaders::shader_source_attention_split_coop(
+                kv_storage,
+                head_dim as u32,
+                vulkan_shaders::KvPaging::Contiguous,
+            )
         } else {
-            vulkan_shaders::shader_source_attention_split(kv_storage, subgroup, head_dim as u32)
+            vulkan_shaders::shader_source_attention_split(
+                kv_storage,
+                subgroup,
+                head_dim as u32,
+                vulkan_shaders::KvPaging::Contiguous,
+            )
         },
         bindings: vec![
             cb(0, q, q_offset, q_size),

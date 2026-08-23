@@ -504,16 +504,35 @@ pub trait Backend: Send + Sync {
     ///
     /// `CpuBackend` goes straight through `quant::dequantize`, so it covers
     /// everything `quant::supports_type` does and keeps this default. Every
-    /// GPU backend has to compile a kernel per type and covers less —
-    /// `VulkanBackend` lacks the three lowest-bit `IQ*` types,
-    /// `CudaBackend`/`RocmBackend`/`OpenClBackend` lack all the
-    /// codebook-indexed ones (see their `SUPPORTED_TYPES`).
+    /// GPU backend has to compile a kernel per type and covers less.
+    ///
+    /// **How much less is pinned by a test, not by this comment** —
+    /// [`tests::the_gpu_type_gap_is_exactly_what_this_comment_says`] asserts
+    /// the set differences and fails if any of them moves. Read the
+    /// assertions, not this paragraph, if the two ever disagree. As of that
+    /// test: `VulkanBackend` lacks only the three lowest-bit `IQ1_*` ids that
+    /// are not ggml's own (`quant`'s 64..=66); the vendor backends
+    /// (`CudaBackend`/`RocmBackend`/`OpenClBackend`, which share one shader
+    /// source) lack those and `MXFP4`. The vendor list is a strict subset of
+    /// Vulkan's, and the test holds it that way on purpose — Vulkan is the
+    /// backend with hardware to verify a kernel on, so a new one lands there
+    /// first.
     ///
     /// This exists so that gap is reported by
     /// [`unsupported_tensor_types`] as a startup error naming the type and
     /// the backend, instead of surfacing as a panic from inside `matmul`
     /// partway through the first request — which is what it did while every
     /// GPU backend was assumed to be at parity with the CPU path.
+    ///
+    /// This paragraph used to name a different gap — that `VulkanBackend`
+    /// lacked the three lowest-bit `IQ*` types and that the vendor backends
+    /// lacked every codebook-indexed one. Both stopped being true when the
+    /// `IQ` kernels landed, and neither the compiler nor a test noticed,
+    /// because a claim about which kernels exist is a fact about two `const`
+    /// arrays and nothing was comparing them. It stayed wrong long enough to
+    /// mislead a reader into scoping work that was already done. The test
+    /// named above is the actual fix; this rewrite is only the half of it a
+    /// reader sees.
     fn supports_type(&self, _ggml_type: u32) -> bool {
         true
     }
@@ -599,6 +618,128 @@ mod tests {
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4};
     use std::sync::Mutex;
+
+    /// **The claim `Backend::supports_type`'s doc makes, asserted.**
+    ///
+    /// Written because that comment made a *different* claim for a while after
+    /// it stopped being true, and nothing caught it: which kernels exist is a
+    /// fact about two `const` arrays, and no test compared them to each other
+    /// or to the CPU path. A stale comment of that shape is not harmless —
+    /// this one was read as evidence that the `IQ` family had no GPU kernels
+    /// and used to scope work that was already finished.
+    ///
+    /// So the comment is no longer the record. This is. Adding a kernel is
+    /// meant to fail this test: update the expected set here and the prose in
+    /// `supports_type` and `arch::gpu_project_expert` in the same commit,
+    /// which is exactly the coupling that was missing.
+    ///
+    /// The CPU side is enumerated through `quant::supports_type` rather than
+    /// from a second hand-written list, so a type added to `quant` shows up
+    /// here without anyone remembering to add it. The repacked ids are
+    /// excluded on the loader's own account: it unpacks them back into the
+    /// type they were built from and nothing downstream of it ever sees them
+    /// (`quant`'s own comment above `GGML_TYPE_Q4_0_4_4`), so a backend is
+    /// never asked about one and a "gap" there would be fiction.
+    #[test]
+    fn the_gpu_type_gap_is_exactly_what_this_comment_says() {
+        use crate::engine::quant;
+
+        // Loader-internal repacks: unpacked before any backend sees them.
+        const REPACKS: &[u32] = &[
+            quant::GGML_TYPE_Q4_0_4_4,
+            quant::GGML_TYPE_Q4_0_4_8,
+            quant::GGML_TYPE_Q4_0_8_8,
+            quant::GGML_TYPE_IQ4_NL_4_4,
+            quant::GGML_TYPE_IQ4_NL_4_8,
+            quant::GGML_TYPE_IQ4_NL_8_8,
+        ];
+        // `I32` is an index/metadata type, never a weight a matmul kernel is
+        // asked for, so it is not part of the quantization coverage question.
+        const NOT_A_WEIGHT: &[u32] = &[quant::GGML_TYPE_I32];
+
+        // Every id `quant` can read, swept rather than listed — the highest
+        // id in the tree is 66 and the sweep is deliberately well past it, so
+        // a new type lands in this set on its own.
+        let cpu: Vec<u32> = (0..=127u32)
+            .filter(|&t| quant::supports_type(t))
+            .filter(|t| !REPACKS.contains(t) && !NOT_A_WEIGHT.contains(t))
+            .collect();
+
+        let vulkan = super::vulkan::SUPPORTED_TYPES;
+        let vendor = super::vendor_shaders::SUPPORTED_TYPES;
+
+        // The vendor backends (CUDA, ROCm, OpenCL) render from one shared
+        // source, so their coverage is one list. It is a strict *subset* of
+        // Vulkan's, which is the shape to assert: Vulkan is the backend with
+        // hardware to verify a kernel on, so it is where a new one lands
+        // first, and a vendor list that grew a type Vulkan does not have
+        // would be a kernel nobody has ever run.
+        let vendor_only: Vec<String> = vendor
+            .iter()
+            .filter(|t| !vulkan.contains(t))
+            .map(|&t| orangu::gguf::ggml_type_name(t))
+            .collect();
+        assert!(
+            vendor_only.is_empty(),
+            "the vendor backends claim kernels Vulkan does not have: {vendor_only:?} — \
+             these are the three backends documented as unverified on real hardware, \
+             so a type reaching them first has been tested nowhere"
+        );
+
+        let vulkan_only: Vec<String> = vulkan
+            .iter()
+            .filter(|t| !vendor.contains(t))
+            .map(|&t| orangu::gguf::ggml_type_name(t))
+            .collect();
+        assert_eq!(
+            vulkan_only,
+            ["MXFP4"],
+            "the set of types Vulkan has a kernel for and the vendor backends do \
+             not has changed; update `Backend::supports_type`'s doc to match"
+        );
+
+        let gap = |list: &[u32]| -> Vec<String> {
+            cpu.iter()
+                .filter(|t| !list.contains(t))
+                .map(|&t| orangu::gguf::ggml_type_name(t))
+                .collect()
+        };
+
+        assert_eq!(
+            gap(vulkan),
+            ["IQ1_XS", "IQ1_XXS", "IQ1_XXXS"],
+            "the set of types the CPU path reads and Vulkan has no kernel for has \
+             changed; update `Backend::supports_type` and \
+             `arch::gpu_project_expert`'s doc comments to match"
+        );
+        assert_eq!(
+            gap(vendor),
+            ["MXFP4", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS"],
+            "the set of types the CPU path reads and the vendor backends have no \
+             kernel for has changed; update `Backend::supports_type`'s doc to match"
+        );
+
+        // The half the previous comment got backwards, stated positively so a
+        // future reader does not have to re-derive it from the list above.
+        for &iq in &[
+            quant::GGML_TYPE_IQ1_S,
+            quant::GGML_TYPE_IQ1_M,
+            quant::GGML_TYPE_IQ2_XXS,
+            quant::GGML_TYPE_IQ2_XS,
+            quant::GGML_TYPE_IQ2_S,
+            quant::GGML_TYPE_IQ3_XXS,
+            quant::GGML_TYPE_IQ3_S,
+            quant::GGML_TYPE_IQ4_NL,
+            quant::GGML_TYPE_IQ4_XS,
+        ] {
+            assert!(
+                vulkan.contains(&iq),
+                "{} has no GPU kernel; the doc comments claiming the IQ family \
+                 is covered are wrong again",
+                orangu::gguf::ggml_type_name(iq)
+            );
+        }
+    }
 
     /// `plan_batch`'s stripes must reconstruct exactly the rows
     /// `guarded_matmul_op` would have produced, in the same order — a

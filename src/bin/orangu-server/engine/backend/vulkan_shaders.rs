@@ -48,9 +48,9 @@
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -142,6 +142,49 @@ fn q3k_scale(base: u32, i: u32) -> u32 {
 /// cached like any other weight read.
 ///
 /// The `u32` offsets below must stay in step with `iq_grid_words`.
+/// `MXFP4`'s scale decode and codebook, appended to [`PRELUDE`] for that one
+/// type by [`prelude_for`] — the same arrangement [`IQ_GRID_PRELUDE`] gets,
+/// and for the same reason: both middles need it, neither should carry its
+/// own copy of a table, and no other type's module should declare it.
+///
+/// **No binding.** The `IQ*` codebooks are large enough to live in a storage
+/// buffer; this one is sixteen values and is folded into arithmetic instead,
+/// so an `MXFP4` shader declares exactly the four bindings [`PRELUDE`] does
+/// and `needs_iq_grids` stays false for it.
+const MXFP4_PRELUDE: &str = r#"
+// `quant::e8m0_to_fp32_half`, transcribed. A one-byte exponent, and the
+// "half" is not a rounding step: `KVALUES_MXFP4` holds the codebook at twice
+// its true value (integers, so the table stays exact), and biasing the
+// exponent down by one is what divides it back. `x < 2` is the subnormal
+// tail the shift would otherwise underflow.
+fn mxfp4_scale(e: u32) -> f32 {
+    var bits: u32;
+    if (e < 2u) {
+        bits = 0x00200000u << e;
+    } else {
+        bits = (e - 1u) << 23u;
+    }
+    return bitcast<f32>(bits);
+}
+
+// `quant::KVALUES_MXFP4[i]` = [0,1,2,3,4,6,8,12] for `i < 8`, negated above.
+// The magnitudes are packed one per nibble of a single `u32` — every value
+// fits in 4 bits — rather than read from a buffer, which is what keeps this
+// type off the `iq_grids` binding.
+//
+// Index 8 yields `-0.0` where the table has `+0.0`. That cannot change a
+// result: the products differ only in the sign of a zero, and `+0.0 +
+// -0.0` is `+0.0`, so every accumulation reaching here is bit-identical to
+// the host path's.
+fn mxfp4_kvalue(i: u32) -> f32 {
+    let mag = f32((0xC8643210u >> ((i & 7u) * 4u)) & 0xFu);
+    if ((i & 8u) != 0u) {
+        return -mag;
+    }
+    return mag;
+}
+"#;
+
 const IQ_GRID_PRELUDE: &str = r#"
 @group(0) @binding(4) var<storage, read> iq_grids: array<u32>;
 
@@ -2268,6 +2311,27 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_mxfp4`: mirrors `quant::dequantize_mxfp4`. Layout is `IQ4_NL`'s
+/// exactly — 16 `qs` bytes, low nibbles the first 16 elements and high
+/// nibbles the next 16 — with a **one-byte `e8m0` exponent** in place of the
+/// `f16` scale, which is what makes the block 17 bytes rather than 18. The
+/// odd size costs nothing: `read_u8` peels bytes out of an `array<u32>` and
+/// never required a block to be 4-aligned (see [`PRELUDE`]).
+const MXFP4_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 17u;
+const BLOCK_ELEMS: u32 = 32u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = mxfp4_scale(read_u8(byte_offset));
+    let byte = read_u8(byte_offset + 1u + (k % 16u));
+    var nib: u32 = byte & 0xFu;
+    if (k >= 16u) {
+        nib = byte >> 4u;
+    }
+    return d * mxfp4_kvalue(nib);
+}
+"#;
+
 /// `block_iq4_nl`: mirrors `quant::dequantize_iq4_nl` — `Q4_0`'s 18-byte
 /// block and low/high-nibble split, with the nibble selecting one of the 16
 /// non-uniformly spaced levels in `iq_kvalue` instead of being read as a
@@ -2502,6 +2566,31 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
         let byte = read_u8(byte_offset + 2u + j);
         acc = acc + (d * iq_kvalue(byte & 0xFu)) * x[x_off + j];
         acc = acc + (d * iq_kvalue(byte >> 4u)) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_mxfp4` for [`block_hoisted_suffix`]: [`IQ4_NL_BLOCK_MIDDLE`]'s
+/// shape with a 17-byte block and the `e8m0` scale — 8 lanes per block, each
+/// taking 2 of the 16 `qs` bytes, exactly as the other 32-element types do.
+const MXFP4_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 17u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = mxfp4_scale(read_u8(byte_offset));
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 2u) {
+            break;
+        }
+        let j = sub * 2u + m;
+        let byte = read_u8(byte_offset + 1u + j);
+        acc = acc + (d * mxfp4_kvalue(byte & 0xFu)) * x[x_off + j];
+        acc = acc + (d * mxfp4_kvalue(byte >> 4u)) * x[x_off + 16u + j];
         m = m + 1u;
     }
     return acc;
@@ -3020,6 +3109,7 @@ fn block_hoisted_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ3_S => IQ3_S_BLOCK_MIDDLE,
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_BLOCK_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_MXFP4 => MXFP4_BLOCK_MIDDLE,
         _ => return None,
     })
 }
@@ -3067,6 +3157,7 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ3_S => IQ3_S_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
+        t if t == GGML_TYPE_MXFP4 => MXFP4_COOP_MIDDLE,
         _ => return None,
     })
 }
@@ -3091,6 +3182,8 @@ fn needs_iq_grids(ggml_type: u32) -> bool {
 fn prelude_for(ggml_type: u32) -> String {
     if needs_iq_grids(ggml_type) {
         format!("{PRELUDE}\n{IQ_GRID_PRELUDE}")
+    } else if ggml_type == GGML_TYPE_MXFP4 {
+        format!("{PRELUDE}\n{MXFP4_PRELUDE}")
     } else {
         PRELUDE.to_string()
     }
@@ -6450,6 +6543,12 @@ struct AttnMeta {
     n_query: u32,
     n_swa: u32,
     causal: u32,
+    // Read only by the paged form of this kernel; zero otherwise.
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -6457,8 +6556,10 @@ struct AttnMeta {
 @group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
 @group(0) @binding(4) var<storage, read_write> aout: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnMeta;
+%KV_PAGE_BINDING%
 
 %KV_READ_FNS%
+%KV_SLOT_FN%
 
 // Size of the workgroup-shared `acc` accumulator, `MAX_HEAD_DIM * 4` bytes.
 // The `2048u` here is a placeholder the shader-source builders substitute
@@ -6475,7 +6576,7 @@ var<workgroup> acc: array<f32, MAX_HEAD_DIM>;
 fn score_at(q_off: u32, h: u32, kv_head: u32, p: u32) -> f32 {
     let head_dim = am.head_dim;
     let q_base = q_off + h * head_dim;
-    let k_base = (p * am.n_head_kv + kv_head) * head_dim;
+    let k_base = (kv_slot(p) * am.n_head_kv + kv_head) * head_dim;
     var s: f32 = 0.0;
     var d: u32 = 0u;
     loop {
@@ -6552,7 +6653,7 @@ fn main(
                     break;
                 }
                 let vp = window_start + tile_start + j;
-                let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
+                let v_base = (kv_slot(vp) * am.n_head_kv + kv_head) * head_dim;
                 tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                 j = j + 1u;
             }
@@ -6712,6 +6813,163 @@ pub enum KvStorage {
     Q8_0,
 }
 
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    /// **The contiguous kernel must be textually unchanged.** Paging is opt-in
+    /// and its whole safety argument is that the un-paged shader is the one
+    /// that has always run — so the identity form must emit no binding, and a
+    /// `kv_slot` the compiler folds away.
+    #[test]
+    fn the_contiguous_form_adds_no_binding_and_no_lookup_at_all() {
+        assert_eq!(KvPaging::Contiguous.binding(), "");
+        assert_eq!(KvPaging::Contiguous.slot_fn(), "");
+        let src = shader_source_attention_split(KvStorage::F16, false, 256, KvPaging::Contiguous);
+        assert!(
+            !src.contains("kv_page_table"),
+            "the contiguous kernel declared a page-table binding it never reads"
+        );
+        // Not merely "no page table" — no `kv_slot` at anywhere either. An
+        // identity function looked equivalent and cost 7.5% of decode, because
+        // a per-position call that is not folded away is a per-position call.
+        assert!(
+            !src.contains("kv_slot("),
+            "the contiguous kernel still routes its address through a lookup"
+        );
+        assert!(src.contains("(p * am.n_head_kv"), "the bare index is back");
+    }
+
+    /// And the paged form must declare the binding it reads, or the shader
+    /// will not compile — which is the good failure, but only if the binding
+    /// is emitted with the lookup rather than separately from it.
+    #[test]
+    fn the_paged_form_declares_the_table_it_reads() {
+        let src = shader_source_attention_split(KvStorage::F16, false, 256, KvPaging::Paged);
+        assert!(src.contains("var<storage, read> kv_page_table"));
+        assert!(src.contains("kv_page_table[am.kv_page_base"));
+        // Every position the kernel addresses must go through the lookup —
+        // a site left as a bare multiply reads the wrong row, silently.
+        assert!(
+            !src.contains("(p * am.n_head_kv"),
+            "a key index bypasses kv_slot"
+        );
+        assert!(
+            !src.contains("(vp * am.n_head_kv"),
+            "a value index bypasses kv_slot"
+        );
+    }
+
+    /// The two forms must differ in exactly the address computation and
+    /// nothing else — same reductions, same tiling, same storage handling.
+    #[test]
+    fn paging_changes_only_the_address() {
+        let plain = shader_source_attention_split(KvStorage::F16, false, 256, KvPaging::Contiguous);
+        let paged = shader_source_attention_split(KvStorage::F16, false, 256, KvPaging::Paged);
+        // Rewrite the paged source into the contiguous one's spelling, by
+        // substituting whole constructs rather than filtering lines. Line
+        // filtering was tried first and was wrong in a way worth recording: it
+        // removed `fn kv_slot`'s signature and body but left its closing brace,
+        // so the test reported a difference that existed only in the test.
+        let strip = |s: &str| {
+            s.replace(KvPaging::Paged.slot_fn(), "")
+                .replace(KvPaging::Paged.binding(), "")
+                .replace("kv_slot(p)", "p")
+                .replace("kv_slot(vp)", "vp")
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            strip(&plain),
+            strip(&paged),
+            "paging changed something other than how a position becomes a row"
+        );
+    }
+}
+
+/// Whether an attention kernel resolves a cached position through a page table.
+///
+/// A KV cache that shares pages between requests is not one contiguous run per
+/// layer, so `position -> row` stops being a multiply. Every attention kernel
+/// computes that address in the same shape —
+/// `(p * n_head_kv + kv_head) * head_dim` — and this changes `p` and nothing
+/// else: [`KvPaging::Contiguous`] emits an identity function that the compiler
+/// folds away, so the un-paged shader is textually what it has always been and
+/// cannot regress.
+///
+/// The lookup is per position rather than per tile. A tile is 64 positions and
+/// a page is typically fewer, so a tile can straddle pages and the hoisted form
+/// would be wrong; the per-position load is one `u32` from a small buffer that
+/// every lane in the workgroup reads at nearly the same address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPaging {
+    /// One run per layer — position *is* row.
+    Contiguous,
+    /// Rows live in pool pages named by a per-sequence table.
+    ///
+    // Not selected by any dispatch yet: the device mirror is still one
+    // contiguous run per request, so nothing has a page table to bind. This
+    // variant is the kernel half of that change, landed and held to the
+    // contiguous kernel's behaviour by `paging_tests` first, so that moving the
+    // storage is a change to *where bytes live* and not simultaneously a change
+    // to what the shader computes.
+    #[allow(dead_code)]
+    Paged,
+}
+
+impl KvPaging {
+    /// Applies whatever post-substitution rewriting this mode needs.
+    ///
+    /// For [`Self::Contiguous`] that is putting the address expressions back:
+    /// the templates are written in terms of `kv_slot(..)` so the paged form
+    /// has somewhere to hook, and the contiguous form must not pay for that
+    /// spelling.
+    fn finish(self, src: String) -> String {
+        match self {
+            KvPaging::Contiguous => src
+                .replace("kv_slot(p)", "p")
+                .replace("kv_slot(vp)", "vp")
+                .replace("kv_slot(pp)", "pp"),
+            KvPaging::Paged => src,
+        }
+    }
+
+    /// `%KV_PAGE_BINDING%` — the table, declared only when it is read.
+    fn binding(self) -> &'static str {
+        match self {
+            KvPaging::Contiguous => "",
+            KvPaging::Paged => {
+                "@group(0) @binding(6) var<storage, read> kv_page_table: array<u32>;"
+            }
+        }
+    }
+
+    /// `%KV_SLOT_FN%` — logical position to physical row.
+    ///
+    /// `am.kv_page_base` is where this sequence's table starts, and
+    /// `am.kv_page_tokens` how many positions one page covers.
+    ///
+    /// **Contiguous emits nothing at all**, and [`Self::finish`] rewrites the
+    /// call sites back to the bare position instead. An identity function
+    /// looked equivalent and was not: leaving `kv_slot(p)` in the contiguous
+    /// kernel cost **7.5% of decode at depth 1024** against the same code
+    /// without it, which is what a per-position call that does not get folded
+    /// away costs. The contiguous shader is now textually what it was before
+    /// paging existed, which is the only form that cannot regress.
+    fn slot_fn(self) -> &'static str {
+        match self {
+            KvPaging::Contiguous => "",
+            KvPaging::Paged => {
+                "fn kv_slot(p: u32) -> u32 {\n    \
+                 let page = kv_page_table[am.kv_page_base + p / am.kv_page_tokens];\n    \
+                 return page * am.kv_page_tokens + p % am.kv_page_tokens;\n}"
+            }
+        }
+    }
+}
+
 impl KvStorage {
     /// `%KV_ENABLE%` — `enable f16;` must lead the WGSL module when (and
     /// only when) an `f16`-typed binding is actually declared.
@@ -6790,7 +7048,12 @@ fn kv_read_v(idx: u32) -> f32 {
 /// selects `attention_subgroup_blocks` over `attention_classic_blocks`
 /// for the per-tile max/sum reductions — see `VulkanBackend::try_init`'s
 /// own comment on its `subgroup_reduce` local for why this is opt-in.
-pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool, max_head_dim: u32) -> String {
+pub fn shader_source_attention(
+    kv_storage: KvStorage,
+    subgroup: bool,
+    max_head_dim: u32,
+    paging: KvPaging,
+) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
     } else {
@@ -6802,7 +7065,7 @@ pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool, max_head_d
         ""
     };
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
-    ATTENTION_SHADER_TEMPLATE
+    let src = ATTENTION_SHADER_TEMPLATE
         .replace(
             "const MAX_HEAD_DIM: u32 = 2048u;",
             &format!("const MAX_HEAD_DIM: u32 = {max_head_dim}u;"),
@@ -6813,7 +7076,10 @@ pub fn shader_source_attention(kv_storage: KvStorage, subgroup: bool, max_head_d
         .replace("%SUBGROUP_PARAMS%", subgroup_params)
         .replace("%MAX_REDUCE_BLOCK%", max_block)
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
-        .replace("%QUERY_SETUP%", ATTENTION_SINGLE_QUERY_SETUP)
+        .replace("%KV_PAGE_BINDING%", paging.binding())
+        .replace("%KV_SLOT_FN%", paging.slot_fn())
+        .replace("%QUERY_SETUP%", ATTENTION_SINGLE_QUERY_SETUP);
+    paging.finish(src)
 }
 
 /// One workgroup per `(head, query)` instead of per head: `wid.y` selects the
@@ -6867,8 +7133,9 @@ pub fn shader_source_attention_prefill(
     kv_storage: KvStorage,
     subgroup: bool,
     max_head_dim: u32,
+    paging: KvPaging,
 ) -> String {
-    shader_source_attention(kv_storage, subgroup, max_head_dim).replace(
+    shader_source_attention(kv_storage, subgroup, max_head_dim, paging).replace(
         ATTENTION_SINGLE_QUERY_SETUP.trim_end(),
         ATTENTION_MULTI_QUERY_SETUP.trim_end(),
     )
@@ -6923,7 +7190,14 @@ struct AttnSplitMeta {
     n_pos: u32,
     k_num: u32,
     scale: f32,
-    _pad: u32,
+    // Where this sequence's block table starts, and how many positions one
+    // page covers. Both read only by the paged form of this kernel; zero
+    // otherwise.
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -6931,8 +7205,10 @@ struct AttnSplitMeta {
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+%KV_PAGE_BINDING%
 
 %KV_READ_FNS%
+%KV_SLOT_FN%
 
 const MAX_HEAD_DIM: u32 = 2048u;
 
@@ -6943,7 +7219,7 @@ var<workgroup> acc: array<f32, MAX_HEAD_DIM>;
 fn score_at(h: u32, kv_head: u32, p: u32) -> f32 {
     let head_dim = am.head_dim;
     let q_base = h * head_dim;
-    let k_base = (p * am.n_head_kv + kv_head) * head_dim;
+    let k_base = (kv_slot(p) * am.n_head_kv + kv_head) * head_dim;
     var s: f32 = 0.0;
     var d: u32 = 0u;
     loop {
@@ -7026,7 +7302,7 @@ fn main(
                         break;
                     }
                     let vp = am.window_start + tile_start + j;
-                    let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
+                    let v_base = (kv_slot(vp) * am.n_head_kv + kv_head) * head_dim;
                     tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                     j = j + 1u;
                 }
@@ -7060,6 +7336,7 @@ pub fn shader_source_attention_split(
     kv_storage: KvStorage,
     subgroup: bool,
     max_head_dim: u32,
+    paging: KvPaging,
 ) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
@@ -7072,7 +7349,7 @@ pub fn shader_source_attention_split(
         ""
     };
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
-    ATTENTION_SPLIT_SHADER_TEMPLATE
+    let src = ATTENTION_SPLIT_SHADER_TEMPLATE
         .replace(
             "const MAX_HEAD_DIM: u32 = 2048u;",
             &format!("const MAX_HEAD_DIM: u32 = {max_head_dim}u;"),
@@ -7083,6 +7360,9 @@ pub fn shader_source_attention_split(
         .replace("%SUBGROUP_PARAMS%", subgroup_params)
         .replace("%MAX_REDUCE_BLOCK%", max_block)
         .replace("%SUM_REDUCE_BLOCK%", sum_block)
+        .replace("%KV_PAGE_BINDING%", paging.binding())
+        .replace("%KV_SLOT_FN%", paging.slot_fn());
+    paging.finish(src)
 }
 
 /// **Cooperative-reduction** split-k phase 1 — on by default wherever the
@@ -7166,11 +7446,17 @@ fn owned_dim_dot(q_prefix: &str, k_prefix: &str, count: u32) -> String {
 /// `head_dim % 32 == 0`. Not byte-identical to the *serial* kernel (the
 /// `subgroupAdd` reduces the dot in a different order), but it is bit-identical
 /// to the rolled cooperative kernel it replaces.
-pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) -> String {
+pub fn shader_source_attention_split_coop(
+    kv_storage: KvStorage,
+    head_dim: u32,
+    paging: KvPaging,
+) -> String {
     debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
     let owned = head_dim / 32;
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     let enable = kv_storage.enable_directive();
+    let kv_page_binding = paging.binding();
+    let kv_slot_fn = paging.slot_fn();
 
     let regs: String = (0..owned)
         .map(|i| {
@@ -7184,6 +7470,67 @@ pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) 
     let acc: String = (0..owned)
         .map(|i| format!("        a{i} = a{i} * alpha + pw * v{i};\n"))
         .collect();
+
+    // The per-position body, shared by both loop shapes below.
+    let body = format!(
+        "{k_reads}        let score = subgroupAdd({dot}) * am.scale;\n\
+         \x20       let new_m = max(m, score);\n\
+         \x20       let alpha = exp(m - new_m);\n\
+         \x20       let pw = exp(score - new_m);\n\
+         \x20       l = l * alpha + pw;\n\
+         {v_reads}{acc}        m = new_m;\n"
+    );
+
+    // **Where the page lookup sits.**
+    //
+    // Contiguous keeps the single flat loop it has always had — one position
+    // per iteration, no lookup, nothing to hoist.
+    //
+    // Paged splits it in two: an outer step per *page run* that resolves the
+    // block table once, and an inner step over the positions inside that page.
+    // A position's row is then an increment rather than a dependent load, which
+    // is the whole point — the flat form made every position wait for
+    // `kv_page_table[..]` before it could compute a KV address, and a
+    // full-attention model pays that latency once per cached position per
+    // layer. Measured on such a model, decode fell 22.1 -> 30.8 -> 32.1 tok/s
+    // as the page size went 16 -> 64 -> 256, which is the same cost seen from
+    // the other side: fewer lookups, less waiting.
+    let pos_loop = match paging {
+        KvPaging::Contiguous => format!(
+            "    var pos: u32 = split_start;\n\
+             \x20   loop {{\n\
+             \x20       if (pos >= split_end) {{\n\
+             \x20           break;\n\
+             \x20       }}\n\
+             \x20       let p = am.window_start + pos;\n\
+             \x20       let kv_base = (kv_slot(p) * am.n_head_kv + kv_head) * HEAD_DIM + lane;\n\
+             {body}        pos = pos + 1u;\n\
+             \x20   }}\n"
+        ),
+        KvPaging::Paged => format!(
+            "    var pos: u32 = split_start;\n\
+             \x20   loop {{\n\
+             \x20       if (pos >= split_end) {{\n\
+             \x20           break;\n\
+             \x20       }}\n\
+             \x20       let p0 = am.window_start + pos;\n\
+             \x20       let page = kv_page_table[am.kv_page_base + p0 / am.kv_page_tokens];\n\
+             \x20       let in_page = p0 % am.kv_page_tokens;\n\
+             \x20       let run = min(am.kv_page_tokens - in_page, split_end - pos);\n\
+             \x20       let row0 = page * am.kv_page_tokens + in_page;\n\
+             \x20       var j: u32 = 0u;\n\
+             \x20       loop {{\n\
+             \x20           if (j >= run) {{\n\
+             \x20               break;\n\
+             \x20           }}\n\
+             \x20           let kv_base = ((row0 + j) * am.n_head_kv + kv_head) * HEAD_DIM + lane;\n\
+             {body}            j = j + 1u;\n\
+             \x20       }}\n\
+             \x20       pos = pos + run;\n\
+             \x20   }}\n"
+        ),
+    };
+
     let writes: String = (0..owned)
         .map(|i| {
             format!(
@@ -7193,7 +7540,7 @@ pub fn shader_source_attention_split_coop(kv_storage: KvStorage, head_dim: u32) 
         })
         .collect();
 
-    format!(
+    let src = format!(
         r#"{enable}
 struct AttnSplitMeta {{
     n_head: u32,
@@ -7203,7 +7550,11 @@ struct AttnSplitMeta {{
     n_pos: u32,
     k_num: u32,
     scale: f32,
-    _pad: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -7211,8 +7562,10 @@ struct AttnSplitMeta {{
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+{kv_page_binding}
 
 {kv_read_fns}
+{kv_slot_fn}
 
 const HEAD_DIM: u32 = {head_dim}u;
 
@@ -7239,21 +7592,7 @@ fn main(
     var m: f32 = -1e30;
     var l: f32 = 0.0;
 
-    var pos: u32 = split_start;
-    loop {{
-        if (pos >= split_end) {{
-            break;
-        }}
-        let p = am.window_start + pos;
-        let kv_base = (p * am.n_head_kv + kv_head) * HEAD_DIM + lane;
-{k_reads}        let score = subgroupAdd({dot}) * am.scale;
-        let new_m = max(m, score);
-        let alpha = exp(m - new_m);
-        let pw = exp(score - new_m);
-        l = l * alpha + pw;
-{v_reads}{acc}        m = new_m;
-        pos = pos + 1u;
-    }}
+{pos_loop}
 
     let out_base = h * k_num + split_idx;
     if (lane == 0u) {{
@@ -7262,7 +7601,8 @@ fn main(
     }}
 {writes}}}
 "#
-    )
+    );
+    paging.finish(src)
 }
 
 /// Multi-query attention with the **cooperative** reduction: 32 lanes split
@@ -7292,7 +7632,11 @@ struct AttnMeta {
     n_query: u32,
     n_swa: u32,
     causal: u32,
-    _pad: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -7300,8 +7644,10 @@ struct AttnMeta {
 @group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
 @group(0) @binding(4) var<storage, read_write> aout: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnMeta;
+%KV_PAGE_BINDING%
 
 %KV_READ_FNS%
+%KV_SLOT_FN%
 
 const HEAD_DIM: u32 = %HEAD_DIM%u;
 const OWNED: u32 = %OWNED%u;
@@ -7349,7 +7695,7 @@ fn main(
         if (p > we) {
             break;
         }
-        let k_base = (p * am.n_head_kv + kv_head) * HEAD_DIM;
+        let k_base = (kv_slot(p) * am.n_head_kv + kv_head) * HEAD_DIM;
         var partial: f32 = 0.0;
         for (var i: u32 = 0u; i < OWNED; i = i + 1u) {
             partial = partial + q_reg[i] * kv_read_k(k_base + lane + i * 32u);
@@ -7449,12 +7795,15 @@ pub fn shader_source_attention_prefill_gqa(
     head_dim: u32,
     group: u32,
     heads: u32,
+    paging: KvPaging,
 ) -> String {
     debug_assert_eq!(head_dim % 32, 0, "gqa attention needs head_dim % 32 == 0");
     debug_assert!(heads >= 1 && group.is_multiple_of(heads));
     let owned = head_dim / 32;
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     let enable = kv_storage.enable_directive();
+    let kv_page_binding = paging.binding();
+    let kv_slot_fn = paging.slot_fn();
 
     let mut regs = String::new();
     for j in 0..heads {
@@ -7505,7 +7854,7 @@ pub fn shader_source_attention_prefill_gqa(
         }
     }
 
-    format!(
+    let src = format!(
         r#"{enable}
 struct AttnMeta {{
     n_head: u32,
@@ -7519,7 +7868,11 @@ struct AttnMeta {{
     n_query: u32,
     n_swa: u32,
     causal: u32,
-    _pad: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -7527,8 +7880,10 @@ struct AttnMeta {{
 @group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
 @group(0) @binding(4) var<storage, read_write> aout: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnMeta;
+{kv_page_binding}
 
 {kv_read_fns}
+{kv_slot_fn}
 
 const HEAD_DIM: u32 = {head_dim}u;
 const GROUP: u32 = {group}u;
@@ -7573,28 +7928,36 @@ fn main(
         if (p > we) {{
             break;
         }}
-        let kv_base = (p * am.n_head_kv + kv_head) * HEAD_DIM + lane;
+        let kv_base = (kv_slot(p) * am.n_head_kv + kv_head) * HEAD_DIM + lane;
 {k_reads}{scores}{softmax}{v_reads}{acc}        p = p + 1u;
     }}
 
 {writes}}}
 "#
-    )
+    );
+    paging.finish(src)
 }
 
 /// Builds [`ATTENTION_COOP_PREFILL_TEMPLATE`] for a specific `head_dim`
 /// (baked in, so the owned loops unroll). Requires subgroups and
 /// `head_dim % 32 == 0`; the caller falls back to
 /// [`shader_source_attention_prefill`] otherwise.
-pub fn shader_source_attention_prefill_coop(kv_storage: KvStorage, head_dim: u32) -> String {
+pub fn shader_source_attention_prefill_coop(
+    kv_storage: KvStorage,
+    head_dim: u32,
+    paging: KvPaging,
+) -> String {
     debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
-    ATTENTION_COOP_PREFILL_TEMPLATE
+    let src = ATTENTION_COOP_PREFILL_TEMPLATE
         .replace("%HEAD_DIM%", &head_dim.to_string())
         .replace("%OWNED%", &(head_dim / 32).to_string())
         .replace("%KV_ENABLE%", kv_storage.enable_directive())
         .replace("%KV_BINDINGS%", &kv_bindings)
         .replace("%KV_READ_FNS%", &kv_read_fns)
+        .replace("%KV_PAGE_BINDING%", paging.binding())
+        .replace("%KV_SLOT_FN%", paging.slot_fn());
+    paging.finish(src)
 }
 
 /// Bytes the flash kernel's *other* workgroup arrays occupy, beside
@@ -7705,7 +8068,11 @@ struct AttnSplitMeta {
     n_pos: u32,
     k_num: u32,
     scale: f32,
-    _pad: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -7713,8 +8080,10 @@ struct AttnSplitMeta {
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+%KV_PAGE_BINDING%
 
 %KV_READ_FNS%
+%KV_SLOT_FN%
 
 const MAX_HEAD_DIM: u32 = 2048u;
 // Positions staged per tile, and the padded K-tile row stride (head_dim + 1).
@@ -7780,7 +8149,7 @@ fn main(
                 let row = e / head_dim;
                 let col = e - row * head_dim;
                 let pp = am.window_start + tile_start + row;
-                let g = (pp * am.n_head_kv + kv_head) * head_dim + col;
+                let g = (kv_slot(pp) * am.n_head_kv + kv_head) * head_dim + col;
                 k_shmem[row * KV_STRIDE + col] = f16(kv_read_k(g));
                 e = e + 64u;
             }
@@ -7826,7 +8195,7 @@ fn main(
                         break;
                     }
                     let vp = am.window_start + tile_start + j;
-                    let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
+                    let v_base = (kv_slot(vp) * am.n_head_kv + kv_head) * head_dim;
                     tile_contribution = tile_contribution + tile_probs[j] * kv_read_v(v_base + d2);
                     j = j + 1u;
                 }
@@ -7865,6 +8234,7 @@ pub fn shader_source_attention_split_flash(
     subgroup: bool,
     head_dim: u32,
     lds_limit: u32,
+    paging: KvPaging,
 ) -> String {
     let (max_block, sum_block) = if subgroup {
         attention_subgroup_blocks()
@@ -7880,7 +8250,7 @@ pub fn shader_source_attention_split_flash(
     let tile_pos = flash_tile_positions(head_dim, lds_limit);
     let stride = head_dim + 1;
     let shmem_len = tile_pos * stride;
-    ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE
+    let src = ATTENTION_SPLIT_FLASH_SHADER_TEMPLATE
         .replace(
             "const MAX_HEAD_DIM: u32 = 2048u;",
             &format!("const MAX_HEAD_DIM: u32 = {head_dim}u;"),
@@ -7894,6 +8264,9 @@ pub fn shader_source_attention_split_flash(
         .replace("%TILE_POS%", &tile_pos.to_string())
         .replace("%KV_STRIDE%", &stride.to_string())
         .replace("%K_SHMEM_LEN%", &shmem_len.to_string())
+        .replace("%KV_PAGE_BINDING%", paging.binding())
+        .replace("%KV_SLOT_FN%", paging.slot_fn());
+    paging.finish(src)
 }
 
 /// Split-k phase 2 of two — merges [`ATTENTION_SPLIT_SHADER_TEMPLATE`]'s
@@ -8008,12 +8381,15 @@ pub fn shader_source_attention_split_gqa(
     kv_storage: KvStorage,
     head_dim: u32,
     group: u32,
+    paging: KvPaging,
 ) -> String {
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     let enable = kv_storage.enable_directive();
+    let kv_page_binding = paging.binding();
+    let kv_slot_fn = paging.slot_fn();
     let acc_len = group * head_dim;
     let probs_len = group * 64;
-    format!(
+    let src = format!(
         r#"{enable}
 struct AttnSplitMeta {{
     n_head: u32,
@@ -8023,7 +8399,11 @@ struct AttnSplitMeta {{
     n_pos: u32,
     k_num: u32,
     scale: f32,
-    _pad: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> aq: array<f32>;
@@ -8031,8 +8411,10 @@ struct AttnSplitMeta {{
 @group(0) @binding(3) var<storage, read_write> partial_ml: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_acc: array<f32>;
 @group(0) @binding(5) var<uniform> am: AttnSplitMeta;
+{kv_page_binding}
 
 {kv_read_fns}
+{kv_slot_fn}
 
 const GROUP: u32 = {group}u;
 const HEAD_DIM: u32 = {head_dim}u;
@@ -8083,7 +8465,7 @@ fn main(
             for (var hq: u32 = 0u; hq < GROUP; hq = hq + 1u) {{ scores[hq] = -1e30; }}
             if (has_pos) {{
                 for (var hq: u32 = 0u; hq < GROUP; hq = hq + 1u) {{ scores[hq] = 0.0; }}
-                let k_base = (p * am.n_head_kv + kv_head) * head_dim;
+                let k_base = (kv_slot(p) * am.n_head_kv + kv_head) * head_dim;
                 var d: u32 = 0u;
                 loop {{
                     if (d >= head_dim) {{ break; }}
@@ -8142,7 +8524,7 @@ fn main(
                 loop {{
                     if (j >= tile_len) {{ break; }}
                     let vp = am.window_start + tile_start + j;
-                    let v_base = (vp * am.n_head_kv + kv_head) * head_dim;
+                    let v_base = (kv_slot(vp) * am.n_head_kv + kv_head) * head_dim;
                     let vval = kv_read_v(v_base + d2);
                     for (var hq: u32 = 0u; hq < GROUP; hq = hq + 1u) {{
                         contrib[hq] = contrib[hq] + probs_g[hq * 64u + j] * vval;
@@ -8176,7 +8558,8 @@ fn main(
     }}
 }}
 "#
-    )
+    );
+    paging.finish(src)
 }
 
 pub fn shader_source_attention_split_reduce() -> String {
@@ -8200,7 +8583,12 @@ struct CastMeta {
     len: u32,
     offset: u32,
     extra: f32,
-    _pad1: u32,
+    // Where in `csrc` this dispatch starts. Zero for every writer that copies
+    // a whole run at once; a paged write splits its range at page boundaries
+    // and issues one dispatch per run, and each run reads from further into
+    // the same source. Every existing caller leaves the word zeroed, which is
+    // the offset that means "from the beginning".
+    src_offset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> csrc: array<f32>;
@@ -8213,7 +8601,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= cm.len) {
         return;
     }
-    cdst[cm.offset + idx] = f16(csrc[idx]);
+    cdst[cm.offset + idx] = f16(csrc[cm.src_offset + idx]);
 }
 "#;
 
@@ -8239,7 +8627,8 @@ struct QuantMeta {
     n_blocks: u32,
     dst_block_offset: u32,
     _pad0: u32,
-    _pad1: u32,
+    /// Blocks into `csrc` this dispatch starts at — see `CastMeta::src_offset`.
+    src_block_offset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> csrc: array<f32>;
@@ -8252,7 +8641,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (block >= cm.n_blocks) {
         return;
     }
-    let src_base = block * 32u;
+    let src_base = (cm.src_block_offset + block) * 32u;
     var amax: f32 = 0.0;
     var i: u32 = 0u;
     loop {

@@ -1539,15 +1539,33 @@ fn device_expert_admissible(enabled: bool, has_gpu: bool, kernel: bool, resident
 /// The whole of the dispatch: an expert's rows are contiguous in the
 /// stacked tensor, so `ExpertQuantMatrix::expert_matrix` views them as an
 /// ordinary `QuantMatrix` and `Backend::matmul` already knows what to do
-/// with one. No new kernel — every GPU backend already has one for every
-/// quantization an expert is stored in, which is what
-/// `engine::expert_tier` is written against.
+/// with one — no kernel is written for this path, it reuses the matmul
+/// kernel the backend already compiled for that quantization.
 ///
 /// Returns `None` — the host path — when the knob is off, the backend has
 /// no GPU, the backend has no kernel for this quantization, or the expert
-/// is not one the device tier holds. The kernel term matters because the
-/// `IQ*` types the Vulkan backend lacks are exactly the ones large MoE
-/// models are shipped in; the residency term is what keeps the tier a tier.
+/// is not one the device tier holds. The residency term is what keeps the
+/// tier a tier.
+///
+/// **The kernel term is not the reason the tier does not pay.** On Vulkan it
+/// now excludes three quantizations, none of them ggml's own ids, and the
+/// whole `IQ` range that large mixture-of-experts files are shipped in is
+/// *not* among them — `Backend::supports_type`'s own doc names the excluded
+/// set per backend and points at the test that pins it. So a routed
+/// expert in an ordinary low-bit file reaches this path; what it then meets is
+/// the dispatch shape `VulkanBackend::matmul_batch` describes, which is where
+/// the measured loss recorded in `engine::expert_tier` comes from.
+///
+/// This paragraph used to say the opposite — that the `IQ*` types the Vulkan
+/// backend lacks are exactly the ones large MoE models ship in — while the
+/// paragraph above it simultaneously claimed every backend had a kernel for
+/// every expert quantization. Both were wrong, they contradicted each other,
+/// and the code between them went on compiling either way, because
+/// `supports_type` is a lookup in a `const` array and no test compared that
+/// array to anything. It stayed wrong long enough that an outside reader of
+/// this source scoped a critical task around building kernels that already
+/// existed. **A doc comment is part of the source, and this one was lying —
+/// twice, in opposite directions.**
 fn gpu_project_expert(
     backend: &dyn crate::engine::backend::Backend,
     weights: &crate::engine::loader::ExpertQuantMatrix,

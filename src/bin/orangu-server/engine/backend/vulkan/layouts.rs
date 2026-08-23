@@ -256,6 +256,22 @@ pub(super) fn elem2_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupL
 /// `aout` (storage, read-write, the attention output), `am` (uniform,
 /// shapes/position) — see `vulkan_shaders::shader_source_attention`.
 pub(super) fn attn_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    attn_layout(device, false)
+}
+
+/// The same, plus binding 6 — the block table a paged attention kernel reads to
+/// turn a cached position into a row (`vulkan_shaders::KvPaging::Paged`).
+///
+/// A separate layout rather than one with an optional entry, because a bind
+/// group layout is part of a pipeline's identity: a kernel compiled without the
+/// binding cannot be given one, and a kernel compiled with it must always be.
+/// Two layouts make that a compile-time fact about which pipeline is in use,
+/// where an "optional" binding would make it a run-time hope.
+pub(super) fn attn_paged_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    attn_layout(device, true)
+}
+
+fn attn_layout(device: &wgpu::Device, paged: bool) -> wgpu::BindGroupLayout {
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
         has_dynamic_offset: false,
@@ -283,7 +299,11 @@ pub(super) fn attn_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLa
                     min_binding_size: None,
                 },
             ),
-        ],
+        ]
+        .iter()
+        .copied()
+        .chain(paged.then(|| entry(6, storage(true))))
+        .collect::<Vec<_>>(),
     })
 }
 

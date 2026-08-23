@@ -56,6 +56,27 @@ pub(crate) fn flag_on(name: &str) -> bool {
     }
 }
 
+/// Whether a boolean tuning flag is switched **on**, for a feature that is on
+/// unless someone turns it off.
+///
+/// Same off-list as [`flag_on`] — `0`, `false`, `no`, `off`, the empty string —
+/// and the same reason for it: these are typed into shell one-liners, and a
+/// sweep of `0,1` has to give a real control arm. The difference is only what
+/// an *unset* variable means.
+///
+/// Deliberately a second function rather than a `default` argument, so that
+/// reading a call site tells you which way the feature points without having to
+/// find the constant.
+pub(crate) fn flag_on_unless_disabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

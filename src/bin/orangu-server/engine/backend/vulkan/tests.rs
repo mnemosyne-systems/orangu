@@ -15,13 +15,14 @@
 
 use super::*;
 use crate::engine::backend::CpuBackend;
+use crate::engine::kv_cache::strided_dims;
 use crate::engine::loader::test_quant_matrix;
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// The RMSNorm width rule must reproduce every width it was measured at,
@@ -465,7 +466,11 @@ fn _scratch_measure_attention_dispatch_cost() {
         n_query: 0,
         n_swa: 0,
         causal: 0,
-        _pad: 0,
+        kv_page_base: 0,
+        kv_page_tokens: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let meta_buf = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scratch attention meta"),
@@ -740,7 +745,11 @@ fn measure_split_k_dispatch_ms(vulkan: &VulkanBackend, k_num: u32) -> f64 {
         n_pos: (pos - window_start + 1) as u32,
         k_num,
         scale,
-        _pad: 0,
+        kv_page_base: 0,
+        kv_page_tokens: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let split_meta_buf = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scratch attention split meta"),
@@ -825,7 +834,11 @@ fn measure_split_k_dispatch_ms(vulkan: &VulkanBackend, k_num: u32) -> f64 {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("scratch split-k encoder"),
             });
-        let split_pipeline = vulkan.attn_split_pipeline_for(head_dim, 1);
+        let split_pipeline = vulkan.attn_split_pipeline_for(
+            head_dim,
+            1,
+            crate::engine::backend::vulkan_shaders::KvPaging::Contiguous,
+        );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("scratch split-k pass"),
@@ -1451,6 +1464,17 @@ fn build_block(ggml_type: u32, seed: &mut u64) -> Vec<u8> {
             out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
             out.extend(next_bytes(seed, 16));
         }
+        // `Q4_0`'s 16 `qs` bytes behind a one-byte `e8m0` exponent instead of
+        // an `f16` scale. The exponent is **bounded** where the nibbles are
+        // not: it is the only field here read as a float, and an unbounded
+        // byte spans 2^-127..2^127, which overflows a dot product to `inf` on
+        // both paths and would compare equal while testing nothing. `128`
+        // decodes to exactly 1.0 (`(128-1) << 23` is f32 exponent 127), so
+        // this is a symmetric 2^-4..2^4 around unity.
+        t if t == GGML_TYPE_MXFP4 => {
+            out.push(124 + (next_byte(seed) % 9));
+            out.extend(next_bytes(seed, 16));
+        }
         t if t == GGML_TYPE_Q4_1 => {
             out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
             out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
@@ -1580,7 +1604,8 @@ fn block_elems(ggml_type: u32) -> usize {
             || t == GGML_TYPE_Q5_0
             || t == GGML_TYPE_Q5_1
             || t == GGML_TYPE_Q8_0
-            || t == GGML_TYPE_IQ4_NL =>
+            || t == GGML_TYPE_IQ4_NL
+            || t == GGML_TYPE_MXFP4 =>
         {
             32
         }
@@ -2578,6 +2603,108 @@ fn matmul_matches_cpu_backend_for_iq4_nl() {
     cross_check(GGML_TYPE_IQ4_NL, 896, 5);
 }
 
+/// `MXFP4` on the decode (block-hoisted) path.
+///
+/// `in_dim = 896` for `IQ4_NL`'s reason above — not a multiple of 256, so a
+/// stray `QK_K` assumption fails here — and because `MXFP4`'s block is the
+/// only **odd** byte size in the tree (17). A kernel that assumed blocks
+/// were 4-aligned would read every block after the first at a shifted
+/// offset, which is a wrong answer rather than a crash: `read_u8` peels
+/// bytes out of an `array<u32>` and will happily return the wrong one.
+#[test]
+fn matmul_matches_cpu_backend_for_mxfp4() {
+    cross_check(GGML_TYPE_MXFP4, 896, 5);
+}
+
+/// The `e8m0` exponent decode across its whole range.
+///
+/// `cross_check`'s generated blocks deliberately bound the exponent near
+/// unity so a dot product does not overflow, which means they never reach the
+/// ends of the range. So this checks every code directly against
+/// `quant::dequantize` — one block per code, comparing the dequantized
+/// weights themselves rather than a matmul over them.
+///
+/// # Codes 0 and 1 are exempt, and the exemption is the finding
+///
+/// `MXFP4` is the only type here whose scale can be **subnormal in f32**:
+/// code 0 decodes to `2^-128` and code 1 to `2^-127`, both below f32's
+/// smallest normal `2^-126`. The device flushes subnormals to zero, the host
+/// does not, and they disagree — measured, not assumed: every other code
+/// (2..=255) is bit-exact on both paths, and only these two differ.
+///
+/// This is a property of the hardware, not a transcription error —
+/// `mxfp4_scale` produces the same *bits* the host does; what differs is what
+/// arithmetic on those bits then yields. It is left as a divergence rather
+/// than papered over on either side, because the alternatives are worse:
+/// flushing on the host would corrupt the reference every other test is
+/// judged against, and no portable knob asks a device to keep subnormals.
+///
+/// It cannot affect a generated token. The largest weight either code can
+/// express is `2^-127 * 12`, about `7e-38`. Against a dot product over
+/// hundreds of `O(1)` terms, that is ~30 orders of magnitude below the f32
+/// epsilon of the running sum — it is not a small contribution, it is one
+/// that cannot change any bit of the result it is added to. A block scaled
+/// this way encodes weights that are zero in every sense that matters, which
+/// is what such a code means in the format.
+#[test]
+fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    // One row per exponent code. The nibbles are fixed to the identity
+    // pattern `j | (j << 4)`, so every codebook entry appears in every row
+    // and a wrong scale shows up on all 32 elements rather than some.
+    let mut bytes = Vec::new();
+    for e in 0..=255u16 {
+        bytes.push(e as u8);
+        bytes.extend((0..16u8).map(|j| j | (j << 4)));
+    }
+    let w = test_quant_matrix(&bytes, GGML_TYPE_MXFP4, 32, 256);
+    // A one-hot activation reads out element `k` of each row unchanged, so
+    // the matmul is a dequantization with the accumulation removed — no
+    // summation order to reconcile, and a mismatch names the element.
+    for k in 0..32usize {
+        let mut x = vec![0f32; 32];
+        x[k] = 1.0;
+        let gpu = vulkan.matmul(&x, 1, &w);
+        let cpu = CpuBackend.matmul_dequant(&x, 1, &w);
+        for (e, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+            if e < 2 {
+                // The subnormal pair. Asserted rather than skipped, so that a
+                // device which *does* keep subnormals fails here and the
+                // comment above gets revisited instead of quietly becoming
+                // untrue on other hardware.
+                assert_eq!(
+                    *g, 0.0,
+                    "exponent code {e} is subnormal and was expected to flush to \
+                     zero on the device, but element {k} came back as {g:e}"
+                );
+                // Element 1's codebook entry is exactly 1, so the host value
+                // there *is* the scale — the one place to check that the
+                // scale itself is subnormal. Not checked at other `k`: the
+                // codebook multiplies up to 12, which lifts some products
+                // back into the normal range even from a subnormal scale
+                // (code 1, element 2 is `1.175e-38`, exactly `f32::MIN_
+                // POSITIVE`). The device still returns zero for those,
+                // because it flushed `d` before the multiply.
+                if k == 1 {
+                    assert!(
+                        c.abs() < f32::MIN_POSITIVE,
+                        "exponent code {e} was expected to decode to a subnormal \
+                         scale on the host, but it is {c:e}"
+                    );
+                }
+                continue;
+            }
+            assert!(
+                g == c || (g.is_nan() && c.is_nan()) || (g - c).abs() <= c.abs() * 1e-6,
+                "exponent code {e}, element {k}: gpu {g:e} != cpu {c:e}"
+            );
+        }
+    }
+}
+
 #[test]
 fn matmul_matches_cpu_backend_cooperative_path_f32() {
     cross_check_n_tokens(GGML_TYPE_F32, 64, 17, 130);
@@ -2691,6 +2818,14 @@ fn matmul_matches_cpu_backend_cooperative_path_iq4_nl() {
     cross_check_n_tokens(GGML_TYPE_IQ4_NL, 896, 64, 130);
 }
 
+/// The cooperative-tiled (prefill) path over an `MXFP4` weight — the same
+/// shape as the `IQ4_NL` case above, which is the type `MXFP4` shares its
+/// nibble layout with.
+#[test]
+fn matmul_matches_cpu_backend_cooperative_path_mxfp4() {
+    cross_check_n_tokens(GGML_TYPE_MXFP4, 896, 64, 130);
+}
+
 /// The cooperative tiled kernel past its own `COOP_TILE_ROWS = 32` output
 /// tile. Every other cooperative cross-check uses `out_dim = 5`, so none of
 /// them exercises more than a partial first row-tile — while the real
@@ -2782,6 +2917,109 @@ fn real_gguf_weights_match_the_cpu_backend() {
         }
     }
     eprintln!("  checked {} tensors, {bad} bad", names.len());
+}
+
+/// The same real-weight cross-check for **stacked routed-expert** tensors,
+/// which [`real_gguf_weights_match_the_cpu_backend`] cannot reach.
+///
+/// That test walks `blk.N.ffn_gate.weight`-style names through
+/// `LoadedModel::matrix`. A mixture-of-experts file has no such tensor: its
+/// experts live in one stacked `blk.N.ffn_gate_exps.weight` that only
+/// `LoadedModel::expert_matrix` can open, and a single expert's rows are a
+/// sub-range of it. So every expert weight in the tree has been checked on
+/// synthetic blocks and none on real ones.
+///
+/// This matters most for the quantizations that *only* appear on expert
+/// tensors. `MXFP4` is the case in point — the files carrying it store it as
+/// `ffn_{gate,down,up}_exps` (routed) or `ffn_{gate,up}_shexp` (shared), and
+/// both are exactly the tensors `arch::gpu_project_expert` and
+/// `arch::matmul_host_fallback` gate on `Backend::supports_type`. Before a
+/// kernel exists they go to the host; after one does, this is what says the
+/// kernel is right on the weights a model actually ships.
+///
+/// Probes expert 0 of each stack it finds, at both sides of the prefill
+/// crossover, and reports the quantization so a run's output says which
+/// types were actually exercised rather than implying all of them.
+///
+/// `#[ignore]` because it needs the model file: run with
+/// `ORANGU_PROBE_GGUF=/path/to/moe.gguf cargo test real_gguf_expert_weights -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs a real MoE GGUF; run with --ignored"]
+fn real_gguf_expert_weights_match_the_cpu_backend() {
+    let Some(vulkan) = shared_vulkan() else {
+        return;
+    };
+    let path = std::env::var("ORANGU_PROBE_GGUF").expect("set ORANGU_PROBE_GGUF");
+    let model =
+        crate::engine::loader::LoadedModel::open(std::path::Path::new(&path)).expect("open gguf");
+    let mut seed = 0x0FEE_1234_u64;
+    let mut checked = 0usize;
+    let mut bad = 0usize;
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for l in 0..12 {
+        for t in [
+            "ffn_gate_exps",
+            "ffn_up_exps",
+            "ffn_down_exps",
+            "ffn_gate_shexp",
+            "ffn_up_shexp",
+            "ffn_down_shexp",
+        ] {
+            let name = format!("blk.{l}.{t}.weight");
+            // A shared expert is an ordinary matrix; a routed stack is not.
+            // Try the stack first and fall back, so one loop covers both.
+            let w = match model.expert_matrix(&name) {
+                Ok(stack) => stack.expert_matrix(0),
+                Err(_) => match model.matrix(&name) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                },
+            };
+            let ty = orangu::gguf::ggml_type_name(w.ggml_type());
+            *seen.entry(ty.clone()).or_default() += 1;
+            checked += 1;
+            if !vulkan.supports_type(w.ggml_type()) {
+                eprintln!("  {name}: {ty} has no GPU kernel, skipped");
+                continue;
+            }
+            for nt in [1usize, 91usize] {
+                let mut x = vec![0f32; nt * w.in_dim];
+                for v in x.iter_mut() {
+                    *v = (next_byte(&mut seed) as f32 - 128.0) / 512.0;
+                }
+                let cpu = CpuBackend.matmul_dequant(&x, nt, &w);
+                let gpu = vulkan.matmul(&x, nt, &w);
+                let ca: f64 = cpu.iter().map(|v| v.abs() as f64).sum();
+                let ga: f64 = gpu.iter().map(|v| v.abs() as f64).sum();
+                let mut worst = 0f32;
+                let mut over = 0usize;
+                for (a, b) in cpu.iter().zip(gpu.iter()) {
+                    let rel = (a - b).abs() / a.abs().max(1e-3);
+                    if rel > worst {
+                        worst = rel;
+                    }
+                    if rel > 1e-2 {
+                        over += 1;
+                    }
+                }
+                if over > 0 || !(0.999..1.001).contains(&(ga / ca)) {
+                    bad += 1;
+                    eprintln!(
+                        "  BAD {name} {ty} {}x{} nt={nt}: ratio {:.4} worst_rel {worst:.3e} over_1e-2 {over}/{}",
+                        w.in_dim,
+                        w.out_dim,
+                        ga / ca,
+                        gpu.len()
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("  checked {checked} expert tensors, {bad} bad");
+    for (ty, n) in &seen {
+        eprintln!("    {ty}: {n}");
+    }
+    assert_eq!(bad, 0, "expert weights disagree between GPU and CPU");
 }
 
 /// `matmul_batch` against per-op `matmul`, **elementwise**, at the real
@@ -4488,6 +4726,315 @@ fn gpu_attention_matches_cpu_reference_many_positions_multi_tile() {
 /// (37 = 9+9+9+10), exercising the uneven-remainder split-range
 /// bookkeeping in `ATTENTION_SPLIT_SHADER_TEMPLATE`, not just the
 /// tidy multiple-of-k_num case.
+/// The same guarantee for **prefill**, which is a different kernel family from
+/// the decode split path and reads the cache through its own address
+/// computation.
+///
+/// Same construction as the decode cross-check and for the same reason: the
+/// sequence lives in the upper half of a pool twice its size, so a kernel that
+/// ignored the block table reads the lower half rather than a permutation of
+/// its own pages. A multi-token prefill also exercises the per-query window
+/// derivation, which the single-query decode path does not.
+#[test]
+fn paged_prefill_matches_the_contiguous_kernel() {
+    paged_prefill_agrees_at(4, 8);
+}
+
+/// The same at a realistic context. A 32-position prefill exercises one tile
+/// and one page-table lookup per query; a sixteen-hundred-position one
+/// exercises the window derivation, many tiles, and a block table long enough
+/// that an off-by-one in its base or stride has somewhere to go wrong.
+///
+/// Written because the small case passed while the engine diverged end-to-end
+/// at ~1600 positions, which is exactly the gap a small fixture leaves.
+#[test]
+fn paged_prefill_matches_the_contiguous_kernel_at_a_real_context() {
+    paged_prefill_agrees_at(16, 100);
+}
+
+/// **A context that is not a whole number of pages.**
+///
+/// Every fixture above used `page * pages` positions exactly, so the sequence
+/// always ended on a page boundary and there was never a partial tail. A real
+/// prompt almost never does: 1638 tokens at 16 to a page leaves 6 in a page
+/// that has not been sealed. Those positions are what a dispatch has to be able
+/// to read, and an exact-multiple fixture cannot ask about them.
+#[test]
+fn paged_prefill_matches_the_contiguous_kernel_with_a_partial_tail() {
+    paged_prefill_agrees_at_len(16, 100, 16 * 100 - 10);
+}
+
+fn paged_prefill_agrees_at(page: usize, pages: usize) {
+    paged_prefill_agrees_at_len(page, pages, page * pages);
+}
+
+fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
+    use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (page_tokens, n_pages) = (page, pages);
+    let pool_pages: usize = n_pages * 2;
+    const N_HEAD: usize = 4;
+    const N_HEAD_KV: usize = 2;
+    const HEAD_DIM: usize = 64;
+    let kv_dim = N_HEAD_KV * HEAD_DIM;
+    let n_positions = positions;
+
+    let mut seed = 0xBEEF_4321_u64;
+    let mut rows_k: Vec<Vec<f32>> = Vec::new();
+    let mut rows_v: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..n_positions {
+        rows_k.push(
+            (0..kv_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect(),
+        );
+        rows_v.push(
+            (0..kv_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect(),
+        );
+    }
+    // Every cached position is a query, which is the prefill shape.
+    let n_tokens = n_positions;
+    let q: Vec<f32> = (0..n_tokens * N_HEAD * HEAD_DIM)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+        .collect();
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+    let mut plain = crate::engine::kv_cache::KvCache::new(1, n_positions + 1, kv_dim);
+    for i in 0..n_positions {
+        plain.layers[0].push(&rows_k[i], &rows_v[i]);
+    }
+    let want = vulkan.gpu_attention_prefill(
+        &q,
+        &mut plain.layers[0],
+        0,
+        n_tokens,
+        N_HEAD,
+        N_HEAD_KV,
+        HEAD_DIM,
+        0,
+        true,
+        scale,
+    );
+
+    // The same rows, reached only through a block table.
+    let mut pool = KvPool::with_policy(
+        pool_pages,
+        page_tokens,
+        vec![LayerGeometry { kv_dim, stride: 1 }],
+        Policy::Lru,
+    );
+    let (device, queue) = vulkan.device_and_queue();
+    // Table room for every page the pool has, twice over — a sequence reserves
+    // `pages_for(capacity)` entries up front, and a table too small to hold
+    // that makes the sequence fall back to the mirror silently. The assertion
+    // below catches it, but sizing it right is what makes the test a test.
+    assert!(pool.attach_device(device, vulkan.kv_storage(), pool_pages * 4));
+    let pool = std::sync::Arc::new(pool);
+
+    // **Hold the low pages so the sequence cannot land on them.**
+    //
+    // The pool hands out never-used pages from the bottom, so a cache created
+    // against an empty pool gets 0, 1, 2 … — which is exactly the identity
+    // mapping. A kernel ignoring the block table would then read the right rows
+    // by accident and the test would pass while proving nothing; it did, until
+    // this was added. Holding the low half forces the sequence into the upper
+    // half, where only the table can find it.
+    let held = pool.alloc(n_pages).expect("pool has room");
+    for &physical in &held {
+        let junk: Vec<f32> = (0..page_tokens * kv_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 32.0)
+            .collect();
+        pool.fill_device(queue, 0, physical, &junk, &junk);
+    }
+
+    let mut paged = crate::engine::kv_cache::KvCache::new_with_strided_dims(
+        n_positions + page_tokens,
+        &strided_dims(&pool),
+    )
+    .into_paged(pool.clone());
+    for i in 0..n_positions {
+        paged.layers[0].push(&rows_k[i], &rows_v[i]);
+    }
+    paged.commit_pages();
+    // Without this the test can silently compare the fallback against itself:
+    // `gpu_attention_prefill` uses the per-request mirror whenever the cache
+    // cannot supply pages, and that mirror is materialized *from* the pages, so
+    // it is correct no matter what the block table says.
+    assert!(
+        paged.layers[0].paged_device_refs(queue).is_some(),
+        "the paged path was not taken; this test would be comparing the \
+         mirrored fallback with itself"
+    );
+
+    let got = vulkan.gpu_attention_prefill(
+        &q,
+        &mut paged.layers[0],
+        0,
+        n_tokens,
+        N_HEAD,
+        N_HEAD_KV,
+        HEAD_DIM,
+        0,
+        true,
+        scale,
+    );
+
+    assert_eq!(got.len(), want.len());
+    let mut worst = 0f32;
+    for (a, b) in want.iter().zip(got.iter()) {
+        worst = worst.max((a - b).abs() / a.abs().max(1e-3));
+    }
+    assert!(
+        worst < 1e-3,
+        "paged prefill disagrees with the contiguous kernel (worst relative \
+         error {worst:.3e})"
+    );
+    pool.release(&held);
+}
+
+/// **The paged kernel against the contiguous one, through a table that maps
+/// away from where the kernel would otherwise look.**
+///
+/// The same keys and values, the same query, the same window — once in a
+/// contiguous per-request cache and once in pool pages the block table has to
+/// be consulted to find.
+///
+/// # A shuffle alone proves nothing, which took a mutant to discover
+///
+/// The first version of this test put the sequence in pages `0..8` and reversed
+/// the table. A kernel that ignored the table entirely **passed it**, at a
+/// relative error of `4e-5`.
+///
+/// The reason is that attention over a full window is *permutation-invariant*:
+/// softmax normalizes, and the weighted sum of values does not depend on the
+/// order the pairs are visited. Reversing the pages changes the order the
+/// kernel reads them and not the set, so the answer is the same to within
+/// floating-point reassociation. The test was measuring reassociation noise and
+/// calling it agreement.
+///
+/// So the sequence is placed in the *upper* half of a pool twice its size, and
+/// the lower half is filled with different data. Now a kernel that computes
+/// `p * n_head_kv * head_dim` reads the lower half — a different set of pairs,
+/// not a permutation of the same one — and the answers separate.
+#[test]
+fn paged_attention_matches_the_contiguous_kernel_through_a_shuffled_table() {
+    use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    // One page per 4 positions. The sequence needs `PAGES`; the pool is twice
+    // that, and the sequence lives in the upper half — see the note above on
+    // why a permutation within its own pages would not discriminate.
+    const PAGE: usize = 4;
+    const PAGES: usize = 8;
+    const POOL_PAGES: usize = 16;
+    const N_HEAD: usize = 4;
+    const N_HEAD_KV: usize = 2;
+    const HEAD_DIM: usize = 64;
+    let kv_dim = N_HEAD_KV * HEAD_DIM;
+    let n_positions = PAGE * PAGES;
+
+    let mut seed = 0x5EED_1234_u64;
+    let mut rows_k: Vec<Vec<f32>> = Vec::new();
+    let mut rows_v: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..n_positions {
+        rows_k.push(
+            (0..kv_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect(),
+        );
+        rows_v.push(
+            (0..kv_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect(),
+        );
+    }
+    let q: Vec<f32> = (0..N_HEAD * HEAD_DIM)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+        .collect();
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+    // Contiguous reference, through the kernel that already has cross-checks.
+    let mut kv_cache = crate::engine::kv_cache::KvCache::new(1, n_positions + 1, kv_dim);
+    for i in 0..n_positions {
+        kv_cache.layers[0].push(&rows_k[i], &rows_v[i]);
+    }
+    let want = vulkan.gpu_attention_split(crate::engine::backend::vulkan::GpuAttentionInput {
+        q: &q,
+        cache: &mut kv_cache.layers[0],
+        pos: n_positions - 1,
+        window_start: 0,
+        n_head: N_HEAD,
+        n_head_kv: N_HEAD_KV,
+        head_dim: HEAD_DIM,
+        scale,
+    });
+
+    // Paged: logical page i lives in physical page (PAGES - 1 - i).
+    let mut pool = KvPool::with_policy(
+        POOL_PAGES,
+        PAGE,
+        vec![LayerGeometry { kv_dim, stride: 1 }],
+        Policy::Lru,
+    );
+    let (device, queue) = vulkan.device_and_queue();
+    assert!(pool.attach_device(device, vulkan.kv_storage(), 64));
+
+    // Decoy data where an unmapped kernel would look.
+    for physical in 0..PAGES {
+        let junk: Vec<f32> = (0..PAGE * kv_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 32.0)
+            .collect();
+        pool.fill_device(queue, 0, physical as u32, &junk, &junk);
+    }
+
+    // The sequence: upper half, and reversed within it so order is exercised
+    // too.
+    let table: Vec<u32> = (0..PAGES).map(|i| (POOL_PAGES - 1 - i) as u32).collect();
+    for (logical, &physical) in table.iter().enumerate() {
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        for r in 0..PAGE {
+            k.extend_from_slice(&rows_k[logical * PAGE + r]);
+            v.extend_from_slice(&rows_v[logical * PAGE + r]);
+        }
+        pool.fill_device(queue, 0, physical, &k, &v);
+    }
+    pool.write_table(queue, 0, &table);
+
+    let got = vulkan.gpu_attention_split_paged(
+        &q,
+        &pool,
+        0,
+        0,
+        n_positions - 1,
+        0,
+        N_HEAD,
+        N_HEAD_KV,
+        HEAD_DIM,
+        scale,
+    );
+
+    assert_eq!(got.len(), want.len());
+    let mut worst = 0f32;
+    for (a, b) in want.iter().zip(got.iter()) {
+        worst = worst.max((a - b).abs() / a.abs().max(1e-3));
+    }
+    assert!(
+        worst < 1e-3,
+        "paged attention disagrees with the contiguous kernel (worst relative \
+         error {worst:.3e}); the block table is not being followed"
+    );
+}
+
 #[test]
 fn gpu_attention_split_matches_cpu_reference() {
     cross_check_gpu_attention_split(4, 2, 8);
@@ -6572,6 +7119,19 @@ fn fused_ple_prefill_matches_the_unfused_sequence_multi_chunk() {
 /// Also checks the K/V rows the GPU hands back for the host mirror against
 /// what the CPU path pushed, since those are what slot save serializes.
 fn cross_check_fused_attention_prefill(n_tokens: usize, owns_v: bool, start_pos: usize) {
+    cross_check_fused_attention_prefill_paged(n_tokens, owns_v, start_pos, false);
+}
+
+/// `paged` runs the fused recorder against a cache backed by the page pool
+/// instead of a per-request mirror, comparing against the same unfused
+/// reference. The reference is deliberately *not* paged: a paged reference
+/// would share the component under test.
+fn cross_check_fused_attention_prefill_paged(
+    n_tokens: usize,
+    owns_v: bool,
+    start_pos: usize,
+    paged: bool,
+) {
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6694,9 +7254,54 @@ fn cross_check_fused_attention_prefill(n_tokens: usize, owns_v: bool, start_pos:
     );
 
     // ---- the fused recorder ----
-    let mut cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    // Held across the call so the pool outlives the cache that borrows it.
+    let mut held_pool = None;
+    let mut cache = if paged {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        const PAGE: usize = 8;
+        let pool_pages = capacity.div_ceil(PAGE) * 4;
+        let mut pool = KvPool::with_policy(
+            pool_pages,
+            PAGE,
+            vec![LayerGeometry { kv_dim, stride: 1 }],
+            Policy::Lru,
+        );
+        let (device, queue) = vulkan.device_and_queue();
+        assert!(pool.attach_device(device, vulkan.kv_storage(), pool_pages * 4));
+        let pool = std::sync::Arc::new(pool);
+        // **The sequence's pages must be neither low nor adjacent.**
+        //
+        // Holding the low half alone is not enough here, and the difference is
+        // what a mutation found: the pool hands out pages in ascending order,
+        // so a sequence gets a *consecutive* run, and a write that failed to
+        // split at a page boundary ran straight through into the next page —
+        // which is exactly where those rows belonged anyway. The test passed
+        // while proving nothing about the split.
+        //
+        // Taking everything and giving back only alternate pages leaves the
+        // sequence with a run that is both high and non-adjacent, so writing
+        // past a page lands in a held page full of junk and both the write
+        // split and the block table have to be right.
+        let all = pool.alloc(pool_pages).expect("pool has room");
+        let (given, held): (Vec<u32>, Vec<u32>) = all.iter().partition(|p| !(*p).is_multiple_of(2));
+        pool.release(&given);
+        for &physical in &held {
+            let junk: Vec<f32> = (0..PAGE * kv_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 32.0)
+                .collect();
+            pool.fill_device(queue, 0, physical, &junk, &junk);
+        }
+        held_pool = Some((pool.clone(), held));
+        crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
+            .into_paged(pool)
+    } else {
+        crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim])
+    };
     for (pk, pv) in &prior {
         cache.layers[0].push(pk, pv);
+    }
+    if paged {
+        cache.commit_pages();
     }
     let got = vulkan
         .fused_attention_prefill(
@@ -6743,12 +7348,23 @@ fn cross_check_fused_attention_prefill(n_tokens: usize, owns_v: bool, start_pos:
             );
         }
     };
+    if paged {
+        assert!(
+            cache.layers[0].is_pool_backed(),
+            "the paged prefill path was not taken; this would be comparing the \
+             mirrored fallback with itself"
+        );
+    }
     cmp("attn_out", &expected, &got.attn_out);
     // The host mirror the fused path leaves behind must match what the CPU
     // path pushed — this is what slot save serializes.
     cmp("k_rows", &k, &got.k_rows);
     cmp("v_rows", &v, &got.v_rows);
     assert_eq!(cache.layers[0].len, ref_cache.layers[0].len);
+    if let Some((pool, held)) = held_pool {
+        drop(cache);
+        pool.release(&held);
+    }
 }
 
 /// The `llama`/`mistral` shape through the same fused chain: **no** per-head
@@ -8822,4 +9438,228 @@ fn a_wide_ffn_clamps_below_the_configured_default() {
 #[test]
 fn a_zero_row_width_does_not_clamp() {
     assert_eq!(stripe_bound(65535, 0), usize::MAX);
+}
+
+/// **The differential test the paged fused decode path has to pass.**
+///
+/// `fused_attention` is the decode step: it computes this token's key and
+/// value on the device, writes them into the cache, and reads the whole
+/// window back — all in one submission. Paging it moves both halves at once,
+/// which is what makes it worth a test of its own rather than trusting the
+/// prefill one. The write now lands in a pool page instead of a per-request
+/// mirror, and if the destination row and the row the kernel reads back
+/// disagree, attention answers from whatever that page held before.
+///
+/// The low pages are held and filled with junk for the reason
+/// `paged_prefill_matches_contiguous`'s own comment gives: the pool hands out
+/// never-used pages from the bottom, so a fresh sequence lands on the identity
+/// mapping and a kernel ignoring the block table reads the right rows by
+/// accident.
+///
+/// Nine positions over four-token pages, so the run crosses two page
+/// boundaries — the case where the fused path has to take a page the host
+/// side never asked for, because there is no tail to upload at a boundary.
+#[test]
+fn paged_fused_decode_matches_cpu_reference() {
+    use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+
+    let n_embd = 32;
+    let n_head = 4;
+    let n_head_kv = 2;
+    let head_dim = 8;
+    let rope_dim = 8;
+    let group_size = n_head / n_head_kv;
+    let kv_dim = n_head_kv * head_dim;
+    let page_tokens = 4;
+    let pool_pages = 16;
+    let capacity = 32;
+    let eps = 1e-6;
+    let rope_freq_base = 10000.0;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut seed = 0x5E9D_1C0B_u64;
+    let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..in_dim {
+                bytes.extend(build_block(GGML_TYPE_F32, seed));
+            }
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_F32, in_dim, out_dim)
+    };
+    let wq = build(n_embd, n_head * head_dim, &mut seed);
+    let wk = build(n_embd, kv_dim, &mut seed);
+    let wv = build(n_embd, kv_dim, &mut seed);
+
+    let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+        (0..len)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+            .collect()
+    };
+    let q_norm = rand_vec(head_dim, &mut seed);
+    let k_norm = rand_vec(head_dim, &mut seed);
+
+    let mut pool = KvPool::with_policy(
+        pool_pages,
+        page_tokens,
+        vec![LayerGeometry { kv_dim, stride: 1 }],
+        Policy::Lru,
+    );
+    let (device, queue) = vulkan.device_and_queue();
+    assert!(pool.attach_device(device, vulkan.kv_storage(), pool_pages * 4));
+    let pool = std::sync::Arc::new(pool);
+    // Alternate pages, so the sequence's run is neither low nor adjacent —
+    // see the same fixture in `cross_check_fused_attention_prefill_paged` for
+    // why adjacency alone lets a broken address computation pass.
+    let all = pool.alloc(pool_pages).expect("pool has room");
+    let (given, held): (Vec<u32>, Vec<u32>) = all.iter().partition(|p| !(*p).is_multiple_of(2));
+    pool.release(&given);
+    for &physical in &held {
+        let junk: Vec<f32> = (0..page_tokens * kv_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 32.0)
+            .collect();
+        pool.fill_device(queue, 0, physical, &junk, &junk);
+    }
+
+    let mut kv_cache =
+        crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
+            .into_paged(pool.clone());
+    let mut reference_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    for _ in 0..3 {
+        let k: Vec<f32> = rand_vec(kv_dim, &mut seed);
+        let v: Vec<f32> = rand_vec(kv_dim, &mut seed);
+        kv_cache.layers[0].push(&k, &v);
+        reference_cache.layers[0].push(&k, &v);
+    }
+    kv_cache.commit_pages();
+
+    for step in 0..6 {
+        let pos = kv_cache.layers[0].len;
+        let window_start = 0;
+        let normed = rand_vec(n_embd, &mut seed);
+
+        let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
+        crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
+        crate::engine::tensor::rope_apply_scaled_inplace(
+            &mut q,
+            n_head,
+            head_dim,
+            rope_dim,
+            pos,
+            rope_freq_base,
+            None,
+        );
+        let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
+        crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
+        let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
+        for row in v.chunks_mut(head_dim) {
+            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+            let s = 1.0 / (mean_sq + eps).sqrt();
+            for x in row.iter_mut() {
+                *x *= s;
+            }
+        }
+        crate::engine::tensor::rope_apply_scaled_inplace(
+            &mut k,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            pos,
+            rope_freq_base,
+            None,
+        );
+        reference_cache.layers[0].push(&k, &v);
+
+        let mut expected = vec![0f32; n_head * head_dim];
+        for h in 0..n_head {
+            let kv_head = h / group_size;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::with_capacity(pos + 1 - window_start);
+            for p in window_start..=pos {
+                let kh = reference_cache.layers[0].key_at(p, kv_head, head_dim);
+                scores.push(crate::engine::tensor::dot(qh, kh) * scale);
+            }
+            crate::engine::tensor::softmax_inplace(&mut scores);
+            let out = &mut expected[h * head_dim..(h + 1) * head_dim];
+            for (offset, &weight) in scores.iter().enumerate() {
+                let p = window_start + offset;
+                let vh = reference_cache.layers[0].value_at(p, kv_head, head_dim);
+                for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                    *o += weight * vi;
+                }
+            }
+        }
+
+        let got = vulkan.fused_attention(FusedAttnInput {
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: true,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
+            normed: GpuInput::Cpu(&normed),
+            wq: &wq,
+            q_norm: Some(&q_norm),
+            kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
+                wk: &wk,
+                k_norm: Some(&k_norm),
+                wv: Some(&wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            rope_freq_base,
+            freq_factors: None,
+            eps,
+            pos,
+            window_start,
+            window: None,
+            scale,
+            cache: &mut kv_cache.layers[0],
+            batch_slot: 0,
+            attn_ts: None,
+        });
+
+        // Without this the test compares the mirrored fallback with itself:
+        // the mirror is built from the same pages, so it is right either way.
+        assert!(
+            kv_cache.layers[0].is_pool_backed(),
+            "step {step}: the paged fused path was not taken"
+        );
+        assert_eq!(expected.len(), got.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            let tol = 6e-2 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "step {step}: mismatch at index {i}: cpu={a} gpu={b}"
+            );
+        }
+        assert_eq!(kv_cache.layers[0].len, pos + 1);
+    }
+    pool.release(&held);
+}
+
+/// **The differential test the paged fused prefill has to pass.**
+///
+/// The prefill writes a whole range of positions at once, so unlike the decode
+/// step its write is not one row but a run per page it crosses. `start_pos` of
+/// 5 against 8-token pages puts the range's start part way into a page and its
+/// end part way into another, which is the case where every run has a
+/// different source offset, destination page and length.
+#[test]
+fn paged_fused_prefill_matches_unfused_reference() {
+    // One token: the degenerate single-run case, mid-page.
+    cross_check_fused_attention_prefill_paged(1, true, 5, true);
+    // Crossing one boundary.
+    cross_check_fused_attention_prefill_paged(6, true, 5, true);
+    // Spanning several whole pages plus partial ends, both V arrangements.
+    cross_check_fused_attention_prefill_paged(21, true, 5, true);
+    cross_check_fused_attention_prefill_paged(21, false, 5, true);
+    // Starting exactly on a page boundary — no leading partial run.
+    cross_check_fused_attention_prefill_paged(17, true, 8, true);
 }
