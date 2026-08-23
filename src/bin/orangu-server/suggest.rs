@@ -19,7 +19,7 @@
 //! CPU/GPU detection `system` reports, then estimates the total VRAM a
 //! candidate model would need across a curated ladder of common open-weight
 //! parameter counts, recommending the largest that fits — for each of
-//! several context lengths ([`CONTEXT_LADDER`], 1K to 256K) and each of a
+//! several context lengths ([`CONTEXT_LADDER`], 1K to 1M) and each of a
 //! few common quantizations ([`QUANT_LADDER`]: `Q2_K`, `Q4_K_M` — this
 //! project's own default, matching `orangu::model_download`'s
 //! `DEFAULT_TAG_PREFERENCE` — and `Q8_0`), presented as a table.
@@ -69,7 +69,9 @@ const KV_CACHE_BITS: f64 = 8.0;
 /// against, from a bare minimum up to a generous long-context ceiling —
 /// since KV cache grows linearly with context, the model size that
 /// comfortably fits shrinks as context grows.
-const CONTEXT_LADDER: &[u64] = &[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+const CONTEXT_LADDER: &[u64] = &[
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+];
 
 /// A curated ladder of common open-weight model parameter counts (in
 /// billions), spanning the range real Hugging Face GGUF releases actually
@@ -264,6 +266,17 @@ fn format_param_count(params_billion: f64) -> String {
     }
 }
 
+/// Formats a [`CONTEXT_LADDER`] entry as a column label: `K` units up to
+/// the megabyte boundary, `M` beyond it, so the longest contexts read as
+/// "1M" rather than the unwieldy "1024K".
+fn format_context_size(context_size: u64) -> String {
+    if context_size >= 1024 * 1024 {
+        format!("{}M", context_size / (1024 * 1024))
+    } else {
+        format!("{}K", context_size / 1024)
+    }
+}
+
 /// Appends one `label`ed budget/suggestion block to `out`: the estimated
 /// budget, followed by a table of the largest model size that comfortably
 /// fits at each context length in [`CONTEXT_LADDER`], one column per
@@ -303,7 +316,7 @@ fn push_suggestion_block(out: &mut String, label: &str, budget: u64, source: Opt
     ));
 
     for &context_size in CONTEXT_LADDER {
-        let context_label = format!("{}K", context_size / 1024);
+        let context_label = format_context_size(context_size);
         let cells: Vec<String> = QUANT_LADDER
             .iter()
             .zip(&headers)

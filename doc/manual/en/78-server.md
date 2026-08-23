@@ -925,7 +925,7 @@ this project's own established defaults (`orangu::model_download`'s
 guess well from hardware alone, and bits-per-weight depends on which
 quantization tag you end up downloading — so instead of picking one of each,
 `push_suggestion_block` prints a row per context length in `CONTEXT_LADDER`
-(1K up to a generous long-context ceiling, 262144) and a column per
+(1K up to a generous long-context ceiling, 1048576) and a column per
 quantization in `QUANT_LADDER` (`Q2_K` at 3.00 bits/weight, `Q4_K_M` at
 `DEFAULT_BITS_PER_WEIGHT`, and `Q8_0` at 8.5 — all three bits-per-weight
 figures read from smcleod's own table, the same source as the formula

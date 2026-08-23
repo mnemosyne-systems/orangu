@@ -423,6 +423,8 @@ Suggested model size (Dedicated)
   64K      ~2B parameters     ~1B parameters       -
   128K     -                  -                    -
   256K     -                  -                    -
+  512K     -                  -                    -
+  1M       -                  -                    -
 
 Suggested model size (Total)
   Estimated budget : 62.19 GiB
@@ -438,11 +440,13 @@ Suggested model size (Total)
   64K      ~120B parameters   ~70B parameters      ~34B parameters
   128K     ~70B parameters    ~34B parameters      ~30B parameters
   256K     ~34B parameters    ~27B parameters      ~14B parameters
+  512K     ~14B parameters    ~9B parameters       ~4B parameters
+  1M       ~4B parameters     ~3B parameters       ~1B parameters
 ```
 
 Prints the same OS/CPU/GPU report `system` does, then estimates how large a
 model (in parameters) is likely to run comfortably — as a table, one row per
-context length (1K to 256K tokens) and one column per quantization (`Q2_K`,
+context length (1K to 1M tokens) and one column per quantization (`Q2_K`,
 `Q4_K_M` — the same default `download` already assumes — and `Q8_0`). Not a
 specific model recommendation yet — just a size class to aim `download` at.
 
