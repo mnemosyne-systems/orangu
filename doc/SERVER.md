@@ -498,11 +498,11 @@ orangu-server list
 ```
 
 ```
-NR  MODEL                                        QUANT   SIZE        SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   Yes (qwen3)
- 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Yes (qwen3)
- 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    Yes (gemma4)
- 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  No (glm-dsa)
+NR  MODEL                                        QUANT   SIZE        LAST_USED        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   2026-08-24 15:42  Yes (qwen3)
+ 2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Never             Yes (qwen3)
+ 3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    2026-08-21 09:16  Yes (gemma4)
+ 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             No (glm-dsa)
 ```
 
 `NR` numbers models in the printed order (alphabetically by `MODEL`), starting
@@ -549,9 +549,9 @@ beside it. Two quantizations of the same repo therefore print the same
 `MODEL` and are told apart by their `QUANT` cells:
 
 ```
-NR  MODEL              QUANT   SIZE        SUPPORTED
- 1  acme/Test-3B-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
- 2  acme/Test-3B-GGUF  Q8_0    4.97 GiB    Yes (gemma4)
+NR  MODEL              QUANT   SIZE        LAST_USED        SUPPORTED
+ 1  acme/Test-3B-GGUF  Q4_K_M  468.64 MiB  2026-08-24 15:42  Yes (qwen2)
+ 2  acme/Test-3B-GGUF  Q8_0    4.97 GiB    Never             Yes (gemma4)
 ```
 
 Both spellings resolve against what's already on disk — `acme/Test-3B-GGUF`
@@ -592,6 +592,16 @@ A file that fails to parse (truncated download, not actually a
 GGUF file) is still listed, with its error in place of `QUANT`/`SIZE` — one
 bad file doesn't abort the scan.
 
+`LAST_USED` is the local date and time at which that model last completed
+server startup. Resolving it for `show`, `plan`, or shell completion does not
+count; neither does a startup that fails while building the backend or binding
+its listener. `Never` means the model has not been successfully served since
+this tracking was introduced. Downloads and successful starts are recorded in
+the versioned JSON file `~/.orangu/models`, including the model name, canonical
+path, download time, and last-use time. A model copied into the directory by
+hand gets a registry entry on its first successful start, and deleting a model
+removes its entry.
+
 `SUPPORTED` says whether this build can actually load the model —
 `Yes (<arch>)` or `No (<arch>)`, judged from the file's header alone
 (`general.architecture` plus the tensor directory — cheap: no tensor data).
@@ -616,9 +626,9 @@ in parallel across every distinct repo on the row list. A row whose local
 commit is behind gets a trailing `(Refresh)` marker, after `SIZE`:
 
 ```
-NR  MODEL                                      QUANT   SIZE       SUPPORTED
- 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  Yes (qwen3) (Refresh)
- 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Yes (gemma4)
+NR  MODEL                                      QUANT   SIZE       LAST_USED        SUPPORTED
+ 1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF  Q4_K_M  17.28 GiB  2026-08-24 15:42  Yes (qwen3) (Refresh)
+ 2  ggml-org/gemma-4-12B-it-GGUF               Q4_K_M  7.14 GiB   Never             Yes (gemma4)
 ```
 
 `orangu-server refresh` (below) is what acts on that marker — it deletes the
@@ -1453,8 +1463,8 @@ deployment posture worth configuring for.
 
 ## Model management
 
-The topbar's **Models** button opens a panel showing the models directory as
-`orangu-server list` prints it — the same numbered table, column for column:
+The topbar's **Models** button opens a panel showing the models directory from
+the same scan as `orangu-server list`, with its core numbered inventory fields:
 
 | | |
 | :-- | :-- |

@@ -255,7 +255,15 @@ pub fn download_model_reporting(
         }
     }
 
-    Ok(snapshot_dir.join(primary_path))
+    let path = snapshot_dir.join(primary_path);
+    // Inventory metadata must never turn a completed multi-gigabyte
+    // download into a reported failure merely because the home directory is
+    // unavailable. A later successful load gets another chance to create
+    // the record and, most importantly, its LAST_USED value.
+    if let Err(err) = crate::model_registry::record_download(spec, &path) {
+        eprintln!("warning: could not update ~/.orangu/models: {err:#}");
+    }
+    Ok(path)
 }
 
 /// How long one shard's header fetch may take before

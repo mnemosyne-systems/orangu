@@ -1386,6 +1386,15 @@ fn prepare(args: Args) -> Result<Prepared> {
         daemonize().context("failed to start as a daemon")?;
     }
 
+    if let ModelSource::File(path) = &source {
+        // Only a completely prepared server counts as use. Resolution alone
+        // (`show`, `plan`, shell completion), or a load that later fails to
+        // build its backend or bind its listener, must not change the date.
+        if let Err(err) = orangu::model_registry::record_used(&model_label, path) {
+            eprintln!("warning: could not update ~/.orangu/models: {err:#}");
+        }
+    }
+
     Ok(Prepared {
         api_key: conf.api_key.clone(),
         tls: conf.tls.clone(),
@@ -2149,14 +2158,18 @@ fn run_command(
             let groups = orangu::model_spec::group_models(&models);
             let latest_commits = check_for_updates(&groups);
             let support = model_support(&groups);
+            let last_used = orangu::model_registry::last_used_for(
+                groups.iter().map(|group| group.paths.as_slice()),
+            );
             print!(
                 "{}",
-                orangu::model_spec::format_groups(
+                orangu::model_spec::format_groups_with_last_used(
                     &groups,
                     &conf.models,
                     &latest_commits,
                     &support,
                     dimming(orangu::model_spec::Dimming::Unsupported),
+                    Some(&last_used),
                 )
             );
             Ok(())
