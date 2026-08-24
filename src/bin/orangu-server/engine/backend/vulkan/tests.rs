@@ -2658,7 +2658,29 @@ fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
     let mut bytes = Vec::new();
     for e in 0..=255u16 {
         bytes.push(e as u8);
-        bytes.extend((0..16u8).map(|j| j | (j << 4)));
+        if e <= 252 {
+            bytes.extend((0..16u8).map(|j| j | (j << 4)));
+        } else {
+            // **The top three codes carry only the entries worth ±1, and
+            // that is the whole portability story.**
+            //
+            // The codebook reaches 12 and the scale is `2^(e - 128)`, so from
+            // code 253 up a full-codebook row's largest product passes
+            // `f32::MAX` and the row holds `±inf`. Such a row cannot be read
+            // out by a one-hot activation at all: the reference sums
+            // `±inf * 0.0` over the 31 elements the activation zeroes, which
+            // is `NaN` under IEEE and simply vanishes under the fast-math a
+            // Metal backend compiles with by default, leaving the true
+            // element behind. Both are defensible, which is precisely what
+            // makes such a row useless for deciding whether the *scale*
+            // decoded correctly.
+            //
+            // So these rows carry `KVALUES_MXFP4[1]` and `[9]`, exactly `1`
+            // and `-1`, whose product with even `2^127` stays finite. All 256
+            // exponent codes are still checked, and nothing in this test
+            // depends on how a device treats `inf * 0`.
+            bytes.extend((0..16u8).map(|_| 0x91u8));
+        }
     }
     let w = test_quant_matrix(&bytes, GGML_TYPE_MXFP4, 32, 256);
     // A one-hot activation reads out element `k` of each row unchanged, so
@@ -2697,35 +2719,13 @@ fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
                 }
                 continue;
             }
-            if !c.is_finite() {
-                // **The overflow codes, and why they cannot be compared.**
-                //
-                // The codebook reaches 12 and the scale is `2^(e - 128)`, so
-                // the largest product a row can form is `12 * 2^(e - 128)` —
-                // past `f32::MAX` from code 253 up. Those rows hold `±inf`,
-                // and a one-hot activation cannot read them out: the reference
-                // dot product sums `±inf * 0.0` for the 31 elements the
-                // activation zeroes, which is `NaN` under IEEE and `0.0` under
-                // the fast-math a Metal backend compiles with by default.
-                // Both are correct, so a disagreement here says nothing about
-                // the scale decode, which is the only thing this test is for.
-                //
-                // Bounded rather than skipped quietly. A code whose products
-                // are all finite has no business producing a non-finite
-                // reference, and if one ever does, that is a decode bug this
-                // must not swallow.
-                assert!(
-                    e >= 253,
-                    "exponent code {e}, element {k}: reference is {c:e}, but                      the largest product this code can form is finite — a                      non-finite reference here is a decode bug, not an overflow"
-                );
-                // Still not vacuous: the device has exactly two defensible
-                // answers and anything else is wrong.
-                assert!(
-                    *g == 0.0 || !g.is_finite(),
-                    "exponent code {e}, element {k}: the reference overflows, so                      the device may return IEEE's non-finite result or                      fast-math's zero — {g:e} is neither"
-                );
-                continue;
-            }
+            // Every product is finite by construction now, so there is no
+            // device-dependent case to allow and nothing to skip.
+            assert!(
+                c.is_finite(),
+                "exponent code {e}, element {k}: reference is {c:e}, but these \
+                 rows are built so that every product stays finite"
+            );
             assert!(
                 g == c || (g - c).abs() <= c.abs() * 1e-6,
                 "exponent code {e}, element {k}: gpu {g:e} != cpu {c:e}"
