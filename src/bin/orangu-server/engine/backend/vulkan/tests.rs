@@ -2697,8 +2697,37 @@ fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
                 }
                 continue;
             }
+            if !c.is_finite() {
+                // **The overflow codes, and why they cannot be compared.**
+                //
+                // The codebook reaches 12 and the scale is `2^(e - 128)`, so
+                // the largest product a row can form is `12 * 2^(e - 128)` —
+                // past `f32::MAX` from code 253 up. Those rows hold `±inf`,
+                // and a one-hot activation cannot read them out: the reference
+                // dot product sums `±inf * 0.0` for the 31 elements the
+                // activation zeroes, which is `NaN` under IEEE and `0.0` under
+                // the fast-math a Metal backend compiles with by default.
+                // Both are correct, so a disagreement here says nothing about
+                // the scale decode, which is the only thing this test is for.
+                //
+                // Bounded rather than skipped quietly. A code whose products
+                // are all finite has no business producing a non-finite
+                // reference, and if one ever does, that is a decode bug this
+                // must not swallow.
+                assert!(
+                    e >= 253,
+                    "exponent code {e}, element {k}: reference is {c:e}, but                      the largest product this code can form is finite — a                      non-finite reference here is a decode bug, not an overflow"
+                );
+                // Still not vacuous: the device has exactly two defensible
+                // answers and anything else is wrong.
+                assert!(
+                    *g == 0.0 || !g.is_finite(),
+                    "exponent code {e}, element {k}: the reference overflows, so                      the device may return IEEE's non-finite result or                      fast-math's zero — {g:e} is neither"
+                );
+                continue;
+            }
             assert!(
-                g == c || (g.is_nan() && c.is_nan()) || (g - c).abs() <= c.abs() * 1e-6,
+                g == c || (g - c).abs() <= c.abs() * 1e-6,
                 "exponent code {e}, element {k}: gpu {g:e} != cpu {c:e}"
             );
         }
