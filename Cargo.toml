@@ -1,6 +1,6 @@
 [package]
 name = "orangu"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 # Not the default `./build.rs`: all source in this package lives under `src/`,
 # and a build script is source.
