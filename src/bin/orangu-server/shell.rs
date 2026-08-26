@@ -94,6 +94,10 @@ _orangu_server() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
+        --sort)
+            COMPREPLY=( $(compgen -W "size last-used" -- "$cur") )
+            return 0
+            ;;
         -p|--port|--web)
             return 0
             ;;
@@ -102,7 +106,7 @@ _orangu_server() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "-c --config -w --workspace --host -p --port --web -i --init -s --shell-completions -d --daemon \
-             --all --code --review --explorer --embedding -o --output --binary --deep -y --yes -h --help -V --version" -- "$cur") )
+             --all --code --review --explorer --embedding -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
 
@@ -179,6 +183,7 @@ _orangu_server() {
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
         '--deep[Also verify plan'"'"'s shards and architecture]' \
+        '--sort[Order list rows while preserving their NR]:field:(size last-used)' \
         '(-y --yes)'{-y,--yes}'[Skip a confirmation prompt (download/delete/bundle/prune)]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
@@ -261,6 +266,7 @@ complete -c orangu-server      -l embedding               -d 'Embeddings-only ro
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
 complete -c orangu-server -l deep                         -d 'Also verify plan\'s shards and architecture'
+complete -c orangu-server -n '__fish_seen_subcommand_from list' -l sort -x -a 'size last-used' -d 'Order rows while preserving their NR'
 complete -c orangu-server -s y -l yes                     -d 'Skip a confirmation prompt (download/delete/bundle/prune)'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'

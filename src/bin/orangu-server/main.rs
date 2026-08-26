@@ -46,7 +46,7 @@ mod tls;
 mod web;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use config::{
     BackendPreference, ServerConfiguration, default_server_config_path, load_server_configuration,
 };
@@ -312,7 +312,12 @@ enum Command {
     /// comfortably on this machine's detected hardware.
     Suggest,
     /// List every .gguf file found under the configured models directory.
-    List,
+    List {
+        /// Order rows by size (largest first) or last use (most recent first).
+        /// NR remains the model's number in the default alphabetical listing.
+        #[arg(long, value_enum, value_name = "FIELD")]
+        sort: Option<ListSort>,
+    },
     /// Report what a model would need to run here — **without loading it**.
     ///
     /// Reads only the GGUF tensor tables, so a plan for a model far larger
@@ -420,6 +425,12 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ListSort {
+    Size,
+    LastUsed,
+}
+
 impl Command {
     /// This subcommand's name as the user typed it, for the terminal title
     /// (see [`terminal_title`]). Kept in step with the variants' clap names
@@ -428,7 +439,7 @@ impl Command {
         match self {
             Command::System => "system",
             Command::Suggest => "suggest",
-            Command::List => "list",
+            Command::List { .. } => "list",
             Command::Plan { .. } => "plan",
             Command::Show { .. } => "show",
             Command::Download { .. } => "download",
@@ -2282,7 +2293,7 @@ fn run_command(
             print!("{}", suggest::format_suggestion(&os, &cpu, &gpus));
             Ok(())
         }
-        Command::List => {
+        Command::List { sort } => {
             let conf = load_config(config_arg, None, false)?;
             let models = orangu::model_spec::scan_models_dir(&conf.models)?;
             let groups = orangu::model_spec::group_models(&models);
@@ -2291,15 +2302,17 @@ fn run_command(
             let last_used = orangu::model_registry::last_used_for(
                 groups.iter().map(|group| group.paths.as_slice()),
             );
+            let order = list_order(&groups, &last_used, sort);
             print!(
                 "{}",
-                orangu::model_spec::format_groups_with_last_used(
+                orangu::model_spec::format_groups_with_last_used_in_order(
                     &groups,
                     &conf.models,
                     &latest_commits,
                     &support,
                     dimming(orangu::model_spec::Dimming::Unsupported),
                     Some(&last_used),
+                    &order,
                 )
             );
             Ok(())
@@ -2447,6 +2460,28 @@ fn run_command(
         }),
         Command::Prune { identifier, yes } => prune::run(identifier, yes),
     }
+}
+
+/// Display order for `list`. Indices always refer to the canonical,
+/// alphabetically grouped inventory, which is also the order numeric model
+/// resolution uses. A sorted table can therefore move a row without changing
+/// its `NR`.
+fn list_order(
+    groups: &[orangu::model_spec::ModelGroup],
+    last_used: &[Option<u64>],
+    sort: Option<ListSort>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    match sort {
+        None => {}
+        Some(ListSort::Size) => {
+            order.sort_by_key(|&index| std::cmp::Reverse(groups[index].size_bytes));
+        }
+        Some(ListSort::LastUsed) => {
+            order.sort_by(|&left, &right| last_used[right].cmp(&last_used[left]));
+        }
+    }
+    order
 }
 
 /// The latest downloadable state for every distinct Hugging Face repo
@@ -4006,8 +4041,55 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::dominant_tensor_types;
+    use super::{ListSort, dominant_tensor_types, list_order};
     use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+    use clap::Parser;
+    use orangu::model_spec::ModelGroup;
+    use std::path::PathBuf;
+
+    fn listed_group(label: &str, size_bytes: u64) -> ModelGroup {
+        ModelGroup {
+            label: label.to_string(),
+            size_bytes,
+            quantization: None,
+            errors: Vec::new(),
+            representative_path: PathBuf::from(format!("{label}.gguf")),
+            paths: Vec::new(),
+            hf_repo: None,
+            local_commit: None,
+        }
+    }
+
+    #[test]
+    fn list_sort_orders_descending_without_changing_canonical_indices() {
+        let groups = [
+            listed_group("a", 20),
+            listed_group("b", 30),
+            listed_group("c", 10),
+        ];
+        let last_used = [Some(10), None, Some(20)];
+
+        assert_eq!(
+            list_order(&groups, &last_used, Some(ListSort::Size)),
+            vec![1, 0, 2]
+        );
+        assert_eq!(
+            list_order(&groups, &last_used, Some(ListSort::LastUsed)),
+            vec![2, 0, 1]
+        );
+        assert_eq!(list_order(&groups, &last_used, None), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn clap_accepts_both_list_sort_fields() {
+        for (value, expected) in [("size", ListSort::Size), ("last-used", ListSort::LastUsed)] {
+            let args = Args::try_parse_from(["orangu-server", "list", "--sort", value]).unwrap();
+            assert!(matches!(
+                args.command,
+                Some(Command::List { sort: Some(actual) }) if actual == expected
+            ));
+        }
+    }
 
     /// On a quantized file the floats are norms and biases and must not
     /// outnumber the type the weight bytes are in.
@@ -4155,7 +4237,7 @@ mod tests {
         let modes = [
             Command::System.mode(),
             Command::Suggest.mode(),
-            Command::List.mode(),
+            Command::List { sort: None }.mode(),
             Command::Plan {
                 file: None,
                 deep: false,

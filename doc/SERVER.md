@@ -495,6 +495,8 @@ where it ends.
 
 ```sh
 orangu-server list
+orangu-server list --sort size       # largest first
+orangu-server list --sort last-used  # most recently used first; Never last
 ```
 
 ```
@@ -505,11 +507,14 @@ NR  MODEL                                        QUANT   SIZE        LAST_USED  
  4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             No (glm-dsa)
 ```
 
-`NR` numbers models in the printed order (alphabetically by `MODEL`), starting
-from 1 — a shorthand for `show` (below) so you don't have to retype or paste a
-long `MODEL` string. It's recomputed fresh on every run from whatever's
-currently on disk, so it only stays stable between one `list`/`show` and the
-next as long as the models directory's contents haven't changed.
+By default, `NR` numbers models alphabetically by `MODEL`, starting from 1 — a
+shorthand for `show` (below) so you don't have to retype or paste a long
+`MODEL` string. `--sort size` and `--sort last-used` reorder the rows but retain
+those default `NR`s, so a model remains easy to find and select after sorting.
+Models tied on the selected field retain alphabetical order; models never used
+sort after all dated rows. Numbers are recomputed fresh from whatever is
+currently on disk, so they only stay stable while the models directory's
+contents remain unchanged.
 
 Recursively scans the configured `models` directory for `.gguf` files (a file
 is used as-is even when it's reached through a symlink — the layout Hugging
@@ -1049,7 +1054,8 @@ reexec = yes
   installed has no row to point at; its spec is offered as written instead,
   and Enter fetches it exactly as `orangu-server <spec>` would. `-i`/`--init` prompts for it with
   TAB-completion over the models already installed under `models` — every
-  `NR` and every `MODEL:QUANT`, in the same order `list` prints them. The
+  `NR` and every `MODEL:QUANT`, in the same order the default `list` prints
+  them. The
   quantization is part of the offered name (`unsloth/gemma-4-E2B-it-GGUF:Q4_K_M`)
   rather than a separate column, because a repo with several quantizations
   on disk prints the same bare `MODEL` on every one of their rows: offering

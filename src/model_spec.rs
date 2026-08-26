@@ -1114,6 +1114,31 @@ pub fn format_groups_with_last_used(
     dim: Dimming,
     last_used: Option<&[Option<u64>]>,
 ) -> String {
+    let order: Vec<usize> = (0..groups.len()).collect();
+    format_groups_with_last_used_in_order(
+        groups,
+        base,
+        latest_updates,
+        support,
+        dim,
+        last_used,
+        &order,
+    )
+}
+
+/// [`format_groups_with_last_used`] with an explicit display order. Entries
+/// in `order` are indices into the canonical `groups` slice; the printed `NR`
+/// remains that original index plus one, and aligned metadata is read by that
+/// same index.
+pub fn format_groups_with_last_used_in_order(
+    groups: &[ModelGroup],
+    base: &Path,
+    latest_updates: &HashMap<String, crate::model_download::RepoUpdateInfo>,
+    support: &[ModelSupport],
+    dim: Dimming,
+    last_used: Option<&[Option<u64>]>,
+    order: &[usize],
+) -> String {
     if groups.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
@@ -1170,7 +1195,8 @@ pub fn format_groups_with_last_used(
             "NR", "MODEL", "QUANT"
         ));
     }
-    for (index, group) in groups.iter().enumerate() {
+    for &index in order {
+        let group = &groups[index];
         let nr = index + 1;
         let refresh = group.is_behind(latest_updates);
         if !group.errors.is_empty() {
@@ -1934,6 +1960,30 @@ mod tests {
         let row = output.lines().nth(1).unwrap();
         assert!(row.contains("Never"));
         assert!(row.ends_with("Yes (llama)"));
+    }
+
+    #[test]
+    fn explicit_display_order_keeps_original_numbers_and_metadata_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("a.gguf"), "llama", None);
+        write_minimal_gguf(&dir.path().join("b.gguf"), "llama", None);
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+
+        let output = format_groups_with_last_used_in_order(
+            &groups,
+            dir.path(),
+            &HashMap::new(),
+            &[],
+            Dimming::Off,
+            Some(&[None, Some(0)]),
+            &[1, 0],
+        );
+        let rows: Vec<&str> = output.lines().skip(1).collect();
+
+        assert!(rows[0].trim_start().starts_with("2  b "), "{}", rows[0]);
+        assert!(!rows[0].ends_with("Never"), "{}", rows[0]);
+        assert!(rows[1].trim_start().starts_with("1  a "), "{}", rows[1]);
+        assert!(rows[1].ends_with("Never"), "{}", rows[1]);
     }
 
     #[cfg(unix)]
