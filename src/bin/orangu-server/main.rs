@@ -64,6 +64,7 @@ use engine::arch::muse::MuseModel;
 use engine::arch::nemotron::NemotronModel;
 use engine::arch::phi::PhiModel;
 use engine::arch::qwen3next::Qwen3NextModel;
+use engine::arch::qwen4exp::Qwen4ExpModel;
 use engine::arch::qwen35::Qwen35Model;
 use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::device;
@@ -1772,6 +1773,9 @@ fn build_model(
         ),
         ArchFamily::Qwen3Next => Arc::new(
             Qwen3NextModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Qwen4Exp => Arc::new(
+            Qwen4ExpModel::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
         ArchFamily::DFlash => {
             Arc::new(DFlashModel::load_with_backend(loaded).context("building model")?)

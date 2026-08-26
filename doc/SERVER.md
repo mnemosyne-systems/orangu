@@ -1764,8 +1764,8 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for twelve
-architecture families: Llama-style (`general.architecture` one of `llama`,
+Text-in/text-out GGUF chat, completion, and embedding models, for fifteen
+servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
@@ -1774,7 +1774,15 @@ embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
 `unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
 `unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
 layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing),
-Qwen3-Next (`qwen3next`), DeepSeek-V4 (`deepseek4`, e.g.
+Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
+`unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
+full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
+as `qwen35moe`, but with no residual *vector*: the state between sub-layers
+is `hyper_connection.count` parallel streams, and every layer norm is
+replaced by the gate that mixes them; full-attention layers additionally
+attend only the blocks a small indexer picks, and the layers named by
+`ple.layers` inject a second embedding read from an n-gram hash table),
+DeepSeek-V4 (`deepseek4`, e.g.
 `unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
 per token, one shared key/value vector serving every query head, compressed
 attention blocks on top of a sliding window, and hash-routed experts),
@@ -1828,6 +1836,67 @@ fused/GPU-resident
 optimizations beyond a basic matmul kernel, verified against real AMD
 and Apple hardware respectively; the other three are real but
 smaller-scoped and unverified on real hardware.
+
+The Qwen4 preview (`qwen4exp`, e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) runs
+on the CPU path only. Its two sub-layers are the ones the Qwen 3.5 family
+already uses — full attention with a joint query+gate projection and a
+partial rotary on every fourth layer, a gated delta net on the rest — and
+its FFN is the same softmax-routed experts plus a sigmoid-gated shared
+expert as `qwen35moe`, here at 512 experts and top-10. Both are shared
+implementations, not copies. Three things around them are new.
+
+**Hyper-connections.** There is no residual *vector*. The state carried
+between sub-layers is `hyper_connection.count` (4) parallel streams,
+seeded as four copies of the token embedding, and there is no
+`output_norm.weight` in the file at all: every layer norm has been replaced
+by the mixer that reads the streams. Each mixer normalizes them, gates them
+through a `hyper_connection.low_rank` bottleneck, and averages them into
+the one vector its sub-layer sees; the sub-layer's output is then scattered
+back across all four, weighted per stream by a projection of the same
+normalized input. Those scatter weights are `2 * sigmoid(..)`, so they
+centre on 1 and an untrained injection would reproduce the plain residual
+add exactly. The final mixer is the model's output norm.
+
+DeepSeek-V4 has four streams too, and shares none of this code: it mixes at
+full rank and normalizes its stream-combination matrix with Sinkhorn
+iterations, where this is a low-rank gate with a plain mean. The two agree
+on the idea and on none of the arithmetic.
+
+**Query-sparse attention.** Every full-attention layer carries an indexer —
+four heads of its own small query and key projections — that scores whole
+blocks of `attention.compress_ratios` (4) consecutive cached positions,
+each block represented by the mean of its members' keys, and the real
+attention then sees only the best `attention.indexer.top_k` (2048) of them
+plus the always-visible incomplete tail. Below `top_k + 4 - 1` cached
+positions the selection cannot change the answer — every visible position
+is chosen — so short contexts skip the indexer entirely and take the
+ordinary dense path.
+
+**Per-layer embeddings.** The layers named by `ple.layers` (layer 1 alone,
+in the released checkpoints) inject a second embedding read from
+`per_layer_token_embd.weight`, a 320-million-row n-gram hash table. Each
+token and its two predecessors are folded into one 64-bit value per n-gram
+width, each of the sixteen hash heads looks that value up in its own slice
+of the table, and the sixteen 160-wide rows concatenate into a second
+`n_embd` vector. That vector is gated against the residual streams, run
+through a causal convolution dilated by the n-gram size, and added back.
+Because the hash is over *token ids*, the cache carries the last two ids of
+a sequence alongside its key/value and recurrent state, so a chunked
+prefill's seam and a decode step hash the same n-grams a single-shot
+prefill would.
+
+The table is `mmap`ped and read one row at a time like every other tensor
+here, so its ~26 GiB of the file is never resident: sixteen rows per token
+are all that is ever touched. It does mean the on-disk size overstates what
+the forward pass streams, and understates nothing.
+
+Like every recurrent family here it has no per-position history to roll
+back, so the opt-in prompt-lookup speculative decoding is not available for
+this model, and a cached prompt prefix is reusable only in full. The
+multi-section RoPE these files declare (`rope.dimension_sections`) is run
+as plain rope, which is exact for text-only input; image and video input is
+out of scope, and with it `ple.image_token_id`, which only names the
+placeholder id a vision batch would hash.
 
 Kimi-K3 (`kimi-k3`) runs on the CPU path only. Three layers in every four
 are Kimi Delta Attention — a gated delta-net whose per-token state is a

@@ -100,6 +100,16 @@ pub enum ArchFamily {
     /// family as Qwen3.5, but with the Qwen3-Next MoE tensor layout. See
     /// `engine::arch::qwen3next`.
     Qwen3Next,
+    /// Qwen4 preview (`qwen4exp`) — the same hybrid full-attention /
+    /// gated-DeltaNet sub-layers and routed-plus-shared-expert MoE as
+    /// [`ArchFamily::Qwen35Moe`], but with no residual *vector*: the state
+    /// between sub-layers is `hyper_connection.count` parallel streams,
+    /// mixed in and scattered back by a low-rank gate that also replaces
+    /// every layer norm. On top of that, full-attention layers attend only
+    /// the blocks a small indexer selects, and the layers named by
+    /// `ple.layers` inject a second embedding read from an n-gram hash
+    /// table. See `engine::arch::qwen4exp`.
+    Qwen4Exp,
     /// GLM with DeepSeek sparse attention (`glm-dsa`, e.g. GLM-5.2) —
     /// absorbed multi-head latent attention over a compressed key/value
     /// cache, a lightning indexer that picks which positions each layer
@@ -208,6 +218,12 @@ const QWEN35_ARCHITECTURES: &[&str] = &["qwen35"];
 /// `qwen3next` (e.g. `unsloth/Qwen3-Coder-Next-GGUF`) - Qwen3-Next's
 /// hybrid attention and MoE architecture.
 const QWEN3NEXT_ARCHITECTURES: &[&str] = &["qwen3next"];
+/// `qwen4exp` (e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) — the Qwen4
+/// architecture preview. Named for what the file declares, not for the
+/// release: `general.name` is `Qwen3.8 Flash Next` and
+/// `general.description` is "A Preview of the Qwen4 Architecture". See
+/// [`ArchFamily::Qwen4Exp`] and `engine::arch::qwen4exp`.
+const QWEN4EXP_ARCHITECTURES: &[&str] = &["qwen4exp"];
 const DFLASH_ARCHITECTURES: &[&str] = &["dflash"];
 const DEEPSEEK4_ARCHITECTURES: &[&str] = &["deepseek4"];
 /// `glm-dsa` (e.g. `unsloth/GLM-5.2-GGUF`) — GLM's transformer block with
@@ -324,6 +340,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if QWEN3NEXT_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Qwen3Next);
     }
+    if QWEN4EXP_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Qwen4Exp);
+    }
     if DFLASH_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::DFlash);
     }
@@ -355,10 +374,10 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
         return Ok(ArchFamily::BailingMoe3);
     }
     // A recognised near miss gets its own reason. The alternative — dropping
-    // the reader into a list of fourteen names that looks like it *should*
-    // contain theirs — is what makes an out-of-tree alias mechanism sound
-    // attractive, and an alias is the one answer that produces wrong output
-    // instead of no output.
+    // the reader into the whole accepted-name list, which looks like it
+    // *should* contain theirs — is what makes an out-of-tree alias mechanism
+    // sound attractive, and an alias is the one answer that produces wrong
+    // output instead of no output.
     if let Some((_, why)) = KNOWN_UNSUPPORTED
         .iter()
         .find(|(name, _)| *name == architecture)
@@ -373,26 +392,42 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     bail!(
         "architecture '{architecture}' is not yet supported by orangu-server \
          (supported: {})",
-        LLAMA_STYLE_ARCHITECTURES
-            .iter()
-            .chain(GEMMA_ARCHITECTURES)
-            .chain(QWEN35MOE_ARCHITECTURES)
-            .chain(QWEN35_ARCHITECTURES)
-            .chain(QWEN3NEXT_ARCHITECTURES)
-            .chain(DFLASH_ARCHITECTURES)
-            .chain(DEEPSEEK4_ARCHITECTURES)
-            .chain(GLM_DSA_ARCHITECTURES)
-            .chain(KIMI_K3_ARCHITECTURES)
-            .chain(PHI3_ARCHITECTURES)
-            .chain(MISTRAL_ARCHITECTURES)
-            .chain(MUSE_ARCHITECTURES)
-            .chain(INKLING_ARCHITECTURES)
-            .chain(NEMOTRON_ARCHITECTURES)
-            .chain(BAILINGMOE3_ARCHITECTURES)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
+        supported_architecture_names().join(", ")
     );
+}
+
+/// Every `general.architecture` string this build serves, in family order.
+///
+/// One list rather than a second copy inlined into the error message above:
+/// the two had already drifted once — `qwen4exp` resolved fine but was
+/// missing from the listing, so a user with an unsupported file was shown a
+/// roster that omitted a family this build serves. That is worse than a
+/// stale comment, because the listing is exactly what someone reads to
+/// decide whether to go looking for a different quant or give up.
+///
+/// [`tests::the_supported_listing_names_every_family`] binds it to
+/// [`ArchFamily`] through an exhaustive `match`, so adding a variant without
+/// adding its names stops compiling rather than shipping a short list.
+fn supported_architecture_names() -> Vec<&'static str> {
+    LLAMA_STYLE_ARCHITECTURES
+        .iter()
+        .chain(GEMMA_ARCHITECTURES)
+        .chain(QWEN35MOE_ARCHITECTURES)
+        .chain(QWEN35_ARCHITECTURES)
+        .chain(QWEN3NEXT_ARCHITECTURES)
+        .chain(QWEN4EXP_ARCHITECTURES)
+        .chain(DFLASH_ARCHITECTURES)
+        .chain(DEEPSEEK4_ARCHITECTURES)
+        .chain(GLM_DSA_ARCHITECTURES)
+        .chain(KIMI_K3_ARCHITECTURES)
+        .chain(PHI3_ARCHITECTURES)
+        .chain(MISTRAL_ARCHITECTURES)
+        .chain(MUSE_ARCHITECTURES)
+        .chain(INKLING_ARCHITECTURES)
+        .chain(NEMOTRON_ARCHITECTURES)
+        .chain(BAILINGMOE3_ARCHITECTURES)
+        .cloned()
+        .collect()
 }
 
 /// The architecture label and whether this build can actually load a model,
@@ -1968,6 +2003,111 @@ mod tests {
         for arch in QWEN3NEXT_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen3Next);
         }
+    }
+
+    /// **The listing and the resolver must name the same set.**
+    ///
+    /// `qwen4exp` resolved correctly while being absent from the "supported:"
+    /// error for the whole of its first implementation: two hand-maintained
+    /// lists, one updated. The `match` below is exhaustive over
+    /// [`ArchFamily`], so a new variant fails to *compile* until it names a
+    /// representative architecture string — and that string is then asserted
+    /// to be both in the listing and resolvable to the variant it stands for.
+    #[test]
+    fn the_supported_listing_names_every_family() {
+        let listing = supported_architecture_names();
+        // Every family, with one name that must appear in the listing.
+        // Adding an `ArchFamily` variant breaks this match, which is the
+        // point.
+        let representatives: &[(ArchFamily, &str)] = &[
+            (ArchFamily::LlamaStyle, "llama"),
+            (ArchFamily::Gemma, "gemma3"),
+            (ArchFamily::Qwen35Moe, "qwen35moe"),
+            (ArchFamily::Qwen35, "qwen35"),
+            (ArchFamily::Qwen3Next, "qwen3next"),
+            (ArchFamily::Qwen4Exp, "qwen4exp"),
+            (ArchFamily::GlmDsa, "glm-dsa"),
+            (ArchFamily::KimiK3, "kimi-k3"),
+            (ArchFamily::DFlash, "dflash"),
+            (ArchFamily::Deepseek4, "deepseek4"),
+            (ArchFamily::Phi3, "phi3"),
+            (ArchFamily::Mistral3, "mistral3"),
+            (ArchFamily::Muse, "muse-glimmer"),
+            (ArchFamily::Inkling, "inkling"),
+            (ArchFamily::NemotronHMoe, "nemotron_h_moe"),
+            (ArchFamily::BailingMoe3, "bailingmoe3"),
+        ];
+        for &(family, name) in representatives {
+            // The exhaustiveness guard: this match has no wildcard, so a new
+            // variant stops compiling here until it is added above.
+            let label = match family {
+                ArchFamily::LlamaStyle => "LlamaStyle",
+                ArchFamily::Gemma => "Gemma",
+                ArchFamily::Qwen35Moe => "Qwen35Moe",
+                ArchFamily::Qwen35 => "Qwen35",
+                ArchFamily::Qwen3Next => "Qwen3Next",
+                ArchFamily::Qwen4Exp => "Qwen4Exp",
+                ArchFamily::GlmDsa => "GlmDsa",
+                ArchFamily::KimiK3 => "KimiK3",
+                ArchFamily::DFlash => "DFlash",
+                ArchFamily::Deepseek4 => "Deepseek4",
+                ArchFamily::Phi3 => "Phi3",
+                ArchFamily::Mistral3 => "Mistral3",
+                ArchFamily::Muse => "Muse",
+                ArchFamily::Inkling => "Inkling",
+                ArchFamily::NemotronHMoe => "NemotronHMoe",
+                ArchFamily::BailingMoe3 => "BailingMoe3",
+            };
+            assert!(
+                listing.contains(&name),
+                "{label}'s '{name}' resolves but is missing from the supported listing"
+            );
+            assert_eq!(resolve_arch_family(name).unwrap(), family, "for '{name}'");
+        }
+    }
+
+    /// Every name the listing offers must actually load — a listing that
+    /// promises a string `resolve_arch_family` then rejects is the same
+    /// defect in the other direction.
+    #[test]
+    fn every_listed_architecture_resolves() {
+        for name in supported_architecture_names() {
+            assert!(
+                resolve_arch_family(name).is_ok(),
+                "'{name}' is listed as supported but does not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_qwen4exp() {
+        for arch in QWEN4EXP_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Qwen4Exp);
+        }
+    }
+
+    /// The Qwen4 preview is a *different* family from the Qwen 3.5 hybrids
+    /// it borrows its two sub-layers from, and the near-miss names around
+    /// it must not resolve to it. `qwen4exp` is one character from
+    /// `qwen3next` in the places that matter — both are hybrid Qwen MoE
+    /// files with `ssm_*` tensors — and reading one as the other would run
+    /// a plain residual add where a hyper-connection mixer belongs: no
+    /// missing tensor, no error, and fluent nonsense out.
+    #[test]
+    fn the_qwen_hybrid_families_stay_distinct() {
+        assert_eq!(
+            resolve_arch_family("qwen3next").unwrap(),
+            ArchFamily::Qwen3Next
+        );
+        assert_eq!(
+            resolve_arch_family("qwen35moe").unwrap(),
+            ArchFamily::Qwen35Moe
+        );
+        assert_eq!(
+            resolve_arch_family("qwen4exp").unwrap(),
+            ArchFamily::Qwen4Exp
+        );
+        assert!(resolve_arch_family("qwen4").is_err());
     }
 
     /// Every near miss refuses with **its own** reason, naming the family it

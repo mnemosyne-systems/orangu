@@ -65,7 +65,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,nemotron,qwen35moe,qwen35,qwen3next,deepseek4,glm,kimi3,dflash}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,nemotron,qwen35moe,qwen35,qwen3next,qwen4exp,deepseek4,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -1276,6 +1276,39 @@ mod`), so adding a family is additive rather than a rewrite:
   the same `MoeFfn` as `qwen35moe.rs`. It differs only in which recurrent
   tensor-naming variants its files use, which the trunk's loader already
   takes, so this module carries no forward pass of its own.
+- `qwen4exp.rs` — the Qwen4 preview (`general.architecture = "qwen4exp"`,
+  confirmed against upstream `src/models/qwen4exp.cpp` and the block
+  bookkeeping in `src/llama-memory-hybrid-idx.cpp`), e.g.
+  `unsloth/Qwen3.8-Flash-Next-GGUF`. It reuses the trunk's *sub-layers* but
+  not its block: the full-attention half is `qwen_hybrid::FullAttn`, the
+  linear half is `qwen_hybrid::Recurrent` (differing by exactly one
+  nonlinearity — the delta net's output gate is `sigmoid` here, not `silu`,
+  which `qwen_hybrid::OutputGate` names), and the FFN is the same
+  `MoeFfn` as `qwen35moe.rs` at 512 experts and top-10. What is only in
+  this module is what has no counterpart on the trunk. **Hyper-connections**
+  replace both norms *and* the residual add: the state between sub-layers
+  is `hyper_connection.count` parallel streams, and there is no
+  `output_norm.weight` in the file at all — the final mixer's own norm is
+  the last one in the model. Unlike `deepseek4.rs`'s four streams, this
+  mixer is a low-rank `down`/`silu`/`up` `sigmoid` gate with a plain mean
+  collapse and a `2 * sigmoid` scatter, with no Sinkhorn anywhere; the two
+  share the shape of the idea and none of the arithmetic, which is why they
+  share no code. **Query-sparse attention**: a four-head indexer per
+  full-attention layer scores whole blocks of
+  `attention.compress_ratios` positions by their members' mean key and
+  hands `FullAttn::forward` a gathered key set instead of a window. Below
+  `indexer.top_k + ratio - 1` positions that set is every visible position,
+  so the batch takes the ordinary dense (GPU-capable) path instead.
+  **Per-layer embeddings**: the layers in `ple.layers` gather sixteen rows
+  of a 320-million-row n-gram hash table per token, gate the result against
+  the streams, and run a convolution dilated by the n-gram size over it.
+  Two consequences of that hash being over *token ids* rather than hidden
+  state: `KvCache::recent_tokens` exists so a chunked prefill's seam and a
+  decode step see the same predecessors a single-shot prefill would, and
+  the dilation is folded into the kernel at load
+  (`expand_dilated_kernel`) so the convolution can go through the same
+  `RecurrentLayerState::conv_step` — and the same rolling history,
+  carryover and slot persistence — as every other short convolution here.
 - `deepseek4.rs` — DeepSeek-V4 (`general.architecture = "deepseek4"`),
   e.g. `unsloth/DeepSeek-V4-Flash-0731-GGUF:IQ1_M`, confirmed against
   upstream `src/models/deepseek4.cpp` and the block planner in
@@ -2973,6 +3006,7 @@ with a clear message if its variable is unset when the test is run
 | `ORANGU_TEST_LLAMA_MODEL` | `llama`-architecture forward-pass test | A local Llama-3.x Instruct `.gguf` file |
 | `ORANGU_TEST_MISTRAL_MODEL` | `mistral3` forward-pass test | A local Ministral-3 `.gguf` file |
 | `ORANGU_TEST_PHI_MODEL` | phi3 real-model forward-pass test | A local Phi-3/Phi-4-mini `.gguf` file |
+| `ORANGU_TEST_QWEN4EXP_MODEL` | `qwen4exp` forward-pass test | A local Qwen3.8-Flash-Next `.gguf` (the first shard of a split model) |
 
 ### HTTP layer and web UI
 

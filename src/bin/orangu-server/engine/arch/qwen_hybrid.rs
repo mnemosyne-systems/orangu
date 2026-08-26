@@ -83,8 +83,10 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::engine::backend::{Backend, MatmulOp};
-use crate::engine::kv_cache::{KvCache, RecurrentSpec};
+use crate::engine::kv_cache::{KvCache, LayerCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
 use crate::engine::tensor;
@@ -219,8 +221,26 @@ pub(crate) fn recurrent_layer_mask(loaded: &LoadedModel, n_layer: usize) -> Vec<
         })
 }
 
+/// A full-attention layer of the trunk: the sub-layer itself, plus the two
+/// RMSNorms this trunk brackets it and its FFN with.
 pub(crate) struct FullAttnWeights {
     attn_norm: Vec<f32>,
+    post_attention_norm: Vec<f32>,
+    attn: FullAttn,
+}
+
+/// One full-attention sub-layer's projections — everything *between* the
+/// norms that bracket it, and nothing about those norms.
+///
+/// Split out from [`FullAttnWeights`] because [`super::qwen4exp`] runs this
+/// exact computation with no pre-norm at all: its residual stream is
+/// `hyper_connection.count` parallel streams, and the mixer that collapses
+/// them into the one vector a sub-layer reads is also the only
+/// normalization that sub-layer gets. From the joint query+gate projection
+/// through to the output projection the two are the same, so it is written
+/// once here rather than copied — the same reason this module exists at
+/// all.
+pub(crate) struct FullAttn {
     /// Joint query+gate projection: per head, `[Q(head_dim), gate(head_dim)]`
     /// interleaved — `out_dim == 2 * n_head * head_dim`.
     wq: QuantMatrix,
@@ -229,10 +249,9 @@ pub(crate) struct FullAttnWeights {
     attn_k_norm: Vec<f32>,
     wv: QuantMatrix,
     wo: QuantMatrix,
-    post_attention_norm: Vec<f32>,
     /// Dense index into `KvCache::layers` (every full-attention layer has
     /// its own cache — no cross-layer sharing in this architecture).
-    cache_index: usize,
+    pub(crate) cache_index: usize,
 }
 
 /// Where a recurrent layer's per-head beta and alpha come from — two
@@ -245,8 +264,17 @@ enum BetaAlpha {
     Packed(QuantMatrix),
 }
 
+/// A gated-DeltaNet layer of the trunk: the sub-layer itself, plus the two
+/// RMSNorms this trunk brackets it and its FFN with.
 pub(crate) struct RecurrentWeights {
     attn_norm: Vec<f32>,
+    post_attention_norm: Vec<f32>,
+    recurrent: Recurrent,
+}
+
+/// One gated-DeltaNet sub-layer's weights — everything *between* the norms
+/// that bracket it, for the same reason [`FullAttn`] is split out.
+pub(crate) struct Recurrent {
     /// Joint Q/K/V mix: `[q(key_dim), k(key_dim), v(value_dim)]`.
     wqkv: QuantMatrix,
     wqkv_gate: QuantMatrix,
@@ -261,21 +289,40 @@ pub(crate) struct RecurrentWeights {
     /// `[head_v_dim]` — the gated output RMSNorm's learned weight.
     ssm_norm: Vec<f32>,
     ssm_out: QuantMatrix,
-    post_attention_norm: Vec<f32>,
     /// Dense index into `KvCache::recurrent`.
-    cache_index: usize,
+    pub(crate) cache_index: usize,
+}
+
+/// What multiplies a gated-DeltaNet layer's normed output — the one
+/// numerical difference between this trunk's own architectures and
+/// [`super::qwen4exp`]'s otherwise identical delta net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputGate {
+    /// `silu(z)` — `qwen35`, `qwen35moe`, `qwen3next`.
+    Silu,
+    /// `sigmoid(z)` — `qwen4exp` (its `build_norm_gated`).
+    Sigmoid,
+}
+
+impl OutputGate {
+    fn apply(self, z: f32) -> f32 {
+        match self {
+            Self::Silu => tensor::silu(z),
+            Self::Sigmoid => tensor::sigmoid(z),
+        }
+    }
 }
 
 /// Per-layer tensor readers, so a loader body reads
 /// `blk.{i}.<suffix>` without repeating the name-building three times per
 /// architecture.
-struct LayerTensors<'a> {
-    loaded: &'a LoadedModel,
-    i: usize,
+pub(crate) struct LayerTensors<'a> {
+    pub(crate) loaded: &'a LoadedModel,
+    pub(crate) i: usize,
 }
 
 impl LayerTensors<'_> {
-    fn vec(&self, suffix: &str) -> Result<Vec<f32>> {
+    pub(crate) fn vec(&self, suffix: &str) -> Result<Vec<f32>> {
         let name = format!("blk.{}.{suffix}", self.i);
         Ok(self
             .loaded
@@ -284,21 +331,21 @@ impl LayerTensors<'_> {
             .0)
     }
 
-    fn matrix(&self, suffix: &str) -> Result<QuantMatrix> {
+    pub(crate) fn matrix(&self, suffix: &str) -> Result<QuantMatrix> {
         let name = format!("blk.{}.{suffix}", self.i);
         self.loaded
             .matrix(&name)
             .with_context(|| format!("loading {name}"))
     }
 
-    fn expert_matrix(&self, suffix: &str) -> Result<ExpertQuantMatrix> {
+    pub(crate) fn expert_matrix(&self, suffix: &str) -> Result<ExpertQuantMatrix> {
         let name = format!("blk.{}.{suffix}", self.i);
         self.loaded
             .expert_matrix(&name)
             .with_context(|| format!("loading {name}"))
     }
 
-    fn has(&self, suffix: &str) -> bool {
+    pub(crate) fn has(&self, suffix: &str) -> bool {
         self.loaded.has_tensor(&format!("blk.{}.{suffix}", self.i))
     }
 }
@@ -307,20 +354,180 @@ impl FullAttnWeights {
     fn load(t: &LayerTensors<'_>, cache_index: usize) -> Result<Self> {
         Ok(Self {
             attn_norm: t.vec("attn_norm.weight")?,
+            post_attention_norm: t.vec("post_attention_norm.weight")?,
+            attn: FullAttn::load(t, cache_index)?,
+        })
+    }
+}
+
+impl FullAttn {
+    pub(crate) fn load(t: &LayerTensors<'_>, cache_index: usize) -> Result<Self> {
+        Ok(Self {
             wq: t.matrix("attn_q.weight")?,
             attn_q_norm: t.vec("attn_q_norm.weight")?,
             wk: t.matrix("attn_k.weight")?,
             attn_k_norm: t.vec("attn_k_norm.weight")?,
             wv: t.matrix("attn_v.weight")?,
             wo: t.matrix("attn_output.weight")?,
-            post_attention_norm: t.vec("post_attention_norm.weight")?,
             cache_index,
         })
+    }
+
+    /// The sub-layer itself: `normed` (`[n_tokens, n_embd]`, already
+    /// whatever normalization the architecture puts in front of it) in, the
+    /// vector to add back into the residual stream out.
+    ///
+    /// `selection`, when given, names per token exactly which cached
+    /// positions that token may attend, in ascending order — the
+    /// block-sparse key set [`super::qwen4exp`]'s indexer picks. `None` is
+    /// ordinary causal attention over everything up to the token's own
+    /// position, which is what this trunk's own three architectures do and
+    /// what the shared (GPU-capable) `engine::attention` path implements.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward(
+        &self,
+        backend: &dyn Backend,
+        dims: &Dims,
+        cache: &mut KvCache,
+        normed: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        selection: Option<&[Vec<usize>]>,
+    ) -> Vec<f32> {
+        let eps = dims.rms_eps;
+        let head_dim = dims.head_dim;
+        let n_head = dims.n_head;
+        let n_head_kv = dims.n_head_kv;
+        let kv_dim = n_head_kv * head_dim;
+
+        // Joint Q+gate projection, K, and V are all independent projections
+        // of the same normed input — one batched dispatch instead of three
+        // sequential round-trips (see `Backend::matmul_batch`). Per head,
+        // the Q+gate projection is [Q(head_dim), gate(head_dim)].
+        let mut qgkv = backend.matmul_batch(&[
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wq,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wk,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wv,
+            },
+        ]);
+        let v = qgkv.pop().unwrap();
+        let mut k = qgkv.pop().unwrap();
+        let qg = qgkv.pop().unwrap();
+        let mut q = vec![0f32; n_tokens * n_head * head_dim];
+        let mut gate = vec![0f32; n_tokens * n_head * head_dim];
+        for t in 0..n_tokens {
+            for h in 0..n_head {
+                let src = &qg[t * n_head * 2 * head_dim + h * 2 * head_dim..];
+                q[t * n_head * head_dim + h * head_dim..t * n_head * head_dim + (h + 1) * head_dim]
+                    .copy_from_slice(&src[0..head_dim]);
+                gate[t * n_head * head_dim + h * head_dim
+                    ..t * n_head * head_dim + (h + 1) * head_dim]
+                    .copy_from_slice(&src[head_dim..2 * head_dim]);
+            }
+        }
+        tensor::rmsnorm_inplace(&mut q, &self.attn_q_norm, n_tokens * n_head, head_dim, eps);
+        for t in 0..n_tokens {
+            let pos = start_pos + t;
+            tensor::rope_apply_inplace(
+                &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
+                n_head,
+                head_dim,
+                dims.rope_dim,
+                pos,
+                dims.rope_freq_base,
+            );
+        }
+
+        tensor::rmsnorm_inplace(
+            &mut k,
+            &self.attn_k_norm,
+            n_tokens * n_head_kv,
+            head_dim,
+            eps,
+        );
+
+        let layer_cache = &mut cache.layers[self.cache_index];
+        for t in 0..n_tokens {
+            let pos = start_pos + t;
+            tensor::rope_apply_inplace(
+                &mut k[t * kv_dim..(t + 1) * kv_dim],
+                n_head_kv,
+                head_dim,
+                dims.rope_dim,
+                pos,
+                dims.rope_freq_base,
+            );
+            layer_cache.push(
+                &k[t * kv_dim..(t + 1) * kv_dim],
+                &v[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut attn_out: Vec<f32> = Vec::new();
+        match selection {
+            // Plain causal attention, on the GPU when the batch is wide
+            // enough -- `engine::attention` owns that choice for every
+            // architecture.
+            None => {
+                crate::engine::attention::attention(
+                    &mut attn_out,
+                    &q,
+                    layer_cache,
+                    &crate::engine::attention::Params {
+                        backend,
+                        // This layer's card — see `attention::Params::device`.
+                        device: self.wo.device(),
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        scale,
+                        causal: true,
+                        n_swa: 0,
+                        start_pos,
+                        n_tokens,
+                    },
+                    |t| (0, start_pos + t),
+                );
+            }
+            // A gathered key set cannot be expressed as a window, so the
+            // shared path has nothing to offer here and this is the plain
+            // per-head softmax over the chosen rows.
+            Some(chosen) => {
+                attn_out = attend_selected(&q, layer_cache, chosen, dims, scale);
+            }
+        }
+        // Gate the attention output (sigmoid), then project.
+        for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
+            *o *= tensor::sigmoid(g);
+        }
+        backend.matmul(&attn_out, n_tokens, &self.wo)
     }
 }
 
 impl RecurrentWeights {
     fn load(t: &LayerTensors<'_>, dims: &Dims, cache_index: usize) -> Result<Self> {
+        Ok(Self {
+            attn_norm: t.vec("attn_norm.weight")?,
+            post_attention_norm: t.vec("post_attention_norm.weight")?,
+            recurrent: Recurrent::load(t, dims, cache_index)?,
+        })
+    }
+}
+
+impl Recurrent {
+    pub(crate) fn load(t: &LayerTensors<'_>, dims: &Dims, cache_index: usize) -> Result<Self> {
         let qkv_out_dim = dims.conv_channels();
         let value_dim = dims.value_dim();
         let (wqkv, wqkv_gate) = if t.has("attn_qkv.weight") {
@@ -364,7 +571,6 @@ impl RecurrentWeights {
         };
 
         Ok(Self {
-            attn_norm: t.vec("attn_norm.weight")?,
             wqkv,
             wqkv_gate,
             beta_alpha,
@@ -373,9 +579,173 @@ impl RecurrentWeights {
             ssm_a: t.vec("ssm_a")?,
             ssm_norm: t.vec("ssm_norm.weight")?,
             ssm_out: t.matrix("ssm_out.weight")?,
-            post_attention_norm: t.vec("post_attention_norm.weight")?,
             cache_index,
         })
+    }
+
+    /// The sub-layer itself: `normed` (`[n_tokens, n_embd]`) in, the vector
+    /// to add back into the residual stream out. `gate` picks the output
+    /// gate's nonlinearity — see [`OutputGate`].
+    pub(crate) fn forward(
+        &self,
+        backend: &dyn Backend,
+        dims: &Dims,
+        cache: &mut KvCache,
+        normed: &[f32],
+        n_tokens: usize,
+        gate: OutputGate,
+    ) -> Vec<f32> {
+        let n_embd = dims.n_embd;
+        let eps = dims.rms_eps;
+        let key_dim = dims.key_dim();
+        let value_dim = dims.value_dim();
+        let head_dim = dims.ssm_head_dim;
+        let n_k_heads = dims.ssm_n_group;
+        let n_v_heads = dims.ssm_dt_rank;
+        let q_scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Every projection here is of the same normed input — one batched
+        // dispatch instead of three or four sequential round-trips (see
+        // `Backend::matmul_batch`).
+        let mut ops = vec![
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wqkv,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wqkv_gate,
+            },
+        ];
+        match &self.beta_alpha {
+            BetaAlpha::Split { beta, alpha } => {
+                ops.push(MatmulOp {
+                    x: normed,
+                    n_tokens,
+                    w: beta,
+                });
+                ops.push(MatmulOp {
+                    x: normed,
+                    n_tokens,
+                    w: alpha,
+                });
+            }
+            BetaAlpha::Packed(packed) => ops.push(MatmulOp {
+                x: normed,
+                n_tokens,
+                w: packed,
+            }),
+        }
+        let mut projected = backend.matmul_batch(&ops);
+        let (mut beta, alpha) = match &self.beta_alpha {
+            BetaAlpha::Split { .. } => {
+                let alpha = projected.pop().unwrap();
+                let beta = projected.pop().unwrap();
+                (beta, alpha)
+            }
+            BetaAlpha::Packed(_) => {
+                let mixed = projected.pop().unwrap();
+                split_beta_alpha(&mixed, n_tokens, n_k_heads, n_v_heads)
+            }
+        };
+        let z = projected.pop().unwrap();
+        let qkv_mixed = projected.pop().unwrap();
+
+        for b in beta.iter_mut() {
+            *b = tensor::sigmoid(*b);
+        }
+        let mut decay = vec![0f32; n_tokens * n_v_heads];
+        for t in 0..n_tokens {
+            for h in 0..n_v_heads {
+                let a = alpha[t * n_v_heads + h] + self.ssm_dt_bias[h];
+                let log_decay = tensor::softplus(a) * self.ssm_a[h];
+                decay[t * n_v_heads + h] = log_decay.exp();
+            }
+        }
+
+        let mut sub_out = vec![0f32; n_tokens * n_embd];
+        let ssm_state = &mut cache.recurrent[self.cache_index];
+        for t in 0..n_tokens {
+            let mixed =
+                &qkv_mixed[t * (2 * key_dim + value_dim)..(t + 1) * (2 * key_dim + value_dim)];
+            let mut conv_out = ssm_state.conv_step(mixed, &self.ssm_conv1d);
+            for v in conv_out.iter_mut() {
+                *v = tensor::silu(*v);
+            }
+            let (q_conv, rest) = conv_out.split_at_mut(key_dim);
+            let (k_conv, v_conv) = rest.split_at_mut(key_dim);
+            debug_assert_eq!(v_conv.len(), value_dim);
+
+            for h in 0..n_k_heads {
+                tensor::l2_norm_inplace(&mut q_conv[h * head_dim..(h + 1) * head_dim], eps);
+                tensor::l2_norm_inplace(&mut k_conv[h * head_dim..(h + 1) * head_dim], eps);
+            }
+            for v in q_conv.iter_mut() {
+                *v *= q_scale;
+            }
+
+            let mut attn_out = vec![0f32; value_dim];
+            for vh in 0..n_v_heads {
+                // Tiled (not block-grouped) broadcast — matches
+                // `ggml_compute_forward_repeat_f32`'s tiling semantics for
+                // this specific mismatched-head-count repeat, distinct from
+                // standard attention's block-grouped GQA.
+                let kh = vh % n_k_heads;
+                let qh = &q_conv[kh * head_dim..(kh + 1) * head_dim];
+                let khv = &k_conv[kh * head_dim..(kh + 1) * head_dim];
+                let vhv = &v_conv[vh * head_dim..(vh + 1) * head_dim];
+                let beta_h = beta[t * n_v_heads + vh];
+                let decay_h = decay[t * n_v_heads + vh];
+
+                let state = ssm_state.delta_state_mut(vh);
+                for s in state.iter_mut() {
+                    *s *= decay_h;
+                }
+                // sk[a] = sum_b k[b] * S[b][a]  (k^T S)
+                let mut sk = vec![0f32; head_dim];
+                for a in 0..head_dim {
+                    let mut sum = 0f32;
+                    for b in 0..head_dim {
+                        sum += khv[b] * state[b * head_dim + a];
+                    }
+                    sk[a] = sum;
+                }
+                let d: Vec<f32> = (0..head_dim).map(|a| beta_h * (vhv[a] - sk[a])).collect();
+                for i in 0..head_dim {
+                    for j in 0..head_dim {
+                        state[i * head_dim + j] += khv[i] * d[j];
+                    }
+                }
+                // o[j] = sum_i q[i] * S_new[i][j]  (q^T S_new)
+                let out = &mut attn_out[vh * head_dim..(vh + 1) * head_dim];
+                for j in 0..head_dim {
+                    let mut sum = 0f32;
+                    for i in 0..head_dim {
+                        sum += qh[i] * state[i * head_dim + j];
+                    }
+                    out[j] = sum;
+                }
+            }
+
+            // Gated RMSNorm, per head: rmsnorm(attn_out_h) * gate(z_h).
+            for h in 0..n_v_heads {
+                let mut normed_h = attn_out[h * head_dim..(h + 1) * head_dim].to_vec();
+                tensor::rmsnorm_inplace(&mut normed_h, &self.ssm_norm, 1, head_dim, eps);
+                let z_h = &z[t * value_dim + h * head_dim..t * value_dim + (h + 1) * head_dim];
+                for (o, (n, zv)) in attn_out[h * head_dim..(h + 1) * head_dim]
+                    .iter_mut()
+                    .zip(normed_h.iter().zip(z_h.iter()))
+                {
+                    *o = *n * gate.apply(*zv);
+                }
+            }
+
+            let projected = backend.matmul(&attn_out, 1, &self.ssm_out);
+            sub_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&projected);
+        }
+        sub_out
     }
 }
 
@@ -495,8 +865,9 @@ pub(crate) struct MoeFfn {
 
 impl MoeFfn {
     /// Loads one layer's MoE FFN. `n_expert_used` comes from the file's
-    /// `expert_used_count`; both architectures require it.
-    fn load(t: &LayerTensors<'_>, n_expert_used: usize) -> Result<Self> {
+    /// `expert_used_count`; every architecture that uses this FFN requires
+    /// it.
+    pub(crate) fn load(t: &LayerTensors<'_>, n_expert_used: usize) -> Result<Self> {
         Ok(Self {
             gate_inp: t.matrix("ffn_gate_inp.weight")?,
             gate_exps: t.expert_matrix("ffn_gate_exps.weight")?,
@@ -721,6 +1092,55 @@ impl HybridFfn for MoeFfn {
     }
 }
 
+/// GQA attention restricted, per query, to a gathered set of cached
+/// positions — the block-sparse counterpart of the dense window
+/// `engine::attention` implements, used only by [`super::qwen4exp`]'s
+/// indexer-selected layers.
+///
+/// `chosen[t]` is token `t`'s key set, ascending. It is a gather rather than
+/// a mask because the sets are small next to the cache they are drawn from —
+/// that is the entire point of the indexer — so materializing an `-inf` mask
+/// the width of the cache would cost more than the attention it guards.
+///
+/// Softmax is taken over the gathered scores alone, which is what masking
+/// everything else to `-inf` means; the caller has already excluded any
+/// position past the query's own, so there is no separate causal step here.
+fn attend_selected(
+    q: &[f32],
+    cache: &LayerCache,
+    chosen: &[Vec<usize>],
+    dims: &Dims,
+    scale: f32,
+) -> Vec<f32> {
+    let head_dim = dims.head_dim;
+    let n_head = dims.n_head;
+    let n_head_kv = dims.n_head_kv;
+    let group = n_head / n_head_kv;
+    let n_tokens = chosen.len();
+
+    // Over (token, head) pairs rather than over tokens: decode is one token,
+    // and parallelizing the outer axis alone would leave every core but one
+    // idle for exactly the call that runs most often.
+    let mut out = vec![0f32; n_tokens * n_head * head_dim];
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(i, dst)| {
+            let (t, h) = (i / n_head, i % n_head);
+            let kv_head = h / group;
+            let keys = &chosen[t];
+            let q_h = &q[i * head_dim..(i + 1) * head_dim];
+            let mut scores: Vec<f32> = keys
+                .iter()
+                .map(|&p| tensor::dot(q_h, cache.key_at(p, kv_head, head_dim)) * scale)
+                .collect();
+            tensor::softmax_inplace(&mut scores);
+            for (&p, &w) in keys.iter().zip(scores.iter()) {
+                tensor::axpy_inplace(dst, cache.value_at(p, kv_head, head_dim), w);
+            }
+        });
+    out
+}
+
 enum Layer<F> {
     FullAttn(FullAttnWeights, F),
     Recurrent(RecurrentWeights, F),
@@ -923,115 +1343,24 @@ impl<F: HybridFfn> Trunk<F> {
             ffn_work,
         } = scratch;
         let n_embd = self.dims.n_embd;
-        let eps = self.dims.rms_eps;
-        let head_dim = self.dims.head_dim;
-        let n_head = self.dims.n_head;
-        let n_head_kv = self.dims.n_head_kv;
-        let kv_dim = n_head_kv * head_dim;
 
-        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n_tokens, n_embd, eps);
-
-        // Joint Q+gate projection, K, and V are all independent projections
-        // of the same normed input — one batched dispatch instead of three
-        // sequential round-trips (see `Backend::matmul_batch`). Per head,
-        // the Q+gate projection is [Q(head_dim), gate(head_dim)].
-        let mut qgkv = self.backend.matmul_batch(&[
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wq,
-            },
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wk,
-            },
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wv,
-            },
-        ]);
-        let v = qgkv.pop().unwrap();
-        let mut k = qgkv.pop().unwrap();
-        let qg = qgkv.pop().unwrap();
-        let mut q = vec![0f32; n_tokens * n_head * head_dim];
-        let mut gate = vec![0f32; n_tokens * n_head * head_dim];
-        for t in 0..n_tokens {
-            for h in 0..n_head {
-                let src = &qg[t * n_head * 2 * head_dim + h * 2 * head_dim..];
-                q[t * n_head * head_dim + h * head_dim..t * n_head * head_dim + (h + 1) * head_dim]
-                    .copy_from_slice(&src[0..head_dim]);
-                gate[t * n_head * head_dim + h * head_dim
-                    ..t * n_head * head_dim + (h + 1) * head_dim]
-                    .copy_from_slice(&src[head_dim..2 * head_dim]);
-            }
-        }
-        tensor::rmsnorm_inplace(&mut q, &layer.attn_q_norm, n_tokens * n_head, head_dim, eps);
-        for t in 0..n_tokens {
-            let pos = start_pos + t;
-            tensor::rope_apply_inplace(
-                &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
-                n_head,
-                head_dim,
-                self.dims.rope_dim,
-                pos,
-                self.dims.rope_freq_base,
-            );
-        }
-
-        tensor::rmsnorm_inplace(
-            &mut k,
-            &layer.attn_k_norm,
-            n_tokens * n_head_kv,
-            head_dim,
-            eps,
+        tensor::rmsnorm_into(
+            normed,
+            x,
+            &layer.attn_norm,
+            n_tokens,
+            n_embd,
+            self.dims.rms_eps,
         );
-
-        let layer_cache = &mut cache.layers[layer.cache_index];
-        for t in 0..n_tokens {
-            let pos = start_pos + t;
-            tensor::rope_apply_inplace(
-                &mut k[t * kv_dim..(t + 1) * kv_dim],
-                n_head_kv,
-                head_dim,
-                self.dims.rope_dim,
-                pos,
-                self.dims.rope_freq_base,
-            );
-            layer_cache.push(
-                &k[t * kv_dim..(t + 1) * kv_dim],
-                &v[t * kv_dim..(t + 1) * kv_dim],
-            );
-        }
-
-        // Plain causal attention, on the GPU when the batch is wide enough --
-        // `engine::attention` owns that choice for every architecture.
-        let mut attn_out: Vec<f32> = Vec::new();
-        crate::engine::attention::attention(
-            &mut attn_out,
-            &q,
-            layer_cache,
-            &crate::engine::attention::Params {
-                backend: self.backend.as_ref(),
-                // This layer's card — see `attention::Params::device`.
-                device: layer.wo.device(),
-                n_head,
-                n_head_kv,
-                head_dim,
-                scale: 1.0 / (head_dim as f32).sqrt(),
-                causal: true,
-                n_swa: 0,
-                start_pos,
-                n_tokens,
-            },
-            |t| (0, start_pos + t),
+        let sub_out = layer.attn.forward(
+            self.backend.as_ref(),
+            &self.dims,
+            cache,
+            normed,
+            n_tokens,
+            start_pos,
+            None,
         );
-        // Gate the attention output (sigmoid), then project.
-        for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
-            *o *= tensor::sigmoid(g);
-        }
-        let sub_out = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
 
         tensor::add_inplace(x, &sub_out);
         self.apply_ffn(
@@ -1062,157 +1391,23 @@ impl<F: HybridFfn> Trunk<F> {
             ffn_work,
         } = scratch;
         let n_embd = self.dims.n_embd;
-        let eps = self.dims.rms_eps;
-        let key_dim = self.dims.key_dim();
-        let value_dim = self.dims.value_dim();
-        let head_dim = self.dims.ssm_head_dim;
-        let n_k_heads = self.dims.ssm_n_group;
-        let n_v_heads = self.dims.ssm_dt_rank;
-        let q_scale = 1.0 / (head_dim as f32).sqrt();
 
-        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n_tokens, n_embd, eps);
-
-        // Every projection here is of the same normed input — one batched
-        // dispatch instead of three or four sequential round-trips (see
-        // `Backend::matmul_batch`).
-        let mut ops = vec![
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wqkv,
-            },
-            MatmulOp {
-                x: normed,
-                n_tokens,
-                w: &layer.wqkv_gate,
-            },
-        ];
-        match &layer.beta_alpha {
-            BetaAlpha::Split { beta, alpha } => {
-                ops.push(MatmulOp {
-                    x: normed,
-                    n_tokens,
-                    w: beta,
-                });
-                ops.push(MatmulOp {
-                    x: normed,
-                    n_tokens,
-                    w: alpha,
-                });
-            }
-            BetaAlpha::Packed(packed) => ops.push(MatmulOp {
-                x: normed,
-                n_tokens,
-                w: packed,
-            }),
-        }
-        let mut projected = self.backend.matmul_batch(&ops);
-        let (mut beta, alpha) = match &layer.beta_alpha {
-            BetaAlpha::Split { .. } => {
-                let alpha = projected.pop().unwrap();
-                let beta = projected.pop().unwrap();
-                (beta, alpha)
-            }
-            BetaAlpha::Packed(_) => {
-                let mixed = projected.pop().unwrap();
-                split_beta_alpha(&mixed, n_tokens, n_k_heads, n_v_heads)
-            }
-        };
-        let z = projected.pop().unwrap();
-        let qkv_mixed = projected.pop().unwrap();
-
-        for b in beta.iter_mut() {
-            *b = tensor::sigmoid(*b);
-        }
-        let mut decay = vec![0f32; n_tokens * n_v_heads];
-        for t in 0..n_tokens {
-            for h in 0..n_v_heads {
-                let a = alpha[t * n_v_heads + h] + layer.ssm_dt_bias[h];
-                let log_decay = tensor::softplus(a) * layer.ssm_a[h];
-                decay[t * n_v_heads + h] = log_decay.exp();
-            }
-        }
-
-        let mut sub_out = vec![0f32; n_tokens * n_embd];
-        let ssm_state = &mut cache.recurrent[layer.cache_index];
-        for t in 0..n_tokens {
-            let mixed =
-                &qkv_mixed[t * (2 * key_dim + value_dim)..(t + 1) * (2 * key_dim + value_dim)];
-            let mut conv_out = ssm_state.conv_step(mixed, &layer.ssm_conv1d);
-            for v in conv_out.iter_mut() {
-                *v = tensor::silu(*v);
-            }
-            let (q_conv, rest) = conv_out.split_at_mut(key_dim);
-            let (k_conv, v_conv) = rest.split_at_mut(key_dim);
-            debug_assert_eq!(v_conv.len(), value_dim);
-
-            for h in 0..n_k_heads {
-                tensor::l2_norm_inplace(&mut q_conv[h * head_dim..(h + 1) * head_dim], eps);
-                tensor::l2_norm_inplace(&mut k_conv[h * head_dim..(h + 1) * head_dim], eps);
-            }
-            for v in q_conv.iter_mut() {
-                *v *= q_scale;
-            }
-
-            let mut attn_out = vec![0f32; value_dim];
-            for vh in 0..n_v_heads {
-                // Tiled (not block-grouped) broadcast — matches
-                // `ggml_compute_forward_repeat_f32`'s tiling semantics for
-                // this specific mismatched-head-count repeat, distinct from
-                // standard attention's block-grouped GQA.
-                let kh = vh % n_k_heads;
-                let qh = &q_conv[kh * head_dim..(kh + 1) * head_dim];
-                let khv = &k_conv[kh * head_dim..(kh + 1) * head_dim];
-                let vhv = &v_conv[vh * head_dim..(vh + 1) * head_dim];
-                let beta_h = beta[t * n_v_heads + vh];
-                let decay_h = decay[t * n_v_heads + vh];
-
-                let state = ssm_state.delta_state_mut(vh);
-                for s in state.iter_mut() {
-                    *s *= decay_h;
-                }
-                // sk[a] = sum_b k[b] * S[b][a]  (k^T S)
-                let mut sk = vec![0f32; head_dim];
-                for a in 0..head_dim {
-                    let mut sum = 0f32;
-                    for b in 0..head_dim {
-                        sum += khv[b] * state[b * head_dim + a];
-                    }
-                    sk[a] = sum;
-                }
-                let d: Vec<f32> = (0..head_dim).map(|a| beta_h * (vhv[a] - sk[a])).collect();
-                for i in 0..head_dim {
-                    for j in 0..head_dim {
-                        state[i * head_dim + j] += khv[i] * d[j];
-                    }
-                }
-                // o[j] = sum_i q[i] * S_new[i][j]  (q^T S_new)
-                let out = &mut attn_out[vh * head_dim..(vh + 1) * head_dim];
-                for j in 0..head_dim {
-                    let mut sum = 0f32;
-                    for i in 0..head_dim {
-                        sum += qh[i] * state[i * head_dim + j];
-                    }
-                    out[j] = sum;
-                }
-            }
-
-            // Gated RMSNorm, per head: rmsnorm(attn_out_h) * silu(z_h).
-            for h in 0..n_v_heads {
-                let mut normed_h = attn_out[h * head_dim..(h + 1) * head_dim].to_vec();
-                tensor::rmsnorm_inplace(&mut normed_h, &layer.ssm_norm, 1, head_dim, eps);
-                let z_h = &z[t * value_dim + h * head_dim..t * value_dim + (h + 1) * head_dim];
-                for (o, (n, zv)) in attn_out[h * head_dim..(h + 1) * head_dim]
-                    .iter_mut()
-                    .zip(normed_h.iter().zip(z_h.iter()))
-                {
-                    *o = *n * tensor::silu(*zv);
-                }
-            }
-
-            let projected = self.backend.matmul(&attn_out, 1, &layer.ssm_out);
-            sub_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&projected);
-        }
+        tensor::rmsnorm_into(
+            normed,
+            x,
+            &layer.attn_norm,
+            n_tokens,
+            n_embd,
+            self.dims.rms_eps,
+        );
+        let sub_out = layer.recurrent.forward(
+            self.backend.as_ref(),
+            &self.dims,
+            cache,
+            normed,
+            n_tokens,
+            OutputGate::Silu,
+        );
 
         tensor::add_inplace(x, &sub_out);
         self.apply_ffn(
@@ -1289,6 +1484,110 @@ impl Trunk<DenseFfn> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::engine::backend::CpuBackend;
+    use crate::engine::kv_cache::KvCache;
+
+    fn test_dims(n_head: usize, n_head_kv: usize, head_dim: usize) -> Dims {
+        Dims {
+            n_embd: n_head * head_dim,
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim: head_dim,
+            rope_freq_base: 10000.0,
+            rms_eps: 1e-6,
+            ssm_d_conv: 4,
+            ssm_head_dim: 1,
+            ssm_n_group: 1,
+            ssm_dt_rank: 1,
+        }
+    }
+
+    /// **The gathered path must be a specialization of the dense one, not a
+    /// second opinion.** Given a selection that names every visible
+    /// position, `attend_selected` has to produce exactly what
+    /// `engine::attention` produces for the same query and cache — because
+    /// that is the case `qwen4exp` deliberately *skips* the indexer for, and
+    /// the two paths would otherwise disagree at the threshold where one
+    /// hands over to the other.
+    ///
+    /// This is also the only cheap check on the gather: with a real
+    /// indexer-selected subset there is nothing to compare against, so a
+    /// grouped-query-attention head mapping mistake (a `kv_head` off by a
+    /// group) would be invisible. Here `n_head_kv` is deliberately smaller
+    /// than `n_head`, so that mapping is exercised rather than degenerate.
+    #[test]
+    fn a_full_selection_reproduces_the_dense_attention_exactly() {
+        let (n_head, n_head_kv, head_dim) = (4usize, 2usize, 8usize);
+        let dims = test_dims(n_head, n_head_kv, head_dim);
+        let n_tokens = 3usize;
+        let kv_dim = n_head_kv * head_dim;
+
+        let mut cache = KvCache::new(1, 16, kv_dim);
+        for p in 0..n_tokens {
+            let k: Vec<f32> = (0..kv_dim)
+                .map(|i| ((p * 31 + i * 7) % 13) as f32 * 0.1)
+                .collect();
+            let v: Vec<f32> = (0..kv_dim)
+                .map(|i| ((p * 17 + i * 5) % 11) as f32 * 0.2)
+                .collect();
+            cache.layers[0].push(&k, &v);
+        }
+        let q: Vec<f32> = (0..n_tokens * n_head * head_dim)
+            .map(|i| ((i * 3) % 9) as f32 * 0.15 - 0.5)
+            .collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut dense: Vec<f32> = Vec::new();
+        crate::engine::attention::attention(
+            &mut dense,
+            &q,
+            &mut cache.layers[0],
+            &crate::engine::attention::Params {
+                backend: &CpuBackend,
+                device: 0,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                causal: true,
+                n_swa: 0,
+                start_pos: 0,
+                n_tokens,
+            },
+            |t| (0, t),
+        );
+
+        let selection: Vec<Vec<usize>> = (0..n_tokens).map(|t| (0..=t).collect()).collect();
+        let gathered = attend_selected(&q, &cache.layers[0], &selection, &dims, scale);
+
+        assert_eq!(gathered.len(), dense.len());
+        for (i, (g, d)) in gathered.iter().zip(dense.iter()).enumerate() {
+            assert!(
+                (g - d).abs() < 1e-5,
+                "element {i} differs: gathered {g}, dense {d}"
+            );
+        }
+    }
+
+    /// A selection that drops a position must actually drop it: the softmax
+    /// is taken over the gathered scores alone, so excluding the *only*
+    /// other key leaves the remaining one with all the weight and the
+    /// output is that key's value verbatim.
+    #[test]
+    fn an_excluded_position_contributes_nothing() {
+        let (n_head, n_head_kv, head_dim) = (1usize, 1usize, 4usize);
+        let dims = test_dims(n_head, n_head_kv, head_dim);
+        let mut cache = KvCache::new(1, 8, head_dim);
+        cache.layers[0].push(&[1.0, 0.0, 0.0, 0.0], &[9.0, 9.0, 9.0, 9.0]);
+        cache.layers[0].push(&[0.0, 1.0, 0.0, 0.0], &[1.0, 2.0, 3.0, 4.0]);
+
+        let q = vec![1.0f32, 1.0, 0.0, 0.0];
+        let out = attend_selected(&q, &cache.layers[0], &[vec![1]], &dims, 1.0);
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
     use super::split_beta_alpha;
 
     /// A packed `ssm_ba` row is grouped by K/V group, not by kind: within

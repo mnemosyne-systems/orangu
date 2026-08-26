@@ -20,7 +20,11 @@
 //! DeltaNet, dense FFN), `qwen35moe` (the same hybrid attention shape,
 //! mixture-of-experts FFN), `qwen3next` (the Qwen3-Next hybrid
 //! attention + MoE path — those three sharing one trunk in `qwen_hybrid`,
-//! which is not itself an architecture), `deepseek4` (DeepSeek-V4:
+//! which is not itself an architecture), `qwen4exp` (the Qwen4 preview:
+//! that same hybrid trunk's two sub-layers and MoE FFN, but strung on a
+//! four-stream hyper-connection residual, with block-sparse
+//! indexer-selected attention and an n-gram-hash per-layer embedding),
+//! `deepseek4` (DeepSeek-V4:
 //! hyper-connections,
 //! shared-key attention over a sliding window plus compressed blocks, and
 //! hash-routed experts), `glm` (GLM with DeepSeek sparse attention:
@@ -59,6 +63,7 @@ pub mod phi;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3next;
+pub mod qwen4exp;
 pub mod qwen_hybrid;
 
 use crate::engine::kv_cache::KvCache;

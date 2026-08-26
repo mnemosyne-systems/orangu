@@ -1,6 +1,6 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries fifteen architecture modules across fourteen
+`orangu-server` carries sixteen architecture modules across fifteen servable
 architecture families, and six device backends.
 Each one documents itself well; what has been missing is the thing you need
 *first* — where they sit, which of them you have to touch, and which rules are
@@ -117,7 +117,12 @@ Three modules are worth reading before writing a fourth of anything:
 `llama.rs` is the plain case, `gemma.rs` the elaborate one, and `qwen_hybrid.rs`
 is a *shared trunk* — `qwen35`, `qwen35moe` and `qwen3next` are 80–170 lines
 each because they delegate to it. If your new architecture is a variant of an
-existing one, that is the pattern to copy.
+existing one, that is the pattern to copy. `qwen4exp` is the partial case
+worth reading next: it reuses that trunk's two sub-layers and its MoE FFN
+but not its block, because what brackets a sub-layer there is a
+hyper-connection mixer rather than a norm — so the trunk exposes the
+sub-layers on their own (`FullAttn::forward`, `Recurrent::forward`) and
+`qwen4exp.rs` carries only what has no counterpart.
 
 ## The rules that are not obvious
 
@@ -194,6 +199,7 @@ Architectures, by what they are rather than by name:
 | `gemma` | QK-norm, per-layer sliding/full attention, cross-layer KV sharing, per-layer embeddings, GEGLU, logit softcapping, optional MoE |
 | `qwen_hybrid` | shared trunk: full attention alternating with gated-DeltaNet |
 | `qwen35`, `qwen35moe`, `qwen3next` | thin modules over that trunk — dense, MoE, and a different MoE layout |
+| `qwen4exp` | that trunk's two sub-layers on a four-stream hyper-connection residual, with indexer-selected block-sparse attention and an n-gram-hash per-layer embedding |
 | `deepseek4` | multi-head latent attention, block-compressed KV, routed experts |
 | `glm` | latent attention with a sparse-attention indexer |
 | `kda` | shared half-layers: Kimi Delta Attention, and absorbed latent attention with an optional rotation and output gate |
@@ -201,6 +207,14 @@ Architectures, by what they are rather than by name:
 | `inkling`, `muse` | their own attention or framing variants |
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
+
+Eighteen rows above, sixteen architecture modules: `qwen_hybrid` and `kda` are
+shared trunks, not architectures of their own. Sixteen `ArchFamily` variants,
+fifteen *servable* families: `dflash` is a module and a variant but resolves to
+the model it drafts for rather than serving itself. Those are the two
+conventions every count in the documentation uses — check them against this
+table and `ArchFamily` rather than against another prose count, which is how
+they drifted apart before.
 
 Backends, and they are not six of a kind:
 

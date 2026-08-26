@@ -1974,6 +1974,26 @@ pub struct KvCache {
     /// KV cache and a recurrent state have nothing in common). Empty for
     /// every other architecture.
     pub recurrent: Vec<RecurrentLayerState>,
+    /// The most recent token *ids* committed to this cache, oldest first —
+    /// the short lookback an architecture needs when part of its forward
+    /// pass is a function of the token ids themselves rather than of any
+    /// hidden state.
+    ///
+    /// Only `engine::arch::qwen4exp` writes or reads it: its per-layer
+    /// embedding hashes the current token together with its
+    /// `ple.ngram_size` minus one predecessors, and during decode — or at a
+    /// chunked prefill's seam — those predecessors are not in the batch.
+    /// Nothing else in a `KvCache` records them: an attention layer holds
+    /// projected keys, and a recurrent layer holds one evolving state.
+    /// Empty for every other architecture, and bounded to the few ids the
+    /// hash actually reaches back for, so this is not a second copy of the
+    /// conversation.
+    ///
+    /// It travels with the cache through every path a recurrent
+    /// architecture can take — carryover, adoption, duplication, and
+    /// slot persistence — so a restored or reused cache hashes the same
+    /// n-grams a freshly prefilled one would.
+    pub recent_tokens: Vec<u32>,
 }
 
 impl KvCache {
@@ -1999,6 +2019,7 @@ impl KvCache {
                 .copied()
                 .map(RecurrentLayerState::new)
                 .collect(),
+            recent_tokens: Vec::new(),
         }
     }
 
@@ -2237,6 +2258,7 @@ impl KvCache {
         for (dst, src_r) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
             dst.copy_from(src_r);
         }
+        self.recent_tokens.clone_from(&src.recent_tokens);
     }
 
     /// Takes `src`'s first `len` token positions as this cache's own, moving
@@ -2276,6 +2298,7 @@ impl KvCache {
         for (dst, s) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
             dst.copy_from(s);
         }
+        self.recent_tokens = std::mem::take(&mut src.recent_tokens);
     }
 
     /// Rolls every attention layer back to `new_len` positions (see
@@ -2337,6 +2360,24 @@ impl KvCache {
             .unwrap_or(0)
     }
 
+    /// Records `token` as the newest entry of [`Self::recent_tokens`],
+    /// keeping at most `keep` of them.
+    ///
+    /// `keep` is the caller's own lookback (`ple.ngram_size - 1` for
+    /// `engine::arch::qwen4exp`), not a cache-wide constant: the cache has
+    /// no opinion on how far back a model reaches, only on carrying what it
+    /// is told to.
+    pub fn push_recent_token(&mut self, token: u32, keep: usize) {
+        if keep == 0 {
+            return;
+        }
+        self.recent_tokens.push(token);
+        if self.recent_tokens.len() > keep {
+            let drop = self.recent_tokens.len() - keep;
+            self.recent_tokens.drain(..drop);
+        }
+    }
+
     /// A CPU-only deep copy (no GPU mirror) of the whole cache — the
     /// [`crate::engine::slot_store`] uses it to snapshot a slot's completed
     /// cache when that same cache is also being handed to the
@@ -2349,6 +2390,7 @@ impl KvCache {
                 .iter()
                 .map(RecurrentLayerState::duplicate)
                 .collect(),
+            recent_tokens: self.recent_tokens.clone(),
         }
     }
 
@@ -2430,6 +2472,16 @@ impl KvCache {
             push_f32s(&mut out, &r.conv_history);
             push_f32s(&mut out, &r.delta_state);
         }
+        // A trailing section rather than a new format version, so a blob
+        // written before this field existed still restores: see
+        // [`Self::from_bytes`] for why an absent section is never the wrong
+        // answer.
+        if !self.recent_tokens.is_empty() {
+            push_u32(&mut out, self.recent_tokens.len() as u32);
+            for &tok in &self.recent_tokens {
+                push_u32(&mut out, tok);
+            }
+        }
         out
     }
 
@@ -2474,10 +2526,31 @@ impl KvCache {
                 delta_state,
             ));
         }
+        // Optional, and absent from every blob written before
+        // [`KvCache::recent_tokens`] existed. Reading nothing there is safe
+        // rather than merely tolerable: the only architecture that reads the
+        // field is `engine::arch::qwen4exp`, which no earlier build could
+        // serve, so no old slot can be one whose lookback this would be
+        // silently dropping. The strict "nothing left over" check below is
+        // kept, so a corrupt blob is still rejected.
+        let recent_tokens = if cur.is_empty() {
+            Vec::new()
+        } else {
+            let n = cur.u32()? as usize;
+            let mut toks = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                toks.push(cur.u32()?);
+            }
+            toks
+        };
         if !cur.is_empty() {
             anyhow::bail!("trailing bytes after KV-cache blob");
         }
-        Ok(Self { layers, recurrent })
+        Ok(Self {
+            layers,
+            recurrent,
+            recent_tokens,
+        })
     }
 }
 
@@ -2929,6 +3002,61 @@ mod tests {
         for i in 0..239 {
             assert_eq!(restored.layers[0].key_at(i, 0, 4), [i as f32; 4]);
         }
+    }
+
+    /// The n-gram lookback keeps only the last `keep` ids, and keeps them
+    /// oldest-first — the order `arch::qwen4exp`'s hash indexes them in.
+    /// Reversing it, or keeping the *first* `keep`, hashes real predecessors
+    /// in the wrong slots: a plausible embedding for an n-gram that never
+    /// occurred, which nothing downstream can see.
+    #[test]
+    fn the_recent_token_lookback_keeps_the_newest_ids_oldest_first() {
+        let mut cache = KvCache::new(1, 8, 4);
+        for tok in [10u32, 11, 12, 13] {
+            cache.push_recent_token(tok, 2);
+        }
+        assert_eq!(cache.recent_tokens, vec![12, 13]);
+    }
+
+    /// A model with no lookback must not accumulate one — every other
+    /// architecture passes `keep == 0` by never calling this at all, but the
+    /// guard is what makes an unbounded `Vec` impossible rather than merely
+    /// unused.
+    #[test]
+    fn a_zero_lookback_records_nothing() {
+        let mut cache = KvCache::new(1, 8, 4);
+        cache.push_recent_token(7, 0);
+        assert!(cache.recent_tokens.is_empty());
+    }
+
+    /// The lookback has to survive a slot save/restore, or a conversation
+    /// resumed from disk would hash its first token against EOS padding
+    /// where a live one hashes it against its real predecessors — the same
+    /// prompt, two different answers, depending only on whether the slot
+    /// happened to be persisted.
+    #[test]
+    fn the_recent_token_lookback_round_trips_through_a_slot_blob() {
+        let mut cache = KvCache::new(1, 8, 4);
+        cache.layers[0].push(&[1.0; 4], &[2.0; 4]);
+        cache.push_recent_token(4242, 2);
+        cache.push_recent_token(99, 2);
+        let restored = KvCache::from_bytes(&cache.to_bytes()).expect("round trip");
+        assert_eq!(restored.recent_tokens, vec![4242, 99]);
+    }
+
+    /// A blob written before the lookback existed carries no trailing
+    /// section, and must still restore rather than being rejected as
+    /// corrupt. Only `qwen4exp` reads the field, and no build that could
+    /// write such a blob could serve it, so an empty lookback here is the
+    /// truth rather than a loss.
+    #[test]
+    fn a_blob_without_a_lookback_section_still_restores() {
+        let mut cache = KvCache::new(1, 8, 4);
+        cache.layers[0].push(&[1.0; 4], &[2.0; 4]);
+        let bytes = cache.to_bytes();
+        let restored = KvCache::from_bytes(&bytes).expect("round trip");
+        assert!(restored.recent_tokens.is_empty());
+        assert_eq!(restored.committed_len(), 1);
     }
 
     /// The reuse bound must be per-*layer*, and taken from the shortest
