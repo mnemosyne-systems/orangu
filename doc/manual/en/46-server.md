@@ -516,6 +516,8 @@ single row, with `SIZE` summed across shards):
 
 ```sh
 orangu-server list
+orangu-server list --sort size       # largest first
+orangu-server list --sort last-used  # most recently used first; Never last
 ```
 
 ```
@@ -526,13 +528,15 @@ NR  MODEL                                        QUANT   SIZE        LAST_USED  
  4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             No (glm-dsa)
 ```
 
-`NR` numbers models in the printed order, starting from 1 — a shorthand for
-`show` so you don't have to retype a long `MODEL` string. When a file was
-downloaded by `-hf`/`--hf-repo`, `MODEL` is the repo id to hand back to
-`-hf`: `<user>/<model>`. The `:quant` tag is left off — `QUANT` shows it in
-the next column — so two quantizations of one repo print the same `MODEL` and
-are told apart by their `QUANT` cells. Both spellings resolve against what's
-on disk, so `unsloth/gemma-4-E2B-it-GGUF` and
+By default, `NR` numbers models alphabetically by `MODEL`, starting from 1 — a
+shorthand for `show` so you don't have to retype a long `MODEL` string.
+`--sort size` and `--sort last-used` reorder the rows but retain those default
+numbers; ties stay alphabetical and models never used sort after dated rows.
+When a file was downloaded by `-hf`/`--hf-repo`, `MODEL` is the repo id to
+hand back to `-hf`: `<user>/<model>`. The `:quant` tag is left off — `QUANT`
+shows it in the next column — so two quantizations of one repo print the same
+`MODEL` and are told apart by their `QUANT` cells. Both spellings resolve
+against what's on disk, so `unsloth/gemma-4-E2B-it-GGUF` and
 `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` name the same local model; use the
 tagged form (or the row's `NR`) to pick one particular quantization of a repo
 that has several, and to ask for one that isn't downloaded yet. A
