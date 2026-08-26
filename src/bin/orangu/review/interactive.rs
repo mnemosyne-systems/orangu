@@ -36,6 +36,17 @@ pub(crate) struct ReviewComment {
     pub(crate) text: String,
 }
 
+/// One successful model consultation from `/review`'s Alt+o feedback popup.
+/// Kept separately from the public review report: `/create_patch` can use the
+/// suggestions, while `/export review` and forge comments remain the concise,
+/// user-curated report they have always been.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewFeedbackRecord {
+    pub(crate) path: String,
+    pub(crate) question: Option<String>,
+    pub(crate) response: String,
+}
+
 /// The inline Alt+c comment editor: the chosen category, which part has the
 /// focus, and the comment text. Tab switches the focus between the single-line
 /// category selector and the comment text; Up/Down move the category while the
@@ -76,6 +87,9 @@ pub(crate) struct ReviewState {
     pub(crate) comments: Vec<ReviewComment>,
     /// General notes entered in the input window as `# <note>`.
     pub(crate) general_notes: Vec<String>,
+    /// Successful Alt+o answers, retained as optional patch context. Errors and
+    /// cancelled requests never enter this history.
+    pub(crate) feedback_history: Vec<ReviewFeedbackRecord>,
     /// When set, the inline comment editor is open for the highlighted line.
     pub(crate) comment_editor: Option<CommentEditor>,
 }
@@ -132,6 +146,7 @@ impl ReviewState {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         }
     }
@@ -1362,6 +1377,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1415,6 +1431,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1460,6 +1477,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1513,6 +1531,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1585,6 +1604,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1676,6 +1696,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 
@@ -1948,6 +1969,7 @@ mod tests {
             feedback: None,
             comments: Vec::new(),
             general_notes: Vec::new(),
+            feedback_history: Vec::new(),
             comment_editor: None,
         };
 

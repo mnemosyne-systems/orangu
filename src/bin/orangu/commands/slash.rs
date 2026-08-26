@@ -103,6 +103,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             false,
             false,
         )),
+        "/create_patch" => Some(LocalCommand::CreatePatch),
         "/duplicates" => Some(LocalCommand::Duplicates(None)),
         "/export" => Some(LocalCommand::Export(ExportTarget::Console)),
         "/push" => Some(LocalCommand::Push(false)),

@@ -17,6 +17,7 @@ mod activity_log;
 mod build;
 mod commands;
 mod completion;
+mod create_patch_context;
 mod dispatch;
 mod docs;
 mod export;
@@ -538,6 +539,7 @@ async fn run() -> Result<()> {
         mut current_branch,
         mut last_review_report,
         mut last_auto_review_report,
+        mut last_review_feedback,
         mut last_assistant_response,
         mut last_review_appendix,
         mut last_auto_review_appendix,
@@ -662,6 +664,7 @@ async fn run() -> Result<()> {
                 current_branch,
                 last_review_report,
                 last_auto_review_report,
+                last_review_feedback,
                 last_assistant_response,
                 last_review_appendix,
                 last_auto_review_appendix,
@@ -698,6 +701,7 @@ async fn run() -> Result<()> {
             current_branch = tab.current_branch;
             last_review_report = tab.last_review_report;
             last_auto_review_report = tab.last_auto_review_report;
+            last_review_feedback = tab.last_review_feedback;
             last_assistant_response = tab.last_assistant_response;
             last_review_appendix = tab.last_review_appendix;
             last_auto_review_appendix = tab.last_auto_review_appendix;
@@ -1407,6 +1411,8 @@ async fn run() -> Result<()> {
                 review_reports: git::ReviewReports {
                     review: last_review_report.as_deref(),
                     auto_review: last_auto_review_report.as_deref(),
+                    review_feedback: Some(&last_review_feedback),
+                    last_was_auto: last_review_was_auto,
                 },
                 skills: &skills,
                 semantic_budget_tokens: config.semantic_budget_tokens,
@@ -2055,6 +2061,11 @@ async fn run() -> Result<()> {
                                     );
                                     // The request succeeded; clear the input window.
                                     input_state.clear();
+                                    review.feedback_history.push(ReviewFeedbackRecord {
+                                        path: path.clone(),
+                                        question: question.clone(),
+                                        response: text.clone(),
+                                    });
                                     render::render_markdown_for_console(&text)
                                         .lines()
                                         .map(str::to_string)
@@ -2085,6 +2096,7 @@ async fn run() -> Result<()> {
                     orangu::tui::display_model_name(header_status.is_coordinator, &active_model_id),
                 );
                 last_review_report = Some(markdown.clone());
+                last_review_feedback = review.feedback_history.clone();
                 // Capture the per-comment source code for the export's appendix
                 // (the `/show_file` view around each comment).
                 last_review_appendix = Some(review::review_export_appendix(
@@ -2315,6 +2327,9 @@ async fn run() -> Result<()> {
             }
             CommandOutcome::SkillInvoked { name, prompt } => {
                 usage_stats.record_skill(&name);
+                prompt_input = prompt;
+            }
+            CommandOutcome::ModelPrompt(prompt) => {
                 prompt_input = prompt;
             }
             CommandOutcome::Unhandled => {}

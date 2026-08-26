@@ -51,6 +51,7 @@ pub enum SlashCommand {
     Branch,
     Restore,
     AutoReview,
+    CreatePatch,
     Duplicates,
     Export,
     CreateFile,
@@ -127,6 +128,7 @@ impl SlashCommand {
             SlashCommand::Branch => "Manages git branches",
             SlashCommand::Restore => "Restores working tree files",
             SlashCommand::AutoReview => "Runs an LLM-driven branch review",
+            SlashCommand::CreatePatch => "Fixes the latest review or merge conflicts",
             SlashCommand::Duplicates => "Finds duplicated Rust/C functions",
             SlashCommand::Export => "Writes session or review to a PDF",
             SlashCommand::CreateFile => {

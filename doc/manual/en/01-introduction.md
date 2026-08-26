@@ -20,7 +20,7 @@ speaks the OpenAI-compatible API. See *A complete stack* below.
 
 * A complete Rust stack — the `orangu` editor, the `orangu-coordinator` model manager, and the native `orangu-server` GGUF inference engine, with no C/C++ inference library and no Python dependency
 * OpenAI-compatible chat completions served by the built-in `orangu-server` — fully local, no Internet connection required after setup
-* Interactive code review (`/review`) and LLM-driven auto review (`/auto_review`) of the changes on your branch, with a category-grouped report you can export or post to an issue
+* Interactive code review (`/review`) and LLM-driven auto review (`/auto_review`) of the changes on your branch, with a category-grouped report you can export, post to an issue, or turn directly into fixes with `/create_patch`
 * Workspace-scoped file tools — show, create, modify, move, and delete files and directories, staged through Git as the change is made
 * Workspace-aware Git and forge tools (commit, rebase, push, pull requests, issues, comments) for the whole change-and-review loop
 * Several projects open at once as workspace tabs, each with its own session, scrollback, and history

@@ -98,6 +98,9 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "review branch",
     // --- auto review ---
     "auto review",
+    // --- create patch ---
+    "create patch",
+    "fix review findings",
     // --- export ---
     "export",
     "export console",
@@ -489,6 +492,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
             false,
             false,
         ));
+    }
+    if matches_ci(input, &["create patch", "fix review findings"]) {
+        return Some(LocalCommand::CreatePatch);
     }
     // Checked before the more specific buffers: "export console" / "export
     // review" / "export auto review" select a buffer, while a bare "export"

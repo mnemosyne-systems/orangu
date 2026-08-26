@@ -397,6 +397,7 @@ async fn run_outcome(
     match outcome {
         CommandOutcome::Unhandled => Ok(Resolution::Prompt(input.to_string())),
         CommandOutcome::SkillInvoked { prompt, .. } => Ok(Resolution::Prompt(prompt)),
+        CommandOutcome::ModelPrompt(prompt) => Ok(Resolution::Prompt(prompt)),
         CommandOutcome::Quiet => Ok(Resolution::Handled),
         CommandOutcome::Output(text)
         | CommandOutcome::MarkdownOutput(text)

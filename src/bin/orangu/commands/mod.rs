@@ -123,6 +123,10 @@ pub enum CommandOutcome {
         name: String,
         prompt: String,
     },
+    /// A local command expanded into an implementation prompt for the coding
+    /// model. Unlike [`Self::SkillInvoked`], this is a built-in workflow and
+    /// does not count as an Agent Skill invocation.
+    ModelPrompt(String),
     Quiet,
     /// Command ran and produced informational output (success).
     Output(String),
@@ -465,6 +469,11 @@ pub enum LocalCommand<'a> {
     /// whether to start every file in Deep mode (the `deep` keyword). The
     /// three keywords and a file argument may appear in any order.
     AutoReview(AutoReviewTarget<'a>, bool, bool),
+    /// `/create_patch`: fix the actionable findings from the most recently
+    /// completed `/review` or `/auto_review`. During an in-progress Git
+    /// operation it also resolves every unmerged path, with or without a
+    /// stored report.
+    CreatePatch,
     /// `/duplicates [<threshold>]`: scan the workspace for duplicated functions
     /// (across every language in [`orangu::duplicates::LANGUAGES`]) and print a
     /// similarity report. The optional argument overrides
