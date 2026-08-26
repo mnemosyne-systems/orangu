@@ -280,12 +280,20 @@ pub fn git_pr_checkout(repo_root: &Path, pr_number: u64) -> Result<String> {
 }
 
 /// The last `/review` summary and `/auto_review` report (Markdown), offered
-/// to `/comment` as comment bodies (`with review`, `with auto review`).
-/// `None` until the matching mode has been run in this session.
+/// to `/comment` as comment bodies (`with review`, `with auto review`) and to
+/// `/create_patch` as implementation context. `None` until the matching mode
+/// has been run in this session.
 #[derive(Clone, Copy, Default)]
 pub struct ReviewReports<'a> {
     pub review: Option<&'a str>,
     pub auto_review: Option<&'a str>,
+    /// Successful model consultations made inside the latest interactive
+    /// review. They are patch-only context, not part of exports or comments.
+    pub(crate) review_feedback: Option<&'a [crate::review::ReviewFeedbackRecord]>,
+    /// Which report completed most recently when both are present. Meaningful
+    /// only when both fields are `Some`; the available report always wins when
+    /// just one exists.
+    pub last_was_auto: bool,
 }
 
 pub fn comment_output(
@@ -1827,6 +1835,8 @@ mod tests {
             ReviewReports {
                 review: Some("**Patch approved**"),
                 auto_review: None,
+                review_feedback: None,
+                last_was_auto: false,
             },
             crate::git::Forge::GitHub,
         )

@@ -66,10 +66,14 @@ pub(crate) struct WorkspaceTab {
     pub(crate) session_slot_path: PathBuf,
     pub(crate) current_branch: Option<String>,
     /// The last `/review` summary and `/auto_review` report (Markdown), kept so
-    /// `/comment <number> with [auto] review` can post them. Per tab, since a
-    /// review is of that tab's branch.
+    /// `/comment <number> with [auto] review` can post them and `/create_patch`
+    /// can implement the latest one. Per tab, since a review is of that tab's
+    /// branch.
     pub(crate) last_review_report: Option<String>,
     pub(crate) last_auto_review_report: Option<String>,
+    /// Successful model feedback from the latest interactive review, retained
+    /// only for `/create_patch` and deliberately excluded from public reports.
+    pub(crate) last_review_feedback: Vec<crate::review::ReviewFeedbackRecord>,
     /// The latest completed assistant response in its original Markdown form,
     /// retained for `/copy` without trying to reconstruct it from the TUI.
     pub(crate) last_assistant_response: Option<String>,
@@ -277,6 +281,7 @@ impl WorkspaceTab {
             current_branch,
             last_review_report: None,
             last_auto_review_report: None,
+            last_review_feedback: Vec::new(),
             last_assistant_response: None,
             last_review_appendix: None,
             last_auto_review_appendix: None,
@@ -618,6 +623,7 @@ mod tests {
             current_branch: None,
             last_review_report: None,
             last_auto_review_report: None,
+            last_review_feedback: Vec::new(),
             last_assistant_response: None,
             last_review_appendix: None,
             last_auto_review_appendix: None,

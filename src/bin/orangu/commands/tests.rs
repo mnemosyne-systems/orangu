@@ -908,6 +908,21 @@ fn parses_review_commands() {
 }
 
 #[test]
+fn parses_create_patch_commands() {
+    for input in [
+        "/create_patch",
+        "create patch",
+        "Create Patch",
+        "fix review findings",
+    ] {
+        assert!(
+            matches!(parse_local_command(input), Some(LocalCommand::CreatePatch)),
+            "expected {input:?} to parse as CreatePatch"
+        );
+    }
+}
+
+#[test]
 fn parses_auto_review_commands() {
     for input in ["/auto_review", "auto review", "Auto Review"] {
         assert!(

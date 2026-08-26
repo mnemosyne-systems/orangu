@@ -410,7 +410,7 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "expand_context",
-            "Retrieve the full uncompressed text using an id from a truncation marker.",
+            "Retrieve an exact cached context node using an id from a truncation or bounded-index marker. A node may contain the original text or links to smaller nodes for selective expansion.",
             json!({
                 "type": "object",
                 "properties": {

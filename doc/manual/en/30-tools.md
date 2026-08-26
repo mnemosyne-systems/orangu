@@ -202,7 +202,7 @@ Behavior:
 
 ## `expand_context`
 
-`expand_context` retrieves massive text blobs (like large file diffs or lengthy command outputs) that `orangu` automatically truncated before they reached your context window to save tokens.
+`expand_context` retrieves exact session-cached context that `orangu` kept outside the prompt to save tokens. Most truncation markers point directly to the complete original blob; bounded workflows such as `/create_patch` may instead point to a small index whose entries can be expanded selectively.
 
 ```json
 {
@@ -214,7 +214,7 @@ Behavior:
 
 - `id` is required and must be a 10-character cache ID.
 - You will find these IDs injected into your context as markers (e.g. `[Note: Output truncated. Run expand_context(id="abc1234567")]`).
-- The tool returns the full, uncompressed, raw text of the original output.
+- The tool returns the exact cached node. This is normally the full, uncompressed original output; a bounded index node contains IDs for smaller exact chunks.
 - The cache ID is a SHA-256 hash prefix of the content, meaning it is mathematically guaranteed to perfectly match the truncated payload.
 - Cache files are strictly scoped to the active session and automatically deleted when the session ends.
 

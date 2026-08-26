@@ -1180,6 +1180,28 @@ auto review all
 
 \newpage
 
+## /create_patch
+
+`/create_patch` turns the result of `/review` or `/auto_review` into changes in the working tree. It uses whichever review completed most recently in the active workspace tab and enables the same workspace tools as an ordinary implementation request. For interactive reviews, successful model-feedback popups are retained separately from the public report and included as patch context; cancelled and failed requests are ignored. The model is instructed to inspect the current code before editing, verify each finding rather than applying stale or incorrect advice blindly, implement every valid fix, add or update tests where appropriate, run focused validation, and inspect the final diff. Its final response identifies the fixes, validation, and any finding it intentionally left unchanged.
+
+Before the request is sent, review Markdown is reduced to actionable list findings, boilerplate and empty categories are dropped, and duplicates are removed. Findings have a 2,048-token initial budget. Any overflow is stored in session-scoped, category/path-grouped reverse-compression nodes of at most 768 tokens each. The initial prompt contains only the root index ID, and the model is told to expand only the branches relevant to the files it is fixing. This is selective exact retrieval, not a lossy summary, and it prevents reverse expansion from restoring a large report all at once.
+
+The command changes files and may stage them through the normal file tools, but it never commits or pushes. Existing unrelated working-tree changes are to be preserved. If no review has completed in this tab and Git has no unresolved paths, the command refuses and points at `/review` and `/auto_review` instead of sending an underspecified request to the model.
+
+The same command handles conflicts from an in-progress merge, rebase, or cherry-pick. It asks Git for every unmerged path and gives the complete list directly to the model; conflict paths are never compressed. A live conflict is enough to run `/create_patch`; no review report is required. When a report and conflicts both exist, the model handles both in one pass. It is instructed to reconstruct the intended combined behavior from the base, both sides, surrounding code, and tests; remove conflict markers; stage resolved paths; and confirm that Git has no unmerged entries. It does not abort or continue the Git operation, so that final control remains with you.
+
+Run it with the slash command or either natural-language form:
+
+```text
+/create_patch
+create patch
+fix review findings
+```
+
+Because this workflow needs a coding model and file tools, it requires a connected LLM server. In `orangu -p` one-shot mode there is no stored review report, but `/create_patch` can still resolve live conflicts.
+
+\newpage
+
 ## /duplicates
 
 `/duplicates` scans the workspace for **duplicated code** across many languages and reports the function pairs that are structurally similar, so you can review them and decide whether they should be unified. It is handled locally and never sent to the model, and needs no Git repository.
