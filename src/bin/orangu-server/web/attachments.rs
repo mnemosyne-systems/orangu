@@ -277,27 +277,23 @@ fn ooxml_runs_to_text(xml: &str) -> String {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"t" => in_run = true,
-                b"p" => out.push('\n'),
+                "t" => in_run = true,
+                "p" => out.push('\n'),
                 _ => {}
             },
             Ok(Event::End(e)) => {
-                if e.local_name().as_ref() == b"t" {
+                if e.local_name().as_ref() == "t" {
                     in_run = false;
                 }
             }
-            Ok(Event::Text(t)) if in_run => {
-                if let Ok(decoded) = t.decode() {
-                    out.push_str(&decoded);
-                }
-            }
+            Ok(Event::Text(t)) if in_run => out.push_str(&t.xml10_content()),
             // quick-xml surfaces entities (`&amp;`, `&#233;`, …) as their own
             // events rather than folding them into the surrounding text.
             Ok(Event::GeneralRef(r)) if in_run => {
                 if let Ok(Some(c)) = r.resolve_char_ref() {
                     out.push(c);
-                } else if let Ok(name) = r.decode() {
-                    let resolved = match name.as_ref() {
+                } else {
+                    let resolved = match r.as_ref() {
                         "amp" => Some('&'),
                         "lt" => Some('<'),
                         "gt" => Some('>'),
@@ -532,5 +528,16 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn ooxml_runs_join_paragraphs_and_resolve_entities() {
+        let xml = concat!(
+            r#"<w:document xmlns:w="urn:w"><w:body>"#,
+            r#"<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t> world</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>a &amp; b &lt;c&gt; &#233;</w:t></w:r></w:p>"#,
+            r#"</w:body></w:document>"#,
+        );
+        assert_eq!(ooxml_runs_to_text(xml), "\nHello world\na & b <c> \u{e9}");
     }
 }
