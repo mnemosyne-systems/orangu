@@ -2803,12 +2803,16 @@ pub(crate) fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String 
 }
 
 /// Lists every `.gguf` model under `models_dir` (the same table
-/// `orangu-server list` prints, `SUPPORTED` column and all — models this
-/// build can't load are shown greyed rather than hidden: a user can still
-/// pick one and will hit the same clear "not yet supported" error `prepare`
-/// gives for any other unsupported model) and prompts for an `NR`, for
-/// `orangu-server` invoked with no model argument. Returns the chosen
-/// model's file path and its display label.
+/// `orangu-server list` prints, `LAST_USED` and `SUPPORTED` columns and all
+/// — models this build can't load are shown greyed rather than hidden: a
+/// user can still pick one and will hit the same clear "not yet supported"
+/// error `prepare` gives for any other unsupported model) and prompts for an
+/// `NR`, for `orangu-server` invoked with no model argument. Returns the
+/// chosen model's file path and its display label.
+///
+/// The one thing not carried over from `list` is the `(Refresh)` marker:
+/// that costs a Hugging Face round trip per repo, and this table is on the
+/// path to starting a server, not to maintaining the models directory.
 ///
 /// A directory holding exactly one model ([`init::sole_model`], shared with
 /// the `--init` wizard's own `model` prompt) skips the `NR` prompt entirely
@@ -2827,14 +2831,17 @@ fn select_model_interactively(
         );
     }
 
+    let last_used =
+        orangu::model_registry::last_used_for(groups.iter().map(|group| group.paths.as_slice()));
     print!(
         "{}",
-        orangu::model_spec::format_groups(
+        orangu::model_spec::format_groups_with_last_used(
             &groups,
             models_dir,
             &Default::default(),
             &model_support(&groups),
             dimming(orangu::model_spec::Dimming::Unsupported),
+            Some(&last_used),
         )
     );
 
