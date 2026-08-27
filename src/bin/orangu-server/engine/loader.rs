@@ -116,6 +116,16 @@ pub enum ArchFamily {
     /// attends, leading dense layers, and sigmoid-routed experts. See
     /// `engine::arch::glm`.
     GlmDsa,
+    /// GLM-5.3-Flash (`glm5next`) — a hybrid whose trunk alternates three
+    /// Kimi Delta Attention layers with one absorbed multi-head latent
+    /// attention layer, strung on a `hyper_connection.count`-stream
+    /// residual bundle rather than a residual vector, over sigmoid-routed
+    /// experts with an always-on shared one. Nothing in it rotates: the
+    /// latent layers are position-free, and choose which positions to
+    /// attend with a lightning indexer that scores fixed *pools* of
+    /// `attention.indexer.kpool` positions rather than single ones. See
+    /// `engine::arch::glm5`.
+    Glm5Next,
     /// Kimi-K3 (`kimi-k3`) — three-in-four Kimi Delta Attention layers
     /// (a gated delta-net with a per-dimension decay) alternating with
     /// absorbed multi-head latent attention, cross-layer residual
@@ -231,6 +241,13 @@ const DEEPSEEK4_ARCHITECTURES: &[&str] = &["deepseek4"];
 /// `glm4moe` are *not* here: they are ordinary GQA models with none of
 /// this module's MLA or indexer machinery.
 const GLM_DSA_ARCHITECTURES: &[&str] = &["glm-dsa"];
+/// `glm5next` (e.g. `unsloth/GLM-5.3-Flash-GGUF`) — GLM-5.3-Flash. Named
+/// for what the file declares rather than for the release, as `qwen4exp`
+/// is: `general.name` is `GLM 5.3 Flash`. It shares `glm-dsa`'s lightning
+/// indexer and absorbed latent attention and almost nothing else — see
+/// [`ArchFamily::Glm5Next`] and `engine::arch::glm5`. The `mmproj-*.gguf`
+/// shipped alongside is a separate vision model and is not this.
+const GLM5NEXT_ARCHITECTURES: &[&str] = &["glm5next"];
 /// `kimi-k3` (e.g. `unsloth/Kimi-K3-GGUF`). `kimi-linear` is *not* here:
 /// it shares the delta-net attention but none of K3's cross-layer
 /// residuals, latent MoE, or situ activation.
@@ -352,6 +369,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if GLM_DSA_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::GlmDsa);
     }
+    if GLM5NEXT_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Glm5Next);
+    }
     if KIMI_K3_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::KimiK3);
     }
@@ -419,6 +439,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(DFLASH_ARCHITECTURES)
         .chain(DEEPSEEK4_ARCHITECTURES)
         .chain(GLM_DSA_ARCHITECTURES)
+        .chain(GLM5NEXT_ARCHITECTURES)
         .chain(KIMI_K3_ARCHITECTURES)
         .chain(PHI3_ARCHITECTURES)
         .chain(MISTRAL_ARCHITECTURES)
@@ -2027,6 +2048,7 @@ mod tests {
             (ArchFamily::Qwen3Next, "qwen3next"),
             (ArchFamily::Qwen4Exp, "qwen4exp"),
             (ArchFamily::GlmDsa, "glm-dsa"),
+            (ArchFamily::Glm5Next, "glm5next"),
             (ArchFamily::KimiK3, "kimi-k3"),
             (ArchFamily::DFlash, "dflash"),
             (ArchFamily::Deepseek4, "deepseek4"),
@@ -2048,6 +2070,7 @@ mod tests {
                 ArchFamily::Qwen3Next => "Qwen3Next",
                 ArchFamily::Qwen4Exp => "Qwen4Exp",
                 ArchFamily::GlmDsa => "GlmDsa",
+                ArchFamily::Glm5Next => "Glm5Next",
                 ArchFamily::KimiK3 => "KimiK3",
                 ArchFamily::DFlash => "DFlash",
                 ArchFamily::Deepseek4 => "Deepseek4",
@@ -2585,6 +2608,10 @@ mod tests {
     #[test]
     fn resolve_arch_family_accepts_kimi_k3() {
         assert_eq!(resolve_arch_family("kimi-k3").unwrap(), ArchFamily::KimiK3);
+        assert_eq!(
+            resolve_arch_family("glm5next").unwrap(),
+            ArchFamily::Glm5Next
+        );
         // Kimi-Linear shares K3's delta-net attention but none of its
         // cross-layer residuals, latent MoE or situ activation, so it is
         // deliberately not routed here.

@@ -1,6 +1,6 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries sixteen architecture modules across fifteen servable
+`orangu-server` carries seventeen architecture modules across sixteen servable
 architecture families, and six device backends.
 Each one documents itself well; what has been missing is the thing you need
 *first* — where they sit, which of them you have to touch, and which rules are
@@ -86,7 +86,7 @@ fill. Skipping one costs a feature, never correctness:
 
 | method | overriding it buys | who overrides it today |
 | :-- | :-- | :-- |
-| `n_trunk_layer` | correct layer count on files carrying a trailing draft block | `deepseek4`, `glm`, `nemotron`, the three Qwen 3.5-family modules |
+| `n_trunk_layer` | correct layer count on files carrying a trailing draft block | `deepseek4`, `glm`, `glm5`, `nemotron`, the three Qwen 3.5-family modules |
 | `vulkan_backend` | GPU timing and tuning reports reach `/props` and `/gpu-timings` | most GPU-capable modules |
 | `forward_maybe_sampling` | device-side argmax, so a greedy decode step never reads back a whole vocabulary | `llama`, `gemma`, `mistral`, `phi` |
 | `forward_all_logits` | **multi-position decode** — speculative decoding needs it on *both* halves of a pair | `gemma`, `deepseek4`, `glm`, `muse` |
@@ -123,6 +123,15 @@ but not its block, because what brackets a sub-layer there is a
 hyper-connection mixer rather than a norm — so the trunk exposes the
 sub-layers on their own (`FullAttn::forward`, `Recurrent::forward`) and
 `qwen4exp.rs` carries only what has no counterpart.
+
+`glm5.rs` is what the shared parts add up to, and worth reading for that
+alone: its trunk is `kda`'s two half-layers, its residual is `hyper`, its
+attention mask is `indexer`, its FFN is `swiglu_moe_ffn`, and what is left is
+a few hundred lines of assembly. Each of those four was extracted from a
+module that already had it — `hyper` out of `deepseek4`, `indexer` out of
+`glm` — rather than written for it. That is the shape a new architecture
+should aim for: if a piece of it looks like a piece of something else, move
+the piece out and share it, in the same change.
 
 ## The rules that are not obvious
 
@@ -204,14 +213,18 @@ Architectures, by what they are rather than by name:
 | `glm` | latent attention with a sparse-attention indexer |
 | `kda` | shared half-layers: Kimi Delta Attention, and absorbed latent attention with an optional rotation and output gate |
 | `kimi3`, `bailingmoe` | thin modules over that pair — cross-layer residuals with latent experts, and Ling 3.0's rotated latent attention with group-limited experts |
+| `hyper` | shared residual: a bundle of hyper-connected streams in place of the residual vector |
+| `indexer` | shared selection: the lightning indexer, over single positions or over pools of them |
+| `glm5` | that pair of half-layers, on that residual, choosing what to attend with that indexer |
 | `inkling`, `muse` | their own attention or framing variants |
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
 
-Eighteen rows above, sixteen architecture modules: `qwen_hybrid` and `kda` are
-shared trunks, not architectures of their own. Sixteen `ArchFamily` variants,
-fifteen *servable* families: `dflash` is a module and a variant but resolves to
-the model it drafts for rather than serving itself. Those are the two
+Twenty-one modules above, seventeen architecture modules: `qwen_hybrid`, `kda`,
+`hyper` and `indexer` are shared parts, not architectures of their own.
+Seventeen `ArchFamily` variants, sixteen *servable* families: `dflash` is a
+module and a variant but resolves to the model it drafts for rather than
+serving itself. Those are the two
 conventions every count in the documentation uses — check them against this
 table and `ArchFamily` rather than against another prose count, which is how
 they drifted apart before.

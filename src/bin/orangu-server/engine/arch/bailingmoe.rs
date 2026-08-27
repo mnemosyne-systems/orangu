@@ -54,7 +54,8 @@ use std::sync::Arc;
 
 use super::kda::{BAILINGMOE3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
 use super::{
-    ExpertGating, ExpertGroups, ExpertRouting, ModelForward, SwigluMoe, SwigluSharedExpert,
+    ExpertGating, ExpertGroups, ExpertRouting, ModelForward, SwigluLimit, SwigluMoe,
+    SwigluSharedExpert,
 };
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
@@ -72,10 +73,11 @@ struct Moe {
     gate_shexp: QuantMatrix,
     up_shexp: QuantMatrix,
     down_shexp: QuantMatrix,
-    /// This layer's entries in `swiglu_clamp_exp` / `swiglu_clamp_shexp`,
-    /// `0` when the file declares none.
-    clamp_exp: f32,
-    clamp_shexp: f32,
+    /// This layer's entries in `swiglu_clamp_exp` / `swiglu_clamp_shexp`.
+    /// Ling 3.0 takes the *activated* form of the clamp — upstream's
+    /// `arch == LLM_ARCH_DEEPSEEK4` branch is the other one.
+    clamp_exp: SwigluLimit,
+    clamp_shexp: SwigluLimit,
 }
 
 enum Ffn {
@@ -157,6 +159,8 @@ impl BailingMoeModel {
             d_conv,
             gate_lower_bound: Some(gate_lower_bound),
             eps: loaded.config.rms_eps,
+            // `bailingmoe3.cpp` L2-normalizes with `f_norm_rms_eps`.
+            l2_eps: loaded.config.rms_eps,
         };
 
         let kv_lora_rank = loaded
@@ -310,8 +314,8 @@ impl BailingMoeModel {
                     gate_shexp: get_matrix("ffn_gate_shexp.weight")?,
                     up_shexp: get_matrix("ffn_up_shexp.weight")?,
                     down_shexp: get_matrix("ffn_down_shexp.weight")?,
-                    clamp_exp: clamp_exp.get(i).copied().unwrap_or(0.0),
-                    clamp_shexp: clamp_shexp.get(i).copied().unwrap_or(0.0),
+                    clamp_exp: SwigluLimit::activated(clamp_exp.get(i).copied().unwrap_or(0.0)),
+                    clamp_shexp: SwigluLimit::activated(clamp_shexp.get(i).copied().unwrap_or(0.0)),
                 };
                 anyhow::ensure!(
                     moe.gate_exps.n_expert == n_expert,

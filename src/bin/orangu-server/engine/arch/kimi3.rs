@@ -182,6 +182,8 @@ impl Kimi3Model {
             d_conv,
             gate_lower_bound: loaded.metadata_f32("kda.gate_lower_bound"),
             eps: loaded.config.rms_eps,
+            // `kimi-k3.cpp` L2-normalizes with the model's own RMS epsilon.
+            l2_eps: loaded.config.rms_eps,
         };
 
         let kv_lora_rank = loaded

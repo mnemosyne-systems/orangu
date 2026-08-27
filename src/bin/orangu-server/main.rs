@@ -56,6 +56,7 @@ use engine::arch::deepseek4::Deepseek4Model;
 use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
 use engine::arch::glm::GlmModel;
+use engine::arch::glm5::Glm5Model;
 use engine::arch::inkling::InklingModel;
 use engine::arch::kimi3::Kimi3Model;
 use engine::arch::llama::LlamaModel;
@@ -1796,6 +1797,9 @@ fn build_model(
         ),
         ArchFamily::GlmDsa => Arc::new(
             GlmModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Glm5Next => Arc::new(
+            Glm5Model::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
         ArchFamily::KimiK3 => Arc::new(
             Kimi3Model::load_with_backend(loaded, backend.clone()).context("building model")?,

@@ -2004,10 +2004,11 @@ impl KvCache {
     /// constructors, and between them they could express per-layer dims,
     /// per-layer strides, and recurrent state — but *not* strides and
     /// recurrent state together, because the two grew on separate branches
-    /// and nothing joined them. No architecture needs that combination today.
-    /// The next one to need it should find a constructor rather than a fifth
-    /// entry point, and every shape should already flow through the same code
-    /// so a change to how rows are allocated lands in one place.
+    /// and nothing joined them. `engine::arch::glm5` is the architecture that
+    /// needs the combination — a per-pool indexer key beside per-token
+    /// delta-net state — and it found a constructor
+    /// ([`KvCache::new_mixed_strided`]) rather than a fifth entry point,
+    /// because every shape already flows through here.
     fn build(capacity: usize, kv_dims: &[(usize, usize)], recurrent: &[RecurrentSpec]) -> Self {
         Self {
             layers: kv_dims
@@ -2231,6 +2232,19 @@ impl KvCache {
     ) -> Self {
         let strided: Vec<(usize, usize)> = kv_dims.iter().map(|&dim| (dim, 1)).collect();
         Self::build(capacity, &strided, recurrent_specs)
+    }
+
+    /// [`KvCache::new_mixed`] with strides, for an architecture that is both
+    /// hybrid and block-compressed: `engine::arch::glm5` alternates recurrent
+    /// (KDA) layers with sparse latent-attention ones, and each of the latter
+    /// keeps a per-token indexer row *and* a pooled key per completed pool of
+    /// `attention.indexer.kpool` positions.
+    pub fn new_mixed_strided(
+        capacity: usize,
+        kv_dims: &[(usize, usize)],
+        recurrent_specs: &[RecurrentSpec],
+    ) -> Self {
+        Self::build(capacity, kv_dims, recurrent_specs)
     }
 
     /// Reuses `src`'s already-computed positions `[0, len)` instead of

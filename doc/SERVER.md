@@ -504,7 +504,9 @@ NR  MODEL                                        QUANT   SIZE        LAST_USED  
  1  unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF    Q4_K_M  17.28 GiB   2026-08-24 15:42  Yes (qwen3)
  2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Never             Yes (qwen3)
  3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    2026-08-21 09:16  Yes (gemma4)
- 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             No (glm-dsa)
+ 4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             Yes (glm-dsa)
+ 5  unsloth/GLM-5.3-Flash-GGUF                   IQ1_M   90.88 GiB   Never             Yes (glm5next)
+ 6  unsloth/GLM-4.6-GGUF                         Q4_K_M  204.15 GiB  Never             No (glm4moe)
 ```
 
 By default, `NR` numbers models alphabetically by `MODEL`, starting from 1 — a
@@ -1478,7 +1480,7 @@ the same scan as `orangu-server list`, with its core numbered inventory fields:
 | `MODEL` | what to pass to `show`/`delete`/`refresh` on the command line |
 | `QUANT` | the quantization the file is stored at, `-` when it says nothing |
 | `SIZE` | summed across every shard |
-| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm-dsa)`, `No (llama, TQ1_0)` |
+| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm4moe)`, `No (llama, TQ1_0)` |
 
 Those strings come from the same code that prints them in the terminal, so
 the two tables cannot end up saying different things about the same file. A
@@ -1770,7 +1772,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for fifteen
+Text-in/text-out GGUF chat, completion, and embedding models, for sixteen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
 *text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -1794,7 +1796,14 @@ per token, one shared key/value vector serving every query head, compressed
 attention blocks on top of a sliding window, and hash-routed experts),
 GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
 attention over a compressed key/value cache, with a lightning indexer
-choosing which positions each layer attends), Kimi-K3 (`kimi-k3`, e.g.
+choosing which positions each layer attends), GLM-5.3-Flash (`glm5next`,
+e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
+layers alternating with that same absorbed latent attention, on a
+`hyper_connection.count`-stream residual bundle rather than a residual
+vector, over sigmoid-routed experts with a shared one. Nothing in it
+rotates, and its lightning indexer scores fixed *pools* of
+`attention.indexer.kpool` positions rather than single positions, so the
+cut lands on pool boundaries), Kimi-K3 (`kimi-k3`, e.g.
 `unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
 latent attention, cross-layer residuals, and experts running in a latent
 space), and
@@ -1948,6 +1957,52 @@ file omits it, as GLM-5.2's quants do). Below `indexer.top_k` positions the
 selection cannot change the answer — every visible position is chosen — so
 the scoring pass is skipped there. The multi-token-prediction block these
 files carry (`blk.78` in GLM-5.2) is a draft head and is not run.
+
+GLM-5.3-Flash (`glm5next`) runs on the CPU path only, and is the model in
+this server assembled most nearly out of parts other models here already
+brought. Its trunk is the `kimi-k3` / `bailingmoe3` pair — three Kimi Delta
+Attention layers to every one absorbed latent attention layer, read from the
+per-layer `attention.head_count_kv` array where `0` marks a recurrent one —
+with the KDA output gate factored through a `kda.head_dim` bottleneck the
+way the decay gate already was. Its residual is `deepseek4`'s: not a vector
+but `hyper_connection.count` parallel streams, mixed down to one vector on
+the way into each sub-layer and scattered back on the way out, by weights a
+low-rank projection predicts per token and a Sinkhorn normalization makes
+doubly stochastic. Its FFN is the leading-dense-then-routed-experts MoE of
+`glm-dsa`, under `deepseek4`'s pre-activation `swiglu_clamp_exp` limit,
+which here applies to the dense blocks too.
+
+Three things are its own. **Nothing rotates.** `rope.dimension_count` is
+`0`: the latent layers are position-free, and position reaches the model
+only through the causal mask, the order the recurrent layers see tokens in,
+and the indexer's intra-pool bias below. **The indexer is pooled.** Where
+`glm-dsa` scores every earlier position one by one, this one groups
+positions into fixed pools of `attention.indexer.kpool` and scores one
+pooled key per pool — a per-channel convex mix of its members' keys,
+weighted by a softmax over a second, independent gate projection plus a
+learned intra-pool position bias. The cut then takes whole pools, never part
+of one, and the query's own trailing incomplete pool is attended on top of
+the `attention.indexer.top_k` budget rather than out of it. Below
+`indexer.top_k` positions the selection cannot change the answer — every
+visible pool fits, and the pools plus the tail are exactly the causal
+window — so the scoring pass is skipped there. **The streams collapse to a
+mean**, where `deepseek4` collapses them with a mixer of its own. The
+multi-token-prediction block these files carry (`blk.45`) is a draft head
+and is not run, and the vision tower shipped beside them
+(`mmproj-*.gguf`) is a separate model that this server does not load.
+
+Serving it needs nothing new. Its vocabulary is the `glm4` byte-level BPE
+pre-tokenizer this server already had, and its template opens the reply
+inside a `<think>` block that the model closes itself — so a
+reasoning-suppressing role (`--review`) separates reasoning from answer
+here exactly as it does for the other `<think>`-marked families, and every
+other role prints the reasoning, a blank line, then the answer. Tool calls
+come back in the
+`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+form GLM and Ling 3.0 share, already parsed. Like every recurrent family
+here it has no per-position history to roll back, so a cached prompt prefix
+is reusable only in full and the opt-in prompt-lookup speculative decoding
+is not available for it. Embeddings requests are not implemented.
 
 DeepSeek-V4 (`deepseek4`) runs on the CPU path only, and differs from every
 other family here in four ways at once: the residual stream is

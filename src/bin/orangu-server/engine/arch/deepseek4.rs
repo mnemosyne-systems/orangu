@@ -67,9 +67,10 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+use super::hyper::{HyperConnection, HyperScratch, HyperShape};
+use super::indexer::pool_block;
 use super::{
-    ExpertGating, ExpertRouting, ModelForward, attend, rms_norm_rows, rms_norm_rows_into,
-    top_k_indices,
+    ExpertGating, ExpertRouting, ModelForward, SwigluLimit, attend, rms_norm_rows, top_k_indices,
 };
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
@@ -128,19 +129,6 @@ struct Indexer {
     /// `[q_lora_rank, indexer.head_count * indexer.key_length]`.
     q_b: QuantMatrix,
     comp: Compressor,
-}
-
-/// One half-layer's hyper-connection mixer: the projection that predicts
-/// the in-mix, out-mix, and stream-combination weights from the four
-/// streams, plus that projection's affine post-scaling.
-struct HyperConnection {
-    /// `[hc * n_embd, (2 + hc) * hc]`.
-    weights: QuantMatrix,
-    /// `[(2 + hc) * hc]`.
-    base: Vec<f32>,
-    /// `[3]` — one scale each for the in-mix, out-mix, and combination
-    /// parts of the projection's output.
-    scale: Vec<f32>,
 }
 
 /// One layer's mixture-of-experts FFN: routed experts plus one always-on
@@ -215,10 +203,9 @@ pub struct Deepseek4Model {
     output_weight: QuantMatrix,
     /// The final collapse of the four residual streams to one vector.
     hc_head: HyperConnection,
-    /// `hyper_connection.count`.
-    hc: usize,
-    hc_sinkhorn_iters: usize,
-    hc_eps: f32,
+    /// The shared hyper-connection machinery every layer runs — see
+    /// `engine::arch::hyper`.
+    hyper: HyperShape,
     n_expert_used: usize,
     routing: ExpertRouting,
     q_lora_rank: usize,
@@ -242,125 +229,6 @@ pub struct Deepseek4Model {
 fn selected_experts_for_token(route: &[i32], token: u32, n_expert_used: usize) -> &[i32] {
     let start = token as usize * n_expert_used;
     &route[start..start + n_expert_used]
-}
-
-fn hc_affine(x: &mut [f32], scale: f32, base: &[f32]) {
-    debug_assert_eq!(x.len(), base.len());
-    for (v, &b) in x.iter_mut().zip(base.iter()) {
-        *v = *v * scale + b;
-    }
-}
-
-fn hc_sigmoid_eps_inplace(x: &mut [f32], eps: f32) {
-    for v in x.iter_mut() {
-        *v = tensor::sigmoid(*v) + eps;
-    }
-}
-
-fn hc_sigmoid_times_two_inplace(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v = tensor::sigmoid(*v) * 2.0;
-    }
-}
-
-/// Sinkhorn-normalizes each token's `[hc, hc]` stream-combination matrix
-/// (destination index fastest) into a doubly stochastic one: a softmax over
-/// destinations, then alternating column/row normalizations. Upstream's
-/// `build_hc_sinkhorn`.
-fn hc_sinkhorn_inplace(comb: &mut [f32], hc: usize, n_tokens: usize, eps: f32, iters: usize) {
-    debug_assert_eq!(comb.len(), hc * hc * n_tokens);
-    for t in 0..n_tokens {
-        let block = &mut comb[t * hc * hc..(t + 1) * hc * hc];
-        for src in 0..hc {
-            let mut max = f32::NEG_INFINITY;
-            for dst in 0..hc {
-                max = max.max(block[dst + src * hc]);
-            }
-            let mut sum = 0.0;
-            for dst in 0..hc {
-                let e = (block[dst + src * hc] - max).exp();
-                block[dst + src * hc] = e;
-                sum += e;
-            }
-            for dst in 0..hc {
-                block[dst + src * hc] = block[dst + src * hc] / sum.max(f32::MIN_POSITIVE) + eps;
-            }
-        }
-
-        let normalize_cols = |block: &mut [f32]| {
-            for dst in 0..hc {
-                let mut sum = eps;
-                for src in 0..hc {
-                    sum += block[dst + src * hc];
-                }
-                for src in 0..hc {
-                    block[dst + src * hc] /= sum;
-                }
-            }
-        };
-        let normalize_rows = |block: &mut [f32]| {
-            for src in 0..hc {
-                let mut sum = eps;
-                for dst in 0..hc {
-                    sum += block[dst + src * hc];
-                }
-                for dst in 0..hc {
-                    block[dst + src * hc] /= sum;
-                }
-            }
-        };
-
-        normalize_cols(block);
-        for _ in 1..iters {
-            normalize_rows(block);
-            normalize_cols(block);
-        }
-    }
-}
-
-/// Splits one token's hyper-connection projection into its three parts: the
-/// in-mix (`pre`), the out-mix (`post`), and the Sinkhorn-normalized
-/// stream-combination matrix (`comb`).
-fn hc_pre_parts(
-    mixes: &[f32],
-    hc: usize,
-    eps: f32,
-    sinkhorn_iters: usize,
-    scale: &[f32],
-    base: &[f32],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    debug_assert_eq!(mixes.len(), hc * (2 + hc));
-    let mut pre = mixes[..hc].to_vec();
-    hc_affine(&mut pre, scale[0], &base[..hc]);
-    hc_sigmoid_eps_inplace(&mut pre, eps);
-
-    let mut post = mixes[hc..2 * hc].to_vec();
-    hc_affine(&mut post, scale[1], &base[hc..2 * hc]);
-    hc_sigmoid_times_two_inplace(&mut post);
-
-    let mut comb = mixes[2 * hc..].to_vec();
-    hc_affine(&mut comb, scale[2], &base[2 * hc..2 * hc + hc * hc]);
-    hc_sinkhorn_inplace(&mut comb, hc, 1, eps, sinkhorn_iters);
-    (pre, post, comb)
-}
-
-/// Pools one completed block from its members' `(value, score)` rows: a
-/// softmax over the members *per feature dimension*, weighted-summed.
-/// `values`/`scores` are `[n_members, width]`, with `-inf` scores for the
-/// synthetic empty members an overlapping block's first window can have.
-fn pool_block(values: &[f32], scores: &[f32], width: usize) -> Vec<f32> {
-    let n = values.len() / width;
-    debug_assert_eq!(scores.len(), n * width);
-    let mut out = vec![0.0; width];
-    let mut w = vec![0.0; n];
-    for (d, o) in out.iter_mut().enumerate() {
-        for (i, wi) in w.iter_mut().enumerate() {
-            *wi = scores[i * width + d];
-        }
-        tensor::softmax_inplace(&mut w);
-        *o = (0..n).map(|i| values[i * width + d] * w[i]).sum();
-    }
-    out
 }
 
 /// The raw (uncompressed) positions a query at `pos` attends: the last
@@ -400,21 +268,9 @@ fn rope_attn_factor(freq_scale: f32, ext_factor: f32) -> f32 {
 /// on a wide prefill each is several times the hidden state itself.
 #[derive(Default)]
 struct LayerScratch {
-    /// The streams as they were before this half-layer, which `hc_expand`
-    /// reads while writing `x`. A real copy — only its allocation is saved.
-    residual: Vec<f32>,
-    /// Per-token out-mix weights (`n_tokens * hc`).
-    post: Vec<f32>,
-    /// Per-token stream-combination weights (`n_tokens * hc * hc`).
-    comb: Vec<f32>,
-    /// The row-normalized streams `hc_collapse` predicts its mixes from.
-    flat: Vec<f32>,
-    /// `hc_collapse`'s mixing weights.
-    mixes: Vec<f32>,
-    /// `hc_collapse`'s collapsed output, one per half-layer so the
-    /// attention half's value is not overwritten while still in use.
-    collapsed_attn: Vec<f32>,
-    collapsed_ffn: Vec<f32>,
+    /// Everything the hyper-connection pair reuses — see
+    /// `engine::arch::hyper::HyperScratch`.
+    hc: HyperScratch,
     /// The attention half's always-run projections — see
     /// `Backend::matmul_into`. The optional compressor and sparse-indexer
     /// projections are **not** here: they are produced inside `Option::map`
@@ -449,10 +305,7 @@ impl Deepseek4Model {
         let output_weight = loaded
             .matrix("output.weight")
             .context("loading output.weight")?;
-        let hc = loaded
-            .metadata_u64("hyper_connection.count")
-            .context("missing hyper_connection.count")? as usize;
-        anyhow::ensure!(hc > 0, "hyper_connection.count must be at least 1");
+        let hyper = HyperShape::from_gguf(loaded)?;
         let hash_layer_count = loaded.metadata_u64("hash_layer_count").unwrap_or(0) as usize;
         let n_expert_used = loaded
             .metadata_u64("expert_used_count")
@@ -488,17 +341,6 @@ impl Deepseek4Model {
         let compress_rope_base = loaded
             .metadata_f32("attention.compress_rope_freq_base")
             .unwrap_or(160000.0);
-        let hc_sinkhorn_iters = loaded
-            .metadata_u64("hyper_connection.sinkhorn_iterations")
-            .context("missing hyper_connection.sinkhorn_iterations")?
-            as usize;
-        anyhow::ensure!(
-            hc_sinkhorn_iters > 0,
-            "hyper_connection.sinkhorn_iterations must be at least 1"
-        );
-        let hc_eps = loaded
-            .metadata_f32("hyper_connection.epsilon")
-            .unwrap_or(1e-6);
         let compress_ratios = loaded
             .metadata_array_f32("attention.compress_ratios")
             .unwrap_or_default();
@@ -566,22 +408,7 @@ impl Deepseek4Model {
         };
         let compress_rope = scaled_rope(compress_rope_base);
 
-        let hyper_connection = |prefix: &str| -> Result<HyperConnection> {
-            Ok(HyperConnection {
-                weights: loaded
-                    .matrix(&format!("{prefix}_fn.weight"))
-                    .with_context(|| format!("loading {prefix}_fn.weight"))?,
-                base: loaded
-                    .tensor(&format!("{prefix}_base.weight"))
-                    .with_context(|| format!("loading {prefix}_base.weight"))?
-                    .0,
-                scale: loaded
-                    .tensor(&format!("{prefix}_scale.weight"))
-                    .with_context(|| format!("loading {prefix}_scale.weight"))?
-                    .0,
-            })
-        };
-        let hc_head = hyper_connection("output_hc")?;
+        let hc_head = HyperConnection::load(loaded, "output_hc")?;
 
         let mut kv_dims: Vec<(usize, usize)> = Vec::new();
         let mut layers = Vec::with_capacity(n_layer);
@@ -665,8 +492,8 @@ impl Deepseek4Model {
                 attn_kv_norm: get("attn_kv_a_norm.weight")?,
                 wo_a: get_matrix("attn_output_a.weight")?,
                 wo_b: get_matrix("attn_output_b.weight")?,
-                hc_attn: hyper_connection(&format!("blk.{i}.hc_attn"))?,
-                hc_ffn: hyper_connection(&format!("blk.{i}.hc_ffn"))?,
+                hc_attn: HyperConnection::load(loaded, &format!("blk.{i}.hc_attn"))?,
+                hc_ffn: HyperConnection::load(loaded, &format!("blk.{i}.hc_ffn"))?,
                 ratio,
                 compressor: compression,
                 indexer,
@@ -721,9 +548,7 @@ impl Deepseek4Model {
             output_norm,
             output_weight,
             hc_head,
-            hc,
-            hc_sinkhorn_iters,
-            hc_eps,
+            hyper,
             n_expert_used,
             routing: ExpertRouting {
                 n_expert_used,
@@ -759,24 +584,18 @@ impl Deepseek4Model {
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
-        let hc = self.hc;
         let eps = self.config.rms_eps;
 
-        // Every stream starts as a copy of the token embedding
-        // (`ggml_repeat_4d` over the hyper-connection axis).
-        let mut x = vec![0f32; n_tokens * hc * n_embd];
+        let mut embeddings = vec![0f32; n_tokens * n_embd];
         for (t, &tok) in tokens.iter().enumerate() {
             let tok = tok as usize;
             anyhow::ensure!(
                 tok < self.config.n_vocab,
                 "token id {tok} is out of vocab range"
             );
-            let embd = self.tok_embeddings.row(tok);
-            for s in 0..hc {
-                let at = (t * hc + s) * n_embd;
-                x[at..at + n_embd].copy_from_slice(&embd);
-            }
+            embeddings[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
+        let mut x = self.hyper.seed(&embeddings, n_tokens);
 
         // Grown once and reused by every layer rather than allocated per
         // half-layer. `flat` is the big one: `hc` times the hidden state.
@@ -787,14 +606,15 @@ impl Deepseek4Model {
         }
 
         let mut out = Vec::new();
-        self.hc_collapse_into(
+        self.hyper.collapse_into(
+            self.backend.as_ref(),
             &mut out,
             &self.hc_head,
             &x,
             n_tokens,
             None,
-            &mut scratch.flat,
-            &mut scratch.mixes,
+            &mut scratch.hc.flat,
+            &mut scratch.hc.mixes,
         );
         tensor::rmsnorm_inplace(&mut out, &self.output_norm, n_tokens, n_embd, eps);
         Ok(out)
@@ -814,22 +634,27 @@ impl Deepseek4Model {
         let eps = self.config.rms_eps;
 
         let LayerScratch {
-            residual,
-            post,
-            comb,
-            flat,
-            mixes: mixes_buf,
-            collapsed_attn,
-            collapsed_ffn,
+            hc:
+                HyperScratch {
+                    residual,
+                    post,
+                    comb,
+                    flat,
+                    mixes: mixes_buf,
+                    collapsed_attn,
+                    collapsed_ffn,
+                },
             attn: attn_scratch,
         } = scratch;
+        let backend = self.backend.as_ref();
 
-        // A genuine copy, unlike the norm inputs: `hc_expand` writes `x`
+        // A genuine copy, unlike the norm inputs: the out-mix writes `x`
         // while still reading the streams as they were before this
         // half-layer. Only the *allocation* is hoisted here, not the copy.
         residual.clear();
         residual.extend_from_slice(x);
-        self.hc_collapse_into(
+        self.hyper.collapse_into(
+            backend,
             collapsed_attn,
             &layer.hc_attn,
             x,
@@ -841,11 +666,12 @@ impl Deepseek4Model {
         let cur = collapsed_attn;
         tensor::rmsnorm_inplace(cur, &layer.attn_norm, n_tokens, n_embd, eps);
         let attn = self.attention(layer, cache, attn_scratch, cur, n_tokens, start_pos)?;
-        self.hc_expand(x, &attn, residual, post, comb, n_tokens);
+        self.hyper.expand(x, &attn, residual, post, comb, n_tokens);
 
         residual.clear();
         residual.extend_from_slice(x);
-        self.hc_collapse_into(
+        self.hyper.collapse_into(
+            backend,
             collapsed_ffn,
             &layer.hc_ffn,
             x,
@@ -857,115 +683,8 @@ impl Deepseek4Model {
         let cur = collapsed_ffn;
         tensor::rmsnorm_inplace(cur, &layer.ffn.norm, n_tokens, n_embd, eps);
         let ffn = self.moe_ffn(&layer.ffn, cur, tokens);
-        self.hc_expand(x, &ffn, residual, post, comb, n_tokens);
+        self.hyper.expand(x, &ffn, residual, post, comb, n_tokens);
         Ok(())
-    }
-
-    /// The hyper-connection in-mix: predicts this half-layer's mixing
-    /// weights from the four streams and collapses them to one vector per
-    /// token. When `out` is given it also yields the out-mix (`post`) and
-    /// stream-combination (`comb`) weights [`Self::hc_expand`] needs; the
-    /// final head passes `None`, which is upstream's separate
-    /// `build_hc_head` (one scale, no `post`/`comb` at all).
-    #[allow(clippy::too_many_arguments)]
-    fn hc_collapse_into(
-        &self,
-        cur: &mut Vec<f32>,
-        mixer: &HyperConnection,
-        x: &[f32],
-        n_tokens: usize,
-        out: Option<(&mut Vec<f32>, &mut Vec<f32>)>,
-        flat: &mut Vec<f32>,
-        mixes_buf: &mut Vec<f32>,
-    ) {
-        let n_embd = self.config.n_embd;
-        let hc = self.hc;
-        let flat_dim = hc * n_embd;
-
-        // `hc` times the hidden state — the largest per-layer copy in this
-        // architecture, and it was being made only to be overwritten by the
-        // norm that follows.
-        rms_norm_rows_into(flat, x, flat_dim, self.config.rms_eps);
-        self.backend
-            .matmul_into(mixes_buf, flat, n_tokens, &mixer.weights);
-        let mixes = &*mixes_buf;
-        let mix_dim = mixer.weights.out_dim;
-
-        // Accumulated into, not overwritten — see `tensor::zeroed_to`.
-        let cur = tensor::zeroed_to(cur, n_tokens * n_embd);
-        let (post_out, comb_out) = match out {
-            Some((post, comb)) => {
-                post.clear();
-                post.resize(n_tokens * hc, 0.0);
-                comb.clear();
-                comb.resize(n_tokens * hc * hc, 0.0);
-                (Some(post), Some(comb))
-            }
-            None => (None, None),
-        };
-        let mut post_out = post_out;
-        let mut comb_out = comb_out;
-
-        for t in 0..n_tokens {
-            let mix = &mixes[t * mix_dim..(t + 1) * mix_dim];
-            let pre = match (&mut post_out, &mut comb_out) {
-                (Some(post), Some(comb)) => {
-                    let (pre, p, c) = hc_pre_parts(
-                        mix,
-                        hc,
-                        self.hc_eps,
-                        self.hc_sinkhorn_iters,
-                        &mixer.scale,
-                        &mixer.base,
-                    );
-                    post[t * hc..(t + 1) * hc].copy_from_slice(&p);
-                    comb[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&c);
-                    pre
-                }
-                _ => {
-                    let mut pre = mix.to_vec();
-                    hc_affine(&mut pre, mixer.scale[0], &mixer.base);
-                    hc_sigmoid_eps_inplace(&mut pre, self.hc_eps);
-                    pre
-                }
-            };
-            let dst = &mut cur[t * n_embd..(t + 1) * n_embd];
-            for (s, &w) in pre.iter().enumerate() {
-                let src = &x[(t * hc + s) * n_embd..(t * hc + s + 1) * n_embd];
-                tensor::axpy_inplace(dst, src, w);
-            }
-        }
-    }
-
-    /// The hyper-connection out-mix: writes this half-layer's output back
-    /// into the four streams, each a `post`-weighted copy of the output plus
-    /// a `comb`-weighted mix of the streams it came from.
-    fn hc_expand(
-        &self,
-        x: &mut [f32],
-        sub_out: &[f32],
-        residual: &[f32],
-        post: &[f32],
-        comb: &[f32],
-        n_tokens: usize,
-    ) {
-        let n_embd = self.config.n_embd;
-        let hc = self.hc;
-        for t in 0..n_tokens {
-            let out_t = &sub_out[t * n_embd..(t + 1) * n_embd];
-            for dst in 0..hc {
-                let target = &mut x[(t * hc + dst) * n_embd..(t * hc + dst + 1) * n_embd];
-                let scale = post[t * hc + dst];
-                for (o, &v) in target.iter_mut().zip(out_t.iter()) {
-                    *o = v * scale;
-                }
-                for src in 0..hc {
-                    let w = comb[t * hc * hc + src * hc + dst];
-                    let from = &residual[(t * hc + src) * n_embd..(t * hc + src + 1) * n_embd];
-                    tensor::axpy_inplace(target, from, w);
-                }
-            }
-        }
     }
 
     /// One layer's attention: the shared-key MLA-style projection, this
@@ -1454,25 +1173,10 @@ impl Deepseek4Model {
     }
 }
 
-/// SwiGLU with DeepSeek-V4's clamp: the up projection is clamped to
-/// `[-limit, limit]` and the gate to `(-inf, limit]` **before** the SiLU,
-/// not after it — upstream branches on the architecture for exactly this
-/// (`arch == LLM_ARCH_DEEPSEEK4` in `build_moe_ffn`/`build_ffn`), and the
-/// other branch clamps the activation instead. A limit of zero (no
-/// `swiglu_clamp_*` key) means plain SwiGLU.
+/// SwiGLU with DeepSeek-V4's clamp — [`super::SwigluLimit::PreActivation`],
+/// shared with `engine::arch::glm5`, which upstream puts in the same branch.
 fn swiglu(gate: &[f32], up: &[f32], limit: f32) -> Vec<f32> {
-    debug_assert_eq!(gate.len(), up.len());
-    if limit <= 1e-6 {
-        return gate
-            .iter()
-            .zip(up.iter())
-            .map(|(&g, &u)| tensor::silu(g) * u)
-            .collect();
-    }
-    gate.iter()
-        .zip(up.iter())
-        .map(|(&g, &u)| tensor::silu(g.min(limit)) * u.clamp(-limit, limit))
-        .collect()
+    SwigluLimit::pre_activation(limit).apply(gate, up)
 }
 
 impl ModelForward for Deepseek4Model {
@@ -1554,9 +1258,8 @@ impl ModelForward for Deepseek4Model {
 #[cfg(test)]
 mod tests {
     use super::{
-        CSA_RATIO, HCA_RATIO, hc_affine, hc_pre_parts, hc_sigmoid_eps_inplace,
-        hc_sigmoid_times_two_inplace, hc_sinkhorn_inplace, pool_block, raw_window,
-        rope_attn_factor, selected_experts_for_token, swiglu, visible_blocks,
+        CSA_RATIO, HCA_RATIO, raw_window, rope_attn_factor, selected_experts_for_token, swiglu,
+        visible_blocks,
     };
     use crate::engine::arch::rms_norm_rows;
     use crate::engine::arch::{ExpertGating, ExpertRouting};
@@ -1592,43 +1295,6 @@ mod tests {
         assert!((weights[0] - std::f32::consts::LN_2.sqrt()).abs() < 1e-6);
     }
 
-    #[test]
-    fn hc_affine_scales_then_biases() {
-        let mut x = vec![1.0, 2.0, 3.0];
-        hc_affine(&mut x, 0.5, &[10.0, 20.0, 30.0]);
-        assert_eq!(x, vec![10.5, 21.0, 31.5]);
-    }
-
-    #[test]
-    fn hc_sigmoid_variants_match_reference_formulas() {
-        let mut pre = vec![0.0, 1.0];
-        hc_sigmoid_eps_inplace(&mut pre, 1e-6);
-        assert!((pre[0] - 0.500001).abs() < 1e-6);
-        assert!((pre[1] - (crate::engine::tensor::sigmoid(1.0) + 1e-6)).abs() < 1e-6);
-
-        let mut post = vec![0.0, 1.0];
-        hc_sigmoid_times_two_inplace(&mut post);
-        assert!((post[0] - 1.0).abs() < 1e-6);
-        assert!((post[1] - crate::engine::tensor::sigmoid(1.0) * 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn hc_sinkhorn_produces_positive_column_normalized_weights() {
-        let mut comb = vec![
-            1.0, 2.0, 3.0, 4.0, //
-            5.0, 6.0, 7.0, 8.0, //
-        ];
-        hc_sinkhorn_inplace(&mut comb, 2, 2, 1e-6, 3);
-        for t in 0..2 {
-            let block = &comb[t * 4..(t + 1) * 4];
-            for dst in 0..2 {
-                let col = block[dst] + block[dst + 2];
-                assert!((col - 1.0).abs() < 1e-4, "{col}");
-            }
-            assert!(block.iter().all(|v| *v > 0.0));
-        }
-    }
-
     /// This architecture's own routing settings through the shared
     /// router: sqrt-softplus probabilities, a hash-table selection, then
     /// renormalize and scale.
@@ -1650,60 +1316,6 @@ mod tests {
         let denom = raw0 + raw1;
         assert!((weights[0] - (raw0 / denom) * 1.5).abs() < 1e-6);
         assert!((weights[1] - (raw1 / denom) * 1.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn hc_pre_parts_split_and_normalize_the_mix_vector() {
-        let mixes = vec![
-            0.0, 1.0, //
-            2.0, 3.0, //
-            4.0, 5.0, 6.0, 7.0, //
-        ];
-        let scale = vec![1.0, 1.0, 1.0];
-        let base = vec![0.0; 2 + 2 + 4];
-        let (pre, post, comb) = hc_pre_parts(&mixes, 2, 1e-6, 3, &scale, &base);
-        assert_eq!(pre.len(), 2);
-        assert_eq!(post.len(), 2);
-        assert_eq!(comb.len(), 4);
-        assert!(pre.iter().all(|v| *v > 0.0));
-        assert!(post.iter().all(|v| *v > 0.0));
-        let col0 = comb[0] + comb[2];
-        let col1 = comb[1] + comb[3];
-        assert!((col0 - 1.0).abs() < 1e-4, "{col0}");
-        assert!((col1 - 1.0).abs() < 1e-4, "{col1}");
-    }
-
-    #[test]
-    fn pool_block_softmaxes_each_dimension_over_its_members() {
-        // Dimension 0: member 1 wins outright; dimension 1: a tie.
-        let values = vec![
-            1.0, 1.0, //
-            2.0, 3.0, //
-        ];
-        let scores = vec![
-            0.0, 0.0, //
-            100.0, 0.0, //
-        ];
-        let out = pool_block(&values, &scores, 2);
-        assert!((out[0] - 2.0).abs() < 1e-4, "{out:?}");
-        assert!((out[1] - 2.0).abs() < 1e-4, "{out:?}");
-    }
-
-    #[test]
-    fn pool_block_ignores_members_scored_negative_infinity() {
-        let values = vec![
-            9.0, 9.0, //
-            2.0, 4.0, //
-        ];
-        let scores = vec![
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY, //
-            0.0,
-            0.0, //
-        ];
-        let out = pool_block(&values, &scores, 2);
-        assert!((out[0] - 2.0).abs() < 1e-6, "{out:?}");
-        assert!((out[1] - 4.0).abs() < 1e-6, "{out:?}");
     }
 
     #[test]

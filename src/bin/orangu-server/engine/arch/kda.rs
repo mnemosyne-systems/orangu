@@ -74,8 +74,12 @@ pub(crate) struct KdaNames {
     /// Its second, when the file factors the decay gate. `None` means
     /// `f_a` already projects to `d_inner`.
     pub f_b: Option<&'static str>,
-    /// The full-rank output gate.
+    /// The output gate's first (or only) projection.
     pub g: &'static str,
+    /// Its second, when the file factors the output gate the way it
+    /// factors the decay one. `None` means `g` already projects to
+    /// `d_inner`.
+    pub g_b: Option<&'static str>,
     /// Whether `ssm_a` holds `-exp(A_log)` (folded at conversion time) or
     /// `+exp(A_log)` with the sign left to live in the gate's lower bound.
     /// Both conventions are in the wild and neither is discoverable from
@@ -90,6 +94,7 @@ pub(crate) const KIMI3_KDA_NAMES: KdaNames = KdaNames {
     f_a: "ssm_f_a.weight",
     f_b: Some("ssm_f_b.weight"),
     g: "ssm_g.weight",
+    g_b: None,
     a_is_negated: true,
 };
 
@@ -99,7 +104,18 @@ pub(crate) const BAILINGMOE3_KDA_NAMES: KdaNames = KdaNames {
     f_a: "ssm_f_a.weight",
     f_b: None,
     g: "ssm_g_a.weight",
+    g_b: None,
     a_is_negated: false,
+};
+
+/// `glm5next`: both gates factored through a `head_dim` bottleneck, and
+/// `ssm_a` already negated.
+pub(crate) const GLM5NEXT_KDA_NAMES: KdaNames = KdaNames {
+    f_a: "ssm_f_a.weight",
+    f_b: Some("ssm_f_b.weight"),
+    g: "ssm_g_a.weight",
+    g_b: Some("ssm_g_b.weight"),
+    a_is_negated: true,
 };
 
 /// The KDA hyperparameters every layer of one model shares.
@@ -114,6 +130,13 @@ pub(crate) struct KdaShape {
     /// `kda.gate_lower_bound`, when the file sets one — the "safe gate".
     pub gate_lower_bound: Option<f32>,
     pub eps: f32,
+    /// The epsilon of the L2 normalization applied to the query and key
+    /// before the delta rule. Usually the model's own RMS epsilon, but
+    /// `glm5next`'s reference hard-codes `1e-6` regardless of it, and the
+    /// two differ there by an order of magnitude. Only ever visible on a
+    /// head whose vector is near zero, which is exactly why it is declared
+    /// rather than assumed.
+    pub l2_eps: f32,
 }
 
 impl KdaShape {
@@ -149,8 +172,10 @@ pub(crate) struct KdaLayer {
     a: Vec<f32>,
     /// `[n_embd, n_head]` — the per-head delta-rule write strength.
     beta: QuantMatrix,
-    /// `[n_embd, d_inner]` — the full-rank output gate.
+    /// The output gate's projection: `[n_embd, d_inner]` on its own, or
+    /// `[n_embd, head_dim]` followed by `g_b`'s `[head_dim, d_inner]`.
     g: QuantMatrix,
+    g_b: Option<QuantMatrix>,
     /// RMSNorm weight applied per head to the scan output, `[head_dim]`.
     o_norm: Vec<f32>,
     wo: QuantMatrix,
@@ -216,6 +241,15 @@ impl KdaLayer {
             shape.d_inner
         );
 
+        let g = get_matrix(names.g)?;
+        let g_b = names.g_b.map(get_matrix).transpose()?;
+        let gate_out = g_b.as_ref().unwrap_or(&g).out_dim;
+        anyhow::ensure!(
+            gate_out == shape.d_inner,
+            "layer {layer}'s output gate projects to {gate_out} outputs, not d_inner ({})",
+            shape.d_inner
+        );
+
         Ok(Self {
             wq: get_matrix("attn_q.weight")?,
             wk: get_matrix("attn_k.weight")?,
@@ -226,7 +260,8 @@ impl KdaLayer {
             dt_bias: get("ssm_dt.bias")?,
             a,
             beta: get_matrix("ssm_beta.weight")?,
-            g: get_matrix(names.g)?,
+            g,
+            g_b,
             o_norm: get("ssm_norm.weight")?,
             wo: get_matrix("attn_output.weight")?,
             cache_index,
@@ -267,6 +302,7 @@ impl KdaLayer {
             f_low,
             beta,
             gate,
+            gate_low,
         } = scratch;
         backend.matmul_into(q, normed, n_tokens, &self.wq);
         backend.matmul_into(k, normed, n_tokens, &self.wk);
@@ -279,7 +315,13 @@ impl KdaLayer {
             None => backend.matmul_into(f, normed, n_tokens, &self.f_a),
         }
         backend.matmul_into(beta, normed, n_tokens, &self.beta);
-        backend.matmul_into(gate, normed, n_tokens, &self.g);
+        match &self.g_b {
+            Some(g_b) => {
+                backend.matmul_into(gate_low, normed, n_tokens, &self.g);
+                backend.matmul_into(gate, gate_low, n_tokens, g_b);
+            }
+            None => backend.matmul_into(gate, normed, n_tokens, &self.g),
+        }
         let (q, k, v, f, beta, gate) = (&*q, &*k, &*v, &*f, &*beta, &*gate);
 
         // The scan output, before the output projection. Every element is
@@ -321,12 +363,12 @@ impl KdaLayer {
             let dst = &mut scan[t * d_inner..(t + 1) * d_inner];
             for h in 0..n_head {
                 let q_h = &mut q_t[h * head_dim..(h + 1) * head_dim];
-                tensor::l2_norm_inplace(q_h, eps);
+                tensor::l2_norm_inplace(q_h, shape.l2_eps);
                 for value in q_h.iter_mut() {
                     *value *= q_scale;
                 }
                 let k_h = &mut k_t[h * head_dim..(h + 1) * head_dim];
-                tensor::l2_norm_inplace(k_h, eps);
+                tensor::l2_norm_inplace(k_h, shape.l2_eps);
                 let q_h = &q_t[h * head_dim..(h + 1) * head_dim];
                 let k_h = &k_t[h * head_dim..(h + 1) * head_dim];
                 let v_h = &v_t[h * head_dim..(h + 1) * head_dim];
@@ -364,6 +406,8 @@ pub(crate) struct KdaScratch {
     f_low: Vec<f32>,
     beta: Vec<f32>,
     gate: Vec<f32>,
+    /// The low-rank intermediate, only when `g_b` is present.
+    gate_low: Vec<f32>,
 }
 
 /// One head's delta-rule step, exactly ggml's `gated_delta_net`: the state
@@ -569,6 +613,12 @@ impl MlaLayer {
     /// `Backend::matmul_into`. There is no allocating twin: both callers
     /// own a scratch, so a second entry point would only be somewhere for
     /// the two to drift apart.
+    ///
+    /// [`Self::project_query_into`] then [`Self::attend_into`] over a dense
+    /// selection, which is all this is: an architecture whose attention is
+    /// *sparse* has to run the two halves apart, because what it needs to
+    /// decide the selection with is the query LoRA intermediate the first
+    /// half produces.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_into(
         &self,
@@ -581,17 +631,28 @@ impl MlaLayer {
         n_tokens: usize,
         start_pos: usize,
     ) {
-        let n_head = shape.n_head;
-        let eps = shape.eps;
-        let nope = shape.head_k_mla - shape.rope_dim;
-        let absorbed_dim = shape.kv_lora_rank + shape.rope_dim;
+        self.project_query_into(backend, scratch, shape, normed, n_tokens);
+        self.attend_into(
+            backend, out, scratch, shape, cache, normed, n_tokens, start_pos, None,
+        );
+    }
 
-        let MlaScratch {
-            q,
-            qr,
-            kv,
-            gate: gate_buf,
-        } = scratch;
+    /// The query half: the LoRA bottleneck (or the one-matrix projection)
+    /// into `scratch`, unrotated — rotation depends on position and belongs
+    /// to [`Self::attend_into`].
+    ///
+    /// Split out for the sparse-attention callers, which project the
+    /// lightning indexer's own query off [`MlaScratch::qr`] before deciding
+    /// what this layer may attend. See `engine::arch::indexer`.
+    pub(crate) fn project_query_into(
+        &self,
+        backend: &dyn Backend,
+        scratch: &mut MlaScratch,
+        shape: &MlaShape,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        let MlaScratch { q, qr, .. } = scratch;
         match &self.q {
             Query::Lora {
                 wq_a,
@@ -599,11 +660,47 @@ impl MlaLayer {
                 wq_b,
             } => {
                 backend.matmul_into(qr, normed, n_tokens, wq_a);
-                tensor::rmsnorm_inplace(qr, q_a_norm, n_tokens, wq_a.out_dim, eps);
+                tensor::rmsnorm_inplace(qr, q_a_norm, n_tokens, wq_a.out_dim, shape.eps);
                 backend.matmul_into(q, qr, n_tokens, wq_b);
             }
-            Query::Plain(wq) => backend.matmul_into(q, normed, n_tokens, wq),
+            Query::Plain(wq) => {
+                qr.clear();
+                backend.matmul_into(q, normed, n_tokens, wq);
+            }
         }
+    }
+
+    /// Everything after the query: the compressed key/value, the rotation,
+    /// the absorbed softmax, and the output projection.
+    ///
+    /// `selection` names, per token, the positions that token may attend,
+    /// in ascending order — a lightning indexer's cut. `None` is the dense
+    /// causal window, `0..=pos`, which is what every architecture without
+    /// one attends.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attend_into(
+        &self,
+        backend: &dyn Backend,
+        out: &mut Vec<f32>,
+        scratch: &mut MlaScratch,
+        shape: &MlaShape,
+        cache: &mut KvCache,
+        normed: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        selection: Option<&[Vec<usize>]>,
+    ) {
+        let n_head = shape.n_head;
+        let eps = shape.eps;
+        let nope = shape.head_k_mla - shape.rope_dim;
+        let absorbed_dim = shape.kv_lora_rank + shape.rope_dim;
+
+        let MlaScratch {
+            q,
+            kv,
+            gate: gate_buf,
+            ..
+        } = scratch;
         let q = &mut *q;
         backend.matmul_into(kv, normed, n_tokens, &self.wkv_a_mqa);
         let kv = &mut *kv;
@@ -692,12 +789,19 @@ impl MlaLayer {
             let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
             cache.layers[self.cache_index].push(kv_t, kv_t);
 
-            let n_keys = start_pos + t + 1;
-            let mut keys = vec![0f32; n_keys * shape.kv_row];
+            let dense: Vec<usize>;
+            let chosen: &[usize] = match selection {
+                Some(rows) => &rows[t],
+                None => {
+                    dense = (0..=start_pos + t).collect();
+                    &dense
+                }
+            };
+            let mut keys = vec![0f32; chosen.len() * shape.kv_row];
             {
                 let slot = &cache.layers[self.cache_index];
-                for p in 0..n_keys {
-                    keys[p * shape.kv_row..(p + 1) * shape.kv_row].copy_from_slice(slot.key_at(
+                for (i, &p) in chosen.iter().enumerate() {
+                    keys[i * shape.kv_row..(i + 1) * shape.kv_row].copy_from_slice(slot.key_at(
                         p,
                         0,
                         shape.kv_row,
@@ -785,6 +889,16 @@ pub(crate) struct MlaScratch {
     qr: Vec<f32>,
     kv: Vec<f32>,
     gate: Vec<f32>,
+}
+
+impl MlaScratch {
+    /// The query LoRA intermediate left by [`MlaLayer::project_query_into`]
+    /// — `[n_tokens, q_lora_rank]`, and empty on a layer that projects its
+    /// query in one matrix. A sparse-attention architecture's lightning
+    /// indexer shares it rather than projecting its own.
+    pub(crate) fn qr(&self) -> &[f32] {
+        &self.qr
+    }
 }
 
 #[cfg(test)]

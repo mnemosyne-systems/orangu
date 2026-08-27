@@ -95,7 +95,13 @@ tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "component"] }
-minijinja = "2.24"
+# `loop_controls` is `{% break %}` / `{% continue %}`, which minijinja gates
+# behind a feature (it is not in its default set) and real chat templates use:
+# GLM-5.3-Flash breaks out of a scan over `messages` as soon as it has seen a
+# duplicate tool-call id. Without it the template does not *parse*, so every
+# chat request against such a model fails outright — and on a plain
+# `/v1/completions`, which applies no template, the same model answers fine.
+minijinja = { version = "2.24", features = ["loop_controls"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 half = "2.7"
 wide = "1.6.1"

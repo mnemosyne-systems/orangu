@@ -980,7 +980,7 @@ impl ModelSupport {
         self.supported && self.unsupported_quant.is_none()
     }
 
-    /// The `SUPPORTED` cell text, e.g. `Yes (llama)`, `No (glm-dsa)`, or
+    /// The `SUPPORTED` cell text, e.g. `Yes (llama)`, `No (glm4moe)`, or
     /// `No (llama, TQ1_0)` when the architecture is fine but a tensor type
     /// isn't. Public because the web console's model manager draws the same
     /// column, and drawing it from the same function is what keeps the two
@@ -1020,7 +1020,7 @@ mod support_cell_tests {
             support("llama", true, Some("TQ1_0")).cell(),
             "No (llama, TQ1_0)"
         );
-        assert_eq!(support("glm-dsa", false, None).cell(), "No (glm-dsa)");
+        assert_eq!(support("glm4moe", false, None).cell(), "No (glm4moe)");
     }
 
     /// `loadable()` is what greys the row and gates the pickers, so it has
@@ -1029,7 +1029,7 @@ mod support_cell_tests {
     fn loadable_requires_both_a_known_arch_and_a_readable_quant() {
         assert!(support("llama", true, None).loadable());
         assert!(!support("llama", true, Some("TQ1_0")).loadable());
-        assert!(!support("glm-dsa", false, None).loadable());
+        assert!(!support("glm4moe", false, None).loadable());
     }
 }
 

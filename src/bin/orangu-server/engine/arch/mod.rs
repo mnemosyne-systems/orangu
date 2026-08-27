@@ -52,6 +52,9 @@ pub mod deepseek4;
 pub mod dflash;
 pub mod gemma;
 pub mod glm;
+pub mod glm5;
+pub mod hyper;
+pub mod indexer;
 pub mod inkling;
 pub mod kda;
 pub mod kimi3;
@@ -1083,6 +1086,36 @@ pub(crate) fn swiglu_ffn_into(
     up_w: &crate::engine::loader::QuantMatrix,
     down_w: &crate::engine::loader::QuantMatrix,
 ) {
+    swiglu_ffn_limited_into(
+        backend,
+        out,
+        scratch,
+        normed,
+        n_tokens,
+        gate_w,
+        up_w,
+        down_w,
+        SwigluLimit::None,
+    );
+}
+
+/// [`swiglu_ffn_into`] under a [`SwigluLimit`] — the dense arm of a model
+/// whose `swiglu_clamp_*` applies to its leading dense blocks as well as to
+/// its experts (`glm5next`). Plain [`swiglu_ffn_into`] is this with
+/// [`SwigluLimit::None`], so there is one implementation and no second
+/// place for the two to drift.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn swiglu_ffn_limited_into(
+    backend: &dyn crate::engine::backend::Backend,
+    out: &mut Vec<f32>,
+    scratch: &mut FfnScratch,
+    normed: &[f32],
+    n_tokens: usize,
+    gate_w: &crate::engine::loader::QuantMatrix,
+    up_w: &crate::engine::loader::QuantMatrix,
+    down_w: &crate::engine::loader::QuantMatrix,
+    limit: SwigluLimit,
+) {
     use crate::engine::backend::MatmulOp;
     backend.matmul_batch_into(
         &mut scratch.gate_up,
@@ -1103,10 +1136,7 @@ pub(crate) fn swiglu_ffn_into(
     // `scratch` so the next layer inherits their capacity.
     let (gate, up) = scratch.gate_up.split_at_mut(1);
     let gate = &mut gate[0];
-    for g in gate.iter_mut() {
-        *g = tensor::silu(*g);
-    }
-    tensor::mul_inplace(gate, &up[0]);
+    limit.apply_inplace(gate, &up[0]);
     backend.matmul_into(out, gate, n_tokens, down_w);
 }
 
@@ -1127,27 +1157,104 @@ pub(crate) struct SwigluMoe<'a> {
     pub shared: Option<SwigluSharedExpert<'a>>,
     /// `<arch>.swiglu_clamp_exp` for this layer — the routed experts'
     /// SwiGLU limit. `0` (the usual case) leaves the activation alone.
-    pub clamp_exp: f32,
+    pub clamp_exp: SwigluLimit,
     /// `<arch>.swiglu_clamp_shexp` for this layer — the same for the
     /// shared expert.
-    pub clamp_shexp: f32,
+    pub clamp_shexp: SwigluLimit,
 }
 
-/// SwiGLU with upstream's optional limit: the up branch is clamped to
-/// `[-limit, limit]` and the *activated* gate branch from above only, so
-/// the two halves are clamped differently and swapping them is silent. A
-/// `limit` at or below `1e-6` — which is what a file that declares no
-/// limit writes — means no clamp at all.
-fn swiglu_limited(gate: &[f32], up: &[f32], limit: f32) -> Vec<f32> {
-    let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
-    if limit > 1e-6 {
-        for (h, &u) in h.iter_mut().zip(up.iter()) {
-            *h = h.min(limit) * u.clamp(-limit, limit);
+/// `<arch>.swiglu_clamp_exp` / `_shexp` — upstream's optional SwiGLU limit,
+/// and **which side of the SiLU it clamps the gate on**.
+///
+/// The up branch is clamped to `[-limit, limit]` either way. The gate is
+/// not, and upstream branches on the architecture for it
+/// (`arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || …` in both
+/// `build_ffn` and `build_moe_ffn`), so the choice cannot be read off the
+/// file. The two agree except where `silu(gate)` crosses the limit, which
+/// makes picking the wrong one a small, quiet accuracy loss rather than an
+/// error — the reason it is a type here and not a `bool` at a call site.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SwigluLimit {
+    /// Plain SwiGLU. What a file that declares no `swiglu_clamp_*` asks
+    /// for, and what a declared limit at or below `1e-6` means.
+    None,
+    /// `min(silu(gate), limit) * clamp(up)` — the clamp lands on the
+    /// activation.
+    Activated(f32),
+    /// `silu(min(gate, limit)) * clamp(up)` — the clamp lands on the gate
+    /// before the activation. `deepseek4` and `glm5next`.
+    PreActivation(f32),
+}
+
+impl SwigluLimit {
+    /// [`Self::Activated`] for a real limit, [`Self::None`] for the `0.0` a
+    /// missing `swiglu_clamp_*` entry reads as.
+    pub(crate) fn activated(limit: f32) -> Self {
+        if limit > 1e-6 {
+            Self::Activated(limit)
+        } else {
+            Self::None
         }
-    } else {
-        tensor::mul_inplace(&mut h, up);
     }
-    h
+
+    /// [`Self::PreActivation`] on the same terms.
+    pub(crate) fn pre_activation(limit: f32) -> Self {
+        if limit > 1e-6 {
+            Self::PreActivation(limit)
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn apply(self, gate: &[f32], up: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(gate.len(), up.len());
+        match self {
+            Self::None => gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| tensor::silu(g) * u)
+                .collect(),
+            Self::Activated(limit) => gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| tensor::silu(g).min(limit) * u.clamp(-limit, limit))
+                .collect(),
+            Self::PreActivation(limit) => gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| tensor::silu(g.min(limit)) * u.clamp(-limit, limit))
+                .collect(),
+        }
+    }
+
+    /// [`Self::apply`] over a gate buffer that is overwritten in place —
+    /// what the dense FFN path wants, since its gate is already the
+    /// caller's scratch.
+    fn apply_inplace(self, gate: &mut [f32], up: &[f32]) {
+        debug_assert_eq!(gate.len(), up.len());
+        match self {
+            Self::None => {
+                for g in gate.iter_mut() {
+                    *g = tensor::silu(*g);
+                }
+                tensor::mul_inplace(gate, up);
+            }
+            Self::Activated(limit) => {
+                for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                    *g = tensor::silu(*g).min(limit) * u.clamp(-limit, limit);
+                }
+            }
+            Self::PreActivation(limit) => {
+                for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                    *g = tensor::silu(g.min(limit)) * u.clamp(-limit, limit);
+                }
+            }
+        }
+    }
+}
+
+fn swiglu_limited(gate: &[f32], up: &[f32], limit: SwigluLimit) -> Vec<f32> {
+    limit.apply(gate, up)
 }
 
 /// Batch width at which a MoE layer's two FFN branches are evaluated
@@ -2142,9 +2249,9 @@ pub trait ModelForward: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpertGating, ExpertProjection, ExpertRouting, attend, device_expert_admissible,
-        evaluate_routed_experts, evaluate_routed_experts_batched_views, flag_is_on,
-        matmul_host_fallback, project_expert, restore_order, top_k_indices,
+        ExpertGating, ExpertProjection, ExpertRouting, SwigluLimit, attend,
+        device_expert_admissible, evaluate_routed_experts, evaluate_routed_experts_batched_views,
+        flag_is_on, matmul_host_fallback, project_expert, restore_order, top_k_indices,
     };
     use crate::engine::backend::Backend;
     use crate::engine::loader::{QuantMatrix, test_quant_matrix};
@@ -2821,6 +2928,44 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Vec::is_empty));
+    }
+
+    /// The two clamp forms differ exactly where `silu(gate)` crosses the
+    /// limit but `gate` does not, which is a narrow band — narrow enough
+    /// that using the wrong one for an architecture reads as noise rather
+    /// than as a bug. Upstream picks between them by architecture, so this
+    /// pins that they are genuinely different functions.
+    #[test]
+    fn the_two_swiglu_clamp_forms_disagree_above_the_limit() {
+        let limit = 2.0;
+        // silu(3.0) = 2.857..., over the limit; 3.0 itself is too.
+        let gate = [3.0f32];
+        let up = [1.0f32];
+        let activated = SwigluLimit::Activated(limit).apply(&gate, &up);
+        let pre = SwigluLimit::PreActivation(limit).apply(&gate, &up);
+        assert!((activated[0] - limit).abs() < 1e-6, "{activated:?}");
+        assert!((pre[0] - tensor::silu(limit)).abs() < 1e-6, "{pre:?}");
+        assert!(activated[0] != pre[0]);
+
+        // Below the limit they agree, and both agree with plain SwiGLU.
+        let small = [0.5f32];
+        let plain = SwigluLimit::None.apply(&small, &up);
+        assert_eq!(SwigluLimit::Activated(limit).apply(&small, &up), plain);
+        assert_eq!(SwigluLimit::PreActivation(limit).apply(&small, &up), plain);
+    }
+
+    /// A `swiglu_clamp_*` entry a file does not carry reads as `0.0`, and
+    /// `0.0` must mean *no clamp* rather than a clamp to zero — which would
+    /// zero the whole FFN.
+    #[test]
+    fn an_absent_swiglu_limit_is_no_clamp_at_all() {
+        assert_eq!(SwigluLimit::activated(0.0), SwigluLimit::None);
+        assert_eq!(SwigluLimit::pre_activation(0.0), SwigluLimit::None);
+        assert_eq!(SwigluLimit::activated(10.0), SwigluLimit::Activated(10.0));
+        assert_eq!(
+            SwigluLimit::pre_activation(10.0),
+            SwigluLimit::PreActivation(10.0)
+        );
     }
 
     #[test]

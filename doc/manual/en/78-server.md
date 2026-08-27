@@ -653,7 +653,7 @@ still carry tensors this build cannot read, so a bare `resolve_arch_family`
 "yes" would promise a load that then fails partway through. It therefore
 also checks every tensor's `ggml_type` against `quant::supports_type` and
 reports the first unreadable one, which `ModelSupport::cell` renders as
-`No (llama, TQ1_0)` — distinct from `No (glm-dsa)`, because only the former
+`No (llama, TQ1_0)` — distinct from `No (glm4moe)`, because only the former
 is fixed by fetching a different quantization of the same model. Note this
 is *not* the same question as the arch module's own tensor expectations:
 gemma MoE checkpoints (`gemma-4-26B-A4B`, `blk.{i}.ffn_gate_inp.weight`
@@ -1359,6 +1359,63 @@ mod`), so adding a family is additive rather than a rewrite:
   bias) rather than RMS-normed, and the attention scale follows
   `key_length_mla`, not the wider absorbed query/key width. The
   multi-token-prediction block (`blk.78`) is not run, as in `deepseek4.rs`.
+- `hyper.rs` — **not an architecture**: the hyper-connection (mHC) residual
+  that `deepseek4.rs` and `glm5.rs` both run, extracted from the first when
+  the second needed it. In place of a residual *vector* the state between
+  sub-layers is `hyper_connection.count` parallel `n_embd` streams. Each
+  sub-layer is bracketed by a pair: an in-mix that RMS-norms the streams
+  flattened, projects one small vector off that, and splits it into an
+  in-mix (`pre`), an out-mix (`post`) and a `[count, count]`
+  stream-combination matrix that a Sinkhorn normalization makes doubly
+  stochastic; and an out-mix that writes the sub-layer output back into
+  every stream as `post[dst]` times the output plus the `comb`-weighted mix
+  of the streams *as they were before the sub-layer ran* — which is why the
+  pass keeps a real copy of them and only hoists its allocation. The two
+  architectures differ solely in the final collapse: `deepseek4` has a mixer
+  of its own (`output_hc_*`), `glm5` takes the plain mean.
+- `indexer.rs` — **not an architecture**: the lightning indexer (DeepSeek
+  sparse attention) that `glm.rs` and `glm5.rs` both bolt onto their latent
+  attention, extracted from the first when the second needed it. A scoring
+  layer projects a small per-head query off the *attention query's own* LoRA
+  intermediate, keeps a narrow key cache, and scores each visible key with a
+  `relu`'d per-head dot product weighted by a per-head scalar read from the
+  layer input. Two shapes: per position (`glm-dsa`), and **pooled**
+  (`glm5next`), where positions are grouped into fixed
+  `attention.indexer.kpool` pools and one pooled key stands for each — a
+  per-channel convex mix of its members' keys under `softmax(gate + ape)`,
+  the gate a second independent projection and `ape` an intra-pool position
+  bias. Two things about the pooled form are load-bearing and easy to lose:
+  the cut takes **whole pools** (`relu` sends many pools to exactly `0.0`,
+  and a top-k over positions would split a pool on that tie and attend an
+  arbitrary subset of one), and the query's own trailing incomplete pool is
+  attended **on top of** the budget rather than out of it. The key store is
+  never gated on the sparse path even though the scoring is: gating both
+  leaves every position below the budget with no indexer state, and the
+  first query past it pools rows that were never written. Upstream's
+  Hadamard rotation is deliberately not carried over, for the same reason as
+  in `deepseek4.rs`.
+- `glm5.rs` — GLM-5.3-Flash (`general.architecture = "glm5next"`), e.g.
+  `unsloth/GLM-5.3-Flash-GGUF`. Almost all of it is the three shared modules
+  above plus `kda.rs` (the KDA / absorbed-MLA half-layer pair `kimi3.rs` and
+  `bailingmoe.rs` share) and `swiglu_moe_ffn`; what the module itself
+  carries is the assembly and four decisions. The trunk alternates three KDA
+  layers to every MLA one, read from the per-layer
+  `attention.head_count_kv` array where `0` marks a recurrent one, with the
+  KDA **output** gate factored through a `kda.head_dim` bottleneck the way
+  the decay gate already was (`GLM5NEXT_KDA_NAMES`) and the query/key L2
+  norm taking the reference's hard-coded `1e-6` rather than the model's
+  `1e-5` RMS epsilon. **Nothing rotates**: `rope.dimension_count` is `0`, so
+  the MLA query is entirely "nope", a cache row is the compressed key/value
+  and nothing more, and the module refuses to load a file that declares
+  otherwise rather than running it as something it is not. The FFN takes
+  `deepseek4`'s **pre-activation** `swiglu_clamp_*` limit
+  (`SwigluLimit::PreActivation`, which upstream selects by architecture and
+  no file declares) and applies it to the leading dense blocks as well as to
+  the experts. The cache is the first here to be **both** strided and
+  recurrent — a pooled indexer key per completed pool beside per-token KDA
+  state — which is what `KvCache::new_mixed_strided` exists for. The
+  multi-token-prediction block (`blk.45`) is not run, as in `glm.rs`, and
+  the `mmproj-*.gguf` shipped alongside is a separate vision model.
 - `kimi3.rs` — Kimi-K3 (`general.architecture = "kimi-k3"`), e.g.
   `unsloth/Kimi-K3-GGUF`, transcribed from `src/models/kimi-k3.cpp` in
   upstream's Kimi-K3 pull request (ggml-org/llama.cpp#26185), the

@@ -618,6 +618,54 @@ mod tests {
         assert_eq!(out, "user: hi\nassistant:");
     }
 
+    /// `{% break %}` — GLM-5.3-Flash's own construct, reduced. minijinja
+    /// gates loop controls behind a Cargo feature that is *not* in its
+    /// default set, so without `features = ["loop_controls"]` this fails at
+    /// **compile** time: the template does not parse, and every chat
+    /// request against such a model answers `invalid chat template: syntax
+    /// error: unknown statement break` instead of generating. Nothing else
+    /// catches it — `/v1/completions` applies no template at all, so the
+    /// same model answers perfectly there while the web console and every
+    /// OpenAI-shaped client see only the error.
+    #[test]
+    fn renders_a_template_that_breaks_out_of_a_loop() {
+        let tmpl = ChatTemplate::new(
+            "{%- set ns = namespace(n=0) -%}\
+             {%- for m in messages -%}\
+             {%- set ns.n = ns.n + 1 -%}\
+             {%- if ns.n > 1 -%}{%- break -%}{%- endif -%}\
+             {{- m.content -}}\
+             {%- endfor -%}"
+                .to_string(),
+        );
+        let messages = vec![
+            ChatMessage::text("user", "first"),
+            ChatMessage::text("assistant", "second"),
+        ];
+        let out = tmpl.render(&messages, false, "<s>", "</s>", None).unwrap();
+        assert_eq!(out, "first");
+    }
+
+    /// `{% continue %}` rides on the same feature, and a template that used
+    /// it would fail the same way.
+    #[test]
+    fn renders_a_template_that_continues_a_loop() {
+        let tmpl = ChatTemplate::new(
+            "{%- for m in messages -%}\
+             {%- if m.role == 'assistant' -%}{%- continue -%}{%- endif -%}\
+             {{- m.content -}}\
+             {%- endfor -%}"
+                .to_string(),
+        );
+        let messages = vec![
+            ChatMessage::text("user", "a"),
+            ChatMessage::text("assistant", "b"),
+            ChatMessage::text("user", "c"),
+        ];
+        let out = tmpl.render(&messages, false, "<s>", "</s>", None).unwrap();
+        assert_eq!(out, "ac");
+    }
+
     /// The whole point of [`parenthesize_call_kwarg_conditionals`]: a
     /// keyword argument whose value is a bare inline conditional. This is
     /// `Muse-Glimmer-30B`'s own construct, reduced — without the rewrite

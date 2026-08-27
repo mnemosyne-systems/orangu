@@ -55,7 +55,8 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::{ExpertGating, ExpertRouting, ModelForward, attend, top_k_indices};
+use super::indexer::{Indexer, IndexerShape};
+use super::{ExpertGating, ExpertRouting, ModelForward, attend};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
@@ -68,24 +69,6 @@ use crate::engine::tensor::{self, RopeLayout, RopeParams};
 /// `config.json`.
 fn default_indexer_is_full(layer: usize) -> bool {
     layer < 2 || (layer - 2).is_multiple_of(4)
-}
-
-/// The lightning indexer of a scoring layer: its own query/key projections,
-/// key normalization and per-head score weights, plus the cache slot its
-/// keys live in.
-struct Indexer {
-    /// `[q_lora_rank, indexer.head_count * indexer.key_length]` — shares
-    /// the attention query's LoRA intermediate.
-    q_b: QuantMatrix,
-    /// `[n_embd, indexer.key_length]`: one key per token, all heads.
-    attn_k: QuantMatrix,
-    /// LayerNorm (not RMS — this is the one normalization in the model
-    /// that subtracts a mean and adds a bias) over the indexer key.
-    k_norm_weight: Vec<f32>,
-    k_norm_bias: Vec<f32>,
-    /// `[n_embd, indexer.head_count]` — the per-head score weights.
-    proj: QuantMatrix,
-    cache_slot: usize,
 }
 
 /// A layer's FFN: dense for the leading blocks, routed MoE for the rest.
@@ -160,29 +143,11 @@ pub struct GlmModel {
     /// correction squared. See [`GlmModel::load_with_backend`].
     kq_scale: f32,
     routing: ExpertRouting,
-    indexer_n_head: usize,
-    indexer_head_size: usize,
-    indexer_top_k: usize,
-    /// LayerNorm epsilon for the indexer key norm — upstream leaves
-    /// `f_norm_eps` at its default for this architecture, since the GGUF
-    /// carries only the RMS one.
-    norm_eps: f32,
+    /// The lightning indexer's shape, shared with `engine::arch::glm5` —
+    /// see `engine::arch::indexer`.
+    indexer: IndexerShape,
     kv_dims: Vec<(usize, usize)>,
     layers: Vec<GlmLayer>,
-}
-
-/// LayerNorm over one row: `(x - mean)/sqrt(var + eps) * weight + bias`.
-/// ggml's `ggml_norm` followed by the weight and bias `build_norm` applies
-/// for `LLM_NORM` — distinct from the RMSNorm every other normalization in
-/// this model uses, which neither centers nor shifts.
-fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
-    let n = x.len() as f32;
-    let mean = x.iter().sum::<f32>() / n;
-    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    let scale = 1.0 / (var + eps).sqrt();
-    for ((v, &w), &b) in x.iter_mut().zip(weight.iter()).zip(bias.iter()) {
-        *v = (*v - mean) * scale * w + b;
-    }
 }
 
 /// The buffers every layer of a forward pass reuses, so the trunk allocates
@@ -253,21 +218,6 @@ impl GlmModel {
         let n_layer_dense_lead = loaded
             .metadata_u64("leading_dense_block_count")
             .unwrap_or(0) as usize;
-        let indexer_n_head = loaded
-            .metadata_u64("attention.indexer.head_count")
-            .context("missing attention.indexer.head_count")? as usize;
-        let indexer_head_size = loaded
-            .metadata_u64("attention.indexer.key_length")
-            .context("missing attention.indexer.key_length")?
-            as usize;
-        let indexer_top_k = loaded
-            .metadata_u64("attention.indexer.top_k")
-            .context("missing attention.indexer.top_k")? as usize;
-        anyhow::ensure!(
-            indexer_head_size > rope_dim,
-            "attention.indexer.key_length ({indexer_head_size}) must exceed rope.dimension_count ({rope_dim})"
-        );
-
         let n_expert_used = loaded
             .metadata_u64("expert_used_count")
             .context("missing expert_used_count")? as usize;
@@ -320,6 +270,7 @@ impl GlmModel {
             layout: RopeLayout::Norm,
         };
 
+        let indexer = IndexerShape::from_gguf(loaded, Some(rope))?;
         let indexer_types = loaded.metadata_array_u64("attention.indexer.types");
         let tok_embeddings = loaded
             .matrix("token_embd.weight")
@@ -365,16 +316,13 @@ impl GlmModel {
                 Some(types) => types.get(i).copied().unwrap_or(1) != 0,
                 None => default_indexer_is_full(i),
             };
-            let indexer = if scores_itself {
-                kv_dims.push((indexer_head_size, 1));
-                Some(Indexer {
-                    q_b: get_matrix("indexer.attn_q_b.weight")?,
-                    attn_k: get_matrix("indexer.attn_k.weight")?,
-                    k_norm_weight: get("indexer.k_norm.weight")?,
-                    k_norm_bias: get("indexer.k_norm.bias")?,
-                    proj: get_matrix("indexer.proj.weight")?,
-                    cache_slot: kv_dims.len() - 1,
-                })
+            let layer_indexer = if scores_itself {
+                kv_dims.push((indexer.head_size, 1));
+                let slot = kv_dims.len() - 1;
+                // No `attention.indexer.kpool`: this architecture scores
+                // single positions, not pools, so there is no pooled-key
+                // slot to name and the argument is never read.
+                Some(Indexer::load(loaded, i, None, &indexer, slot, slot)?)
             } else {
                 None
             };
@@ -423,7 +371,7 @@ impl GlmModel {
                 wk_b: get_expert_matrix("attn_k_b.weight")?,
                 wv_b: get_expert_matrix("attn_v_b.weight")?,
                 wo: get_matrix("attn_output.weight")?,
-                indexer,
+                indexer: layer_indexer,
                 kv_slot,
                 ffn,
             });
@@ -450,12 +398,7 @@ impl GlmModel {
                 weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
                 groups: expert_groups,
             },
-            indexer_n_head,
-            indexer_head_size,
-            indexer_top_k,
-            norm_eps: loaded
-                .metadata_f32("attention.layer_norm_epsilon")
-                .unwrap_or(0.0),
+            indexer,
             kv_dims,
             layers,
         })
@@ -687,10 +630,16 @@ impl GlmModel {
             }
         }
 
-        let indexer = layer
-            .indexer
-            .as_ref()
-            .map(|ix| self.indexer_inputs(ix, qr, normed, n_tokens, start_pos));
+        let indexer = layer.indexer.as_ref().map(|ix| {
+            ix.inputs(
+                self.backend.as_ref(),
+                &self.indexer,
+                qr,
+                normed,
+                n_tokens,
+                start_pos,
+            )
+        });
 
         let mut attn_out = vec![0f32; n_tokens * n_head * self.head_v_mla];
         selection.resize(n_tokens, Vec::new());
@@ -699,31 +648,8 @@ impl GlmModel {
             let kv_t = &kv[t * self.kv_row..(t + 1) * self.kv_row];
             cache.layers[layer.kv_slot].push(kv_t, kv_t);
 
-            if let (Some(ix), Some((iq, weights, keys))) =
-                (layer.indexer.as_ref(), indexer.as_ref())
-            {
-                cache.layers[ix.cache_slot].push(
-                    &keys[t * self.indexer_head_size..(t + 1) * self.indexer_head_size],
-                    &keys[t * self.indexer_head_size..(t + 1) * self.indexer_head_size],
-                );
-                // Scoring can only change the answer once there are more
-                // positions than the indexer is allowed to keep: below
-                // that, its top-k is every visible position and the mask it
-                // produces is the causal mask upstream adds back anyway.
-                selection[t] = if pos < self.indexer_top_k {
-                    (0..=pos).collect()
-                } else {
-                    let scores = self.indexer_scores(
-                        &cache.layers[ix.cache_slot],
-                        &iq[t * self.indexer_n_head * self.indexer_head_size
-                            ..(t + 1) * self.indexer_n_head * self.indexer_head_size],
-                        &weights[t * self.indexer_n_head..(t + 1) * self.indexer_n_head],
-                        pos + 1,
-                    );
-                    let mut chosen = top_k_indices(&scores, self.indexer_top_k);
-                    chosen.sort_unstable();
-                    chosen
-                };
+            if let (Some(ix), Some(inputs)) = (layer.indexer.as_ref(), indexer.as_ref()) {
+                selection[t] = ix.select(&self.indexer, cache, inputs, t, pos);
             }
             anyhow::ensure!(
                 !selection[t].is_empty(),
@@ -782,76 +708,6 @@ impl GlmModel {
         Ok(std::mem::take(out_buf))
     }
 
-    /// A scoring layer's per-token indexer inputs: the roped query, the
-    /// pre-scaled per-head weights, and the key to cache.
-    fn indexer_inputs(
-        &self,
-        ix: &Indexer,
-        qr: &[f32],
-        normed: &[f32],
-        n_tokens: usize,
-        start_pos: usize,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let rope_dim = self.config.rope_dim;
-        let dim = self.indexer_head_size;
-        let mut q = self.backend.matmul(qr, n_tokens, &ix.q_b);
-        let mut keys = self.backend.matmul(normed, n_tokens, &ix.attn_k);
-        for t in 0..n_tokens {
-            let pos = start_pos + t;
-            // Unlike the main attention, the indexer's rotary dimensions
-            // are the *leading* ones of each head.
-            let q_t = &mut q[t * self.indexer_n_head * dim..(t + 1) * self.indexer_n_head * dim];
-            for h in 0..self.indexer_n_head {
-                tensor::rope_apply_params_inplace(
-                    &mut q_t[h * dim..h * dim + rope_dim],
-                    1,
-                    rope_dim,
-                    pos,
-                    None,
-                    &self.rope,
-                );
-            }
-            let key = &mut keys[t * dim..(t + 1) * dim];
-            layer_norm_inplace(key, &ix.k_norm_weight, &ix.k_norm_bias, self.norm_eps);
-            tensor::rope_apply_params_inplace(
-                &mut key[..rope_dim],
-                1,
-                rope_dim,
-                pos,
-                None,
-                &self.rope,
-            );
-        }
-        let mut weights = self.backend.matmul(normed, n_tokens, &ix.proj);
-        let scale = 1.0 / ((dim * self.indexer_n_head) as f32).sqrt();
-        for w in weights.iter_mut() {
-            *w *= scale;
-        }
-        (q, weights, keys)
-    }
-
-    /// The lightning indexer's score for each visible position: a per-head
-    /// `relu`'d dot product against that position's indexer key, combined
-    /// with this token's own per-head weights.
-    fn indexer_scores(
-        &self,
-        keys: &crate::engine::kv_cache::LayerCache,
-        q: &[f32],
-        weights: &[f32],
-        visible: usize,
-    ) -> Vec<f32> {
-        let dim = self.indexer_head_size;
-        (0..visible)
-            .into_par_iter()
-            .map(|p| {
-                let key = keys.key_at(p, 0, dim);
-                (0..self.indexer_n_head)
-                    .map(|h| tensor::dot(&q[h * dim..(h + 1) * dim], key).max(0.0) * weights[h])
-                    .sum()
-            })
-            .collect()
-    }
-
     /// The routed + shared-expert SwiGLU MoE FFN — `super::swiglu_moe_ffn`,
     /// shared with `engine::arch::bailingmoe`, which runs the same
     /// computation over the same tensor names under whatever routing rules
@@ -874,8 +730,9 @@ impl GlmModel {
                     up: &moe.up_shexp,
                     down: &moe.down_shexp,
                 }),
-                clamp_exp: 0.0,
-                clamp_shexp: 0.0,
+                // GLM-5.2 declares no `swiglu_clamp_*` at all.
+                clamp_exp: super::SwigluLimit::None,
+                clamp_shexp: super::SwigluLimit::None,
             },
         )
     }
@@ -957,7 +814,7 @@ impl ModelForward for GlmModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_indexer_is_full, layer_norm_inplace};
+    use super::default_indexer_is_full;
 
     /// GLM-5.2's pattern: the first three layers score, then every fourth.
     #[test]
@@ -971,21 +828,5 @@ mod tests {
     #[test]
     fn the_first_layer_always_scores() {
         assert!(default_indexer_is_full(0));
-    }
-
-    /// LayerNorm centers and shifts; RMSNorm does neither. Using the wrong
-    /// one on the indexer key is a silent accuracy loss, not an error.
-    #[test]
-    fn layer_norm_centers_scales_and_shifts() {
-        let mut x = vec![1.0, 3.0];
-        layer_norm_inplace(&mut x, &[1.0, 1.0], &[0.0, 0.0], 0.0);
-        // mean 2, variance 1 -> -1, +1
-        assert!((x[0] + 1.0).abs() < 1e-5, "{x:?}");
-        assert!((x[1] - 1.0).abs() < 1e-5, "{x:?}");
-
-        let mut y = vec![1.0, 3.0];
-        layer_norm_inplace(&mut y, &[2.0, 2.0], &[0.5, 0.5], 0.0);
-        assert!((y[0] + 1.5).abs() < 1e-5, "{y:?}");
-        assert!((y[1] - 2.5).abs() < 1e-5, "{y:?}");
     }
 }
