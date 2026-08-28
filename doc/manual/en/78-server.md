@@ -39,9 +39,9 @@ dependency on any C or C++ inference library.
   for the web console's **Load** button: descriptor hand-over, `argv`
   reconstruction, the header pre-check, and the one-shot fallback. See
   below.
-- `refresh.rs` — `refresh`'s own CLI logic: the confirmation, the
-  delete-then-download ordering, and the interactive picker that greys
-  every already-current row; see below.
+- `refresh.rs` — `refresh`'s own CLI logic: the stale-revision guard, the
+  single/`--all` delete-then-download flows, and the interactive picker that
+  greys every already-current row; see below.
 - `prune.rs` — `prune`'s own CLI logic (listing, `NR`/id resolution, the
   `all`/interactive/explicit-identifier flows), built on `web::sessions`'s
   activity tracking; see below.
@@ -374,8 +374,7 @@ blob-sharing symlink a re-download of the *same* commit produces. Downloading
 first would mean a 17 GiB model needing 34 GiB free to refresh. The cost —
 an interrupted download leaving the model missing rather than stale — is
 recovered by re-running `refresh` or `download`, which resumes from the
-`.part` file `download_attempt` left behind, and is stated up front in the
-confirmation line rather than discovered afterwards.
+`.part` file `download_attempt` left behind.
 
 **An ambiguous `MODEL` name is an error.**
 `model_spec::resolve_refresh_target` mirrors `resolve_delete_target` (path,
@@ -401,6 +400,15 @@ so `select_files_to_download` would reject it as an unknown quant instead of
 re-fetching the model that is actually on disk. A group with no `hf_repo` at
 all has no spec, and `run` bails on it *before* deleting anything — a
 hand-copied `.gguf` has no repo to come back from.
+
+**`--all` uses the same proof once.** `refresh_all` scans and groups the
+models, calls `check_for_updates` once for the distinct repositories, and
+keeps only groups for which `plan` returns `Refresh`. Current models,
+hand-copied files, and groups whose repositories could not be reached are
+never passed to deletion. Each selected group then goes through the same
+`refresh_group` delete-and-download path as a single explicit target; the
+first failure stops the run so a lost connection does not delete further
+models.
 
 With no argument, `select_model_to_refresh` prints the same `format_groups`
 table `list` does, with `Dimming::UpToDate` and the same

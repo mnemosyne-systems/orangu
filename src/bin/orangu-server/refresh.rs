@@ -35,6 +35,7 @@
 //! `download`'s own resume (a `.part` file picked up on the next run) is
 //! what recovers it.
 //!
+//! With `--all`, every model known to be behind is refreshed in one run.
 //! With no argument it prints `list`'s table with every already-current row
 //! greyed ([`orangu::model_spec::Dimming::UpToDate`]) and prompts for an
 //! `NR`, so the rows worth refreshing are the only ones standing out. When
@@ -82,12 +83,30 @@ fn plan(group: &ModelGroup, updates: &HashMap<String, RepoUpdateInfo>) -> Plan {
     }
 }
 
+/// The subset `refresh --all` can prove needs work. Repositories that could
+/// not be reached are deliberately absent: unknown is not stale.
+fn refresh_targets<'a>(
+    groups: &'a [ModelGroup],
+    updates: &HashMap<String, RepoUpdateInfo>,
+) -> Vec<&'a ModelGroup> {
+    groups
+        .iter()
+        .filter(|group| plan(group, updates) == Plan::Refresh)
+        .collect()
+}
+
 /// Deletes one model and downloads it again, when the Hub says its files
 /// have changed. `model` resolves the same way `delete`'s argument does,
 /// except that a `MODEL` name matching more than one row is an error rather
 /// than a first-match (see [`orangu::model_spec::resolve_refresh_target`]);
-/// omitting it picks one interactively.
-pub fn run(models_dir: &Path, model: Option<String>, _yes: bool) -> Result<()> {
+/// omitting it picks one interactively. `all` refreshes every model that the
+/// same Hub check says is behind.
+pub fn run(models_dir: &Path, model: Option<String>, all: bool, _yes: bool) -> Result<()> {
+    if all {
+        debug_assert!(model.is_none(), "clap makes MODEL conflict with --all");
+        return refresh_all(models_dir);
+    }
+
     // The interactive path has already asked the Hub about every repo on
     // disk, so it hands its answer over rather than making the same lookup
     // twice; an explicit argument asks about that one repo only.
@@ -102,6 +121,72 @@ pub fn run(models_dir: &Path, model: Option<String>, _yes: bool) -> Result<()> {
         },
     };
 
+    refresh_group(
+        models_dir,
+        &group,
+        &known_updates.unwrap_or_else(|| check_for_updates(std::slice::from_ref(&group))),
+    )?;
+    Ok(())
+}
+
+/// Refreshes every model whose remote file hashes differ from its local
+/// blobs. The Hub is queried once for all distinct repositories, exactly as
+/// for `list`; a repository that could not be checked is reported and left
+/// untouched.
+fn refresh_all(models_dir: &Path) -> Result<()> {
+    let models = orangu::model_spec::scan_models_dir(models_dir)
+        .with_context(|| format!("scanning {}", models_dir.display()))?;
+    let groups = orangu::model_spec::group_models(&models);
+    if groups.is_empty() {
+        bail!("no .gguf models found under {}", models_dir.display());
+    }
+
+    let updates = check_for_updates(&groups);
+    let targets = refresh_targets(&groups, &updates);
+    let unreachable = groups
+        .iter()
+        .filter(|group| {
+            group
+                .hf_repo
+                .as_ref()
+                .is_some_and(|repo| !updates.contains_key(repo))
+        })
+        .count();
+
+    if targets.is_empty() {
+        if groups.iter().all(|group| group.hf_repo.is_none()) {
+            println!(
+                "No model under {} was downloaded from Hugging Face, so there is nothing to refresh.",
+                models_dir.display()
+            );
+        } else if unreachable > 0 {
+            println!(
+                "No reachable model needs refreshing; {unreachable} model(s) could not be checked and nothing was changed."
+            );
+        } else {
+            println!("Every model is already at its repo's latest revision; nothing to do.");
+        }
+        return Ok(());
+    }
+
+    println!("Refreshing {} model(s).", targets.len());
+    if unreachable > 0 {
+        println!("Skipping {unreachable} model(s) whose repositories could not be reached.");
+    }
+    for group in &targets {
+        refresh_group(models_dir, group, &updates)
+            .with_context(|| format!("refreshing '{}'", group.label))?;
+    }
+    println!("Refreshed {} model(s).", targets.len());
+    Ok(())
+}
+
+/// Applies a previously computed plan to one group.
+fn refresh_group(
+    models_dir: &Path,
+    group: &ModelGroup,
+    updates: &HashMap<String, RepoUpdateInfo>,
+) -> Result<()> {
     // A model outside the Hugging Face hub-cache layout — a `.gguf` copied
     // in by hand, say — has no repo to download it again from, so there's
     // nothing to refresh *to*. Bail before deleting anything: this is the
@@ -113,8 +198,7 @@ pub fn run(models_dir: &Path, model: Option<String>, _yes: bool) -> Result<()> {
         )
     })?;
 
-    let updates = known_updates.unwrap_or_else(|| check_for_updates(std::slice::from_ref(&group)));
-    match plan(&group, &updates) {
+    match plan(group, updates) {
         Plan::Refresh => {}
         Plan::UpToDate => {
             println!(
@@ -133,7 +217,7 @@ pub fn run(models_dir: &Path, model: Option<String>, _yes: bool) -> Result<()> {
     }
 
     let plural = if group.paths.len() == 1 { "" } else { "s" };
-    orangu::model_spec::delete_model(models_dir, &group)?;
+    orangu::model_spec::delete_model(models_dir, group)?;
     println!(
         "Deleted '{}' ({} file{plural}, {})",
         group.label,
@@ -302,6 +386,37 @@ mod tests {
 
         let other = updates("unsloth/Qwen3-Coder-Next-GGUF", FILE, "blob-1");
         assert_eq!(plan(&group, &other), Plan::Unreachable);
+    }
+
+    #[test]
+    fn refresh_all_selects_only_models_proven_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_repo = "owner/stale-GGUF";
+        let current_repo = "owner/current-GGUF";
+        let unreachable_repo = "owner/unreachable-GGUF";
+        let groups = vec![
+            group(stale_repo, cached(dir.path(), stale_repo, FILE, "old-blob")),
+            group(
+                current_repo,
+                cached(dir.path(), current_repo, FILE, "current-blob"),
+            ),
+            group(
+                unreachable_repo,
+                cached(dir.path(), unreachable_repo, FILE, "unknown-blob"),
+            ),
+        ];
+        let mut known = updates(stale_repo, FILE, "new-blob");
+        known.extend(updates(current_repo, FILE, "current-blob"));
+
+        let targets = refresh_targets(&groups, &known);
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|group| group.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![stale_repo]
+        );
     }
 
     #[test]
