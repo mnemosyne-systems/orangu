@@ -4949,8 +4949,15 @@ mod tests {
         let a = profile_path_for_point("perf/pp.svg", "ORANGU_NO_CHUNK_COST_FIT=1");
         let b = profile_path_for_point("perf/pp.svg", "ORANGU_NO_CHUNK_COST_FIT=0");
         assert_ne!(a, b, "two points must not share a path");
-        assert_eq!(a, "perf/pp-orangu-no-chunk-cost-fit-1.svg");
-        assert_eq!(b, "perf/pp-orangu-no-chunk-cost-fit-0.svg");
+        // The directory is rejoined with the platform's separator.
+        let in_perf = |name: &str| {
+            std::path::Path::new("perf")
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(a, in_perf("pp-orangu-no-chunk-cost-fit-1.svg"));
+        assert_eq!(b, in_perf("pp-orangu-no-chunk-cost-fit-0.svg"));
         // A bare filename keeps working, and so does one with no extension.
         assert_eq!(profile_path_for_point("pp.svg", "x=1"), "pp-x-1.svg");
         assert_eq!(profile_path_for_point("pp", "x=1"), "pp-x-1");
