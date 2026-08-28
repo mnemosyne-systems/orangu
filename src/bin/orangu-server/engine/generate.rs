@@ -23,7 +23,7 @@
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -1470,7 +1470,10 @@ fn prefill(
     slot_id: usize,
     on_chunk: &mut dyn FnMut(usize),
 ) -> Result<Vec<f32>> {
-    prefill_in_chunks(
+    // Priced once and carried forward: see [`CHUNK_COST`].
+    let mut cost = load_chunk_cost();
+    let out = prefill_in_chunks(
+        &mut cost,
         model,
         cache,
         tokens,
@@ -1478,14 +1481,61 @@ fn prefill(
         slot_id,
         Chunking::for_prompt(tokens.len()),
         on_chunk,
-    )
+    );
+    // Written back on the error path too: a chunk that ran is a chunk that
+    // was measured, and what it cost is true whether or not a later one
+    // failed.
+    store_chunk_cost(cost);
+    out
+}
+
+/// What prefill has learned about the cost of one submission here, carried
+/// across requests.
+///
+/// The curve belongs to this machine and this model, not to one request, so
+/// re-deriving it per request throws away an answer already paid for — and
+/// that is what made every prompt open with a probe and climb its way back to
+/// a workable width. One `orangu-server` process serves one model, so one
+/// estimate describes every prefill it will ever run.
+static CHUNK_COST: Mutex<ChunkCost> = Mutex::new(ChunkCost::new());
+
+/// The carried estimate, or a fresh one if another thread poisoned the lock.
+///
+/// A poisoned lock costs a ramp, not a wrong answer: the worst an unusable
+/// estimate can do is start the next prompt at the probe, which is where every
+/// prompt started before this existed.
+fn load_chunk_cost() -> ChunkCost {
+    if chunk_cost_fit_disabled() {
+        return ChunkCost::proportional_only();
+    }
+    *CHUNK_COST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether `ORANGU_NO_CHUNK_COST_FIT` asked for the single-point sizer back.
+///
+/// The control arm for the two-point fit, so the change can be measured
+/// against what it replaced in one `orangu-bench --sweep` rather than across
+/// two sessions, where this machine's drift is larger than the effect.
+fn chunk_cost_fit_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_CHUNK_COST_FIT"))
+}
+
+fn store_chunk_cost(cost: ChunkCost) {
+    *CHUNK_COST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = cost;
 }
 
 /// [`prefill`] with the chunk size passed in rather than read from the
 /// environment, so the splitting itself is testable — the property that
 /// matters (every token fed exactly once, in order, at the right position)
 /// is the one that silently corrupts a KV cache when it's wrong.
+#[allow(clippy::too_many_arguments)]
 fn prefill_in_chunks(
+    cost: &mut ChunkCost,
     model: &dyn ModelForward,
     cache: &mut KvCache,
     tokens: &[u32],
@@ -1521,9 +1571,20 @@ fn prefill_in_chunks(
     // not have, and pricing a streamed model by the clock is what shrinks the
     // chunk into a read spiral. Start at the full width and stay there.
     let mut width = match policy {
-        ChunkPolicy::Adaptive => PREFILL_PROBE_TOKENS.min(batch),
+        ChunkPolicy::Adaptive => cost
+            .opening_width(start_pos, budget, batch)
+            .unwrap_or(PREFILL_PROBE_TOKENS.min(batch)),
         ChunkPolicy::Flat => batch,
     };
+    // One line per prefill, not one per submission — which is the whole point.
+    // `ORANGU_PREFILL_TRACE` answers a different question and answers it by
+    // writing to stderr inside the submission loop, so it changes the cost it
+    // is measuring: under it this sizer reads inflated chunk costs and picks
+    // narrower chunks, which is a real effect on the number being checked.
+    // Recording the widths and printing them once afterwards costs nothing
+    // measurable and is enough to see what the sizer actually chose.
+    let chunks_report = chunk_widths_reported();
+    let mut widths: Vec<usize> = Vec::new();
     while done < tokens.len() {
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
@@ -1533,15 +1594,42 @@ fn prefill_in_chunks(
         done += n;
         // After the forward, not before: progress means work finished.
         on_chunk(done);
-        if policy == ChunkPolicy::Adaptive {
-            width = next_chunk_width(n, elapsed, budget, batch);
+        if chunks_report {
+            widths.push(n);
         }
+        if policy == ChunkPolicy::Adaptive {
+            cost.observe(n, elapsed);
+            width = cost.next_width(budget, batch);
+        }
+    }
+    if chunks_report {
+        let total: usize = widths.iter().sum();
+        eprintln!(
+            "orangu-server: [prefill-chunks] {} tokens from {} in {} submissions: {:?}",
+            total,
+            start_pos,
+            widths.len(),
+            widths
+        );
     }
     Ok(logits)
 }
 
-/// How wide the next chunk should be, given how long a chunk of `n` tokens
-/// just took.
+/// Whether `ORANGU_PREFILL_CHUNKS=1` asked for one line per prefill naming the
+/// widths the sizer chose.
+fn chunk_widths_reported() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_CHUNKS"))
+}
+
+/// How wide the next chunk should be, reading one chunk's cost as if all of it
+/// were per-token work.
+///
+/// This is the estimate available before two observations exist to separate a
+/// submission's fixed cost from its marginal one ([`ChunkCost`]), and the one
+/// deliberately used again whenever a chunk overruns its budget — charging
+/// everything to per-token work under-sizes, and under-sizing is the safe
+/// direction.
 ///
 /// Cost per token is not constant: a prefill chunk attends over everything
 /// before it, so the same 512 tokens that take 2.3 s at position 0 take 10.1 s
@@ -1561,10 +1649,228 @@ fn next_chunk_width(n: usize, elapsed: Duration, budget: Duration, max_width: us
     if per_token <= 0.0 {
         return max_width;
     }
-    let fits = (budget.as_secs_f64() * PREFILL_BUDGET_HEADROOM / per_token) as usize;
-    // `min(max_width)` on the floor as well: a caller that configured a batch
-    // smaller than the floor asked for chunks that small, and `clamp` panics
-    // outright when its own min exceeds its max.
+    clamp_chunk_width(
+        budget.as_secs_f64() * PREFILL_BUDGET_HEADROOM / per_token,
+        max_width,
+    )
+}
+
+/// What one prefill submission costs on this machine, as a line through its
+/// token count: `fixed + per_token · n` seconds.
+///
+/// A chunk's cost is not proportional to its width. A submission pays for
+/// itself before it processes a single token — the encoder, the bind groups,
+/// the host round trip, and the per-layer dispatches whose grids do not shrink
+/// with the batch — and only then pays per token. Sizing from `elapsed / n`,
+/// which is what this did while it modelled cost as pure proportion, reads all
+/// of that fixed cost as if it were per-token work. The error is worst exactly
+/// where the sizing starts: the opening probe is almost entirely fixed cost,
+/// so its apparent per-token rate comes out several times the real one and the
+/// next chunk is sized at a fraction of what the budget allows. The width then
+/// climbs one chunk at a time, and on a prompt only a few chunks long the
+/// climb *is* the prompt.
+///
+/// Two observations at different widths separate the two terms. That
+/// separation is also what keeps this portable: `fixed` and `per_token` are
+/// measured here, against this machine and this model, rather than carried in
+/// as constants from whichever machine the code was written on. A card with a
+/// cheaper round trip, a model with fewer layers, or a backend with no
+/// per-submission cost at all describes itself correctly through the same two
+/// numbers.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkCost {
+    /// The most recent observation: how wide a chunk was, and what it cost.
+    last: Option<(usize, Duration)>,
+    /// The line through the two most recent observations wide enough apart to
+    /// support one, kept until a better-separated pair replaces it.
+    fit: Option<CostFit>,
+    /// Never form a fit, and so never offer an opening width — which leaves
+    /// the proportional sizer this replaced, exactly. The control arm for
+    /// `ORANGU_NO_CHUNK_COST_FIT`, carried in the value rather than read from
+    /// the environment down here so the type stays pure and a test can have
+    /// either behaviour without touching a process-wide switch.
+    proportional_only: bool,
+}
+
+/// `fixed + per_token · n` seconds, both non-negative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CostFit {
+    fixed: f64,
+    per_token: f64,
+}
+
+/// How much wider than its partner the wider of two observations must be
+/// before the pair is allowed to set a slope.
+///
+/// Two points near the same width put a small, noisy denominator under the
+/// subtraction — the slope they imply is mostly the difference between two
+/// timings of the same thing. Requiring real separation costs nothing, because
+/// the widths this sizer produces vary by much more than this on the way up,
+/// and a pair that fails the test leaves the previous fit standing rather than
+/// replacing it with a coincidence.
+const COST_FIT_SEPARATION: usize = 2;
+
+impl CostFit {
+    /// The line through two observations, or `None` when the pair cannot
+    /// support one.
+    ///
+    /// Rejects a pair that is too close together to carry a slope, and one
+    /// where the wider chunk did not cost more — which is noise, not a
+    /// negative marginal cost, and would size the next chunk off a downward
+    /// line.
+    fn through(a: (usize, Duration), b: (usize, Duration)) -> Option<Self> {
+        let (narrow, wide) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+        let (n_narrow, n_wide) = (narrow.0, wide.0);
+        if n_narrow == 0 || n_wide < n_narrow.saturating_mul(COST_FIT_SEPARATION) {
+            return None;
+        }
+        let (t_narrow, t_wide) = (narrow.1.as_secs_f64(), wide.1.as_secs_f64());
+        let per_token = (t_wide - t_narrow) / ((n_wide - n_narrow) as f64);
+        if !per_token.is_finite() || per_token <= 0.0 {
+            return None;
+        }
+        // Clamped rather than rejected: a measured intercept below zero means
+        // the narrow point sat above the line, which is ordinary scatter, and
+        // the slope it came with is still the useful half of the answer.
+        let fixed = (t_wide - per_token * n_wide as f64).max(0.0);
+        if !fixed.is_finite() {
+            return None;
+        }
+        Some(Self { fixed, per_token })
+    }
+
+    /// This line moved to pass through `point`, keeping its fixed term.
+    ///
+    /// The marginal cost is whatever is left of the observation once the fixed
+    /// cost is taken off it. Floored above zero rather than at it: a point
+    /// that lands under the intercept — ordinary scatter on a narrow chunk —
+    /// would otherwise produce a zero or negative slope and size the next
+    /// chunk at the ceiling on the strength of one cheap measurement.
+    fn through_holding_fixed(self, (n, elapsed): (usize, Duration)) -> Self {
+        if n == 0 {
+            return self;
+        }
+        let marginal = (elapsed.as_secs_f64() - self.fixed) / n as f64;
+        if !marginal.is_finite() || marginal <= 0.0 {
+            return self;
+        }
+        Self {
+            fixed: self.fixed,
+            per_token: marginal,
+        }
+    }
+
+    /// The widest chunk whose predicted cost still fits `target` seconds.
+    fn fits_in(&self, target: f64) -> f64 {
+        let room = target - self.fixed;
+        if room <= 0.0 {
+            return 0.0;
+        }
+        room / self.per_token
+    }
+}
+
+impl ChunkCost {
+    /// An estimate that has measured nothing yet.
+    const fn new() -> Self {
+        Self {
+            last: None,
+            fit: None,
+            proportional_only: false,
+        }
+    }
+
+    /// An estimate that will never fit — the control arm, which restores the
+    /// single-point sizer this replaced.
+    const fn proportional_only() -> Self {
+        Self {
+            last: None,
+            fit: None,
+            proportional_only: true,
+        }
+    }
+
+    /// Record what a chunk of `n` tokens actually cost.
+    fn observe(&mut self, n: usize, elapsed: Duration) {
+        let point = (n, elapsed);
+        if !self.proportional_only {
+            match self.last.and_then(|prev| CostFit::through(prev, point)) {
+                // Two well-separated widths price both terms.
+                Some(fit) => self.fit = Some(fit),
+                // One width cannot, but it must still be allowed to move the
+                // estimate, and this is the case that occurs *most* — once the
+                // sizer settles at a width it keeps choosing it, so every
+                // later pair is the same width twice and can never separate.
+                // Leaving the fit untouched there freezes it: whatever the
+                // first two chunks happened to say becomes permanent, a single
+                // unlucky pair sizes every prompt the server will ever serve,
+                // and because the frozen width is then the only width chosen,
+                // nothing can ever dislodge it. Re-derive the marginal cost
+                // through the new point instead, holding the fixed cost — the
+                // decomposition is what makes that sound. Fixed cost is a
+                // property of the submission and is stable; marginal cost
+                // climbs with context, so it is the term that has to track.
+                None => {
+                    if let Some(fit) = self.fit {
+                        self.fit = Some(fit.through_holding_fixed(point));
+                    }
+                }
+            }
+        }
+        self.last = Some(point);
+    }
+
+    /// How wide the next chunk of the prompt being processed should be.
+    fn next_width(&self, budget: Duration, max_width: usize) -> usize {
+        let target = budget.as_secs_f64() * PREFILL_BUDGET_HEADROOM;
+        // No separate "did it overrun?" branch, because the fit already
+        // shrinks on one and cannot fail to. Every observation moves the line
+        // through the newest point, so a chunk of `n` tokens that cost `t`
+        // sizes the next at `n · (target − fixed) / (t − fixed)`, which is
+        // below `n` exactly when `t` exceeds the target — which is what an
+        // overrun is. A guard in front of that would be safety code no test
+        // could ever reach: it would read as a promise, and the honest way to
+        // keep this one is the arithmetic above rather than a branch nothing
+        // exercises.
+        match (self.fit, self.last) {
+            (Some(fit), _) => clamp_chunk_width(fit.fits_in(target), max_width),
+            // One observation cannot separate the terms. Charging all of it to
+            // per-token work is the conservative reading — it under-sizes, and
+            // under-sizing costs a chunk where over-sizing costs a device.
+            (None, Some((n, elapsed))) => next_chunk_width(n, elapsed, budget, max_width),
+            (None, None) => max_width,
+        }
+    }
+
+    /// How wide to open a *new* prompt, for a machine already priced by an
+    /// earlier one — or `None` to open with the probe.
+    ///
+    /// Offered only from position zero. The probe exists to keep the opening
+    /// submission small at a depth where a token costs many times what it did
+    /// at the start, and an estimate carried in from an earlier request knows
+    /// nothing about the depth this one begins at. So the continuation path —
+    /// the one the probe was built for, and the one that used to reset the
+    /// GPU — keeps probing, and only a prompt starting from nothing opens at
+    /// the width this machine has already been shown to sustain.
+    fn opening_width(&self, start_pos: usize, budget: Duration, max_width: usize) -> Option<usize> {
+        if start_pos != 0 {
+            return None;
+        }
+        self.fit.map(|_| self.next_width(budget, max_width))
+    }
+}
+
+/// The bounds every adapted width lives inside, in one place.
+///
+/// `min(max_width)` on the floor as well: a caller that configured a batch
+/// smaller than the floor asked for chunks that small, and `clamp` panics
+/// outright when its own min exceeds its max.
+fn clamp_chunk_width(fits: f64, max_width: usize) -> usize {
+    let fits = if fits.is_finite() && fits >= 0.0 {
+        fits as usize
+    } else {
+        0
+    };
     fits.clamp(PREFILL_MIN_CHUNK_TOKENS.min(max_width), max_width)
 }
 
@@ -2820,6 +3126,7 @@ mod tests {
         let tokens: Vec<u32> = (0..25).collect();
 
         let logits = prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -2862,6 +3169,7 @@ mod tests {
             let mut cache = model.new_kv_cache(128);
             let tokens: Vec<u32> = (0..40).collect();
             prefill_in_chunks(
+                &mut ChunkCost::new(),
                 &model,
                 &mut cache,
                 &tokens,
@@ -2895,6 +3203,7 @@ mod tests {
         let tokens: Vec<u32> = (0..25).collect();
 
         prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -2993,6 +3302,7 @@ mod tests {
         let tokens: Vec<u32> = (0..7).collect();
 
         prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -3053,6 +3363,259 @@ mod tests {
         assert_eq!(next_chunk_width(8, Duration::ZERO, budget, 128), 128);
     }
 
+    /// The bug this sizer was rebuilt around: a chunk's cost is not
+    /// proportional to its width, and reading it as if it were turns the
+    /// opening probe's fixed cost into a per-token rate several times the real
+    /// one.
+    ///
+    /// The numbers are a real measurement — a 1120-token prompt on a 35-layer
+    /// model, where a 16-token chunk cost 270 ms and a 122-token chunk 733 ms.
+    /// Proportional sizing reads the probe at 16.9 ms/token and asks for ~133;
+    /// the two-point fit recovers ~200 ms fixed and ~4.4 ms/token and asks for
+    /// what the budget actually affords.
+    #[test]
+    fn two_observations_separate_fixed_cost_from_per_token_cost() {
+        let budget = Duration::from_millis(3_000);
+        let mut cost = ChunkCost::new();
+
+        cost.observe(16, Duration::from_millis(270));
+        let one_point = cost.next_width(budget, 512);
+
+        cost.observe(122, Duration::from_millis(733));
+        let two_points = cost.next_width(budget, 512);
+
+        assert!(
+            (120..=145).contains(&one_point),
+            "one observation cannot do better than proportional: {one_point}"
+        );
+        assert!(
+            two_points > one_point * 3,
+            "the fit must reach a working width, not climb to it: \
+             {one_point} then {two_points}"
+        );
+        let fit = cost.fit.expect("two separated observations must fit");
+        assert!(
+            (0.15..0.25).contains(&fit.fixed),
+            "fixed cost {} s off the measured ~0.2 s",
+            fit.fixed
+        );
+    }
+
+    /// The safety property the budget exists for, preserved through the
+    /// rewrite: a chunk that overran must shrink the next one. Over-sizing
+    /// here is what resets the device, so it is asserted against a *standing*
+    /// fit that still calls the wider chunk affordable.
+    #[test]
+    fn an_overrunning_chunk_shrinks_the_next_one_despite_a_fit() {
+        let budget = Duration::from_millis(3_000);
+        let mut cost = ChunkCost::new();
+        // Two cheap, well-separated chunks: a fit that says 512 is affordable.
+        cost.observe(16, Duration::from_millis(120));
+        cost.observe(256, Duration::from_millis(600));
+        assert_eq!(cost.next_width(budget, 512), 512);
+
+        // Then the cost curve rises underneath it and 512 blows the budget.
+        // This repeats the previous width deliberately: two observations that
+        // close together cannot separate the two terms, so the *only* thing
+        // that can shrink this is the fit tracking through the new point.
+        cost.observe(512, Duration::from_millis(9_000));
+        let after = cost.next_width(budget, 512);
+        assert!(
+            after < 256,
+            "an overrun must shrink the next chunk, sized {after}"
+        );
+    }
+
+    /// The estimate must never freeze.
+    ///
+    /// Once the sizer settles on a width it keeps choosing it, so every later
+    /// pair is the same width twice and cannot separate the two terms. If that
+    /// case left the fit untouched, whatever the opening pair happened to
+    /// measure would size every prompt the process ever served — and since the
+    /// frozen width is then the only width chosen, nothing could ever dislodge
+    /// it. Measured on hardware before this was handled: a server whose
+    /// opening pair was taken under profiling overhead pinned itself to
+    /// 117-token chunks for every later request and ran *slower* than carrying
+    /// no estimate at all.
+    #[test]
+    fn a_width_frozen_by_an_unlucky_opening_pair_recovers() {
+        let budget = Duration::from_millis(3_000);
+        let mut cost = ChunkCost::new();
+        // An opening pair measured while something else had the machine: the
+        // costs are inflated and the fit they produce is far too pessimistic.
+        cost.observe(16, Duration::from_millis(270));
+        cost.observe(106, Duration::from_millis(1_900));
+        let frozen = cost.next_width(budget, 512);
+        assert!(frozen < 200, "the unlucky pair should size low: {frozen}");
+
+        // The interference goes away and that width is now cheap. Every later
+        // observation is the *same* width, so nothing can separate the terms —
+        // and the width must still climb back toward what the budget affords.
+        let mut width = frozen;
+        for _ in 0..4 {
+            cost.observe(width, Duration::from_millis(300));
+            width = cost.next_width(budget, 512);
+        }
+        assert_eq!(
+            width, 512,
+            "a frozen width must recover to the ceiling, reached {width}"
+        );
+    }
+
+    /// A pair of observations too close in width cannot set a slope: the
+    /// subtraction that produces it has a small, noisy denominator under it.
+    /// Such a pair must leave the previous fit standing rather than replace it.
+    #[test]
+    fn observations_too_close_together_do_not_set_a_slope() {
+        assert_eq!(
+            CostFit::through(
+                (500, Duration::from_millis(2_000)),
+                (512, Duration::from_millis(2_010))
+            ),
+            None,
+            "near-identical widths must not produce a fit"
+        );
+        // Nor may a wider chunk that somehow cost less — noise, not a negative
+        // marginal cost.
+        assert_eq!(
+            CostFit::through(
+                (16, Duration::from_millis(300)),
+                (256, Duration::from_millis(200))
+            ),
+            None,
+        );
+    }
+
+    /// A machine already priced by an earlier prompt opens the next one at a
+    /// working width instead of re-running the ramp — that is the whole point
+    /// of carrying the estimate — but only from position zero, because a
+    /// carried fit knows nothing about the depth a continuation starts at.
+    #[test]
+    fn a_priced_machine_opens_a_fresh_prompt_at_width_but_still_probes_deep() {
+        let budget = Duration::from_millis(3_000);
+        let mut cost = ChunkCost::new();
+        cost.observe(16, Duration::from_millis(270));
+        cost.observe(122, Duration::from_millis(733));
+
+        let fresh = cost
+            .opening_width(0, budget, 512)
+            .expect("a priced machine must offer an opening width");
+        assert!(fresh > 400, "opened only {fresh} tokens wide");
+        assert_eq!(
+            cost.opening_width(100_000, budget, 512),
+            None,
+            "a continuation must still open with the probe"
+        );
+        // And an unpriced one has nothing to offer, at any position.
+        assert_eq!(ChunkCost::new().opening_width(0, budget, 512), None);
+    }
+
+    /// End to end through the chunk loop: a cold estimate opens with the probe
+    /// and a carried one does not. Asserted on the widths the model was
+    /// actually called with, so it covers the wiring and not just the
+    /// arithmetic.
+    ///
+    /// Only the *opening* width is asserted, because only it is decided before
+    /// any forward runs. Every later width comes from timing a `RecordingModel`
+    /// call, which is a few microseconds of noise on an idle machine and
+    /// whatever the scheduler decides on a busy one — an earlier version of
+    /// this test asserted the submission *count* and failed intermittently for
+    /// exactly that reason. The count belongs to
+    /// [`the_carried_estimate_is_what_removes_the_submissions`], which models
+    /// the cost curve instead of racing it.
+    #[test]
+    fn a_carried_estimate_opens_the_next_prompt_without_the_probe() {
+        let widths = |cost: &mut ChunkCost| {
+            let model = RecordingModel::new();
+            let mut cache = model.new_kv_cache(4096);
+            let tokens: Vec<u32> = (0..1120).collect();
+            prefill_in_chunks(
+                cost,
+                &model,
+                &mut cache,
+                &tokens,
+                0,
+                0,
+                Chunking {
+                    width: 512,
+                    policy: ChunkPolicy::Adaptive,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            let calls = model.calls.lock().unwrap().clone();
+            calls.into_iter().map(|(t, _)| t.len()).collect::<Vec<_>>()
+        };
+
+        let cold = widths(&mut ChunkCost::new());
+        assert_eq!(
+            cold[0], PREFILL_PROBE_TOKENS,
+            "a cold estimate must still probe: {cold:?}"
+        );
+        assert_eq!(cold.iter().sum::<usize>(), 1120, "every token fed once");
+
+        // Primed with a fixed pair rather than with whatever the previous run
+        // happened to measure, so the opening width is decided by arithmetic.
+        let mut primed = ChunkCost::new();
+        primed.observe(16, Duration::from_millis(270));
+        primed.observe(122, Duration::from_millis(733));
+        let warm = widths(&mut primed);
+        // 469, not 512: that pair prices the machine at 200 ms fixed and
+        // 4.37 ms a token, and 469 is what the budget then affords. The point
+        // is that it opens at a working width instead of the 16-token probe.
+        assert_eq!(
+            warm[0], 469,
+            "a priced machine must open at a working width: {warm:?}"
+        );
+        assert_eq!(warm.iter().sum::<usize>(), 1120);
+    }
+
+    /// The submission count, against a cost curve rather than a clock: a
+    /// prefill chunk really costs `fixed + per_token · n`, so the sizer is
+    /// driven here with the numbers measured on hardware
+    /// (`fixed` 297 ms, `per_token` 3.57 ms) instead of by timing a mock.
+    ///
+    /// This is the claim the change is for, so it is the one worth pinning
+    /// deterministically: carrying the estimate turns a 1120-token prompt from
+    /// five submissions into three.
+    #[test]
+    fn the_carried_estimate_is_what_removes_the_submissions() {
+        let budget = Duration::from_millis(3_000);
+        let cost_of = |n: usize| Duration::from_secs_f64(0.297 + 0.00357 * n as f64);
+
+        // Run the sizer over a 1120-token prompt and report the widths it picks.
+        let run = |cost: &mut ChunkCost| {
+            let mut widths = Vec::new();
+            let mut done = 0usize;
+            let mut width = cost
+                .opening_width(0, budget, 512)
+                .unwrap_or(PREFILL_PROBE_TOKENS.min(512));
+            while done < 1120 {
+                let n = width.min(1120 - done);
+                widths.push(n);
+                done += n;
+                cost.observe(n, cost_of(n));
+                width = cost.next_width(budget, 512);
+            }
+            widths
+        };
+
+        let mut carried = ChunkCost::new();
+        let cold = run(&mut carried);
+        let warm = run(&mut carried);
+
+        assert_eq!(cold, vec![16, 101, 512, 491], "cold ramp: {cold:?}");
+        assert_eq!(warm, vec![512, 512, 96], "warm run: {warm:?}");
+        assert!(
+            warm.len() < cold.len(),
+            "carrying the estimate must cost fewer submissions"
+        );
+        // And it stays converged: a third prompt does not drift off it.
+        assert_eq!(run(&mut carried), vec![512, 512, 96]);
+        assert_eq!(cold.iter().sum::<usize>(), 1120);
+        assert_eq!(warm.iter().sum::<usize>(), 1120);
+    }
+
     /// A deep continuation is the shape that used to hang the GPU: a full-width
     /// chunk submitted at a position where each token costs ten times what it
     /// did at the start. It must open with the small probe instead.
@@ -3063,6 +3626,7 @@ mod tests {
         let tokens: Vec<u32> = (0..600).collect();
 
         prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -3091,6 +3655,7 @@ mod tests {
         let mut seen = Vec::new();
 
         prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -3119,6 +3684,7 @@ mod tests {
         let mut seen = Vec::new();
 
         prefill_in_chunks(
+            &mut ChunkCost::new(),
             &model,
             &mut cache,
             &tokens,
@@ -3146,6 +3712,7 @@ mod tests {
             let tokens: Vec<u32> = (0..len as u32).collect();
 
             prefill_in_chunks(
+                &mut ChunkCost::new(),
                 &model,
                 &mut cache,
                 &tokens,

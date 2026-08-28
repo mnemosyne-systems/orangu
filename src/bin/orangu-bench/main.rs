@@ -493,15 +493,46 @@ struct Sample {
     gen_tokens: u32,
     ttft_ms: f64,
     decode_s: f64,
+    /// `predicted_n` and `predicted_ms` from the server's own `timings`, when
+    /// it reported them. Preferred over the streamed count — see
+    /// [`Sample::tok_per_s`].
+    reported: Option<(u32, f64)>,
 }
 
 impl Sample {
+    /// Decode rate, from the server's own accounting when it offered one.
+    ///
+    /// Counting streamed chunks under-reports, and the error is not small. A
+    /// generated token whose text is empty — a special token the server
+    /// filters out of the stream, a partial UTF-8 or BPE continuation that
+    /// decodes to nothing on its own — costs a full forward pass and arrives
+    /// as no visible text, so the chunk loop cannot see it. The elapsed window
+    /// still spans it, because the clock keeps running. So the denominator
+    /// counts the token and the numerator does not, and the rate comes out low
+    /// by whatever share of the generation was invisible.
+    ///
+    /// Measured on `gemma-4-E2B-it:Q4_K_M` at depth 1024: the server generated
+    /// 128 tokens in 2.88 s (44.5 tok/s) and only 79 of them carried text, so
+    /// this reported **27.6 tok/s** — a 38% under-read that looked exactly
+    /// like a decode cliff between depth 768 and 1024, and was not one.
+    ///
+    /// `predicted_n` / `predicted_ms` are what the server actually did, and
+    /// they already exclude prefill. The streamed count remains the fallback
+    /// for a server that reports no timings at all.
     fn tok_per_s(&self) -> f64 {
+        if let Some((n, ms)) = self.reported.filter(|&(n, ms)| ms > 0.0 && n > 0) {
+            return f64::from(n) / (ms / 1000.0);
+        }
         if self.decode_s > 0.0 && self.gen_tokens > 1 {
             (self.gen_tokens - 1) as f64 / self.decode_s
         } else {
             0.0
         }
+    }
+
+    /// Tokens generated: the server's count when it gave one.
+    fn generated(&self) -> u32 {
+        self.reported.map_or(self.gen_tokens, |(n, _)| n)
     }
 }
 
@@ -903,6 +934,7 @@ fn stream_and_time(
     let mut first: Option<Instant> = None;
     let mut last = t0;
     let mut n: u32 = 0;
+    let mut reported: Option<(u32, f64)> = None;
 
     loop {
         line.clear();
@@ -943,6 +975,16 @@ fn stream_and_time(
             last = now;
             n += 1;
         }
+        // The server's own accounting, carried on the final chunk. Preferred
+        // over the count above, which cannot see a generated token that
+        // streamed no text — see `Sample::tok_per_s`.
+        if let Some(t) = v.get("timings") {
+            let n = t.get("predicted_n").and_then(serde_json::Value::as_u64);
+            let ms = t.get("predicted_ms").and_then(serde_json::Value::as_f64);
+            if let (Some(n), Some(ms)) = (n, ms) {
+                reported = Some((n as u32, ms));
+            }
+        }
     }
 
     let first = first.unwrap_or(last);
@@ -950,6 +992,7 @@ fn stream_and_time(
         gen_tokens: n,
         ttft_ms: (first - t0).as_secs_f64() * 1000.0,
         decode_s: (last - first).as_secs_f64(),
+        reported,
     })
 }
 
@@ -1725,10 +1768,33 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
             warm_up_for_sweep(&client, args)?;
         }
         let mut env_report = report_environment(&client, args);
+        // Per point, into a path named after the point. A sweep is the one
+        // shape where two profiles are *meant* to be compared — that is what
+        // a sweep is — and until this existed `--sweep` accepted
+        // `--flamegraph` and silently profiled nothing, so the question a
+        // sweep raises ("the rate moved; what moved with it?") had no answer
+        // from this tool at all. Sharing one path between points would be
+        // worse than none: every point would overwrite the last and the file
+        // would carry the final configuration under the run's name.
+        let recorder = match &args.flamegraph {
+            Some(path) => Some(start_profile(
+                &client,
+                args,
+                &profile_path_for_point(path, &label),
+                &label,
+            )?),
+            None => None,
+        };
         let _ = take_gpu_timings(&client, &args.url);
         let clocks = ClockWatch::start();
         let measured = measure(&client, args, &label);
         report_clocks(&clocks.stop(), args);
+        if let Some(recorder) = recorder {
+            match recorder.finish() {
+                Ok(summary) => report_profile(&summary, args),
+                Err(e) => eprintln!("  profile: {e}"),
+            }
+        }
         env_report.gpu_timings = take_gpu_timings(&client, &args.url);
         report_gpu_timings(&env_report.gpu_timings, args);
         let mut measured = measured?;
@@ -1831,6 +1897,29 @@ fn sweep_point_label(args: &Args, spec: &sweep::Spec, value: &str) -> String {
 }
 
 /// `ORANGU_COOP_MIN_TOKENS=16` → `orangu_coop_min_tokens-16`, for a filename.
+/// Where one sweep point's flamegraph goes: the `--flamegraph` path with the
+/// point's own label folded into the file stem.
+///
+/// `perf/pp.svg` at point `ORANGU_NO_CHUNK_COST_FIT=0` becomes
+/// `perf/pp-orangu-no-chunk-cost-fit-0.svg`, and the `.folded`/`.png`/
+/// `.meta.json` siblings follow it, because [`profile::Recorder`] derives them
+/// from the stem it is given.
+fn profile_path_for_point(svg: &str, label: &str) -> String {
+    let path = std::path::Path::new(svg);
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    let Some(stem) = stem else {
+        return svg.to_string();
+    };
+    let named = match ext {
+        Some(ext) => format!("{stem}-{}.{ext}", slug(label)),
+        None => format!("{stem}-{}", slug(label)),
+    };
+    path.parent()
+        .map(|dir| dir.join(&named).to_string_lossy().into_owned())
+        .unwrap_or(named)
+}
+
 fn slug(label: &str) -> String {
     label
         .chars()
@@ -2633,7 +2722,7 @@ fn run_tg(
                     // The standard estimator, for putting this number beside
                     // one from another benchmark.
                     "tok_per_s_sd_sample": stats.sd_sample,
-                    "gen_tokens": s.gen_tokens,
+                    "gen_tokens": s.generated(),
                 })
             );
         } else {
@@ -2642,7 +2731,7 @@ fn run_tg(
                 depth,
                 args.n_gen,
                 s.ttft_ms,
-                s.gen_tokens,
+                s.generated(),
                 stats.best,
                 stats.mean,
                 stats.plus_minus(5, 2)
@@ -3386,7 +3475,7 @@ fn run_streams(
                     .collect()
             });
             let wall = start.elapsed().as_secs_f64();
-            let tokens: u32 = results.iter().map(|s| s.gen_tokens).sum();
+            let tokens: u32 = results.iter().map(Sample::generated).sum();
             if tokens == 0 || wall <= 0.0 {
                 anyhow::bail!("no tokens generated across {n} streams");
             }
@@ -3518,7 +3607,7 @@ fn run_shared_prefix(
             for s in &results {
                 fastest = fastest.min(s.ttft_ms);
                 slowest = slowest.max(s.ttft_ms);
-                total_tokens += s.gen_tokens;
+                total_tokens += s.generated();
             }
         }
         let ratio = if fastest > 0.0 {
@@ -3720,10 +3809,10 @@ fn run_decode_cpu(
             let s = run_once_cached(client, &args.url, &prompt, args.n_gen, &args.model)?;
             let after = profile::proc_cpu_seconds(pid)
                 .ok_or_else(|| anyhow::anyhow!("could not read /proc/{pid}/stat"))?;
-            if s.gen_tokens == 0 {
+            if s.generated() == 0 {
                 anyhow::bail!("no tokens generated at depth {depth}; cannot divide by zero");
             }
-            per_token.push((after - before).max(0.0) / f64::from(s.gen_tokens) * 1000.0);
+            per_token.push((after - before).max(0.0) / f64::from(s.generated()) * 1000.0);
             rate = s.tok_per_s();
             reported = (primed.prompt_tokens, primed.processed_tokens());
         }
@@ -4808,6 +4897,65 @@ mod tests {
     /// after `--`, or `systemd-run` swallows the server's own flags as its
     /// own. It also has to pin swap off: a cap the kernel can satisfy by
     /// swapping measures the swap device, not the model's read path.
+    /// A generated token that streams no text still cost a forward pass, and
+    /// the decode window still spans it. Counting visible chunks therefore
+    /// divides a full-length elapsed time by a short count and under-reports
+    /// the rate — which is not a rounding error: measured on
+    /// `gemma-4-E2B-it:Q4_K_M` at depth 1024, 128 generated tokens streamed as
+    /// 79 visible ones and the rate read 27.6 instead of 44.5 tok/s. It looked
+    /// exactly like a decode cliff, and there was no cliff.
+    #[test]
+    fn the_servers_own_token_count_beats_counting_visible_chunks() {
+        // 128 tokens in 2.88 s is 44.4 tok/s, whatever streamed.
+        let measured = Sample {
+            gen_tokens: 79,
+            ttft_ms: 7109.0,
+            decode_s: 2.88,
+            reported: Some((128, 2880.0)),
+        };
+        assert!(
+            (measured.tok_per_s() - 44.44).abs() < 0.05,
+            "reported {}",
+            measured.tok_per_s()
+        );
+        assert_eq!(measured.generated(), 128);
+
+        // Counting chunks on the same stream is the under-read this avoids.
+        let visible_only = Sample {
+            reported: None,
+            ..measured
+        };
+        assert!(
+            visible_only.tok_per_s() < 28.0,
+            "the fallback should be the low read: {}",
+            visible_only.tok_per_s()
+        );
+
+        // A server that reports no timings still gets a number.
+        assert_eq!(visible_only.generated(), 79);
+        // And a nonsense timings block falls back rather than dividing by zero.
+        let zeroed = Sample {
+            reported: Some((0, 0.0)),
+            ..measured
+        };
+        assert!(zeroed.tok_per_s() > 27.0);
+    }
+
+    /// Each sweep point's profile must land in its own file. Sharing one path
+    /// would leave the last point's profile under the run's name, which reads
+    /// as a profile of the whole sweep and is a profile of one arm of it.
+    #[test]
+    fn each_sweep_point_gets_its_own_profile_path() {
+        let a = profile_path_for_point("perf/pp.svg", "ORANGU_NO_CHUNK_COST_FIT=1");
+        let b = profile_path_for_point("perf/pp.svg", "ORANGU_NO_CHUNK_COST_FIT=0");
+        assert_ne!(a, b, "two points must not share a path");
+        assert_eq!(a, "perf/pp-orangu-no-chunk-cost-fit-1.svg");
+        assert_eq!(b, "perf/pp-orangu-no-chunk-cost-fit-0.svg");
+        // A bare filename keeps working, and so does one with no extension.
+        assert_eq!(profile_path_for_point("pp.svg", "x=1"), "pp-x-1.svg");
+        assert_eq!(profile_path_for_point("pp", "x=1"), "pp-x-1");
+    }
+
     #[test]
     fn the_cap_wraps_the_command_without_eating_its_arguments() {
         let wrapped = capped("orangu-server -c cfg.conf model:Q4_K_M", Some("4G"));

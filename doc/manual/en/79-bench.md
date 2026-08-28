@@ -20,12 +20,30 @@ comparable.
 
 ### What it measures
 
-For each run, `orangu-bench` sends one streaming completion and times the
-window **from the first streamed token to the last**. Prompt processing
-(prefill) and time-to-first-token are therefore *excluded* from the reported
-rate — the number is steady-state decode throughput, `(tokens - 1) /
-decode_seconds`, the standard token-generation (`tg`) quantity. Time to first
-token is printed separately (`ttft_ms`) so prefill cost is still visible.
+For each run, `orangu-bench` sends one streaming completion and reports
+steady-state decode throughput — the standard token-generation (`tg`)
+quantity, with prompt processing (prefill) and time-to-first-token *excluded*.
+Time to first token is printed separately (`ttft_ms`) so prefill cost is still
+visible.
+
+The rate comes from the server's own `predicted_n` / `predicted_ms`, which
+already exclude prefill. It is **not** derived by counting streamed chunks,
+because that under-reports: a generated token whose text is empty — a special
+token the server filters out of the stream, a partial UTF-8 or BPE
+continuation that decodes to nothing on its own — costs a full forward pass and
+arrives as no visible text, while the elapsed window still spans it. Measured
+on `gemma-4-E2B-it:Q4_K_M` at depth 1024, 128 generated tokens streamed as 79
+visible ones, and counting chunks read 27.6 tok/s where the server had done
+44.5 — a 38% under-read that looked exactly like a decode cliff. Counting
+chunks, `(tokens - 1) / decode_seconds`, remains the fallback for a server that
+reports no `timings` block at all; the `n_tok` column shows which count was
+used.
+
+**Profile decode at depth 0.** `--flamegraph` brackets the measured window, and
+that window includes each repetition's prefill. At depth 1024 with `--gen 256`
+prefill is 6.4 s against 5.8 s of decode, so half the profile is prefill and it
+reads like one. `--depths 0 --gen 512` puts 0.5 s of prefill against 12 s of
+decode.
 
 To see how decode scales with context, it sweeps **depths**: each depth pads
 the prompt with filler so generation begins at roughly that many tokens of
