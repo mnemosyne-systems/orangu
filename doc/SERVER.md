@@ -721,11 +721,11 @@ removed from them are cleaned up too — never anything above the configured
 orangu-server refresh 3                                        # NR from `list`
 orangu-server refresh unsloth/Qwen3-Coder-Next-GGUF             # MODEL from `list`
 orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K # one quantization of a repo with several on disk
+orangu-server refresh --all                                     # every model marked (Refresh)
 orangu-server refresh                                           # no argument: prints `list`'s table and prompts for an NR
 ```
 
 ```
-Refresh 'unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M' (4 files, 17.28 GiB)? The local copy is deleted first, then downloaded again. [y/N]: y
 Deleted 'unsloth/Qwen3-Coder-Next-GGUF' (4 files, 17.28 GiB)
 Downloaded Qwen3-Coder-30B-A3B-Instruct-Q4_K_M-00001-of-00004.gguf: 100% [4/4]
 Downloaded to /home/you/models/models--unsloth--Qwen3-Coder-Next-GGUF/snapshots/<newcommit>/...
@@ -741,8 +741,8 @@ is that the repo's files have changed, so the new revision is a full second
 copy on disk rather than a cheap blob-sharing snapshot: deleting first means
 a 17 GiB model needs 17 GiB free to refresh, not 34. The trade is that an
 interrupted download leaves the model missing rather than stale — which is
-what the confirmation line says, and what re-running `refresh` (or
-`download`, which resumes from the `.part` file left behind) recovers from.
+what re-running `refresh` (or `download`, which resumes from the `.part` file
+left behind) recovers from.
 
 The argument resolves the way `delete`'s does — `NR`, `MODEL`, bare name, or
 path, always against every shard of the model — with one deliberate
@@ -778,7 +778,13 @@ with the marker itself, a model outside the Hugging Face hub cache layout has
 no repo to refresh from; naming one is an error, raised before anything is
 deleted.
 
-Confirmation, and `-y`/`--yes` to skip it, work exactly as in `delete`.
+`refresh --all` checks all distinct repositories once and refreshes every
+model row known to be behind. Current models and hand-copied files are left
+alone; repositories that could not be reached are reported and skipped rather
+than guessed stale. The option cannot be combined with a model argument.
+
+`-y`/`--yes` remains accepted for compatibility, but refresh no longer
+prompts.
 
 ## `bundle`: the server and a model as one file
 

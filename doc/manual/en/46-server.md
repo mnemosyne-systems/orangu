@@ -719,6 +719,7 @@ same `<user>/<model>:<quant>` spec, in one step:
 orangu-server refresh 3                                        # NR from `list`
 orangu-server refresh unsloth/Qwen3-Coder-Next-GGUF             # MODEL from `list`
 orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF:Q6_K # one quantization of several on disk
+orangu-server refresh --all                                     # every model marked (Refresh)
 orangu-server refresh                                           # no argument: interactive
 ```
 
@@ -772,6 +773,13 @@ nothing is behind, or the Hub couldn't be reached at all, it says so instead
 of opening a picker whose every choice would be a no-op. A model that didn't
 come from Hugging Face has no repo to refresh from; naming one is an error,
 raised before anything is deleted.
+
+`refresh --all` performs the same Hub check once, then refreshes every row
+that would carry `(Refresh)` in `list`. Already-current and hand-copied models
+are left alone. A repository that could not be reached is reported and
+skipped: an unknown remote state is never treated as stale, so an offline or
+partly unreachable run does not delete models speculatively. `--all` cannot
+be combined with a model argument.
 
 ## Bundling: the server and a model as one file
 

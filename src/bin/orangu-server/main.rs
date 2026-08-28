@@ -377,7 +377,11 @@ enum Command {
         /// An NR from `list`, a MODEL name (with `:QUANT` when the repo has
         /// more than one on disk), a bare name, or a path. Omit it to pick
         /// one interactively.
+        #[arg(conflicts_with = "all")]
         model: Option<String>,
+        /// Refresh every model that is behind its Hugging Face repository.
+        #[arg(long)]
+        all: bool,
         /// Accepted for compatibility; refresh no longer prompts.
         #[arg(short = 'y', long)]
         yes: bool,
@@ -2435,9 +2439,9 @@ fn run_command(
             );
             Ok(())
         }
-        Command::Refresh { model, yes } => {
+        Command::Refresh { model, all, yes } => {
             let conf = load_config(config_arg, None, false)?;
-            refresh::run(&conf.models, model, yes)
+            refresh::run(&conf.models, model, all, yes)
         }
         Command::Bundle {
             model,
@@ -4106,6 +4110,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clap_parses_refresh_all_as_a_refresh_option() {
+        let args = Args::try_parse_from(["orangu-server", "refresh", "--all"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Refresh {
+                model: None,
+                all: true,
+                yes: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn clap_rejects_refresh_all_with_a_model() {
+        assert!(Args::try_parse_from(["orangu-server", "refresh", "1", "--all"]).is_err());
+    }
+
     /// On a quantized file the floats are norms and biases and must not
     /// outnumber the type the weight bytes are in.
     #[test]
@@ -4276,6 +4298,7 @@ mod tests {
             .mode(),
             Command::Refresh {
                 model: None,
+                all: false,
                 yes: false,
             }
             .mode(),

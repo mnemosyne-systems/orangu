@@ -64,7 +64,12 @@ _orangu_server() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     COMPREPLY=()
 
-    if [[ "$prev" == "show" || "$prev" == "plan" || "$prev" == "delete" || "$prev" == "refresh" ]]; then
+    if [[ "$prev" == "refresh" ]]; then
+        COMPREPLY=( $(compgen -W "--all $(_orangu_server_models)" -- "$cur") )
+        return 0
+    fi
+
+    if [[ "$prev" == "show" || "$prev" == "plan" || "$prev" == "delete" ]]; then
         COMPREPLY=( $(compgen -W "$(_orangu_server_models)" -- "$cur") )
         return 0
     fi
@@ -198,7 +203,11 @@ _orangu_server() {
                 'commands:command:_orangu_server_commands'
             ;;
         arg)
-            [[ ${line[1]} == show || ${line[1]} == plan || ${line[1]} == delete || ${line[1]} == refresh || ${line[1]} == bundle ]] && _orangu_server_models
+            [[ ${line[1]} == show || ${line[1]} == plan || ${line[1]} == delete || ${line[1]} == bundle ]] && _orangu_server_models
+            if [[ ${line[1]} == refresh ]]; then
+                compadd -- --all
+                _orangu_server_models
+            fi
             [[ ${line[1]} == prune ]] && _orangu_server_sessions
             ;;
     esac
@@ -247,6 +256,7 @@ complete -c orangu-server -n '__fish_seen_subcommand_from show' -a '(__orangu_se
 complete -c orangu-server -n '__fish_seen_subcommand_from plan' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from delete' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from refresh' -a '(__orangu_server_models)'
+complete -c orangu-server -n '__fish_seen_subcommand_from refresh' -l all -d 'Refresh every model that needs it'
 complete -c orangu-server -n '__fish_seen_subcommand_from bundle' -a '(__orangu_server_models)'
 complete -c orangu-server -n '__fish_seen_subcommand_from prune' -a '(__orangu_server_sessions)'
 
