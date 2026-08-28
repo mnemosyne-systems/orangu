@@ -111,7 +111,7 @@ jobs:
           # server, the benchmarking tool, the manual in both formats, and the
           # four-page cheat sheet the installers put in ~/.orangu.
           tar -czf "$ARCHIVE" -C "$BINDIR" \
-            orangu orangu-coordinator orangu-server orangu-bench \
+            orangu orangu-coordinator orangu-server orangu-bench orangu-gguf \
             orangu-en.pdf orangu-en.html orangu-cheatsheet-en.pdf
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -130,6 +130,7 @@ jobs:
             "$bindir\orangu-coordinator.exe",
             "$bindir\orangu-server.exe",
             "$bindir\orangu-bench.exe",
+            "$bindir\orangu-gguf.exe",
             "$bindir\orangu-en.pdf",
             "$bindir\orangu-en.html",
             "$bindir\orangu-cheatsheet-en.pdf"

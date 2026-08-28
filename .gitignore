@@ -15,6 +15,11 @@ doc/perf/
 perf/
 target-fp/
 
+# Trained models and the kit's stage output. `contrib/orangu-model/*.sh`
+# writes beside itself, so a run inside the checkout leaves GGUF files here.
+*.gguf
+contrib/orangu-model/smoke/
+
 # Source is never ignored. The patterns above are for build output and the
 # scratch files a working tree collects (`*.html`, `*.svg`, `*.txt`, `*.pdf`,
 # `*.log`), and they swallowed a web console's own `index.html`: `git add`

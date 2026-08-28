@@ -2507,6 +2507,22 @@ fn matmul_matches_cpu_backend_for_q6_k() {
     cross_check(GGML_TYPE_Q6_K, 512, 5);
 }
 
+/// A weight tensor whose byte length is not a multiple of 4.
+///
+/// `Q6_K` blocks are 210 bytes, so a single-super-block row against an odd
+/// row count gives 1,050 bytes — even, and not a multiple of 4. Uploading
+/// that is rejected outright (`Copy size N does not respect
+/// COPY_BUFFER_ALIGNMENT`), which is a *panic*, not a wrong number, and it
+/// takes the whole server down on the first token. The shapes above all
+/// happen to land on 4 and so never saw it; a vocabulary with an odd token
+/// count and a `Q6_K` `output.weight` does, and nothing about that file is
+/// malformed.
+#[test]
+fn matmul_uploads_a_weight_whose_length_is_not_a_multiple_of_four() {
+    assert_eq!(210 * 5 % 4, 2, "this shape has to be the awkward one");
+    cross_check(GGML_TYPE_Q6_K, 256, 5);
+}
+
 /// `n_tokens = 130` (> 64, so this needs 3 tiles of the cooperative
 /// path's internal token-tiling loop — 64 + 64 + a final, only
 /// partially-active tile of 2 — not just the first) against every

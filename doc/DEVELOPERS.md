@@ -11,6 +11,13 @@ This project is a local coding-environment client built around a direct OpenAI-c
 - `src/tools.rs` - local workspace tools for reading, editing, listing, fetching, and shell commands
 - `src/tui.rs` - banner and prompt frame rendering
 
+The model builder is a separate program too: `src/bin/orangu-gguf/` pretrains
+a model from a manifest of repositories and writes it as GGUF, or rewrites an
+existing model at another weight format. Its internals — the parameter
+layout, the hand-written backward pass, the tokenizer's one hard constraint,
+and the quantization mixture rules — are in
+[`doc/manual/en/81-gguf.md`](manual/en/81-gguf.md).
+
 The inference engine is a separate program with its own shape, and it has its
 own map: **[`doc/ENGINE.md`](ENGINE.md)** — where the architecture and backend
 modules sit, what a new one has to implement, and the handful of rules that

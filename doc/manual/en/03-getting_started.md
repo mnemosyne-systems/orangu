@@ -16,7 +16,7 @@ The order matters: steps 2 and 3 both read the models directory from the configu
 
 ## Install orangu
 
-The quickest way to install the latest release is the one-liner installer. It installs the whole stack — `orangu`, `orangu-coordinator`, `orangu-server`, and the benchmarking tool `orangu-bench`.
+The quickest way to install the latest release is the one-liner installer. It installs the whole stack — `orangu`, `orangu-coordinator`, `orangu-server`, the benchmarking tool `orangu-bench`, and the model builder `orangu-gguf`.
 
 **Linux / macOS:**
 

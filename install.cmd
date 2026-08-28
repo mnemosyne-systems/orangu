@@ -46,10 +46,10 @@ powershell -NoProfile -NonInteractive -Command ^
     (echo error: could not extract archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 :: The whole stack: the editor plus the coordinator, the inference server and
 :: the benchmarking tool — every executable the release archive carries.
-for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do if not exist "!TMP!\out\%%b.exe" (echo error: %%b.exe not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
+for %%b in (orangu orangu-coordinator orangu-server orangu-bench orangu-gguf) do if not exist "!TMP!\out\%%b.exe" (echo error: %%b.exe not found in archive & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 if not exist "!INSTALL_DIR!" mkdir "!INSTALL_DIR!"
-for %%b in (orangu orangu-coordinator orangu-server orangu-bench) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
+for %%b in (orangu orangu-coordinator orangu-server orangu-bench orangu-gguf) do copy /y "!TMP!\out\%%b.exe" "!INSTALL_DIR!\%%b.exe" >nul || (echo error: could not write to !INSTALL_DIR! & rd /s /q "!TMP!" >nul 2>&1 & exit /b 1)
 
 :: The four-page cheat sheet — setup, coding, review, merge and push. Older
 :: archives do not carry it, so its absence is not an error.

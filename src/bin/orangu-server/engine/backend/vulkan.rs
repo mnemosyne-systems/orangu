@@ -4080,13 +4080,37 @@ impl VulkanBackend {
             return None;
         }
         let t = std::time::Instant::now();
-        self.queue.write_buffer(&arena.buffer, offset, bytes);
+        self.write_weight_bytes(&arena.buffer, offset, bytes);
         arena.upload_ns += t.elapsed().as_nanos();
         arena.next_offset = offset + size;
         arena.uploaded += size;
         arena.uploads += 1;
         arena.slots.insert(key, (offset, size));
         Some((arena.buffer.clone(), offset, size))
+    }
+
+    /// Uploads a tensor's raw bytes, padding the *copy* out to
+    /// `COPY_BUFFER_ALIGNMENT`.
+    ///
+    /// `write_buffer` rejects a copy whose length is not a multiple of 4,
+    /// and a quantized tensor's length routinely is not: `Q6_K` blocks are
+    /// 210 bytes, so any odd row count gives an even length that is not a
+    /// multiple of 4 (a 327-row `output.weight` is 68,670 bytes). The
+    /// allocation is already rounded up to 16 here, so the up-to-3 zero
+    /// bytes this appends land inside the tensor's own padded region — no
+    /// kernel ever addresses them, and the next tensor starts at its own
+    /// aligned offset well past them.
+    fn write_weight_bytes(&self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        const ALIGN: usize = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+        let head = bytes.len() - bytes.len() % ALIGN;
+        if head > 0 {
+            self.queue.write_buffer(buffer, offset, &bytes[..head]);
+        }
+        if head < bytes.len() {
+            let mut tail = [0u8; ALIGN];
+            tail[..bytes.len() - head].copy_from_slice(&bytes[head..]);
+            self.queue.write_buffer(buffer, offset + head as u64, &tail);
+        }
     }
 
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
@@ -4139,8 +4163,7 @@ impl VulkanBackend {
 
         let chunk_index = arena.chunks.len() - 1;
         let offset = arena.next_offset.next_multiple_of(align);
-        self.queue
-            .write_buffer(&arena.chunks[chunk_index], offset, bytes);
+        self.write_weight_bytes(&arena.chunks[chunk_index], offset, bytes);
         arena.next_offset = offset + size;
         arena.slots.insert(key, (chunk_index, offset, size));
         (arena.chunks[chunk_index].clone(), offset, size)

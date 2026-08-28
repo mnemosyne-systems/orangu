@@ -28,6 +28,13 @@ path = "src/bin/orangu-server/main.rs"
 name = "orangu-bench"
 path = "src/bin/orangu-bench/main.rs"
 
+# Builds a model file: trains one from a manifest of permissively-licensed
+# repositories, or rewrites an existing one at another weight format.
+# Documented in doc/manual/en/77-gguf.md.
+[[bin]]
+name = "orangu-gguf"
+path = "src/bin/orangu-gguf/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 arboard = { version = "3.6.1", default-features = false }
@@ -103,6 +110,12 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system", 
 # `/v1/completions`, which applies no template, the same model answers fine.
 minijinja = { version = "2.24", features = ["loop_controls"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+# Corpus sources `orangu-gguf` reads that are not Git repositories: bzip2
+# for the Wikipedia dumps and `.tar.bz2`, flate2 for `.tar.gz`, tar for
+# what is inside both. The bzip2 backend is the pure-Rust one.
+bzip2 = "0.6.1"
+flate2 = "1.1"
+tar = "0.4"
 half = "2.7"
 wide = "1.7.0"
 memmap2 = "0.9"

@@ -1,0 +1,26 @@
+{
+  "name": "orangu-code",
+  "license": "Apache-2.0",
+  "description": "The four smallest permissively-licensed projects of the full corpus, for proving the pipeline end to end.",
+
+  "training_size": "smoke",
+  "context_size": "8k",
+  "quantization": "bf16",
+
+  "vocab_size": 8192,
+  "sequence_length": 512,
+  "batch": 2,
+  "steps": 200,
+  "log_every": 20,
+  "eval_every": 100,
+  "checkpoint_every": 0,
+
+  "wikipedia": { "language": "simple", "max_bytes": 20000000 },
+
+  "repositories": [
+    { "url": "https://github.com/pgagroal/pgagroal",     "license": "BSD-3-Clause" },
+    { "url": "https://github.com/pgmoneta/pgmoneta",     "license": "BSD-3-Clause" },
+    { "url": "https://github.com/pgexporter/pgexporter", "license": "BSD-3-Clause" },
+    { "url": "https://github.com/pgvictoria/pgvictoria", "license": "BSD-3-Clause" }
+  ]
+}

@@ -60,6 +60,8 @@ Every layer talks to the next over the OpenAI-compatible API, so the pieces stay
 
 A fourth binary, `orangu-bench`, is a developer tool rather than part of the stack: it measures decode and prefill throughput of any OpenAI-compatible server over HTTP — `orangu-server` or another engine under the identical harness — and can record and chart results over time. See the [Benchmarking](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/79-bench.md) chapter.
 
+A fifth, `orangu-gguf`, builds the model files the server runs: it pretrains one from scratch out of a JSON manifest of permissively-licensed repositories — cloning, tokenizer, corpus packing, training and GGUF export in one binary — and rewrites an existing model at a smaller weight format — the K-quants `Q6_K` down to `Q2_K` with their `_S`/`_M`/`_L` mixtures, plus `IQ4_NL` and `IQ4_XS`. See the [Building a model](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/47-gguf.md) chapter, and [`contrib/orangu-model/`](contrib/orangu-model/README.md) for a ready-to-run corpus manifest with one script per stage — smoke test, BF16, Q6_K, Q4_K_M.
+
 ## Features
 
 **Fully local and private.** orangu runs on its own `orangu-server`, so once the server and models are downloaded, nothing leaves your machine and no Internet connection is required. Your code is never sent to a third-party cloud.
@@ -206,7 +208,7 @@ curl -fsSL https://mnemosyne-systems.github.io/orangu/install.sh | sh
 curl -fsSL https://mnemosyne-systems.github.io/orangu/install.cmd -o install.cmd && install.cmd
 ```
 
-Both scripts download the latest release and install the whole stack — `orangu`, `orangu-coordinator`, `orangu-server`, and the benchmarking tool `orangu-bench` — to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), and warn if the directory is not in your `PATH`.
+Both scripts download the latest release and install the whole stack — `orangu`, `orangu-coordinator`, `orangu-server`, the benchmarking tool `orangu-bench`, and the model builder `orangu-gguf` — to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), and warn if the directory is not in your `PATH`.
 
 **Custom install directory:** set `INSTALL_DIR` before running the script:
 
@@ -394,12 +396,13 @@ Useful first commands:
 - [Usage tools](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/43-usage_tools.md)
 - [Coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/44-coordinator.md)
 - [Inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/46-server.md)
+- [Building a model](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/47-gguf.md)
 - [Serving models per role](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/73-openai.md)
 - [Shell completions](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/74-completions.md)
 - [Compression](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/75-compression.md)
 - [HTTP endpoints](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/80-http.md)
 - [Benchmarking](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/79-bench.md)
-- Internals: [coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md), [inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md), [developer information](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/70-dev.md)
+- Internals: [coordinator](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/76-coordinator.md), [inference server](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/78-server.md), [model building](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/81-gguf.md), [developer information](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/70-dev.md)
 - [Engine contributor's map](https://github.com/mnemosyne-systems/orangu/blob/main/doc/ENGINE.md) — where the architecture and backend modules sit, what a new one has to implement, and the rules that are not visible from inside one
 
 ## Tested platforms

@@ -68,6 +68,11 @@ A fourth binary, `orangu-bench`, is a developer tool rather than part of the
 stack: it measures decode and prefill throughput of any OpenAI-compatible
 server over HTTP and charts it over time. See the *Benchmarking* chapter.
 
+A fifth, `orangu-gguf`, builds the model files the rest of the stack runs on:
+it pretrains one from scratch out of a manifest of permissively-licensed
+repositories, and rewrites an existing model at a smaller weight format. See
+the *Building a model* chapter.
+
 Because every layer talks to the next over the OpenAI-compatible API, the pieces
 stay cleanly separated, yet they ship and run as one. The result is a fully
 local, fully private, single-language AI coding stack — no Python, no C/C++ engine,

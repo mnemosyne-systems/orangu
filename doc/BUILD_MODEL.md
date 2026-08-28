@@ -8,6 +8,17 @@ hardware permitting, a **sparse Mixture-of-Experts model with ~2B
 *active* parameters ("Bx-A2")**, trained entirely from
 permissively-licensed GitHub repositories and open English corpora.
 
+**`orangu-gguf` already does all of this in one binary.** The
+[Building a model](manual/en/47-gguf.md) chapter covers it: hand it a JSON
+manifest of permissively-licensed repositories and it clones them, trains a
+tokenizer, packs the corpus, pretrains from random weights, and writes the
+GGUF — with no Python, no training framework, and nothing to install beside
+the binary. It trains on the CPU, which is its limit: it is the right tool
+for the `smoke` and `0.5b` end of the plan below, and for producing the
+quantizations at the end of any of them. This guide remains the reference
+for the GPU-trained sizes, and for anyone who wants to build the pipeline
+themselves rather than run one.
+
 This guide gives two independent, complete paths to that same target: a
 **Rust toolchain** built on [Burn](https://github.com/tracel-ai/burn), and
 a **Python toolchain** built on PyTorch/`transformers`. They aren't meant
