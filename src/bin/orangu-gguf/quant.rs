@@ -1460,19 +1460,25 @@ fn fit_signed_scale(x: &[f32], nmax: i32, quants: &mut [i8]) -> f32 {
 pub fn decode(ggml_type: u32, bytes: &[u8], elements: usize) -> Result<Vec<f32>> {
     match ggml_type {
         GGML_TYPE_F32 => Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(elements)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .map(|b| f32::from_le_bytes(*b))
             .collect()),
         GGML_TYPE_F16 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(elements)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .map(|b| f16::from_le_bytes(*b).to_f32())
             .collect()),
         GGML_TYPE_BF16 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(elements)
-            .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+            .map(|b| f32::from_bits((u16::from_le_bytes(*b) as u32) << 16))
             .collect()),
         other => bail!(
             "this file's tensors are already {} — quantize from the F32, F16 or BF16 file instead",
@@ -1491,7 +1497,9 @@ mod tests {
     fn dequantize(ggml_type: u32, bytes: &[u8], elements: usize) -> Vec<f32> {
         match ggml_type {
             GGML_TYPE_Q2_K => bytes
-                .chunks_exact(QK_K / 16 + QK_K / 4 + 4)
+                .as_chunks::<{ QK_K / 16 + QK_K / 4 + 4 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let scales = &block[..QK_K / 16];
                     let quants = &block[QK_K / 16..QK_K / 16 + QK_K / 4];
@@ -1509,7 +1517,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_Q3_K => bytes
-                .chunks_exact(QK_K / 8 + QK_K / 4 + 12 + 2)
+                .as_chunks::<{ QK_K / 8 + QK_K / 4 + 12 + 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let mask = &block[..QK_K / 8];
                     let quants = &block[QK_K / 8..QK_K / 8 + QK_K / 4];
@@ -1529,7 +1539,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_Q5_K => bytes
-                .chunks_exact(2 + 2 + 12 + QK_K / 8 + QK_K / 2)
+                .as_chunks::<{ 2 + 2 + 12 + QK_K / 8 + QK_K / 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
                     let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -1552,7 +1564,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_IQ4_NL => bytes
-                .chunks_exact(2 + QK / 2)
+                .as_chunks::<{ 2 + QK / 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
                     let quants = &block[2..];
@@ -1565,7 +1579,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_IQ4_XS => bytes
-                .chunks_exact(2 + 2 + QK_K / 64 + QK_K / 2)
+                .as_chunks::<{ 2 + 2 + QK_K / 64 + QK_K / 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
                     let scales_h = u16::from_le_bytes([block[2], block[3]]);
@@ -1589,7 +1605,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_Q4_K => bytes
-                .chunks_exact(2 + 2 + 12 + QK_K / 2)
+                .as_chunks::<{ 2 + 2 + 12 + QK_K / 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
                     let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -1609,7 +1627,9 @@ mod tests {
                 .take(elements)
                 .collect(),
             GGML_TYPE_Q6_K => bytes
-                .chunks_exact(QK_K / 2 + QK_K / 4 + QK_K / 16 + 2)
+                .as_chunks::<{ QK_K / 2 + QK_K / 4 + QK_K / 16 + 2 }>()
+                .0
+                .iter()
                 .flat_map(|block| {
                     let low = &block[..QK_K / 2];
                     let high = &block[QK_K / 2..QK_K / 2 + QK_K / 4];

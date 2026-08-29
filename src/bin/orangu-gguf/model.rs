@@ -1573,21 +1573,21 @@ mod tests {
             for j in 0..2 {
                 let at = i + j * LANES;
                 let weight = load8(&b[at..]);
-                for (r, row) in rows.iter().enumerate() {
-                    acc[r][j] = load8(&row[at..]).mul_add(weight, acc[r][j]);
+                for (row, sums) in rows.iter().zip(acc.iter_mut()) {
+                    sums[j] = load8(&row[at..]).mul_add(weight, sums[j]);
                 }
             }
             i += 2 * LANES;
         }
         let mut out = [0f32; 4];
-        for (r, row) in rows.iter().enumerate() {
-            let mut sum = horizontal(acc[r][0] + acc[r][1]);
+        for ((value, row), sums) in out.iter_mut().zip(rows.iter()).zip(acc.iter()) {
+            let mut sum = horizontal(sums[0] + sums[1]);
             let mut at = i;
             while at < b.len() {
                 sum += row[at] * b[at];
                 at += 1;
             }
-            out[r] = sum;
+            *value = sum;
         }
         out
     }
@@ -1647,7 +1647,7 @@ mod tests {
         }
     }
 
-    fn matmul_blocked8(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+    fn matmul_blocked8(y: &mut [f32], x: &[f32], w: &[f32], k: usize, n: usize) {
         y.par_chunks_mut(n * TILE)
             .zip(x.par_chunks(k * TILE))
             .for_each(|(out_tile, in_tile)| tile_blocked8(out_tile, in_tile, w, k, n));
@@ -1678,7 +1678,7 @@ mod tests {
         }
     }
 
-    fn matmul_blocked(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+    fn matmul_blocked(y: &mut [f32], x: &[f32], w: &[f32], k: usize, n: usize) {
         y.par_chunks_mut(n * TILE)
             .zip(x.par_chunks(k * TILE))
             .for_each(|(out_tile, in_tile)| tile_blocked(out_tile, in_tile, w, k, n));
@@ -1831,18 +1831,18 @@ mod tests {
             }
             let plain = flop * passes as f64 / start.elapsed().as_secs_f64() / 1e9;
 
-            matmul_blocked(&mut y, &x, &w, t, k, n);
+            matmul_blocked(&mut y, &x, &w, k, n);
             let start = std::time::Instant::now();
             for _ in 0..passes {
-                matmul_blocked(&mut y, &x, &w, t, k, n);
+                matmul_blocked(&mut y, &x, &w, k, n);
             }
             let four = flop * passes as f64 / start.elapsed().as_secs_f64() / 1e9;
             let error4 = relative(&reference, &y);
 
-            matmul_blocked8(&mut y, &x, &w, t, k, n);
+            matmul_blocked8(&mut y, &x, &w, k, n);
             let start = std::time::Instant::now();
             for _ in 0..passes {
-                matmul_blocked8(&mut y, &x, &w, t, k, n);
+                matmul_blocked8(&mut y, &x, &w, k, n);
             }
             let eight = flop * passes as f64 / start.elapsed().as_secs_f64() / 1e9;
             let error8 = relative(&reference, &y);

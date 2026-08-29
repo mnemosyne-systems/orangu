@@ -570,8 +570,10 @@ fn read_floats(input: &mut impl Read) -> Result<Vec<f32>> {
         input.read_exact(&mut buffer[..take * 4])?;
         values.extend(
             buffer[..take * 4]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
         );
         left -= take;
     }
