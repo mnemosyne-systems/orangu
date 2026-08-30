@@ -19,11 +19,15 @@ beside the built-in ones. orangu connects; it does not launch them.
 
 | Command | What it does |
 | --- | --- |
-| `[mcp.<name>]` | A service in `orangu.conf`: its URL (usually ending in `/mcp`), `timeout`, `enabled`, `required`, `enabled_tools` / `disabled_tools`. |
-| `approval_mode = auto` | Or `prompt` (ask per call), `writes` (ask unless the tool is read-only), `deny`. Unattended and review runs deny what needs asking. |
-| `/mcp` `/mcp refresh` | What is connected, disabled or failed, and how many tools each gave; reconnect and rediscover. |
-| `/mcp add <name> <command>` | Write a profile and connect it; `/mcp remove <name>` drops it. |
-| `mcp__<server>__<tool>` | How they are named, so nothing collides; `/tools` lists them. Tools only. |
+| `[mcp.<name>]` | A configured Streamable HTTP service; URL, filters and approval are in `orangu.conf`. |
+| `/mcp` `/mcp refresh` | Show and reconnect; `/mcp add` / `remove` manage one. `/tools` lists `mcp__<server>__<tool>`. |
+
+## Workflow files
+
+| Command | What it does |
+| --- | --- |
+| `orangu --workflow run.yaml --dry-run` / `--workflow run.yaml` | Validate every job without executing; then run the jobs in order. |
+| `orangu --workflow run.yaml` `status` `pause` `resume` `clear` | Run a workflow, or inspect/pause/resume/clear its saved job state. |
 
 ## The rest of the stack
 

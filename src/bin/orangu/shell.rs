@@ -27,9 +27,29 @@ _orangu() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     COMPREPLY=()
 
+    local word loop_mode=false
+    for word in "${COMP_WORDS[@]:1:COMP_CWORD}"; do
+        [[ "$word" == "loop" ]] && loop_mode=true
+    done
+    if $loop_mode; then
+        case "$prev" in
+            --file)
+                COMPREPLY=( $(compgen -f -- "$cur") )
+                compopt -o filenames 2>/dev/null
+                return 0
+                ;;
+        esac
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--turns --time --until --file --check --review --help" -- "$cur") )
+        else
+            COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
+        fi
+        return 0
+    fi
+
     case "$prev" in
-        -c|--config)
-            # Configuration file (orangu.conf)
+        -c|--config|--workflow)
+            # Configuration or YAML workflow file.
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -66,9 +86,10 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
         return 0
     fi
+    COMPREPLY=( $(compgen -W "loop" -- "$cur") )
 }
 
 complete -F _orangu orangu
@@ -118,11 +139,27 @@ _orangu() {
         '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
         '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
+        '--workflow[Validate and execute every job in a YAML workflow]:workflow file:_files' \
+        '--dry-run[Validate the workflow without executing it]' \
         '(-q --quiet)'{-q,--quiet}'[Print nothing on success; the exit code is the result]' \
         '(-l --list)'{-l,--list}'[List all stored sessions as a table and exit]' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
-        '(-h --help)'{-h,--help}'[Print help]'
+        '(-h --help)'{-h,--help}'[Print help]' \
+        '1:command:(loop)' \
+        '*::argument:->arguments'
+
+    if [[ $state == arguments && $words[2] == loop ]]; then
+        _arguments \
+            '--turns[Stop after a number of work-and-review iterations]:count:' \
+            '--time[Stop after an active-time duration]:duration:' \
+            '--until[Continue until review verifies a condition]:condition:' \
+            '--file[Load a reusable loop definition]:loop file:_files' \
+            '*--check[Run a validation command after each work phase]:command:' \
+            '*--review[Add a review criterion]:criterion:' \
+            '1:action:(status pause resume clear)' \
+            '*:objective:'
+    fi
 }
 
 _orangu "$@"
@@ -151,6 +188,10 @@ function __orangu_workspaces
     sed -n 's/.*"workspace":"\([^"]*\)".*/\1/p' $sessions_dir/*/metadata 2>/dev/null | sort -u
 end
 
+function __orangu_using_loop
+    contains -- loop (commandline -opc)
+end
+
 complete -c orangu -s c -l config           -r                          -d 'Path to the configuration file (orangu.conf)'
 complete -c orangu -s t -l theme             -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
 complete -c orangu -s t -l theme             -r -a '(__fish_complete_path)' -d 'Theme file'
@@ -158,11 +199,21 @@ complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'W
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'
 complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
+complete -c orangu      -l workflow          -r -a '(__fish_complete_path)' -d 'Validate and execute every job in a YAML workflow'
+complete -c orangu      -l dry-run          -d 'Validate the workflow without executing it'
 complete -c orangu -s q -l quiet                                          -d 'Print nothing on success; the exit code is the result'
 complete -c orangu -s l -l list                                           -d 'List all stored sessions as a table and exit'
 complete -c orangu -s i -l init                                           -d 'Interactively create ~/.orangu/orangu.conf and exit'
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu -s h -l help                                           -d 'Print help'
+complete -c orangu -n 'not __orangu_using_loop' -f -a loop                -d 'Run a bounded code-and-review loop'
+complete -c orangu -n '__orangu_using_loop' -l turns -r                   -d 'Stop after a number of work-and-review iterations'
+complete -c orangu -n '__orangu_using_loop' -l time -r                    -d 'Stop after an active-time duration'
+complete -c orangu -n '__orangu_using_loop' -l until -r                   -d 'Continue until review verifies a condition'
+complete -c orangu -n '__orangu_using_loop' -l file -r -a '(__fish_complete_path)' -d 'Load a reusable loop definition'
+complete -c orangu -n '__orangu_using_loop' -l check -r                   -d 'Run a validation command after each work phase'
+complete -c orangu -n '__orangu_using_loop' -l review -r                  -d 'Add a review criterion'
+complete -c orangu -n '__orangu_using_loop' -f -a 'status pause resume clear' -d 'Manage the saved loop'
 "#;
 
 #[cfg(test)]
@@ -231,6 +282,27 @@ mod tests {
                     script.contains(&theme),
                     "{shell} completion omits the built-in theme: {theme}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_shell_completes_the_loop_interface() {
+        for option in ["turns", "time", "until", "file", "check", "review"] {
+            for (shell, script, needle) in [
+                ("bash", BASH, format!("--{option}")),
+                ("zsh", ZSH, format!("--{option}")),
+                ("fish", FISH, format!("-l {option}")),
+            ] {
+                assert!(
+                    script.contains(&needle),
+                    "{shell} completion omits --{option}"
+                );
+            }
+        }
+        for value in ["loop", "status", "pause", "resume", "clear"] {
+            for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+                assert!(script.contains(value), "{shell} completion omits {value}");
             }
         }
     }

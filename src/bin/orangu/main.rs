@@ -25,6 +25,7 @@ mod git;
 mod information;
 mod init;
 mod input;
+mod r#loop;
 mod manual;
 mod mode;
 mod models;
@@ -40,13 +41,14 @@ mod slash_command;
 mod stats;
 mod terminal;
 mod wait;
+mod workflow;
 mod workspace_tab;
 
 #[cfg(test)]
 mod test_support;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -164,6 +166,42 @@ struct Args {
     /// console and exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
+    /// Validate and execute every job in a YAML workflow.
+    #[arg(
+        long = "workflow",
+        value_name = "FILE",
+        conflicts_with_all = [
+            "theme",
+            "workspace",
+            "resume",
+            "all",
+            "list",
+            "init",
+            "prompt",
+            "shell_completions",
+            "build_cheatsheet",
+            "build_manual"
+        ]
+    )]
+    workflow: Option<PathBuf>,
+    /// Validate a YAML workflow completely without loading configuration or
+    /// executing any job.
+    #[arg(
+        long = "dry-run",
+        conflicts_with_all = [
+            "theme",
+            "workspace",
+            "resume",
+            "all",
+            "list",
+            "init",
+            "prompt",
+            "shell_completions",
+            "build_cheatsheet",
+            "build_manual"
+        ]
+    )]
+    dry_run: bool,
     /// Print nothing on success: no answer, no command output, no diagnostics.
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
@@ -190,6 +228,22 @@ struct Args {
         hide = true
     )]
     build_manual: Option<Vec<PathBuf>>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Run a bounded code-and-review loop.
+    Loop(r#loop::LoopArgs),
+    /// Show the saved loop state for every job in a workflow.
+    Status,
+    /// Pause every active loop in a workflow at its next safe boundary.
+    Pause,
+    /// Resume every paused or failed loop in a workflow.
+    Resume,
+    /// Cancel every saved loop in a workflow.
+    Clear,
 }
 
 /// Pick the completion script for a `$SHELL` value. Separate from printing it
@@ -235,6 +289,8 @@ fn quiet_refusal(args: &Args) -> Option<&'static str> {
         || args.list
         || args.build_cheatsheet.is_some()
         || args.build_manual.is_some()
+        || args.workflow.is_some()
+        || args.dry_run
     {
         return None;
     }
@@ -244,13 +300,42 @@ fn quiet_refusal(args: &Args) -> Option<&'static str> {
              is a dialogue, and its questions are the output",
         );
     }
-    if args.prompt.is_none() {
+    if args.prompt.is_none() && args.command.is_none() {
         return Some(
             "-q/--quiet applies to the modes that print and exit (-p, -l, -s); \
              the terminal interface has nothing to silence",
         );
     }
     None
+}
+
+fn command_mode_refusal(args: &Args) -> Option<&'static str> {
+    args.command.as_ref()?;
+    let workflow_action = matches!(
+        args.command.as_ref(),
+        Some(CliCommand::Status | CliCommand::Pause | CliCommand::Resume | CliCommand::Clear)
+    );
+    if workflow_action && args.workflow.is_none() {
+        return Some("workflow lifecycle actions require --workflow FILE");
+    }
+    if (args.workflow.is_some() && !workflow_action)
+        || args.dry_run
+        || args.theme.is_some()
+        || args.resume.is_some()
+        || args.all
+        || args.list
+        || args.init
+        || args.prompt.is_some()
+        || args.shell_completions
+        || args.build_cheatsheet.is_some()
+        || args.build_manual.is_some()
+    {
+        Some(
+            "a CLI subcommand cannot be combined with another execution mode; only --config, --workspace, and --quiet are accepted with `orangu loop`",
+        )
+    } else {
+        None
+    }
 }
 
 fn main() -> ExitCode {
@@ -279,6 +364,9 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let mut args = Args::parse();
+    if let Some(refusal) = command_mode_refusal(&args) {
+        return Err(anyhow!(refusal));
+    }
     if let Some(refusal) = quiet_refusal(&args) {
         return Err(anyhow!(refusal));
     }
@@ -319,6 +407,28 @@ async fn run() -> Result<()> {
     if args.init {
         return init::run_init().await;
     }
+    if args.dry_run {
+        let path = args
+            .workflow
+            .take()
+            .ok_or_else(|| anyhow!("--dry-run requires --workflow FILE"))?;
+        let plan = load_workflow(&path)?;
+        if !args.quiet {
+            println!(
+                "workflow is valid: {} job{}",
+                plan.jobs.len(),
+                if plan.jobs.len() == 1 { "" } else { "s" }
+            );
+        }
+        return Ok(());
+    }
+    // Compile every job before loading configuration or starting the first
+    // potentially long-running step.
+    let workflow = args
+        .workflow
+        .take()
+        .map(|path| load_workflow(&path))
+        .transpose()?;
     let config_path = match args.config.or_else(default_client_config_path) {
         Some(path) => path,
         None => {
@@ -328,6 +438,32 @@ async fn run() -> Result<()> {
         }
     };
     let config = load_client_configuration(&config_path)?;
+    if let Some(plan) = workflow {
+        let action = match args.command.take() {
+            Some(CliCommand::Status) => Some("status"),
+            Some(CliCommand::Pause) => Some("pause"),
+            Some(CliCommand::Resume) => Some("resume"),
+            Some(CliCommand::Clear) => Some("clear"),
+            None => None,
+            Some(CliCommand::Loop(_)) => unreachable!("loop is refused with workflow"),
+        };
+        if let Some(action) = action {
+            return workflow::manage(plan, config, args.quiet, action).await;
+        }
+        return workflow::run(plan, config, config_path, args.quiet).await;
+    }
+    if let Some(CliCommand::Loop(loop_args)) = args.command.take() {
+        return r#loop::run(
+            loop_args,
+            r#loop::LoopRunContext {
+                workspace: resolve_workspace_root(args.workspace)?,
+                config,
+                role: None,
+                quiet: args.quiet,
+            },
+        )
+        .await;
+    }
     // A one-shot prints a report and exits. Applying a theme here would emit the
     // OSC sequences that repaint the terminal's own background and foreground —
     // a lasting change to someone else's terminal, and output where `-q`
@@ -339,6 +475,7 @@ async fn run() -> Result<()> {
                 workspace: resolve_workspace_root(args.workspace)?,
                 config,
                 config_path,
+                role: None,
                 quiet: args.quiet,
             },
         )
@@ -2561,6 +2698,17 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn load_workflow(path: &Path) -> Result<workflow::WorkflowPlan> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read workflow {}", path.display()))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let plan = workflow::compile(&source, base_dir)
+        .with_context(|| format!("failed to validate workflow {}", path.display()))?;
+    workflow::validate(&plan)
+        .with_context(|| format!("failed to validate workflow {}", path.display()))?;
+    Ok(plan)
+}
+
 fn llm_prompt_block_reason(
     endpoint: Option<&str>,
     _header_status: orangu::tui::HeaderStatus,
@@ -2664,11 +2812,15 @@ pub fn process_env_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
-
-    use super::{Args, completion_script, llm_prompt_block_reason, quiet_refusal};
+    use super::{
+        Args, command_mode_refusal, completion_script, llm_prompt_block_reason, load_workflow,
+        quiet_refusal,
+    };
     use clap::Parser;
 
     use orangu::tui::{ConnStatus, HeaderStatus};
+    use std::fs;
+    use tempfile::tempdir;
 
     fn args(argv: &[&str]) -> Args {
         Args::parse_from(std::iter::once("orangu").chain(argv.iter().copied()))
@@ -2679,6 +2831,11 @@ mod tests {
         assert_eq!(quiet_refusal(&args(&["-q", "-p", "/help"])), None);
         assert_eq!(quiet_refusal(&args(&["-q", "-l"])), None);
         assert_eq!(quiet_refusal(&args(&["-q", "-s"])), None);
+        assert_eq!(quiet_refusal(&args(&["-q", "--workflow", "run.yml"])), None);
+        assert_eq!(
+            quiet_refusal(&args(&["-q", "--workflow", "run.yml", "--dry-run"])),
+            None
+        );
         // Without -q there is nothing to refuse, whatever the mode.
         assert_eq!(quiet_refusal(&args(&["-i"])), None);
         assert_eq!(quiet_refusal(&args(&[])), None);
@@ -2716,6 +2873,140 @@ mod tests {
         assert!(err.contains("nonesuch"), "{err}");
         assert!(err.contains("bash, zsh, fish"), "{err}");
         assert!(completion_script("").is_err());
+    }
+
+    #[test]
+    fn workflow_modes_conflict_with_interactive_inputs() {
+        for argv in [
+            vec!["orangu", "--workflow", "run.yml", "--prompt", "/status"],
+            vec![
+                "orangu",
+                "--workflow",
+                "run.yml",
+                "--dry-run",
+                "--workspace",
+                ".",
+            ],
+        ] {
+            assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
+        }
+        assert!(command_mode_refusal(&args(&["status"])).is_some());
+        assert_eq!(
+            command_mode_refusal(&args(&["--workflow", "run.yml", "status"])),
+            None
+        );
+    }
+
+    #[test]
+    fn loop_subcommand_only_accepts_shared_runtime_options() {
+        assert_eq!(
+            command_mode_refusal(&args(&[
+                "--config",
+                "orangu.conf",
+                "--workspace",
+                ".",
+                "--quiet",
+                "loop",
+                "status"
+            ])),
+            None
+        );
+        let refusal = command_mode_refusal(&args(&["--workflow", "run.yml", "loop", "status"]))
+            .expect("two execution modes must be refused");
+        assert!(refusal.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn load_workflow_resolves_workspaces_relative_to_the_yaml_file() {
+        let root = tempdir().expect("root");
+        fs::create_dir(root.path().join("repo")).expect("workspace");
+        let path = root.path().join("workflow.yml");
+        fs::write(
+            &path,
+            r#"orangu:
+  version: 1
+  jobs:
+    - job: repo
+      workspace: repo
+  main:
+    - command: /status
+"#,
+        )
+        .expect("workflow");
+
+        let plan = load_workflow(&path).expect("valid workflow");
+        assert_eq!(
+            plan.jobs[0].workspace,
+            root.path().join("repo").canonicalize().expect("canonical")
+        );
+    }
+
+    #[test]
+    fn load_workflow_rejects_all_invalid_slash_commands_before_execution() {
+        let root = tempdir().expect("root");
+        for workspace in ["one", "two"] {
+            fs::create_dir(root.path().join(workspace)).expect("workspace");
+        }
+        let path = root.path().join("workflow.yml");
+        fs::write(
+            &path,
+            r#"orangu:
+  version: 1
+  jobs:
+    - job: one
+      workspace: one
+    - job: two
+      workspace: two
+  main:
+    - command: /not-a-command
+    - command: /review
+    - command: /shell
+    - command: /export console
+"#,
+        )
+        .expect("workflow");
+
+        let error = format!(
+            "{:#}",
+            load_workflow(&path).expect_err("commands must be rejected")
+        );
+        assert!(error.contains("job 'one' step 1"), "{error}");
+        assert!(error.contains("job 'one' step 2"), "{error}");
+        assert!(error.contains("job 'one' step 3"), "{error}");
+        assert!(error.contains("job 'one' step 4"), "{error}");
+        assert!(error.contains("job 'two' step 1"), "{error}");
+        assert!(error.contains("job 'two' step 2"), "{error}");
+        assert!(error.contains("job 'two' step 3"), "{error}");
+        assert!(error.contains("job 'two' step 4"), "{error}");
+    }
+
+    #[test]
+    fn load_workflow_accepts_workspace_skills_and_plain_prompts() {
+        let root = tempdir().expect("root");
+        let workspace = root.path().join("repo");
+        let skill_dir = workspace.join(".orangu/skills/code-review");
+        fs::create_dir_all(&skill_dir).expect("skill directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: code-review\ndescription: Review code\n---\nReview $ARGUMENTS\n",
+        )
+        .expect("skill");
+        let path = root.path().join("workflow.yml");
+        fs::write(
+            &path,
+            r#"orangu:
+  version: 1
+  jobs:
+    - job: repo
+      workspace: repo
+  main:
+    - command: /code-review auth
+    - command: Explain the result
+"#,
+        )
+        .expect("workflow");
+
+        load_workflow(&path).expect("skill and prompt should validate");
     }
 
     #[test]

@@ -961,6 +961,30 @@ pub fn resolve_workspace_path(workspace: &Path, raw_path: &str) -> Result<PathBu
     if !normalized.starts_with(&normalized_workspace) {
         return Err(anyhow!("path escapes the configured workspace"));
     }
+
+    // The lexical comparison above catches `..`, but an in-workspace symlink
+    // can still point outside. Canonicalize the nearest existing ancestor so
+    // this also protects paths for files that have not been created yet.
+    let canonical_workspace = normalized_workspace
+        .canonicalize()
+        .map_err(|error| anyhow!("failed to resolve configured workspace: {error}"))?;
+    let mut existing = normalized.as_path();
+    let anchor = loop {
+        if existing.exists() {
+            break existing;
+        }
+        existing = existing
+            .parent()
+            .ok_or_else(|| anyhow!("path has no existing parent inside the workspace"))?;
+    };
+    let canonical_anchor = anchor
+        .canonicalize()
+        .map_err(|error| anyhow!("failed to resolve workspace path: {error}"))?;
+    if !canonical_anchor.starts_with(&canonical_workspace) {
+        return Err(anyhow!(
+            "path escapes the configured workspace through a symlink"
+        ));
+    }
     Ok(normalized)
 }
 
@@ -1339,6 +1363,19 @@ mod tests {
         let workspace = PathBuf::from("/tmp/workspace");
         let err = resolve_workspace_path(&workspace, "../outside").unwrap_err();
         assert!(err.to_string().contains("escapes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape"))
+            .expect("symlink");
+
+        let err = resolve_workspace_path(workspace.path(), "escape/new.txt")
+            .expect_err("symlink must not leave workspace");
+        assert!(err.to_string().contains("symlink"), "{err}");
     }
 
     #[test]
