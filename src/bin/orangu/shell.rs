@@ -29,7 +29,13 @@ _orangu() {
 
     case "$prev" in
         -c|--config)
-            # Configuration file (orangu.conf)
+            # Configuration file (orangu.conf).
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            compopt -o filenames 2>/dev/null
+            return 0
+            ;;
+        --workflow)
+            # YAML workflow file.
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -66,9 +72,10 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
         return 0
     fi
+    COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
 }
 
 complete -F _orangu orangu
@@ -118,11 +125,14 @@ _orangu() {
         '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
         '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
+        '--workflow[Validate and execute every job in a YAML workflow]:workflow file:_files' \
+        '--dry-run[Validate the workflow without executing it]' \
         '(-q --quiet)'{-q,--quiet}'[Print nothing on success; the exit code is the result]' \
         '(-l --list)'{-l,--list}'[List all stored sessions as a table and exit]' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
-        '(-h --help)'{-h,--help}'[Print help]'
+        '(-h --help)'{-h,--help}'[Print help]' \
+        '1:command:(status pause resume clear)'
 }
 
 _orangu "$@"
@@ -158,11 +168,14 @@ complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'W
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'
 complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
+complete -c orangu      -l workflow        -r -a '(__fish_complete_path)' -d 'Validate and execute every job in a YAML workflow'
+complete -c orangu      -l dry-run                                        -d 'Validate the workflow without executing it'
 complete -c orangu -s q -l quiet                                          -d 'Print nothing on success; the exit code is the result'
 complete -c orangu -s l -l list                                           -d 'List all stored sessions as a table and exit'
 complete -c orangu -s i -l init                                           -d 'Interactively create ~/.orangu/orangu.conf and exit'
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu -s h -l help                                           -d 'Print help'
+complete -c orangu -f -a 'status pause resume clear'                      -d 'Manage the saved workflow loops'
 "#;
 
 #[cfg(test)]
@@ -231,6 +244,22 @@ mod tests {
                     script.contains(&theme),
                     "{shell} completion omits the built-in theme: {theme}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_shell_completes_the_workflow_lifecycle_actions() {
+        // `loop` is a workflow-language step, not a CLI subcommand: the only
+        // positional commands are the `orangu --workflow FILE <action>`
+        // lifecycle actions.
+        for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+            assert!(
+                !script.contains("__orangu_using_loop") && !script.contains("--until"),
+                "{shell} completion still mentions the removed loop interface"
+            );
+            for value in ["status", "pause", "resume", "clear"] {
+                assert!(script.contains(value), "{shell} completion omits {value}");
             }
         }
     }
