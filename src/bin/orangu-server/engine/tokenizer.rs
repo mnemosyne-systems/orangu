@@ -282,10 +282,14 @@ pub struct Tokenizer {
     /// the merge loop over its bytes. Set for every `LLAMA3_PRE_TYPES`
     /// vocab; false elsewhere, which is exactly the previous behavior.
     ignore_merges: bool,
-    /// Control/special tokens (`tokenizer.ggml.token_type` == `CONTROL`),
-    /// longest-string-first, so a literal occurrence in text (e.g. a chat
-    /// template's `<|start_header_id|>`) is recognized as one atomic token
-    /// instead of being run through BPE like ordinary text.
+    /// Structural tokens ([`is_structural_token_type`]), longest-string-first,
+    /// so a literal occurrence in text (a chat template's
+    /// `<|start_header_id|>`, or the `<think>` its generation prompt opens
+    /// with) is recognized as one atomic token instead of being run through
+    /// BPE like ordinary text.
+    ///
+    /// The same set [`Tokenizer::is_special`] hides on the way out: a marker
+    /// this cannot produce is a marker that filter can never catch.
     special_tokens: Vec<(String, u32)>,
     /// Ids of every CONTROL / USER_DEFINED token (BOS/EOS/pad plus a chat
     /// format's structural markers — gemma-4's `<|turn>`/`<turn|>`/
@@ -361,6 +365,27 @@ enum VocabKind {
 const TOKEN_TYPE_CONTROL: i64 = 3;
 const TOKEN_TYPE_USER_DEFINED: i64 = 4;
 const TOKEN_TYPE_BYTE: i64 = 6;
+
+/// Whether a `tokenizer.ggml.token_type` marks a token as **structural** —
+/// one that must be matched atomically when text is encoded, and hidden
+/// rather than printed when it comes back out.
+///
+/// One predicate for both directions, deliberately. They were two: the
+/// encoder split only on `CONTROL` while [`Tokenizer::is_special`] hid
+/// `CONTROL | USER_DEFINED`, and a set that can be suppressed but never
+/// produced is a set that does nothing. A vocabulary typing `<think>` /
+/// `</think>` / `<tool_call>` as `USER_DEFINED` — Qwen-family models do — had
+/// them run through BPE into ordinary pieces on the way in, so the model wrote
+/// the pieces back out and no id-keyed filter could ever see them: a plain
+/// greeting came back with a literal `</think>` sitting in the middle of it,
+/// and a tool call reached the parser as loose prose.
+///
+/// `UNKNOWN` is the one attribute the reference also splits on and this does
+/// not: no vocabulary here types a structural marker that way, and admitting
+/// it would silently change what an unknown-piece vocabulary tokenizes to.
+fn is_structural_token_type(ty: i64) -> bool {
+    ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED
+}
 
 /// Reusable per-thread working set for [`Tokenizer::bpe_merge_word`]:
 /// the symbol linked-list columns and the bigram heap. Held in a thread-local
@@ -516,20 +541,21 @@ impl Tokenizer {
             metadata_u32(gguf, "tokenizer.ggml.add_bos_token").is_none_or(|v| v != 0);
 
         let token_types = i64_array(gguf, "tokenizer.ggml.token_type").unwrap_or_default();
+        // One predicate for both — see `is_structural_token_type`. Matched
+        // atomically when text is encoded, and suppressed by `is_special` when
+        // it comes back out.
         let mut special_tokens: Vec<(String, u32)> = token_types
             .iter()
             .enumerate()
-            .filter(|&(_, &ty)| ty == TOKEN_TYPE_CONTROL)
+            .filter(|&(_, &ty)| is_structural_token_type(ty))
             .filter_map(|(id, _)| tokens.get(id).map(|tok| (tok.clone(), id as u32)))
             .collect();
         special_tokens.sort_by_key(|(tok, _)| std::cmp::Reverse(tok.len()));
 
-        // Every structural (CONTROL or USER_DEFINED) token id, for
-        // `skip_special_tokens`-style suppression of streamed output.
         let special_ids: FxHashSet<u32> = token_types
             .iter()
             .enumerate()
-            .filter(|&(_, &ty)| ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED)
+            .filter(|&(_, &ty)| is_structural_token_type(ty))
             .map(|(id, _)| id as u32)
             .collect();
 
@@ -890,6 +916,12 @@ impl Tokenizer {
             self.append_token_bytes(id, &mut bytes);
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The bytes one token contributes, appended to `out` — what
+    /// [`StreamDecoder`] needs and what [`Self::decode`] is built from.
+    pub fn append_bytes(&self, id: u32, out: &mut Vec<u8>) {
+        self.append_token_bytes(id, out);
     }
 
     /// The bytes one token id contributes to decoded output.
@@ -1353,6 +1385,91 @@ fn byte_to_unicode_table() -> [char; 256] {
     out
 }
 
+/// Decodes a token stream one token at a time **without splitting
+/// characters**.
+///
+/// [`Tokenizer::decode`] is given every id at once and so never sees a
+/// character cut in half. A streaming caller has no such luxury: it must emit
+/// each token as it is sampled, and on a byte-level BPE vocabulary one
+/// character is routinely several tokens. Decoding each of those alone hands
+/// `String::from_utf8_lossy` two byte fragments and it replaces both — so a
+/// waving-hand emoji reached the reader as two replacement characters, and
+/// every emoji, and most CJK text, arrived the same way.
+///
+/// This holds the trailing bytes of an unfinished character back until the
+/// token that completes it arrives. Only a *prefix* is ever withheld — at most
+/// three bytes, since that is the longest incomplete UTF-8 sequence there is —
+/// so nothing is delayed by more than the character it belongs to.
+///
+/// A byte that cannot begin a valid sequence is not withheld: it is replaced
+/// immediately, exactly as `from_utf8_lossy` would. Waiting for a continuation
+/// that can never come would stall the rest of the stream behind one corrupt
+/// byte.
+#[derive(Default)]
+pub struct StreamDecoder {
+    /// The tail of an incomplete UTF-8 sequence, waiting for the token that
+    /// finishes it. Empty between characters, which is almost always.
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// The text `id` completes, which may be empty (a token that is only the
+    /// first half of a character) or longer than that token alone (the token
+    /// that finishes one held over from before).
+    pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> String {
+        tokenizer.append_bytes(id, &mut self.pending);
+        self.take_complete()
+    }
+
+    /// Everything still held, at the end of a stream.
+    ///
+    /// Generation can stop mid-character — a token limit, a stop token, a
+    /// client hanging up — and the bytes held for a continuation that will
+    /// never arrive are still bytes the model produced. Rendered lossily here
+    /// rather than dropped: a replacement character says something was cut
+    /// off, and silence does not.
+    pub fn flush(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
+    }
+
+    /// Splits `pending` into the text that is complete and the incomplete tail
+    /// to keep.
+    fn take_complete(&mut self) -> String {
+        match std::str::from_utf8(&self.pending) {
+            // The common case: everything held is a whole character or more.
+            Ok(text) => {
+                let out = text.to_string();
+                self.pending.clear();
+                out
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                match error.error_len() {
+                    // A truncated sequence: emit what is whole and keep the
+                    // rest for the next token.
+                    None => {
+                        let out = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                        self.pending.drain(..valid);
+                        out
+                    }
+                    // Genuinely invalid, not merely unfinished. Replace it now
+                    // and carry on, or the stream stalls behind it forever.
+                    Some(bad) => {
+                        let out =
+                            String::from_utf8_lossy(&self.pending[..valid + bad]).into_owned();
+                        self.pending.drain(..valid + bad);
+                        // What follows the bad bytes may itself be a whole
+                        // character, or another bad one.
+                        out + &self.take_complete()
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,6 +1640,98 @@ mod tests {
         // — the case that broke a naive longest-token-first scan.
         let ids = tok.encode("<|a|><|b|>", false);
         assert_eq!(ids, vec![start_idx as u32, end_idx as u32]);
+    }
+
+    /// A `USER_DEFINED` marker must be encoded as **one** token, not run
+    /// through BPE into ordinary pieces.
+    ///
+    /// This is the bug it guards, and it is not cosmetic: `is_special`
+    /// suppresses `USER_DEFINED` ids, but the encoder used to split only on
+    /// `CONTROL`, so a vocabulary typing `</think>` as `USER_DEFINED` never
+    /// produced that id at all. The model wrote the pieces back, the id-keyed
+    /// filter had nothing to match, and a literal `</think>` landed in the
+    /// middle of the answer. The two sets have to name the same tokens or
+    /// neither does its job.
+    #[test]
+    fn a_user_defined_marker_encodes_as_one_token_and_is_suppressed() {
+        let byte_to_char = byte_to_unicode_table();
+        let mut tokens: Vec<String> = (0..256u32)
+            .map(|b| byte_to_char[b as usize].to_string())
+            .collect();
+        // The pieces BPE would otherwise fall back to, so the test fails by
+        // producing them rather than by failing to encode at all.
+        for piece in ["</", "think", ">"] {
+            tokens.push(piece.to_string());
+        }
+        let marker_idx = tokens.len();
+        tokens.push("</think>".to_string());
+        let owned_tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let mut gguf = build_gguf(&owned_tokens, &[], 0, 0);
+        let mut types = vec![1i32; owned_tokens.len()]; // NORMAL
+        types[marker_idx] = 4; // USER_DEFINED
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(types.into_iter().map(GgufValue::I32).collect()),
+        ));
+
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.encode("</think>", false), vec![marker_idx as u32]);
+        assert!(tok.is_special(marker_idx as u32));
+    }
+
+    /// A character split across tokens must survive being streamed one token
+    /// at a time.
+    ///
+    /// The whole-string form always worked — `decode` sees every byte at once
+    /// — so this deliberately drives the **streaming** shape, token by token,
+    /// which is the only one the bug ever appeared in: an emoji reached the
+    /// reader as two replacement characters because each half was
+    /// lossy-converted on its own.
+    #[test]
+    fn a_character_split_across_tokens_survives_streaming() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // A byte-level vocabulary of single bytes, so a 4-byte emoji is
+        // necessarily four tokens — exactly the case that broke.
+        let text = "a\u{1f44b}b";
+        let ids = tok.encode(text, false);
+        assert!(ids.len() >= 4, "expected the emoji to span tokens: {ids:?}");
+        assert_eq!(streamed(&tok, &ids), text);
+        // Streaming and whole-string decoding must agree, or a caller could
+        // tell which one produced the text.
+        assert_eq!(streamed(&tok, &ids), tok.decode(&ids));
+    }
+
+    /// Bytes held for a continuation that never arrives are still reported,
+    /// rather than vanishing when the stream ends mid-character.
+    #[test]
+    fn a_stream_cut_mid_character_flushes_what_it_held() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode("\u{1f44b}", false);
+        let mut decoder = StreamDecoder::default();
+        // Every token but the last: the character can never complete.
+        let held: String = ids[..ids.len() - 1]
+            .iter()
+            .map(|&id| decoder.push(&tok, id))
+            .collect();
+        assert_eq!(
+            held, "",
+            "an unfinished character must not be emitted early"
+        );
+        assert!(
+            !decoder.flush().is_empty(),
+            "the withheld bytes must be reported at the end, not dropped"
+        );
+    }
+
+    /// `ids` decoded the way the generate loop decodes them: one token at a
+    /// time, then flushed.
+    fn streamed(tok: &Tokenizer, ids: &[u32]) -> String {
+        let mut decoder = StreamDecoder::default();
+        let mut out: String = ids.iter().map(|&id| decoder.push(tok, id)).collect();
+        out.push_str(&decoder.flush());
+        out
     }
 
     #[test]

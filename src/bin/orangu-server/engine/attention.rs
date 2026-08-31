@@ -246,6 +246,23 @@ pub fn attention(
     params: &Params<'_>,
     window: impl Fn(usize) -> (usize, usize) + Sync,
 ) -> Ran {
+    // Timed here, in the one place that decides where attention runs, so
+    // `attn` is reported for every architecture rather than for whichever
+    // ones remembered to ask. See `engine::decode_stages`.
+    crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Attn, || {
+        attention_timed(out, q, cache, params, window)
+    })
+}
+
+/// The body of [`attention`], split out only so the timing scope above wraps
+/// it without re-indenting the whole function.
+fn attention_timed(
+    out: &mut Vec<f32>,
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Ran {
     let Params {
         n_head,
         n_head_kv,

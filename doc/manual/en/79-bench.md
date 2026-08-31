@@ -978,6 +978,57 @@ and the history file. A best is always the flattering statistic, so the PDF
 report says so on the page and the console's table heads its column `± sd (n-1)`
 for the same reason.
 
+### The `stages` lines — where a forward pass's *elapsed* time went
+
+A CPU profile counts cycles, and that is the wrong unit for a forward pass. A
+stage that runs alone on one core and a stage that spreads the same arithmetic
+over sixteen look alike in a flamegraph, while the first costs sixteen times
+the wall clock. Worse, a stage that spends its time parked in a GPU driver
+waiting for a submission barely appears at all — the thread is not running, so
+nothing samples it — even though the token is waiting on exactly that.
+
+Start the server with `ORANGU_DECODE_STAGES=1` and each measured point gains a
+breakdown in the same units as the rate it explains:
+
+```text
+  stages   217.6 ms per forward pass over 256 passes
+           recurrent.project     31.13 ms/pass   14.3%  (30.0 calls/pass)
+           recurrent.delta       54.47 ms/pass   25.0%  (75.5 calls/pass)
+           recurrent.out         29.72 ms/pass   13.7%  (37.7 calls/pass)
+           attn                   0.94 ms/pass    0.4%  (10.0 calls/pass)
+           ffn.router            13.49 ms/pass    6.2%  (80.0 calls/pass)
+           ffn.routed            51.32 ms/pass   23.6%  (40.0 calls/pass)
+           ffn.shared            40.42 ms/pass   18.6%  (40.0 calls/pass)
+           head                  10.17 ms/pass    4.7%  (1.0 calls/pass)
+           other                  0.00 ms/pass    0.0%
+```
+
+The counters are drained on read, exactly like `moe` and `gpu-timings`: the
+tool reads once before the workload to discard the warmup and once after, so
+the window is the measured one and nothing else.
+
+Read it with three rules:
+
+- **Percentages are against `forward`, never against each other.** `forward`
+  is the parent and every other row is inside it.
+- **`other` is `forward` less what was attributed.** `forward`, `attn`,
+  `ffn.router` and `ffn.routed` are timed inside code every architecture goes
+  through, so they are reported for any model; the finer rows are timed at the
+  one call site that can name them, which is per-architecture. On a model whose
+  architecture has not been given those, `other` is most of the pass — and
+  saying so is the point, because a breakdown that quietly omitted the
+  unattributed remainder would look complete when it was not.
+- **`ffn.routed` and `ffn.shared` overlap** when the FFN runs its two branches
+  concurrently, so their sum can exceed the elapsed time they shared. That is
+  what overlapping them was for; `other` clamps at zero rather than going
+  negative when it happens, and the size of the overlap is the two rows' sum
+  less what the pass actually spent there.
+
+A row's `calls/pass` is the other half of the reading. A stage entered thirty
+times a pass is a per-layer cost and scales with depth; one entered once is
+not. Where the stage is a device call, `calls/pass` is also a submission count,
+and `ORANGU_GPU_TRACE=1` reports the total per decode step to check it against.
+
 ### Profiling what was measured (`--flamegraph`)
 
 A rate says *how* slow something is and never *where* the time went. Both

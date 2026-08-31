@@ -80,7 +80,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::device::{self, DeviceCandidate, DeviceClass};
 use super::vulkan_replay;
 use super::vulkan_shaders;
-use super::{Backend, MatmulOp};
+use super::{Backend, CpuBackend, MatmulOp};
 use crate::engine::loader::QuantMatrix;
 
 /// The `IQ*` codebooks packed for upload — `engine::iq_grids::packed`,
@@ -2683,6 +2683,11 @@ impl VulkanBackend {
             },
             "tuning": {
                 "coop_min_n_tokens": self.coop_min_n_tokens,
+                // Weight bytes below which a decode matmul goes to the host
+                // instead of here. Reported because it is machine-dependent
+                // and silently changes which backend ran most of a decode
+                // step — see `backend::host_matmul_threshold_bytes`.
+                "host_matmul_kib": super::host_matmul_threshold_bytes() / 1024,
                 "reduce_n_rows": reduce_n_rows(),
                 // Not one number any more: the RMSNorm width is chosen per
                 // row width (`norm_wg_for`), so report what the rule answers
@@ -4190,10 +4195,16 @@ impl Backend for VulkanBackend {
     }
 
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let op = MatmulOp { x, n_tokens, w };
+        // Ahead of the `mmvq` branch as well as the batched path, so the rule
+        // holds for every call rather than for whichever route a diagnostic
+        // flag happens to take. See `backend::prefers_host_matmul`.
+        if super::prefers_host_matmul(std::slice::from_ref(&op)) {
+            return CpuBackend.matmul(x, n_tokens, w);
+        }
         if self.q4_k_mmvq && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K {
             return self.matmul_mmvq(x, n_tokens, w);
         }
-        let op = MatmulOp { x, n_tokens, w };
         self.matmul_batch(std::slice::from_ref(&op))
             .pop()
             .expect("matmul_batch returns exactly one result per input op")
@@ -4216,6 +4227,15 @@ impl Backend for VulkanBackend {
     fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
         if ops.is_empty() {
             return Vec::new();
+        }
+        // A decode-sized batch the host will finish before this one could be
+        // submitted. The one place every device matmul funnels through, so the
+        // rule needs stating once. See `backend::prefers_host_matmul`.
+        if super::prefers_host_matmul(ops) {
+            return ops
+                .iter()
+                .map(|op| CpuBackend.matmul(op.x, op.n_tokens, op.w))
+                .collect();
         }
         // **Mixed token counts are fine below the stripe threshold**, and
         // that is the case this exists for. Every op is resourced
@@ -4627,6 +4647,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
 
         const CONTEXT: &str = "reading back a striped matmul";
         // Every buffer's map is recorded into one shared `MapWait` — a
@@ -4783,6 +4804,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
 
         // Every readback buffer's `map_async` is fired before the single
         // `poll(Wait)` below — that one poll drains every callback bound to
@@ -6596,6 +6618,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
         let submit_ms = t_submit.ms();
         // The same map + wait as `submit_and_readback_u32`, sharing
         // `wait_mapped` so this readback is not left carrying the single-poll
@@ -6734,6 +6757,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
         let wait = self.map_read(&readback_buffer);
         self.wait_mapped(&wait, CONTEXT);
         let data = self.mapped_bytes(&readback_buffer, CONTEXT);
@@ -10437,6 +10461,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
         const CONTEXT: &str = "reading back an attention result";
         let wait = self.map_read(&readback_buffer);
         self.poll_blocking(CONTEXT);
@@ -10585,6 +10610,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
         out_buf
     }
 
@@ -12898,6 +12924,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
     }
 
     /// Finishes and submits `encoder`, then reads back `w`'s own
@@ -12951,6 +12978,7 @@ impl VulkanBackend {
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
         let submit_elapsed = submit_start.map(|t| t.elapsed());
 
         const CONTEXT: &str = "reading back a cached matmul";
@@ -14399,3 +14427,11 @@ mod tests;
 /// `cargo test --release --bin orangu-server m6_expert_shaped -- --ignored --nocapture`
 #[cfg(test)]
 mod m6_probe;
+
+/// What one decode-shaped `matmul` call costs before any arithmetic — the
+/// unit the 200-odd calls in a decode step are priced in, and where the
+/// device stops being the faster place to run one.
+///
+/// `cargo test --release --bin orangu-server decode_matvec -- --ignored --nocapture`
+#[cfg(test)]
+mod decode_matvec_probe;

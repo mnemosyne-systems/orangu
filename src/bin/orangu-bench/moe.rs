@@ -251,6 +251,97 @@ pub fn summary_line(stats: &serde_json::Value) -> Option<String> {
     Some(line)
 }
 
+/// Drain the server's per-stage forward-pass timings.
+///
+/// `GET /decode-stages` is read-and-reset like `/moe-stats`, and is drained on
+/// the same schedule for the same reason. `Null` when the server has no such
+/// endpoint — another engine will not have one, and that must degrade to "no
+/// breakdown" rather than to an error.
+pub fn take_stages(client: &reqwest::blocking::Client, url: &str) -> serde_json::Value {
+    get_json(client, &format!("{url}/decode-stages"))
+}
+
+/// The `stages` lines: where one forward pass's elapsed time went.
+///
+/// `None` unless the server measured a window — no endpoint, the counters
+/// switched off, or no pass finished. Reported per pass rather than per
+/// window, because a pass is the unit the rate is quoted in and dividing it
+/// by hand is exactly the arithmetic a report exists to have already done.
+///
+/// Stages are printed in the order the pass runs them, with a percentage of
+/// `forward` — the parent — and an `other` row for whatever the architecture
+/// did not attribute. That row is not slack: on a model whose architecture
+/// has not been instrumented past the generic stages it is most of the pass,
+/// and saying so is the point.
+pub fn stage_lines(stages: &serde_json::Value) -> Option<Vec<String>> {
+    let passes = number(stages, &["passes"]).unwrap_or(0.0);
+    if passes <= 0.0 {
+        return None;
+    }
+    let rows = stages.get("stages")?.as_array()?;
+    let total = rows
+        .iter()
+        .find(|r| r.get("parent").and_then(serde_json::Value::as_bool) == Some(true))
+        .and_then(|r| r.get("ms"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    if total <= 0.0 {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "  stages   {:.1} ms per forward pass over {passes:.0} passes",
+        total / passes,
+    )];
+    let mut attributed = 0.0;
+    for row in rows {
+        let (Some(name), Some(ms)) = (
+            row.get("name").and_then(serde_json::Value::as_str),
+            row.get("ms").and_then(serde_json::Value::as_f64),
+        ) else {
+            continue;
+        };
+        if row.get("parent").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        attributed += ms;
+        // A stage an architecture never enters is silence, not a zero row:
+        // eleven zeroes would bury the handful of numbers worth reading.
+        if ms <= 0.0 {
+            continue;
+        }
+        let calls = row
+            .get("calls")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        // Submissions only where there are any: on a stage that never reaches
+        // the device an empty column says more than a zero would, and most
+        // stages never reach it.
+        let submits = row
+            .get("submits")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let device = if submits > 0.0 {
+            format!("  ·  {:.1} gpu", submits / passes)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "           {name:<18} {:8.2} ms/pass  {:5.1}%  ({:.1} calls/pass){device}",
+            ms / passes,
+            100.0 * ms / total,
+            calls / passes,
+        ));
+    }
+    let other = (total - attributed).max(0.0);
+    lines.push(format!(
+        "           {:<18} {:8.2} ms/pass  {:5.1}%",
+        "other",
+        other / passes,
+        100.0 * other / total,
+    ));
+    Some(lines)
+}
+
 /// The `cache` line: how much of the model was in RAM, and whether that is
 /// even knowable here. `None` when the server does not report it.
 pub fn residency_line(residency: &serde_json::Value) -> Option<String> {

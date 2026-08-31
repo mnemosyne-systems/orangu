@@ -2817,6 +2817,18 @@ impl RecurrentLayerState {
         let start = head * size;
         &mut self.delta_state[start..start + size]
     }
+
+    /// Every head's state matrix at once, with the stride between them —
+    /// `(states, size)`, where head `h` owns `states[h * size..][..size]`.
+    ///
+    /// [`Self::delta_state_mut`] hands out one head at a time, which is what a
+    /// sequential loop wants and what a parallel one cannot use: the heads are
+    /// independent, so their update is a fan-out, and a fan-out needs every
+    /// head's slice disjoint and alive at once rather than one at a time.
+    pub fn delta_states_mut(&mut self) -> (&mut [f32], usize) {
+        let size = self.head_dim * self.state_dim;
+        (&mut self.delta_state, size)
+    }
 }
 
 /// The `(kv_dim, stride)` list a pool describes — for tests that build a cache

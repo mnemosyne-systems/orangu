@@ -227,6 +227,30 @@ pub async fn moe_stats() -> impl IntoResponse {
     }))
 }
 
+/// `GET /decode-stages` — where a forward pass's *elapsed* time went, since
+/// the last call, and **reset**.
+///
+/// Same drain-on-read contract as [`gpu_timings`] and [`moe_stats`], for the
+/// same reason: read once before the workload to discard the warmup, run it,
+/// read again to get exactly that window.
+///
+/// This answers the question a CPU profile cannot. A sampling profile counts
+/// cycles, so a stage that runs alone on one core and a stage that runs the
+/// same arithmetic across sixteen look alike in it — while the first costs
+/// sixteen times the wall clock. `stages[].ms` is time on the thread that ran
+/// the stage, so the breakdown is in the same units as the token latency it
+/// explains.
+///
+/// `enabled: false` means `ORANGU_DECODE_STAGES=1` was not set, and
+/// `passes: 0` that no forward pass finished in the window — reported as zero
+/// *passes* rather than zero milliseconds, so "not measured" cannot be read as
+/// "took no time", exactly as [`gpu_timings`] reports zero steps. See
+/// `engine::decode_stages` for which stages are measured for every
+/// architecture and which are per-architecture.
+pub async fn decode_stages() -> impl IntoResponse {
+    Json(crate::engine::decode_stages::take_json())
+}
+
 /// `GET /model-cache` — how much of the model's weights are in RAM right now.
 ///
 /// Not drain-on-read: this is a state, not a window. A benchmark records it

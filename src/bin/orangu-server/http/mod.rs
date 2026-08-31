@@ -181,6 +181,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/props", get(native::props))
         .route("/gpu-timings", get(native::gpu_timings))
         .route("/moe-stats", get(native::moe_stats))
+        .route("/decode-stages", get(native::decode_stages))
         .route("/model-cache", get(native::model_cache))
         .route("/model-cache/drop", post(native::drop_model_cache))
         .route("/slots", get(native::slots))

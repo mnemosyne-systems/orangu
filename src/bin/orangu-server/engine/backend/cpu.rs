@@ -103,10 +103,20 @@ impl CpuBackend {
             // write straight into the caller's buffer, no transpose and no
             // allocation at all.
             out.resize(out_dim, 0.0);
-            out.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
-                dst[0] =
-                    vecdot::dot_k_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], &act);
-            });
+            // A floor on how small a task may get, not a chunk size — see
+            // `backend::matmul_min_rows`. One row per task is a few hundred
+            // nanoseconds of arithmetic inside a job the pool has to create,
+            // steal and join.
+            out.par_chunks_mut(1)
+                .with_min_len(super::matmul_min_rows())
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    dst[0] = vecdot::dot_k_row(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        &act,
+                    );
+                });
             return true;
         }
 
@@ -128,9 +138,13 @@ impl CpuBackend {
         // back.
         if n_tokens == 1 {
             let act = &acts[0];
-            yt.par_chunks_mut(1).enumerate().for_each(|(o, dst)| {
-                dst[0] = vecdot::dot_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], act);
-            });
+            yt.par_chunks_mut(1)
+                .with_min_len(super::matmul_min_rows())
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    dst[0] =
+                        vecdot::dot_row(ggml_type, &raw[o * row_bytes..(o + 1) * row_bytes], act);
+                });
             // The transpose is the identity — hand the buffer straight back.
             Self::finish_into(out, yt, n_tokens, out_dim);
             return true;
@@ -433,6 +447,10 @@ impl CpuBackend {
 }
 
 impl Backend for CpuBackend {
+    fn is_host(&self) -> bool {
+        true
+    }
+
     /// There is no ring to reset and no driver to give up on a submission:
     /// a long forward pass on the host is slow, not fatal. See the trait
     /// method for what the chunker does with this.

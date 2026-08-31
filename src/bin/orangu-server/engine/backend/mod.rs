@@ -114,6 +114,203 @@ where
     }
 }
 
+/// Weight bytes below which a **decode** matmul is faster on the host than on
+/// the device, from `ORANGU_HOST_MATMUL_KIB`. `0` switches the rule off, and
+/// is the control arm a sweep needs.
+///
+/// A device matmul costs a large fixed amount before it computes anything —
+/// building a command buffer, handing it to the driver, waiting for the device
+/// to pick it up — and that cost is several times the host's. So the two
+/// backends' costs are two lines, `fixed + bytes / bandwidth`, and they cross:
+/// above the crossing the device's bandwidth wins, below it the device's fixed
+/// cost does. A decode step is nothing but small matmuls, so on a model whose
+/// per-layer tensors are small this is not a rounding error — it was most of
+/// the token.
+///
+/// **Measure it on the machine that will run it.** `decode_matvec_
+/// fixed_cost_gpu_versus_cpu` (`engine::backend::vulkan::decode_matvec_probe`)
+/// prints the crossing directly, and the default here is a measured value on
+/// one card — a starting point rather than an answer, exactly as
+/// `attention::min_gpu_tokens` and the coop-tile threshold are.
+pub(crate) fn host_matmul_threshold_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        env_tuning_value(
+            "ORANGU_HOST_MATMUL_KIB",
+            HOST_MATMUL_KIB_DEFAULT,
+            "a size in KiB (0 disables the rule)",
+            |kib| kib <= 1024 * 1024,
+        ) * 1024
+    })
+}
+
+/// The default for [`host_matmul_threshold_bytes`], in KiB.
+///
+/// The probe puts the crossing between 5.3 and 7.7 MiB on this project's card,
+/// and an end-to-end sweep of this constant agrees with it — which is the
+/// point, since the two measure different things and only one of them is a
+/// prediction:
+///
+/// | KiB | decode |
+/// | --: | --: |
+/// | 0 (rule off) | 9.72 tok/s |
+/// | 4096 | 9.40 |
+/// | 6144 | **10.02–10.18** |
+/// | 8192 | 10.11 |
+/// | 20480 | 9.60 |
+///
+/// The curve is **flat across the crossing and steep outside it**: 6 and 8 MiB
+/// are within 1% of each other, while 4 MiB gives up 6% by leaving a 4.5 MiB
+/// projection on the device and 20 MiB gives up 5% by taking a 17.7 MiB one
+/// off it. So the default sits inside the measured crossing rather than at
+/// either edge — being a megabyte wrong in either direction costs nothing,
+/// and being several megabytes wrong costs about as much as the rule is worth.
+///
+/// Swept with `--delay`, and that is not incidental: an earlier sweep of the
+/// same values on a card that had been benchmarked for an hour reported the
+/// rate rising all the way to 20 MiB, which is the opposite conclusion. Heat,
+/// not the threshold.
+#[cfg(not(test))]
+const HOST_MATMUL_KIB_DEFAULT: usize = 6144;
+
+/// **Zero under `cfg(test)`**, which is not a detail: this module's sibling
+/// tests cross-check the device's kernels against `CpuBackend`, and every test
+/// weight is small. Left at the production default they would route to the
+/// host, compare the host against itself, and pass while testing nothing — a
+/// cross-check that shares the component under test proves nothing. Six of
+/// them said so out loud when this landed.
+///
+/// Only the *default* changes. An explicit `ORANGU_HOST_MATMUL_KIB` still
+/// wins, so a real-model test can ask for the production rule.
+#[cfg(test)]
+const HOST_MATMUL_KIB_DEFAULT: usize = 0;
+
+/// Whether a batch of matmuls is small enough to be worth running on the host
+/// instead of the device — see [`host_matmul_threshold_bytes`].
+///
+/// Two conditions beyond the size, both of them about the comparison staying
+/// the one that was measured:
+///
+/// - **One token.** The crossing was measured at `n_tokens == 1`, which is
+///   what a decode step is. A wider batch reads the same weights and does more
+///   arithmetic with them, which is the regime the device was built for, and
+///   the fixed cost it is being charged is unchanged — so the crossing moves
+///   away, and this rule has no business guessing how far.
+/// - **The whole batch together.** The fixed cost is per submission, not per
+///   op, so a batch of eight small matmuls pays it once. What is compared
+///   against the threshold is therefore the batch's total, not any one op's:
+///   splitting a batch up to send half of it to the host would pay the fixed
+///   cost anyway and lose the amortization that made it cheap.
+pub(crate) fn prefers_host_matmul(ops: &[MatmulOp<'_>]) -> bool {
+    prefers_host_matmul_with(host_matmul_threshold_bytes(), ops)
+}
+
+/// The fewest output rows a thread-pool task will take, from
+/// `ORANGU_MATMUL_MIN_ROWS`.
+///
+/// A decode matmul fans out over its output rows, and the natural expression
+/// of that is one row per item — which leaves `rayon` free to split until each
+/// task is a single dot product. On this model a routed expert's row is
+/// 288–1152 bytes, so a task is a few hundred nanoseconds of arithmetic
+/// wrapped in a job that has to be created, possibly stolen, and joined.
+///
+/// The cost is not hypothetical and it grew: once
+/// [`host_matmul_threshold_bytes`] moved the small matmuls to the host, a
+/// decode step's parallel regions multiplied, and **40% of all CPU samples
+/// were pool machinery — `find_work`, `steal`, `join_context`, and 24% in
+/// `sched_yield` alone**. Those are cores spinning to discover there is
+/// nothing to steal.
+///
+/// `with_min_len` is a floor, not a chunk size: `rayon` still splits down to it
+/// and no further, so a wide projection keeps every worker and a narrow one
+/// stops manufacturing jobs smaller than the overhead of having one.
+///
+/// **A flat floor, and it was worth measuring rather than reasoning about.**
+/// The obvious refinement is to scale it with the projection and the pool —
+/// `out_dim / threads`, so a narrow projection never leaves a worker idle.
+/// That was tried, and it is **6.7% slower than no floor at all**, while the
+/// flat 64 below is **3.7% faster** than no floor; both against the same
+/// control, three matched pairs each, every pair agreeing.
+///
+/// The reason is that this function cannot see the parallelism *around* it. A
+/// routed expert's projection already sits inside an eight-wide fan-out over
+/// experts, so eight tasks per projection is sixty-four in flight, not eight.
+/// Scaling the floor down to "fill the pool from this call alone" manufactures
+/// work the pool did not need.
+///
+/// Measured on `Ornith-1.5-35B-A3B`: a floor of 1 is the worst setting in
+/// every sweep, 32 and 64 are the best and are not separable from each other
+/// here (two adjacent points at one setting differed by 14%), 256 is worse
+/// again.
+///
+/// **The risk this leaves.** On a much wider pool, a narrow projection with no
+/// outer fan-out around it would get few tasks and leave workers idle. That
+/// case was not measurable here, which is what the environment variable is
+/// for — this is a machine-dependent constant like every other threshold in
+/// this module.
+///
+/// **Bit-identical at any value.** Each output row is computed and written
+/// independently, so this changes which worker does what and nothing else.
+/// `ORANGU_MATMUL_MIN_ROWS=1` restores one-row-per-task splitting and is the
+/// control arm.
+pub(crate) fn matmul_min_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        env_tuning_value(
+            "ORANGU_MATMUL_MIN_ROWS",
+            MATMUL_MIN_ROWS_DEFAULT,
+            "a row count of at least 1 (1 disables the floor)",
+            |n| n >= 1,
+        )
+    })
+}
+
+/// The default for [`matmul_min_rows`].
+const MATMUL_MIN_ROWS_DEFAULT: usize = 64;
+
+/// The same decision from the weights alone.
+///
+/// For a caller that has to know **where a matmul will run before it builds
+/// the call** — which is what deciding whether two branches are on different
+/// processors requires, and that decision has to be made before either branch
+/// starts. See `arch::moe_overlap`.
+pub(crate) fn weights_prefer_host_matmul(n_tokens: usize, weights: &[&QuantMatrix]) -> bool {
+    let threshold = host_matmul_threshold_bytes();
+    if threshold == 0 || weights.is_empty() || n_tokens != 1 {
+        return false;
+    }
+    let mut total = 0usize;
+    for w in weights {
+        total = total.saturating_add(w.row_bytes().saturating_mul(w.out_dim));
+        if total >= threshold {
+            return false;
+        }
+    }
+    true
+}
+
+/// [`prefers_host_matmul`] against an explicit threshold.
+///
+/// Split out so the decision can be tested: the threshold itself is read from
+/// the environment once per process, which a test cannot vary and must not
+/// depend on.
+fn prefers_host_matmul_with(threshold: usize, ops: &[MatmulOp<'_>]) -> bool {
+    if threshold == 0 || ops.is_empty() {
+        return false;
+    }
+    if ops.iter().any(|op| op.n_tokens != 1) {
+        return false;
+    }
+    let mut total = 0usize;
+    for op in ops {
+        total = total.saturating_add(op.w.row_bytes().saturating_mul(op.w.out_dim));
+        if total >= threshold {
+            return false;
+        }
+    }
+    true
+}
+
 /// One `matmul` call's operands, for [`Backend::matmul_batch`] — a slice of
 /// these describes several matmuls that don't depend on each other's
 /// results (e.g. a transformer layer's Q/K/V projections, all reading the
@@ -472,6 +669,16 @@ pub trait Backend: Send + Sync {
     /// Metal (see `metal`'s module doc). Everything reached through this
     /// hook is therefore live on Apple GPUs too — a `Some` here means "a
     /// `wgpu` device with orangu's fused pipelines on it", not "Vulkan".
+    /// Whether this backend *is* the host — so a caller weighing whether two
+    /// pieces of work will run on different processors can tell.
+    ///
+    /// Not the same question as `as_wgpu().is_none()`: a split model's
+    /// multi-device wrapper answers `None` there by design and is emphatically
+    /// not the host. Overridden only by `CpuBackend`.
+    fn is_host(&self) -> bool {
+        false
+    }
+
     fn as_wgpu(&self) -> Option<&VulkanBackend> {
         None
     }
@@ -618,6 +825,128 @@ mod tests {
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4};
     use std::sync::Mutex;
+
+    /// A `[in, out]` F32 weight of exactly `bytes` bytes, for the routing
+    /// tests — only its size matters to the decision under test.
+    fn weight_of_bytes(bytes: usize) -> crate::engine::loader::QuantMatrix {
+        let out_dim = bytes / 4;
+        test_quant_matrix(&vec![0u8; bytes], GGML_TYPE_F32, 1, out_dim)
+    }
+
+    /// The decision is about the **batch**, not any one op in it.
+    ///
+    /// This is the load-bearing part of the rule and the easy thing to get
+    /// wrong. A device pays its fixed cost once per submission, so eight small
+    /// matmuls issued together pay it once between them — pricing each op on
+    /// its own would send a batch to the host that the device would have won,
+    /// and would do it precisely when batching had already made the device
+    /// cheap.
+    #[test]
+    fn the_host_matmul_rule_weighs_the_whole_batch_not_one_op() {
+        let w = weight_of_bytes(4096);
+        let op = || MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: &w,
+        };
+        // One op, comfortably under.
+        assert!(prefers_host_matmul_with(8192, &[op()]));
+        // Two of the same op are not: together they cross.
+        assert!(!prefers_host_matmul_with(8192, &[op(), op()]));
+        assert!(prefers_host_matmul_with(16384, &[op(), op()]));
+    }
+
+    /// The crossing was measured at one token, so the rule applies at one
+    /// token. A wider batch reads the same weights and does more arithmetic
+    /// with them — the regime the device exists for — while the fixed cost it
+    /// is charged does not change, so the crossing moves and this rule has no
+    /// business guessing how far.
+    #[test]
+    fn the_host_matmul_rule_is_decode_only() {
+        let w = weight_of_bytes(1024);
+        let one = MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: &w,
+        };
+        let two = MatmulOp {
+            x: &[],
+            n_tokens: 2,
+            w: &w,
+        };
+        assert!(prefers_host_matmul_with(8192, &[one]));
+        assert!(!prefers_host_matmul_with(8192, &[two]));
+    }
+
+    /// `ORANGU_HOST_MATMUL_KIB=0` has to be a real control arm — a sweep that
+    /// cannot switch the feature off measures it against itself. See
+    /// `engine::env::flag_on`'s own note on why zero must mean off.
+    #[test]
+    fn a_zero_threshold_switches_the_host_matmul_rule_off() {
+        let w = weight_of_bytes(4);
+        let op = MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: &w,
+        };
+        assert!(prefers_host_matmul_with(1024, &[op]));
+        let op = MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: &w,
+        };
+        assert!(!prefers_host_matmul_with(0, &[op]));
+    }
+
+    /// The fan-out floor is a floor, and `1` has to switch it off.
+    ///
+    /// `with_min_len(0)` panics, and `1` is the original one-row-per-task
+    /// splitting — the control arm every sweep of this value is scored
+    /// against.
+    #[test]
+    fn the_matmul_floor_is_at_least_one_row() {
+        assert!(matmul_min_rows() >= 1);
+    }
+
+    /// The two forms of the host-routing decision must agree.
+    ///
+    /// `weights_prefer_host_matmul` exists so a caller can ask *before* it
+    /// builds the call — deciding whether two branches will share a processor
+    /// has to happen before either starts. Two predicates that can disagree
+    /// would put a mixture-of-experts layer's branches on the same pool while
+    /// the join still believed they were on different ones, which is the exact
+    /// failure the join condition was rewritten to avoid.
+    #[test]
+    fn the_two_host_matmul_predicates_agree() {
+        let w = weight_of_bytes(4096);
+        for (n_tokens, threshold) in [(1usize, 8192usize), (1, 4096), (1, 0), (2, 8192)] {
+            let ops = [MatmulOp {
+                x: &[],
+                n_tokens,
+                w: &w,
+            }];
+            // `weights_prefer_host_matmul` reads the live threshold, so only
+            // the cases where that is what `threshold` is can be compared
+            // directly; the rest check the shape of the rule.
+            let by_ops = prefers_host_matmul_with(threshold, &ops);
+            let by_weights =
+                threshold != 0 && n_tokens == 1 && w.row_bytes() * w.out_dim < threshold;
+            assert_eq!(
+                by_ops, by_weights,
+                "n_tokens {n_tokens}, threshold {threshold}"
+            );
+        }
+        // And the weights-only form itself, against the live threshold.
+        assert!(!weights_prefer_host_matmul(2, &[&w]));
+        assert!(!weights_prefer_host_matmul(1, &[]));
+    }
+
+    /// An empty batch is not a batch the host should be handed: it is nothing
+    /// at all, and the device path returns for it immediately.
+    #[test]
+    fn an_empty_batch_never_prefers_the_host() {
+        assert!(!prefers_host_matmul_with(usize::MAX, &[]));
+    }
 
     /// **The claim `Backend::supports_type`'s doc makes, asserted.**
     ///

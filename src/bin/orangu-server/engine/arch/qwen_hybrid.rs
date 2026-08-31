@@ -86,6 +86,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::engine::backend::{Backend, MatmulOp};
+use crate::engine::decode_stages::{self, Stage};
 use crate::engine::kv_cache::{KvCache, LayerCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
@@ -595,7 +596,6 @@ impl Recurrent {
         n_tokens: usize,
         gate: OutputGate,
     ) -> Vec<f32> {
-        let n_embd = dims.n_embd;
         let eps = dims.rms_eps;
         let key_dim = dims.key_dim();
         let value_dim = dims.value_dim();
@@ -638,7 +638,8 @@ impl Recurrent {
                 w: packed,
             }),
         }
-        let mut projected = backend.matmul_batch(&ops);
+        let mut projected =
+            decode_stages::scope(Stage::RecurrentProject, || backend.matmul_batch(&ops));
         let (mut beta, alpha) = match &self.beta_alpha {
             BetaAlpha::Split { .. } => {
                 let alpha = projected.pop().unwrap();
@@ -665,12 +666,34 @@ impl Recurrent {
             }
         }
 
-        let mut sub_out = vec![0f32; n_tokens * n_embd];
+        // Every position's gated output, gathered before any of it is
+        // projected.
+        //
+        // The recurrence forces the loop below to walk positions in order —
+        // each one's state depends on the last — but `ssm_out` does not: it
+        // is applied to each position's output independently. Projecting
+        // inside the loop therefore issued **one matmul per position per
+        // layer**, which at a 512-token prefill is fifteen thousand
+        // matrix-*vector* products against a 4.5 MiB weight that is read in
+        // full for every one of them. Gathering first turns them into one
+        // matrix-matrix product per layer that reads the weight once.
+        //
+        // At decode this is a `n_tokens == 1` buffer and the identical single
+        // call, bit for bit. At prefill it takes the same coarser activation
+        // quantization every other multi-token matmul in the engine already
+        // takes — see `Backend::matmul_decode`.
+        let mut attn_all = vec![0f32; n_tokens * value_dim];
         let ssm_state = &mut cache.recurrent[self.cache_index];
+        // The delta rule and its output projection are timed separately: the
+        // first is scalar and sequential, the second is a device submission,
+        // and a breakdown that charged them to one line would hide exactly
+        // the difference worth seeing. See `engine::decode_stages`.
         for t in 0..n_tokens {
             let mixed =
                 &qkv_mixed[t * (2 * key_dim + value_dim)..(t + 1) * (2 * key_dim + value_dim)];
-            let mut conv_out = ssm_state.conv_step(mixed, &self.ssm_conv1d);
+            let mut conv_out = decode_stages::scope(Stage::RecurrentDelta, || {
+                ssm_state.conv_step(mixed, &self.ssm_conv1d)
+            });
             for v in conv_out.iter_mut() {
                 *v = tensor::silu(*v);
             }
@@ -686,66 +709,149 @@ impl Recurrent {
                 *v *= q_scale;
             }
 
-            let mut attn_out = vec![0f32; value_dim];
-            for vh in 0..n_v_heads {
-                // Tiled (not block-grouped) broadcast — matches
-                // `ggml_compute_forward_repeat_f32`'s tiling semantics for
-                // this specific mismatched-head-count repeat, distinct from
-                // standard attention's block-grouped GQA.
-                let kh = vh % n_k_heads;
-                let qh = &q_conv[kh * head_dim..(kh + 1) * head_dim];
-                let khv = &k_conv[kh * head_dim..(kh + 1) * head_dim];
-                let vhv = &v_conv[vh * head_dim..(vh + 1) * head_dim];
-                let beta_h = beta[t * n_v_heads + vh];
-                let decay_h = decay[t * n_v_heads + vh];
+            // Reborrowed shared: the fan-out below reads all three from every
+            // head at once, and `split_at_mut` handed them over mutably.
+            let (q_conv, k_conv, v_conv) = (&*q_conv, &*k_conv, &*v_conv);
 
-                let state = ssm_state.delta_state_mut(vh);
-                for s in state.iter_mut() {
-                    *s *= decay_h;
-                }
-                // sk[a] = sum_b k[b] * S[b][a]  (k^T S)
-                let mut sk = vec![0f32; head_dim];
-                for a in 0..head_dim {
-                    let mut sum = 0f32;
-                    for b in 0..head_dim {
-                        sum += khv[b] * state[b * head_dim + a];
-                    }
-                    sk[a] = sum;
-                }
-                let d: Vec<f32> = (0..head_dim).map(|a| beta_h * (vhv[a] - sk[a])).collect();
-                for i in 0..head_dim {
-                    for j in 0..head_dim {
-                        state[i * head_dim + j] += khv[i] * d[j];
-                    }
-                }
-                // o[j] = sum_i q[i] * S_new[i][j]  (q^T S_new)
-                let out = &mut attn_out[vh * head_dim..(vh + 1) * head_dim];
-                for j in 0..head_dim {
-                    let mut sum = 0f32;
-                    for i in 0..head_dim {
-                        sum += qh[i] * state[i * head_dim + j];
-                    }
-                    out[j] = sum;
-                }
-            }
-
-            // Gated RMSNorm, per head: rmsnorm(attn_out_h) * gate(z_h).
-            for h in 0..n_v_heads {
-                let mut normed_h = attn_out[h * head_dim..(h + 1) * head_dim].to_vec();
-                tensor::rmsnorm_inplace(&mut normed_h, &self.ssm_norm, 1, head_dim, eps);
-                let z_h = &z[t * value_dim + h * head_dim..t * value_dim + (h + 1) * head_dim];
-                for (o, (n, zv)) in attn_out[h * head_dim..(h + 1) * head_dim]
-                    .iter_mut()
-                    .zip(normed_h.iter().zip(z_h.iter()))
-                {
-                    *o = *n * gate.apply(*zv);
-                }
-            }
-
-            let projected = backend.matmul(&attn_out, 1, &self.ssm_out);
-            sub_out[t * n_embd..(t + 1) * n_embd].copy_from_slice(&projected);
+            let attn_out = &mut attn_all[t * value_dim..(t + 1) * value_dim];
+            decode_stages::scope(Stage::RecurrentDelta, || {
+                let (states, state_size) = ssm_state.delta_states_mut();
+                let beta_t = &beta[t * n_v_heads..(t + 1) * n_v_heads];
+                let decay_t = &decay[t * n_v_heads..(t + 1) * n_v_heads];
+                let z_t = &z[t * value_dim..(t + 1) * value_dim];
+                // One task per value head. The heads share only read-only
+                // inputs — each owns its own state matrix and its own slice of
+                // the output — so this is a fan-out with nothing to
+                // synchronize, and it was the single largest sequential stage
+                // of a decode step before it became one.
+                //
+                // `for_each_init` rather than an allocation per head: `sk` and
+                // `d` are `head_dim` long and are refilled every head, so one
+                // buffer per worker is reused across every head that worker
+                // takes.
+                states
+                    .par_chunks_mut(state_size)
+                    .zip(attn_out.par_chunks_mut(head_dim))
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0f32; 2 * head_dim],
+                        |scratch, (vh, (state, out))| {
+                            // Tiled (not block-grouped) broadcast — matches
+                            // `ggml_compute_forward_repeat_f32`'s tiling
+                            // semantics for this specific mismatched-head-count
+                            // repeat, distinct from standard attention's
+                            // block-grouped GQA.
+                            let kh = vh % n_k_heads;
+                            let (sk, d) = scratch.split_at_mut(head_dim);
+                            delta_head_step(
+                                state,
+                                &q_conv[kh * head_dim..(kh + 1) * head_dim],
+                                &k_conv[kh * head_dim..(kh + 1) * head_dim],
+                                &v_conv[vh * head_dim..(vh + 1) * head_dim],
+                                beta_t[vh],
+                                decay_t[vh],
+                                out,
+                                sk,
+                                d,
+                            );
+                            // Gated RMSNorm, per head: rmsnorm(out) * gate(z_h).
+                            // In place on `out`, which is already this head's
+                            // own slice — the copy this used to make was one
+                            // `head_dim` allocation per head per layer per
+                            // token.
+                            tensor::rmsnorm_inplace(out, &self.ssm_norm, 1, head_dim, eps);
+                            let z_h = &z_t[vh * head_dim..(vh + 1) * head_dim];
+                            for (o, zv) in out.iter_mut().zip(z_h.iter()) {
+                                *o *= gate.apply(*zv);
+                            }
+                        },
+                    );
+            });
         }
-        sub_out
+
+        decode_stages::scope(Stage::RecurrentOut, || {
+            backend.matmul(&attn_all, n_tokens, &self.ssm_out)
+        })
+    }
+}
+
+/// One head's gated-delta-rule step: decay the state, apply the delta update
+/// for this position's key/value, and read the output off the updated state.
+///
+/// In terms of the head's `[head_dim, head_dim]` state `S`:
+///
+/// ```text
+///   S  <- decay * S
+///   d  <- beta * (v - k^T S)
+///   S  <- S + k d^T
+///   o  <- q^T S
+/// ```
+///
+/// **Written as two row-major sweeps rather than four.** The literal reading
+/// of those four lines is four passes over the state, and two of them —
+/// `k^T S` and `q^T S` — index it *down its columns*, one float from each row.
+/// At `head_dim` 128 that is a 512-byte stride: a cache line fetched per
+/// multiply-add, and nothing a vectorizer can use.
+///
+/// Each of the two column-wise passes is an accumulation over the same axis
+/// the rank-one update walks, so both fold into the pass beside them and both
+/// turn row-wise:
+///
+/// - **Sweep one** scales row `b` by `decay` and immediately accumulates
+///   `k[b] * row` into `sk`.
+/// - **Sweep two** adds `k[i] * d` into row `i` and immediately accumulates
+///   `q[i] * row` into `o`.
+///
+/// The state is read twice instead of four times, every access is contiguous,
+/// and both inner loops are `head_dim`-long fused multiply-adds over three
+/// slices — which is what the autovectorizer wants.
+///
+/// **Bit-identical to the four-pass form**, deliberately: each accumulator is
+/// still summed in ascending index order, and folding the decay into the read
+/// of the row it scales cannot change a value because the multiply happens
+/// before the read either way. `sk` and `d` are caller-owned scratch of
+/// `head_dim` each, so a fan-out over heads allocates once per worker rather
+/// than twice per head.
+#[allow(clippy::too_many_arguments)]
+fn delta_head_step(
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    decay: f32,
+    out: &mut [f32],
+    sk: &mut [f32],
+    d: &mut [f32],
+) {
+    let head_dim = out.len();
+    debug_assert_eq!(state.len(), head_dim * head_dim);
+    debug_assert_eq!(q.len(), head_dim);
+    debug_assert_eq!(k.len(), head_dim);
+    debug_assert_eq!(v.len(), head_dim);
+    debug_assert_eq!(sk.len(), head_dim);
+    debug_assert_eq!(d.len(), head_dim);
+
+    // Sweep one: `S <- decay * S` and `sk <- k^T S`, off the same rows.
+    sk.fill(0.0);
+    for (row, &k_b) in state.chunks_exact_mut(head_dim).zip(k) {
+        for (s, sk_a) in row.iter_mut().zip(sk.iter_mut()) {
+            *s *= decay;
+            *sk_a += k_b * *s;
+        }
+    }
+
+    for ((d_a, &v_a), &sk_a) in d.iter_mut().zip(v).zip(sk.iter()) {
+        *d_a = beta * (v_a - sk_a);
+    }
+
+    // Sweep two: `S <- S + k d^T` and `o <- q^T S`, off the same rows. `out`
+    // arrives zeroed — it is this token's own buffer, freshly allocated.
+    for ((row, &k_i), &q_i) in state.chunks_exact_mut(head_dim).zip(k).zip(q) {
+        for ((s, &d_j), o) in row.iter_mut().zip(d.iter()).zip(out.iter_mut()) {
+            *s += k_i * d_j;
+            *o += q_i * *s;
+        }
     }
 }
 
@@ -908,25 +1014,28 @@ impl HybridFfn for MoeFfn {
         // of an otherwise host-side branch.
         let logits = super::moe_router_logits(backend, normed, n_tokens, &ffn.gate_inp);
         let n_expert = logits.len() / n_tokens.max(1);
-        let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
-            .map(|t| {
-                let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
-                tensor::softmax_inplace(&mut probs);
+        let mut selection: Vec<Vec<(usize, f32)>> = decode_stages::scope(Stage::FfnSelect, || {
+            (0..n_tokens)
+                .map(|t| {
+                    let mut probs = logits[t * n_expert..(t + 1) * n_expert].to_vec();
+                    tensor::softmax_inplace(&mut probs);
 
-                let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                indexed.truncate(ffn.n_expert_used);
-                let weight_sum: f32 = indexed
-                    .iter()
-                    .map(|(_, w)| w)
-                    .sum::<f32>()
-                    .max(6.103_515_6e-5);
-                indexed
-                    .into_iter()
-                    .map(|(expert, weight)| (expert, weight / weight_sum))
-                    .collect()
-            })
-            .collect();
+                    let mut indexed: Vec<(usize, f32)> =
+                        probs.iter().copied().enumerate().collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    indexed.truncate(ffn.n_expert_used);
+                    let weight_sum: f32 = indexed
+                        .iter()
+                        .map(|(_, w)| w)
+                        .sum::<f32>()
+                        .max(6.103_515_6e-5);
+                    indexed
+                        .into_iter()
+                        .map(|(expert, weight)| (expert, weight / weight_sum))
+                        .collect()
+                })
+                .collect()
+        });
         // Trim to the expert budget *before* anything is recorded or
         // read: the counters should describe the work actually done,
         // and a dropped expert's weights must never be fetched.
@@ -1025,68 +1134,77 @@ impl HybridFfn for MoeFfn {
         // which this repeats inline because it also decides which backend
         // the `down` projection goes to.
         let shared_branch = || {
-            let cpu = crate::engine::backend::CpuBackend;
-            let use_cpu_shared = !backend.supports_type(ffn.gate_shexp.ggml_type())
-                || !backend.supports_type(ffn.up_shexp.ggml_type())
-                || !backend.supports_type(ffn.down_shexp.ggml_type());
-            let (shexp_gate, shexp_up) = if use_cpu_shared {
-                (
-                    cpu.matmul(normed, n_tokens, &ffn.gate_shexp),
-                    cpu.matmul(normed, n_tokens, &ffn.up_shexp),
-                )
-            } else {
-                let mut gate_up = backend.matmul_batch(&[
-                    MatmulOp {
-                        x: normed,
-                        n_tokens,
-                        w: &ffn.gate_shexp,
-                    },
-                    MatmulOp {
-                        x: normed,
-                        n_tokens,
-                        w: &ffn.up_shexp,
-                    },
-                ]);
-                let up = gate_up.pop().unwrap();
-                let gate = gate_up.pop().unwrap();
-                (gate, up)
-            };
-            let mut shexp_h: Vec<f32> = shexp_gate.iter().map(|&g| tensor::silu(g)).collect();
-            tensor::mul_inplace(&mut shexp_h, &shexp_up);
-            let mut shexp_out = if use_cpu_shared {
-                cpu.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
-            } else {
-                backend.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
-            };
-            // The per-token sigmoid gate on the shared branch.
-            for t in 0..n_tokens {
-                let x_t = &normed[t * n_embd..(t + 1) * n_embd];
-                let gate = tensor::sigmoid(tensor::dot(x_t, &ffn.gate_inp_shexp));
-                for v in shexp_out[t * n_embd..(t + 1) * n_embd].iter_mut() {
-                    *v *= gate;
+            decode_stages::scope(Stage::FfnShared, || {
+                let cpu = crate::engine::backend::CpuBackend;
+                let use_cpu_shared = !backend.supports_type(ffn.gate_shexp.ggml_type())
+                    || !backend.supports_type(ffn.up_shexp.ggml_type())
+                    || !backend.supports_type(ffn.down_shexp.ggml_type());
+                let (shexp_gate, shexp_up) = if use_cpu_shared {
+                    (
+                        cpu.matmul(normed, n_tokens, &ffn.gate_shexp),
+                        cpu.matmul(normed, n_tokens, &ffn.up_shexp),
+                    )
+                } else {
+                    let mut gate_up = backend.matmul_batch(&[
+                        MatmulOp {
+                            x: normed,
+                            n_tokens,
+                            w: &ffn.gate_shexp,
+                        },
+                        MatmulOp {
+                            x: normed,
+                            n_tokens,
+                            w: &ffn.up_shexp,
+                        },
+                    ]);
+                    let up = gate_up.pop().unwrap();
+                    let gate = gate_up.pop().unwrap();
+                    (gate, up)
+                };
+                let mut shexp_h: Vec<f32> = shexp_gate.iter().map(|&g| tensor::silu(g)).collect();
+                tensor::mul_inplace(&mut shexp_h, &shexp_up);
+                let mut shexp_out = if use_cpu_shared {
+                    cpu.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
+                } else {
+                    backend.matmul(&shexp_h, n_tokens, &ffn.down_shexp)
+                };
+                // The per-token sigmoid gate on the shared branch.
+                for t in 0..n_tokens {
+                    let x_t = &normed[t * n_embd..(t + 1) * n_embd];
+                    let gate = tensor::sigmoid(tensor::dot(x_t, &ffn.gate_inp_shexp));
+                    for v in shexp_out[t * n_embd..(t + 1) * n_embd].iter_mut() {
+                        *v *= gate;
+                    }
                 }
-            }
-            shexp_out
+                shexp_out
+            })
         };
 
         // Different processors, nothing shared but the input, summed at the
         // end — see `super::moe_overlap_min_tokens`.
-        let (shexp_out, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+        let overlap = super::moe_overlap(
+            backend,
+            n_tokens,
+            &[&ffn.gate_shexp, &ffn.up_shexp, &ffn.down_shexp],
+        );
+        let (shexp_out, contribs) = if overlap {
             rayon::join(shared_branch, routed_branch)
         } else {
             (shared_branch(), routed_branch())
         };
         experts.loaded_once_per_distinct_expert();
 
-        for t in 0..n_tokens {
-            let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            dst.copy_from_slice(&shexp_out[t * n_embd..(t + 1) * n_embd]);
-            for contrib in &contribs[t] {
-                for (o, d) in dst.iter_mut().zip(contrib.iter()) {
-                    *o += d;
+        decode_stages::scope(Stage::FfnCombine, || {
+            for t in 0..n_tokens {
+                let dst = &mut out[t * n_embd..(t + 1) * n_embd];
+                dst.copy_from_slice(&shexp_out[t * n_embd..(t + 1) * n_embd]);
+                for contrib in &contribs[t] {
+                    for (o, d) in dst.iter_mut().zip(contrib.iter()) {
+                        *o += d;
+                    }
                 }
             }
-        }
+        });
         experts.commit(n_tokens);
         out
     }
@@ -1283,7 +1401,9 @@ impl<F: HybridFfn> Trunk<F> {
                 tok < self.config.n_vocab,
                 "token id {tok} is out of vocab range"
             );
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+            decode_stages::scope(Stage::Embed, || {
+                x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+            });
         }
 
         // Grown once and reused by every layer rather than allocated per
@@ -1294,33 +1414,32 @@ impl<F: HybridFfn> Trunk<F> {
 
         for layer in &self.layers {
             match layer {
-                Layer::FullAttn(weights, ffn) => {
-                    self.forward_full_attn_layer(
-                        weights,
-                        ffn,
-                        cache,
-                        &mut x,
-                        n_tokens,
-                        start_pos,
-                        &mut scratch,
-                    )?;
-                }
-                Layer::Recurrent(weights, ffn) => {
-                    self.forward_recurrent_layer(
-                        weights,
-                        ffn,
-                        cache,
-                        &mut x,
-                        n_tokens,
-                        &mut scratch,
-                    )?;
-                }
+                Layer::FullAttn(weights, ffn) => self.forward_full_attn_layer(
+                    weights,
+                    ffn,
+                    cache,
+                    &mut x,
+                    n_tokens,
+                    start_pos,
+                    &mut scratch,
+                )?,
+                Layer::Recurrent(weights, ffn) => self.forward_recurrent_layer(
+                    weights,
+                    ffn,
+                    cache,
+                    &mut x,
+                    n_tokens,
+                    &mut scratch,
+                )?,
             }
         }
 
-        let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
-        tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, self.dims.rms_eps);
-        Ok(self.backend.matmul(last, 1, &self.output_weight))
+        let logits = decode_stages::scope(Stage::Head, || {
+            let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
+            tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, self.dims.rms_eps);
+            self.backend.matmul(last, 1, &self.output_weight)
+        });
+        Ok(logits)
     }
 
     // Eight because the scratch buffers are threaded rather than held in
@@ -1595,6 +1714,133 @@ mod tests {
     /// values. Reading it as "all beta then all alpha" produces a
     /// well-formed vector of the right length carrying the wrong numbers,
     /// which is invisible downstream — decay and gating both still run.
+    /// The four-pass reading of the delta rule, written out literally — the
+    /// shape [`delta_head_step`] replaced, kept here as the thing it has to
+    /// agree with.
+    fn delta_head_step_reference(
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: f32,
+        decay: f32,
+        out: &mut [f32],
+    ) {
+        let head_dim = out.len();
+        for s in state.iter_mut() {
+            *s *= decay;
+        }
+        let mut sk = vec![0f32; head_dim];
+        for a in 0..head_dim {
+            let mut sum = 0f32;
+            for b in 0..head_dim {
+                sum += k[b] * state[b * head_dim + a];
+            }
+            sk[a] = sum;
+        }
+        let d: Vec<f32> = (0..head_dim).map(|a| beta * (v[a] - sk[a])).collect();
+        for i in 0..head_dim {
+            for j in 0..head_dim {
+                state[i * head_dim + j] += k[i] * d[j];
+            }
+        }
+        for j in 0..head_dim {
+            let mut sum = 0f32;
+            for i in 0..head_dim {
+                sum += q[i] * state[i * head_dim + j];
+            }
+            out[j] = sum;
+        }
+    }
+
+    /// The fused two-sweep kernel must be **bit-identical** to the four-pass
+    /// form, not merely close.
+    ///
+    /// Exactness is the claim the rewrite was allowed to make: every
+    /// accumulator still sums in ascending index order, and folding the decay
+    /// into the read of the row it scales cannot change a value. A tolerance
+    /// here would let a real reordering through, and a recurrence carries its
+    /// own error forward — a state matrix that drifts by an ulp a token is a
+    /// different model a thousand tokens later.
+    ///
+    /// Run at a model-shaped `head_dim`, and over several steps against the
+    /// *same* state, because the state is what carries a discrepancy.
+    #[test]
+    fn the_fused_delta_step_is_bit_identical_to_the_four_pass_form() {
+        let head_dim = 128;
+        // Deterministic, irregular, and spanning both signs — a smooth ramp
+        // would let a reordering cancel out instead of showing up.
+        let value = |n: usize| ((n as f32 * 0.7391).sin() * 1.7 + 0.03 * n as f32).fract() - 0.5;
+
+        let mut fused: Vec<f32> = (0..head_dim * head_dim).map(value).collect();
+        let mut reference = fused.clone();
+
+        for step in 0..4 {
+            let q: Vec<f32> = (0..head_dim).map(|i| value(i + 11 * step + 3)).collect();
+            let k: Vec<f32> = (0..head_dim).map(|i| value(i + 29 * step + 7)).collect();
+            let v: Vec<f32> = (0..head_dim).map(|i| value(i + 53 * step + 13)).collect();
+            let beta = 0.31 + 0.05 * step as f32;
+            let decay = 0.87 - 0.03 * step as f32;
+
+            let mut out_fused = vec![0f32; head_dim];
+            let mut sk = vec![0f32; head_dim];
+            let mut d = vec![0f32; head_dim];
+            delta_head_step(
+                &mut fused,
+                &q,
+                &k,
+                &v,
+                beta,
+                decay,
+                &mut out_fused,
+                &mut sk,
+                &mut d,
+            );
+
+            let mut out_reference = vec![0f32; head_dim];
+            delta_head_step_reference(&mut reference, &q, &k, &v, beta, decay, &mut out_reference);
+
+            assert_eq!(out_fused, out_reference, "output differs at step {step}");
+            assert_eq!(fused, reference, "state differs at step {step}");
+        }
+        // The state must actually have moved, or the comparison above proves
+        // nothing about a kernel that did no work.
+        assert!(fused.iter().any(|&s| s != 0.0));
+    }
+
+    /// `out` is accumulated into, so a caller handing over a dirty buffer would
+    /// add this head's output to whatever was there. Every caller passes a
+    /// freshly zeroed slice; this is what says so.
+    #[test]
+    fn the_fused_delta_step_accumulates_into_out() {
+        let head_dim = 4;
+        let mut state = vec![0.5f32; head_dim * head_dim];
+        let q = vec![1.0f32; head_dim];
+        let k = vec![0.0f32; head_dim];
+        let v = vec![0.0f32; head_dim];
+        let (mut sk, mut d) = (vec![0f32; head_dim], vec![0f32; head_dim]);
+
+        let mut clean = vec![0f32; head_dim];
+        delta_head_step(
+            &mut state.clone(),
+            &q,
+            &k,
+            &v,
+            0.0,
+            1.0,
+            &mut clean,
+            &mut sk,
+            &mut d,
+        );
+        let mut dirty = vec![100f32; head_dim];
+        delta_head_step(
+            &mut state, &q, &k, &v, 0.0, 1.0, &mut dirty, &mut sk, &mut d,
+        );
+        for (c, dd) in clean.iter().zip(&dirty) {
+            assert_eq!(dd - c, 100.0);
+        }
+    }
+
     #[test]
     fn packed_beta_alpha_deinterleaves_per_group() {
         // 2 K/V groups, 4 value heads => group = 2.

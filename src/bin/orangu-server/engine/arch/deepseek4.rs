@@ -1154,7 +1154,12 @@ impl Deepseek4Model {
 
         // Different processors, no dependency between them, summed at the
         // end — see `super::moe_overlap_min_tokens`.
-        let (shexp, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+        let overlap = super::moe_overlap(
+            self.backend.as_ref(),
+            n_tokens,
+            &[&ffn.gate_shexp, &ffn.up_shexp, &ffn.down_shexp],
+        );
+        let (shexp, contribs) = if overlap {
             rayon::join(shared_branch, routed_branch)
         } else {
             (shared_branch(), routed_branch())

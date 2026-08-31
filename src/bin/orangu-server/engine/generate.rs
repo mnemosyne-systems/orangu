@@ -636,6 +636,10 @@ fn run(
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
     let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
+    // One decoder for the whole stream, not one call per token: a character
+    // wider than a byte is routinely several tokens, and decoding each of them
+    // alone replaces both halves. See `tokenizer::StreamDecoder`.
+    let mut decoder = crate::engine::tokenizer::StreamDecoder::default();
     // When the previous token was produced, so the gap to the next one can be
     // observed. `None` until there is a previous one to measure from.
     let mut last_token_at: Option<Instant> = None;
@@ -694,7 +698,7 @@ fn run(
             // Suppressed while this is a message *header* (the recipient the
             // model wrote for the format's benefit, not the reader's), and
             // while it is a message body the role hides.
-            header.observe_text(tokenizer.decode(&[next]))
+            header.observe_text(decoder.push(tokenizer, next))
         };
         if let Some(text) = emitted {
             let _ = tx.send(StreamEvent::Token(text));
@@ -826,15 +830,22 @@ fn run(
                 .then(|| model.vulkan_backend())
                 .flatten()
                 .map(|v| v.submission_count());
-            let outcome = model.forward_maybe_sampling(
-                cache
-                    .as_mut()
-                    .expect("cache is always Some between iterations"),
-                &[next],
-                start_pos,
-                greedy_sample,
-                guard.id(),
-            );
+            // Timed as one whole pass, here rather than inside any
+            // architecture: this is the single call every model's decode step
+            // goes through, so `forward` — the denominator the per-stage
+            // breakdown is read against — is measured for all of them. See
+            // `engine::decode_stages`.
+            let outcome = crate::engine::decode_stages::pass(|| {
+                model.forward_maybe_sampling(
+                    cache
+                        .as_mut()
+                        .expect("cache is always Some between iterations"),
+                    &[next],
+                    start_pos,
+                    greedy_sample,
+                    guard.id(),
+                )
+            });
             if let Some(before) = submissions_before
                 && let Some(v) = model.vulkan_backend()
             {
@@ -861,6 +872,15 @@ fn run(
                 }
             }
         };
+    }
+    // Generation can stop part-way through a character — a token limit, a stop
+    // token — and those bytes are still bytes the model produced. Sent through
+    // the same filter every other token's text goes through, so a stream that
+    // ends mid-header stays withheld.
+    if let Some(text) = header.observe_text(decoder.flush())
+        && !text.is_empty()
+    {
+        let _ = tx.send(StreamEvent::Token(text));
     }
     let generate_time = generate_start.elapsed();
     if spec_steps > 0 {
@@ -1552,7 +1572,9 @@ fn prefill_in_chunks(
     // chunk *and* starts at position zero is the least work a prefill can be.
     // `batch == 0` is an explicit opt-out — see [`prefill_batch`].
     if batch == 0 || (tokens.len() <= batch && start_pos == 0) {
-        let logits = model.forward(cache, tokens, start_pos, slot_id)?;
+        let logits = crate::engine::decode_stages::pass(|| {
+            model.forward(cache, tokens, start_pos, slot_id)
+        })?;
         on_chunk(tokens.len());
         return Ok(logits);
     }
@@ -1588,7 +1610,9 @@ fn prefill_in_chunks(
     while done < tokens.len() {
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
-        logits = model.forward(cache, &tokens[done..done + n], pos, slot_id)?;
+        logits = crate::engine::decode_stages::pass(|| {
+            model.forward(cache, &tokens[done..done + n], pos, slot_id)
+        })?;
         let elapsed = started.elapsed();
         pos += n;
         done += n;

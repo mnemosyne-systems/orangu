@@ -2530,7 +2530,12 @@ impl GemmaModel {
         // this small is not worth believing on a cross-session comparison.
         let hoist = !crate::engine::env::flag_on("ORANGU_MOE_ROUTER_IN_JOIN");
         let hoisted = hoist.then(|| self.moe_router_logits(il, moe, attn_out, n_tokens, decode));
-        if n_tokens >= super::moe_overlap_min_tokens() {
+        let overlap = super::moe_overlap(
+            self.backend.as_ref(),
+            n_tokens,
+            &[&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down],
+        );
+        if overlap {
             let (mut result, moe_out) = rayon::join(
                 || self.moe_shared_mlp(il, layer, moe, attn_out, n_tokens, decode),
                 || {

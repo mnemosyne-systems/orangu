@@ -842,7 +842,12 @@ impl NemotronModel {
             relu_squared(&mut shared);
             super::matmul_host_fallback(self.backend.as_ref(), &shared, n_tokens, &layer.down_shexp)
         };
-        let (mut out, contribs) = if n_tokens >= super::moe_overlap_min_tokens() {
+        let overlap = super::moe_overlap(
+            self.backend.as_ref(),
+            n_tokens,
+            std::slice::from_ref(&&layer.down_shexp),
+        );
+        let (mut out, contribs) = if overlap {
             rayon::join(shared_branch, routed_branch)
         } else {
             (shared_branch(), routed_branch())

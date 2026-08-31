@@ -676,6 +676,26 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     down: &ExpertProjection<'_>,
     activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
+    crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::FfnRouted, || {
+        evaluate_routed_experts_batched_views_inner(
+            backend, selection, hidden, n_embd, gate, up, down, activate,
+        )
+    })
+}
+
+/// The body of [`evaluate_routed_experts_batched_views`], split out only so
+/// the timing scope above wraps it without re-indenting two hundred lines.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_routed_experts_batched_views_inner(
+    backend: &dyn crate::engine::backend::Backend,
+    selection: &[Vec<(usize, f32)>],
+    hidden: &[f32],
+    n_embd: usize,
+    gate: Option<&ExpertProjection<'_>>,
+    up: &ExpertProjection<'_>,
+    down: &ExpertProjection<'_>,
+    activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
+) -> Vec<Vec<Vec<f32>>> {
     use crate::engine::backend::MatmulOp;
 
     // A gate-less expert — `nemotron`'s squared-ReLU FFN is `down(relu(up
@@ -1286,6 +1306,49 @@ fn swiglu_limited(gate: &[f32], up: &[f32], limit: SwigluLimit) -> Vec<f32> {
 /// Lives here rather than in one architecture because the shape it exploits
 /// — a device-side shared branch summed with a host-side routed branch — is
 /// what *every* mixture-of-experts module in this directory builds.
+/// Whether a mixture-of-experts layer should run its shared and routed
+/// branches concurrently.
+///
+/// [`moe_overlap_min_tokens`]'s own reasoning names the condition: the overlap
+/// exploits *"a device-side shared branch summed with a host-side routed
+/// branch"*. Two branches on **different** processors wait out each other when
+/// run in sequence, and a MoE forward that does leaves the GPU engine and the
+/// CPU both around 60% idle.
+///
+/// Two branches on the *same* processor do not overlap at all. They are two
+/// fan-outs competing for one thread pool, and `rayon::join` turns them into
+/// exactly that: each wants every worker, neither gets them, and both finish
+/// later than either would have alone. Measured on `qwen35moe` once
+/// `engine::backend::host_matmul_threshold_bytes` had moved the shared branch
+/// to the host — the shared stage went from **13 ms a token run in sequence to
+/// 41 ms run "concurrently"**, and switching the join off was worth +8 to +12%
+/// end to end.
+///
+/// So the question is not how wide the batch is, it is where the shared branch
+/// will run — and that has to be answered before either branch starts, which is
+/// what `backend::weights_prefer_host_matmul` is for. `shared` is the shared
+/// expert's own weights; an architecture that passes none keeps the width rule
+/// alone.
+pub(crate) fn moe_overlap(
+    backend: &dyn crate::engine::backend::Backend,
+    n_tokens: usize,
+    shared: &[&crate::engine::loader::QuantMatrix],
+) -> bool {
+    if n_tokens < moe_overlap_min_tokens() {
+        return false;
+    }
+    if shared.is_empty() {
+        return true;
+    }
+    // On the host either way — because this backend *is* the host, because it
+    // has no kernel for one of these types (`matmul_host_fallback` will send
+    // it to the host), or because the size rule will.
+    let shared_on_host = backend.is_host()
+        || shared.iter().any(|w| !backend.supports_type(w.ggml_type()))
+        || crate::engine::backend::weights_prefer_host_matmul(n_tokens, shared);
+    !shared_on_host
+}
+
 pub(crate) fn moe_overlap_min_tokens() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1328,13 +1391,18 @@ pub(crate) fn moe_router_logits(
     n_tokens: usize,
     gate_inp: &crate::engine::loader::QuantMatrix,
 ) -> Vec<f32> {
-    if n_tokens > 1 && !router_per_token() {
-        return backend.matmul(x, n_tokens, gate_inp);
-    }
-    let in_dim = gate_inp.in_dim;
-    (0..n_tokens)
-        .flat_map(|t| backend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, gate_inp))
-        .collect()
+    // Timed here rather than at each architecture's call site: every
+    // mixture-of-experts model routes through this one function, so one scope
+    // reports `ffn.router` for all of them. See `engine::decode_stages`.
+    crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::FfnRouter, || {
+        if n_tokens > 1 && !router_per_token() {
+            return backend.matmul(x, n_tokens, gate_inp);
+        }
+        let in_dim = gate_inp.in_dim;
+        (0..n_tokens)
+            .flat_map(|t| backend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, gate_inp))
+            .collect()
+    })
 }
 
 /// Which experts each token selected, and with what weight, from the
@@ -1351,13 +1419,18 @@ pub(crate) fn route_batch(
     exp_probs_b: Option<&[f32]>,
 ) -> Vec<Vec<(usize, f32)>> {
     let n_expert = logits.len() / n_tokens.max(1);
-    (0..n_tokens)
-        .map(|t| {
-            let row = &logits[t * n_expert..(t + 1) * n_expert];
-            let (selected, weights) = routing.route(row, exp_probs_b, None);
-            selected.into_iter().zip(weights).collect()
-        })
-        .collect()
+    // Timed here for the same reason `moe_router_logits` is: every
+    // architecture that routes through this helper reports `ffn.select`
+    // without knowing the stage exists.
+    crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::FfnSelect, || {
+        (0..n_tokens)
+            .map(|t| {
+                let row = &logits[t * n_expert..(t + 1) * n_expert];
+                let (selected, weights) = routing.route(row, exp_probs_b, None);
+                selected.into_iter().zip(weights).collect()
+            })
+            .collect()
+    })
 }
 
 /// The shared expert half of [`SwigluMoe`] — an ordinary SwiGLU FFN.
@@ -1496,7 +1569,10 @@ pub(crate) fn swiglu_moe_ffn(
     // worker while the rest keep evaluating experts. `join` returns a pair,
     // not a race, and each branch is internally deterministic, so the sum
     // below does not depend on which finishes first.
-    let (shared_out, contribs) = if moe.shared.is_some() && n_tokens >= moe_overlap_min_tokens() {
+    let overlap = moe.shared.as_ref().is_some_and(|shared| {
+        moe_overlap(backend, n_tokens, &[shared.gate, shared.up, shared.down])
+    });
+    let (shared_out, contribs) = if overlap {
         rayon::join(shared_branch, routed_branch)
     } else {
         (shared_branch(), routed_branch())
@@ -1798,8 +1874,12 @@ pub(crate) fn project_expert(
             // amortize it over.
             if vecdot::supports_k_row(ggml_type, in_dim) {
                 let act = vecdot::quantize_act_k_row(inputs[0]);
+                // See `backend::matmul_min_rows`: an expert's row here is
+                // 288-1152 bytes, so one row per task is a job that costs more
+                // to hand out than to run.
                 by_row
                     .par_chunks_mut(1)
+                    .with_min_len(crate::engine::backend::matmul_min_rows())
                     .enumerate()
                     .for_each(|(index, out)| {
                         out[0] = vecdot::dot_k_row(ggml_type, row(index), &act);
@@ -1808,6 +1888,7 @@ pub(crate) fn project_expert(
                 let act = vecdot::quantize_act(inputs[0]);
                 by_row
                     .par_chunks_mut(1)
+                    .with_min_len(crate::engine::backend::matmul_min_rows())
                     .enumerate()
                     .for_each(|(index, out)| {
                         out[0] = vecdot::dot_row(ggml_type, row(index), &act);
@@ -2057,11 +2138,16 @@ where
     // prefill, identical at decode (where every selection is already
     // distinct), and each task now carries every token that wants that
     // expert, so the work per task grew by exactly what the fan-out lost.
-    let evaluated: Vec<Vec<Vec<f32>>> = experts
-        .par_iter()
-        .zip(members.par_iter())
-        .map(|(&expert, members)| eval(expert, members))
-        .collect();
+    // Timed here for the same reason `moe_router_logits` is: this is the one
+    // fan-out every architecture's routed experts go through.
+    let evaluated: Vec<Vec<Vec<f32>>> =
+        crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::FfnRouted, || {
+            experts
+                .par_iter()
+                .zip(members.par_iter())
+                .map(|(&expert, members)| eval(expert, members))
+                .collect()
+        });
 
     let mut out: Vec<Vec<Vec<f32>>> = selection
         .iter()

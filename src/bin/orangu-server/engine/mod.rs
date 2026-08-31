@@ -18,6 +18,7 @@ pub mod attention;
 pub mod backend;
 pub mod chat_template;
 pub mod constraint;
+pub mod decode_stages;
 pub mod dense_residency;
 pub mod env;
 pub mod expert_read;

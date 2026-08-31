@@ -2697,6 +2697,7 @@ fn run_tg(
         let mut last_sample: Option<Sample> = None;
         // Discarded, for the reason `run_pp` documents.
         let _ = moe::take_stats(client, &args.url);
+        let _ = moe::take_stages(client, &args.url);
         for _ in 0..args.reps.max(1) {
             args.drop_page_cache(client);
             let s = run_once(client, &args.url, &prompt, args.n_gen, &args.model)?;
@@ -2704,6 +2705,7 @@ fn run_tg(
             last_sample = Some(s);
         }
         let moe_stats = moe::take_stats(client, &args.url);
+        let stage_stats = moe::take_stages(client, &args.url);
         let stats = Stats::of(&rates, false);
         let s = last_sample.expect("at least one rep ran");
 
@@ -2764,6 +2766,11 @@ fn run_tg(
         if !args.json {
             if let Some(line) = moe::summary_line(&moe_stats) {
                 println!("{line}");
+            }
+            if let Some(lines) = moe::stage_lines(&stage_stats) {
+                for line in lines {
+                    println!("{line}");
+                }
             }
             if let Some(line) = moe::io_line(&moe_stats, generated) {
                 println!("{line}");
@@ -3311,6 +3318,7 @@ fn run_pp(
         // Discarded: drains the previous point's (or the warmup's) counters,
         // so what the read after the loop returns is this point alone.
         let _ = moe::take_stats(client, &args.url);
+        let _ = moe::take_stages(client, &args.url);
         for _ in 0..args.reps.max(1) {
             args.drop_page_cache(client);
             let s = run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
@@ -3318,6 +3326,7 @@ fn run_pp(
             last = Some(s);
         }
         let moe_stats = moe::take_stats(client, &args.url);
+        let stage_stats = moe::take_stages(client, &args.url);
         let stats = Stats::of(&rates, false);
         let s = last.expect("at least one rep ran");
 
@@ -3399,6 +3408,11 @@ fn run_pp(
         if !args.json {
             if let Some(line) = moe::summary_line(&moe_stats) {
                 println!("{line}");
+            }
+            if let Some(lines) = moe::stage_lines(&stage_stats) {
+                for line in lines {
+                    println!("{line}");
+                }
             }
             if let Some(line) = moe::io_line(
                 &moe_stats,
@@ -4370,8 +4384,13 @@ fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
         show(get(["features", "subgroup"])),
     ));
     out.push(format!(
-        "tuning   coop≥{} tok · n_rows {} · {} · split_k {} · geom {} · lds {} B",
+        "tuning   coop≥{} tok · host-matmul<{} KiB · n_rows {} · {} · split_k {} · geom {} · lds {} B",
         show(get(["tuning", "coop_min_n_tokens"])),
+        // Which backend ran most of a decode step, in one number: below this
+        // many weight bytes a decode matmul goes to the host. Machine-
+        // dependent, so a result that does not record it cannot be compared
+        // against one from another box.
+        show(get(["tuning", "host_matmul_kib"])),
         show(get(["tuning", "reduce_n_rows"])),
         // `norm_wg` became a rule over row width rather than one constant,
         // so report what it answers at a representative width — and say when
