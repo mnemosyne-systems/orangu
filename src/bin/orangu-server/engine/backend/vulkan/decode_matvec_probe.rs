@@ -299,7 +299,10 @@ fn decode_matvec_fixed_cost_gpu_versus_cpu() {
         for (o, slot) in out.iter_mut().enumerate() {
             let row = &weights[o * R_IN..(o + 1) * R_IN];
             let mut acc = [0f32; 8];
-            for (rb, xb) in row.chunks_exact(8).zip(xr.chunks_exact(8)) {
+            // `as_chunks` rather than `chunks_exact`: both slices are exact
+            // multiples of the lane count, so there is no remainder to read
+            // and the typed form is what clippy asks for at a constant width.
+            for (rb, xb) in row.as_chunks::<8>().0.iter().zip(xr.as_chunks::<8>().0) {
                 for lane in 0..8 {
                     acc[lane] += rb[lane] * xb[lane];
                 }
