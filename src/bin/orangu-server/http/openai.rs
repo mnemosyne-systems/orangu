@@ -359,7 +359,7 @@ pub async fn chat_completions(
         true,
         bos,
         eos,
-        state.engine.role.enable_thinking(),
+        state.engine.reasoning(),
         tools,
     ) {
         Ok(p) => p,
@@ -400,12 +400,14 @@ pub async fn chat_completions(
 
     if !req.stream {
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut finish_reason = "stop";
         let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
         let mut timings = serde_json::Value::Null;
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
+                StreamEvent::Reasoning(text) => reasoning.push_str(&text),
                 // Progress and per-token timings only mean something to a
                 // reader watching the stream; a whole response already
                 // carries the final `timings`/`usage`.
@@ -431,6 +433,21 @@ pub async fn chat_completions(
             .clean_up_tokenization_spaces(&content);
         let split = tool_calls::split(&content);
         let mut message = json!({"role": "assistant", "content": split.content});
+        // `reasoning_content` is where DeepSeek put a reasoning model's
+        // thinking and where llama-server puts it under
+        // `--reasoning-format deepseek`; a client that does not know the
+        // field ignores it and sees the answer alone, which is the point.
+        // Absent rather than empty when there was no thinking, so "this
+        // model does not reason" and "it reasoned about nothing" stay
+        // distinguishable.
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = json!(
+                state
+                    .engine
+                    .tokenizer
+                    .clean_up_tokenization_spaces(&reasoning)
+            );
+        }
         if split.has_calls() {
             message["tool_calls"] = tool_calls_json(&split.calls, created);
             // OpenAI's contract: a turn that called tools finishes for that
@@ -495,6 +512,19 @@ pub async fn chat_completions(
                         "timings": timings_json(&stats),
                     });
                     yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                }
+                // Reasoning streams straight through in its own delta field,
+                // bypassing the tool-call splitter entirely: a call is
+                // something the model addresses to the caller, never part of
+                // a body it addressed to itself, and holding thinking back
+                // to see whether it turns into one would delay the only
+                // thing there is to show during a long think.
+                StreamEvent::Reasoning(text) => {
+                    let chunk = json!({
+                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}],
+                    });
+                    yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
                 }
                 StreamEvent::Token(text) => {
                     pending.push_str(&text);
@@ -724,7 +754,11 @@ pub async fn completions(
                 let Some(event) = rx.recv().await else { break };
                 match event {
                     StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-                    StreamEvent::Token(text) => {
+                    // A raw completion has one field to put text in and no
+                    // message shape to split it across, so reasoning stays
+                    // in it — a caller that prefilled `<think>` here asked
+                    // for exactly that text back.
+                    StreamEvent::Token(text) | StreamEvent::Reasoning(text) => {
                         let chunk = json!({
                             "id": format!("cmpl-{created}"), "object": "text_completion", "created": created,
                             "model": model, "choices": [{"index": 0, "text": text, "finish_reason": null}],
@@ -769,7 +803,8 @@ pub async fn completions(
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-            StreamEvent::Token(t) => text.push_str(&t),
+            // See the streaming arm above: one field, no message shape.
+            StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
             StreamEvent::Done {
                 finish_reason: fr,
                 stats,

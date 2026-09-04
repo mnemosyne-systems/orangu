@@ -392,6 +392,41 @@ button:disabled {
   margin-bottom: 0;
 }
 
+/* The chain-of-thought pane. Dimmed and set apart from the answer by a
+   rule down its left edge — the reading order is "here is what it thought,
+   here is what it said", and the two must never be mistaken for one
+   another, which is exactly what happened while thinking arrived as the
+   answer. Collapsed by default (`<details>` with no `open`): for a
+   reasoning model it routinely runs several times the length of the answer.
+   `.answer` needs no rules of its own — it is the ordinary message body,
+   and every `.message *` selector already reaches it. */
+.thinking {
+  margin: 0 0 0.8em;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  color: var(--text-dim);
+  font-size: 0.92em;
+}
+
+.thinking-summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 0.85em;
+  letter-spacing: 0.02em;
+  list-style-position: outside;
+  user-select: none;
+}
+
+.thinking-summary:hover {
+  color: var(--text);
+}
+
+/* Only while it is open: a closed pane is one line, and the gap would read
+   as a paragraph break above the answer. */
+.thinking[open] .thinking-body {
+  margin-top: 0.5em;
+}
+
 .truncated-notice {
   color: var(--text-dim);
   font-size: 0.85em;

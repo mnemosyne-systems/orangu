@@ -833,6 +833,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     let threads_flag = args.threads.clone();
     let conf = load_config(args.config, cli_role, args.daemon)?;
     let mut role = conf.role;
+    let reasoning_effort = conf.reasoning_effort.clone();
     let workspace = resolve_workspace(args.workspace.clone())?;
     let bundled = bundle::embedded();
 
@@ -1477,6 +1478,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         prefix_cache,
         slot_store,
         role,
+        reasoning_effort,
     });
 
     // `all` (the default) and its `*` alias become `0.0.0.0` here — see

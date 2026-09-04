@@ -143,6 +143,24 @@ impl Default for GenerateRequest {
 
 pub enum StreamEvent {
     Token(String),
+    /// Text the model addressed to itself: a chain-of-thought body, in one
+    /// of the three ways a format *names* one — a `<think>` block, an
+    /// `inkling` `<|content_thinking|>` body, a `muse-glimmer` message
+    /// addressed `to=self` (see [`MessageHeader`]).
+    ///
+    /// Its own event rather than a flag on `Token` so that a caller which
+    /// has no use for reasoning cannot accidentally treat it as the answer
+    /// — which is what every caller did while this did not exist, because
+    /// the markers around a `<think>` block are hidden and nothing else
+    /// said where the thinking ended. A reasoning-suppressing role
+    /// (`--review`) emits none of these at all; the body is dropped before
+    /// it gets here.
+    ///
+    /// A gemma-4 `<|channel>` body is deliberately **not** one of these.
+    /// That format names the channel rather than its kind, and `tool_code`
+    /// is one of the names — routing it away from the answer would take a
+    /// tool call out of the content `engine::tool_calls` reads.
+    Reasoning(String),
     /// The admission queue was full, so this request was refused before it
     /// ever reached a slot.
     ///
@@ -237,6 +255,12 @@ pub struct Engine {
     /// sampling parameters, generation-endpoint gating, and (`Review`
     /// only) reasoning suppression. See `config::Role`'s own doc comment.
     pub role: crate::config::Role,
+    /// `[orangu-server].reasoning_effort`, passed into the chat template by
+    /// every endpoint that renders one. Held here beside [`Self::role`]
+    /// because the two answer the same question — how much thinking this
+    /// deployment wants — and the three HTTP paths that render a prompt
+    /// already reach for the role.
+    pub reasoning_effort: Option<String>,
     /// Latency distributions and totals for `/metrics` — see
     /// `engine::metrics`. Always present: an unscraped deployment pays a
     /// handful of relaxed atomic adds per request and one per token, which is
@@ -264,6 +288,42 @@ fn panic_report(detail: String, device_lost: bool) -> String {
         detail
     }
 }
+
+impl Engine {
+    /// What to ask the chat template for: whether to think, and how hard.
+    ///
+    /// The effort falls back to [`DEFAULT_REASONING_EFFORT`] rather than
+    /// being left unset, because "unset" is not neutral — it hands the
+    /// choice to the template, and a template's own default can be the most
+    /// expensive setting it has. Qwen3.x's asks for
+    /// `reasoning_effort|default('xhigh')`. Measured on `Qwen3.8-27B`, same
+    /// prompt ("implement a doubly linked list in C") and same machine, the
+    /// difference is not a matter of degree: at `low` it closed its
+    /// `<think>` block after **184** tokens and wrote the answer; left to
+    /// the template it was still thinking at **8192**, having drafted the
+    /// program three times, and the answer never arrived at all.
+    ///
+    /// `medium` rather than `low`: the point is to stop asking for the
+    /// maximum, not to ask for the minimum. A deployment that wants either
+    /// end says so in `[orangu-server].reasoning_effort`, and only that
+    /// stated value is held against the template if it rejects it — see
+    /// `chat_template::Reasoning::effort_is_default`.
+    pub fn reasoning(&self) -> crate::engine::chat_template::Reasoning<'_> {
+        crate::engine::chat_template::Reasoning {
+            enabled: self.role.enable_thinking(),
+            effort: Some(
+                self.reasoning_effort
+                    .as_deref()
+                    .unwrap_or(DEFAULT_REASONING_EFFORT),
+            ),
+            effort_is_default: self.reasoning_effort.is_none(),
+        }
+    }
+}
+
+/// The `reasoning_effort` this server asks for when the deployment names
+/// none — see [`Engine::reasoning`].
+pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 
 impl Engine {
     /// Starts generating in the background (on tokio's blocking pool) and
@@ -701,7 +761,11 @@ fn run(
             header.observe_text(decoder.push(tokenizer, next))
         };
         if let Some(text) = emitted {
-            let _ = tx.send(StreamEvent::Token(text));
+            let _ = tx.send(if header.in_reasoning() {
+                StreamEvent::Reasoning(text)
+            } else {
+                StreamEvent::Token(text)
+            });
         }
         // Whether anyone is still listening, asked **every token** rather than
         // only when there was text to send.
@@ -880,7 +944,11 @@ fn run(
     if let Some(text) = header.observe_text(decoder.flush())
         && !text.is_empty()
     {
-        let _ = tx.send(StreamEvent::Token(text));
+        let _ = tx.send(if header.in_reasoning() {
+            StreamEvent::Reasoning(text)
+        } else {
+            StreamEvent::Token(text)
+        });
     }
     let generate_time = generate_start.elapsed();
     if spec_steps > 0 {
@@ -1038,10 +1106,25 @@ const MAX_HEADER_LEN: usize = 128;
 /// blank line — read off `Tokenizer::content_kinds` rather than off a
 /// recipient string.
 ///
-/// Inert (`framing`, `kinds` and `channel` all `None`) for every vocabulary
-/// with none of them, which is every other model this server serves — those
-/// keep byte-for-byte the behavior they had. That is also what `Default`
-/// gives, which is how the tests build one framing at a time.
+/// A fourth format is the one nearly every reasoning model uses, and the
+/// last to be handled here: a `<think>` … `</think>` pair (Qwen3.x,
+/// DeepSeek-R1, QwQ, GLM). Both tokens are special and so were already
+/// hidden, which is precisely what made this format the quiet one — with
+/// the tags gone and nothing marking the span, a whole chain of thought
+/// arrived as the answer, and a reply to "implement a doubly linked list"
+/// was 8192 tokens of the model talking to itself, code drafts and all,
+/// with the answer never reached. Same rule as the other three: hidden when
+/// the role suppresses reasoning, and otherwise marked, so a caller can
+/// present the thinking as thinking. One wrinkle the others don't have —
+/// the *template* writes the opening tag as the tail of the generation
+/// prompt, so the model emits only the close; see
+/// [`MessageHeader::prompt_ends_in_think`].
+///
+/// Inert (`framing`, `kinds`, `channel` and `think` all `None`) for every
+/// vocabulary with none of them, which is every other model this server
+/// serves — those keep byte-for-byte the behavior they had. That is also
+/// what `Default` gives, which is how the tests build one framing at a
+/// time.
 #[derive(Default)]
 struct MessageHeader {
     /// `(<|start|>, <|message|>)`, or `None` when this vocabulary has no
@@ -1053,6 +1136,9 @@ struct MessageHeader {
     /// `(<|channel>, <channel|>)`, for a vocabulary that frames the model's
     /// side channels with them. `None` for every other.
     channel: Option<(u32, u32)>,
+    /// `(<think>, </think>)`, for a vocabulary that marks its chain of
+    /// thought with them. `None` for every other.
+    think: Option<(u32, u32)>,
     /// Whether the stream is currently inside a channel *name* — between
     /// `<|channel>` and the newline that ends it.
     naming_channel: bool,
@@ -1075,6 +1161,27 @@ struct MessageHeader {
     channel_name: String,
     /// Whether the message body now streaming is suppressed.
     hidden_body: bool,
+    /// Whether the body now streaming is the model's reasoning — what
+    /// decides whether its text leaves as `StreamEvent::Reasoning` or as
+    /// `StreamEvent::Token`. Distinct from [`Self::hidden_body`]: a
+    /// suppressing role hides reasoning, every other role marks it.
+    reasoning_body: bool,
+    /// Whether the body just opened is still owed a trim: leading
+    /// whitespace to drop before its first real character.
+    ///
+    /// A think-tagging template writes its markers with the blank lines
+    /// that used to separate them from the prose — Qwen3.x's generation
+    /// prompt ends `<think>\n` and its replies close with `</think>\n\n`.
+    /// The markers are hidden and the newlines are not, so before this
+    /// every such answer arrived starting with a blank line and every
+    /// chain of thought with a newline. Harmless in a markdown renderer,
+    /// which ignores leading blank lines, and not harmless at all in
+    /// `content` / `reasoning_content`, which callers compare, hash and
+    /// concatenate.
+    ///
+    /// Only the think framing sets it. The other three already emit their
+    /// own separators and have no stray whitespace to lose.
+    trim_leading: bool,
     /// Whether any *visible* body has already been emitted this turn —
     /// what decides if the next one needs a separator in front of it.
     emitted_body: bool,
@@ -1087,15 +1194,48 @@ impl MessageHeader {
             framing: tokenizer.message_framing(),
             kinds: tokenizer.content_kinds(),
             channel: tokenizer.channel_framing(),
+            think: tokenizer.think_framing(),
             naming_channel: false,
             owed_separator: false,
             inside: Self::prompt_ends_in_header(tokenizer, prompt_tokens),
             recipient: String::new(),
             channel_name: String::new(),
-            hidden_body: false,
+            hidden_body: Self::prompt_ends_in_think(tokenizer, prompt_tokens)
+                && role.suppresses_reasoning(),
+            reasoning_body: Self::prompt_ends_in_think(tokenizer, prompt_tokens),
+            trim_leading: Self::prompt_ends_in_think(tokenizer, prompt_tokens),
             emitted_body: false,
             suppress_reasoning: role.suppresses_reasoning(),
         }
+    }
+
+    /// Whether the body now streaming is the model's reasoning.
+    fn in_reasoning(&self) -> bool {
+        self.reasoning_body
+    }
+
+    /// Whether generation resumes *inside* a `<think>` block.
+    ///
+    /// Read off the prompt for the same reason [`Self::
+    /// prompt_ends_in_header`] is, and needed for the same reason: a
+    /// `<think>`-marking template writes the opening tag itself as the last
+    /// thing in the generation prompt (Qwen3.x ends `<|im_start|>assistant\n
+    /// <think>\n`), so the model emits only the *closing* one. Seeded
+    /// `false`, every such reply would be taken for an answer up to the
+    /// `</think>` and for reasoning after it — exactly backwards.
+    ///
+    /// A prompt whose last think marker is the opening one resumes inside
+    /// reasoning. One that closed its last block, and one with no think
+    /// markers at all — which includes every raw-completion prompt and the
+    /// empty block `--review` prefills — resumes in an answer.
+    fn prompt_ends_in_think(tokenizer: &Tokenizer, prompt_tokens: &[u32]) -> bool {
+        tokenizer.think_framing().is_some_and(|(open, close)| {
+            prompt_tokens
+                .iter()
+                .rev()
+                .find_map(|&t| (t == open || t == close).then_some(t == open))
+                .unwrap_or(false)
+        })
     }
 
     /// Whether generation resumes *inside* a header.
@@ -1143,6 +1283,33 @@ impl MessageHeader {
                 return None;
             }
         }
+        // A `<think>` block is the same message boundary a channel is, and
+        // is settled the same way. The one difference is that a template
+        // opens the block itself, so the opening marker is often never
+        // generated at all — `prompt_ends_in_think` has already put this
+        // stream inside one by then, and only the close arrives here.
+        if let Some((open, close)) = self.think {
+            // Neither edge owes a separator, unlike a channel's. A
+            // separator exists to keep two visible bodies from running
+            // together in one stream; these two leave as *different*
+            // events, so nothing downstream concatenates them, and the
+            // "\n\n" would show up as a blank first line in whichever pane
+            // it landed in.
+            if id == open {
+                self.reasoning_body = true;
+                self.hidden_body = self.suppress_reasoning;
+                self.trim_leading = true;
+                return None;
+            }
+            if id == close {
+                // Whatever follows is the answer: a new message, and one no
+                // marker will announce.
+                self.reasoning_body = false;
+                self.hidden_body = false;
+                self.trim_leading = true;
+                return None;
+            }
+        }
         // A body-kind marker settles the same question a header's recipient
         // does, and settles it on its own — a format that has these writes
         // no header, so this is checked first and returns rather than
@@ -1150,6 +1317,7 @@ impl MessageHeader {
         if let Some(kinds) = &self.kinds
             && (id == kinds.reasoning || kinds.other.contains(&id))
         {
+            self.reasoning_body = id == kinds.reasoning;
             self.hidden_body = self.suppress_reasoning && id == kinds.reasoning;
             let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
             self.emitted_body |= !self.hidden_body;
@@ -1166,11 +1334,11 @@ impl MessageHeader {
         }
         // The header just ended: its text says who this message is for.
         self.inside = false;
-        self.hidden_body = self.suppress_reasoning
-            && self
-                .recipient
-                .replace(' ', "")
-                .contains(REASONING_RECIPIENT);
+        self.reasoning_body = self
+            .recipient
+            .replace(' ', "")
+            .contains(REASONING_RECIPIENT);
+        self.hidden_body = self.suppress_reasoning && self.reasoning_body;
         let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
         self.emitted_body |= !self.hidden_body;
         separator
@@ -1199,6 +1367,7 @@ impl MessageHeader {
                     }
                     self.naming_channel = false;
                     self.hidden_body = false;
+                    self.reasoning_body = false;
                     text = std::mem::take(&mut self.channel_name);
                 }
             }
@@ -1206,6 +1375,16 @@ impl MessageHeader {
         if !self.inside {
             if self.hidden_body || text.is_empty() {
                 return None;
+            }
+            if self.trim_leading {
+                // One token can be all whitespace and the next carry the
+                // first real character, so the flag stays set until
+                // something survives the trim.
+                text = text.trim_start().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                self.trim_leading = false;
             }
             self.emitted_body = true;
             if std::mem::take(&mut self.owed_separator) {
@@ -1224,6 +1403,7 @@ impl MessageHeader {
         // whole is not, and only the second can happen without a bound.
         self.inside = false;
         self.hidden_body = false;
+        self.reasoning_body = false;
         self.emitted_body = true;
         Some(std::mem::take(&mut self.recipient))
     }
@@ -2371,6 +2551,149 @@ mod message_header_tests {
         out
     }
 
+    /// The framing of the fourth format (`<think>` / `</think>`).
+    const THINK_OPEN: u32 = 8;
+    const THINK_CLOSE: u32 = 9;
+
+    /// Everything a client would see for a `<think>`-marking model, split
+    /// the way the stream splits it: `(reasoning, answer)`.
+    ///
+    /// `resumes_in_think` is what `prompt_ends_in_think` answers off the
+    /// real prompt — true for every ordinary Qwen3.x generation prompt,
+    /// which ends with the opening tag already written.
+    fn thinking_and_answer(
+        suppress_reasoning: bool,
+        resumes_in_think: bool,
+        stream: &[Out],
+    ) -> (String, String) {
+        let mut header = MessageHeader {
+            think: Some((THINK_OPEN, THINK_CLOSE)),
+            reasoning_body: resumes_in_think,
+            hidden_body: resumes_in_think && suppress_reasoning,
+            trim_leading: resumes_in_think,
+            suppress_reasoning,
+            ..Default::default()
+        };
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for item in stream {
+            let emitted = match item {
+                Marker(id) => header.observe_marker(*id).map(str::to_string),
+                Text(text) => header.observe_text((*text).to_string()),
+            };
+            if let Some(text) = emitted {
+                if header.in_reasoning() {
+                    reasoning.push_str(&text);
+                } else {
+                    answer.push_str(&text);
+                }
+            }
+        }
+        (reasoning, answer)
+    }
+
+    /// The whole point: a Qwen3.x turn resumes inside the `<think>` block
+    /// its own template opened, so everything up to `</think>` is thinking
+    /// and everything after it is the answer. Before this, both arrived as
+    /// one run of content and the answer was indistinguishable from the
+    /// notes that led to it.
+    #[test]
+    fn a_think_block_is_separated_from_the_answer() {
+        let turn = [
+            Text("Let me plan this.\n\ntypedef struct Node { int v; } Node;"),
+            Marker(THINK_CLOSE),
+            Text("Here is a doubly linked list:\n\n```c\nint main(void){}\n```"),
+        ];
+        let (reasoning, answer) = thinking_and_answer(false, true, &turn);
+        assert_eq!(
+            reasoning,
+            "Let me plan this.\n\ntypedef struct Node { int v; } Node;"
+        );
+        assert_eq!(
+            answer,
+            "Here is a doubly linked list:\n\n```c\nint main(void){}\n```"
+        );
+    }
+
+    /// The blank lines the template writes around its markers do not
+    /// survive into either pane. Qwen3.x opens with `<think>\n` and closes
+    /// with `</think>\n\n`: the tags are hidden and the newlines are not,
+    /// so before this every answer began with a blank line and every chain
+    /// of thought with a newline — invisible in a rendered bubble,
+    /// perfectly visible in `content`.
+    #[test]
+    fn the_whitespace_around_the_markers_is_trimmed() {
+        let turn = [
+            Text("\nThinking."),
+            Marker(THINK_CLOSE),
+            Text("\n\n"),
+            Text("Answer."),
+        ];
+        assert_eq!(
+            thinking_and_answer(false, true, &turn),
+            ("Thinking.".to_string(), "Answer.".to_string())
+        );
+    }
+
+    /// No separator is inserted where `</think>` was. The two sides leave
+    /// as different events, so nothing downstream runs them together — and
+    /// a leading blank line is visible whitespace once the answer is shown
+    /// on its own.
+    #[test]
+    fn no_separator_is_owed_across_a_think_boundary() {
+        let turn = [Text("Thinking."), Marker(THINK_CLOSE), Text("Answer.")];
+        assert_eq!(
+            thinking_and_answer(false, true, &turn),
+            ("Thinking.".to_string(), "Answer.".to_string())
+        );
+    }
+
+    /// A reasoning-suppressing role (`--review`) drops the body outright
+    /// rather than merely labelling it — the `<think>` prefill usually
+    /// means there is none to drop, but a model that opens one anyway must
+    /// not have it reach the caller.
+    #[test]
+    fn a_suppressing_role_drops_a_think_block() {
+        let turn = [
+            Marker(THINK_OPEN),
+            Text("Second-guessing myself."),
+            Marker(THINK_CLOSE),
+            Text("Answer."),
+        ];
+        assert_eq!(
+            thinking_and_answer(true, false, &turn),
+            (String::new(), "Answer.".to_string())
+        );
+    }
+
+    /// A model that writes its own opening tag (no prefill in the prompt)
+    /// is split on the tags it wrote, not on where the prompt ended.
+    #[test]
+    fn a_self_opened_think_block_is_split_too() {
+        let turn = [
+            Text("Sure!"),
+            Marker(THINK_OPEN),
+            Text("Actually, let me check."),
+            Marker(THINK_CLOSE),
+            Text("Yes."),
+        ];
+        let (reasoning, answer) = thinking_and_answer(false, false, &turn);
+        assert_eq!(reasoning, "Actually, let me check.");
+        assert_eq!(answer, "Sure!Yes.");
+    }
+
+    /// A vocabulary with no think framing is untouched: every byte is the
+    /// answer, exactly as before.
+    #[test]
+    fn a_vocabulary_without_think_tokens_is_unaffected() {
+        let mut header = MessageHeader::default();
+        assert!(!header.in_reasoning());
+        assert_eq!(
+            header.observe_text("plain answer".to_string()),
+            Some("plain answer".to_string())
+        );
+        assert!(!header.in_reasoning());
+    }
+
     /// The channel *name* is framing and never reaches the reader, whatever
     /// the role. This is the bug that ended replies with a bare
     /// `"tool_code\nprint(create_directory(path='pacman_game'))"`.
@@ -2783,7 +3106,7 @@ mod tests {
         let mut ok = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                StreamEvent::Token(t) => text.push_str(&t),
+                StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                 StreamEvent::Done { .. } => ok = true,
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
@@ -3785,6 +4108,7 @@ mod tests {
             prefix_cache: None,
             slot_store: None,
             role: crate::config::Role::default(),
+            reasoning_effort: None,
         };
 
         let mut rx = engine

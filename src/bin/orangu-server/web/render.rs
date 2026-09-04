@@ -105,18 +105,323 @@ pub fn render_markdown_to_html(
     text: &str,
     project_licence: Option<&orangu::license::Project>,
 ) -> String {
+    render(text, project_licence, false)
+}
+
+/// Renders a message's *reasoning* — everything
+/// `engine::generate::StreamEvent::Reasoning` carried — with one difference
+/// from [`render_markdown_to_html`]: a line break in the source is a line
+/// break on screen.
+///
+/// A chain of thought is a scratchpad, not a document. The model is not
+/// writing markdown in there; it is writing notes, and its notes are full
+/// of code it never bothered to fence, because it is talking to itself:
+///
+/// ```text
+/// Let's design: #include <stdio.h>
+/// #include <stdlib.h>
+///
+/// typedef struct Node { int data; struct Node *prev; struct Node *next; } Node;
+/// ```
+///
+/// CommonMark folds those single newlines into spaces, and the two
+/// `#include`s come out on one line — a reported symptom, and the reason
+/// this exists. Fenced blocks in the thinking still become code windows;
+/// what changes is only what happens to the code that was never fenced.
+///
+/// Deliberately *not* how the answer is rendered. There the model is
+/// writing markdown on purpose, and a soft break folding into a space is
+/// what it means by one.
+pub fn render_reasoning_to_html(text: &str) -> String {
+    // No project licence, ever: a draft the model wrote to itself, and
+    // often rewrote twice more, is not a file for this project.
+    render(&fence_unfenced_code(text), None, true)
+}
+
+/// Puts a fence around each run of unfenced code in the model's notes, so
+/// the rest of this file renders it as a code window like any other.
+///
+/// The model does fence code in its thinking sometimes — one measured reply
+/// opened nineteen blocks in there — but only sometimes, because it is
+/// writing to itself and a fence is a courtesy to a reader. What arrives
+/// otherwise is a paragraph as far as CommonMark is concerned, so its
+/// indentation is stripped as a lazy continuation and, without
+/// [`render_reasoning_to_html`]'s line breaks, its newlines fold into
+/// spaces as well:
+///
+/// ```text
+/// Let's design: #include <stdio.h> #include <stdlib.h> typedef struct …
+/// ```
+///
+/// Rewriting the *source* rather than special-casing the walk is what keeps
+/// that from needing a second kind of code block: once the run carries a
+/// fence, it is an ordinary `Node::Code` and picks up the window, the
+/// footer and the download with it. It also keeps
+/// [`unterminated_fence_start`] honest, which reads the same text this
+/// produces.
+///
+/// Deliberately confined to the thinking pane. An answer is markdown the
+/// model wrote on purpose, and second-guessing its formatting there is how
+/// a paragraph that happens to end in a semicolon becomes a code listing.
+/// Here the cost of a wrong guess is a few dimmed lines in a collapsed pane
+/// set in the wrong face.
+fn fence_unfenced_code(text: &str) -> String {
+    let ends_with_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    let kinds = classify_lines(&lines);
+
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(end) = code_run_end(&kinds, index) else {
+            out.push_str(lines[index]);
+            out.push('\n');
+            index += 1;
+            continue;
+        };
+        // Untagged: the notes could be C, Python or a shell transcript, and
+        // naming the wrong language is worse than naming none. An untagged
+        // fence is still offered to the diagram renderers, but a run that
+        // got here looks like code by the very rules that would have to
+        // fail for `looks_like_diagram` to succeed.
+        out.push_str("```\n");
+        for line in &lines[index..end] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("```\n");
+        index = end;
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
+/// What one line of the notes is, for [`fence_unfenced_code`].
+#[derive(Clone, Copy, PartialEq)]
+enum LineKind {
+    /// Already inside a fence, or the fence line itself — left alone.
+    Fenced,
+    /// Blank. Joins a run only when code follows it.
+    Blank,
+    Code,
+    Prose,
+}
+
+/// Classifies every line, tracking fence state so an already-fenced block
+/// is passed through untouched.
+fn classify_lines(lines: &[&str]) -> Vec<LineKind> {
+    // (fence character, length) of the block currently open.
+    let mut open: Option<(char, usize)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let rest = &line[indent.min(line.len())..];
+            if indent <= 3
+                && let Some(fence) = rest.chars().next().filter(|c| *c == '`' || *c == '~')
+            {
+                let len = rest.chars().take_while(|c| *c == fence).count();
+                if len >= 3 {
+                    match open {
+                        Some((open_fence, open_len))
+                            if fence == open_fence
+                                && len >= open_len
+                                && rest[len..].trim().is_empty() =>
+                        {
+                            open = None;
+                        }
+                        Some(_) => {}
+                        None => open = Some((fence, len)),
+                    }
+                    return LineKind::Fenced;
+                }
+            }
+            if open.is_some() {
+                return LineKind::Fenced;
+            }
+            if line.trim().is_empty() {
+                return LineKind::Blank;
+            }
+            if looks_like_code_line(line) {
+                LineKind::Code
+            } else {
+                LineKind::Prose
+            }
+        })
+        .collect()
+}
+
+/// Where the code run starting at `start` ends, or `None` if none does.
+///
+/// A run is at least **two** code lines — one line ending in a semicolon is
+/// as likely to be a sentence as a statement — and may contain blank lines,
+/// but never ends on one: a listing keeps its internal spacing without
+/// swallowing the paragraph break after it.
+fn code_run_end(kinds: &[LineKind], start: usize) -> Option<usize> {
+    if kinds[start] != LineKind::Code {
+        return None;
+    }
+    let mut end = start;
+    let mut code_lines = 0;
+    for (offset, kind) in kinds[start..].iter().enumerate() {
+        match kind {
+            LineKind::Code => {
+                code_lines += 1;
+                end = start + offset + 1;
+            }
+            LineKind::Blank => {}
+            LineKind::Prose | LineKind::Fenced => break,
+        }
+    }
+    (code_lines >= 2).then_some(end)
+}
+
+/// Whether one line reads as code rather than prose.
+///
+/// Kept blunt on purpose. Everything here is something a sentence does not
+/// do: end in a semicolon or a brace, or open with a preprocessor
+/// directive. The last is why `#` is checked for a *non*-space after it —
+/// `# Heading` is markdown, `#include` is not.
+fn looks_like_code_line(line: &str) -> bool {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix('#') {
+        return !rest.starts_with(' ') && !rest.is_empty();
+    }
+    line.ends_with(';') || line.ends_with('{') || line.ends_with('}')
+}
+
+fn render(
+    text: &str,
+    project_licence: Option<&orangu::license::Project>,
+    line_breaks: bool,
+) -> String {
     if text.is_empty() {
         return String::new();
     }
+    let text = &align_fenced_block_indent(text);
     let renderer = Renderer {
         open_fence_start: unterminated_fence_start(text),
         code_blocks_seen: Cell::new(0),
         project_licence,
+        line_breaks,
     };
     match to_mdast(text, &parse_options()) {
         Ok(tree) => renderer.render_node(&tree),
         Err(_) => format!("<p>{}</p>", escape_html(text)),
     }
+}
+
+/// Pads the interior of a fenced block out to its opening fence's
+/// indentation, so a line the model indented one space short does not throw
+/// the whole block away.
+///
+/// A fence inside a list item is indented to the item's content column, and
+/// CommonMark measures everything after it against that column. A line with
+/// *less* indentation is not under-indented content — it is the end of the
+/// list item, which takes the open fence down with it. One missing space is
+/// enough. Observed, from `gemma-4-E2B-it` asked for a K-D tree:
+///
+/// ```text
+/// 3.  **Run:**
+///     ```bash
+///    ./kdtree
+///     ```
+/// ```
+///
+/// Three spaces where the item's content column is four. What the reader got
+/// was an empty code window followed by the paragraph `./kdtree ```` ``` ````
+/// — the block's one line of content and its own closing fence, rendered as
+/// prose. Every strict CommonMark renderer does this; it is the model that
+/// is wrong. But the model is what this console renders, a missing space is
+/// not a thing a reader can act on, and losing the command someone is meant
+/// to run is a poor trade for standards compliance.
+///
+/// Deliberately narrow. It pads only lines that are *inside* a fence and
+/// *shallower* than the fence that opened them, so a well-formed document is
+/// untouched, and only for a block that actually closes — an unterminated
+/// fence is the streaming case, where every token would otherwise re-decide
+/// what the block contains.
+fn align_fenced_block_indent(text: &str) -> String {
+    let ends_with_newline = text.ends_with('\n');
+    let mut out: Vec<String> = Vec::new();
+    // The fence currently open: its character, length and indentation, plus
+    // the interior lines seen so far. Held back rather than emitted, because
+    // whether to pad them is not known until the block closes.
+    let mut open: Option<(char, usize, usize)> = None;
+    let mut held: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let rest = &line[indent..];
+        let fence = rest
+            .chars()
+            .next()
+            .filter(|c| *c == '`' || *c == '~')
+            .map(|c| (c, rest.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, len)| *len >= 3);
+
+        match (open, fence) {
+            // A closing fence: same character, at least as long, nothing but
+            // an info-string-free tail. The interior is now known to be a
+            // block, so it goes out padded.
+            (Some((open_char, open_len, open_indent)), Some((c, len)))
+                if c == open_char && len >= open_len && rest[len..].trim().is_empty() =>
+            {
+                let shift = indent_deficit(&held, open_indent);
+                for interior in held.drain(..) {
+                    out.push(shift_right(interior, shift));
+                }
+                out.push(line.to_string());
+                open = None;
+            }
+            // Any other line while a fence is open is its content.
+            (Some(_), _) => held.push(line),
+            // An opening fence. Only one at a non-zero indent can have
+            // content shallower than itself, but the state is tracked either
+            // way so an inner ``` is not mistaken for a fence of its own.
+            (None, Some((c, len))) => {
+                open = Some((c, len, indent));
+                out.push(line.to_string());
+            }
+            (None, None) => out.push(line.to_string()),
+        }
+    }
+    // Still open at the end: the block never closed, so its lines go out
+    // exactly as they arrived.
+    out.extend(held.into_iter().map(str::to_string));
+
+    let mut joined = out.join("\n");
+    if ends_with_newline {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// How far a block's interior has to move right to clear `open_indent`.
+///
+/// Measured from the *shallowest* line, and applied to the whole block
+/// rather than per line, because the block's internal indentation is the
+/// code's shape. Padding each short line up to the fence on its own would
+/// flatten it: a body indented four spaces under its `if` came out three
+/// when only the `if` line was short.
+fn indent_deficit(interior: &[&str], open_indent: usize) -> usize {
+    interior
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .min()
+        .map_or(0, |shallowest| open_indent.saturating_sub(shallowest))
+}
+
+/// `line` moved right by `shift` spaces. A blank line stays blank rather
+/// than becoming trailing whitespace.
+fn shift_right(line: &str, shift: usize) -> String {
+    if shift == 0 || line.trim().is_empty() {
+        return line.to_string();
+    }
+    format!("{}{line}", " ".repeat(shift))
 }
 
 /// Carries the one piece of whole-document context the walk needs: where a
@@ -128,6 +433,10 @@ struct Renderer<'a> {
     /// block is a file for *that* project, so it carries that project's
     /// licence or no licence at all — never a default one.
     project_licence: Option<&'a orangu::license::Project>,
+    /// Whether a soft line break renders as `<br>` rather than folding into
+    /// a space — see [`render_reasoning_to_html`], which is the only thing
+    /// that sets it.
+    line_breaks: bool,
     /// Byte offset of the opening fence of a code block that never closes —
     /// which, mid-stream, is every code block the model is still typing.
     /// See [`unterminated_fence_start`].
@@ -234,6 +543,10 @@ impl Renderer<'_> {
 
     fn render_inline_node(&self, node: &Node) -> String {
         match node {
+            // Only *inline* text goes through here, so this cannot reach
+            // the inside of a code block — those carry their own newlines
+            // through `render_code_block`'s `<pre>`.
+            Node::Text(text) if self.line_breaks => escape_html(&text.value).replace('\n', "<br>"),
             Node::Text(text) => escape_html(&text.value),
             Node::Strong(strong) => {
                 format!(
@@ -878,6 +1191,130 @@ mod tests {
         let html = render_markdown_to_html_t("- one\n\n  two");
         assert!(html.contains("<p>one</p>"));
         assert!(html.contains("<p>two</p>"));
+    }
+
+    /// The reported symptom, exactly: a model sketching C in its chain of
+    /// thought writes one `#include` per line and fences none of it, and
+    /// CommonMark folds those newlines into spaces. The answer keeps
+    /// CommonMark's rule; the thinking does not.
+    #[test]
+    fn reasoning_keeps_the_line_breaks_the_model_typed() {
+        let notes = "Let's design: #include <stdio.h>\n#include <stdlib.h>";
+        let thinking = render_reasoning_to_html(notes);
+        assert!(
+            thinking.contains("&lt;stdio.h&gt;<br>#include"),
+            "a line break in the notes must survive: {thinking}"
+        );
+        // The same text as an *answer* is markdown, and a soft break there
+        // means a space — which is what the model meant by one.
+        assert!(!render_markdown_to_html_t(notes).contains("<br>"));
+    }
+
+    /// The reported case: a fence inside a list item whose content line is
+    /// one space shallower than the item's content column. Strict
+    /// CommonMark ends the list item there, closing the block empty and
+    /// spilling its content and its own closing fence into a paragraph —
+    /// the reader saw `./kdtree ``` ` sitting outside the snippet.
+    #[test]
+    fn a_content_line_indented_short_stays_in_its_code_block() {
+        let html = render_markdown_to_html_t(
+            "3.  **Run:**\n    ```bash\n   ./kdtree\n    ```\n\n### Next\n",
+        );
+        assert!(html.contains("./kdtree"), "{html}");
+        // Inside the block, not after it.
+        assert!(!html.contains("<p>./kdtree"), "{html}");
+        // And the closing fence is a fence, not prose.
+        assert!(!html.contains("```</p>"), "{html}");
+        // The list item and what follows it survive.
+        assert!(html.contains("<h3>Next</h3>"), "{html}");
+    }
+
+    /// The block moves as a whole, by the amount its *shallowest* line is
+    /// short, so the code's own relative indentation survives. Padding each
+    /// short line up to the fence instead would flatten it — a body indented
+    /// four under its `if` came out three.
+    #[test]
+    fn realigning_a_block_keeps_its_inner_indentation() {
+        assert_eq!(
+            super::align_fenced_block_indent(
+                "1.  Run:\n    ```c\n   if (x) {\n       f();\n   }\n    ```\n"
+            ),
+            "1.  Run:\n    ```c\n    if (x) {\n        f();\n    }\n    ```\n"
+        );
+    }
+
+    /// A well-formed document must come out byte-identical — the pass is a
+    /// repair, not a reformatter.
+    #[test]
+    fn a_correctly_indented_document_is_untouched() {
+        let text = "Intro\n\n1.  Run:\n    ```bash\n    ./x\n    ```\n\nEnd\n";
+        assert_eq!(super::align_fenced_block_indent(text), text);
+        let plain = "```c\nint main(void){}\n```\n";
+        assert_eq!(super::align_fenced_block_indent(plain), plain);
+    }
+
+    /// An unterminated fence is the streaming case: nothing is padded,
+    /// because what the block contains is not yet known and every token
+    /// would otherwise re-decide it.
+    #[test]
+    fn an_unterminated_fence_is_left_exactly_as_it_arrived() {
+        let text = "1.  Run:\n    ```bash\n   ./kdtree\n";
+        assert_eq!(super::align_fenced_block_indent(text), text);
+    }
+
+    /// The reported case, end to end: notes with an unfenced C sketch in
+    /// them come back with the sketch in a code window and the prose around
+    /// it still prose.
+    #[test]
+    fn unfenced_code_in_the_notes_gets_a_code_window() {
+        let notes = "Let's design:\n#include <stdio.h>\n#include <stdlib.h>\n\n                     typedef struct Node {\n    int data;\n    struct Node *prev;\n                     } Node;\n\nThat is the shape.";
+        let html = render_reasoning_to_html(notes);
+        assert_eq!(html.matches("class=\"code-block\"").count(), 1);
+        // Indentation survives, which is the thing a paragraph destroys.
+        assert!(html.contains("    int data;"), "{html}");
+        // The prose on either side stays prose.
+        assert!(html.contains("<p>Let's design:</p>"), "{html}");
+        assert!(html.contains("<p>That is the shape.</p>"), "{html}");
+    }
+
+    /// One line ending in a semicolon is as likely to be a sentence as a
+    /// statement, so a run has to be at least two lines long. Prose must
+    /// not turn into a listing.
+    #[test]
+    fn a_single_code_looking_line_stays_prose() {
+        let html = render_reasoning_to_html("We need a list; that is all.\nThen answer.");
+        assert!(!html.contains("code-block"), "{html}");
+    }
+
+    /// `# Heading` is markdown and `#include` is not — the discriminator is
+    /// the space, and getting it wrong would put every heading in the
+    /// model's notes in a code box.
+    #[test]
+    fn a_markdown_heading_is_not_a_preprocessor_directive() {
+        let html = render_reasoning_to_html("# Plan\n# Steps\n\nDone.");
+        assert!(!html.contains("code-block"), "{html}");
+        assert!(html.contains("<h1>"), "{html}");
+    }
+
+    /// Line breaks are the only difference for text that is not code. A
+    /// fence in the thinking still becomes a code window, and nothing
+    /// inside it gains a `<br>` — the `<pre>` already carries its own
+    /// newlines.
+    #[test]
+    fn reasoning_still_renders_fenced_code_as_a_code_window() {
+        let html = render_reasoning_to_html("Draft:\n\n```c\nint a;\nint b;\n```");
+        assert!(html.contains("class=\"code-block\""));
+        assert!(!html.contains("int a;<br>"));
+    }
+
+    /// A draft the model wrote to itself is not a file for this project,
+    /// so it never picks up a licence header — unlike the same block in an
+    /// answer, which does.
+    #[test]
+    fn reasoning_code_carries_no_licence_header() {
+        let html = render_reasoning_to_html("```c\nint main(void){}\n```");
+        assert!(!html.contains("MIT License"));
+        assert!(render_markdown_to_html_t("```c\nint main(void){}\n```").contains("MIT License"));
     }
 
     #[test]

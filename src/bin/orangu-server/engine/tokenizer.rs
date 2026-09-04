@@ -876,6 +876,28 @@ impl Tokenizer {
         (self.is_special(open) && self.is_special(close)).then_some((open, close))
     }
 
+    /// `(<think>, </think>)` for a vocabulary that wraps the model's chain
+    /// of thought in them, and `None` for every vocabulary that doesn't.
+    ///
+    /// The fourth spelling of the question [`Self::message_framing`],
+    /// [`Self::channel_framing`] and [`Self::content_kinds`] answer, and by
+    /// far the most common one: Qwen3.x, DeepSeek-R1, QwQ and GLM all mark
+    /// their reasoning this way. Both markers are already hidden by
+    /// [`Self::is_special`] — which is exactly the problem this exists to
+    /// fix. Hidden and otherwise unaccounted for, the chain of thought is
+    /// delivered as ordinary content, glued to the answer by nothing more
+    /// than the newlines around the vanished tag, and a client has no way
+    /// left to tell the two apart.
+    ///
+    /// Matched on the vocabulary's own token names, like its three
+    /// neighbours here: the framing belongs to the chat format, not to an
+    /// architecture.
+    pub fn think_framing(&self) -> Option<(u32, u32)> {
+        let open = *self.token_to_id.get("<think>")?;
+        let close = *self.token_to_id.get("</think>")?;
+        (self.is_special(open) && self.is_special(close)).then_some((open, close))
+    }
+
     /// The marker a reasoning body opens with, and the markers every other
     /// kind of body opens with — for a vocabulary that types each message
     /// *body* with a control token instead of naming a recipient in text.

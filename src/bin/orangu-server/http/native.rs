@@ -545,7 +545,11 @@ pub async fn completion(
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-                StreamEvent::Token(text) => content.push_str(&text),
+                // `/completion` is llama.cpp's raw endpoint: one `content`
+                // field, no message shape to split reasoning out into, so
+                // the thinking stays where it has always been. The chat
+                // endpoints are where a caller gets the two apart.
+                StreamEvent::Token(text) | StreamEvent::Reasoning(text) => content.push_str(&text),
                 StreamEvent::Done { stats, .. } => {
                     timings = super::openai::timings_json(&stats);
                     break;
@@ -568,7 +572,8 @@ pub async fn completion(
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-                StreamEvent::Token(text) => {
+                // See the non-streaming arm above: one field, no shape.
+                StreamEvent::Token(text) | StreamEvent::Reasoning(text) => {
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default()
                             .data(serde_json::json!({"content": text, "stop": false}).to_string()),
@@ -679,13 +684,7 @@ pub async fn apply_template(
             .into_response();
     };
     let template = ChatTemplate::new(source.clone());
-    match template.render(
-        &req.messages,
-        true,
-        "",
-        "",
-        state.engine.role.enable_thinking(),
-    ) {
+    match template.render(&req.messages, true, "", "", state.engine.reasoning()) {
         Ok(mut prompt) => {
             // Mirror `openai::chat_completions`'s own reasoning-suppression
             // prefill, so this endpoint's whole point — showing exactly

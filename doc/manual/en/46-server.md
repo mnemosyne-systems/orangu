@@ -1237,6 +1237,7 @@ shown.
 | `device_split` | `off` | spread one model across several devices |
 | `threads` | rayon's choice | CPU worker threads |
 | `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding` |
+| `reasoning_effort` | `medium` | how hard a reasoning model is asked to think, in its own template's words |
 | `web` | `0` | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does |
 
 | `[web]` | default | what it does |
@@ -1502,7 +1503,74 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   the reply, and no `<think>` block is prefilled (that prefill would land
   inside the message header the first format leaves open, or ahead of the
   marker that types the body in the second, and the reply came back empty
-  when it did).
+  when it did). A `<think>`-tagging model is now handled exactly too, as a
+  second line of defence behind the prefill: a block the model opens
+  anyway is recognised and its body dropped, rather than reaching the
+  caller because the tags around it were hidden.
+
+**Reasoning is separated from the answer for every role.** Suppressing it
+is one question; telling the two apart is another, and it applies whether
+or not the reasoning is shown. `<think>`/`</think>`, `to=self`, and
+`<|content_thinking|>` all mark a body the model addressed to itself, and
+that body now leaves the engine as its own kind of event. What each
+endpoint does with it:
+
+- `/v1/chat/completions` puts it in `reasoning_content` — on the message
+  when the response is whole, and on the delta while streaming — leaving
+  `content` as the answer alone. A client that does not know the field
+  ignores it and sees only the answer, which is the point.
+- The **web console** shows it in a collapsed *Thinking* pane above the
+  answer, so the answer's code blocks are what the reader sees first.
+- `/completion` and `/v1/completions` are raw endpoints with one text
+  field and no message shape to split across, so thinking stays in it —
+  a caller that prefilled `<think>` there asked for exactly that text
+  back.
+
+Left unmarked, a chain of thought arrives as the answer, and for a model
+that thinks at length that is most of the reply: asked to implement a
+doubly linked list, one 27B reasoning model spent over eight thousand
+tokens inside `<think>` — drafting the program three times and checking
+its own index arithmetic — before writing a word of the answer.
+
+**`reasoning_effort`** is the other half of that. It is passed straight
+into the chat template as the same-named variable, and it defaults to
+`medium` rather than to nothing, because *nothing* is not neutral: it hands
+the choice to the template, and a template's own default can be the most
+expensive setting it has. Qwen3.x's asks for
+`reasoning_effort|default('xhigh')` and prepends a system message telling
+the model to think carefully, validate its assumptions and consider
+alternatives.
+
+Measured on `Qwen3.8-27B`, same prompt ("implement a doubly linked list in
+C") and same machine, the difference is not a matter of degree:
+
+| `reasoning_effort` | thinking | answer |
+| :-- | --: | :-- |
+| left to the template (`xhigh`) | still going at **8192** tokens | never written |
+| `low` | **184** tokens | written in full |
+
+At `xhigh` the reply was the model talking to itself — drafting the program
+three times and checking its own index arithmetic — and the console showed
+a Thinking pane and nothing else, because there was nothing else.
+
+`medium` is the default rather than `low` because the point is to stop
+asking for the maximum, not to start asking for the minimum. Ask for either
+end explicitly:
+
+```ini
+[orangu-server]
+models = ~/models
+reasoning_effort = low
+```
+
+The levels are the template's vocabulary, not this server's — Qwen3.x
+accepts `xhigh`, `medium` and `low` and raises on anything else, other
+templates spell theirs `high`/`medium`/`low`. So the two cases are treated
+differently: a level **you** asked for that the template rejects comes back
+as a `400` carrying the template's own complaint, while the *default* is
+simply dropped and the prompt rendered again without it — a default this
+server picked has no business breaking a model whose scale is spelled
+differently.
 
 `code` behaves identically to `all` today — no `orangu-server` feature is
 `code`-specific yet beyond what `all` already provides.
@@ -2700,7 +2768,8 @@ pre-tokenizer this server already had, and its template opens the reply
 inside a `<think>` block that the model closes itself — so a
 reasoning-suppressing role (`--review`) separates reasoning from answer
 here exactly as it does for the other `<think>`-marked families, and every
-other role prints the reasoning, a blank line, then the answer. Tool calls
+other role reports the reasoning apart from the answer (`reasoning_content`
+on the chat endpoints, a collapsed *Thinking* pane in the console). Tool calls
 come back in the
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 form GLM and Ling 3.0 share, already parsed. Like every recurrent family

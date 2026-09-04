@@ -161,7 +161,15 @@ const KATEX_FONTS: &[(&str, &[u8])] = &[
 /// runaway request pinning a slot indefinitely. The engine additionally
 /// clamps this to what's left of the model's context window, so raising
 /// it here never risks overrunning `n_ctx_train`.
-const MAX_TOKENS: usize = 8192;
+///
+/// It was 8192, and that is not generous for a *reasoning* model. Measured,
+/// `Qwen3.8-27B` asked to implement a doubly linked list spent all 8192 of
+/// them inside its `<think>` block — drafting the program three times and
+/// checking its own index arithmetic — and was cut off before writing a
+/// word of the answer. A reader watching that saw the thinking and no
+/// answer, which is a worse failure than a slot held a while longer: the
+/// turn cost the same and produced nothing usable.
+const MAX_TOKENS: usize = 32768;
 
 pub struct WebState {
     pub engine: Arc<Engine>,
@@ -602,6 +610,11 @@ struct SessionMessageView {
     // The extracted text itself stays server-side.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentView>,
+    /// The rendered chain of thought, when the model wrote one. Absent
+    /// otherwise, so the console shows a Thinking section only for a turn
+    /// that actually has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_html: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -630,12 +643,15 @@ async fn get_session(
                     let html = (m.role == "assistant").then(|| {
                         render::render_markdown_to_html(&m.content, state.project_licence.as_ref())
                     });
+                    let reasoning_html = (!m.reasoning.is_empty())
+                        .then(|| render::render_reasoning_to_html(&m.reasoning));
                     SessionMessageView {
                         role: m.role,
                         content: m.content,
                         html,
                         generation_ms: m.generation_ms,
                         attachments: m.attachments.into_iter().map(attachment_view).collect(),
+                        reasoning_html,
                     }
                 })
                 .collect(),
@@ -733,30 +749,54 @@ async fn send_message(
             );
         }
         let mut full = String::new();
+        let mut reasoning = String::new();
+        // The last HTML sent for each of the two panes, so each frame can
+        // carry what changed instead of the whole document. See
+        // [`html_delta`] for why that matters here in particular.
+        let mut sent_answer = String::new();
+        let mut sent_reasoning = String::new();
         loop {
             let Some(event) = rx.recv().await else { break };
             match event {
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::Reasoning(text) => {
+                    reasoning.push_str(&text);
+                    let html = render::render_reasoning_to_html(&reasoning);
+                    let (keep, add) = html_delta(&sent_reasoning, &html);
+                    yield Ok::<_, Infallible>(
+                        axum::response::sse::Event::default()
+                            .data(json!({"type": "reasoning", "keep": keep, "add": add}).to_string()),
+                    );
+                    sent_reasoning = html;
+                }
                 StreamEvent::Token(text) => {
                     full.push_str(&text);
                     let html = render::render_markdown_to_html(&full, state.project_licence.as_ref());
+                    let (keep, add) = html_delta(&sent_answer, &html);
                     yield Ok::<_, Infallible>(
                         axum::response::sse::Event::default()
-                            .data(json!({"type": "token", "html": html}).to_string()),
+                            .data(json!({"type": "token", "keep": keep, "add": add}).to_string()),
                     );
+                    sent_answer = html;
                 }
                 StreamEvent::Done { finish_reason, stats } => {
                     let full = state.engine.tokenizer.clean_up_tokenization_spaces(&full);
+                    let reasoning = state.engine.tokenizer.clean_up_tokenization_spaces(&reasoning);
+                    // Whole rather than as a delta, once: the reader's copy
+                    // is now the one that gets saved, copied and re-rendered,
+                    // and it costs one frame to know it matches the server's
+                    // exactly.
                     let html = render::render_markdown_to_html(&full, state.project_licence.as_ref());
+                    let reasoning_html = render::render_reasoning_to_html(&reasoning);
                     let generation_ms = stats.generate_time.as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &full, Some(generation_ms)) {
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &full, &reasoning, Some(generation_ms)) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "content": full, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
                     break;
                 }
                 StreamEvent::Overloaded => {
@@ -773,6 +813,42 @@ async fn send_message(
         }
     };
     axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// What changed between the last HTML sent for a pane and the current one:
+/// how much of the reader's copy to keep, and what to append to it.
+///
+/// The transcript is re-rendered from the whole message on every token, and
+/// used to be *sent* whole too. That is quadratic in the reply's length and
+/// it is not a small constant: one measured 8192-token answer with 19 code
+/// blocks came to 8193 frames and **590 MB** over the wire, for a reply
+/// whose final HTML is 200 KB. Decode held at ~1.1 tok/s throughout, so
+/// none of that was the model — it was the same document, re-serialised
+/// once per token and re-parsed by the browser once per token.
+///
+/// Rendering stays whole-document, because markdown is not incrementally
+/// parseable — a table row, a setext underline or a closing fence changes
+/// how earlier lines render. Only the *transport* is incremental: the two
+/// renders share a prefix (growing text almost always appends), so the
+/// frame carries the divergence. The client's copy stays byte-identical to
+/// the server's, and `done` re-sends the finished document whole to
+/// guarantee it.
+///
+/// `keep` is counted in UTF-16 code units, the unit JavaScript's
+/// `String.prototype.slice` indexes in — counting bytes or `char`s here
+/// would truncate the reader's copy mid-way through the first emoji in the
+/// reply, and models do write them.
+fn html_delta<'a>(sent: &str, current: &'a str) -> (usize, &'a str) {
+    let mut keep_utf16 = 0;
+    let mut keep_bytes = 0;
+    for (previous, next) in sent.chars().zip(current.chars()) {
+        if previous != next {
+            break;
+        }
+        keep_utf16 += next.len_utf16();
+        keep_bytes += next.len_utf8();
+    }
+    (keep_utf16, &current[keep_bytes..])
 }
 
 fn render_prompt(
@@ -829,7 +905,7 @@ fn render_prompt(
         true,
         bos,
         eos,
-        state.engine.role.enable_thinking(),
+        state.engine.reasoning(),
     )?;
     crate::http::openai::append_reasoning_suppression(
         &mut prompt,
@@ -947,5 +1023,49 @@ mod tests {
         // what the model got, so the panel shows what was actually sent.
         let view = upload("notes.txt", "text/plain", "hello there");
         assert_eq!(view.text.as_deref(), Some("hello there"));
+    }
+
+    /// The ordinary streaming case: the render grew by a word, so that is
+    /// all that goes over the wire. Sending the document instead is what
+    /// made one 8192-token reply cost 590 MB.
+    #[test]
+    fn a_delta_carries_only_what_the_render_added() {
+        assert_eq!(
+            super::html_delta("<p>Hello</p>", "<p>Hello there</p>"),
+            (8, " there</p>")
+        );
+    }
+
+    /// Markdown re-renders are not always append-only — a closing fence
+    /// turns a paragraph into a code block, a second row turns a line into
+    /// a table — so the delta has to be able to *replace* a tail, and the
+    /// reader's copy has to end up byte-identical either way.
+    #[test]
+    fn a_delta_replaces_a_tail_the_render_rewrote() {
+        let sent = "<p>```c int x;</p>";
+        let current = "<pre><code>int x;</code></pre>";
+        let (keep, add) = super::html_delta(sent, current);
+        assert_eq!(&sent[..keep], "<p");
+        assert_eq!(format!("{}{add}", &sent[..keep]), current);
+    }
+
+    /// `keep` is counted in UTF-16 code units, because the browser slices
+    /// in them. Counted in bytes, an emoji before the divergence would
+    /// leave the reader's copy cut through the middle of a character —
+    /// and a model that ends its answers "Want me to explain? 😊" writes
+    /// one of these in the first paragraph.
+    #[test]
+    fn a_delta_counts_the_units_the_browser_slices_in() {
+        // "😊" is 4 bytes, 2 UTF-16 units, 1 char — three different
+        // answers, and only one of them is the one the client needs.
+        let (keep, add) = super::html_delta("<p>😊</p>", "<p>😊 hi</p>");
+        assert_eq!(keep, "<p>".len() + 2);
+        assert_eq!(add, " hi</p>");
+    }
+
+    /// Nothing rendered yet: keep nothing, send everything.
+    #[test]
+    fn the_first_delta_is_the_whole_render() {
+        assert_eq!(super::html_delta("", "<p>Hi</p>"), (0, "<p>Hi</p>"));
     }
 }

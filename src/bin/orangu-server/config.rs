@@ -224,6 +224,7 @@ pub fn bundled_configuration(
         reexec: default_reexec(),
         role_key: Some(role),
         role,
+        reasoning_effort: None,
         mcp_servers: Vec::new(),
     }
 }
@@ -621,6 +622,26 @@ pub struct ServerConfiguration {
     /// reasoning as `model`: no attached terminal to pass a CLI flag to),
     /// the config file's own `role` key; or, failing both, [`Role::All`].
     pub role: Role,
+    /// `[orangu-server].reasoning_effort`: how hard a reasoning model is
+    /// asked to think, passed straight into the chat template as the
+    /// same-named variable and otherwise left undefined.
+    ///
+    /// Undefined is not the same as "normal". A template that reads this
+    /// picks its own default when the variable is absent, and Qwen3.x's
+    /// picks the *most* expensive one — `reasoning_effort|default('xhigh')`,
+    /// which prepends "Reasoning effort is set to xhigh. Please think
+    /// carefully through the task, validate key assumptions, consider
+    /// plausible alternatives…" as a system message. Measured on
+    /// `Qwen3.8-27B`, that is not a small tax: "implement a doubly linked
+    /// list in C" spent over 8000 tokens inside `<think>`, drafting the
+    /// program three times before writing any of the answer.
+    ///
+    /// Left `None` by default all the same, because the levels are the
+    /// template's vocabulary rather than this server's — Qwen3.x accepts
+    /// `xhigh`/`medium`/`low` and raises on anything else, others spell
+    /// theirs `high`/`medium`/`low` — and imposing one model family's word
+    /// on every other template would turn an unset knob into a 400.
+    pub reasoning_effort: Option<String>,
     /// Read-only HTTP MCP profiles exposed by the web console. Changing this
     /// list requires restarting `orangu-server`.
     pub mcp_servers: Vec<McpConfiguration>,
@@ -879,6 +900,14 @@ pub fn load_server_configuration(
         None => DEFAULT_READ_SIZE,
     };
 
+    // Trimmed, and an empty value read as unset: a template that validates
+    // its levels would raise on "" exactly as it would on a typo, and
+    // `reasoning_effort =` with nothing after it plainly means "no opinion".
+    let reasoning_effort = section
+        .get("reasoning_effort")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "auto" => BackendPreference::Auto,
@@ -951,6 +980,7 @@ pub fn load_server_configuration(
         model,
         role_key,
         role,
+        reasoning_effort,
         slots,
         web,
         web_host,

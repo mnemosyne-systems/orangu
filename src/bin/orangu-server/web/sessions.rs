@@ -59,6 +59,18 @@ pub struct SessionMessage {
     /// backward compatibility with `chat.json` written before attachments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// The model's chain of thought for this message, kept apart from the
+    /// answer it led to. Empty for a user message, for a model that does
+    /// not reason, and for assistant messages persisted before this field
+    /// existed — `#[serde(default)]` so those still deserialize.
+    ///
+    /// Stored so a reloaded transcript shows what the live one showed, and
+    /// **not** replayed into the next turn's prompt: a chat template
+    /// rebuilds a previous turn from its answer alone (Qwen3.x's writes an
+    /// empty `<think></think>` for it), and feeding thinking back would
+    /// grow every following prompt by the largest thing in the reply.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
 }
 
 /// One user-uploaded file: its identity, plus the text pulled out of it by
@@ -430,6 +442,7 @@ pub fn append_turn(
     user_message: &str,
     user_attachments: Vec<Attachment>,
     assistant_message: &str,
+    assistant_reasoning: &str,
     generation_ms: Option<u64>,
 ) -> Result<()> {
     if session.title.is_empty() {
@@ -450,12 +463,14 @@ pub fn append_turn(
         content: user_message.to_string(),
         generation_ms: None,
         attachments: user_attachments,
+        reasoning: String::new(),
     });
     session.messages.push(SessionMessage {
         role: "assistant".to_string(),
         content: assistant_message.to_string(),
         generation_ms,
         attachments: Vec::new(),
+        reasoning: assistant_reasoning.to_string(),
     });
     session.updated_at = unix_now();
     save_session(session)
@@ -556,6 +571,7 @@ mod tests {
                 "What is Rust?",
                 Vec::new(),
                 "A systems language.",
+                "",
                 Some(123),
             )
             .unwrap();
@@ -565,6 +581,7 @@ mod tests {
                 "And Go?",
                 Vec::new(),
                 "Also a systems-ish language.",
+                "",
                 Some(456),
             )
             .unwrap();
@@ -583,12 +600,14 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             b.messages.push(SessionMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             a.updated_at = 100;
             b.updated_at = 200;
@@ -612,6 +631,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             save_session(&empty).unwrap();
             save_session(&used).unwrap();
@@ -728,6 +748,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             save_session(&used_inactive).unwrap();
             let empty_active = create_session().unwrap();
@@ -767,6 +788,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             save_session(&used).unwrap();
 
@@ -802,6 +824,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 attachments: Vec::new(),
+                reasoning: String::new(),
             });
             save_session(&used).unwrap();
 

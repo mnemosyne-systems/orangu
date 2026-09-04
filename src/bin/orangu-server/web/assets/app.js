@@ -289,13 +289,87 @@
     renderPendingAttachments();
   }
 
-  function addRenderedMessage(role, html) {
+  function addRenderedMessage(role, html, reasoningHtml) {
     const el = document.createElement("div");
     el.className = `message ${role}`;
-    el.innerHTML = html;
+    if (role === "assistant") {
+      // An assistant bubble is two panes, always in this order: what the
+      // model thought, then what it answered. Separate elements rather than
+      // one blob of HTML because they arrive as separate streams and are
+      // updated independently — and because the thinking has to be
+      // collapsible, which a run of sibling <p>s cannot be.
+      el.appendChild(buildThinkingPane());
+      const answer = document.createElement("div");
+      answer.className = "answer";
+      answer.innerHTML = html ?? "";
+      el.appendChild(answer);
+      setThinkingHtml(el, reasoningHtml ?? "");
+    } else {
+      el.innerHTML = html;
+    }
     transcript.appendChild(el);
     transcript.scrollTop = transcript.scrollHeight;
     return el;
+  }
+
+  // The collapsed chain-of-thought pane. A <details> so it costs no
+  // JavaScript to open and closes by default: for a reasoning model the
+  // thinking is routinely several times the length of the answer, and left
+  // open it buries what the reader asked for. Hidden entirely — not merely
+  // empty — until there is thinking to show, so a non-reasoning model's
+  // replies look exactly as they did.
+  function buildThinkingPane() {
+    const details = document.createElement("details");
+    details.className = "thinking";
+    details.hidden = true;
+    const summary = document.createElement("summary");
+    summary.className = "thinking-summary";
+    summary.textContent = "Thinking";
+    const body = document.createElement("div");
+    body.className = "thinking-body";
+    details.appendChild(summary);
+    details.appendChild(body);
+    return details;
+  }
+
+  // Turns the placeholder bubble (`addMessage("assistant", "🤖")`) into the
+  // two-pane shape the moment the first thing to put in it arrives. Doing it
+  // here rather than at send time keeps the placeholder exactly as it was —
+  // an emoji and nothing else — for the whole of the prompt-processing wait.
+  function ensurePanes(assistantEl) {
+    if (answerBodyOf(assistantEl)) return;
+    assistantEl.textContent = "";
+    assistantEl.appendChild(buildThinkingPane());
+    const answer = document.createElement("div");
+    answer.className = "answer";
+    assistantEl.appendChild(answer);
+  }
+
+  function thinkingBodyOf(assistantEl) {
+    return assistantEl.querySelector(".thinking-body");
+  }
+
+  function answerBodyOf(assistantEl) {
+    return assistantEl.querySelector(".answer");
+  }
+
+  function setThinkingHtml(assistantEl, html) {
+    const details = assistantEl.querySelector(".thinking");
+    const body = thinkingBodyOf(assistantEl);
+    if (!details || !body) return;
+    body.innerHTML = html;
+    details.hidden = html === "";
+  }
+
+  // Applies one streamed delta: keep the first `keep` UTF-16 units of what
+  // is already on screen, append the rest. The server renders the whole
+  // message every token and sends only where the two renders diverge —
+  // sending it whole came to 590 MB for one long reply — so the string
+  // rebuilt here is byte-for-byte the server's own render, and the "done"
+  // event replaces it wholesale to guarantee that.
+  function applyHtmlDelta(previous, payload) {
+    const keep = Number.isInteger(payload.keep) ? payload.keep : 0;
+    return previous.slice(0, keep) + (payload.add ?? "");
   }
 
   // Shortest colon-separated D:H:M:S form that fits — leading all-zero
@@ -398,7 +472,9 @@
   // while omitting the generation footer and its controls.
   function renderedAnswerText(assistantEl) {
     const answer = assistantEl.cloneNode(true);
-    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source, .code-footer").forEach((el) => el.remove());
+    // The thinking goes with the footer and the controls: it is not part of
+    // the answer being saved, copied or printed.
+    answer.querySelectorAll(".thinking, .gen-time, .diagram-actions, .diagram-source, .code-footer").forEach((el) => el.remove());
     return (answer.innerText ?? answer.textContent ?? "").trim();
   }
 
@@ -415,7 +491,7 @@
     pdfWindow.opener = null;
 
     const answer = assistantEl.cloneNode(true);
-    answer.querySelectorAll(".gen-time, .diagram-actions, .diagram-source").forEach((el) => el.remove());
+    answer.querySelectorAll(".thinking, .gen-time, .diagram-actions, .diagram-source").forEach((el) => el.remove());
     answer.classList.add("pdf-answer");
 
     pdfWindow.document.open();
@@ -743,7 +819,7 @@
     let pendingTurnDiagrams = [];
     for (const message of session.messages) {
       if (message.role === "assistant") {
-        const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content));
+        const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content), message.reasoning_html);
         renderMathIn(el);
         appendAttachedDiagramsToAnswer(el, pendingTurnDiagrams);
         addTimingFooter(el, message.generation_ms, message.content);
@@ -911,6 +987,10 @@
     let tpsStartMs = 0;
     let tpsCount = 0;
     let liveFooter = null;
+    // The reader's copy of each pane's rendered HTML, rebuilt from the
+    // deltas the server sends — see `applyHtmlDelta`.
+    let answerHtml = "";
+    let reasoningHtml = "";
     // The server's view of this turn's uploads, as sent by the "attachments"
     // event — kept so the finished answer can carry their diagrams.
     let turnAttachments = [];
@@ -960,22 +1040,35 @@
             continue;
           }
           assistantEl.classList.remove("pending");
-          if (payload.type === "token" || payload.type === "done") {
-            assistantEl.innerHTML = payload.html;
+          if (payload.type === "reasoning" || payload.type === "token" || payload.type === "done") {
+            ensurePanes(assistantEl);
+            if (payload.type === "done") {
+              // The finished documents, whole — see `applyHtmlDelta`.
+              reasoningHtml = payload.reasoning_html ?? "";
+              answerHtml = payload.html ?? "";
+            } else if (payload.type === "reasoning") {
+              reasoningHtml = applyHtmlDelta(reasoningHtml, payload);
+            } else {
+              answerHtml = applyHtmlDelta(answerHtml, payload);
+            }
+            // Only the pane that changed is reassigned. The other keeps its
+            // DOM — and with it its already-typeset math and the scroll
+            // position of any code block the reader had scrolled by hand.
+            if (payload.type !== "token") setThinkingHtml(assistantEl, reasoningHtml);
+            if (payload.type !== "reasoning") answerBodyOf(assistantEl).innerHTML = answerHtml;
             pinCodeBlocksToLatest(assistantEl);
             renderMathIn(assistantEl);
-            if (payload.type === "token") {
+            if (payload.type !== "done") {
               if (!tpsStarted) {
                 tpsStarted = true;
                 tpsStartMs = performance.now();
               } else {
                 tpsCount += 1;
               }
-              // `innerHTML = payload.html` above wipes the message's
-              // children every token, so the live footer can't be attached
-              // just once — build it lazily, keep the reference, and
-              // re-append it after each re-render (same reason the final
-              // footer waits for "done"). Left-aligned via `.gen-tps`.
+              // Thinking counts: it is tokens the model generated and time
+              // the reader waited, and a rate that stalled at zero for the
+              // whole think would be the least useful moment to stop
+              // reporting one.
               const text = tpsText();
               if (text) {
                 if (!liveFooter) {

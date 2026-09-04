@@ -935,7 +935,7 @@ mod real_model_tests {
                     .eos_token
                     .and_then(|id| tokenizer.token_text(id))
                     .unwrap_or(""),
-                None,
+                crate::engine::chat_template::Reasoning::default(),
             )
             .expect("render chat template");
         let tokens = tokenizer.encode(&prompt, false);

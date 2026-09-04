@@ -224,6 +224,22 @@ A streaming reply is a series of `chat.completion.chunk` events, each carrying
 a `delta`, ending with a chunk that carries `finish_reason` (plus `usage`,
 `timings` and `prompt_progress`) and then `[DONE]`.
 
+##### `reasoning_content`
+
+A reasoning model's chain of thought is reported **apart from the answer**,
+never inside `content`. Whole, it is `message.reasoning_content`; streaming,
+it arrives as `delta.reasoning_content` chunks, which come before the
+`delta.content` ones the answer arrives in. The field is absent — not empty
+— when the model wrote no thinking, so "does not reason" and "reasoned about
+nothing" stay distinguishable, and a client that does not know the field
+ignores it and sees the answer alone.
+
+This covers every format that *names* a reasoning body: a
+`<think>`…`</think>` span, a message addressed `to=self`, a body opened with
+`<|content_thinking|>`. Thinking never passes through the tool-call splitter
+— a call is something the model addresses to the caller, not part of a body
+it addressed to itself — so `tool_calls` are parsed from the answer only.
+
 ##### `cache_prompt`
 
 `/v1/chat/completions`, `/v1/completions` and `/completion` all accept it, and
@@ -650,6 +666,10 @@ field names:
 | `id_slot` | — | as on `/v1/chat/completions` |
 
 Non-streaming, the reply is `{"content": "…", "stop": true, "timings": {…}}`.
+This endpoint has one text field and no message shape to split a reasoning
+model's thinking out into, so — unlike `/v1/chat/completions` — thinking
+stays in `content`, which is what a caller who prefilled `<think>` here
+asked for.
 Streaming, each event is `{"content": "…", "stop": false}` and the last is
 `{"content": "", "stop": true, "finish_reason": …, "timings": {…},
 "prompt_progress": {…}}`. There is no `response_format` here — structured

@@ -126,10 +126,35 @@ dependency on any C or C++ inference library.
   question with tokens: `inkling` writes no header and instead opens each
   body with a marker naming its *kind*
   (`<|content_thinking|>`/`<|content_text|>`, read off
-  `Tokenizer::content_kinds`), and the same rule applies to it. Inert for
-  a vocabulary with neither, which is every other model here.
+  `Tokenizer::content_kinds`), and the same rule applies to it. A third
+  frames the distinction with a channel (`<|channel>`…`<channel|>`), whose
+  *name* is framing and never shown. A fourth is the one nearly every
+  reasoning model uses and the one that matters most in practice: a
+  `<think>`…`</think>` pair (read off `Tokenizer::think_framing`). Both
+  tokens are special and were already hidden, which is what made this
+  format the quiet failure — with the tags gone and nothing marking the
+  span, a whole chain of thought was delivered as the answer. It is now
+  marked, and leaves as `StreamEvent::Reasoning` rather than
+  `StreamEvent::Token`, so a caller can present thinking as thinking.
+  One wrinkle the others do not have: the *template* writes the opening
+  tag as the tail of the generation prompt, so the model emits only the
+  close — `MessageHeader::prompt_ends_in_think` reads the prompt to decide
+  which side of the boundary generation resumes on. Inert for a vocabulary
+  with none of the four, which is every other model here.
 - `http/{mod,openai,native}.rs` — the HTTP surface.
 - `web/{mod,render,sessions,models,attachments}.rs` — the built-in chat UI.
+  `render.rs` repairs two things about the markdown a model actually writes,
+  rather than rendering it strictly and losing content. A fenced block whose
+  content is indented *less* than the fence that opened it — one space is
+  enough, and a fence inside a numbered list is where it happens — ends its
+  list item in strict CommonMark, taking the open fence with it and spilling
+  the block's content and its own closing fence into a paragraph; the
+  interior is shifted right as a whole (`align_fenced_block_indent`) so it
+  stays in its block with its own indentation intact. And in the *thinking*
+  pane only, where the model is writing notes rather than markdown, line
+  breaks are kept and runs of unfenced code get a fence
+  (`fence_unfenced_code`), because a scratchpad's code is rarely fenced and
+  a paragraph folds it into one line.
   `sessions.rs` also owns the `session.json` activity marker
   (`mark_active`/`is_active`) and the prune-facing listing/sweep
   (`list_sessions_for_prune`/`sweep_empty_sessions`/`delete_session_dir`)

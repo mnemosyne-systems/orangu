@@ -69,6 +69,35 @@ pub struct ChatTemplate {
     source: String,
 }
 
+/// What a request wants from a reasoning model: whether it should think at
+/// all, and how hard.
+///
+/// One parameter rather than two because it is one decision, taken in one
+/// place (`config::Role` plus `[orangu-server].reasoning_effort`) and read
+/// by the three endpoints that render a prompt. Both fields are `Option`
+/// and both mean the same thing when `None`: leave the variable *undefined*
+/// so the template's own `default(...)` applies, rather than passing a null
+/// a template would have to treat as a value.
+#[derive(Clone, Copy, Default)]
+pub struct Reasoning<'a> {
+    /// `enable_thinking` — `Some(false)` for a reasoning-suppressing role,
+    /// `None` to leave the template's own default alone.
+    pub enabled: Option<bool>,
+    /// `reasoning_effort`, verbatim: the levels are the template's
+    /// vocabulary, not this server's.
+    pub effort: Option<&'a str>,
+    /// Whether [`Self::effort`] is this server's default rather than a
+    /// value the deployment asked for.
+    ///
+    /// It decides what happens when a template *rejects* the level. A
+    /// default this server picked has no business turning someone's request
+    /// into a `400` because their template spells its levels differently,
+    /// so it is dropped and the prompt rendered again without it. A value
+    /// from `[orangu-server].reasoning_effort` is a stated intention, and a
+    /// typo in it should say so rather than be quietly ignored.
+    pub effort_is_default: bool,
+}
+
 impl ChatTemplate {
     pub fn new(source: String) -> Self {
         Self { source }
@@ -99,7 +128,7 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         bos_token: &str,
         eos_token: &str,
-        enable_thinking: Option<bool>,
+        reasoning: Reasoning<'_>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         self.render_inner(
@@ -107,7 +136,7 @@ impl ChatTemplate {
             add_generation_prompt,
             bos_token,
             eos_token,
-            enable_thinking,
+            reasoning,
             tools,
         )
     }
@@ -118,25 +147,62 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         bos_token: &str,
         eos_token: &str,
-        enable_thinking: Option<bool>,
+        reasoning: Reasoning<'_>,
     ) -> Result<String> {
         self.render_inner(
             messages,
             add_generation_prompt,
             bos_token,
             eos_token,
-            enable_thinking,
+            reasoning,
             None,
         )
     }
 
+    /// Renders, and — when the level was this server's own default and the
+    /// template refused it — renders again without one. See
+    /// [`Reasoning::effort_is_default`].
     fn render_inner(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         bos_token: &str,
         eos_token: &str,
-        enable_thinking: Option<bool>,
+        reasoning: Reasoning<'_>,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        match self.render_once(
+            messages,
+            add_generation_prompt,
+            bos_token,
+            eos_token,
+            reasoning,
+            tools,
+        ) {
+            Err(err) if reasoning.effort_is_default && reasoning.effort.is_some() => self
+                .render_once(
+                    messages,
+                    add_generation_prompt,
+                    bos_token,
+                    eos_token,
+                    Reasoning {
+                        effort: None,
+                        ..reasoning
+                    },
+                    tools,
+                )
+                .map_err(|_| err),
+            other => other,
+        }
+    }
+
+    fn render_once(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        bos_token: &str,
+        eos_token: &str,
+        reasoning: Reasoning<'_>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         let mut env = Environment::new();
@@ -171,8 +237,18 @@ impl ChatTemplate {
         );
         ctx.insert("bos_token", minijinja::Value::from(bos_token));
         ctx.insert("eos_token", minijinja::Value::from(eos_token));
-        if let Some(enable_thinking) = enable_thinking {
+        if let Some(enable_thinking) = reasoning.enabled {
             ctx.insert("enable_thinking", minijinja::Value::from(enable_thinking));
+        }
+        // Absent unless configured, for the same reason `enable_thinking`
+        // is: a template asks `reasoning_effort|default('xhigh')` or
+        // `is defined`, and a null would be neither what it asked for nor
+        // silence. Passed through verbatim — every template that reads it
+        // spells its own levels ('xhigh'/'medium'/'low' for Qwen3.x,
+        // 'high'/'medium'/'low' elsewhere) and validates them itself, with
+        // an error this server surfaces as a 400.
+        if let Some(reasoning_effort) = reasoning.effort {
+            ctx.insert("reasoning_effort", minijinja::Value::from(reasoning_effort));
         }
         if let Some(tools) = tools {
             ctx.insert("tools", minijinja::Value::from_serialize(tools));
@@ -614,7 +690,9 @@ mod tests {
                 .to_string(),
         );
         let messages = vec![ChatMessage::text("user", "hi")];
-        let out = tmpl.render(&messages, true, "<s>", "</s>", None).unwrap();
+        let out = tmpl
+            .render(&messages, true, "<s>", "</s>", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "user: hi\nassistant:");
     }
 
@@ -642,7 +720,9 @@ mod tests {
             ChatMessage::text("user", "first"),
             ChatMessage::text("assistant", "second"),
         ];
-        let out = tmpl.render(&messages, false, "<s>", "</s>", None).unwrap();
+        let out = tmpl
+            .render(&messages, false, "<s>", "</s>", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "first");
     }
 
@@ -662,7 +742,9 @@ mod tests {
             ChatMessage::text("assistant", "b"),
             ChatMessage::text("user", "c"),
         ];
-        let out = tmpl.render(&messages, false, "<s>", "</s>", None).unwrap();
+        let out = tmpl
+            .render(&messages, false, "<s>", "</s>", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "ac");
     }
 
@@ -679,8 +761,16 @@ mod tests {
                 .to_string(),
         );
         let messages = vec![ChatMessage::text("user", "hi")];
-        assert_eq!(tmpl.render(&messages, false, "", "", None).unwrap(), "hi");
-        assert_eq!(tmpl.render(&[], false, "", "", None).unwrap(), "none");
+        assert_eq!(
+            tmpl.render(&messages, false, "", "", Reasoning::default())
+                .unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            tmpl.render(&[], false, "", "", Reasoning::default())
+                .unwrap(),
+            "none"
+        );
     }
 
     /// The rewrite is a widening, so a template that never needed it must
@@ -729,7 +819,9 @@ mod tests {
     #[test]
     fn exposes_bos_and_eos_tokens() {
         let tmpl = ChatTemplate::new("{{ bos_token }}...{{ eos_token }}".to_string());
-        let out = tmpl.render(&[], false, "<BOS>", "<EOS>", None).unwrap();
+        let out = tmpl
+            .render(&[], false, "<BOS>", "<EOS>", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "<BOS>...<EOS>");
     }
 
@@ -748,7 +840,9 @@ mod tests {
                 .to_string(),
         );
         let messages = vec![ChatMessage::text("user", "hi")];
-        let out = tmpl.render(&messages, false, "", "", None).unwrap();
+        let out = tmpl
+            .render(&messages, false, "", "", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "user=default ");
     }
 
@@ -768,12 +862,12 @@ mod tests {
             {"type": "function", "function": {"name": "run_shell_command"}},
         ]);
         let with = tmpl
-            .render_with_tools(&[], false, "", "", None, Some(&tools))
+            .render_with_tools(&[], false, "", "", Reasoning::default(), Some(&tools))
             .unwrap();
         assert_eq!(with, "TOOL:show_file;TOOL:run_shell_command;");
 
         let without = tmpl
-            .render_with_tools(&[], false, "", "", None, None)
+            .render_with_tools(&[], false, "", "", Reasoning::default(), None)
             .unwrap();
         assert_eq!(without, "NONE");
     }
@@ -787,7 +881,7 @@ mod tests {
             "{% if tools is defined %}DEFINED{% else %}UNDEFINED{% endif %}".to_string(),
         );
         assert_eq!(
-            tmpl.render_with_tools(&[], false, "", "", None, None)
+            tmpl.render_with_tools(&[], false, "", "", Reasoning::default(), None)
                 .unwrap(),
             "UNDEFINED"
         );
@@ -825,7 +919,9 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let out = tmpl.render(&messages, false, "", "", None).unwrap();
+        let out = tmpl
+            .render(&messages, false, "", "", Reasoning::default())
+            .unwrap();
         assert_eq!(out, "CALL:get_weather;RESULT[get_weather/call-1]=17C;");
     }
 
@@ -836,7 +932,87 @@ mod tests {
                 .to_string(),
         );
         let messages = vec![ChatMessage::text("user", "hi")];
-        assert!(tmpl.render(&messages, false, "", "", None).is_err());
+        assert!(
+            tmpl.render(&messages, false, "", "", Reasoning::default())
+                .is_err()
+        );
+    }
+
+    /// `reasoning_effort` reaches the template, and is *undefined* rather
+    /// than null when unset — the difference between a template picking its
+    /// own default and one seeing a value it has to validate. Qwen3.x's
+    /// unset default is `xhigh`, the most expensive setting there is, which
+    /// is why this knob exists at all.
+    #[test]
+    fn reasoning_effort_is_only_defined_when_given() {
+        let tmpl = ChatTemplate::new("{{- reasoning_effort|default('xhigh') -}}".to_string());
+        assert_eq!(
+            tmpl.render(&[], false, "", "", Reasoning::default())
+                .unwrap(),
+            "xhigh"
+        );
+        assert_eq!(
+            tmpl.render(
+                &[],
+                false,
+                "",
+                "",
+                Reasoning {
+                    enabled: None,
+                    effort: Some("low"),
+                    effort_is_default: false,
+                }
+            )
+            .unwrap(),
+            "low"
+        );
+    }
+
+    /// A template that refuses this server's *default* level gets the
+    /// prompt without one rather than turning the request into a `400`.
+    /// The levels are the template's vocabulary — Qwen3.x raises on
+    /// anything but `xhigh`/`medium`/`low` — and a default this server
+    /// chose has no business breaking a model whose scale is spelled
+    /// differently.
+    #[test]
+    fn a_default_level_the_template_refuses_is_dropped() {
+        let tmpl = ChatTemplate::new(
+            "{%- if reasoning_effort is defined -%}\
+             {%- if reasoning_effort != 'thorough' -%}\
+             {{- raise_exception('Unexpected reasoning effort') -}}\
+             {%- endif -%}\
+             {{- reasoning_effort -}}\
+             {%- else -%}\
+             none\
+             {%- endif -%}"
+                .to_string(),
+        );
+        let default = Reasoning {
+            enabled: None,
+            effort: Some("medium"),
+            effort_is_default: true,
+        };
+        assert_eq!(tmpl.render(&[], false, "", "", default).unwrap(), "none");
+
+        // A level the deployment asked for is a stated intention: it fails
+        // loudly, with the template's own complaint, rather than being
+        // silently swapped for something that renders.
+        let asked_for = Reasoning {
+            effort_is_default: false,
+            ..default
+        };
+        let err = tmpl.render(&[], false, "", "", asked_for).unwrap_err();
+        assert!(err.to_string().contains("Unexpected reasoning effort"));
+
+        // And a default the template *accepts* is used, not dropped.
+        let accepted = Reasoning {
+            effort: Some("thorough"),
+            ..default
+        };
+        assert_eq!(
+            tmpl.render(&[], false, "", "", accepted).unwrap(),
+            "thorough"
+        );
     }
 
     /// `enable_thinking: Some(false)` reaches the template as a real
@@ -855,14 +1031,40 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            tmpl.render(&[], false, "", "", Some(false)).unwrap(),
+            tmpl.render(
+                &[],
+                false,
+                "",
+                "",
+                Reasoning {
+                    enabled: Some(false),
+                    effort: None,
+                    effort_is_default: false,
+                }
+            )
+            .unwrap(),
             "no-think"
         );
         assert_eq!(
-            tmpl.render(&[], false, "", "", Some(true)).unwrap(),
+            tmpl.render(
+                &[],
+                false,
+                "",
+                "",
+                Reasoning {
+                    enabled: Some(true),
+                    effort: None,
+                    effort_is_default: false,
+                }
+            )
+            .unwrap(),
             "think"
         );
-        assert_eq!(tmpl.render(&[], false, "", "", None).unwrap(), "think");
+        assert_eq!(
+            tmpl.render(&[], false, "", "", Reasoning::default())
+                .unwrap(),
+            "think"
+        );
     }
 
     #[test]
@@ -1008,7 +1210,7 @@ mod real_model_tests {
             ChatMessage::text("user", "And one more?"),
         ];
         ChatTemplate::new(source)
-            .render_with_tools(&messages, true, "", "", None, tools)
+            .render_with_tools(&messages, true, "", "", Reasoning::default(), tools)
             .expect("render")
     }
 
