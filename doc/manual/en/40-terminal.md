@@ -22,7 +22,9 @@ The sync runs in the background so it never delays startup. Its progress and res
 | `-a`  | `--all`       | Reopen the workspace tabs that were open at the end of the last run. |
 | `-t`  | `--theme`     | Apply a theme to the terminal interface for this run. Built-in names and paths to `.theme` files are accepted. |
 | `-p`  | `--prompt`    | Run a single prompt or command and exit — no terminal UI and no session on disk. See One-shot mode below. |
-| `-q`  | `--quiet`     | Print nothing on success — the exit code is the result. Applies to the modes that print and exit (`-p`, `-l`, `-s`). |
+|       | `--workflow FILE` | Validate and execute every job in a YAML workflow. |
+|       | `--dry-run FILE` | Validate a YAML workflow completely without executing it or loading configuration. |
+| `-q`  | `--quiet`     | Print nothing on success — the exit code is the result. Applies to the modes that print and exit, including workflows. |
 | `-l`  | `--list`      | List all stored sessions as a `SESSION WORKSPACE BRANCH DATE` table and exit. |
 | `-i`  | `--init`      | Interactively create `~/.orangu/orangu.conf` and exit (see the Configuration chapter). |
 | `-s`  | `--shell-completions` | Print the shell completion script for the detected shell (`$SHELL`; bash, zsh, or fish) and exit. |
@@ -56,7 +58,7 @@ orangu -q -p "/export pr"    # writes the PDF, says nothing
 echo $?                      # 0, or 1 with the reason on stderr
 ```
 
-That is what makes it suit a crontab or a `~/.orangu/schedule` job: silent until the day it fails. It applies to the modes that print and exit — `-p`, `-l`, and `-s`. Combining it with `-i` or with the terminal interface is an error rather than a no-op, since neither has diagnostics to separate from its output.
+That is what makes it suit a crontab or a `~/.orangu/schedule` job: silent until the day it fails. It applies to the modes that print and exit — `-p`, `-l`, `-s`, and `--workflow` (including `--dry-run`). Combining it with `-i` or with the terminal interface is an error rather than a no-op, since neither has diagnostics to separate from its output.
 
 `-t`/`--theme` is the other way round: a theme paints the interface — including the terminal's own background and foreground — so it takes effect only when there is an interface. A one-shot ignores it rather than repainting the terminal it printed into.
 

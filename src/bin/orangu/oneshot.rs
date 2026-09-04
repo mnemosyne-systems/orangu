@@ -38,16 +38,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use crate::commands::{
-    CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand,
+    CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand, McpSubcommand,
     current_terminal_width, parse_local_command, system_prompt,
 };
 use crate::dispatch::{handle_command, run_duplicates_scan};
 use crate::export;
 use crate::git::{Forge, ReviewReports, fetch_pull_request_details};
-use crate::models::{detect_embeddings_server, is_active_connection_a_coordinator};
+use crate::models::{
+    coordinator_role_profile, detect_embeddings_server, is_active_connection_a_coordinator,
+};
 use crate::stats::UsageStats;
 use orangu::{
-    config::ClientAppConfiguration,
+    config::{ClientAppConfiguration, LlmConfiguration},
     llm::{StreamMetrics, normalized_openai_endpoint},
     session::ChatSession,
     skills::SkillRegistry,
@@ -61,8 +63,26 @@ pub(crate) struct OneshotContext {
     pub(crate) config: ClientAppConfiguration,
     pub(crate) config_path: PathBuf,
     pub(crate) workspace: PathBuf,
+    /// Optional workflow role. A coordinator receives the role name directly;
+    /// a plain setup uses the first server configured for that role.
+    pub(crate) role: Option<String>,
     /// `-q`: print nothing at all, and let the exit code carry the result.
     pub(crate) quiet: bool,
+}
+
+/// A reusable one-shot environment. Ordinary `-p` creates one for its single
+/// input; a workflow keeps one per job so natural-language steps share the
+/// same conversation and MCP/tool connections.
+pub(crate) struct OneshotSession {
+    config: ClientAppConfiguration,
+    config_path: PathBuf,
+    workspace: PathBuf,
+    quiet: bool,
+    server: String,
+    profile: LlmConfiguration,
+    tools: ToolExecutor,
+    skills: SkillRegistry,
+    session: ChatSession,
 }
 
 /// What the `-p` text turned out to be.
@@ -122,119 +142,168 @@ impl Console {
 }
 
 pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<()> {
-    let OneshotContext {
-        config,
-        config_path,
-        workspace,
-        quiet,
-    } = context;
-    let console = Console { quiet };
+    let mut session = OneshotSession::new(context).await?;
+    session.run(prompt).await
+}
 
-    let server = config.default_server.clone();
-    let profile = config
-        .llms
-        .get(&server)
-        .ok_or_else(|| anyhow!("missing configured server {server}"))?;
+impl OneshotSession {
+    pub(crate) async fn new(context: OneshotContext) -> Result<Self> {
+        let OneshotContext {
+            config,
+            config_path,
+            workspace,
+            role,
+            quiet,
+        } = context;
+        let console = Console { quiet };
 
-    let (mcp, mcp_warnings) =
-        orangu::mcp::McpManager::connect_all(&config.mcp_servers, &workspace).await?;
-    for warning in mcp_warnings {
-        console.note(&format!("Warning: {warning}"));
-    }
-    let tools = orangu::tools::ToolExecutor::with_config(
-        &workspace,
-        config.compression,
-        config.auto_downsample_lines,
-        config.diff_file_cap,
-        None,
-    )
-    .with_mcp(mcp.clone());
-    let skills = orangu::skills::SkillRegistry::discover(&workspace);
-
-    // Anything orangu answers on its own is answered here, before a single byte
-    // goes to the server.
-    let prompt = match run_local_command(
-        prompt,
-        LocalRun {
-            config: &config,
-            config_path: &config_path,
-            workspace: &workspace,
-            server: &server,
-            tools: &tools,
-            skills: &skills,
-            console,
-        },
-    )
-    .await?
-    {
-        Resolution::Handled => return Ok(()),
-        Resolution::Prompt(text) => text,
-    };
-    let prompt = prompt.as_str();
-
-    // The same system prompt the interactive client builds for a tab.
-    let mut system = system_prompt(profile, None).to_string();
-    let index = skills.system_prompt_index();
-    if !index.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&index);
-    }
-    system.push_str(&orangu::config::load_agents_instructions(&workspace));
-    if !mcp.instructions().is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&mcp.instructions());
-    }
-
-    let definitions = tools.definitions();
-    let tools_bytes = serde_json::to_string(&definitions).map_or(0, |json| json.len());
-    console.note(&format!(
-        "server {server} ({}) model {} — workspace {}",
-        profile.endpoint,
-        profile.model,
-        workspace.display()
-    ));
-    console.note(&format!(
-        "sending {} chars of system prompt and {} tool definitions ({tools_bytes} chars)",
-        system.chars().count(),
-        definitions.len(),
-    ));
-
-    let mut session = ChatSession::new(&system);
-    let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
-    let collected = Arc::clone(&metrics);
-    let started = Instant::now();
-    let mut first_delta: Option<std::time::Duration> = None;
-
-    let result = session
-        .prompt(
-            prompt,
-            profile,
-            &tools,
-            |delta| {
-                if first_delta.is_none() {
-                    first_delta = Some(started.elapsed());
+        let server = role
+            .as_deref()
+            .map(|role| config.find_server_for_role(role))
+            .unwrap_or_else(|| config.default_server.clone());
+        let configured_profile = config
+            .llms
+            .get(&server)
+            .ok_or_else(|| anyhow!("missing configured server {server}"))?
+            .clone();
+        let profile = match role.as_deref() {
+            Some(role) => {
+                let endpoint = normalized_openai_endpoint(&configured_profile.endpoint);
+                let http_client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(3))
+                    .build()?;
+                if is_active_connection_a_coordinator(
+                    &http_client,
+                    &config,
+                    &server,
+                    Some(&endpoint),
+                )
+                .await
+                {
+                    coordinator_role_profile(&configured_profile, &endpoint, role)
+                } else {
+                    configured_profile
                 }
-                console.delta(delta);
-            },
-            move |update| {
-                if let Ok(mut state) = collected.lock() {
-                    state.merge(update);
-                }
-            },
-            |_running| {},
-            |tool_call| {
-                console.note(&format!("[tool] {}", tool_call.function.name));
-            },
-            |_| false,
+            }
+            None => configured_profile,
+        };
+
+        let (mcp, mcp_warnings) =
+            orangu::mcp::McpManager::connect_all(&config.mcp_servers, &workspace).await?;
+        for warning in mcp_warnings {
+            console.note(&format!("Warning: {warning}"));
+        }
+        let tools = orangu::tools::ToolExecutor::with_config(
+            &workspace,
+            config.compression,
+            config.auto_downsample_lines,
+            config.diff_file_cap,
+            None,
         )
-        .await;
+        .with_mcp(mcp.clone());
+        let skills = orangu::skills::SkillRegistry::discover(&workspace);
 
-    console.delta("\n");
-    let elapsed = started.elapsed();
-    let metrics = metrics.lock().ok().map(|state| state.clone());
-    report_timings(console, elapsed, first_delta, metrics.as_ref());
+        // The same system prompt the interactive client builds for a tab.
+        let mut system = system_prompt(&profile, None).to_string();
+        let index = skills.system_prompt_index();
+        if !index.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&index);
+        }
+        system.push_str(&orangu::config::load_agents_instructions(&workspace));
+        if !mcp.instructions().is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&mcp.instructions());
+        }
 
-    result.map(|_| ())
+        let definitions = tools.definitions();
+        let tools_bytes = serde_json::to_string(&definitions).map_or(0, |json| json.len());
+        console.note(&format!(
+            "server {server} ({}) model {} — workspace {}",
+            profile.endpoint,
+            profile.model,
+            workspace.display()
+        ));
+        console.note(&format!(
+            "sending {} chars of system prompt and {} tool definitions ({tools_bytes} chars)",
+            system.chars().count(),
+            definitions.len(),
+        ));
+
+        Ok(Self {
+            config,
+            config_path,
+            workspace,
+            quiet,
+            server,
+            profile,
+            tools,
+            skills,
+            session: ChatSession::new(&system),
+        })
+    }
+
+    pub(crate) async fn run(&mut self, input: &str) -> Result<()> {
+        let console = Console { quiet: self.quiet };
+
+        // Anything orangu answers on its own is answered here, before a single
+        // byte goes to the server.
+        let prompt = match run_local_command(
+            input,
+            LocalRun {
+                config: &self.config,
+                config_path: &self.config_path,
+                workspace: &self.workspace,
+                server: &self.server,
+                profile: &self.profile,
+                tools: &self.tools,
+                skills: &self.skills,
+                console,
+            },
+        )
+        .await?
+        {
+            Resolution::Handled => return Ok(()),
+            Resolution::Prompt(text) => text,
+        };
+
+        let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
+        let collected = Arc::clone(&metrics);
+        let started = Instant::now();
+        let mut first_delta: Option<std::time::Duration> = None;
+
+        let result = self
+            .session
+            .prompt(
+                &prompt,
+                &self.profile,
+                &self.tools,
+                |delta| {
+                    if first_delta.is_none() {
+                        first_delta = Some(started.elapsed());
+                    }
+                    console.delta(delta);
+                },
+                move |update| {
+                    if let Ok(mut state) = collected.lock() {
+                        state.merge(update);
+                    }
+                },
+                |_running| {},
+                |tool_call| {
+                    console.note(&format!("[tool] {}", tool_call.function.name));
+                },
+                |_| false,
+            )
+            .await;
+
+        console.delta("\n");
+        let elapsed = started.elapsed();
+        let metrics = metrics.lock().ok().map(|state| state.clone());
+        report_timings(console, elapsed, first_delta, metrics.as_ref());
+
+        result.map(|_| ())
+    }
 }
 
 /// What the local-command path needs that the run loop would normally hold in
@@ -245,6 +314,7 @@ struct LocalRun<'a> {
     workspace: &'a Path,
     /// The configured server section the one-shot runs against.
     server: &'a str,
+    profile: &'a LlmConfiguration,
     tools: &'a ToolExecutor,
     skills: &'a SkillRegistry,
     console: Console,
@@ -253,11 +323,7 @@ struct LocalRun<'a> {
 /// Offer the `-p` text to the interactive dispatcher and, when it is a command,
 /// run it here. Returns the text to send to the model when it is not.
 async fn run_local_command(input: &str, run: LocalRun<'_>) -> Result<Resolution> {
-    let profile = run
-        .config
-        .llms
-        .get(run.server)
-        .ok_or_else(|| anyhow!("missing configured server {}", run.server))?;
+    let profile = run.profile;
 
     if let Some(command) = parse_local_command(input)
         && let Some(reason) = session_only_reason(&command)
@@ -353,7 +419,7 @@ fn absent_session_dir() -> PathBuf {
 }
 
 /// Commands whose whole effect is on the running session — the connection, the
-/// active server or model, the theme, the verbosity. A one-shot exits the
+/// active server or model, the theme, the prompt mode, or the verbosity. A one-shot exits the
 /// moment the command is done, so running them would change nothing anyone
 /// could see; say that instead of reporting a silent success.
 fn session_only_reason(command: &LocalCommand<'_>) -> Option<&'static str> {
@@ -377,11 +443,110 @@ fn session_only_reason(command: &LocalCommand<'_>) -> Option<&'static str> {
             "only changes the running session's licence, which -p does not keep; \
              the workspace's own licence is what a one-shot writes",
         ),
-        LocalCommand::SetVerbosity(_) => {
+        LocalCommand::SetVerbosity(_) | LocalCommand::Mode(_) => {
             Some("only changes the running session's system prompt, which -p does not keep")
         }
         _ => None,
     }
+}
+
+/// Reject an explicit workflow slash command when its failure can be known
+/// before configuration is loaded or a job starts. Unknown names may still be
+/// workspace skills, so discovery is part of this otherwise static check.
+pub(crate) fn validate_workflow_input(input: &str, skills: &SkillRegistry) -> Result<()> {
+    let input = input.trim();
+    if !input.starts_with('/') {
+        return Ok(());
+    }
+
+    let Some(command) = parse_local_command(input) else {
+        let name = input[1..]
+            .split_once(char::is_whitespace)
+            .map_or(&input[1..], |(name, _)| name);
+        if !name.is_empty() && skills.find(name).is_some() {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "unknown command or workspace skill '{input}'; use /help to see available commands"
+        ));
+    };
+
+    if let Some(reason) = session_only_reason(&command) {
+        return Err(anyhow!("'{input}' {reason}"));
+    }
+    if terminal_only(&command) {
+        return Err(anyhow!(
+            "'{input}' needs the terminal interface and cannot run in a workflow"
+        ));
+    }
+    if invalid_static_arguments(&command) {
+        return Err(anyhow!("'{input}' has missing or invalid arguments"));
+    }
+    if matches!(
+        command,
+        LocalCommand::Export(
+            ExportTarget::Console | ExportTarget::Review | ExportTarget::AutoReview
+        )
+    ) {
+        return Err(anyhow!(
+            "'{input}' exports interactive session state that a workflow does not have"
+        ));
+    }
+
+    Ok(())
+}
+
+fn terminal_only(command: &LocalCommand<'_>) -> bool {
+    matches!(
+        command,
+        LocalCommand::Restart
+            | LocalCommand::Review
+            | LocalCommand::AutoReview(_, _, _)
+            | LocalCommand::Manual
+            | LocalCommand::Clear
+            | LocalCommand::Copy
+            | LocalCommand::Quit
+            | LocalCommand::Session(Some(_))
+            | LocalCommand::Workspace(Some(_))
+            | LocalCommand::CreateWorkspace(_)
+            | LocalCommand::DeleteWorkspace
+            | LocalCommand::PendingList
+            | LocalCommand::PendingDelete(Some(_))
+    )
+}
+
+fn invalid_static_arguments(command: &LocalCommand<'_>) -> bool {
+    matches!(
+        command,
+        LocalCommand::ShowFile(path) if path.trim().is_empty()
+    ) || matches!(
+        command,
+        LocalCommand::OpenFile(path) if path.trim().is_empty()
+    ) || matches!(
+        command,
+        LocalCommand::Grep(None)
+            | LocalCommand::Search(None)
+            | LocalCommand::Pull(None)
+            | LocalCommand::Comment(None)
+            | LocalCommand::Close(None)
+            | LocalCommand::Issue(None)
+            | LocalCommand::GetComments(None)
+            | LocalCommand::Merge(None)
+            | LocalCommand::Restore(None)
+            | LocalCommand::CreateFile(None)
+            | LocalCommand::DeleteFile(None)
+            | LocalCommand::MoveFile(None)
+            | LocalCommand::CreateDirectory(None)
+            | LocalCommand::MoveDirectory(None)
+            | LocalCommand::DeleteDirectory(None)
+            | LocalCommand::CherryPick(None)
+            | LocalCommand::Commit(None)
+            | LocalCommand::Amend(None)
+            | LocalCommand::Prune(None)
+            | LocalCommand::Shell(None)
+            | LocalCommand::PendingDelete(None)
+            | LocalCommand::Mcp(McpSubcommand::Usage)
+    )
 }
 
 /// Carry out what the dispatcher decided, printing to stdout instead of to the
@@ -543,6 +708,8 @@ mod tests {
             "/license MIT",
             "/verbosity terse",
             "/verbosity",
+            "/developer",
+            "/committer",
         ] {
             assert!(reason_for(input).is_some(), "{input} should be refused");
         }
