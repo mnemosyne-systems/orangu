@@ -37,6 +37,7 @@ pub mod model_download;
 pub mod model_registry;
 pub mod model_spec;
 pub mod os;
+pub mod profiling;
 
 pub mod session;
 pub mod shell;

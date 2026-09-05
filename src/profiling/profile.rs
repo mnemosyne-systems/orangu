@@ -53,7 +53,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::flamegraph;
+use crate::profiling::flamegraph;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 

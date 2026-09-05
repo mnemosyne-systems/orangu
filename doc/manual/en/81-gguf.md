@@ -250,6 +250,57 @@ Quantizing an already-quantized file is refused rather than supported.
 Rounding twice is worse than rounding once from the original, and a tool
 that quietly does the worse thing is a trap.
 
+## Finding out where the time goes
+
+Two instruments, and they answer different questions. Using the wrong one
+is how a stage that costs a quarter of a training run stays invisible.
+
+### `--flamegraph`: which code the CPUs are in
+
+```sh
+orangu-gguf manifest.json --flamegraph run.svg
+```
+
+Samples this process for the whole build — corpus, tokenizer, packing,
+training and the write — and renders the flamegraph, the folded stacks
+beside it, and a PNG with `--flamegraph-png`. There is no shell pipeline
+and no external script: `perf record` is the only outside program, and
+everything after it is `orangu::profiling`, which `orangu-bench` uses for
+the same job on a running server.
+
+A manifest with no steps left to run therefore profiles corpus
+preparation, and one with steps profiles training — which is how the two
+are told apart without a flag that could disagree with the manifest.
+
+The thread pool is warmed before sampling starts, deliberately. `perf
+record -p` attaches to the threads that exist at that instant and never
+picks up ones created later, and rayon builds its workers on first use —
+so on a run whose corpus is already packed, a recorder started any earlier
+would sample the main thread and nothing else, and still produce a
+perfectly confident-looking flamegraph of a program doing one thing at a
+time.
+
+### `ORANGU_GGUF_STAGES`: where the seconds go
+
+```sh
+ORANGU_GGUF_STAGES=1 orangu-gguf manifest.json
+```
+
+prints a table after the run: seconds in each stage of a training step,
+its share of the run, and how many times it was entered. Each stage is
+timed on the calling thread, around its parallel region rather than inside
+it, so what it reports is elapsed time — and the total comes back within a
+few percent of the run.
+
+**This is the one that finds a narrow stage.** A profiler counts where the
+CPUs are, so a stage running on one thread while fifteen sit idle costs a
+sixteenth of the samples it costs in seconds. Both of the largest wins in
+this tool's history were invisible to the flamegraph and obvious here: a
+kernel at 9.6% of samples and 24.7% of the clock, and a serial loop at
+half a percent of samples and 5.4% of the clock. Read the two together —
+the profiler says which code, the table says whether it is slow because it
+is *slow* or slow because it is *narrow*.
+
 ## The writer's invariant
 
 Every tensor's data offset follows from the types and shapes alone, so the
@@ -276,7 +327,10 @@ are numerically fine and completely meaningless.
 - **A new size**: add a `Size` to `SIZES` in `model.rs`. The hidden width
   must be the head count times the head width, and the head count must
   divide by the key/value head count — `the_named_sizes_are_the_sizes_they_claim`
-  checks both.
+  checks both. `tiny` and `smoke` are not two names for the same idea:
+  `tiny` is the shape the unit tests use, and `smoke` is the shape a
+  change is *measured* on, which is why it has grouped attention and
+  matrices past a last-level cache.
 - **A new weight format**: add an `Ftype` variant, its `file_type` number,
   its per-tensor rule in `plan_tensor`, a block encoder, and its fallback
   in `fit`. The round-trip test's tolerance should be set just above the

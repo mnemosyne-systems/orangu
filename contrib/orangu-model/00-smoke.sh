@@ -14,12 +14,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# Stage 0: prove the whole pipeline works here, in minutes.
+# Stage 0: prove the whole pipeline works here, in about half an hour.
 #
 # `corpus-smoke.json` is a four-repository corpus of about 20 MB at the
 # `smoke` size — clone, tokenizer, packing, training, and a written GGUF
 # that `orangu-server` loads and generates from. It is a *pipeline* test,
-# not a model: 200 steps on 20 MB teaches nothing, and the output is meant
+# not a model: 240 steps on 20 MB teaches nothing, and the output is meant
 # to be gibberish. What it proves is that every stage runs on this machine,
 # which is worth knowing before committing days to stage 1.
 #
@@ -43,6 +43,6 @@ echo
 echo "  orangu-server ${BF16} --port 8100"
 echo
 echo "The web console is then on http://localhost:8200. Expect nonsense out"
-echo "of it: this model has ~8M parameters and saw 200 steps, so what you"
+echo "of it: this model has ~63M parameters and saw 240 steps, so what you"
 echo "are checking is that a prompt goes in and tokens come back, not what"
 echo "they say. Then run ./10-bf16.sh for the real thing."

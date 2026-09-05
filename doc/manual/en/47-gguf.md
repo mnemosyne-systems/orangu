@@ -47,9 +47,10 @@ orangu-gguf corpus.json
 
 The manifest is the whole command: the size, the context length, the weight
 format, the corpus and the schedule all live in it, and everything it does
-not mention takes a documented default. `smoke` finishes in minutes and
-exists to prove the whole pipeline works on your machine before you commit
-a week to it. Then serve what came out:
+not mention takes a documented default. `smoke` finishes in about half an
+hour and exists to prove the whole pipeline works on your machine before you
+commit a week to it; `tiny` is a smaller shape again, for when the question
+is only whether the tool runs at all. Then serve what came out:
 
 ```sh
 orangu-server ./my-model-smoke-BF16.gguf
@@ -121,7 +122,7 @@ outcome than a parse failure.
 
 | Field | Default | Meaning |
 |:---|:---|:---|
-| `training_size` | `2b` | `smoke`, `0.5b`, `1b` or `2b` |
+| `training_size` | `2b` | `tiny`, `smoke`, `0.5b`, `1b` or `2b` |
 | `context_size` | `256k` | The context length the model declares. Accepts `8192`, `8k`, `1M` |
 | `quantization` | `bf16` | The weight format written |
 | `vocab_size` | `32768` | Tokens in a newly trained vocabulary |
@@ -144,7 +145,7 @@ outcome than a parse failure.
 | `export_only` | `false` | Write the model from the checkpoint without training further |
 
 `log_every` is in **seconds**, unlike `eval_every` and `checkpoint_every`.
-A step is seconds at `smoke` and minutes at `2b`, so a count of steps is a
+A step is seconds at `tiny` and minutes at `2b`, so a count of steps is a
 different amount of output at every size — and it is worst at the size that
 runs for days, which is the one somebody is watching to see that it is
 still alive. A run prints a line a minute:
@@ -299,7 +300,7 @@ same question they do.
 
 `contrib/orangu-model/` is the whole thing ready to run: two manifests,
 and a script per stage from the smoke test through BF16 to both
-quantizations. Its own `README.md` covers the settings and what each stage
+quantizations, plus one that installs the result. Its own `README.md` covers the settings and what each stage
 costs; this is the summary.
 
 `contrib/orangu-model/corpus.json` is the training list — this project's
@@ -333,19 +334,27 @@ identifier, and they do not have one. `hello-algo` is CC BY-NC-SA
 `wrk` is under a *modified* Apache 2.0. Adding any of them means saying so
 deliberately with `allow_any_license`.
 
-The four stages, in order:
+The stages, in order:
 
 ```sh
 cd contrib/orangu-model
-./00-smoke.sh       # the whole pipeline, on 20 MB, in minutes
+./00-smoke.sh       # the whole pipeline, on 20 MB, in about half an hour
 ./10-bf16.sh        # the real run, entirely per corpus.json
 ./20-q6_k.sh
 ./30-q4_k_m.sh
+./install.sh        # into the models directory, so the server can see them
 ```
 
 The scripts hold no settings of their own — everything is in the two
 manifests, so changing the run means editing `corpus.json` rather than
-hunting through shell. `00-smoke.sh` uses `corpus-smoke.json` — the four
+hunting through shell. `install.sh` is the exception to "everything is in
+the manifest", and only because the setting it needs is not a property of
+the model: it reads the models directory out of `orangu-server.conf`, the
+same file and the same key the server reads, and lays each file out as
+`models--<org>--<model>-<size>-GGUF/snapshots/<rev>/` so that
+`orangu-server list` shows it as `mnemosynesystems/orangu-smoke-GGUF:Q4_K_M`
+rather than as a bare filename — which is also the form `--model` takes. Its
+own `README.md` has the details. `00-smoke.sh` uses `corpus-smoke.json` — the four
 smallest permissive projects, about 20 MB — so it clones in seconds and
 keeps its output in `smoke/`. Its result is meant to be gibberish; what it
 proves is that every stage runs on this machine, which is worth knowing
@@ -394,10 +403,10 @@ in both the `-ts 1b` and `-ts=1b` spellings, alongside the long forms.
 
 ## Sizes
 
-Four sizes, sharing one vocabulary, so a tokenizer trained once carries
+Five sizes, sharing one vocabulary, so a tokenizer trained once carries
 across all of them. The parameter counts are for the default 32,768-token
 vocabulary; a smaller one takes two tensors down with it, which is most of
-what `smoke` is.
+what `tiny` is.
 
 Every hidden and feed-forward width is a multiple of **256**, and that is a
 requirement rather than a preference: 256 is the K-quants' super-block, and
@@ -407,13 +416,26 @@ length is the feed-forward width rather than the hidden one.
 
 | Size | Hidden | Feed-forward | Blocks | Heads | KV heads | Parameters |
 |:---|---:|---:|---:|---:|---:|---:|
-| `smoke` | 256 | 768 | 4 | 4 | 4 | ~20M |
+| `tiny` | 256 | 768 | 4 | 4 | 4 | ~20M |
+| `smoke` | 768 | 2048 | 8 | 6 | 2 | ~100M |
 | `0.5b` | 1280 | 3584 | 24 | 10 | 5 | ~0.53B |
 | `1b` | 1536 | 5632 | 28 | 12 | 6 | ~1.0B |
 | `2b` | 2048 | 8192 | 30 | 16 | 8 | ~2.0B |
 
+The two small ones have different jobs. `tiny` answers "does this machine
+run the tool at all", and it answers it in a couple of minutes. `smoke`
+answers "does this machine run the tool *properly*", and it takes about
+half an hour, because the things that go wrong quietly need a model shaped
+like a real one to go wrong in: it has fewer key/value heads than query
+heads, so grouped-query attention is actually grouped; three query heads to
+a key/value head, so the group is not a power of two and an index that
+works by alignment stops working; eight blocks; and a feed-forward matrix
+larger than a last-level cache, which is what makes a measurement taken on
+it mean anything at the sizes below.
+
 **These are real training runs, and they cost what training costs.**
-Everything runs on the CPU in 32-bit floating point. `smoke` is minutes;
+Everything runs on the CPU in 32-bit floating point. `tiny` is minutes and
+`smoke` is about half an hour;
 the three real sizes are days to weeks of continuous compute on a corpus
 large enough to be worth it, and they need memory to match — training holds
 four numbers per parameter (the weight, its gradient, and the optimizer's

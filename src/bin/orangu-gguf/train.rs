@@ -30,6 +30,7 @@
 //!   validation set, and a validation loss measured on trained tokens
 //!   measures nothing.
 
+use crate::stages::{self, Stage, time};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use std::{
@@ -329,8 +330,11 @@ pub fn run(
         start_step,
     );
 
+    // The steps that are reported on are the ones asked for; anything
+    // before the loop is setup, not a step.
+    stages::reset();
     for step in start_step..options.steps {
-        grads.fill(0.0);
+        time(Stage::GradientZero, || grads.fill(0.0));
         let mut loss = 0.0f32;
         for _ in 0..options.batch {
             let at = (rng.next_u64() % train_limit as u64) as usize;
@@ -348,21 +352,24 @@ pub fn run(
 
         // One scale carries both the batch average and the clip, so the
         // gradient is only ever multiplied through once.
-        let norm = Optimizer::gradient_norm(&grads) / options.batch as f32;
+        let norm =
+            time(Stage::GradientNorm, || Optimizer::gradient_norm(&grads)) / options.batch as f32;
         let clip = if norm > options.grad_clip && norm > 0.0 {
             options.grad_clip / norm
         } else {
             1.0
         };
         let lr = learning_rate(step, options);
-        optimizer.apply(
-            &mut model.params,
-            &grads,
-            &model.layout,
-            lr,
-            options.weight_decay,
-            clip / options.batch as f32,
-        );
+        time(Stage::Optimizer, || {
+            optimizer.apply(
+                &mut model.params,
+                &grads,
+                &model.layout,
+                lr,
+                options.weight_decay,
+                clip / options.batch as f32,
+            )
+        });
 
         let done = step + 1;
         {
@@ -399,6 +406,7 @@ pub fn run(
         "{}",
         status.line(started, options.steps, start_step, status.done)
     );
+    print!("{}", stages::report(started.elapsed().as_secs_f64()));
     Ok(())
 }
 

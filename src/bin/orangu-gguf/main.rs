@@ -37,6 +37,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use orangu::gguf::{GgufFile, GgufValue};
+use orangu::profiling::profile;
 use rayon::prelude::*;
 use std::{
     ffi::OsString,
@@ -52,6 +53,7 @@ mod manifest;
 mod model;
 mod pack;
 mod quant;
+mod stages;
 mod train;
 mod vocab;
 mod wikipedia;
@@ -86,6 +88,11 @@ Options:
   -cs, --context-size <N>      Context length the model declares, overriding the manifest
   -o,  --output <FILE>         Where the model is written, overriding the manifest
        --list-quantizations    List the weight formats a manifest's quantization accepts
+       --flamegraph <PATH>     Record a CPU flamegraph of the run and render it here
+       --flamegraph-freq <HZ>  Sampling frequency in Hz for --flamegraph [default: 999]
+       --flamegraph-call-graph <MODE>
+                               Call-graph mode for --flamegraph: fp or dwarf [default: fp]
+       --flamegraph-png        Also render a PNG beside the flamegraph SVG
   -h,  --help                  Print help
   -V,  --version               Print version
 ";
@@ -134,10 +141,31 @@ struct Args {
     /// List the weight formats a manifest's `quantization` accepts and exit.
     #[arg(long = "list-quantizations")]
     list_quantizations: bool,
+
+    /// Record a CPU flamegraph of the run and render it here.
+    #[arg(long, value_name = "PATH")]
+    flamegraph: Option<PathBuf>,
+
+    /// Sampling frequency in Hz for `--flamegraph`.
+    #[arg(long = "flamegraph-freq", default_value_t = 999, value_name = "HZ")]
+    flamegraph_freq: u32,
+
+    /// Call-graph mode for `--flamegraph`: `fp` or `dwarf`.
+    #[arg(
+        long = "flamegraph-call-graph",
+        default_value = "fp",
+        value_name = "MODE"
+    )]
+    flamegraph_call_graph: String,
+
+    /// Also render a PNG beside the flamegraph SVG.
+    #[arg(long = "flamegraph-png", default_value_t = false)]
+    flamegraph_png: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse_from(normalize(std::env::args_os()));
+    stages::init();
 
     if args.list_quantizations {
         for ftype in Ftype::ALL {
@@ -247,6 +275,55 @@ fn verify_round_trip(encoder: &vocab::Encoder<'_>, files: &[PathBuf]) -> Result<
 }
 
 /// The full pipeline: corpus, tokenizer, packed tokens, training, export.
+/// Starts sampling this process, if the run asked for a flamegraph.
+///
+/// The pool is warmed first, and that is not a nicety. `perf record -p`
+/// attaches to the threads that exist at the moment it starts and never
+/// picks up ones created later, and rayon builds its workers lazily — on a
+/// run whose corpus is already packed, the first parallel region is inside
+/// training, so a recorder started before it would sample the main thread
+/// and nothing else, and still produce a confident-looking flamegraph of a
+/// program doing one thing at a time.
+fn start_profile(args: &Args, label: &str) -> Result<Option<profile::Recorder>> {
+    let Some(path) = &args.flamegraph else {
+        return Ok(None);
+    };
+    rayon::broadcast(|_| {});
+    let recorder = profile::Recorder::start(profile::Options {
+        svg: path.clone(),
+        pid: std::process::id(),
+        freq: args.flamegraph_freq,
+        call_graph: args.flamegraph_call_graph.clone(),
+        png: args.flamegraph_png,
+        title: format!("orangu-gguf · {label}"),
+    })?;
+    Ok(Some(recorder))
+}
+
+/// Renders what was recorded, and says what it saw.
+///
+/// Reported rather than propagated: a run that trained for hours and then
+/// could not render its profile has still produced the model, and losing
+/// that to a missing `perf` would be the wrong trade.
+fn finish_profile(recorder: Option<profile::Recorder>) {
+    let Some(recorder) = recorder else { return };
+    match recorder.finish() {
+        Ok(summary) => {
+            println!(
+                "\nprofile    {} ({} samples, {:.1} cores busy)",
+                summary.svg.display(),
+                summary.samples,
+                summary.cores_busy
+            );
+            println!("           {}", summary.folded.display());
+            if let Some(png) = &summary.png {
+                println!("           {}", png.display());
+            }
+        }
+        Err(why) => eprintln!("\nprofile    not written: {why:#}"),
+    }
+}
+
 fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     let started = Instant::now();
     let mut manifest = Manifest::load(manifest_path)?;
@@ -324,150 +401,158 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     }
     println!();
 
-    // 1. The corpus.
-    let mut roots: Vec<corpus::Root> = if manifest.offline {
-        vec![corpus::Root::repository(
-            corpus_dir.clone(),
-            manifest.max_file_size,
-        )]
-    } else {
-        corpus::fetch_all(&manifest, &corpus_dir, manifest.jobs)?
-            .into_iter()
-            .map(|path| corpus::Root::repository(path, manifest.max_file_size))
-            .collect()
-    };
-
-    // Prose, if the manifest asked for it. It lands inside the corpus
-    // directory as plain text, so every stage after this one treats it as
-    // one more source and nothing downstream needs to know where it came
-    // from.
-    let mut wikipedia_source: Option<String> = None;
-    if let Some(settings) = &manifest.wikipedia {
-        // Beside the clones, not inside them: it is not a repository, and
-        // keeping it separate is what lets it be walked under its own
-        // rules.
-        let dir = work.join("wikipedia");
-        if manifest.offline {
-            println!(
-                "\nwikipedia: offline — using what is already in {}",
-                dir.display()
-            );
+    // Everything from here to the written file is inside the profile, so a
+    // manifest with no steps left to run profiles corpus preparation and one
+    // with steps profiles training — which is how the two are told apart
+    // without a second flag that could disagree with the manifest.
+    let recorder = start_profile(args, size.key)?;
+    let outcome = (|| -> Result<()> {
+        // 1. The corpus.
+        let mut roots: Vec<corpus::Root> = if manifest.offline {
+            vec![corpus::Root::repository(
+                corpus_dir.clone(),
+                manifest.max_file_size,
+            )]
         } else {
-            println!(
-                "\nwikipedia: {}wiki, up to {} of article text",
-                settings.language,
-                bytes(settings.max_bytes)
-            );
-            let report = wikipedia::fetch(&dir, settings, &|report| {
-                print!(
-                    "\r  {} articles, {} across {} shards    ",
+            corpus::fetch_all(&manifest, &corpus_dir, manifest.jobs)?
+                .into_iter()
+                .map(|path| corpus::Root::repository(path, manifest.max_file_size))
+                .collect()
+        };
+
+        // Prose, if the manifest asked for it. It lands inside the corpus
+        // directory as plain text, so every stage after this one treats it as
+        // one more source and nothing downstream needs to know where it came
+        // from.
+        let mut wikipedia_source: Option<String> = None;
+        if let Some(settings) = &manifest.wikipedia {
+            // Beside the clones, not inside them: it is not a repository, and
+            // keeping it separate is what lets it be walked under its own
+            // rules.
+            let dir = work.join("wikipedia");
+            if manifest.offline {
+                println!(
+                    "\nwikipedia: offline — using what is already in {}",
+                    dir.display()
+                );
+            } else {
+                println!(
+                    "\nwikipedia: {}wiki, up to {} of article text",
+                    settings.language,
+                    bytes(settings.max_bytes)
+                );
+                let report = wikipedia::fetch(&dir, settings, &|report| {
+                    print!(
+                        "\r  {} articles, {} across {} shards    ",
+                        report.articles,
+                        bytes(report.bytes),
+                        report.shards
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                })?;
+                println!(
+                    "\nwikipedia: {} articles, {} across {} shards",
                     report.articles,
                     bytes(report.bytes),
                     report.shards
                 );
+                wikipedia_source = Some(report.source);
+            }
+            roots.push(corpus::Root::generated(dir));
+        }
+        let (files, report) = corpus::scan(&roots);
+        println!(
+            "\ncorpus: {} files ({} skipped by name, {} too large)",
+            report.kept, report.skipped_extension, report.skipped_large
+        );
+        if files.is_empty() {
+            bail!("the corpus has no files to train on");
+        }
+
+        // 2. The tokenizer.
+        let vocabulary = if vocab_path.exists() && !manifest.rebuild {
+            println!("tokenizer: reusing {}", vocab_path.display());
+            vocab::Vocab::load(&vocab_path)?
+        } else {
+            println!(
+                "tokenizer: sampling up to {} of corpus text",
+                bytes(manifest.tokenizer_sample)
+            );
+            let sample = pack::sample(&files, manifest.tokenizer_sample);
+            let sampled: u64 = sample.iter().map(|s| s.len() as u64).sum();
+            println!(
+                "tokenizer: training {} tokens on {} from {} documents",
+                manifest.vocab_size,
+                bytes(sampled),
+                sample.len()
+            );
+            let vocabulary =
+                vocab::train(sample.into_iter(), manifest.vocab_size, &|done, total| {
+                    print!("\r  merges {done}/{total}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                })?;
+            println!();
+            vocabulary.save(&vocab_path)?;
+            vocabulary
+        };
+        println!("tokenizer: {} tokens", vocabulary.len());
+        let encoder = vocabulary.encoder()?;
+        verify_round_trip(&encoder, &files)?;
+
+        // 3. The packed token stream.
+        if !tokens_path.exists() || manifest.rebuild {
+            let report = pack::pack(&files, &encoder, &tokens_path, &|report, seen| {
+                print!(
+                    "\r  packing {}/{} files, {} tokens",
+                    seen.min(files.len()),
+                    files.len(),
+                    report.tokens
+                );
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             })?;
             println!(
-                "\nwikipedia: {} articles, {} across {} shards",
-                report.articles,
-                bytes(report.bytes),
-                report.shards
+                "\npacked: {} documents, {} tokens ({} duplicates, {} unreadable)",
+                report.documents, report.tokens, report.duplicates, report.unreadable
             );
-            wikipedia_source = Some(report.source);
+        } else {
+            println!("packed: reusing {}", tokens_path.display());
         }
-        roots.push(corpus::Root::generated(dir));
-    }
-    let (files, report) = corpus::scan(&roots);
-    println!(
-        "\ncorpus: {} files ({} skipped by name, {} too large)",
-        report.kept, report.skipped_extension, report.skipped_large
-    );
-    if files.is_empty() {
-        bail!("the corpus has no files to train on");
-    }
+        let tokens = pack::Tokens::open(&tokens_path)?;
+        println!("packed: {} tokens", tokens.len());
 
-    // 2. The tokenizer.
-    let vocabulary = if vocab_path.exists() && !manifest.rebuild {
-        println!("tokenizer: reusing {}", vocab_path.display());
-        vocab::Vocab::load(&vocab_path)?
-    } else {
-        println!(
-            "tokenizer: sampling up to {} of corpus text",
-            bytes(manifest.tokenizer_sample)
-        );
-        let sample = pack::sample(&files, manifest.tokenizer_sample);
-        let sampled: u64 = sample.iter().map(|s| s.len() as u64).sum();
-        println!(
-            "tokenizer: training {} tokens on {} from {} documents",
-            manifest.vocab_size,
-            bytes(sampled),
-            sample.len()
-        );
-        let vocabulary = vocab::train(sample.into_iter(), manifest.vocab_size, &|done, total| {
-            print!("\r  merges {done}/{total}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        })?;
-        println!();
-        vocabulary.save(&vocab_path)?;
-        vocabulary
-    };
-    println!("tokenizer: {} tokens", vocabulary.len());
-    let encoder = vocabulary.encoder()?;
-    verify_round_trip(&encoder, &files)?;
+        // 4. The model.
+        let cfg = Config::from_size(size, vocabulary.len(), context);
+        let sequence = manifest.sequence_length.min(context);
+        let steps = match manifest.steps {
+            Some(steps) => steps,
+            None => {
+                let per_step = (manifest.batch * sequence) as f64;
+                ((tokens.len() as f64 * manifest.epochs) / per_step).ceil() as u64
+            }
+        };
+        let options = train::Options {
+            steps,
+            batch: manifest.batch,
+            sequence,
+            peak_lr: manifest.learning_rate.unwrap_or_else(|| size.peak_lr()),
+            warmup: (steps / 20).clamp(1, 2000),
+            weight_decay: 0.1,
+            grad_clip: 1.0,
+            seed: manifest.seed,
+            log_every: manifest.log_every,
+            eval_every: manifest.eval_every,
+            checkpoint_every: manifest.checkpoint_every,
+        };
 
-    // 3. The packed token stream.
-    if !tokens_path.exists() || manifest.rebuild {
-        let report = pack::pack(&files, &encoder, &tokens_path, &|report, seen| {
-            print!(
-                "\r  packing {}/{} files, {} tokens",
-                seen.min(files.len()),
-                files.len(),
-                report.tokens
+        if manifest.export_only && !checkpoint_path.exists() {
+            bail!(
+                "\"export_only\" has nothing to export: {} does not exist",
+                checkpoint_path.display()
             );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        })?;
-        println!(
-            "\npacked: {} documents, {} tokens ({} duplicates, {} unreadable)",
-            report.documents, report.tokens, report.duplicates, report.unreadable
-        );
-    } else {
-        println!("packed: reusing {}", tokens_path.display());
-    }
-    let tokens = pack::Tokens::open(&tokens_path)?;
-    println!("packed: {} tokens", tokens.len());
-
-    // 4. The model.
-    let cfg = Config::from_size(size, vocabulary.len(), context);
-    let sequence = manifest.sequence_length.min(context);
-    let steps = match manifest.steps {
-        Some(steps) => steps,
-        None => {
-            let per_step = (manifest.batch * sequence) as f64;
-            ((tokens.len() as f64 * manifest.epochs) / per_step).ceil() as u64
         }
-    };
-    let options = train::Options {
-        steps,
-        batch: manifest.batch,
-        sequence,
-        peak_lr: manifest.learning_rate.unwrap_or_else(|| size.peak_lr()),
-        warmup: (steps / 20).clamp(1, 2000),
-        weight_decay: 0.1,
-        grad_clip: 1.0,
-        seed: manifest.seed,
-        log_every: manifest.log_every,
-        eval_every: manifest.eval_every,
-        checkpoint_every: manifest.checkpoint_every,
-    };
-
-    if manifest.export_only && !checkpoint_path.exists() {
-        bail!(
-            "\"export_only\" has nothing to export: {} does not exist",
-            checkpoint_path.display()
-        );
-    }
-    let (mut network, mut optimizer, start_step) =
-        if (manifest.resume || manifest.export_only) && checkpoint_path.exists() {
+        let (mut network, mut optimizer, start_step) = if (manifest.resume || manifest.export_only)
+            && checkpoint_path.exists()
+        {
             let (network, optimizer, step) = train::load(&checkpoint_path, &cfg)?;
             println!("resuming from step {step}");
             (network, optimizer, step)
@@ -481,8 +566,8 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
                 if reached < steps {
                     bail!(
                         "{} already holds a checkpoint, stopped at step {reached} of {steps}.\n  \
-                     To continue it, set \"resume\": true in {}.\n  \
-                     To start over, set \"rebuild\": true there, or delete the file.",
+                         To continue it, set \"resume\": true in {}.\n  \
+                         To start over, set \"rebuild\": true there, or delete the file.",
                         checkpoint_path.display(),
                         manifest_path.display()
                     );
@@ -494,62 +579,65 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             (network, optimizer, 0)
         };
 
-    if manifest.export_only {
-        println!(
-            "\nexporting {} parameters as they stand\n",
-            network.layout.total
-        );
-    } else {
-        println!(
-            "\ntraining {} parameters for {steps} steps of {} x {sequence} tokens\n",
-            network.layout.total, options.batch
-        );
-    }
-    if !manifest.export_only {
-        train::run(
-            &mut network,
-            &mut optimizer,
-            &tokens,
-            &options,
-            &checkpoint_path,
-            start_step,
-        )?;
-        if options.checkpoint_every == 0 {
-            train::save(&checkpoint_path, &network, &optimizer, steps)?;
+        if manifest.export_only {
+            println!(
+                "\nexporting {} parameters as they stand\n",
+                network.layout.total
+            );
+        } else {
+            println!(
+                "\ntraining {} parameters for {steps} steps of {} x {sequence} tokens\n",
+                network.layout.total, options.batch
+            );
         }
-    }
+        if !manifest.export_only {
+            train::run(
+                &mut network,
+                &mut optimizer,
+                &tokens,
+                &options,
+                &checkpoint_path,
+                start_step,
+            )?;
+            if options.checkpoint_every == 0 {
+                train::save(&checkpoint_path, &network, &optimizer, steps)?;
+            }
+        }
 
-    // 5. The model file.
-    let output = manifest.output.clone().unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "{}-{}-{}.gguf",
-            manifest.name,
+        // 5. The model file.
+        let output = manifest.output.clone().unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{}-{}-{}.gguf",
+                manifest.name,
+                size.key,
+                ftype.name()
+            ))
+        });
+        let metadata = model_metadata(
+            &manifest,
+            &cfg,
+            ftype,
             size.key,
-            ftype.name()
-        ))
-    });
-    let metadata = model_metadata(
-        &manifest,
-        &cfg,
-        ftype,
-        size.key,
-        wikipedia_source.as_deref(),
-    );
-    let written = export(
-        &output,
-        &network,
-        &vocabulary,
-        metadata,
-        ftype,
-        &manifest.chat_template,
-    )?;
-    println!(
-        "\nwrote {} ({}) in {}",
-        output.display(),
-        bytes(written),
-        train::format_duration(started.elapsed().as_secs_f64())
-    );
-    Ok(())
+            wikipedia_source.as_deref(),
+        );
+        let written = export(
+            &output,
+            &network,
+            &vocabulary,
+            metadata,
+            ftype,
+            &manifest.chat_template,
+        )?;
+        println!(
+            "\nwrote {} ({}) in {}",
+            output.display(),
+            bytes(written),
+            train::format_duration(started.elapsed().as_secs_f64())
+        );
+        Ok(())
+    })();
+    finish_profile(recorder);
+    outcome
 }
 
 /// Writes a trained model out at `ftype`.

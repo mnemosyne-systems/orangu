@@ -51,11 +51,10 @@ use clap::Parser;
 
 mod bundle;
 mod chart;
-mod flamegraph;
 mod history;
 mod moe;
 mod points;
-mod profile;
+use orangu::profiling::profile;
 mod report;
 mod storage;
 mod sweep;

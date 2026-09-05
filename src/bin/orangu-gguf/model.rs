@@ -38,11 +38,12 @@
 //! long sequence fit at all.
 
 use crate::aligned::Aligned;
+use crate::stages::{Stage, time};
 use rayon::prelude::*;
 use std::f32::consts::PI;
 use wide::f32x8;
 
-/// A named training size. The four the guide's staged plan uses, sharing
+/// A named training size. The ones the guide's staged plan uses, sharing
 /// one vocabulary so a tokenizer trained once carries across all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -73,9 +74,26 @@ impl Size {
 ///
 /// `ffn` is otherwise the usual `8/3 * hidden` of a SwiGLU network, rounded
 /// up to the next multiple of 256.
+///
+/// The two small sizes have different jobs. `tiny` is the shape the unit
+/// tests and a first "does this machine work at all" run want: four blocks
+/// of 256, small enough to finish while you watch it. `smoke` is the one a
+/// change is *measured* on, and every one of its numbers is there because
+/// the tiny shape does not exercise it:
+///
+/// - **`kv_heads` below `heads`.** Grouped-query attention is half the
+///   reason this architecture was chosen, and at `tiny` the group is one,
+///   so the grouping is never taken. Three query heads per key/value head
+///   also makes the group something other than a power of two, which is
+///   where an index that happens to work by alignment stops working.
+/// - **A feed-forward matrix larger than a last-level cache.** `tiny`'s
+///   weights all fit in one, so every conclusion about memory traffic drawn
+///   at that size is a conclusion about cache hits.
+/// - **Eight blocks and a 128-wide head.** The block loop, the rotation and
+///   the per-head norms all run at the widths the real sizes use.
 pub const SIZES: &[Size] = &[
     Size {
-        key: "smoke",
+        key: "tiny",
         hidden: 256,
         ffn: 768,
         layers: 4,
@@ -83,6 +101,16 @@ pub const SIZES: &[Size] = &[
         kv_heads: 4,
         head_dim: 64,
         peak_lr_micro: 1000,
+    },
+    Size {
+        key: "smoke",
+        hidden: 768,
+        ffn: 2048,
+        layers: 8,
+        heads: 6,
+        kv_heads: 2,
+        head_dim: 128,
+        peak_lr_micro: 700,
     },
     Size {
         key: "0.5b",
@@ -428,10 +456,12 @@ impl Model {
         let mut inputs: Vec<Aligned> = Vec::with_capacity(cfg.layers + 1);
         let mut x = Aligned::zeros(t * h);
         let embd = self.tensor(self.layout.tok_embd, cfg.vocab * h);
-        for (i, &token) in tokens.iter().enumerate() {
-            let row = token as usize * h;
-            x[i * h..(i + 1) * h].copy_from_slice(&embd[row..row + h]);
-        }
+        time(Stage::Embed, || {
+            for (i, &token) in tokens.iter().enumerate() {
+                let row = token as usize * h;
+                x[i * h..(i + 1) * h].copy_from_slice(&embd[row..row + h]);
+            }
+        });
 
         for l in 0..cfg.layers {
             inputs.push(x.clone());
@@ -445,7 +475,9 @@ impl Model {
         // largest single allocation in the whole pass, and nothing needs it
         // all at once.
         let final_norm = self.tensor(self.layout.output_norm, h);
-        let (normed, final_rms) = rmsnorm_forward(&x, final_norm, t, h, cfg.eps);
+        let (normed, final_rms) = time(Stage::RmsNorm, || {
+            rmsnorm_forward(&x, final_norm, t, h, cfg.eps)
+        });
         let head = self.tensor(self.layout.output, cfg.vocab * h);
 
         let mut loss = 0.0f64;
@@ -467,50 +499,76 @@ impl Model {
         for start in (0..t).step_by(rows_per_pass) {
             let rows = rows_per_pass.min(t - start);
             let logits = &mut logits[..rows * cfg.vocab];
-            matmul(
-                logits,
-                &normed[start * h..(start + rows) * h],
-                head,
-                rows,
-                h,
-                cfg.vocab,
-            );
-            for r in 0..rows {
-                let row = &mut logits[r * cfg.vocab..(r + 1) * cfg.vocab];
-                let target = targets[start + r] as usize;
-                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for value in row.iter_mut() {
-                    *value = (*value - max).exp();
-                    sum += *value;
-                }
-                loss -= ((row[target] / sum).max(f32::MIN_POSITIVE) as f64).ln();
-                if grads.is_some() {
-                    let scale = inv / sum;
-                    for value in row.iter_mut() {
-                        *value *= scale;
-                    }
-                    row[target] -= inv;
-                }
-            }
-            if let Some(g) = grads.as_deref_mut() {
-                let dhead = grad_slice(g, self.layout.output, cfg.vocab * h);
-                matmul_add_dw(
-                    dhead,
+            time(Stage::Logits, || {
+                matmul(
                     logits,
                     &normed[start * h..(start + rows) * h],
-                    rows,
-                    h,
-                    cfg.vocab,
-                );
-                matmul_add_dx(
-                    &mut d_normed[start * h..(start + rows) * h],
-                    logits,
                     head,
                     rows,
                     h,
                     cfg.vocab,
-                );
+                )
+            });
+            // A row at a time, and the rows in parallel: a token's
+            // softmax depends on nothing outside its own row, and this was
+            // one thread walking a `[tokens, vocab]` buffer — the largest
+            // one a step allocates — four times over.
+            //
+            // The per-row losses come back in row order and are summed in
+            // row order, which is the order the serial loop added them in.
+            // A `par_iter().sum()` here would be a different number on
+            // every run.
+            let want_grads = grads.is_some();
+            let row_targets = &targets[start..start + rows];
+            let losses: Vec<f64> = time(Stage::CrossEntropy, || {
+                logits
+                    .par_chunks_mut(cfg.vocab)
+                    .zip(row_targets.par_iter())
+                    .map(|(row, &target)| {
+                        let target = target as usize;
+                        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for value in row.iter_mut() {
+                            *value = (*value - max).exp();
+                            sum += *value;
+                        }
+                        let row_loss = -((row[target] / sum).max(f32::MIN_POSITIVE) as f64).ln();
+                        if want_grads {
+                            let scale = inv / sum;
+                            for value in row.iter_mut() {
+                                *value *= scale;
+                            }
+                            row[target] -= inv;
+                        }
+                        row_loss
+                    })
+                    .collect()
+            });
+            for row_loss in &losses {
+                loss += row_loss;
+            }
+            if let Some(g) = grads.as_deref_mut() {
+                let dhead = grad_slice(g, self.layout.output, cfg.vocab * h);
+                time(Stage::MatmulDw, || {
+                    matmul_add_dw(
+                        dhead,
+                        logits,
+                        &normed[start * h..(start + rows) * h],
+                        rows,
+                        h,
+                        cfg.vocab,
+                    )
+                });
+                time(Stage::MatmulDx, || {
+                    matmul_add_dx(
+                        &mut d_normed[start * h..(start + rows) * h],
+                        logits,
+                        head,
+                        rows,
+                        h,
+                        cfg.vocab,
+                    )
+                });
             }
         }
         let loss = (loss / t as f64) as f32;
@@ -522,16 +580,18 @@ impl Model {
         let mut dx = Aligned::zeros(t * h);
         {
             let dnorm = grad_slice(grads, self.layout.output_norm, h);
-            rmsnorm_backward(
-                &mut dx,
-                dnorm,
-                &d_normed,
-                &inputs[cfg.layers],
-                final_norm,
-                &final_rms,
-                t,
-                h,
-            );
+            time(Stage::RmsNormBackward, || {
+                rmsnorm_backward(
+                    &mut dx,
+                    dnorm,
+                    &d_normed,
+                    &inputs[cfg.layers],
+                    final_norm,
+                    &final_rms,
+                    t,
+                    h,
+                )
+            });
         }
 
         for l in (0..cfg.layers).rev() {
@@ -539,12 +599,14 @@ impl Model {
         }
 
         let dembd = grad_slice(grads, self.layout.tok_embd, cfg.vocab * h);
-        for (i, &token) in tokens.iter().enumerate() {
-            let row = token as usize * h;
-            for j in 0..h {
-                dembd[row + j] += dx[i * h + j];
+        time(Stage::EmbedBackward, || {
+            for (i, &token) in tokens.iter().enumerate() {
+                let row = token as usize * h;
+                for j in 0..h {
+                    dembd[row + j] += dx[i * h + j];
+                }
             }
-        }
+        });
         loss
     }
 
@@ -556,64 +618,79 @@ impl Model {
         let o = self.layout.layers[l];
 
         let attn_w = self.tensor(o.attn_norm, h);
-        let (normed, attn_rms) = rmsnorm_forward(x, attn_w, t, h, cfg.eps);
+        let (normed, attn_rms) = time(Stage::RmsNorm, || rmsnorm_forward(x, attn_w, t, h, cfg.eps));
 
         let mut q = Aligned::zeros(t * qd);
         let mut k = Aligned::zeros(t * kvd);
         let mut v = Aligned::zeros(t * kvd);
-        matmul_qkv(
-            &mut q,
-            &mut k,
-            &mut v,
-            &normed,
-            self.tensor(o.wq, qd * h),
-            self.tensor(o.wk, kvd * h),
-            self.tensor(o.wv, kvd * h),
-            t,
-            h,
-            qd,
-            kvd,
-        );
+        time(Stage::MatmulQkv, || {
+            matmul_qkv(
+                &mut q,
+                &mut k,
+                &mut v,
+                &normed,
+                self.tensor(o.wq, qd * h),
+                self.tensor(o.wk, kvd * h),
+                self.tensor(o.wv, kvd * h),
+                t,
+                h,
+                qd,
+                kvd,
+            )
+        });
 
         let q_w = self.tensor(o.q_norm, cfg.head_dim);
         let k_w = self.tensor(o.k_norm, cfg.head_dim);
-        let (q_normed, q_rms) = rmsnorm_forward(&q, q_w, t * cfg.heads, cfg.head_dim, cfg.eps);
-        let (k_normed, k_rms) = rmsnorm_forward(&k, k_w, t * cfg.kv_heads, cfg.head_dim, cfg.eps);
+        let (q_normed, q_rms) = time(Stage::RmsNorm, || {
+            rmsnorm_forward(&q, q_w, t * cfg.heads, cfg.head_dim, cfg.eps)
+        });
+        let (k_normed, k_rms) = time(Stage::RmsNorm, || {
+            rmsnorm_forward(&k, k_w, t * cfg.kv_heads, cfg.head_dim, cfg.eps)
+        });
 
         let mut q_rope = q_normed;
         let mut k_rope = k_normed;
-        rope(&mut q_rope, cfg.heads, cfg.head_dim, cfg.rope_base, false);
-        rope(
-            &mut k_rope,
-            cfg.kv_heads,
-            cfg.head_dim,
-            cfg.rope_base,
-            false,
-        );
+        {
+            // Bound as slices before the closure: `&mut` on an `Aligned`
+            // inside one captures the *deref*, which is unsized.
+            let (q_slice, k_slice): (&mut [f32], &mut [f32]) = (&mut q_rope, &mut k_rope);
+            time(Stage::Rope, || {
+                rope(q_slice, cfg.heads, cfg.head_dim, cfg.rope_base, false);
+                rope(k_slice, cfg.kv_heads, cfg.head_dim, cfg.rope_base, false);
+            });
+        }
 
-        let ctx = attention(&q_rope, &k_rope, &v, cfg, t);
+        let ctx = time(Stage::Attention, || attention(&q_rope, &k_rope, &v, cfg, t));
 
         let mut mid = Aligned::zeros(t * h);
-        matmul_residual(&mut mid, &ctx, self.tensor(o.wo, h * qd), x, t, qd, h);
+        time(Stage::MatmulAttnOut, || {
+            matmul_residual(&mut mid, &ctx, self.tensor(o.wo, h * qd), x, t, qd, h)
+        });
 
         let ffn_w = self.tensor(o.ffn_norm, h);
-        let (ffn_normed, ffn_rms) = rmsnorm_forward(&mid, ffn_w, t, h, cfg.eps);
+        let (ffn_normed, ffn_rms) = time(Stage::RmsNorm, || {
+            rmsnorm_forward(&mid, ffn_w, t, h, cfg.eps)
+        });
         let mut gate = Aligned::zeros(t * f);
         let mut up = Aligned::zeros(t * f);
         let mut act = Aligned::zeros(t * f);
-        matmul_swiglu(
-            &mut gate,
-            &mut up,
-            &mut act,
-            &ffn_normed,
-            self.tensor(o.w_gate, f * h),
-            self.tensor(o.w_up, f * h),
-            t,
-            h,
-            f,
-        );
+        time(Stage::MatmulSwiglu, || {
+            matmul_swiglu(
+                &mut gate,
+                &mut up,
+                &mut act,
+                &ffn_normed,
+                self.tensor(o.w_gate, f * h),
+                self.tensor(o.w_up, f * h),
+                t,
+                h,
+                f,
+            )
+        });
         let mut out = Aligned::zeros(t * h);
-        matmul_residual(&mut out, &act, self.tensor(o.w_down, h * f), &mid, t, f, h);
+        time(Stage::MatmulFfnDown, || {
+            matmul_residual(&mut out, &act, self.tensor(o.w_down, h * f), &mid, t, f, h)
+        });
 
         if !keep {
             return LayerCache {
@@ -659,106 +736,132 @@ impl Model {
         let mut d_act = Aligned::zeros(t * f);
         {
             let dw_down = grad_slice(grads, o.w_down, h * f);
-            matmul_add_dw(dw_down, dout, &c.act, t, f, h);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dw_down, dout, &c.act, t, f, h)
+            });
         }
-        matmul_add_dx(&mut d_act, dout, self.tensor(o.w_down, h * f), t, f, h);
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(&mut d_act, dout, self.tensor(o.w_down, h * f), t, f, h)
+        });
 
         let mut d_gate = Aligned::zeros(t * f);
         let mut d_up = Aligned::zeros(t * f);
-        for i in 0..t * f {
-            let s = silu(c.gate[i]);
-            d_up[i] = d_act[i] * s;
-            d_gate[i] = d_act[i] * c.up[i] * dsilu(c.gate[i]);
-        }
+        time(Stage::SwigluBackward, || {
+            swiglu_backward(&mut d_gate, &mut d_up, &d_act, &c.gate, &c.up)
+        });
 
         let mut d_ffn_normed = Aligned::zeros(t * h);
         {
             let dw_gate = grad_slice(grads, o.w_gate, f * h);
-            matmul_add_dw(dw_gate, &d_gate, &c.ffn_normed, t, h, f);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dw_gate, &d_gate, &c.ffn_normed, t, h, f)
+            });
         }
-        matmul_add_dx(
-            &mut d_ffn_normed,
-            &d_gate,
-            self.tensor(o.w_gate, f * h),
-            t,
-            h,
-            f,
-        );
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(
+                &mut d_ffn_normed,
+                &d_gate,
+                self.tensor(o.w_gate, f * h),
+                t,
+                h,
+                f,
+            )
+        });
         {
             let dw_up = grad_slice(grads, o.w_up, f * h);
-            matmul_add_dw(dw_up, &d_up, &c.ffn_normed, t, h, f);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dw_up, &d_up, &c.ffn_normed, t, h, f)
+            });
         }
-        matmul_add_dx(
-            &mut d_ffn_normed,
-            &d_up,
-            self.tensor(o.w_up, f * h),
-            t,
-            h,
-            f,
-        );
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(
+                &mut d_ffn_normed,
+                &d_up,
+                self.tensor(o.w_up, f * h),
+                t,
+                h,
+                f,
+            )
+        });
 
         // The residual around the feed-forward: `dout` flows straight
         // through to `mid` as well as through the block above.
         let mut d_mid = Aligned::from_slice(dout);
         {
             let dffn_norm = grad_slice(grads, o.ffn_norm, h);
-            rmsnorm_backward(
-                &mut d_mid,
-                dffn_norm,
-                &d_ffn_normed,
-                &c.mid,
-                self.tensor(o.ffn_norm, h),
-                &c.ffn_rms,
-                t,
-                h,
-            );
+            time(Stage::RmsNormBackward, || {
+                rmsnorm_backward(
+                    &mut d_mid,
+                    dffn_norm,
+                    &d_ffn_normed,
+                    &c.mid,
+                    self.tensor(o.ffn_norm, h),
+                    &c.ffn_rms,
+                    t,
+                    h,
+                )
+            });
         }
 
         // Attention output projection.
         let mut d_ctx = Aligned::zeros(t * qd);
         {
             let dwo = grad_slice(grads, o.wo, h * qd);
-            matmul_add_dw(dwo, &d_mid, &c.ctx, t, qd, h);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dwo, &d_mid, &c.ctx, t, qd, h)
+            });
         }
-        matmul_add_dx(&mut d_ctx, &d_mid, self.tensor(o.wo, h * qd), t, qd, h);
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(&mut d_ctx, &d_mid, self.tensor(o.wo, h * qd), t, qd, h)
+        });
 
-        let (mut d_q, mut d_k, d_v) =
-            attention_backward(&c.q_rope, &c.k_rope, &c.v, &d_ctx, cfg, t);
+        let (mut d_q, mut d_k, d_v) = time(Stage::AttentionBackward, || {
+            attention_backward(&c.q_rope, &c.k_rope, &c.v, &d_ctx, cfg, t)
+        });
 
         // Undo the rotation: it is orthogonal, so its backward is the same
         // rotation with the sine negated.
-        rope(&mut d_q, cfg.heads, cfg.head_dim, cfg.rope_base, true);
-        rope(&mut d_k, cfg.kv_heads, cfg.head_dim, cfg.rope_base, true);
+        {
+            let (dq_slice, dk_slice): (&mut [f32], &mut [f32]) = (&mut d_q, &mut d_k);
+            time(Stage::Rope, || {
+                rope(dq_slice, cfg.heads, cfg.head_dim, cfg.rope_base, true);
+                rope(dk_slice, cfg.kv_heads, cfg.head_dim, cfg.rope_base, true);
+            });
+        }
 
         // The Q/K norms run per head, so their "rows" are heads, not tokens.
-        let (q_pre, k_pre) = self.qk_pre_norm(l, t, &c);
+        let (q_pre, k_pre) = time(Stage::QkPreNorm, || self.qk_pre_norm(l, t, &c));
         let mut d_q_pre = Aligned::zeros(t * qd);
         {
             let dq_norm = grad_slice(grads, o.q_norm, cfg.head_dim);
-            rmsnorm_backward(
-                &mut d_q_pre,
-                dq_norm,
-                &d_q,
-                &q_pre,
-                self.tensor(o.q_norm, cfg.head_dim),
-                &c.q_rms,
-                t * cfg.heads,
-                cfg.head_dim,
-            );
+            time(Stage::RmsNormBackward, || {
+                rmsnorm_backward(
+                    &mut d_q_pre,
+                    dq_norm,
+                    &d_q,
+                    &q_pre,
+                    self.tensor(o.q_norm, cfg.head_dim),
+                    &c.q_rms,
+                    t * cfg.heads,
+                    cfg.head_dim,
+                )
+            });
         }
         let mut d_k_pre = Aligned::zeros(t * kvd);
         {
             let dk_norm = grad_slice(grads, o.k_norm, cfg.head_dim);
-            rmsnorm_backward(
-                &mut d_k_pre,
-                dk_norm,
-                &d_k,
-                &k_pre,
-                self.tensor(o.k_norm, cfg.head_dim),
-                &c.k_rms,
-                t * cfg.kv_heads,
-                cfg.head_dim,
-            );
+            time(Stage::RmsNormBackward, || {
+                rmsnorm_backward(
+                    &mut d_k_pre,
+                    dk_norm,
+                    &d_k,
+                    &k_pre,
+                    self.tensor(o.k_norm, cfg.head_dim),
+                    &c.k_rms,
+                    t * cfg.kv_heads,
+                    cfg.head_dim,
+                )
+            });
         }
         d_q = d_q_pre;
         d_k = d_k_pre;
@@ -766,34 +869,48 @@ impl Model {
         let mut d_normed = Aligned::zeros(t * h);
         {
             let dwq = grad_slice(grads, o.wq, qd * h);
-            matmul_add_dw(dwq, &d_q, &c.normed, t, h, qd);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dwq, &d_q, &c.normed, t, h, qd)
+            });
         }
-        matmul_add_dx(&mut d_normed, &d_q, self.tensor(o.wq, qd * h), t, h, qd);
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(&mut d_normed, &d_q, self.tensor(o.wq, qd * h), t, h, qd)
+        });
         {
             let dwk = grad_slice(grads, o.wk, kvd * h);
-            matmul_add_dw(dwk, &d_k, &c.normed, t, h, kvd);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dwk, &d_k, &c.normed, t, h, kvd)
+            });
         }
-        matmul_add_dx(&mut d_normed, &d_k, self.tensor(o.wk, kvd * h), t, h, kvd);
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(&mut d_normed, &d_k, self.tensor(o.wk, kvd * h), t, h, kvd)
+        });
         {
             let dwv = grad_slice(grads, o.wv, kvd * h);
-            matmul_add_dw(dwv, &d_v, &c.normed, t, h, kvd);
+            time(Stage::MatmulDw, || {
+                matmul_add_dw(dwv, &d_v, &c.normed, t, h, kvd)
+            });
         }
-        matmul_add_dx(&mut d_normed, &d_v, self.tensor(o.wv, kvd * h), t, h, kvd);
+        time(Stage::MatmulDx, || {
+            matmul_add_dx(&mut d_normed, &d_v, self.tensor(o.wv, kvd * h), t, h, kvd)
+        });
 
         // The residual around attention.
         let mut dx = d_mid;
         {
             let dattn_norm = grad_slice(grads, o.attn_norm, h);
-            rmsnorm_backward(
-                &mut dx,
-                dattn_norm,
-                &d_normed,
-                x,
-                self.tensor(o.attn_norm, h),
-                &c.attn_rms,
-                t,
-                h,
-            );
+            time(Stage::RmsNormBackward, || {
+                rmsnorm_backward(
+                    &mut dx,
+                    dattn_norm,
+                    &d_normed,
+                    x,
+                    self.tensor(o.attn_norm, h),
+                    &c.attn_rms,
+                    t,
+                    h,
+                )
+            });
         }
         dx
     }
@@ -906,6 +1023,51 @@ fn dot_rows<const R: usize>(rows: [&[f32]; R], b: &[f32]) -> [f32; R] {
     out
 }
 
+/// [`dot_rows`] for the four rows the tile actually runs on, written out.
+///
+/// Same accumulators, same order, same answer to the bit — and thirty-eight
+/// percent fewer instructions, because it is written as a zip of chunked
+/// slices rather than as indexing. The generic form compiled to eight
+/// multiply-adds wrapped in *five compares and five branches*: a bounds
+/// check on the weight vector and on each of the four rows, once per pass,
+/// on a loop body that is otherwise perfect — the row operands fold into
+/// the multiply-adds as memory operands and only the weight is loaded.
+///
+/// The generic one stays for the tail, where `rows` is not a multiple of
+/// four, and `the_four_row_dot_is_the_generic_one` holds the two together.
+#[inline]
+fn dot_rows4(rows: [&[f32]; 4], b: &[f32]) -> [f32; 4] {
+    let [r0, r1, r2, r3] = rows;
+    let mut acc = [[f32x8::ZERO; 2]; 4];
+    let (weights, _) = b.as_chunks::<ACC_LANES>();
+    let (a0, _) = r0.as_chunks::<ACC_LANES>();
+    let (a1, _) = r1.as_chunks::<ACC_LANES>();
+    let (a2, _) = r2.as_chunks::<ACC_LANES>();
+    let (a3, _) = r3.as_chunks::<ACC_LANES>();
+    for ((((w, x0), x1), x2), x3) in weights.iter().zip(a0).zip(a1).zip(a2).zip(a3) {
+        let low = load8(&w[..LANES]);
+        acc[0][0] = load8(&x0[..LANES]).mul_add(low, acc[0][0]);
+        acc[1][0] = load8(&x1[..LANES]).mul_add(low, acc[1][0]);
+        acc[2][0] = load8(&x2[..LANES]).mul_add(low, acc[2][0]);
+        acc[3][0] = load8(&x3[..LANES]).mul_add(low, acc[3][0]);
+        let high = load8(&w[LANES..]);
+        acc[0][1] = load8(&x0[LANES..]).mul_add(high, acc[0][1]);
+        acc[1][1] = load8(&x1[LANES..]).mul_add(high, acc[1][1]);
+        acc[2][1] = load8(&x2[LANES..]).mul_add(high, acc[2][1]);
+        acc[3][1] = load8(&x3[LANES..]).mul_add(high, acc[3][1]);
+    }
+    let done = weights.len() * ACC_LANES;
+    let mut out = [0f32; 4];
+    for ((value, row), sums) in out.iter_mut().zip(rows.iter()).zip(acc.iter()) {
+        let mut sum = horizontal(sums[0] + sums[1]);
+        for at in done..b.len() {
+            sum += row[at] * b[at];
+        }
+        *value = sum;
+    }
+    out
+}
+
 /// One tile of [`matmul`]: the whole weight matrix against `rows` tokens.
 ///
 /// Split out so the fused kernels below can do several of these on one tile
@@ -921,7 +1083,7 @@ fn tile(out_tile: &mut [f32], in_tile: &[f32], w: &[f32], k: usize, n: usize) {
         let mut r = 0;
         while r + 4 <= rows {
             let group = [row(r), row(r + 1), row(r + 2), row(r + 3)];
-            for (j, v) in dot_rows(group, weight_row).iter().enumerate() {
+            for (j, v) in dot_rows4(group, weight_row).iter().enumerate() {
                 out_tile[(r + j) * n + o] = *v;
             }
             r += 4;
@@ -1033,72 +1195,261 @@ fn matmul_residual(
         });
 }
 
+/// Output rows whose accumulators are held in registers at once.
+///
+/// Four rows of two vectors each is eight accumulator registers, which
+/// leaves room in the sixteen this target has for the two operand vectors
+/// and the broadcast — and it makes the inner loop six loads for eight
+/// fused multiply-adds, against the two loads *and a store* per multiply
+/// that an `axpy` chain costs.
+const ACC_ROWS: usize = 4;
+
+/// Floats of the contracted dimension accumulated at once: sixteen, which
+/// is exactly one cache line.
+///
+/// Not a free parameter. Both kernels below sweep their shared operand
+/// column-block by column-block, so a block narrower than a line would
+/// fetch each line once per block that lands in it and use a fraction of
+/// it each time; a block of exactly one line reads every byte it fetches.
+const ACC_LANES: usize = 2 * LANES;
+
+/// Rows of the swept operand held in cache across one pass of column
+/// blocks, in bytes.
+///
+/// The register blocking turns the loop inside out — column block
+/// outermost, the swept dimension inside it — which on its own would walk
+/// the whole shared operand once per column block. Cutting that operand
+/// into slabs of about this size means each pass re-reads a slab rather
+/// than a matrix, and the accumulators are still loaded and stored once
+/// per slab rather than once per element.
+const SLAB_BYTES: usize = 256 << 10;
+
+/// How many rows of a `[rows, k]` operand fit in a slab.
+#[inline]
+fn slab_rows(k: usize) -> usize {
+    (SLAB_BYTES / (k * 4).max(1)).clamp(8, 512)
+}
+
 /// `dx[t, k] += dy[t, n] . w[n, k]`.
+///
+/// The accumulation lives in vector registers for the whole sweep over
+/// `n`, so the only stores are one pair per (token row, column block) at
+/// the end, rather than one for every multiply.
+///
+/// Two things change and one does not. The *order* of the terms does not:
+/// the register starts at the value in memory and takes the same terms in
+/// the same sequence. What changes is that each term is a fused
+/// multiply-add — one rounding where the `axpy` chain had two, and one
+/// vector operation where it had two — so the result is a little more
+/// accurate than what it replaces rather than a little less. The forward
+/// kernels have always used the fused form; this is the backward catching
+/// up with them.
 fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
     debug_assert_eq!(dx.len(), t * k);
-    dx.par_chunks_mut(k * TILE)
-        .zip(dy.par_chunks(n * TILE))
+    debug_assert_eq!(dy.len(), t * n);
+    debug_assert_eq!(w.len(), n * k);
+    let slab = slab_rows(k);
+    dx.par_chunks_mut(k * ACC_ROWS)
+        .zip(dy.par_chunks(n * ACC_ROWS))
         .for_each(|(dx_tile, dy_tile)| {
             let rows = dx_tile.len() / k;
-            for (o, weight_row) in w.chunks_exact(k).enumerate() {
-                let mut r = 0;
-                while r + 4 <= rows {
-                    let a = [
-                        dy_tile[r * n + o],
-                        dy_tile[(r + 1) * n + o],
-                        dy_tile[(r + 2) * n + o],
-                        dy_tile[(r + 3) * n + o],
-                    ];
-                    if a.iter().any(|g| *g != 0.0) {
-                        axpy_rows4(four_rows(dx_tile, r, k), weight_row, a);
+            // `dy` is read down a column here — one value per output row,
+            // `n` floats apart — and it is read again for every column
+            // block of `k`. Gathering a slab of it into row-major order
+            // once turns all of those into contiguous reads, and the
+            // buffer is a few kilobytes.
+            let mut column = vec![0f32; slab * rows];
+            let mut first = 0;
+            while first < n {
+                let last = (first + slab).min(n);
+                for o in first..last {
+                    let at = (o - first) * rows;
+                    for r in 0..rows {
+                        column[at + r] = dy_tile[r * n + o];
                     }
-                    r += 4;
                 }
-                while r < rows {
-                    let g = dy_tile[r * n + o];
-                    if g != 0.0 {
-                        axpy(&mut dx_tile[r * k..(r + 1) * k], weight_row, g);
+                let column = &column[..(last - first) * rows];
+                let mut j = 0;
+                while j + ACC_LANES <= k {
+                    match rows {
+                        4 => dx_block::<4>(dx_tile, column, w, k, first, last, j),
+                        3 => dx_block::<3>(dx_tile, column, w, k, first, last, j),
+                        2 => dx_block::<2>(dx_tile, column, w, k, first, last, j),
+                        _ => dx_block::<1>(dx_tile, column, w, k, first, last, j),
                     }
-                    r += 1;
+                    j += ACC_LANES;
                 }
+                // Whatever is left of a row that a whole number of cache
+                // lines does not cover. Every width this trains is a
+                // multiple of 256, so this runs in the tests and nowhere
+                // else — which is why it takes the plain path rather than a
+                // second blocked one.
+                if j < k {
+                    for o in first..last {
+                        for r in 0..rows {
+                            fma_into(
+                                &mut dx_tile[r * k + j..(r + 1) * k],
+                                &w[o * k + j..(o + 1) * k],
+                                column[(o - first) * rows + r],
+                            );
+                        }
+                    }
+                }
+                first = last;
             }
         });
 }
 
-/// Four consecutive rows of a tile, as four disjoint mutable slices.
+/// One column block of [`matmul_add_dx`], for `R` token rows.
+///
+/// Written entirely in iterators over exact chunks. The same loop written
+/// with indices carried five bounds checks per pass — on the two operand
+/// slices, on the accumulator and on the gathered column — which is more
+/// branching than there is arithmetic, and it cost the whole point of the
+/// blocking.
 #[inline]
-fn four_rows(tile: &mut [f32], first: usize, k: usize) -> [&mut [f32]; 4] {
-    let rest = &mut tile[first * k..(first + 4) * k];
-    let (a, rest) = rest.split_at_mut(k);
-    let (b, rest) = rest.split_at_mut(k);
-    let (c, d) = rest.split_at_mut(k);
-    [a, b, c, d]
+fn dx_block<const R: usize>(
+    dx_tile: &mut [f32],
+    column: &[f32],
+    w: &[f32],
+    k: usize,
+    first: usize,
+    last: usize,
+    j: usize,
+) {
+    let mut acc = [[f32x8::ZERO; 2]; R];
+    for (r, sums) in acc.iter_mut().enumerate() {
+        let cell = &dx_tile[r * k + j..r * k + j + ACC_LANES];
+        sums[0] = load8(cell);
+        sums[1] = load8(&cell[LANES..]);
+    }
+    let weights = w[first * k..last * k].chunks_exact(k);
+    let (gathered, _) = column.as_chunks::<R>();
+    for (weight_row, scalars) in weights.zip(gathered) {
+        // Arrays, not ranges: their length is known at compile time, so
+        // every load out of one is free of a bounds check. The same loop
+        // written with ranges kept seven compares per eight multiply-adds,
+        // which is more branching than there is arithmetic, and it cost
+        // the whole point of the blocking.
+        let Some(cell) = weight_row[j..].first_chunk::<ACC_LANES>() else {
+            continue;
+        };
+        let w0 = load8(&cell[..LANES]);
+        let w1 = load8(&cell[LANES..]);
+        // No test for a zero gradient: adding `0.0 * w` leaves the
+        // accumulator exactly as it was, and a branch that almost never
+        // takes is worse than the multiply it skips.
+        for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
+            let g = f32x8::splat(scalar);
+            sums[0] = w0.mul_add(g, sums[0]);
+            sums[1] = w1.mul_add(g, sums[1]);
+        }
+    }
+    for (r, sums) in acc.iter().enumerate() {
+        store8(&mut dx_tile[r * k + j..], sums[0]);
+        store8(&mut dx_tile[r * k + j + LANES..], sums[1]);
+    }
 }
 
 /// `dw[n, k] += dy[t, n]^T . x[t, k]`.
+///
+/// The same shape as [`matmul_add_dx`] with the swept dimension being the
+/// tokens rather than the output rows, and the same reason for it: this was
+/// an `axpy` into memory per token per output row, which is a load and a
+/// store of the accumulator for every multiply. The same note about the
+/// fused multiply-add applies.
 fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
     debug_assert_eq!(dw.len(), n * k);
-    dw.par_chunks_mut(k * TILE)
+    debug_assert_eq!(dy.len(), t * n);
+    debug_assert_eq!(x.len(), t * k);
+    let slab = slab_rows(k);
+    dw.par_chunks_mut(k * ACC_ROWS)
         .enumerate()
         .for_each(|(tile, dw_tile)| {
             let rows = dw_tile.len() / k;
-            let first = tile * TILE;
-            // Token outermost, so a token's activations are read once for
-            // the whole tile of output rows rather than once for each.
-            for step in 0..t {
-                let x_row = &x[step * k..(step + 1) * k];
-                // Not blocked, unlike the two above: measured at 1.00-1.06x
-                // on every shape this trains. The weight gradient reads a
-                // *token's* activations against a tile of output rows, and
-                // that row is already the thing staying in cache.
-                for r in 0..rows {
-                    let g = dy[step * n + first + r];
-                    if g != 0.0 {
-                        axpy(&mut dw_tile[r * k..(r + 1) * k], x_row, g);
+            let out = tile * ACC_ROWS;
+            let mut first = 0;
+            while first < t {
+                let last = (first + slab).min(t);
+                let mut j = 0;
+                while j + ACC_LANES <= k {
+                    match rows {
+                        4 => dw_block::<4>(dw_tile, dy, x, k, n, out, first, last, j),
+                        3 => dw_block::<3>(dw_tile, dy, x, k, n, out, first, last, j),
+                        2 => dw_block::<2>(dw_tile, dy, x, k, n, out, first, last, j),
+                        _ => dw_block::<1>(dw_tile, dy, x, k, n, out, first, last, j),
+                    }
+                    j += ACC_LANES;
+                }
+                if j < k {
+                    for step in first..last {
+                        for r in 0..rows {
+                            fma_into(
+                                &mut dw_tile[r * k + j..(r + 1) * k],
+                                &x[step * k + j..(step + 1) * k],
+                                dy[step * n + out + r],
+                            );
+                        }
                     }
                 }
+                first = last;
             }
         });
+}
+
+/// One column block of [`matmul_add_dw`], for `R` output rows.
+///
+/// `dy` needs no gathering here, unlike [`dx_block`]: the `R` values one
+/// token contributes are `R` consecutive floats of its row already.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn dw_block<const R: usize>(
+    dw_tile: &mut [f32],
+    dy: &[f32],
+    x: &[f32],
+    k: usize,
+    n: usize,
+    out: usize,
+    first: usize,
+    last: usize,
+    j: usize,
+) {
+    let mut acc = [[f32x8::ZERO; 2]; R];
+    for (r, sums) in acc.iter_mut().enumerate() {
+        let cell = &dw_tile[r * k + j..r * k + j + ACC_LANES];
+        sums[0] = load8(cell);
+        sums[1] = load8(&cell[LANES..]);
+    }
+    let activations = x[first * k..last * k].chunks_exact(k);
+    let gradients = dy[first * n..last * n].chunks_exact(n);
+    for (x_row, dy_row) in activations.zip(gradients) {
+        // See [`dx_block`] on why these are arrays and not ranges.
+        let (Some(cell), Some(scalars)) = (
+            x_row[j..].first_chunk::<ACC_LANES>(),
+            dy_row[out..].first_chunk::<R>(),
+        ) else {
+            continue;
+        };
+        let x0 = load8(&cell[..LANES]);
+        let x1 = load8(&cell[LANES..]);
+        for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
+            let g = f32x8::splat(scalar);
+            sums[0] = x0.mul_add(g, sums[0]);
+            sums[1] = x1.mul_add(g, sums[1]);
+        }
+    }
+    for (r, sums) in acc.iter().enumerate() {
+        store8(&mut dw_tile[r * k + j..], sums[0]);
+        store8(&mut dw_tile[r * k + j + LANES..], sums[1]);
+    }
+}
+
+/// Writes eight consecutive floats back. Once per column block rather than
+/// once per multiply, which is why this may take the shape [`axpy`] was
+/// measured to be slower for.
+#[inline(always)]
+fn store8(out: &mut [f32], v: f32x8) {
+    out[..LANES].copy_from_slice(&v.to_array());
 }
 
 /// Loads eight consecutive floats. `copy_from_slice` of exactly eight
@@ -1128,15 +1479,25 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     // at a time, on a target built for eight-wide AVX2 with FMA. Widening
     // it is a decision about numerics, which is the programmer's to make
     // and is made here.
+    //
+    // Written as a zip of chunked slices rather than as indexing, and that
+    // is not a matter of taste: indexed, the four multiply-adds came with
+    // *ten compares and ten branches* around them — a bounds check on each
+    // operand of each one — in a loop that is otherwise four instructions
+    // of arithmetic and two loads. Chunking hands the compiler arrays whose
+    // length it knows, and the checks go away without changing a single
+    // sum. This one matters twice over: it is the inner loop of both
+    // attention and its backward.
     let mut acc = [f32x8::ZERO; 4];
-    let mut i = 0;
-    while i + BLOCK <= a.len() {
-        for (k, sum) in acc.iter_mut().enumerate() {
-            let at = i + k * LANES;
-            *sum = load8(&a[at..]).mul_add(load8(&b[at..]), *sum);
-        }
-        i += BLOCK;
+    let (a_blocks, _) = a.as_chunks::<BLOCK>();
+    let (b_blocks, _) = b.as_chunks::<BLOCK>();
+    for (x, y) in a_blocks.iter().zip(b_blocks) {
+        acc[0] = load8(&x[..]).mul_add(load8(&y[..]), acc[0]);
+        acc[1] = load8(&x[LANES..]).mul_add(load8(&y[LANES..]), acc[1]);
+        acc[2] = load8(&x[2 * LANES..]).mul_add(load8(&y[2 * LANES..]), acc[2]);
+        acc[3] = load8(&x[3 * LANES..]).mul_add(load8(&y[3 * LANES..]), acc[3]);
     }
+    let mut i = a_blocks.len().min(b_blocks.len()) * BLOCK;
     while i + LANES <= a.len() {
         acc[0] = load8(&a[i..]).mul_add(load8(&b[i..]), acc[0]);
         i += LANES;
@@ -1212,23 +1573,15 @@ fn dot3(a: &[f32], b: &[f32], c: &[f32]) -> f32 {
     sum
 }
 
-/// Four `y += a * x` against the same `x`, in one pass.
-///
-/// The mirror of [`dot_rows`] for the backward: `x` is loaded once and used
-/// four times instead of once each, which is the same load ceiling in the
-/// same place. Written as a plain loop on purpose — the autovectorizer
-/// turns this shape into one broadcast load and four FMAs, and every
-/// attempt to hand-write the stores has come out slower.
+/// `y += a * x`, fused — the scalar spelling of what the blocked kernels
+/// do in vectors, for the columns a whole number of cache lines leaves
+/// over. It has to be the fused form or the tail of a row would round
+/// differently from the rest of it.
 #[inline]
-fn axpy_rows4(y: [&mut [f32]; 4], x: &[f32], a: [f32; 4]) {
-    let [y0, y1, y2, y3] = y;
-    debug_assert_eq!(y0.len(), x.len());
-    for i in 0..x.len() {
-        let v = x[i];
-        y0[i] += a[0] * v;
-        y1[i] += a[1] * v;
-        y2[i] += a[2] * v;
-        y3[i] += a[3] * v;
+fn fma_into(y: &mut [f32], x: &[f32], a: f32) {
+    debug_assert_eq!(y.len(), x.len());
+    for (o, &v) in y.iter_mut().zip(x.iter()) {
+        *o = a.mul_add(v, *o);
     }
 }
 
@@ -1245,10 +1598,50 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// The derivative of [`silu`]. Not called on the hot path — the loop that
+/// needs it shares an exponential with [`silu`] instead — but it is the
+/// definition the fused form is checked against.
 #[inline]
+#[cfg_attr(not(test), expect(dead_code))]
 fn dsilu(x: f32) -> f32 {
     let s = 1.0 / (1.0 + (-x).exp());
     s * (1.0 + x * (1.0 - s))
+}
+
+/// The backward of `act = silu(gate) * up`, for the whole `[tokens, ffn]`
+/// buffer at once.
+///
+/// It was a serial loop over the widest buffer in the network, between two
+/// parallel regions, and a serial loop is invisible to a sampling profiler
+/// in proportion to how serial it is: one thread's worth of samples, and
+/// all of everyone else's seconds.
+///
+/// The other half is the exponential. [`silu`] and [`dsilu`] each compute
+/// `exp(-x)` for the same `x`, so the pair costs two of the most expensive
+/// operation in the loop. Sharing it is exact rather than approximate:
+/// `d` below is the identical denominator both functions build, so this
+/// produces the same two floats they did, bit for bit.
+fn swiglu_backward(d_gate: &mut [f32], d_up: &mut [f32], d_act: &[f32], gate: &[f32], up: &[f32]) {
+    /// Elements one task takes. Large enough that the fork and join around
+    /// it disappear, small enough that there are far more tasks than
+    /// threads for the pool to balance with.
+    const CHUNK: usize = 1 << 14;
+    debug_assert_eq!(d_gate.len(), d_up.len());
+    d_gate
+        .par_chunks_mut(CHUNK)
+        .zip(d_up.par_chunks_mut(CHUNK))
+        .zip(d_act.par_chunks(CHUNK))
+        .zip(gate.par_chunks(CHUNK))
+        .zip(up.par_chunks(CHUNK))
+        .for_each(|((((dg, du), da), g), u)| {
+            for i in 0..dg.len() {
+                let x = g[i];
+                let d = 1.0 + (-x).exp();
+                let s = 1.0 / d;
+                du[i] = da[i] * (x / d);
+                dg[i] = da[i] * u[i] * (s * (1.0 + x * (1.0 - s)));
+            }
+        });
 }
 
 /// RMSNorm over each `dim`-wide row, returning the normalized values and
@@ -1342,11 +1735,16 @@ const NORM_GROUP: usize = 32;
 /// gives exactly the backward pass.
 fn rope(x: &mut [f32], heads: usize, head_dim: usize, base: f32, inverse: bool) {
     let half = head_dim / 2;
+    // One `powf` per index rather than one per (position, index): the
+    // frequency does not depend on the position, and this loop ran the
+    // whole table again for every token in the sequence.
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| base.powf(-2.0 * i as f32 / head_dim as f32))
+        .collect();
     x.par_chunks_mut(heads * head_dim)
         .enumerate()
         .for_each(|(pos, row)| {
-            for i in 0..half {
-                let freq = base.powf(-2.0 * i as f32 / head_dim as f32);
+            for (i, &freq) in freqs.iter().enumerate() {
                 let (mut sin, cos) = (pos as f32 * freq).sin_cos();
                 if inverse {
                     sin = -sin;
@@ -1419,10 +1817,57 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], cfg: &Config, t: usize) -> Aligned
     ctx
 }
 
+/// Tasks [`attention_backward`] aims to split itself into.
+///
+/// Fixed, and deliberately not derived from `rayon::current_num_threads()`.
+/// A model whose weights depend on how many threads happened to train it is
+/// not a reproducible model, and the split decides which sums happen where.
+/// Four times a common thread count, because both of this kernel's passes
+/// are triangular — the chunks are not equal work, and the pool needs more
+/// of them than it has threads to even that out.
+const ATTN_BACKWARD_TASKS: usize = 64;
+
+/// The shortest chunk either pass will cut, in positions. Below this the
+/// per-task setup starts to matter next to the work.
+const ATTN_BACKWARD_MIN: usize = 32;
+
 /// The backward of [`attention`], recomputing the scores rather than
 /// having stored a `[heads, tokens, tokens]` probability matrix — that
 /// matrix is quadratic in the sequence length and is the single biggest
 /// thing a training step could be made to hold.
+///
+/// **Two passes, split on different axes.** Head-wide is as wide as the
+/// model has heads, and a network with six of them leaves most of a
+/// machine idle in what is, in seconds, the largest single stage of a
+/// training step. The obstacle to splitting further is that the three
+/// gradients want opposite things: `dq` belongs to the query, so query
+/// chunks own their rows outright, while `dk` and `dv` belong to the key,
+/// and every query at or after a key contributes to it.
+///
+/// Splitting only by query and reducing partial `dk`/`dv` buffers
+/// afterwards was tried, and it is *slower* than the head-wide version it
+/// replaces: the partials are larger than the last-level cache, so the
+/// accumulation that used to hit cache goes to memory, and the reduction
+/// pays for them twice more.
+///
+/// So each pass is split on the axis that makes its own output disjoint:
+///
+/// - **Query chunks** produce `dq`, and the three per-row numbers the
+///   second pass would otherwise need a whole row of scores to get: the
+///   softmax maximum, the reciprocal of its sum, and the probability
+///   weighted derivative. Three floats per (head, position), against a
+///   partial buffer of `head_dim` floats per (chunk, key).
+/// - **Key chunks** produce `dk` and `dv`, and because a key belongs to
+///   exactly one chunk they are written and never merged. The chunk's keys
+///   and values stay in the first-level cache while every later query
+///   streams past them, which the head-wide version could not do.
+///
+/// The price is the scores: the second pass rebuilds the ones it needs
+/// rather than keeping the first pass's. That is about a third more
+/// arithmetic in exchange for several times the width, and it buys back
+/// exact reproducibility — every sum here takes the same terms in the same
+/// order as the single-pass version did, so a model trained through this
+/// is byte for byte the model trained through that.
 fn attention_backward(
     q: &[f32],
     k: &[f32],
@@ -1434,77 +1879,154 @@ fn attention_backward(
     let (hd, heads, group) = (cfg.head_dim, cfg.heads, cfg.group());
     let (qd, kvd) = (cfg.q_dim(), cfg.kv_dim());
     let scale = 1.0 / (hd as f32).sqrt();
+    let limit = t.div_ceil(ATTN_BACKWARD_MIN).max(1);
+    let query_chunks = ATTN_BACKWARD_TASKS.div_ceil(heads).clamp(1, limit);
+    let key_chunks = ATTN_BACKWARD_TASKS.div_ceil(cfg.kv_heads).clamp(1, limit);
 
-    let parts: Vec<(Aligned, Aligned, Aligned)> = (0..heads)
+    // ---- Pass one: dq, and the row statistics pass two needs.
+    let span = t.div_ceil(query_chunks);
+    let rows: Vec<(usize, usize, Aligned, Aligned)> = (0..heads * query_chunks)
         .into_par_iter()
-        .map(|head| {
+        .map(|task| {
+            let head = task / query_chunks;
+            let chunk = task % query_chunks;
+            let first = (chunk * span).min(t);
+            let last = (first + span).min(t);
             let kv = head / group;
-            let mut dq = Aligned::zeros(t * hd);
-            let mut dk = Aligned::zeros(t * hd);
-            let mut dv = Aligned::zeros(t * hd);
+            let count = last - first;
+            let mut dq = Aligned::zeros(count * hd);
+            // Three per position, interleaved so one buffer carries them:
+            // the softmax maximum, one over its sum, and the weighted
+            // derivative the softmax backward subtracts.
+            let mut stats = Aligned::zeros(count * 3);
             let mut probs = Aligned::zeros(t);
             let mut dscores = Aligned::zeros(t);
 
-            for step in 0..t {
+            for step in first..last {
                 let q_row = &q[step * qd + head * hd..step * qd + (head + 1) * hd];
-                {
+                let (max, inv_sum) = {
                     let scores = &mut probs[..=step];
                     for (s, score) in scores.iter_mut().enumerate() {
                         let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
                         *score = dot(q_row, k_row) * scale;
                     }
-                    softmax(scores);
-                }
+                    softmax_stats(scores)
+                };
                 let d_row = &d_ctx[step * qd + head * hd..step * qd + (head + 1) * hd];
 
-                // The value gradient, and the raw probability gradient.
                 let mut weighted = 0.0f32;
                 for s in 0..=step {
                     let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
                     let dp = dot(d_row, v_row);
                     dscores[s] = dp;
                     weighted += probs[s] * dp;
-                    axpy(&mut dv[s * hd..(s + 1) * hd], d_row, probs[s]);
                 }
-                // Softmax backward, folded together with the score scaling.
+                let at = (step - first) * hd;
                 for s in 0..=step {
-                    dscores[s] = probs[s] * (dscores[s] - weighted) * scale;
-                }
-                for s in 0..=step {
-                    let g = dscores[s];
+                    let g = probs[s] * (dscores[s] - weighted) * scale;
                     if g == 0.0 {
                         continue;
                     }
                     let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                    axpy(&mut dq[step * hd..(step + 1) * hd], k_row, g);
-                    axpy(&mut dk[s * hd..(s + 1) * hd], q_row, g);
+                    axpy(&mut dq[at..at + hd], k_row, g);
                 }
+                let out = (step - first) * 3;
+                stats[out] = max;
+                stats[out + 1] = inv_sum;
+                stats[out + 2] = weighted;
             }
-            (dq, dk, dv)
+            (head, first, dq, stats)
         })
         .collect();
 
-    // Query heads own their own gradient column; every head in a group adds
-    // into the one key/value head they share.
+    // Query heads own their own gradient column, so this is a scatter with
+    // no addition in it at all.
     let mut d_q = Aligned::zeros(t * qd);
+    let mut stats = Aligned::zeros(heads * t * 3);
+    for (head, first, dq, chunk_stats) in &rows {
+        for (row, values) in dq.chunks_exact(hd).enumerate() {
+            let at = (first + row) * qd + head * hd;
+            d_q[at..at + hd].copy_from_slice(values);
+        }
+        let at = (head * t + first) * 3;
+        stats[at..at + chunk_stats.len()].copy_from_slice(chunk_stats);
+    }
+
+    // ---- Pass two: dk and dv, by key.
+    let span = t.div_ceil(key_chunks);
+    let pieces: Vec<(usize, usize, Aligned, Aligned)> = (0..cfg.kv_heads * key_chunks)
+        .into_par_iter()
+        .map(|task| {
+            let kv = task / key_chunks;
+            let chunk = task % key_chunks;
+            let first = (chunk * span).min(t);
+            let last = (first + span).min(t);
+            let count = last - first;
+            let mut dk = Aligned::zeros(count * hd);
+            let mut dv = Aligned::zeros(count * hd);
+            // One head at a time into its own buffer, then added in: the
+            // single-pass version summed a head's whole contribution before
+            // any of the next head's, and that is the order this keeps.
+            let mut head_k = Aligned::zeros(count * hd);
+            let mut head_v = Aligned::zeros(count * hd);
+
+            for head in kv * group..(kv + 1) * group {
+                head_k.fill(0.0);
+                head_v.fill(0.0);
+                for step in first..t {
+                    let q_row = &q[step * qd + head * hd..step * qd + (head + 1) * hd];
+                    let d_row = &d_ctx[step * qd + head * hd..step * qd + (head + 1) * hd];
+                    let at = (head * t + step) * 3;
+                    let (max, inv_sum, weighted) = (stats[at], stats[at + 1], stats[at + 2]);
+                    // Causal: this query only reaches keys up to itself.
+                    let reach = (step + 1).min(last);
+                    for s in first..reach {
+                        let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                        let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                        let p = (dot(q_row, k_row) * scale - max).exp() * inv_sum;
+                        let dp = dot(d_row, v_row);
+                        let row = (s - first) * hd;
+                        axpy(&mut head_v[row..row + hd], d_row, p);
+                        let g = p * (dp - weighted) * scale;
+                        if g == 0.0 {
+                            continue;
+                        }
+                        axpy(&mut head_k[row..row + hd], q_row, g);
+                    }
+                }
+                for i in 0..count * hd {
+                    dk[i] += head_k[i];
+                    dv[i] += head_v[i];
+                }
+            }
+            (kv, first, dk, dv)
+        })
+        .collect();
+
     let mut d_k = Aligned::zeros(t * kvd);
     let mut d_v = Aligned::zeros(t * kvd);
-    for (head, (dq, dk, dv)) in parts.iter().enumerate() {
-        let kv = head / group;
-        for step in 0..t {
-            let q_at = step * qd + head * hd;
-            d_q[q_at..q_at + hd].copy_from_slice(&dq[step * hd..(step + 1) * hd]);
-            let kv_at = step * kvd + kv * hd;
-            for j in 0..hd {
-                d_k[kv_at + j] += dk[step * hd + j];
-                d_v[kv_at + j] += dv[step * hd + j];
-            }
+    for (kv, first, dk, dv) in &pieces {
+        for (row, (kvals, vvals)) in dk.chunks_exact(hd).zip(dv.chunks_exact(hd)).enumerate() {
+            let at = (first + row) * kvd + kv * hd;
+            d_k[at..at + hd].copy_from_slice(kvals);
+            d_v[at..at + hd].copy_from_slice(vvals);
         }
     }
     (d_q, d_k, d_v)
 }
 
 fn softmax(values: &mut [f32]) {
+    softmax_stats(values);
+}
+
+/// The softmax, returning the two numbers it shifted and scaled by.
+///
+/// [`attention_backward`] rebuilds individual probabilities from these
+/// rather than a whole row of scores, and it can only do that if what it
+/// rebuilds is the same float this produced — so the maximum and the
+/// *reciprocal* of the sum are what come back, and the multiply below is
+/// the one a caller has to repeat.
+fn softmax_stats(values: &mut [f32]) -> (f32, f32) {
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for value in values.iter_mut() {
@@ -1515,6 +2037,7 @@ fn softmax(values: &mut [f32]) {
     for value in values.iter_mut() {
         *value *= inv;
     }
+    (max, inv)
 }
 
 /// A small deterministic normal generator — the initializer needs
@@ -2185,6 +2708,268 @@ mod tests {
 
     /// Attention must not see the future: changing a token can only change
     /// the predictions at or after its own position.
+    /// The four-row dot and the generic one are the same arithmetic.
+    ///
+    /// They exist as two functions only because the generic one compiles to
+    /// a bounds check per row per pass and the specialized one does not, so
+    /// the specialization is worth nothing at all if it is not *exactly*
+    /// the same sum. Bits, therefore, and at the row lengths a block
+    /// actually uses plus one that leaves a tail.
+    #[test]
+    fn the_four_row_dot_is_the_generic_one() {
+        let mut rng = Rng::new(3);
+        for len in [768usize, 2048, 256, 128, 100, 8, 3] {
+            let b: Vec<f32> = (0..len).map(|_| rng.normal()).collect();
+            let rows: Vec<Vec<f32>> = (0..4)
+                .map(|_| (0..len).map(|_| rng.normal()).collect())
+                .collect();
+            let group = [
+                rows[0].as_slice(),
+                rows[1].as_slice(),
+                rows[2].as_slice(),
+                rows[3].as_slice(),
+            ];
+            let fast = dot_rows4(group, &b);
+            let generic = dot_rows::<4>(group, &b);
+            for r in 0..4 {
+                assert_eq!(
+                    fast[r].to_bits(),
+                    generic[r].to_bits(),
+                    "len {len} row {r}: {} vs {}",
+                    fast[r],
+                    generic[r]
+                );
+            }
+        }
+    }
+
+    /// [`attention_backward`] as it was before the split: one pass, one
+    /// task per head, a full-length `dq`/`dk`/`dv` per head, and a
+    /// reduction over heads at the end.
+    fn attention_backward_single_pass(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        d_ctx: &[f32],
+        cfg: &Config,
+        t: usize,
+    ) -> (Aligned, Aligned, Aligned) {
+        let (hd, heads, group) = (cfg.head_dim, cfg.heads, cfg.group());
+        let (qd, kvd) = (cfg.q_dim(), cfg.kv_dim());
+        let scale = 1.0 / (hd as f32).sqrt();
+        let parts: Vec<(Aligned, Aligned, Aligned)> = (0..heads)
+            .map(|head| {
+                let kv = head / group;
+                let mut dq = Aligned::zeros(t * hd);
+                let mut dk = Aligned::zeros(t * hd);
+                let mut dv = Aligned::zeros(t * hd);
+                let mut probs = Aligned::zeros(t);
+                let mut dscores = Aligned::zeros(t);
+                for step in 0..t {
+                    let q_row = &q[step * qd + head * hd..step * qd + (head + 1) * hd];
+                    {
+                        let scores = &mut probs[..=step];
+                        for (s, score) in scores.iter_mut().enumerate() {
+                            let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                            *score = dot(q_row, k_row) * scale;
+                        }
+                        softmax(scores);
+                    }
+                    let d_row = &d_ctx[step * qd + head * hd..step * qd + (head + 1) * hd];
+                    let mut weighted = 0.0f32;
+                    for s in 0..=step {
+                        let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                        let dp = dot(d_row, v_row);
+                        dscores[s] = dp;
+                        weighted += probs[s] * dp;
+                        axpy(&mut dv[s * hd..(s + 1) * hd], d_row, probs[s]);
+                    }
+                    for s in 0..=step {
+                        dscores[s] = probs[s] * (dscores[s] - weighted) * scale;
+                    }
+                    for s in 0..=step {
+                        let g = dscores[s];
+                        if g == 0.0 {
+                            continue;
+                        }
+                        let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                        axpy(&mut dq[step * hd..(step + 1) * hd], k_row, g);
+                        axpy(&mut dk[s * hd..(s + 1) * hd], q_row, g);
+                    }
+                }
+                (dq, dk, dv)
+            })
+            .collect();
+        let mut d_q = Aligned::zeros(t * qd);
+        let mut d_k = Aligned::zeros(t * kvd);
+        let mut d_v = Aligned::zeros(t * kvd);
+        for (head, (dq, dk, dv)) in parts.iter().enumerate() {
+            let kv = head / group;
+            for step in 0..t {
+                let q_at = step * qd + head * hd;
+                d_q[q_at..q_at + hd].copy_from_slice(&dq[step * hd..(step + 1) * hd]);
+                let kv_at = step * kvd + kv * hd;
+                for j in 0..hd {
+                    d_k[kv_at + j] += dk[step * hd + j];
+                    d_v[kv_at + j] += dv[step * hd + j];
+                }
+            }
+        }
+        (d_q, d_k, d_v)
+    }
+
+    /// Splitting the attention backward across two passes on two different
+    /// axes has to be a *scheduling* change and nothing else, and this is
+    /// the claim that a model trained through it is byte for byte the model
+    /// trained through the single-pass version it replaces.
+    ///
+    /// Bit for bit, therefore. The second pass rebuilds each probability
+    /// from the first pass's stored maximum and reciprocal sum rather than
+    /// keeping a row of scores, and "rebuilds it exactly" is precisely what
+    /// there is to get wrong — a tolerance would pass a version that
+    /// divided by the sum where the softmax multiplied by its reciprocal.
+    ///
+    /// At the smoke model's own head geometry, which is the one with three
+    /// query heads to a key/value head, and long enough that both passes
+    /// really do cut into several chunks.
+    #[test]
+    fn the_two_pass_attention_backward_is_the_single_pass_one() {
+        let cfg = Config::from_size(size_named("smoke").unwrap(), 8192, 8192);
+        let t = 160;
+        let mut rng = Rng::new(11);
+        let q: Vec<f32> = (0..t * cfg.q_dim()).map(|_| rng.normal()).collect();
+        let k: Vec<f32> = (0..t * cfg.kv_dim()).map(|_| rng.normal()).collect();
+        let v: Vec<f32> = (0..t * cfg.kv_dim()).map(|_| rng.normal()).collect();
+        let d_ctx: Vec<f32> = (0..t * cfg.q_dim()).map(|_| rng.normal()).collect();
+
+        let (dq, dk, dv) = attention_backward(&q, &k, &v, &d_ctx, &cfg, t);
+        let (rq, rk, rv) = attention_backward_single_pass(&q, &k, &v, &d_ctx, &cfg, t);
+        for (name, got, want) in [("dq", &dq, &rq), ("dk", &dk, &rk), ("dv", &dv, &rv)] {
+            assert_eq!(got.len(), want.len(), "{name} length");
+            for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name} at {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// `dx[t, k] += dy[t, n] . w[n, k]`, written as its own definition:
+    /// three loops, no blocking, and the same fused multiply-add the
+    /// blocked kernel uses, accumulating over `o` in ascending order.
+    fn dx_reference(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+        for r in 0..t {
+            for o in 0..n {
+                for j in 0..k {
+                    dx[r * k + j] = dy[r * n + o].mul_add(w[o * k + j], dx[r * k + j]);
+                }
+            }
+        }
+    }
+
+    /// `dw[n, k] += dy[t, n]^T . x[t, k]`, likewise, accumulating over the
+    /// tokens in ascending order.
+    fn dw_reference(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
+        for o in 0..n {
+            for step in 0..t {
+                for j in 0..k {
+                    dw[o * k + j] = dy[step * n + o].mul_add(x[step * k + j], dw[o * k + j]);
+                }
+            }
+        }
+    }
+
+    /// The register-blocked backward kernels against their own definition,
+    /// *bit for bit*.
+    ///
+    /// The whole argument for holding an accumulator in a register is that
+    /// it takes the same terms in the same order as one held in memory, and
+    /// only a bit-exact check can say that. A tolerance cannot: reordering
+    /// a sum of a few hundred terms of mixed sign moves it by about the
+    /// square root of their count in units of the last place, which any
+    /// tolerance loose enough to allow a legitimate rounding difference
+    /// also allows. This was tried, and a deliberately reversed inner loop
+    /// passed it.
+    ///
+    /// The reference is fused for the same reason: `a * b + c` as two Rust
+    /// operations rounds twice, because the language does not contract
+    /// them, so a reference written that way would differ from a correct
+    /// kernel and force exactly the tolerance this is avoiding.
+    ///
+    /// At the widths a block of the smoke model actually trains, not toy
+    /// ones: the blocking has a column tail, a row tail and a slab
+    /// boundary, and a 4x4 case exercises none of them.
+    #[test]
+    fn the_blocked_backward_kernels_are_their_own_definition() {
+        let mut rng = Rng::new(7);
+        for &(t, k, n) in &[
+            (96usize, 768usize, 768usize),
+            (96, 2048, 768),
+            (37, 100, 53),
+        ] {
+            let dy: Vec<f32> = (0..t * n).map(|_| rng.normal()).collect();
+            let w: Vec<f32> = (0..n * k).map(|_| rng.normal()).collect();
+            let x: Vec<f32> = (0..t * k).map(|_| rng.normal()).collect();
+
+            // Started from something other than zero, because the kernels
+            // accumulate into a gradient a previous sequence already added
+            // to, and a sum that starts at zero cannot see a difference in
+            // where its first term went.
+            let seed: Vec<f32> = (0..t * k).map(|_| rng.normal()).collect();
+            let mut blocked = seed.clone();
+            let mut reference = seed;
+            matmul_add_dx(&mut blocked, &dy, &w, t, k, n);
+            dx_reference(&mut reference, &dy, &w, t, k, n);
+            for (i, (a, b)) in blocked.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dx {t}x{k}x{n} at {i}: {a} vs {b}"
+                );
+            }
+
+            let seed: Vec<f32> = (0..n * k).map(|_| rng.normal()).collect();
+            let mut blocked = seed.clone();
+            let mut reference = seed;
+            matmul_add_dw(&mut blocked, &dy, &x, t, k, n);
+            dw_reference(&mut reference, &dy, &x, t, k, n);
+            for (i, (a, b)) in blocked.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dw {t}x{k}x{n} at {i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// The SwiGLU backward computes `exp(-x)` once where the two functions
+    /// it replaces computed it twice. That is only allowed if it produces
+    /// the same two floats, so this asserts the *bits*, not a tolerance —
+    /// a tolerance here would let a real numerics change through.
+    #[test]
+    fn the_fused_swiglu_backward_is_bit_identical() {
+        let gate: Vec<f32> = (0..1024)
+            .map(|i| (i as f32 - 512.0) / 37.0)
+            .chain([0.0, -0.0, 1e-8, -1e-8, 40.0, -40.0])
+            .collect();
+        let up: Vec<f32> = gate.iter().map(|g| 0.5 - g * 0.25).collect();
+        let d_act: Vec<f32> = gate.iter().map(|g| 1.5 + g * 0.125).collect();
+        let mut d_gate = vec![0.0f32; gate.len()];
+        let mut d_up = vec![0.0f32; gate.len()];
+        swiglu_backward(&mut d_gate, &mut d_up, &d_act, &gate, &up);
+        for i in 0..gate.len() {
+            assert_eq!(
+                d_up[i].to_bits(),
+                (d_act[i] * silu(gate[i])).to_bits(),
+                "d_up at {i}"
+            );
+            assert_eq!(
+                d_gate[i].to_bits(),
+                (d_act[i] * up[i] * dsilu(gate[i])).to_bits(),
+                "d_gate at {i}"
+            );
+        }
+    }
+
     #[test]
     fn attention_is_causal() {
         let cfg = tiny();

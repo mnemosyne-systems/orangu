@@ -92,17 +92,19 @@ test can fetch in seconds while still covering both kinds of source.
 
 | Script | What it does | How long |
 |:---|:---|:---|
-| `00-smoke.sh` | The whole pipeline on a 20 MB corpus at the `smoke` size, then both quantizations | minutes |
+| `00-smoke.sh` | The whole pipeline on a 20 MB corpus at the `smoke` size, then both quantizations | ~30 minutes |
 | `10-bf16.sh` | The training run: random weights to a BF16 GGUF | days to weeks |
 | `20-q6_k.sh` | BF16 to Q6_K | seconds to minutes |
 | `30-q4_k_m.sh` | BF16 to Q4_K_M | seconds to minutes |
-| `run-all.sh` | All four, in order | as above |
+| `install.sh` | Puts the finished files where `orangu-server` looks for them | seconds |
+| `run-all.sh` | The four build stages, in order | as above |
 
 ```sh
 ./00-smoke.sh       # prove the pipeline works here first
 ./10-bf16.sh        # the real run, entirely per corpus.json
 ./20-q6_k.sh
 ./30-q4_k_m.sh
+./install.sh        # and make the server able to see them
 ```
 
 Both quantizations read the **BF16** file, never each other. Rounding an
@@ -110,9 +112,49 @@ already-quantized model a second time is worse than rounding the original
 once, and `orangu-gguf` refuses to do it rather than quietly producing the
 worse file.
 
+### Installing
+
+`./install.sh` reads the models directory out of `orangu-server.conf` — the
+same file and the same key the server reads, so there is nothing to keep in
+step — and copies each `*.gguf` into it in Hugging Face's hub cache layout:
+
+```
+<models>/models--mnemosynesystems--orangu-smoke-GGUF/
+    refs/main                                    the revision
+    blobs/<sha256>                               the file, named by contents
+    snapshots/<rev>/orangu-code-smoke-BF16.gguf  a symlink to the blob
+```
+
+That layout is what turns a file into a *model*. `orangu-server list` finds
+any `.gguf` anywhere under the models directory, but it can only show one as
+`<org>/<name>:<QUANT>` — the form `--model` and `download` accept — when
+there is a `models--<org>--<name>` directory on its path:
+
+```
+NR  MODEL                               QUANT   SIZE       SUPPORTED
+ 1  mnemosynesystems/orangu-smoke-GGUF  BF16    14.77 MiB  Yes (qwen3)
+ 2  mnemosynesystems/orangu-smoke-GGUF  Q4_K_M   4.99 MiB  Yes (qwen3)
+ 3  mnemosynesystems/orangu-smoke-GGUF  Q6_K     6.21 MiB  Yes (qwen3)
+```
+
+```sh
+orangu-server --model mnemosynesystems/orangu-smoke-GGUF:Q4_K_M
+```
+
+One repository per *training size*, with every quantization of that size
+inside it, so a `smoke` build and a `2b` build never land in the same one.
+`ORANGU_MODEL_ORG` and `ORANGU_MODEL_NAME` change the two halves of the
+name; `./install.sh a.gguf b.gguf` installs only what you name.
+
+Re-running it is safe. The revision is derived from the file contents, so
+installing an unchanged model twice changes nothing, and installing a
+retrained one replaces the previous revision and drops the files nothing
+points at any more. A repository directory this script did not create — a
+downloaded copy of the same one — makes it stop rather than rewrite it.
+
 ### Run the smoke test first
 
-It costs minutes, and it is the only thing standing between a typo in the
+It costs about half an hour, and it is the only thing standing between a typo in the
 settings and finding out about it a week into the training run. Its output
 is meant to be gibberish — 200 steps on 20 MB of source teaches a model
 nothing. What it proves is that every stage runs on this machine and that

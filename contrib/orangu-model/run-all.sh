@@ -14,7 +14,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# Every stage in order: smoke test, train, then both quantizations.
+# Every build stage in order: smoke test, train, then both quantizations.
+#
+# Installing is not one of them. `./install.sh` writes outside this
+# directory — into whatever models directory `orangu-server.conf` names —
+# and it would pick up the smoke model as well as the real one, so it is
+# left as a thing you ask for.
 #
 # The smoke test runs first on purpose. It costs minutes and it is the only
 # thing standing between a typo in the manifest and finding out about it a
@@ -29,3 +34,9 @@
 "${KIT_DIR}/30-q4_k_m.sh"
 
 ls -la ./*.gguf
+
+echo
+echo "To make orangu-server able to see and serve these:"
+echo
+echo "  ./install.sh"
+

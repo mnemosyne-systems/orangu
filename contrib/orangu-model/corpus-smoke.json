@@ -8,11 +8,10 @@
   "quantization": "bf16",
 
   "vocab_size": 8192,
-  "sequence_length": 512,
+  "sequence_length": 1024,
   "batch": 2,
-  "steps": 200,
-  "log_every": 20,
-  "eval_every": 100,
+  "steps": 240,
+  "eval_every": 120,
   "checkpoint_every": 0,
 
   "wikipedia": { "language": "simple", "max_bytes": 20000000 },

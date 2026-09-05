@@ -40,6 +40,14 @@ else
     exit 1
 fi
 
+# Which one, out loud. The PATH comes first, so a checkout that also has an
+# installed release runs the *installed* binary — and a stage that trains
+# the shape the release had rather than the shape the checkout defines
+# looks exactly like a stage that worked. Printing it is what turns that
+# into a thing you notice.
+echo "binary      $(command -v "$ORANGU_GGUF" 2>/dev/null || echo "$ORANGU_GGUF")"
+echo
+
 # The BF16 file the quantization stages read: the one named on the command
 # line, or the single `*-BF16.gguf` in this directory.
 #
