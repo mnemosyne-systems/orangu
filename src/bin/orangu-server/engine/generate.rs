@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use super::arch::{ForwardOutcome, GreedySampleParams, ModelForward};
+use super::arch::{ForwardOutcome, GreedySampleParams, ModelForward, MtpHead, MtpStep};
 use super::kv_cache::KvCache;
 use super::prefix_cache::PrefixCache;
 use super::sampling::{Sampler, SamplingParams};
@@ -210,6 +210,22 @@ pub struct DraftModel {
     pub label: String,
 }
 
+/// The served model's own multi-token-prediction draft head, when one was
+/// found beside its weights — `engine::arch::qwen4exp_mtp`.
+///
+/// Held next to [`Engine::draft`] rather than inside it because the two are
+/// alternatives, not variants of one thing: a draft model is a second model
+/// and this is a block of the first. When both are configured the draft
+/// model wins, since it was asked for explicitly and this was not.
+pub struct MtpDraft {
+    pub head: Arc<dyn MtpHead>,
+    /// How many tokens to draft per verification. See
+    /// `[orangu-server].draft_tokens`.
+    pub tokens: usize,
+    /// The head file's own label, for the banner and the acceptance log.
+    pub label: String,
+}
+
 pub struct Engine {
     pub model: Arc<dyn ModelForward>,
     /// The draft half of a speculative pair, when one is configured.
@@ -225,6 +241,10 @@ pub struct Engine {
     /// GPU decode path instead, whose rows exist only on the device. See
     /// [`draft_forward`].
     pub draft: Option<Arc<DraftModel>>,
+    /// The served model's own MTP head, when one shipped with it. Unlike
+    /// [`Self::draft`] this needs no second vocabulary check and no second
+    /// backend: it is a block of the model already loaded.
+    pub mtp: Option<Arc<MtpDraft>>,
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template_source: Option<String>,
     pub slots: Arc<SlotPool>,
@@ -346,6 +366,7 @@ impl Engine {
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
         let draft = self.draft.clone();
+        let mtp = self.mtp.clone();
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
         let paged_kv = self.paged_kv.clone();
@@ -404,6 +425,7 @@ impl Engine {
                         model.as_ref(),
                         tokenizer.as_ref(),
                         draft.as_deref(),
+                        mtp.as_deref(),
                         prefix_cache.as_deref(),
                         slot_store.as_deref(),
                         paged_kv.as_ref(),
@@ -488,6 +510,7 @@ fn run(
     model: &dyn ModelForward,
     tokenizer: &Tokenizer,
     draft: Option<&DraftModel>,
+    mtp: Option<&MtpDraft>,
     prefix_cache: Option<&PrefixCache>,
     slot_store: Option<&super::slot_store::SlotStore>,
     paged_kv: Option<&(
@@ -610,6 +633,56 @@ fn run(
     }
     let mut history = req.prompt_tokens.clone();
 
+    // Speculative decoding, greedy-only, and not while fused batching is
+    // running the decode step. `spec_buf` (below) holds tokens a speculative
+    // step already verified and committed to the KV cache, waiting to be
+    // emitted before the next forward.
+    //
+    // Not under a constraint: speculation drafts several tokens and accepts
+    // them where they match what greedy decoding *would* have produced, and
+    // greedy decoding knows nothing about the grammar. A drafted token the
+    // constraint forbids would be accepted on that comparison alone.
+    let may_speculate = sampler.is_greedy() && !sampler.is_constrained();
+    // A configured draft model wins over the model's own MTP head, which
+    // wins over prompt-lookup. All three guess at the same tokens, so
+    // running more than one only turns the loser's misses into a second,
+    // wasted verification forward; the order is explicit-over-implicit, then
+    // trained-over-free.
+    //
+    // **Built before prefill, not after it.** An MTP head reads the served
+    // model's hidden state at the position before each token, and prefill is
+    // where the prompt's states exist — a head that first appears afterwards
+    // has no way back to them and would enter generation with an empty
+    // cache.
+    let mut drafter = match (
+        may_speculate,
+        draft,
+        mtp.filter(|_| model.mtp_state_width().is_some()),
+        speculative_config(),
+    ) {
+        (false, ..) => None,
+        (true, Some(draft), _, _) => Some(Drafter::Model {
+            model: draft.model.as_ref(),
+            tokens: draft.tokens,
+            cache: draft.model.new_kv_cache(capacity),
+            committed: 0,
+        }),
+        (true, None, Some(mtp), _) => Some(Drafter::Mtp {
+            head: mtp.head.as_ref(),
+            tokens: mtp.tokens,
+            cache: mtp.head.new_kv_cache(capacity),
+            committed: 0,
+            first_pos: None,
+            states: Vec::new(),
+            states_start: 0,
+            width: mtp.head.state_width(),
+        }),
+        (true, None, None, Some((ngram, max_draft))) => {
+            Some(Drafter::PromptLookup { ngram, max_draft })
+        }
+        (true, None, None, None) => None,
+    };
+
     let prompt_start = Instant::now();
     let total_prompt = req.prompt_tokens.len();
     let progress_tx = tx.clone();
@@ -636,6 +709,7 @@ fn run(
         &req.prompt_tokens[reused_len..],
         reused_len,
         guard.id(),
+        drafter.as_mut(),
         &mut on_chunk,
     ) {
         Ok(l) => l,
@@ -666,32 +740,6 @@ fn run(
     let finish_reason;
     let mut last_report = Instant::now();
     let mut reported = false;
-    // Speculative decoding, greedy-only, and not while fused batching is
-    // running the decode step. `spec_buf` holds tokens a speculative step
-    // already verified and committed to the KV cache, waiting to be emitted
-    // before the next forward.
-    //
-    // Not under a constraint: speculation drafts several tokens and accepts
-    // them where they match what greedy decoding *would* have produced, and
-    // greedy decoding knows nothing about the grammar. A drafted token the
-    // constraint forbids would be accepted on that comparison alone.
-    let may_speculate = sampler.is_greedy() && !sampler.is_constrained();
-    // A configured draft model wins over prompt-lookup rather than being
-    // combined with it. Both are guesses at the same tokens, and running the
-    // free one first would only turn its misses into a second, wasted
-    // verification forward — the drafter that is always available is the one
-    // worth having when there is one.
-    let mut drafter = match (may_speculate, draft, speculative_config()) {
-        (false, _, _) => None,
-        (true, Some(draft), _) => Some(Drafter::Model {
-            model: draft.model.as_ref(),
-            tokens: draft.tokens,
-            cache: draft.model.new_kv_cache(capacity),
-            committed: 0,
-        }),
-        (true, None, Some((ngram, max_draft))) => Some(Drafter::PromptLookup { ngram, max_draft }),
-        (true, None, None) => None,
-    };
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
@@ -1662,12 +1710,14 @@ fn chunk_policy() -> ChunkPolicy {
     *CHUNK_POLICY.get().unwrap_or(&ChunkPolicy::Adaptive)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prefill(
     model: &dyn ModelForward,
     cache: &mut KvCache,
     tokens: &[u32],
     start_pos: usize,
     slot_id: usize,
+    drafter: Option<&mut Drafter<'_>>,
     on_chunk: &mut dyn FnMut(usize),
 ) -> Result<Vec<f32>> {
     // Priced once and carried forward: see [`CHUNK_COST`].
@@ -1680,6 +1730,7 @@ fn prefill(
         start_pos,
         slot_id,
         Chunking::for_prompt(tokens.len()),
+        drafter,
         on_chunk,
     );
     // Written back on the error path too: a chunk that ran is a chunk that
@@ -1742,19 +1793,39 @@ fn prefill_in_chunks(
     start_pos: usize,
     slot_id: usize,
     chunking: Chunking,
+    mut drafter: Option<&mut Drafter<'_>>,
     on_chunk: &mut dyn FnMut(usize),
 ) -> Result<Vec<f32>> {
     let Chunking {
         width: batch,
         policy,
     } = chunking;
+    // One extra decoder block over the prompt, and only for the drafter that
+    // reads it. Everything else takes the forward it always took: exporting
+    // a state row per position costs a `hc * n_embd` buffer per chunk, and
+    // there is no reason to build one nobody will read.
+    let mut chunk = |model: &dyn ModelForward,
+                     cache: &mut KvCache,
+                     part: &[u32],
+                     pos: usize|
+     -> Result<Vec<f32>> {
+        let Some(drafter) = drafter.as_deref_mut().filter(|d| d.wants_states()) else {
+            return crate::engine::decode_stages::pass(|| model.forward(cache, part, pos, slot_id));
+        };
+        let (logits, states) = crate::engine::decode_stages::pass(|| {
+            model.forward_with_states(cache, part, pos, slot_id)
+        })?;
+        drafter.observe_states(pos, &states);
+        // The head runs over the chunk that was just committed, so the
+        // states it needs never have to outlive one chunk.
+        drafter.catch_up(part, pos)?;
+        Ok(logits)
+    };
     // The one shape that needs no bounding: a prompt that fits in a single
     // chunk *and* starts at position zero is the least work a prefill can be.
     // `batch == 0` is an explicit opt-out — see [`prefill_batch`].
     if batch == 0 || (tokens.len() <= batch && start_pos == 0) {
-        let logits = crate::engine::decode_stages::pass(|| {
-            model.forward(cache, tokens, start_pos, slot_id)
-        })?;
+        let logits = chunk(model, cache, tokens, start_pos)?;
         on_chunk(tokens.len());
         return Ok(logits);
     }
@@ -1790,9 +1861,7 @@ fn prefill_in_chunks(
     while done < tokens.len() {
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
-        logits = crate::engine::decode_stages::pass(|| {
-            model.forward(cache, &tokens[done..done + n], pos, slot_id)
-        })?;
+        logits = chunk(model, cache, &tokens[done..done + n], pos)?;
         let elapsed = started.elapsed();
         pos += n;
         done += n;
@@ -2153,6 +2222,39 @@ fn speculative_config() -> Option<(usize, usize)> {
 enum Drafter<'a> {
     /// Copy the continuation of an earlier occurrence of the trailing n-gram.
     PromptLookup { ngram: usize, max_draft: usize },
+    /// Run the served model's own multi-token-prediction head — one decoder
+    /// block that reads the token just produced *and* the state the served
+    /// model was in when it produced it (`engine::arch::qwen4exp_mtp`).
+    ///
+    /// Cheaper per drafted token than a draft model (one block, not a whole
+    /// second trunk) and a much closer guesser (it was trained against this
+    /// model's own states), at the cost of a state row that has to be kept
+    /// in step with the served model token for token — which is what
+    /// everything below is bookkeeping for.
+    Mtp {
+        head: &'a dyn MtpHead,
+        tokens: usize,
+        /// The head's own single-layer cache, indexed by the served model's
+        /// absolute positions.
+        cache: KvCache,
+        /// How many positions of that cache are filled — placeholders
+        /// included. The same quantity `Drafter::Model` tracks, and kept for
+        /// the same reason.
+        committed: usize,
+        /// The earliest position the head has a *real* row for, or `None`
+        /// until it has one. Everything below it is a placeholder standing
+        /// in for a prompt prefix this request reused instead of forwarding,
+        /// and must stay out of every attention window.
+        first_pos: Option<usize>,
+        /// The served model's own state rows from its most recent forward,
+        /// and the absolute position of row 0. A draft step needs the state
+        /// of the position *before* the token it reads, so this is the only
+        /// thing that has to survive between one forward and the next.
+        states: Vec<f32>,
+        states_start: usize,
+        /// One state row's width, from `ModelForward::mtp_state_width`.
+        width: usize,
+    },
     /// Run a second, smaller model autoregressively.
     Model {
         model: &'a dyn ModelForward,
@@ -2183,10 +2285,16 @@ impl Drafter<'_> {
         if room == 0 {
             return Ok(Vec::new());
         }
+        // Dispatched before the match rather than inside it: the head's own
+        // step borrows the drafter, and an arm already holds it.
+        if self.wants_states() {
+            return self.draft_from_head(history, room);
+        }
         match self {
             Drafter::PromptLookup { ngram, max_draft } => {
                 Ok(ngram_draft(history, *ngram, (*max_draft).min(room)))
             }
+            Drafter::Mtp { .. } => unreachable!("dispatched above"),
             Drafter::Model {
                 model,
                 tokens,
@@ -2238,14 +2346,227 @@ impl Drafter<'_> {
     /// target would say, and the only symptom would be an acceptance rate
     /// quietly falling to zero.
     fn commit(&mut self, committed_tokens: usize) {
-        if let Drafter::Model {
-            cache, committed, ..
-        } = self
-            && *committed > committed_tokens
-        {
-            cache.truncate(committed_tokens);
-            *committed = committed_tokens;
+        match self {
+            Drafter::Model {
+                cache, committed, ..
+            }
+            | Drafter::Mtp {
+                cache, committed, ..
+            } if *committed > committed_tokens => {
+                cache.truncate(committed_tokens);
+                *committed = committed_tokens;
+            }
+            _ => {}
         }
+    }
+
+    /// The [`Drafter::Mtp`] half of [`Self::draft`].
+    ///
+    /// The catch-up's own last position *is* the first draft step: it reads
+    /// the token the served model is about to forward, paired with the state
+    /// behind it, which is precisely what a guess at the next token is. Every
+    /// step after it chains onto the head's own state and its own guess.
+    fn draft_from_head(&mut self, history: &[u32], room: usize) -> Result<Vec<u32>> {
+        let want = match self {
+            Drafter::Mtp { tokens, .. } => (*tokens).min(room),
+            _ => unreachable!("guarded by wants_states"),
+        };
+        let mut drafted = Vec::with_capacity(want);
+        let committed = self.mtp_committed();
+        anyhow::ensure!(
+            committed < history.len(),
+            "the draft head's cache is ahead of the committed history"
+        );
+        let Some(step) = self.catch_up(&history[committed..], committed)? else {
+            return Ok(drafted);
+        };
+        let mut logits = step.logits;
+        let mut state = step.state;
+        for i in 0..want {
+            // Plain argmax, not the request's sampler, for the reason the
+            // draft model uses one: a guess's only effect is how often it is
+            // accepted.
+            drafted.push(crate::engine::sampling::argmax(&logits));
+            // Nothing would read the last guess's own logits, and caching
+            // its row would put the head a position ahead of anything the
+            // served model can accept.
+            if i + 1 == want {
+                break;
+            }
+            let step = self.mtp_step(drafted[i], &state)?;
+            logits = step.logits;
+            state = step.state;
+        }
+        Ok(drafted)
+    }
+
+    /// How many positions the MTP head's cache holds, or `0` for a drafter
+    /// that keeps no state of the served model's.
+    fn mtp_committed(&self) -> usize {
+        match self {
+            Drafter::Mtp { committed, .. } => *committed,
+            _ => 0,
+        }
+    }
+
+    /// Whether this drafter needs the served model to export its hidden
+    /// state — the one thing a forward has to do differently for it.
+    fn wants_states(&self) -> bool {
+        matches!(self, Drafter::Mtp { .. })
+    }
+
+    /// Takes the served model's per-position state rows for the batch it has
+    /// just forwarded. Row 0 is position `start_pos`.
+    ///
+    /// Only stored, never consumed here: what a draft step needs is the row
+    /// *behind* the token it reads, and which token that is depends on how
+    /// much of the batch the verification went on to accept.
+    ///
+    /// **One row of overlap is carried.** A batch's first token pairs with
+    /// the last state of the batch before it, so dropping the old rows
+    /// wholesale loses exactly the one the seam needs — and the head then
+    /// gains a hole at every chunk boundary of a long prompt, which the
+    /// rest of this refuses to paper over.
+    fn observe_states(&mut self, start_pos: usize, rows: &[f32]) {
+        if let Drafter::Mtp {
+            states,
+            states_start,
+            width,
+            ..
+        } = self
+        {
+            let contiguous =
+                !states.is_empty() && *states_start + states.len() / *width == start_pos;
+            if contiguous {
+                let last = states.split_off(states.len() - *width);
+                *states = last;
+                *states_start = start_pos - 1;
+            } else {
+                states.clear();
+                *states_start = start_pos;
+            }
+            states.extend_from_slice(rows);
+        }
+    }
+
+    /// The served model's state at the position *before* `pos`, if this
+    /// drafter still holds it.
+    ///
+    /// Position 0 has no predecessor, and the head is trained against a zero
+    /// state there — but only when the run actually began at 0. A batch that
+    /// starts further in is a reused prefix, and *its* first positions have
+    /// a predecessor whose state was simply never computed. The two cases
+    /// look alike and are opposite, so they are different answers here
+    /// rather than one zero row standing for both.
+    fn previous_state(&self, pos: usize) -> Option<PrevState<'_>> {
+        let Drafter::Mtp {
+            states,
+            states_start,
+            width,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if pos == 0 {
+            return (*states_start == 0).then_some(PrevState::Zero);
+        }
+        let row = (pos - 1).checked_sub(*states_start)?;
+        states
+            .get(row * *width..(row + 1) * *width)
+            .map(PrevState::Row)
+    }
+
+    /// Runs the head over `tokens` — position `start_pos + i` — for every
+    /// position its cache does not already hold, and hands back the last
+    /// step. `None` when there was nothing to run.
+    ///
+    /// Positions whose paired state is missing are not run at all: the head
+    /// holds them as placeholders (`MtpHead::forward` fills the gap) and
+    /// keeps them out of every window. Feeding them a zero state instead
+    /// would put a row that means nothing where the model expects one that
+    /// means something, and the only symptom would be a lower acceptance
+    /// rate.
+    fn catch_up(&mut self, tokens: &[u32], start_pos: usize) -> Result<Option<MtpStep>> {
+        if !self.wants_states() {
+            return Ok(None);
+        }
+        let end = start_pos + tokens.len();
+        let from = self.mtp_committed().max(start_pos);
+        if from >= end {
+            return Ok(None);
+        }
+        let first = (from..end).find(|&pos| self.previous_state(pos).is_some());
+        let Some(first) = first else {
+            // A whole batch with no state behind it: hold it all as
+            // placeholders and wait for one that has.
+            if let Drafter::Mtp { committed, .. } = self {
+                *committed = end;
+            }
+            return Ok(None);
+        };
+
+        let width = match self {
+            Drafter::Mtp { width, .. } => *width,
+            _ => unreachable!("guarded by wants_states"),
+        };
+        let mut rows = Vec::with_capacity((end - first) * width);
+        for pos in first..end {
+            match self.previous_state(pos) {
+                Some(PrevState::Row(row)) => rows.extend_from_slice(row),
+                Some(PrevState::Zero) => rows.resize(rows.len() + width, 0.0),
+                // A hole *after* the head has started caching is a
+                // bookkeeping bug, not a reused prefix — and a silent one,
+                // since a head fed the wrong row still drafts fluently.
+                None => anyhow::bail!(
+                    "the served model's state for position {} is missing mid-batch",
+                    pos - 1
+                ),
+            }
+        }
+
+        let Drafter::Mtp {
+            head,
+            cache,
+            committed,
+            first_pos,
+            ..
+        } = self
+        else {
+            unreachable!("guarded by wants_states")
+        };
+        anyhow::ensure!(
+            first_pos.is_none() || first == from,
+            "the draft head's cache would gain a hole at position {from}"
+        );
+        let window_from = *first_pos.get_or_insert(first);
+        let step = head.forward(
+            cache,
+            &tokens[first - start_pos..],
+            &rows,
+            first,
+            window_from,
+        )?;
+        *committed = end;
+        Ok(Some(step))
+    }
+
+    /// One chained draft step: the head reads its own last guess paired with
+    /// its own state, one position past everything it has cached.
+    fn mtp_step(&mut self, token: u32, state: &[f32]) -> Result<MtpStep> {
+        let Drafter::Mtp {
+            head,
+            cache,
+            committed,
+            first_pos,
+            ..
+        } = self
+        else {
+            unreachable!("only reached from the Mtp arm")
+        };
+        let step = head.forward(cache, &[token], state, *committed, first_pos.unwrap_or(0))?;
+        *committed += 1;
+        Ok(step)
     }
 
     /// What the acceptance log calls this drafter.
@@ -2253,8 +2574,18 @@ impl Drafter<'_> {
         match self {
             Drafter::PromptLookup { .. } => "prompt-lookup",
             Drafter::Model { .. } => "draft model",
+            Drafter::Mtp { .. } => "mtp head",
         }
     }
+}
+
+/// What sits behind the token a draft step reads — see
+/// [`Drafter::previous_state`].
+enum PrevState<'s> {
+    /// The run began at position 0, where the head is trained against a
+    /// state of zeros because there is no earlier position to have one.
+    Zero,
+    Row(&'s [f32]),
 }
 
 /// Runs the draft model forward and returns the last position's logits.
@@ -2352,8 +2683,19 @@ fn speculative_next(
     input.extend_from_slice(&draft);
 
     // Per-position logits for `current` and every drafted token, from one
-    // forward that appends all of them to the cache.
-    let logits = model.forward_all_logits(cache, &input, start_pos, slot_id)?;
+    // forward that appends all of them to the cache. A head-based drafter
+    // also needs each of those positions' hidden state, and takes it from
+    // the same pass — the next draft reads the state behind whichever token
+    // the verification below goes on to accept last, and only this forward
+    // ever computes it.
+    let logits = if drafter.wants_states() {
+        let (logits, states) =
+            model.forward_all_logits_with_states(cache, &input, start_pos, slot_id)?;
+        drafter.observe_states(start_pos, &states);
+        logits
+    } else {
+        model.forward_all_logits(cache, &input, start_pos, slot_id)?
+    };
 
     // Verify greedily. `recent` mirrors what `history` would be as accepted
     // tokens are committed, so the repeat penalty (if any) sees exactly the
@@ -3171,6 +3513,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &guard,
             req,
             crate::config::Role::default(),
@@ -3208,6 +3551,7 @@ mod tests {
         run(
             model,
             tokenizer,
+            None,
             None,
             prefix_cache,
             None,
@@ -3462,6 +3806,319 @@ mod tests {
         }
     }
 
+    /// One state row per position, valued [`STATE_BASE`] above the position
+    /// it belongs to, so a test can read straight off a head's input which
+    /// position's state it was paired with — and so that the zero row
+    /// position 0 is paired with cannot be mistaken for position 0's own.
+    const STATE_WIDTH: usize = 2;
+    const STATE_BASE: f32 = 100.0;
+
+    /// A `ModelForward` that exports [`STATE_WIDTH`]-wide state rows —
+    /// `[pos, pos]` for position `pos` — alongside whatever logits it is
+    /// asked for, so a paired MTP head's bookkeeping can be checked without
+    /// an architecture that has one.
+    struct StatefulModel {
+        config: ModelConfig,
+    }
+
+    impl StatefulModel {
+        fn new() -> Self {
+            Self {
+                config: PanickingModel::new().config,
+            }
+        }
+
+        fn states(tokens: &[u32], start_pos: usize) -> Vec<f32> {
+            (0..tokens.len())
+                .flat_map(|i| [STATE_BASE + (start_pos + i) as f32; STATE_WIDTH])
+                .collect()
+        }
+    }
+
+    impl ModelForward for StatefulModel {
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            KvCache::new(1, capacity, 1)
+        }
+
+        fn forward(
+            &self,
+            _cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            _slot_id: usize,
+        ) -> Result<Vec<f32>> {
+            Ok(vec![start_pos as f32 + tokens.len() as f32; 8])
+        }
+
+        fn mtp_state_width(&self) -> Option<usize> {
+            Some(STATE_WIDTH)
+        }
+
+        fn forward_with_states(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            slot_id: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>)> {
+            let logits = self.forward(cache, tokens, start_pos, slot_id)?;
+            Ok((logits, Self::states(tokens, start_pos)))
+        }
+
+        fn forward_all_logits_with_states(
+            &self,
+            _cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            _slot_id: usize,
+        ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+            let logits = tokens.iter().map(|_| vec![0.0; 8]).collect();
+            Ok((logits, Self::states(tokens, start_pos)))
+        }
+
+        fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    /// One call into a draft head, as the head saw it.
+    #[derive(Debug, PartialEq)]
+    struct HeadCall {
+        tokens: Vec<u32>,
+        /// The position each paired state row names — `-1.0` standing for
+        /// the zero row a run beginning at position 0 gets.
+        states: Vec<f32>,
+        start_pos: usize,
+        first_pos: usize,
+    }
+
+    /// An [`MtpHead`] that records what it was fed and guesses a fresh token
+    /// every call, so a test can see the exact pairing the drafter built.
+    struct RecordingHead {
+        calls: std::sync::Mutex<Vec<HeadCall>>,
+        next: std::sync::atomic::AtomicU32,
+    }
+
+    impl RecordingHead {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                next: std::sync::atomic::AtomicU32::new(1),
+            }
+        }
+
+        fn calls(&self) -> std::sync::MutexGuard<'_, Vec<HeadCall>> {
+            self.calls.lock().unwrap()
+        }
+    }
+
+    impl MtpHead for RecordingHead {
+        fn state_width(&self) -> usize {
+            STATE_WIDTH
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            KvCache::new(1, capacity, 1)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            states: &[f32],
+            start_pos: usize,
+            first_pos: usize,
+        ) -> Result<MtpStep> {
+            // The real head holds the positions it never saw so its cache
+            // stays indexed by the served model's, and appends a row per
+            // token after them. A recorder that skipped this would let a
+            // rollback test pass against a cache that was never filled.
+            let slot = &mut cache.layers[0];
+            let zeros = vec![0.0; 1];
+            while slot.len < start_pos + tokens.len() {
+                slot.push(&zeros, &zeros);
+            }
+            self.calls().push(HeadCall {
+                tokens: tokens.to_vec(),
+                states: states.chunks(STATE_WIDTH).map(|row| row[0]).collect(),
+                start_pos,
+                first_pos,
+            });
+            let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut logits = vec![0.0; 8];
+            logits[token as usize % 8] = 1.0;
+            Ok(MtpStep {
+                logits,
+                state: vec![-(token as f32); STATE_WIDTH],
+            })
+        }
+    }
+
+    fn mtp_drafter<'a>(head: &'a RecordingHead, tokens: usize) -> Drafter<'a> {
+        Drafter::Mtp {
+            head,
+            tokens,
+            cache: head.new_kv_cache(64),
+            committed: 0,
+            first_pos: None,
+            states: Vec::new(),
+            states_start: 0,
+            width: STATE_WIDTH,
+        }
+    }
+
+    /// The pairing an MTP head is trained on: the token at position `p`
+    /// with the served model's state at `p - 1`. Getting it off by one is
+    /// invisible — the head still drafts fluent tokens, they are simply
+    /// tokens for a context one position out, and the only symptom is an
+    /// acceptance rate that never rises.
+    ///
+    /// Position 0 has no predecessor and takes the zero row the head is
+    /// trained against there, which is why a real row is offset by
+    /// [`STATE_BASE`]: the two would otherwise both read `0.0` and the test
+    /// could not tell a correct pairing from a missing one.
+    #[test]
+    fn the_head_sees_each_prompt_token_paired_with_the_state_behind_it() {
+        let model = StatefulModel::new();
+        let head = RecordingHead::new();
+        let mut drafter = mtp_drafter(&head, 2);
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (100..110).collect();
+        prefill_in_chunks(
+            &mut ChunkCost::new(),
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            0,
+            Chunking {
+                width: 4,
+                policy: ChunkPolicy::Flat,
+            },
+            Some(&mut drafter),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let calls = head.calls();
+        assert_eq!(calls.len(), 3, "one head pass per prompt chunk");
+        assert_eq!(calls[0].tokens, vec![100, 101, 102, 103]);
+        assert_eq!(calls[0].states, vec![0.0, 100.0, 101.0, 102.0]);
+        assert_eq!(calls[0].start_pos, 0);
+        assert_eq!(calls[1].tokens, vec![104, 105, 106, 107]);
+        assert_eq!(calls[1].states, vec![103.0, 104.0, 105.0, 106.0]);
+        assert_eq!(calls[1].start_pos, 4);
+        assert_eq!(calls[2].states, vec![107.0, 108.0]);
+        assert_eq!(calls[2].start_pos, 8);
+        // Nothing was skipped, so every position is attendable.
+        assert!(calls.iter().all(|c| c.first_pos == 0));
+    }
+
+    /// A prompt prefix served out of the KV cache never reaches the head:
+    /// the states it would need were not recomputed. Those positions become
+    /// placeholders and every window starts past them.
+    ///
+    /// The position the prefill *starts* at is a placeholder too, and that
+    /// is the easy one to get wrong — its own state exists, but the state
+    /// **behind** it does not.
+    #[test]
+    fn a_reused_prefix_is_held_as_placeholders_the_head_never_attends() {
+        let model = StatefulModel::new();
+        let head = RecordingHead::new();
+        let mut drafter = mtp_drafter(&head, 2);
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (200..206).collect();
+        prefill_in_chunks(
+            &mut ChunkCost::new(),
+            &model,
+            &mut cache,
+            &tokens,
+            5,
+            0,
+            Chunking {
+                width: 4,
+                policy: ChunkPolicy::Flat,
+            },
+            Some(&mut drafter),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let calls = head.calls();
+        assert_eq!(calls[0].start_pos, 6, "position 5 has no state behind it");
+        assert_eq!(calls[0].tokens, vec![201, 202, 203]);
+        assert_eq!(calls[0].states, vec![105.0, 106.0, 107.0]);
+        assert!(
+            calls.iter().all(|c| c.first_pos == 6),
+            "the reused prefix must stay out of every window: {calls:?}"
+        );
+    }
+
+    /// A draft chains onto the head's *own* state and its *own* last guess,
+    /// one position at a time, starting where the served model is about to
+    /// forward. Feeding the served model's state again on the second step
+    /// would draft the same token forever.
+    #[test]
+    fn a_draft_chains_the_head_onto_its_own_state() {
+        let head = RecordingHead::new();
+        let mut drafter = mtp_drafter(&head, 3);
+        // As if the served model had just forwarded positions 0..4 and the
+        // history now ends with the token it is about to forward at 4.
+        drafter.observe_states(0, &StatefulModel::states(&[0, 0, 0, 0], 0));
+        let history: Vec<u32> = vec![10, 11, 12, 13, 14];
+        let drafted = drafter.draft(&history, 8, 0).unwrap();
+        assert_eq!(drafted.len(), 3);
+
+        let calls = head.calls();
+        assert_eq!(calls.len(), 3, "a catch-up pass, then one per extra guess");
+        // The catch-up ends on the token about to be forwarded — that last
+        // position is the first guess, so no separate call for it.
+        assert_eq!(calls[0].tokens, vec![10, 11, 12, 13, 14]);
+        assert_eq!(calls[0].states, vec![0.0, 100.0, 101.0, 102.0, 103.0]);
+        assert_eq!(calls[1].tokens, vec![drafted[0]]);
+        assert_eq!(
+            calls[1].start_pos, 5,
+            "one past the position being forwarded"
+        );
+        assert_eq!(calls[2].tokens, vec![drafted[1]]);
+        assert_eq!(calls[2].start_pos, 6);
+        // The chained rows are the head's own, never the served model's.
+        assert!(
+            calls[1].states[0] < 0.0 && calls[2].states[0] < 0.0,
+            "chained steps must read the head's own state: {calls:?}"
+        );
+    }
+
+    /// Rejected drafts come off the head's cache with the served model's.
+    /// Left there, every later position is written one slot too far along
+    /// and the acceptance rate falls quietly to zero — the failure this
+    /// engine has already had once, on the draft-model path.
+    #[test]
+    fn a_rejected_draft_is_rolled_off_the_head_cache_too() {
+        let head = RecordingHead::new();
+        let mut drafter = mtp_drafter(&head, 3);
+        drafter.observe_states(0, &StatefulModel::states(&[0, 0, 0, 0], 0));
+        let history: Vec<u32> = vec![10, 11, 12, 13, 14];
+        drafter.draft(&history, 8, 0).unwrap();
+        assert_eq!(
+            drafter.mtp_committed(),
+            7,
+            "five committed plus two guesses"
+        );
+
+        // The served model accepted `current` and one drafted token.
+        drafter.commit(6);
+        assert_eq!(drafter.mtp_committed(), 6);
+        let Drafter::Mtp { cache, .. } = &drafter else {
+            unreachable!()
+        };
+        assert_eq!(cache.layers[0].len, 6);
+    }
+
     /// A prompt longer than one chunk is fed as consecutive `forward`
     /// calls, each starting where the previous one ended — covering every
     /// token exactly once, in order, with no gap or overlap. Anything else
@@ -3483,6 +4140,7 @@ mod tests {
                 width: 10,
                 policy: ChunkPolicy::Adaptive,
             },
+            None,
             &mut |_| {},
         )
         .unwrap();
@@ -3523,6 +4181,7 @@ mod tests {
                 0,
                 0,
                 Chunking { width: 32, policy },
+                None,
                 &mut |_| {},
             )
             .unwrap();
@@ -3560,6 +4219,7 @@ mod tests {
                 width: 10,
                 policy: ChunkPolicy::Flat,
             },
+            None,
             &mut |_| {},
         )
         .unwrap();
@@ -3659,6 +4319,7 @@ mod tests {
                 width: 3,
                 policy: ChunkPolicy::Adaptive,
             },
+            None,
             &mut |_| {},
         )
         .unwrap();
@@ -3887,6 +4548,7 @@ mod tests {
                     width: 512,
                     policy: ChunkPolicy::Adaptive,
                 },
+                None,
                 &mut |_| {},
             )
             .unwrap();
@@ -3983,6 +4645,7 @@ mod tests {
                 width: 512,
                 policy: ChunkPolicy::Adaptive,
             },
+            None,
             &mut |_| {},
         )
         .unwrap();
@@ -4012,6 +4675,7 @@ mod tests {
                 width: 10,
                 policy: ChunkPolicy::Adaptive,
             },
+            None,
             &mut |done| seen.push((done, model.calls.lock().unwrap().len())),
         )
         .unwrap();
@@ -4041,6 +4705,7 @@ mod tests {
                 width: 512,
                 policy: ChunkPolicy::Adaptive,
             },
+            None,
             &mut |done| seen.push(done),
         )
         .unwrap();
@@ -4069,6 +4734,7 @@ mod tests {
                     width: batch,
                     policy: ChunkPolicy::Adaptive,
                 },
+                None,
                 &mut |_| {},
             )
             .unwrap();
@@ -4098,6 +4764,7 @@ mod tests {
         crate::panic_capture::install();
 
         let engine = Engine {
+            mtp: None,
             paged_kv: None,
             metrics: Arc::new(crate::engine::metrics::ServerMetrics::new()),
             draft: None,
@@ -4189,6 +4856,7 @@ mod tests {
         run(
             &model,
             &tokenizer,
+            None,
             None,
             None,
             None,

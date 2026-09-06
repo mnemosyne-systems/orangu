@@ -1331,6 +1331,62 @@ Prompt-lookup speculation needs no second model and stays behind
 `ORANGU_SPECULATIVE`; see the *Inference server internals* chapter. Setting
 `draft_model` takes precedence over it.
 
+### Multi-token-prediction heads
+
+Some models ship a **draft head** of their own: one decoder block, trained
+alongside the model, that predicts the token *after* the one just produced.
+`unsloth/Qwen3.8-Flash-Next-GGUF` carries several in an `MTP/` folder.
+
+There is nothing to configure. `orangu-server download` fetches the best head
+in the repository along with the weights, and the server attaches whichever
+head it finds beside the model it is serving:
+
+```text
+orangu-server: multi-token-prediction head mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf attached (4 drafted tokens per verification)
+```
+
+A head is not a second model. It reads the token just produced **and the
+served model's own hidden state at the position before it**, which is what
+lets one block stand in for a whole trunk — so it is smaller than any draft
+model worth having, needs no vocabulary check (it predicts through the served
+model's own output projection), and guesses far better, because it was trained
+against these exact states. Verification is unchanged: every guess is checked
+against what the served model would itself have said, so **the answer is the
+answer you would have got without it**.
+
+Two heads of each quantization are usually released. A `shared-` one carries
+no token embedding and no output projection, borrowing the served model's —
+around 1.3 GB smaller, and what the download picks. A self-contained one
+carries its own copies and drafts identically.
+
+`draft_tokens` sets how many tokens a head proposes per verification, the same
+knob a `draft_model` uses; `ORANGU_SPEC_DRAFT` overrides it for one run. A
+configured `draft_model` takes precedence over the head, and the head takes
+precedence over prompt lookup — all three guess at the same tokens, so running
+more than one only turns the loser's misses into a second wasted verification.
+`ORANGU_NO_MTP=1` turns the head off, which is how to measure what it is
+worth.
+
+Three limits are worth knowing, and none of them can affect what is emitted:
+
+- A head drafts only for **greedy, unconstrained** requests, like every other
+  drafter here, for the reason above.
+- A head sees only the prompt the server actually forwarded for this request.
+  A prefix served out of the KV cache (a follow-up turn in the same
+  conversation) never reaches it, because the hidden states it would pair
+  those positions with were not recomputed. Those positions are held aside
+  and kept out of the head's attention rather than filled with zeros — the
+  head drafts a little less well on such a turn, and cannot draft anything
+  wrong.
+- Speculation of any kind trades spare capacity for latency, so it is worth
+  most at one request at a time and can be a net loss under real concurrency,
+  where there is no spare capacity to trade. If this server is busy, measure
+  it against `ORANGU_NO_MTP=1` before assuming it helps.
+
+Naming a head file as the model serves the model it drafts for instead, the
+same redirect a `dflash` sidecar gets: a head has one block and no trunk, so
+there is nothing else the request could mean.
+
 ### The `[web]` section
 
 The built-in web console (see **Web UI** below) is configured in its own
@@ -2619,10 +2675,11 @@ table and LM head — so there is no standalone model in the file to serve.
 Selecting one therefore serves the *paired target model* from the same
 Hugging Face repo, downloading it first if the models directory does not
 have it yet; the startup banner names the model actually being served.
-Running a draft as an actual draft would
-need a second-model speculative path, which this server does not have: its
-speculative decoding drafts by prompt lookup against the served model
-itself.
+Running a `dflash` draft as an actual draft would need it to read the target's
+hidden states from *inside* the target's own layers, which the speculative
+path here does not offer — unlike a multi-token-prediction head, which reads
+one state at the end of the trunk and *is* run (see **Multi-token-prediction
+heads** above).
 
 The Qwen4 preview (`qwen4exp`, e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) runs
 on the CPU path only. Its two sub-layers are the ones the Qwen 3.5 family
@@ -2631,6 +2688,11 @@ partial rotary on every fourth layer, a gated delta net on the rest — and
 its FFN is the same softmax-routed experts plus a sigmoid-gated shared
 expert as `qwen35moe`, here at 512 experts and top-10. Both are shared
 implementations, not copies. Three things around them are new.
+
+The release also ships **multi-token-prediction draft heads** in an `MTP/`
+folder, and this engine runs them — see **Multi-token-prediction heads**
+above. A head is one more block of exactly this shape with a small pre-mix in
+front of it, so it reuses everything below.
 
 **Hyper-connections.** There is no residual *vector*. The state carried
 between sub-layers is `hyper_connection.count` (4) parallel streams,
@@ -2934,8 +2996,11 @@ steers the selection only, top-k, then normalization and a scale.
 
 The file also carries a trailing multi-token-prediction block — an extra
 `block_count` entry holding a self-contained draft head that predicts two
-tokens ahead. Nothing in the trunk reads it, and this server has no
-second-model speculative path to use it with, so it is left on disk. `plan`
+tokens ahead. Nothing in the trunk reads it. This server does run such heads
+(see **Multi-token-prediction heads** above), but only where one is released
+as its own file with a graph the engine implements; this one is a block of an
+architecture whose head shape has no implementation here, so it is left on
+disk. `plan`
 reports it on its own `Draft head` line rather than folding it into either
 of the two figures that decide whether a model is usable: it is neither
 weight that must be resident nor weight that can stream, because it is never

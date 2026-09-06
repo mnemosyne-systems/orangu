@@ -1342,6 +1342,30 @@ mod`), so adding a family is additive rather than a rewrite:
   (`expand_dilated_kernel`) so the convolution can go through the same
   `RecurrentLayerState::conv_step` — and the same rolling history,
   carryover and slot persistence — as every other short convolution here.
+- `qwen4exp_mtp.rs` — the **multi-token-prediction draft head** released
+  beside a `qwen4exp` model (`MTP/mtp-*.gguf`), confirmed against upstream's
+  own MTP graph for this architecture and the driver that feeds it. One
+  block of exactly the shape `qwen4exp.rs` runs — so `HcMixer`, `hc_mix`,
+  `hc_combine`, `FullAttn` and `MoeFfn` are used from there rather than
+  copied — with `nextn.enorm`/`nextn.hnorm`/`nextn.eh_proj` in front of it
+  and `nextn.hc_head_*` behind it. It is an `MtpHead`, not a `ModelForward`,
+  and deliberately: a draft model reads tokens, a head reads a token **and
+  the served model's wide residual at the position before it**, which is
+  what lets one block stand in for forty-eight. The state is exactly what
+  `Qwen4ExpModel::trunk` returns — this architecture has no `output_norm`,
+  so the wide residual leaving the last block is the model's last
+  un-collapsed state. Two departures, both licensed by verification: it runs
+  **dense attention** (upstream's own MTP graph does; below
+  `indexer.top_k` positions the indexer selects everything anyway), and it
+  holds positions it was never fed as **placeholder rows excluded from every
+  window** rather than attending them as zeros — a zero key is not "no
+  contribution", it is a key that scores zero and takes a share of the
+  softmax. `nextn_shared_target_tensors` marks a head with no token
+  embedding or LM head of its own, which borrows the served model's.
+  `engine::generate`'s `Drafter::Mtp` is the bookkeeping: one state row is
+  carried across every batch seam (the first token of a batch pairs with the
+  last state of the one before it), and the head's cache is rolled back with
+  the served model's on every rejected draft.
 - `deepseek4.rs` — DeepSeek-V4 (`general.architecture = "deepseek4"`),
   e.g. `unsloth/DeepSeek-V4-Flash-0731-GGUF:IQ1_M`, confirmed against
   upstream `src/models/deepseek4.cpp` and the block planner in
@@ -2866,6 +2890,7 @@ or parsed, and are noted as such where they appear.
 | `ORANGU_SPECULATIVE` | unset (off) | Enables prompt-lookup speculative decoding: each step drafts the next few tokens by matching recent output against an earlier point in the context and verifies the whole draft in one forward, so the weights stream once for several tokens. Greedy-only (the output is identical to non-speculative greedy decoding); ignored for non-greedy sampling and for multi-slot batched decode. **Currently slower on this GPU** — see `SERVER_ROADMAP.md` Step 12 — because the multi-token verify runs the CPU-orchestrated forward; kept for hardware/paths where a resident multi-position forward makes it a win. Off by default. |
 | `ORANGU_SPEC_NGRAM` | `2` | With `ORANGU_SPECULATIVE`, how many trailing tokens must match an earlier point in the context to trigger a draft. Lower drafts more often (more speculative work, more misses); higher drafts only on a longer exact echo. |
 | `ORANGU_SPEC_DRAFT` | `4` | How many tokens to draft (and verify in one forward) once a match is found. The ceiling on tokens a single accepted step can produce. Also overrides `[orangu-server].draft_tokens` for a run using a draft *model*, so a sweep of drafting depth reads the same whichever drafter is in play. |
+| `ORANGU_NO_MTP` | unset (head on) | Turns off the **multi-token-prediction head** the server attaches when one ships beside the model it is serving (`MTP/mtp-*.gguf`; see `engine::arch::qwen4exp_mtp`). The control arm for measuring what a head is worth, and the way out if one ever costs more than it saves. The head only ever changes how fast an answer arrives, so this changes throughput and nothing else. |
 | `ORANGU_GPU_TIMESTAMPS` | unset (off) | Logs a per-decode-step GPU timing breakdown to stderr — the per-layer-embedding (PLE) projection, the sum/average/slowest across all model layers, and the output-norm-plus-`lm_head` tail, in milliseconds. Also logs a `[gpu-op-breakdown]` line splitting each token into **qkv-side** (Q/K/V matmuls + norm/RoPE + KV write), **attention** (split-k), and **ffn-side** (wo/gate/up/down matmuls + their norms + GELU/mul + PLE + copies) — so matmul vs attention vs overhead is measured, not estimated. Requires an adapter with `TIMESTAMP_QUERY` and `TIMESTAMP_QUERY_INSIDE_ENCODERS`; a diagnostic, no effect on the computation. **Unavailable on a split model**: a query set belongs to one device and a split resolves none, so `GET /gpu-timings` answers `{"enabled": false, "timings": null, "unavailable": "split"}` — the reason is named rather than left as an empty result, since a client that reports nothing when it receives nothing makes a split run look like one whose GPU stages cost nothing. `--flamegraph` still profiles the CPU side. |
 
 Shader compilation is cached to disk across restarts
@@ -3102,6 +3127,7 @@ with a clear message if its variable is unset when the test is run
 | `ORANGU_TEST_MISTRAL_MODEL` | `mistral3` forward-pass test | A local Ministral-3 `.gguf` file |
 | `ORANGU_TEST_PHI_MODEL` | phi3 real-model forward-pass test | A local Phi-3/Phi-4-mini `.gguf` file |
 | `ORANGU_TEST_QWEN4EXP_MODEL` | `qwen4exp` forward-pass test | A local Qwen3.8-Flash-Next `.gguf` (the first shard of a split model) |
+| `ORANGU_TEST_QWEN4EXP_MTP` | `qwen4exp` draft-head acceptance test | One of that repo's `MTP/mtp-*.gguf` heads; measures how often the head guesses what the model goes on to say |
 
 ### HTTP layer and web UI
 

@@ -780,6 +780,16 @@ fn resolve_model_spec(
     Ok((ModelSource::File(path), label))
 }
 
+/// Redirects a **draft sidecar** named as the model to the model it drafts
+/// for.
+///
+/// Two kinds reach here and neither is servable on its own: a `dflash`/DSpark
+/// file, which has no token embeddings or output projection at all, and a
+/// multi-token-prediction head (`MTP/mtp-*.gguf`), which is one decoder block
+/// and no trunk. Both are ordinary `.gguf` files in the models directory, so
+/// both turn up in `list` and can be typed at the command line; serving the
+/// paired model is the only thing either request can sensibly mean, and it is
+/// what happens.
 fn auto_pair_dflash_target(
     models_dir: &Path,
     source: ModelSource,
@@ -789,12 +799,14 @@ fn auto_pair_dflash_target(
         return Ok((source, label));
     };
     let gguf = GgufFile::open(path)?;
-    if metadata_string(&gguf, "general.architecture").as_deref() != Some("dflash") {
-        return Ok((source, label));
-    }
+    let kind = match metadata_string(&gguf, "general.architecture").as_deref() {
+        Some("dflash") => "dflash draft",
+        _ if is_mtp_head_file(path) => "multi-token-prediction",
+        _ => return Ok((source, label)),
+    };
     let repo = orangu::model_spec::hf_repo_for_path(path).ok_or_else(|| {
         anyhow!(
-            "dflash draft model {} is not under a Hugging Face cache repo, so its paired target model cannot be resolved automatically",
+            "{kind} sidecar {} is not under a Hugging Face cache repo, so its paired target model cannot be resolved automatically",
             path.display()
         )
     })?;
@@ -809,7 +821,7 @@ fn auto_pair_dflash_target(
     }
     let target = orangu::model_download::download_model(models_dir, &repo).with_context(|| {
         format!(
-            "selected dflash draft sidecar {}, but failed to fetch its paired target model from {repo}",
+            "selected {kind} sidecar {}, but failed to fetch its paired target model from {repo}",
             path.display()
         )
     })?;
@@ -1444,6 +1456,57 @@ fn prepare(args: Args) -> Result<Prepared> {
         })
         .flatten();
 
+    // The served model's own multi-token-prediction head, when one shipped
+    // beside its weights. Nothing asks for it: a head is part of the model's
+    // own release, `orangu-server download` fetches it with the weights, and
+    // the only reason it is not simply always on is that most models have
+    // none. `ORANGU_NO_MTP` turns it off — the control arm an A/B of drafting
+    // needs, and the way out if a head ever costs more than it saves.
+    let mtp = match mtp_head_path(&source) {
+        Some(path) if !crate::engine::env::flag_on("ORANGU_NO_MTP") => {
+            let attach = || -> Result<engine::generate::MtpDraft> {
+                let head = load_mtp_head(
+                    &path,
+                    model.as_ref(),
+                    &backend,
+                    draft_tokens(conf.draft_tokens),
+                )?;
+                // Same probe, same reason as the draft-model pair below:
+                // verification is one multi-position forward, and an
+                // architecture that cannot run one would fail every
+                // generation rather than fail to start. The state-exporting
+                // form specifically, because that is the one a head's
+                // verification actually calls — probing the other would
+                // answer a question nobody asked.
+                supports_multi_position_with_states(model.as_ref(), &architecture)?;
+                Ok(head)
+            };
+            match attach() {
+                Ok(head) => {
+                    println!(
+                        "orangu-server: multi-token-prediction head {} attached ({} drafted \
+                         tokens per verification)",
+                        head.label, head.tokens
+                    );
+                    Some(Arc::new(head))
+                }
+                // **Never fatal.** A head is a speed-up over a path that
+                // works without it, so nothing about one failing is a reason
+                // to refuse to serve the model it belongs to. Said out loud,
+                // though: a silently absent head is a feature nobody can
+                // tell from a slow one.
+                Err(err) => {
+                    eprintln!(
+                        "orangu-server: multi-token-prediction head {} not attached: {err:#}",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let draft = match &conf.draft_model {
         Some(spec) => {
             let draft = load_draft_model(
@@ -1472,6 +1535,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
         model,
         draft,
+        mtp,
         tokenizer,
         chat_template_source,
         slots,
@@ -1707,6 +1771,146 @@ fn load_draft_model(
         tokens,
         label,
     })
+}
+
+/// Every `snapshots/<commit>/` directory of the hub-cache repository `path`
+/// belongs to, or empty when it is not in one.
+fn sibling_snapshot_dirs(path: &Path) -> Vec<PathBuf> {
+    let snapshots = path
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "snapshots"));
+    let Some(snapshots) = snapshots else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(snapshots) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Deterministic, so two starts of one server pick the same head.
+    dirs.sort();
+    dirs
+}
+
+/// Whether `path` names a multi-token-prediction head — the `mtp-` prefix
+/// the released heads carry, matching what `orangu::model_download` keeps out
+/// of "the model" when it downloads them.
+fn is_mtp_head_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_lowercase)
+        .is_some_and(|name| name.starts_with("mtp-") && name.ends_with(".gguf"))
+}
+
+/// The multi-token-prediction head that ships beside `source`'s weights, if
+/// one is there.
+///
+/// Looked for in an `MTP/` directory beside the model's own, which is where
+/// the released heads sit — `orangu-server download` puts them there because
+/// that is the layout the repository has. A bundled model carries one file
+/// and no sidecars, so it never has a head.
+///
+/// **Sibling revisions are searched too**, and that is not thoroughness for
+/// its own sake: a model downloaded before this server could use a head sits
+/// in an older `snapshots/<commit>/` that has no `MTP/` at all, and the head
+/// a later download fetched lands in a new one. The two revisions share the
+/// same content-addressed blobs, so this is the same file either way — and a
+/// head that belongs to a different model is refused on its dimensions
+/// rather than run. Without this the symptom is a server that starts, serves
+/// correctly, and is quietly slower, which is the one failure mode a draft
+/// head can have.
+///
+/// The best of several is the one the download would have chosen: a
+/// `shared-` head over a self-contained one, then the smaller file. Both
+/// draft identically; the shared one borrows the served model's token
+/// embedding and output projection instead of carrying its own.
+fn mtp_head_path(source: &ModelSource) -> Option<PathBuf> {
+    let ModelSource::File(path) = source else {
+        return None;
+    };
+    let dir = path.parent()?;
+    // The model sits in a per-quantization directory inside the snapshot;
+    // the heads sit in `MTP/` beside it. An unsharded, un-nested layout has
+    // the model in the snapshot root, so look there too.
+    let mut candidates = vec![dir.join("MTP"), dir.parent()?.join("MTP")];
+    candidates.extend(
+        sibling_snapshot_dirs(path)
+            .into_iter()
+            .map(|d| d.join("MTP")),
+    );
+    let mut heads: Vec<PathBuf> = candidates
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| is_mtp_head_file(p))
+        .collect();
+    heads.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        // `false` sorts first, so the preferred half is the negation.
+        (
+            !name.contains("shared-"),
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX),
+        )
+    });
+    heads.into_iter().next()
+}
+
+/// Loads the head at `path` against the model it drafts for.
+///
+/// No vocabulary check of its own and no second backend, unlike
+/// [`load_draft_model`]: a head predicts through the served model's output
+/// projection (borrowing it outright, on a `shared-` export), so there are
+/// not two vocabularies here to disagree.
+fn load_mtp_head(
+    path: &Path,
+    model: &dyn ModelForward,
+    backend: &Arc<dyn Backend>,
+    tokens: usize,
+) -> Result<engine::generate::MtpDraft> {
+    let loaded = engine::loader::LoadedModel::open(path).context("loading draft head weights")?;
+    let unsupported = engine::backend::unsupported_tensor_types(loaded.tensor_types(), &**backend);
+    if !unsupported.is_empty() {
+        bail!(
+            "the selected backend has no kernel for the draft head's tensor type(s) {}",
+            unsupported.join(", ")
+        );
+    }
+    let head = model.load_mtp_head(&loaded, backend)?;
+    let label = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("mtp head")
+        .to_string();
+    Ok(engine::generate::MtpDraft {
+        head,
+        tokens,
+        label,
+    })
+}
+
+/// [`supports_multi_position`] for the forward a draft head's verification
+/// takes — the one that exports the hidden state the head reads back.
+fn supports_multi_position_with_states(model: &dyn ModelForward, label: &str) -> Result<()> {
+    let mut cache = model.new_kv_cache(1);
+    model
+        .forward_all_logits_with_states(&mut cache, &[0], 0, 0)
+        .with_context(|| {
+            format!(
+                "{label} cannot be paired with a multi-token-prediction head: verifying a draft \
+                 is one multi-position forward that also exports the head's input state, and \
+                 this architecture has no such path"
+            )
+        })?;
+    Ok(())
 }
 
 /// Refuses a model that cannot run a multi-position forward.

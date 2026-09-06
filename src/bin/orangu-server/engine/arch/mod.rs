@@ -67,6 +67,7 @@ pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3next;
 pub mod qwen4exp;
+pub mod qwen4exp_mtp;
 pub mod qwen_hybrid;
 
 use crate::engine::kv_cache::KvCache;
@@ -2330,6 +2331,125 @@ pub trait ModelForward: Send + Sync {
     fn post_pool_projection(&self, pooled: Vec<f32>) -> Result<Vec<f32>> {
         Ok(pooled)
     }
+
+    /// The width of one row of the hidden state a multi-token-prediction
+    /// draft head reads from this model, or `None` when the architecture has
+    /// no such head to pair with.
+    ///
+    /// Not `n_embd`: the state an MTP head consumes is whatever the trunk
+    /// carries between its own blocks, which on `qwen4exp` is
+    /// `hyper_connection.count` parallel streams of it.
+    fn mtp_state_width(&self) -> Option<usize> {
+        None
+    }
+
+    /// [`Self::forward`], additionally returning every position's hidden
+    /// state (`n_tokens` rows of [`Self::mtp_state_width`], in input order)
+    /// — what a paired MTP draft head reads to predict past its input.
+    ///
+    /// The logits are the *last* position's alone, as [`Self::forward`]'s
+    /// are: this is the prefill path, and a per-position `[n_vocab]` row for
+    /// a chunk of a long prompt is hundreds of megabytes nobody reads.
+    fn forward_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let _ = (cache, tokens, start_pos, slot_id);
+        anyhow::bail!("this architecture has no multi-token-prediction state to export")
+    }
+
+    /// [`Self::forward_all_logits`], additionally returning every position's
+    /// hidden state — the verification half of the same pairing
+    /// [`Self::forward_with_states`] covers for prefill.
+    fn forward_all_logits_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        let _ = (cache, tokens, start_pos, slot_id);
+        anyhow::bail!("this architecture has no multi-token-prediction state to export")
+    }
+
+    /// Builds the draft head `loaded` holds against *this* model, which owns
+    /// the tensors a `shared-` head does not carry.
+    ///
+    /// The head is a decoder block of the served architecture's own shape, so
+    /// the architecture module builds it; nothing outside knows how. The
+    /// default refuses, which is the honest answer for every architecture
+    /// with no MTP graph — a head cannot be loaded and quietly not run.
+    fn load_mtp_head(
+        &self,
+        loaded: &crate::engine::loader::LoadedModel,
+        backend: &std::sync::Arc<dyn crate::engine::backend::Backend>,
+    ) -> Result<std::sync::Arc<dyn MtpHead>> {
+        let _ = (loaded, backend);
+        anyhow::bail!(
+            "this architecture has no multi-token-prediction path, so a draft head cannot be \
+             attached to it"
+        )
+    }
+}
+
+/// A **multi-token-prediction draft head**: one decoder block, trained to
+/// predict the token *after* the one its input produced, from the served
+/// model's own hidden state.
+///
+/// It is not a [`ModelForward`] and deliberately does not pretend to be one.
+/// A draft model is a second model that reads tokens; a head reads a token
+/// *and* the state the served model was in when it emitted it, which is what
+/// lets one block stand in for a whole trunk. It has no trunk of its own to
+/// run, so there is no `forward` it could honestly implement.
+///
+/// Verification is unchanged by any of that: the served model re-derives what
+/// it would have said and keeps the matching prefix, so a head can only
+/// change how fast an answer arrives, never what it is.
+pub trait MtpHead: Send + Sync {
+    /// Width of one state row — matches the served model's
+    /// [`ModelForward::mtp_state_width`], checked when the pair is built.
+    fn state_width(&self) -> usize;
+
+    /// A fresh cache for the head's own single attention layer, sized for
+    /// `capacity` positions and indexed by the *served model's* absolute
+    /// positions, so the two stay in step token for token.
+    fn new_kv_cache(&self, capacity: usize) -> KvCache;
+
+    /// One batch of positions: `tokens[i]` sits at `start_pos + i`, paired
+    /// with `states[i]` — the state row of the position *before* it, from
+    /// the served model for a catch-up and from this head itself when a
+    /// draft chains onto its own guess.
+    ///
+    /// `first_pos` is the earliest cached position this head has a real row
+    /// for; anything below it was never fed and must not be attended.
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        states: &[f32],
+        start_pos: usize,
+        first_pos: usize,
+    ) -> Result<MtpStep>;
+}
+
+/// What one [`MtpHead::forward`] produced.
+///
+/// The **last** input position only, both times. A head's earlier positions
+/// exist to fill its cache, not to be read: their logits predict tokens the
+/// served model has already committed, and their states are only ever
+/// chained from by the position that follows them, which is in the same
+/// call. Returning a row per position would be hundreds of megabytes of
+/// prompt nobody looks at.
+pub struct MtpStep {
+    /// `[n_vocab]` — the head's guess at what follows the last input token.
+    pub logits: Vec<f32>,
+    /// `[state_width]` — this head's own state at the last input position,
+    /// which the next chained draft step reads in place of the served
+    /// model's.
+    pub state: Vec<f32>,
 }
 
 #[cfg(test)]

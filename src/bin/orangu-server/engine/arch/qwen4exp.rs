@@ -101,8 +101,9 @@ use crate::engine::tensor;
 /// reads, plus (except on the model's final head) the projection that
 /// predicts how that sub-layer's output is scattered back across them.
 ///
-/// `hc_attn_*` and `hc_ffn_*` per layer, `output_hc_*` once at the end.
-struct HcMixer {
+/// `hc_attn_*` and `hc_ffn_*` per layer, `output_hc_*` once at the end, and
+/// `blk.N.nextn.hc_head_*` on a draft head ([`super::qwen4exp_mtp`]).
+pub(super) struct HcMixer {
     /// `[hc * n_embd]` — one gamma per stream *and* channel, applied after
     /// a norm taken over each stream separately. The converter folded the
     /// `1 + w` these were trained with, so this is a plain multiply.
@@ -117,7 +118,7 @@ struct HcMixer {
 }
 
 impl HcMixer {
-    fn load(loaded: &LoadedModel, prefix: &str, with_inject: bool) -> Result<Self> {
+    pub(super) fn load(loaded: &LoadedModel, prefix: &str, with_inject: bool) -> Result<Self> {
         let get = |suffix: &str| -> Result<Vec<f32>> {
             let name = format!("{prefix}_{suffix}.weight");
             Ok(loaded
@@ -260,6 +261,18 @@ pub struct Qwen4ExpModel {
     /// `(kv_dim, stride)` per `KvCache::layers` slot, in slot order.
     kv_dims: Vec<usize>,
     recurrent_specs: Vec<RecurrentSpec>,
+}
+
+/// Whether `loaded` is a **draft-head-only export** — an `MTP/mtp-*.gguf`
+/// sidecar rather than a model.
+///
+/// Declaring `nextn_predict_layers` is not enough on its own: a model that
+/// ships its head *inside* its own file declares it too, and that file has a
+/// trunk. What separates the two is the trunk's own first block, which a
+/// head has no reason to carry and no ability to run.
+pub(super) fn is_draft_head_export(loaded: &LoadedModel) -> bool {
+    loaded.metadata_u64("nextn_predict_layers").unwrap_or(0) > 0
+        && !loaded.has_tensor("blk.0.hc_attn_norm.weight")
 }
 
 /// Re-lays a `[channels, kernel]` depthwise kernel as a `[channels, (kernel
@@ -495,7 +508,30 @@ impl Ple {
 }
 
 impl Qwen4ExpModel {
+    /// The shared dimensions a paired draft head checks itself against.
+    pub(super) fn dims(&self) -> &Dims {
+        &self.dims
+    }
+
+    /// The token embedding and the output projection, for a `shared-` draft
+    /// head exported without either — see [`super::qwen4exp_mtp`]. A
+    /// [`QuantMatrix`] is a handle, so the head clones these rather than
+    /// borrowing the model for its own lifetime.
+    pub(super) fn tok_embeddings(&self) -> &QuantMatrix {
+        &self.tok_embeddings
+    }
+
+    pub(super) fn output_weight(&self) -> &QuantMatrix {
+        &self.output_weight
+    }
+
     pub fn load_with_backend(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
+        anyhow::ensure!(
+            !is_draft_head_export(loaded),
+            "this is a multi-token-prediction draft head, not a servable model: it carries one \
+             block and no trunk, and reads the served model's own hidden state. Serve the model \
+             it drafts for instead — the head beside it is attached automatically"
+        );
         let dims = Dims::from_loaded(loaded)?;
         let n_layer = trunk_layer_count(loaded)?;
         let is_recr = recurrent_layer_mask(loaded, n_layer);
@@ -659,73 +695,108 @@ impl Qwen4ExpModel {
         })
     }
 
-    /// The hyper-connection in-mix: normalizes the streams, gates them, and
-    /// collapses them to the one `[n_tokens, n_embd]` vector the sub-layer
-    /// reads. When the mixer has an injection projection, the `[n_tokens,
-    /// hc]` scatter weights [`Self::hc_combine`] needs come back with it.
-    ///
-    /// `x` is `[n_tokens, hc, n_embd]`, streams contiguous within a token.
+    /// [`hc_mix`] against this model's own dimensions.
     fn hc_mix(&self, mixer: &HcMixer, x: &[f32], n_tokens: usize) -> (Vec<f32>, Option<Vec<f32>>) {
-        let n_embd = self.dims.n_embd;
-        let hc = self.hc;
-        let hc_dim = hc * n_embd;
-
-        // Grouped RMSNorm: the norm is taken over one stream at a time, and
-        // the gamma that follows spans all of them.
-        let mut normed = Vec::new();
-        super::rms_norm_rows_into(&mut normed, x, n_embd, self.dims.rms_eps);
-        for row in normed.chunks_mut(hc_dim) {
-            tensor::mul_inplace(row, &mixer.norm);
-        }
-
-        let mut low =
-            super::matmul_host_fallback(self.backend.as_ref(), &normed, n_tokens, &mixer.down);
-        let inv_hc = 1.0 / hc as f32;
-        for v in low.iter_mut() {
-            *v = tensor::silu(*v * inv_hc);
-        }
-        let mut gate =
-            super::matmul_host_fallback(self.backend.as_ref(), &low, n_tokens, &mixer.up);
-        for v in gate.iter_mut() {
-            *v = tensor::sigmoid(*v);
-        }
-        tensor::mul_inplace(&mut gate, &normed);
-        let gated = gate;
-
-        // Collapse the streams by their mean.
-        let mut mixed = vec![0f32; n_tokens * n_embd];
-        for (t, dst) in mixed.chunks_mut(n_embd).enumerate() {
-            for c in 0..hc {
-                let src = &gated[(t * hc + c) * n_embd..(t * hc + c + 1) * n_embd];
-                tensor::axpy_inplace(dst, src, inv_hc);
-            }
-        }
-
-        let inject = mixer
-            .inject
-            .as_ref()
-            .map(|w| super::matmul_host_fallback(self.backend.as_ref(), &normed, n_tokens, w));
-        (mixed, inject)
+        hc_mix(
+            self.backend.as_ref(),
+            self.dims.n_embd,
+            self.hc,
+            self.dims.rms_eps,
+            mixer,
+            x,
+            n_tokens,
+        )
     }
 
-    /// The hyper-connection out-mix: adds this sub-layer's output back into
-    /// every stream, weighted per stream.
-    ///
-    /// `2 * sigmoid(inject / hc)` centres the weights on 1, so an untrained
-    /// injection matrix reproduces the plain residual add this replaces.
+    /// [`hc_combine`] against this model's own dimensions.
     fn hc_combine(&self, x: &mut [f32], sub_out: &[f32], inject: &[f32], n_tokens: usize) {
-        let n_embd = self.dims.n_embd;
-        let hc = self.hc;
-        for t in 0..n_tokens {
-            let out_t = &sub_out[t * n_embd..(t + 1) * n_embd];
-            for c in 0..hc {
-                let w = hc_scatter_weight(inject[t * hc + c], hc);
-                let dst = &mut x[(t * hc + c) * n_embd..(t * hc + c + 1) * n_embd];
-                tensor::axpy_inplace(dst, out_t, w);
-            }
+        hc_combine(self.dims.n_embd, self.hc, x, sub_out, inject, n_tokens);
+    }
+}
+
+/// The hyper-connection in-mix: normalizes the streams, gates them, and
+/// collapses them to the one `[n_tokens, n_embd]` vector the sub-layer
+/// reads. When the mixer has an injection projection, the `[n_tokens, hc]`
+/// scatter weights [`hc_combine`] needs come back with it.
+///
+/// `x` is `[n_tokens, hc, n_embd]`, streams contiguous within a token.
+///
+/// A free function rather than a method because the draft head
+/// ([`super::qwen4exp_mtp`]) is a block of this architecture without being
+/// this architecture's model: it brackets its sub-layers with exactly these
+/// mixers and holds none of the trunk they belong to.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hc_mix(
+    backend: &dyn Backend,
+    n_embd: usize,
+    hc: usize,
+    rms_eps: f32,
+    mixer: &HcMixer,
+    x: &[f32],
+    n_tokens: usize,
+) -> (Vec<f32>, Option<Vec<f32>>) {
+    let hc_dim = hc * n_embd;
+
+    // Grouped RMSNorm: the norm is taken over one stream at a time, and
+    // the gamma that follows spans all of them.
+    let mut normed = Vec::new();
+    super::rms_norm_rows_into(&mut normed, x, n_embd, rms_eps);
+    for row in normed.chunks_mut(hc_dim) {
+        tensor::mul_inplace(row, &mixer.norm);
+    }
+
+    let mut low = super::matmul_host_fallback(backend, &normed, n_tokens, &mixer.down);
+    let inv_hc = 1.0 / hc as f32;
+    for v in low.iter_mut() {
+        *v = tensor::silu(*v * inv_hc);
+    }
+    let mut gate = super::matmul_host_fallback(backend, &low, n_tokens, &mixer.up);
+    for v in gate.iter_mut() {
+        *v = tensor::sigmoid(*v);
+    }
+    tensor::mul_inplace(&mut gate, &normed);
+    let gated = gate;
+
+    // Collapse the streams by their mean.
+    let mut mixed = vec![0f32; n_tokens * n_embd];
+    for (t, dst) in mixed.chunks_mut(n_embd).enumerate() {
+        for c in 0..hc {
+            let src = &gated[(t * hc + c) * n_embd..(t * hc + c + 1) * n_embd];
+            tensor::axpy_inplace(dst, src, inv_hc);
         }
     }
 
+    let inject = mixer
+        .inject
+        .as_ref()
+        .map(|w| super::matmul_host_fallback(backend, &normed, n_tokens, w));
+    (mixed, inject)
+}
+
+/// The hyper-connection out-mix: adds this sub-layer's output back into
+/// every stream, weighted per stream.
+///
+/// `2 * sigmoid(inject / hc)` centres the weights on 1, so an untrained
+/// injection matrix reproduces the plain residual add this replaces.
+pub(super) fn hc_combine(
+    n_embd: usize,
+    hc: usize,
+    x: &mut [f32],
+    sub_out: &[f32],
+    inject: &[f32],
+    n_tokens: usize,
+) {
+    for t in 0..n_tokens {
+        let out_t = &sub_out[t * n_embd..(t + 1) * n_embd];
+        for c in 0..hc {
+            let w = hc_scatter_weight(inject[t * hc + c], hc);
+            let dst = &mut x[(t * hc + c) * n_embd..(t * hc + c + 1) * n_embd];
+            tensor::axpy_inplace(dst, out_t, w);
+        }
+    }
+}
+
+impl Qwen4ExpModel {
     /// Which cached positions each token of this batch may attend, or
     /// `None` when every one of them can see everything it could anyway.
     ///
@@ -924,6 +995,80 @@ impl ModelForward for Qwen4ExpModel {
         start_pos: usize,
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
+        let x = self.trunk(cache, tokens, start_pos)?;
+        Ok(self.last_logits(&x, tokens.len()))
+    }
+
+    /// The trunk's own multi-position path — the whole of [`Self::forward`]
+    /// already runs several positions at once, so this is that pass with
+    /// every position's logits read out instead of the last one's.
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let x = self.trunk(cache, tokens, start_pos)?;
+        Ok(self.all_logits(&x, tokens.len()))
+    }
+
+    fn mtp_state_width(&self) -> Option<usize> {
+        Some(self.hc * self.dims.n_embd)
+    }
+
+    fn forward_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let x = self.trunk(cache, tokens, start_pos)?;
+        let logits = self.last_logits(&x, tokens.len());
+        Ok((logits, x))
+    }
+
+    fn forward_all_logits_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        let x = self.trunk(cache, tokens, start_pos)?;
+        let logits = self.all_logits(&x, tokens.len());
+        Ok((logits, x))
+    }
+
+    fn load_mtp_head(
+        &self,
+        loaded: &LoadedModel,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<Arc<dyn super::MtpHead>> {
+        Ok(Arc::new(super::qwen4exp_mtp::Qwen4ExpMtpHead::load(
+            loaded,
+            backend.clone(),
+            self,
+        )?))
+    }
+
+    fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
+        anyhow::bail!("embeddings are not yet supported for Qwen4-preview models")
+    }
+}
+
+impl Qwen4ExpModel {
+    /// The trunk alone: `[n_tokens, hc, n_embd]`, streams contiguous within
+    /// a token, with every layer's key/value appended to `cache`.
+    ///
+    /// This is the whole forward pass bar the head mixer and the output
+    /// projection, and it is separate from them because *this* is what a
+    /// multi-token-prediction draft head reads. There is no `output_norm` in
+    /// this architecture, so the wide residual leaving the last block is the
+    /// model's last un-collapsed state and the row an MTP head is trained
+    /// against — see [`super::qwen4exp_mtp`].
+    fn trunk(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.dims.n_embd;
         let hc = self.hc;
@@ -988,21 +1133,35 @@ impl ModelForward for Qwen4ExpModel {
             self.hc_combine(&mut x, &ffn_out, &inject, n_tokens);
         }
 
-        // Only the last position's logits are wanted, and the head mixer is
-        // per token, so only that token's streams are collapsed.
-        let last = &x[(n_tokens - 1) * hc_dim..];
-        let (out, _) = self.hc_mix(&self.head, last, 1);
-
         if let Some(ple) = self.ple.as_ref() {
             for &tok in tokens {
                 cache.push_recent_token(tok, ple.hash.lookback());
             }
         }
-        Ok(self.backend.matmul(&out, 1, &self.output_weight))
+        Ok(x)
     }
 
-    fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
-        anyhow::bail!("embeddings are not yet supported for Qwen4-preview models")
+    /// The last position's logits from the trunk's output.
+    ///
+    /// The head mixer is per token, so only that token's streams are
+    /// collapsed — a prefill chunk of hundreds of positions would otherwise
+    /// pay a `[n_vocab]` projection per position for one row anybody reads.
+    fn last_logits(&self, x: &[f32], n_tokens: usize) -> Vec<f32> {
+        let hc_dim = self.hc * self.dims.n_embd;
+        let last = &x[(n_tokens - 1) * hc_dim..];
+        let (out, _) = self.hc_mix(&self.head, last, 1);
+        self.backend.matmul(&out, 1, &self.output_weight)
+    }
+
+    /// Every position's logits, one row per input token — what speculative
+    /// decoding's verify step checks each drafted token against.
+    fn all_logits(&self, x: &[f32], n_tokens: usize) -> Vec<Vec<f32>> {
+        let (out, _) = self.hc_mix(&self.head, x, n_tokens);
+        let logits = self.backend.matmul(&out, n_tokens, &self.output_weight);
+        logits
+            .chunks(self.config.n_vocab)
+            .map(<[f32]>::to_vec)
+            .collect()
     }
 }
 

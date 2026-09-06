@@ -35,11 +35,16 @@
 //! image-related flag, so fetching it up front means `LLAMA_CACHE=<models>`
 //! already has everything ready offline — and the same on-disk layout
 //! (content-addressed blobs, a relative symlink per snapshot file). Not
-//! mirrored: `--mtp` companion downloads, `preset.ini` repos, and Docker
-//! registry sources — all out of scope for a first version of a "download
-//! the model" command.
+//! mirrored: `preset.ini` repos and Docker registry sources — both out of
+//! scope for a first version of a "download the model" command.
 //!
-//! A multi-part model's shards (and a bundled `mmproj`, when present)
+//! A **multi-token-prediction draft head** is fetched with the model
+//! ([`find_best_mtp`]), which is this engine's own decision rather than a
+//! mirrored one: the server attaches whichever head sits beside the weights,
+//! so a head nobody downloaded is a feature that silently never happens. See
+//! `engine::arch::qwen4exp_mtp`.
+//!
+//! A multi-part model's shards (and its `mmproj`/MTP sidecars, when present)
 //! download concurrently rather than one at a time — bounded by rayon's
 //! global thread pool — each reporting its own progress line on a shared
 //! [`ProgressBoard`]. Every file gets a line from the first draw onwards,
@@ -159,6 +164,13 @@ pub fn download_model_reporting(
 
     if let Some(mmproj) = find_best_mmproj(&files, &selected[0].path) {
         selected.push(mmproj);
+    }
+    // Fetched with the model rather than on demand, for the reason the
+    // `mmproj` sidecar above is: the server attaches whichever head it finds
+    // beside the weights, and a head that was never downloaded is a feature
+    // that silently does not happen. It is a fraction of the model's size.
+    if let Some(mtp) = find_best_mtp(&files) {
+        selected.push(mtp);
     }
 
     let repo_dir = models_dir.join(repo_folder_name(&repo));
@@ -748,6 +760,55 @@ fn find_best_sibling<'a>(
 
 fn find_best_mmproj<'a>(files: &'a [RepoFile], model_path: &str) -> Option<&'a RepoFile> {
     find_best_sibling(files, model_path, "mmproj")
+}
+
+/// The quantizations of a multi-token-prediction head worth having, best
+/// first — the same shape as [`DEFAULT_TAG_PREFERENCE`], and chosen for the
+/// same kind of reason: a draft step is dominated by the output projection,
+/// which is cheaper to execute at 8 bits than at 16, so the widest head is
+/// both the largest file and the slowest drafter. A head outside this list
+/// is still taken when nothing in it exists.
+const MTP_TAG_PREFERENCE: &[&str] = &["Q8_0", "Q4_K_M"];
+
+/// Picks the multi-token-prediction draft head to fetch alongside the model,
+/// or `None` when the repository ships none.
+///
+/// **Not [`find_best_sibling`].** That one requires the sidecar's directory
+/// to be a prefix of the model's, which is exactly what an MTP head is not:
+/// the heads sit in their own `MTP/` folder while the model sits in a
+/// per-quantization one, so the two directories share no prefix and a
+/// sibling search finds nothing. A repository carries heads for one model,
+/// so the whole listing is the right place to look — and there is nothing to
+/// match a head against, which is why this takes no model path.
+///
+/// `shared-` heads win. They carry no token embedding and no output
+/// projection of their own, borrowing the served model's — around 1.3 GB
+/// less to download and hold, drafting identically. Among equals, the
+/// preferred quantization, then the smaller file.
+fn find_best_mtp(files: &[RepoFile]) -> Option<&RepoFile> {
+    let heads: Vec<&RepoFile> = files.iter().filter(|f| is_mtp_head(&f.path)).collect();
+    let rank = |f: &RepoFile| -> (bool, usize, u64) {
+        let filename = f.path.rsplit('/').next().unwrap_or(&f.path).to_lowercase();
+        let tag = trailing_tag(&f.path).unwrap_or_default();
+        (
+            // `false` sorts first, so the preferred half of each pair is the
+            // negation of what is wanted.
+            !filename.contains("shared-"),
+            MTP_TAG_PREFERENCE
+                .iter()
+                .position(|t| *t == tag)
+                .unwrap_or(MTP_TAG_PREFERENCE.len()),
+            f.size,
+        )
+    };
+    heads.into_iter().min_by_key(|f| rank(f))
+}
+
+/// Whether `path` names a multi-token-prediction draft head — the `mtp-`
+/// prefix [`is_model_gguf`] excludes from being "the model".
+fn is_mtp_head(path: &str) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    filename.ends_with(".gguf") && filename.starts_with("mtp-")
 }
 
 /// Lists the quant tags found among `model_files`'s own filenames (via the
@@ -1892,6 +1953,74 @@ mod tests {
     fn find_best_mmproj_returns_none_without_a_sidecar() {
         let files = vec![file("model-Q4_K_M.gguf", "m", 1)];
         assert!(find_best_mmproj(&files, "model-Q4_K_M.gguf").is_none());
+    }
+
+    /// The real `unsloth/Qwen3.8-Flash-Next-GGUF` layout: the heads live in
+    /// their own `MTP/` folder, the model in a per-quantization one. The
+    /// `shared-` head is the one to take, and `Q8_0` over `Q4_K_M`.
+    #[test]
+    fn find_best_mtp_prefers_a_shared_head_at_the_preferred_quant() {
+        let files = vec![
+            file(
+                "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+                "m",
+                1,
+            ),
+            file("MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf", "a", 7_770_760_320),
+            file("MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf", "b", 2_786_204_800),
+            file("MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "c", 4_137_429_120),
+            file(
+                "MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf",
+                "d",
+                5_227_963_456,
+            ),
+            file(
+                "MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
+                "e",
+                1_907_151_936,
+            ),
+            file(
+                "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+                "f",
+                2_786_568_256,
+            ),
+        ];
+        let best = find_best_mtp(&files).unwrap();
+        assert_eq!(best.path, "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf");
+    }
+
+    /// The head sits in a directory that shares no prefix with the model's,
+    /// which is precisely what `find_best_sibling` rejects — so a repository
+    /// laid out this way must not be searched with it.
+    #[test]
+    fn the_sibling_search_cannot_see_a_head_in_its_own_folder() {
+        let files = vec![
+            file("UD-Q4_K_XL/model-UD-Q4_K_XL.gguf", "m", 1),
+            file("MTP/mtp-model-shared-Q8_0.gguf", "a", 2),
+        ];
+        assert!(find_best_sibling(&files, "UD-Q4_K_XL/model-UD-Q4_K_XL.gguf", "mtp-").is_none());
+        assert!(find_best_mtp(&files).is_some());
+    }
+
+    /// A repository with no head at all — every other model in the models
+    /// directory — must add nothing to the download.
+    #[test]
+    fn find_best_mtp_returns_none_without_a_head() {
+        let files = vec![
+            file("model-Q4_K_M.gguf", "m", 1),
+            file("mmproj-F16.gguf", "p", 2),
+        ];
+        assert!(find_best_mtp(&files).is_none());
+    }
+
+    /// Only the `mtp-` prefix names a head. A model whose own name merely
+    /// contains the letters is a model.
+    #[test]
+    fn is_mtp_head_reads_the_prefix_not_the_whole_name() {
+        assert!(is_mtp_head("MTP/mtp-model-shared-Q8_0.gguf"));
+        assert!(is_mtp_head("mtp-model-Q8_0.gguf"));
+        assert!(!is_mtp_head("model-mtp-Q8_0.gguf"));
+        assert!(!is_mtp_head("MTP/README.md"));
     }
 
     #[test]
