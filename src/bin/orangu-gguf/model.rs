@@ -463,10 +463,19 @@ impl Model {
             }
         });
 
+        // Keeping a block's intermediates costs memory and saves the
+        // recompute the backward would otherwise do. `keep` is only worth
+        // paying when there is room, so it follows the budget.
+        let mut kept = Activations::new(if grads.is_some() {
+            activation_budget()
+        } else {
+            0
+        });
         for l in 0..cfg.layers {
             inputs.push(x.clone());
-            let cache = self.layer_forward(l, &x, t, false);
-            x = cache.out;
+            let cache = self.layer_forward(l, &x, t, kept.budget > 0);
+            x = cache.out.clone();
+            kept.insert(l, cache);
         }
         inputs.push(x.clone());
 
@@ -595,7 +604,8 @@ impl Model {
         }
 
         for l in (0..cfg.layers).rev() {
-            dx = self.layer_backward(l, &inputs[l], &dx, t, grads);
+            let cached = kept.take(l);
+            dx = self.layer_backward(l, &inputs[l], &dx, t, grads, cached);
         }
 
         let dembd = grad_slice(grads, self.layout.tok_embd, cfg.vocab * h);
@@ -647,6 +657,9 @@ impl Model {
         let (k_normed, k_rms) = time(Stage::RmsNorm, || {
             rmsnorm_forward(&k, k_w, t * cfg.kv_heads, cfg.head_dim, cfg.eps)
         });
+        // Kept only when the block's intermediates are; the early return
+        // below drops them for a plain forward.
+        let (q_pre, k_pre) = (q, k);
 
         let mut q_rope = q_normed;
         let mut k_rope = k_normed;
@@ -701,6 +714,8 @@ impl Model {
         LayerCache {
             normed,
             attn_rms,
+            q_pre,
+            k_pre,
             q_rope,
             k_rope,
             v,
@@ -726,11 +741,18 @@ impl Model {
         dout: &[f32],
         t: usize,
         grads: &mut [f32],
+        cached: Option<LayerCache>,
     ) -> Aligned {
         let cfg = &self.cfg;
         let (h, qd, kvd, f) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.ffn);
         let o = self.layout.layers[l];
-        let c = self.layer_forward(l, x, t, true);
+        // The forward's own intermediates when they were kept, and the same
+        // ones rebuilt when they were not. `layer_forward` is a function of
+        // the block input alone, so the two are the same floats.
+        let c = match cached {
+            Some(cache) => cache,
+            None => self.layer_forward(l, x, t, true),
+        };
 
         // Feed-forward.
         let mut d_act = Aligned::zeros(t * f);
@@ -830,7 +852,13 @@ impl Model {
         }
 
         // The Q/K norms run per head, so their "rows" are heads, not tokens.
-        let (q_pre, k_pre) = time(Stage::QkPreNorm, || self.qk_pre_norm(l, t, &c));
+        // Kept by the forward when its intermediates were kept, rebuilt
+        // from the block's own normed input when they were not.
+        let (q_pre, k_pre) = if c.q_pre.is_empty() {
+            time(Stage::QkPreNorm, || self.qk_pre_norm(l, t, &c))
+        } else {
+            (c.q_pre.clone(), c.k_pre.clone())
+        };
         let mut d_q_pre = Aligned::zeros(t * qd);
         {
             let dq_norm = grad_slice(grads, o.q_norm, cfg.head_dim);
@@ -936,6 +964,12 @@ impl Model {
 struct LayerCache {
     normed: Aligned,
     attn_rms: Aligned,
+    /// The query and key projections *before* their per-head norms — the
+    /// inputs those norms' backward needs. Free to keep: the forward
+    /// computes exactly these and used to drop them, and the backward then
+    /// rebuilt them with two more matmuls.
+    q_pre: Aligned,
+    k_pre: Aligned,
     q_rope: Aligned,
     k_rope: Aligned,
     v: Aligned,
@@ -949,6 +983,115 @@ struct LayerCache {
     up: Aligned,
     act: Aligned,
     out: Aligned,
+}
+
+impl LayerCache {
+    /// Floats held, for the cache's budget.
+    fn floats(&self) -> usize {
+        self.normed.len()
+            + self.attn_rms.len()
+            + self.q_pre.len()
+            + self.k_pre.len()
+            + self.q_rope.len()
+            + self.k_rope.len()
+            + self.v.len()
+            + self.q_rms.len()
+            + self.k_rms.len()
+            + self.ctx.len()
+            + self.mid.len()
+            + self.ffn_normed.len()
+            + self.ffn_rms.len()
+            + self.gate.len()
+            + self.up.len()
+            + self.act.len()
+            + self.out.len()
+    }
+}
+
+/// A least-recently-used cache of block activations, bounded in bytes.
+///
+/// **What it is for.** The backward pass needs every intermediate the
+/// forward produced, and storing them all costs an activation footprint
+/// that grows with the feed-forward width; the tool has always paid one
+/// extra forward pass instead and recomputed them. That recompute is a
+/// quarter of a training step's arithmetic, and it is bought with memory
+/// this machine has spare — a smoke model's whole working set is a
+/// gigabyte against sixty-two.
+///
+/// So: keep what fits, recompute the rest. The budget is the knob, and the
+/// two extremes are the two strategies — nothing cached is exactly the
+/// recompute-everything behaviour this replaces, and everything cached is
+/// no recompute at all.
+///
+/// **Why least-recently-used is the right policy and not just a familiar
+/// one.** The forward fills it in block order and the backward drains it in
+/// reverse, so the entry that has gone longest without being touched is
+/// always the one furthest from being needed. Evicting it is exactly right,
+/// and the policy needs no knowledge of the schedule to get there.
+struct Activations {
+    /// Oldest first, so eviction is from the front.
+    entries: Vec<(usize, LayerCache)>,
+    floats: usize,
+    budget: usize,
+}
+
+impl Activations {
+    fn new(budget_bytes: usize) -> Self {
+        Activations {
+            entries: Vec::new(),
+            floats: 0,
+            budget: budget_bytes / 4,
+        }
+    }
+
+    /// Keeps `cache` for `layer` if it fits, evicting the least recently
+    /// used entries to make room. A cache larger than the whole budget is
+    /// dropped rather than emptying the cache for it.
+    fn insert(&mut self, layer: usize, cache: LayerCache) {
+        let floats = cache.floats();
+        if floats > self.budget {
+            return;
+        }
+        while self.floats + floats > self.budget {
+            let Some((_, evicted)) = (!self.entries.is_empty()).then(|| self.entries.remove(0))
+            else {
+                break;
+            };
+            self.floats -= evicted.floats();
+        }
+        self.floats += floats;
+        self.entries.push((layer, cache));
+    }
+
+    /// Takes a block's activations if they are still here. Removing rather
+    /// than borrowing is deliberate: each is wanted exactly once, and
+    /// holding it past that would be holding the largest buffers in the
+    /// process for nothing.
+    fn take(&mut self, layer: usize) -> Option<LayerCache> {
+        let at = self.entries.iter().position(|(l, _)| *l == layer)?;
+        let (_, cache) = self.entries.remove(at);
+        self.floats -= cache.floats();
+        Some(cache)
+    }
+}
+
+/// Bytes of block activations a training step may hold rather than
+/// recompute.
+///
+/// Zero restores the recompute-everything behaviour exactly. The default
+/// is a quarter of what the machine reports free at startup — enough to
+/// hold every block of the sizes this trains without being the reason a
+/// larger one runs out.
+pub fn activation_budget() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if let Ok(value) = std::env::var("ORANGU_GGUF_CACHE_MIB")
+            && let Ok(mib) = value.parse::<usize>()
+        {
+            return mib << 20;
+        }
+        orangu::hardware::detect_cpu().available_memory_bytes as usize / 4
+    })
 }
 
 fn grad_slice(grads: &mut [f32], offset: usize, len: usize) -> &mut [f32] {
@@ -970,16 +1113,39 @@ fn grad_slice(grads: &mut [f32], offset: usize, len: usize) -> &mut [f32] {
 /// other seven reads of it hit L1. Eight was chosen because a tile's
 /// working set — eight rows of the widest activation this trains, plus the
 /// row they are multiplied against — still fits in 32 KB of L1.
-const TILE: usize = 8;
+const TILE_DEFAULT: usize = 8;
+
+/// How many token rows one task of a forward matmul takes.
+///
+/// This is the knob that decides how many times a weight matrix is swept
+/// per call — `tokens / TILE` of them — and therefore how much of the
+/// traffic a step generates is compulsory and how much is re-reading. It is
+/// tunable at run time (`ORANGU_GGUF_TILE`) because the right value is a
+/// property of the machine's cache hierarchy rather than of the model, and
+/// because the only way to find it is to sweep it.
+///
+/// Read once. The value cannot change within a run, so a matmul that
+/// consulted it per call would be paying for a decision already made.
+fn tile_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_TILE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(TILE_DEFAULT)
+    })
+}
 
 /// `y[t, n] = x[t, k] . w[n, k]` — the row-major weight layout a GGUF
 /// matrix already has, so no transpose is ever materialized.
 pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+    let rows_per_tile = tile_rows();
     debug_assert_eq!(y.len(), t * n);
     debug_assert_eq!(x.len(), t * k);
     debug_assert_eq!(w.len(), n * k);
-    y.par_chunks_mut(n * TILE)
-        .zip(x.par_chunks(k * TILE))
+    y.par_chunks_mut(n * rows_per_tile)
+        .zip(x.par_chunks(k * rows_per_tile))
         .for_each(|(out_tile, in_tile)| tile(out_tile, in_tile, w, k, n));
 }
 
@@ -1068,6 +1234,43 @@ fn dot_rows4(rows: [&[f32]; 4], b: &[f32]) -> [f32; 4] {
     out
 }
 
+/// Weight rows one pass of [`tile`] produces before writing them out.
+///
+/// The output of a tile is `[rows, n]` and the natural loop writes it one
+/// *column* at a time — `out[r * n + o]` for each of the four token rows,
+/// `n` floats apart. At `n = 4096` that is four cache lines touched per
+/// weight row, sixteen kilobytes apart, and the tile is far too large to
+/// keep them; each line is fetched, written to four times over the whole
+/// sweep, and evicted in between. It is why the forward matmul's
+/// efficiency falls as `n` grows — measured at 53% of a core's peak on the
+/// 768-wide attention output and 30% on the 4096-wide feed-forward.
+///
+/// Sixty-four columns at a time into a one-kilobyte scratch turns those
+/// scattered stores into four contiguous runs. The weight block is re-read
+/// once per group of four token rows, from the level-two cache, which is
+/// the trade.
+const OUT_BLOCK: usize = 64;
+
+/// The widest scratch [`tile`] will use, so it can live on the stack.
+const OUT_BLOCK_MAX: usize = 256;
+
+/// [`OUT_BLOCK`], overridable for a sweep. **One** reproduces the write
+/// pattern this replaced — a store per output, `n` floats from the last —
+/// so the two arms of that comparison live in one binary and can be
+/// interleaved, which is the only way to measure anything on a machine
+/// whose throughput drifts by a tenth as it warms up.
+fn out_block() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_OUT_BLOCK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|width| *width > 0)
+            .unwrap_or(OUT_BLOCK)
+            .min(OUT_BLOCK_MAX)
+    })
+}
+
 /// One tile of [`matmul`]: the whole weight matrix against `rows` tokens.
 ///
 /// Split out so the fused kernels below can do several of these on one tile
@@ -1076,24 +1279,39 @@ fn dot_rows4(rows: [&[f32]; 4], b: &[f32]) -> [f32; 4] {
 fn tile(out_tile: &mut [f32], in_tile: &[f32], w: &[f32], k: usize, n: usize) {
     let rows = in_tile.len() / k;
     let row = |r: usize| &in_tile[r * k..(r + 1) * k];
-    // Weight row outermost: each one is fetched once and then used by
-    // every token in the tile while it is still in L1 — and, four at a
-    // time, while it is still in a register.
-    for (o, weight_row) in w.chunks_exact(k).enumerate() {
+    // Four token rows by `OUT_BLOCK` outputs, held on the stack.
+    let mut scratch = [0f32; 4 * OUT_BLOCK_MAX];
+    let block = out_block();
+    let mut first = 0;
+    while first < n {
+        let last = (first + block).min(n);
+        let width = last - first;
         let mut r = 0;
         while r + 4 <= rows {
             let group = [row(r), row(r + 1), row(r + 2), row(r + 3)];
-            for (j, v) in dot_rows4(group, weight_row).iter().enumerate() {
-                out_tile[(r + j) * n + o] = *v;
+            // Weight row outermost, so each is fetched once and then used by
+            // every token in the group while it is still in a register.
+            for (i, weight_row) in w[first * k..last * k].chunks_exact(k).enumerate() {
+                let values = dot_rows4(group, weight_row);
+                for (j, value) in values.iter().enumerate() {
+                    scratch[j * block + i] = *value;
+                }
+            }
+            for j in 0..4 {
+                let at = (r + j) * n + first;
+                out_tile[at..at + width].copy_from_slice(&scratch[j * block..j * block + width]);
             }
             r += 4;
         }
         // The tail takes the same shape rather than [`dot`], so every row
         // of every tensor is summed in one order.
         while r < rows {
-            out_tile[r * n + o] = dot_rows([row(r)], weight_row)[0];
+            for (i, weight_row) in w[first * k..last * k].chunks_exact(k).enumerate() {
+                out_tile[r * n + first + i] = dot_rows([row(r)], weight_row)[0];
+            }
             r += 1;
         }
+        first = last;
     }
 }
 
@@ -1119,13 +1337,14 @@ fn matmul_qkv(
     qd: usize,
     kvd: usize,
 ) {
+    let rows_per_tile = tile_rows();
     debug_assert_eq!(q.len(), t * qd);
     debug_assert_eq!(k_out.len(), t * kvd);
     debug_assert_eq!(v.len(), t * kvd);
-    q.par_chunks_mut(qd * TILE)
-        .zip(k_out.par_chunks_mut(kvd * TILE))
-        .zip(v.par_chunks_mut(kvd * TILE))
-        .zip(x.par_chunks(k * TILE))
+    q.par_chunks_mut(qd * rows_per_tile)
+        .zip(k_out.par_chunks_mut(kvd * rows_per_tile))
+        .zip(v.par_chunks_mut(kvd * rows_per_tile))
+        .zip(x.par_chunks(k * rows_per_tile))
         .for_each(|(((q_tile, k_tile), v_tile), in_tile)| {
             tile(q_tile, in_tile, wq, k, qd);
             tile(k_tile, in_tile, wk, k, kvd);
@@ -1152,11 +1371,12 @@ fn matmul_swiglu(
     k: usize,
     f: usize,
 ) {
+    let rows_per_tile = tile_rows();
     debug_assert_eq!(gate.len(), t * f);
-    gate.par_chunks_mut(f * TILE)
-        .zip(up.par_chunks_mut(f * TILE))
-        .zip(act.par_chunks_mut(f * TILE))
-        .zip(x.par_chunks(k * TILE))
+    gate.par_chunks_mut(f * rows_per_tile)
+        .zip(up.par_chunks_mut(f * rows_per_tile))
+        .zip(act.par_chunks_mut(f * rows_per_tile))
+        .zip(x.par_chunks(k * rows_per_tile))
         .for_each(|(((gate_tile, up_tile), act_tile), in_tile)| {
             tile(gate_tile, in_tile, w_gate, k, f);
             tile(up_tile, in_tile, w_up, k, f);
@@ -1182,11 +1402,12 @@ fn matmul_residual(
     k: usize,
     n: usize,
 ) {
+    let rows_per_tile = tile_rows();
     debug_assert_eq!(y.len(), t * n);
     debug_assert_eq!(residual.len(), t * n);
-    y.par_chunks_mut(n * TILE)
-        .zip(x.par_chunks(k * TILE))
-        .zip(residual.par_chunks(n * TILE))
+    y.par_chunks_mut(n * rows_per_tile)
+        .zip(x.par_chunks(k * rows_per_tile))
+        .zip(residual.par_chunks(n * rows_per_tile))
         .for_each(|((out_tile, in_tile), residual_tile)| {
             tile(out_tile, in_tile, w, k, n);
             for (o, r) in out_tile.iter_mut().zip(residual_tile) {
@@ -1222,12 +1443,113 @@ const ACC_LANES: usize = 2 * LANES;
 /// into slabs of about this size means each pass re-reads a slab rather
 /// than a matrix, and the accumulators are still loaded and stored once
 /// per slab rather than once per element.
-const SLAB_BYTES: usize = 256 << 10;
+/// Measured, not assumed. Interleaved against a control stage, one thread,
+/// two runs each: `dw` 8.17/8.28 s at 32 KiB, **7.69/7.83 at 64**,
+/// 8.30/8.45 at 128, 8.56 at 256, 10.4 at 1024; `dx` the same shape. Small
+/// enough that the slab and the accumulator tile share the second-level
+/// cache rather than evict each other, large enough that the accumulators
+/// are still loaded and stored once per slab and not once per element.
+const SLAB_BYTES: usize = 64 << 10;
 
-/// How many rows of a `[rows, k]` operand fit in a slab.
+/// Output rows one *task* of a backward matmul owns.
+///
+/// Distinct from [`ACC_ROWS`], which is how many the registers hold, and
+/// that distinction is the whole point. A task sweeps its shared operand —
+/// the weight matrix for `dx`, the activations for `dw` — once, so chunking
+/// the work four rows at a time meant sweeping it `rows / 4` times: two
+/// hundred and fifty-six passes over a matrix larger than any cache, per
+/// call. Giving a task many rows and blocking the registers inside it reads
+/// that operand `rows / ROWS_PER_TASK` times instead, for the same
+/// arithmetic and the same answer.
+///
+/// Thirty-two, measured. On this machine the difference between four and
+/// thirty-two is only about a tenth at sixteen threads — because sixteen
+/// tasks sweeping the *same* weight matrix at the same time keep it in a
+/// shared last-level cache, and the re-reads never reach memory. Run the
+/// same work on one thread, where nothing can hide it, and it is **1.7x**
+/// end to end: `dx` 14.29 s -> 3.35 s and `dw` 12.71 s -> 4.82 s. The cache
+/// will stop hiding it on a model whose weights do not fit, which is every
+/// size above this one.
+///
+/// Wider is not better without limit: past this the task count falls below
+/// what keeps the pool busy, and occupancy goes with it.
+///
+/// Unlike [`ATTN_BACKWARD_TASKS`] this may be tuned freely, including from
+/// the thread count, because it does not change any sum: every output
+/// element still accumulates over the whole swept dimension in slab order
+/// whatever the split. `the_blocked_backward_kernels_are_their_own_definition`
+/// is run at 4, 16, 64 and 256 to hold that true.
+fn task_rows(rows: usize, k: usize) -> usize {
+    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let fixed = *FIXED.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .map(|rows| rows.next_multiple_of(ACC_ROWS))
+    });
+    if let Some(rows) = fixed {
+        return rows;
+    }
+    // Wide enough that the sweep is amortized, narrow enough that there are
+    // still several tasks per thread for the pool to balance with. Measured
+    // one thread, with a forward matmul as the control: `dx` 8.22 s at 16
+    // rows, 7.12 at 32, 6.63 at 64, 6.49 at 128 — it wants to be as wide as
+    // the work allows. Sixteen threads want the opposite, and at a fixed
+    // 128 the token dimension would only cut into eight tasks for sixteen
+    // of them.
+    //
+    // Deriving it from the thread count is safe here and would not be for
+    // [`ATTN_BACKWARD_TASKS`]: the split decides nothing about which sums
+    // happen where — every output element still accumulates over the whole
+    // swept dimension in slab order — so a model trained on four threads is
+    // the same model trained on forty.
+    let tasks = rayon::current_num_threads() * TASKS_PER_THREAD;
+    // Two bounds, and the tighter one wins. Enough tasks to keep the pool
+    // busy; and an accumulator tile that still fits a second-level cache,
+    // because the tile is touched once per slab of the swept operand and a
+    // tile past the cache is refetched every time. The width the sweep
+    // above found best at one thread — 128 rows at `k = 768` — is exactly
+    // what the byte bound gives, which is the reason to believe it is a
+    // capacity effect and not a coincidence of this shape.
+    let by_cache = ACC_TILE_BYTES / (k * 4).max(1);
+    rows.div_ceil(tasks.max(1))
+        .min(by_cache)
+        .next_multiple_of(ACC_ROWS)
+        .max(ACC_ROWS)
+}
+
+/// Tasks per thread the backward matmuls aim for. More than one, because
+/// the slabs are not equal work once a tail is involved, and the
+/// work-stealing pool needs something to steal.
+const TASKS_PER_THREAD: usize = 2;
+
+/// How much of a second-level cache one task's accumulator tile may take,
+/// leaving room for the slab of the operand being swept past it.
+const ACC_TILE_BYTES: usize = 384 << 10;
+
+/// Whether [`matmul_add_dw`] gathers its slab of `dy` before sweeping the
+/// column blocks. **Zero** is the strided read it replaced, kept so the two
+/// can be alternated in one binary.
+fn dw_gather() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORANGU_GGUF_DW_GATHER").as_deref() != Ok("0"))
+}
+
+/// How many rows of a `[rows, k]` operand fit in a slab. `ORANGU_GGUF_SLAB_KIB`
+/// overrides the budget, for sweeping it.
 #[inline]
 fn slab_rows(k: usize) -> usize {
-    (SLAB_BYTES / (k * 4).max(1)).clamp(8, 512)
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let budget = *BYTES.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_SLAB_KIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|kib| *kib > 0)
+            .map(|kib| kib << 10)
+            .unwrap_or(SLAB_BYTES)
+    });
+    (budget / (k * 4).max(1)).clamp(8, 512)
 }
 
 /// `dx[t, k] += dy[t, n] . w[n, k]`.
@@ -1249,51 +1571,61 @@ fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: usize, n: u
     debug_assert_eq!(dy.len(), t * n);
     debug_assert_eq!(w.len(), n * k);
     let slab = slab_rows(k);
-    dx.par_chunks_mut(k * ACC_ROWS)
-        .zip(dy.par_chunks(n * ACC_ROWS))
-        .for_each(|(dx_tile, dy_tile)| {
-            let rows = dx_tile.len() / k;
+    let per_task = task_rows(t, k);
+    dx.par_chunks_mut(k * per_task)
+        .zip(dy.par_chunks(n * per_task))
+        .for_each(|(dx_task, dy_task)| {
+            let task_rows = dx_task.len() / k;
             // `dy` is read down a column here — one value per output row,
             // `n` floats apart — and it is read again for every column
             // block of `k`. Gathering a slab of it into row-major order
-            // once turns all of those into contiguous reads, and the
-            // buffer is a few kilobytes.
-            let mut column = vec![0f32; slab * rows];
+            // once turns all of those into contiguous reads.
+            let mut column = vec![0f32; slab * ACC_ROWS];
             let mut first = 0;
             while first < n {
                 let last = (first + slab).min(n);
-                for o in first..last {
-                    let at = (o - first) * rows;
-                    for r in 0..rows {
-                        column[at + r] = dy_tile[r * n + o];
-                    }
-                }
-                let column = &column[..(last - first) * rows];
-                let mut j = 0;
-                while j + ACC_LANES <= k {
-                    match rows {
-                        4 => dx_block::<4>(dx_tile, column, w, k, first, last, j),
-                        3 => dx_block::<3>(dx_tile, column, w, k, first, last, j),
-                        2 => dx_block::<2>(dx_tile, column, w, k, first, last, j),
-                        _ => dx_block::<1>(dx_tile, column, w, k, first, last, j),
-                    }
-                    j += ACC_LANES;
-                }
-                // Whatever is left of a row that a whole number of cache
-                // lines does not cover. Every width this trains is a
-                // multiple of 256, so this runs in the tests and nowhere
-                // else — which is why it takes the plain path rather than a
-                // second blocked one.
-                if j < k {
+                // The slab of `w` is outside the row loop, so every group of
+                // rows in this task reuses it while it is still in cache.
+                // That is what makes a task worth more than four rows.
+                let mut row = 0;
+                while row < task_rows {
+                    let rows = ACC_ROWS.min(task_rows - row);
+                    let dx_tile = &mut dx_task[row * k..(row + rows) * k];
+                    let dy_tile = &dy_task[row * n..(row + rows) * n];
                     for o in first..last {
+                        let at = (o - first) * rows;
                         for r in 0..rows {
-                            fma_into(
-                                &mut dx_tile[r * k + j..(r + 1) * k],
-                                &w[o * k + j..(o + 1) * k],
-                                column[(o - first) * rows + r],
-                            );
+                            column[at + r] = dy_tile[r * n + o];
                         }
                     }
+                    let column = &column[..(last - first) * rows];
+                    let mut j = 0;
+                    while j + ACC_LANES <= k {
+                        match rows {
+                            4 => dx_block::<4>(dx_tile, column, w, k, first, last, j),
+                            3 => dx_block::<3>(dx_tile, column, w, k, first, last, j),
+                            2 => dx_block::<2>(dx_tile, column, w, k, first, last, j),
+                            _ => dx_block::<1>(dx_tile, column, w, k, first, last, j),
+                        }
+                        j += ACC_LANES;
+                    }
+                    // Whatever is left of a row that a whole number of cache
+                    // lines does not cover. Every width this trains is a
+                    // multiple of 256, so this runs in the tests and nowhere
+                    // else — which is why it takes the plain path rather
+                    // than a second blocked one.
+                    if j < k {
+                        for o in first..last {
+                            for r in 0..rows {
+                                fma_into(
+                                    &mut dx_tile[r * k + j..(r + 1) * k],
+                                    &w[o * k + j..(o + 1) * k],
+                                    column[(o - first) * rows + r],
+                                );
+                            }
+                        }
+                    }
+                    row += rows;
                 }
                 first = last;
             }
@@ -1351,59 +1683,11 @@ fn dx_block<const R: usize>(
     }
 }
 
-/// `dw[n, k] += dy[t, n]^T . x[t, k]`.
-///
-/// The same shape as [`matmul_add_dx`] with the swept dimension being the
-/// tokens rather than the output rows, and the same reason for it: this was
-/// an `axpy` into memory per token per output row, which is a load and a
-/// store of the accumulator for every multiply. The same note about the
-/// fused multiply-add applies.
-fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
-    debug_assert_eq!(dw.len(), n * k);
-    debug_assert_eq!(dy.len(), t * n);
-    debug_assert_eq!(x.len(), t * k);
-    let slab = slab_rows(k);
-    dw.par_chunks_mut(k * ACC_ROWS)
-        .enumerate()
-        .for_each(|(tile, dw_tile)| {
-            let rows = dw_tile.len() / k;
-            let out = tile * ACC_ROWS;
-            let mut first = 0;
-            while first < t {
-                let last = (first + slab).min(t);
-                let mut j = 0;
-                while j + ACC_LANES <= k {
-                    match rows {
-                        4 => dw_block::<4>(dw_tile, dy, x, k, n, out, first, last, j),
-                        3 => dw_block::<3>(dw_tile, dy, x, k, n, out, first, last, j),
-                        2 => dw_block::<2>(dw_tile, dy, x, k, n, out, first, last, j),
-                        _ => dw_block::<1>(dw_tile, dy, x, k, n, out, first, last, j),
-                    }
-                    j += ACC_LANES;
-                }
-                if j < k {
-                    for step in first..last {
-                        for r in 0..rows {
-                            fma_into(
-                                &mut dw_tile[r * k + j..(r + 1) * k],
-                                &x[step * k + j..(step + 1) * k],
-                                dy[step * n + out + r],
-                            );
-                        }
-                    }
-                }
-                first = last;
-            }
-        });
-}
-
-/// One column block of [`matmul_add_dw`], for `R` output rows.
-///
-/// `dy` needs no gathering here, unlike [`dx_block`]: the `R` values one
-/// token contributes are `R` consecutive floats of its row already.
+/// [`dw_block`] reading `dy` where it lies instead of from a gathered
+/// slab: the form the gather replaced, for measuring against.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn dw_block<const R: usize>(
+fn dw_block_strided<const R: usize>(
     dw_tile: &mut [f32],
     dy: &[f32],
     x: &[f32],
@@ -1423,11 +1707,135 @@ fn dw_block<const R: usize>(
     let activations = x[first * k..last * k].chunks_exact(k);
     let gradients = dy[first * n..last * n].chunks_exact(n);
     for (x_row, dy_row) in activations.zip(gradients) {
-        // See [`dx_block`] on why these are arrays and not ranges.
         let (Some(cell), Some(scalars)) = (
             x_row[j..].first_chunk::<ACC_LANES>(),
             dy_row[out..].first_chunk::<R>(),
         ) else {
+            continue;
+        };
+        let x0 = load8(&cell[..LANES]);
+        let x1 = load8(&cell[LANES..]);
+        for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
+            let g = f32x8::splat(scalar);
+            sums[0] = x0.mul_add(g, sums[0]);
+            sums[1] = x1.mul_add(g, sums[1]);
+        }
+    }
+    for (r, sums) in acc.iter().enumerate() {
+        store8(&mut dw_tile[r * k + j..], sums[0]);
+        store8(&mut dw_tile[r * k + j + LANES..], sums[1]);
+    }
+}
+
+/// `dw[n, k] += dy[t, n]^T . x[t, k]`.
+///
+/// The same shape as [`matmul_add_dx`] with the swept dimension being the
+/// tokens rather than the output rows, and the same reason for it: this was
+/// an `axpy` into memory per token per output row, which is a load and a
+/// store of the accumulator for every multiply. The same note about the
+/// fused multiply-add applies.
+fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
+    debug_assert_eq!(dw.len(), n * k);
+    debug_assert_eq!(dy.len(), t * n);
+    debug_assert_eq!(x.len(), t * k);
+    let slab = slab_rows(k);
+    let per_task = task_rows(n, k);
+    let gather = dw_gather();
+    dw.par_chunks_mut(k * per_task)
+        .enumerate()
+        .for_each(|(task, dw_task)| {
+            let task_rows = dw_task.len() / k;
+            let base = task * per_task;
+            // `dy` is read down a column here — the `ACC_ROWS` values one
+            // token contributes are consecutive, but the next token's are
+            // `n` floats away — and the column-block loop below reads it
+            // again for every sixteen columns of `k`. That is sixteen bytes
+            // taken from each cache line, tens of times over. Gathering the
+            // slab once turns all of it into one contiguous read of a few
+            // kilobytes, which is what `matmul_add_dx` has always done and
+            // this had not.
+            let mut column = vec![0f32; slab * ACC_ROWS];
+            let mut first = 0;
+            while first < t {
+                let last = (first + slab).min(t);
+                let mut row = 0;
+                while row < task_rows {
+                    let rows = ACC_ROWS.min(task_rows - row);
+                    let out = base + row;
+                    let dw_tile = &mut dw_task[row * k..(row + rows) * k];
+                    if gather {
+                        for step in first..last {
+                            let at = (step - first) * rows;
+                            column[at..at + rows]
+                                .copy_from_slice(&dy[step * n + out..step * n + out + rows]);
+                        }
+                    }
+                    let column = &column[..(last - first) * rows];
+                    let mut j = 0;
+                    while j + ACC_LANES <= k {
+                        match (gather, rows) {
+                            (true, 4) => dw_block::<4>(dw_tile, column, x, k, first, last, j),
+                            (true, 3) => dw_block::<3>(dw_tile, column, x, k, first, last, j),
+                            (true, 2) => dw_block::<2>(dw_tile, column, x, k, first, last, j),
+                            (true, _) => dw_block::<1>(dw_tile, column, x, k, first, last, j),
+                            (false, 4) => {
+                                dw_block_strided::<4>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
+                            (false, 3) => {
+                                dw_block_strided::<3>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
+                            (false, 2) => {
+                                dw_block_strided::<2>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
+                            (false, _) => {
+                                dw_block_strided::<1>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
+                        }
+                        j += ACC_LANES;
+                    }
+                    if j < k {
+                        for step in first..last {
+                            for r in 0..rows {
+                                fma_into(
+                                    &mut dw_tile[r * k + j..(r + 1) * k],
+                                    &x[step * k + j..(step + 1) * k],
+                                    dy[step * n + out + r],
+                                );
+                            }
+                        }
+                    }
+                    row += rows;
+                }
+                first = last;
+            }
+        });
+}
+
+/// One column block of [`matmul_add_dw`], for `R` output rows.
+///
+/// `dy` needs no gathering here, unlike [`dx_block`]: the `R` values one
+/// token contributes are `R` consecutive floats of its row already.
+#[inline]
+fn dw_block<const R: usize>(
+    dw_tile: &mut [f32],
+    column: &[f32],
+    x: &[f32],
+    k: usize,
+    first: usize,
+    last: usize,
+    j: usize,
+) {
+    let mut acc = [[f32x8::ZERO; 2]; R];
+    for (r, sums) in acc.iter_mut().enumerate() {
+        let cell = &dw_tile[r * k + j..r * k + j + ACC_LANES];
+        sums[0] = load8(cell);
+        sums[1] = load8(&cell[LANES..]);
+    }
+    let activations = x[first * k..last * k].chunks_exact(k);
+    let (gathered, _) = column.as_chunks::<R>();
+    for (x_row, scalars) in activations.zip(gathered) {
+        // See [`dx_block`] on why these are arrays and not ranges.
+        let Some(cell) = x_row[j..].first_chunk::<ACC_LANES>() else {
             continue;
         };
         let x0 = load8(&cell[..LANES]);
@@ -1759,6 +2167,21 @@ fn rope(x: &mut [f32], heads: usize, head_dim: usize, base: f32, inverse: bool) 
         });
 }
 
+/// Queries that share one pass over the keys and values, inside a task.
+///
+/// Tunable so the two arms of that change can be interleaved in one binary;
+/// **one** is the query-at-a-time form it replaced.
+fn attn_queries() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_ATTN_QUERIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(8)
+    })
+}
+
 /// Query positions handled by one attention task.
 ///
 /// Attention parallelizes over heads *and* query positions, which is what
@@ -1777,6 +2200,7 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], cfg: &Config, t: usize) -> Aligned
     let kvd = cfg.kv_dim();
     let scale = 1.0 / (hd as f32).sqrt();
     let mut ctx = Aligned::zeros(t * cfg.q_dim());
+    let block = attn_queries();
 
     let chunks = t.div_ceil(ATTN_CHUNK);
     let pieces: Vec<(usize, usize, Aligned)> = (0..heads * chunks)
@@ -1788,21 +2212,44 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], cfg: &Config, t: usize) -> Aligned
             let last = (first + ATTN_CHUNK).min(t);
             let kv = head / group;
             let mut out = Aligned::zeros((last - first) * hd);
-            let mut scores = Aligned::zeros(t);
-            for step in first..last {
-                let q_row = &q[step * heads * hd + head * hd..step * heads * hd + (head + 1) * hd];
-                let scores = &mut scores[..=step];
-                for (s, score) in scores.iter_mut().enumerate() {
+            let mut scores = Aligned::zeros(block * t);
+
+            let mut base = first;
+            while base < last {
+                let stop = (base + block).min(last);
+                let rows = stop - base;
+
+                // Key outermost. One query at a time re-reads every key and
+                // every value it attends to, which is `hd` floats of traffic
+                // for `hd` multiply-adds — half a flop per byte, and the
+                // most memory-bound arithmetic in the model. A key row read
+                // once and used by `rows` queries is that many times fewer
+                // bytes for the same work, and it is the same `dot` in the
+                // same order, so the answer does not move.
+                for s in 0..stop {
                     let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                    *score = dot(q_row, k_row) * scale;
+                    // Causal: only queries at or after this key see it, and
+                    // they are the tail of the block, so this is a bound
+                    // rather than a test inside the loop.
+                    for r in s.saturating_sub(base)..rows {
+                        let step = base + r;
+                        let at = step * heads * hd + head * hd;
+                        scores[r * t + s] = dot(&q[at..at + hd], k_row) * scale;
+                    }
                 }
-                softmax(scores);
-                let at = (step - first) * hd;
-                let out_row = &mut out[at..at + hd];
-                for (s, &p) in scores.iter().enumerate() {
+                for r in 0..rows {
+                    softmax(&mut scores[r * t..r * t + base + r + 1]);
+                }
+                // Values the same way round, and the accumulation into a
+                // query's output still walks the keys in ascending order.
+                for s in 0..stop {
                     let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                    axpy(out_row, v_row, p);
+                    for r in s.saturating_sub(base)..rows {
+                        let at = (base + r - first) * hd;
+                        axpy(&mut out[at..at + hd], v_row, scores[r * t + s]);
+                    }
                 }
+                base = stop;
             }
             (head, first, out)
         })
@@ -1899,41 +2346,68 @@ fn attention_backward(
             // the softmax maximum, one over its sum, and the weighted
             // derivative the softmax backward subtracts.
             let mut stats = Aligned::zeros(count * 3);
-            let mut probs = Aligned::zeros(t);
-            let mut dscores = Aligned::zeros(t);
+            // Per query in a block rather than per query: this pass reads
+            // every key *twice* — once for the score and once for the
+            // gradient it accumulates into `dq` — and every value once, and
+            // one query at a time pays all of that per query. A block shares
+            // each of those reads. The order of every sum is unchanged, so
+            // so is every float it produces.
+            let block = attn_queries();
+            let mut probs = Aligned::zeros(block * t);
+            let mut dscores = Aligned::zeros(block * t);
+            let mut weighted = vec![0f32; block];
 
-            for step in first..last {
-                let q_row = &q[step * qd + head * hd..step * qd + (head + 1) * hd];
-                let (max, inv_sum) = {
-                    let scores = &mut probs[..=step];
-                    for (s, score) in scores.iter_mut().enumerate() {
-                        let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                        *score = dot(q_row, k_row) * scale;
-                    }
-                    softmax_stats(scores)
-                };
-                let d_row = &d_ctx[step * qd + head * hd..step * qd + (head + 1) * hd];
+            let mut base = first;
+            while base < last {
+                let stop = (base + block).min(last);
+                let width = stop - base;
 
-                let mut weighted = 0.0f32;
-                for s in 0..=step {
-                    let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                    let dp = dot(d_row, v_row);
-                    dscores[s] = dp;
-                    weighted += probs[s] * dp;
-                }
-                let at = (step - first) * hd;
-                for s in 0..=step {
-                    let g = probs[s] * (dscores[s] - weighted) * scale;
-                    if g == 0.0 {
-                        continue;
-                    }
+                // Scores, key row outermost.
+                for s in 0..stop {
                     let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
-                    axpy(&mut dq[at..at + hd], k_row, g);
+                    for r in s.saturating_sub(base)..width {
+                        let at = (base + r) * qd + head * hd;
+                        probs[r * t + s] = dot(&q[at..at + hd], k_row) * scale;
+                    }
                 }
-                let out = (step - first) * 3;
-                stats[out] = max;
-                stats[out + 1] = inv_sum;
-                stats[out + 2] = weighted;
+                for r in 0..width {
+                    let step = base + r;
+                    let (max, inv_sum) = softmax_stats(&mut probs[r * t..r * t + step + 1]);
+                    let out = (step - first) * 3;
+                    stats[out] = max;
+                    stats[out + 1] = inv_sum;
+                }
+
+                // The value gradient's dot product, value row outermost.
+                // `weighted` still accumulates over the keys in ascending
+                // order for each query, which is the order that matters.
+                weighted[..width].fill(0.0);
+                for s in 0..stop {
+                    let v_row = &v[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                    for r in s.saturating_sub(base)..width {
+                        let at = (base + r) * qd + head * hd;
+                        let dp = dot(&d_ctx[at..at + hd], v_row);
+                        dscores[r * t + s] = dp;
+                        weighted[r] += probs[r * t + s] * dp;
+                    }
+                }
+                for r in 0..width {
+                    stats[(base + r - first) * 3 + 2] = weighted[r];
+                }
+
+                // And the query gradient, key row outermost again.
+                for s in 0..stop {
+                    let k_row = &k[s * kvd + kv * hd..s * kvd + (kv + 1) * hd];
+                    for r in s.saturating_sub(base)..width {
+                        let g = probs[r * t + s] * (dscores[r * t + s] - weighted[r]) * scale;
+                        if g == 0.0 {
+                            continue;
+                        }
+                        let at = (base + r - first) * hd;
+                        axpy(&mut dq[at..at + hd], k_row, g);
+                    }
+                }
+                base = stop;
             }
             (head, first, dq, stats)
         })
@@ -2076,6 +2550,11 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
+
+    /// The default tile width, for the reference kernels below. They exist
+    /// to be compared against, so they hold the shape still while
+    /// `ORANGU_GGUF_TILE` moves the real one.
+    const TILE: usize = super::TILE_DEFAULT;
 
     /// One weight row against four token rows at once.
     ///

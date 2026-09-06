@@ -586,9 +586,19 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             );
         } else {
             println!(
-                "\ntraining {} parameters for {steps} steps of {} x {sequence} tokens\n",
+                "\ntraining {} parameters for {steps} steps of {} x {sequence} tokens",
                 network.layout.total, options.batch
             );
+            // What the backward will keep rather than recompute. Printed
+            // because it is the one setting that trades memory for time,
+            // and a run that quietly took a gigabyte should say so.
+            let budget = model::activation_budget();
+            if budget == 0 {
+                println!("activations recomputed (ORANGU_GGUF_CACHE_MIB=0)");
+            } else {
+                println!("activations cached up to {}", bytes(budget as u64));
+            }
+            println!();
         }
         if !manifest.export_only {
             train::run(

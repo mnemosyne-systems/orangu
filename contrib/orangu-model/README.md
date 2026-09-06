@@ -92,7 +92,7 @@ test can fetch in seconds while still covering both kinds of source.
 
 | Script | What it does | How long |
 |:---|:---|:---|
-| `00-smoke.sh` | The whole pipeline on a 20 MB corpus at the `smoke` size, then both quantizations | ~30 minutes |
+| `00-smoke.sh` | The whole pipeline on a 20 MB corpus at the `smoke` size, then both quantizations | ~20 minutes |
 | `10-bf16.sh` | The training run: random weights to a BF16 GGUF | days to weeks |
 | `20-q6_k.sh` | BF16 to Q6_K | seconds to minutes |
 | `30-q4_k_m.sh` | BF16 to Q4_K_M | seconds to minutes |
@@ -154,7 +154,7 @@ downloaded copy of the same one — makes it stop rather than rewrite it.
 
 ### Run the smoke test first
 
-It costs about half an hour, and it is the only thing standing between a typo in the
+It costs about twenty minutes, and it is the only thing standing between a typo in the
 settings and finding out about it a week into the training run. Its output
 is meant to be gibberish — 200 steps on 20 MB of source teaches a model
 nothing. What it proves is that every stage runs on this machine and that

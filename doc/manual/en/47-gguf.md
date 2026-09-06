@@ -47,10 +47,11 @@ orangu-gguf corpus.json
 
 The manifest is the whole command: the size, the context length, the weight
 format, the corpus and the schedule all live in it, and everything it does
-not mention takes a documented default. `smoke` finishes in about half an
-hour and exists to prove the whole pipeline works on your machine before you
-commit a week to it; `tiny` is a smaller shape again, for when the question
-is only whether the tool runs at all. Then serve what came out:
+not mention takes a documented default. `smoke` trains in about a quarter
+of an hour and exists to prove the whole pipeline works on your machine
+before you commit a week to it; `tiny` is a smaller shape again, for when
+the question is only whether the tool runs at all. Then serve what came
+out:
 
 ```sh
 orangu-server ./my-model-smoke-BF16.gguf
@@ -338,7 +339,7 @@ The stages, in order:
 
 ```sh
 cd contrib/orangu-model
-./00-smoke.sh       # the whole pipeline, on 20 MB, in about half an hour
+./00-smoke.sh       # the whole pipeline, on 20 MB, in about twenty minutes
 ./10-bf16.sh        # the real run, entirely per corpus.json
 ./20-q6_k.sh
 ./30-q4_k_m.sh
@@ -435,7 +436,7 @@ it mean anything at the sizes below.
 
 **These are real training runs, and they cost what training costs.**
 Everything runs on the CPU in 32-bit floating point. `tiny` is minutes and
-`smoke` is about half an hour;
+`smoke` is about a quarter of an hour;
 the three real sizes are days to weeks of continuous compute on a corpus
 large enough to be worth it, and they need memory to match — training holds
 four numbers per parameter (the weight, its gradient, and the optimizer's

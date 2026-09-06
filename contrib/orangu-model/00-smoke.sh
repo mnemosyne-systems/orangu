@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# Stage 0: prove the whole pipeline works here, in about half an hour.
+# Stage 0: prove the whole pipeline works here, in about twenty minutes.
 #
 # `corpus-smoke.json` is a four-repository corpus of about 20 MB at the
 # `smoke` size — clone, tokenizer, packing, training, and a written GGUF

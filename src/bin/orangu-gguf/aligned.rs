@@ -75,6 +75,31 @@ thread_local! {
 const POOL_COUNT: usize = 48;
 const POOL_BYTES: usize = 128 << 20;
 
+/// The bounds above, overridable so they can be swept. They were measured
+/// before a training step kept any of its activations; a step that holds
+/// several hundred megabytes of them takes those buffers out of
+/// circulation, and the pool has to be big enough to cover what is left.
+fn pool_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_POOL_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(POOL_COUNT)
+    })
+}
+
+fn pool_bytes() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_POOL_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mib| mib << 20)
+            .unwrap_or(POOL_BYTES)
+    })
+}
+
 // Takes a buffer of at least `lines` lines from this thread's pool.
 //
 // Best fit, not first fit: handing a 32 MiB buffer to a request for 8 KiB
@@ -101,7 +126,8 @@ fn give(buffer: Vec<Line>) {
     POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let held: usize = pool.iter().map(|b| b.capacity() * size_of::<Line>()).sum();
-        if pool.len() < POOL_COUNT && held + buffer.capacity() * size_of::<Line>() <= POOL_BYTES {
+        if pool.len() < pool_count() && held + buffer.capacity() * size_of::<Line>() <= pool_bytes()
+        {
             pool.push(buffer);
         }
     });
