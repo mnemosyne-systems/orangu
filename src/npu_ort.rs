@@ -148,20 +148,24 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 
+#[cfg(unix)]
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
 /// Where the vendor BSP installs ONNX Runtime and the Zhouyi provider.
+#[cfg(unix)]
 const DIR: &str = "/usr/share/cix/lib/onnxruntime";
 
 /// The provider's compiler loads its operator library from here. It is read
 /// from the environment, defaults to a relative `./operator`, and without it
 /// session creation fails with "Cannot find layerlib under path".
+#[cfg(unix)]
 const OPERATOR_PATH: &str = "OPERATOR_PATH";
 
 /// Loaded before ONNX Runtime because the provider's libraries have no
 /// `RUNPATH` and live in a directory that is not on the loader path.
 /// Preloading them by absolute path with `RTLD_GLOBAL` satisfies those
 /// references without requiring `LD_LIBRARY_PATH`.
+#[cfg(unix)]
 const DEPS: &[&str] = &[
     "libaipu_driver.so",
     "libaipu_buildingtool.so",
@@ -873,6 +877,7 @@ struct ProjectionShape {
 impl NpuOrt {
     /// Opens ONNX Runtime, or `None` when the vendor stack is not installed
     /// — the same "absence is an answer" contract [`crate::npu`] has.
+    #[cfg(unix)]
     pub fn open() -> Option<Self> {
         // SAFETY: the provider's libraries carry no RUNPATH and sit outside
         // the loader path, so they are preloaded by absolute path with
@@ -992,6 +997,14 @@ impl NpuOrt {
             inner: std::rc::Rc::new(OrtInner { api, env }),
             append_zhouyi,
         })
+    }
+
+    /// The vendor stack is a set of ELF shared objects opened by absolute
+    /// path with flags only the dynamic loader defines, so where that loader
+    /// does not exist there is nothing to open and absence is the answer.
+    #[cfg(not(unix))]
+    pub fn open() -> Option<Self> {
+        None
     }
 
     /// Turns an ONNX Runtime status into an error carrying its message.
